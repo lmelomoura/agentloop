@@ -132,6 +132,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     payload; the page's own `EFFORTS`/`PERMS` copies are gone; a job whose
     platform the engine does not know reads as Anthropic here too, the
     engine's own rule.
+  - The job editor's Agent pane opens with **Platform**: picking OpenAI
+    repopulates the model list from the Codex catalog (with the catalog's
+    descriptions, a deprecated slug's successor and retirement date, and
+    "no price" where `config/pricing.json` has none), rebuilds the effort
+    slider with that model's own levels (up to `ultra`), swaps the
+    permission modes to `read-only` / `workspace-write` / `full-access`,
+    switches Interactive off (Codex exec has no stdin protocol) and notes on
+    the Limits pane that cost is estimated and the per-run cap advisory. The
+    editor saves `platform` before the fields it governs.
 
 ### Changed
 

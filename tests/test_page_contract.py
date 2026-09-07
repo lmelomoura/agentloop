@@ -1822,6 +1822,38 @@ def test_the_page_has_no_effort_vocabulary_of_its_own(srv):
     )
 
 
+def test_the_job_editor_saves_platform_before_the_fields_it_governs(srv):
+    """The engine rewrites model, effort and permission_mode to the new
+    platform's defaults when platform changes (set-field platform), so the page
+    must send platform FIRST and only then the three it governs -- sent after,
+    the rewrite would overwrite what the page had just saved."""
+    js = _fn(_js(srv), "saveEditor")
+    first = js.index('field:"platform"')
+    assert first < js.index('setF("model"'), "platform must be saved before model"
+    assert first < js.index('setF("effort"'), "platform must be saved before effort"
+    assert first < js.index('setF("permission_mode"'), "platform must be saved before permission_mode"
+    assert first < js.index('api("set_prompt"'), "platform is the first field after the rename"
+    assert "platform:f.platform" in js, "create sends the platform in the job object"
+
+
+def test_the_page_has_no_permission_vocabulary_of_its_own(srv):
+    """Same rule as the effort ladder: the permission modes are the engine's
+    (platform_permissions), mirrored by /api/models; the page keeps no copy."""
+    page = srv.render_page()
+    assert "const PERMS" not in page
+
+
+def test_the_job_editor_has_a_platform_combo_before_the_model(srv):
+    page = srv.render_page("boot-authed")
+    for part in ("ed-platform-combo", "ed-platform-trigger", "ed-platform-val",
+                 "ed-platform-pop", "ed-platform-search", "ed-platform-opts",
+                 "ed-platform-note", "ed-interactive-help", "ed-limits-note"):
+        assert f'id="{part}"' in page, f"missing {part}"
+    assert '<input type="hidden" id="ed-platform">' in page
+    assert page.index('id="ed-platform-combo"') < page.index('id="ed-model-combo"')
+    assert 'createCombo({id:"ed-platform"' in page
+
+
 def test_the_cells_icon_rule_cannot_repaint_the_favourite_star(srv):
     """The identity cell (.jobcell) holds two icons: its own, a direct child,
     and the favourite star's, nested inside the .favstar button. The star
