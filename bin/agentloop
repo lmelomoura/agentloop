@@ -1512,7 +1512,7 @@ resolve_pricing_openai() { # refresh config/pricing.json from the source; 0 = cu
   # successful refresh ever writes PRICING_FILE (the mv below creates it).
   if [ ! -s "$PRICING_FILE" ] || ! "$JQ" -e 'type == "object"' "$PRICING_FILE" >/dev/null 2>&1; then
     echo "pricing.json missing or not valid JSON — a successful refresh will write a fresh table"
-    log_tick "pricing.json missing or not valid JSON — a successful refresh will write a fresh table"
+    log_tick "pricing: pricing.json missing or not valid JSON — a successful refresh will write a fresh table"
     printf '{"openai":{}}\n' > "$tmp.base" || { log_tick "pricing: cannot write under $CONFIG_DIR — refresh skipped"; _pricing_cleanup; return 1; }
     base="$tmp.base"
   fi
@@ -1610,7 +1610,7 @@ resolve_pricing_openai() { # refresh config/pricing.json from the source; 0 = cu
                elif $b == 0 then " — now free at the source; runs will estimate $0"
                elif ($b / $a) >= 3 or ($b / $a) <= (1 / 3) then " — check the source"
                else "" end)
-        end' "$tmp" 2>/dev/null)"
+        end' "$tmp" 2>/dev/null)" || log_tick "pricing: could not compare the old and new tables — their changes are not listed below"
   if [ -n "$changes" ]; then
     printf '%s\n' "$changes" | while IFS= read -r line; do
       [ -z "$line" ] || log_tick "pricing: $line"
