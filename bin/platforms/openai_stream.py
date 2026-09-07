@@ -82,8 +82,10 @@ def error_status(message):
     text = message or ""
     try:
         embedded = json.loads(text)
-        if isinstance(embedded, dict) and isinstance(embedded.get("status"), int):
-            return embedded["status"]
+        if isinstance(embedded, dict):
+            status = embedded.get("status")
+            if isinstance(status, int) and not isinstance(status, bool):
+                return status
     except Exception:  # noqa: BLE001
         pass
     if QUOTA_PHRASE in text.lower():
@@ -148,7 +150,11 @@ class Normalizer:
                 "num_turns": self.assistant_events, "permission_denials": []}
         if error is None:
             toks = tokens_of(usage)
-            cost = estimate(toks, self.price)
+            # No `usage` dict at all (turn.completed sent none) is not the same
+            # as a turn that genuinely used zero tokens: tokens_of() defaults
+            # every counter to zero either way, so without this guard a priced
+            # model with no usage data would still get an "estimated" $0.00.
+            cost = estimate(toks, self.price) if isinstance(usage, dict) else None
             base.update({"subtype": "success", "is_error": False, "result": self.last_text,
                          # the names the engine's salvage and the modal already sum
                          "usage": {"input_tokens": toks["input"],
@@ -157,11 +163,17 @@ class Normalizer:
                                    "output_tokens": toks["output"]},
                          "total_cost_usd": cost,
                          "cost_basis": "estimated" if cost is not None else "none",
-                         "tokens": toks})
+                         "tokens": toks,
+                         "api_error_status": None})
         else:
             base.update({"subtype": "error_during_execution", "is_error": True,
                          "result": error, "total_cost_usd": None, "cost_basis": "none",
-                         "tokens": None, "api_error_status": error_status(error)})
+                         "tokens": None, "api_error_status": error_status(error),
+                         # every reader of `result` can sum `usage` blindly,
+                         # win or lose -- an error turn billed nothing, not
+                         # "nothing recorded"
+                         "usage": {"input_tokens": 0, "cache_read_input_tokens": 0,
+                                   "cache_creation_input_tokens": 0, "output_tokens": 0}})
         return base
 
     def feed(self, ev):
@@ -187,7 +199,12 @@ class Normalizer:
                 if kind != "item.completed":
                     return []
                 msg = item.get("message") or ""
-                self.pending_error = self.pending_error or msg
+                # Measured (04-unknown-model.jsonl line 2): this item can be a
+                # BENIGN warning ("Defaulting to fallback metadata") that the
+                # CLI carries on past. It is shown to the reader as text; only
+                # a top-level `error` event (below) can end the run -- an
+                # item-level one must never become the run's ending, or a run
+                # cut off later with no turn.failed loses its salvage path.
                 return [self._assistant([{"type": "text", "text": "error: " + msg}])]
             if kind == "item.started":
                 return [self._tool_use(item)]
@@ -197,11 +214,15 @@ class Normalizer:
             out.append(self._tool_result(item))
             return out
         if kind == "turn.completed":
+            if self.done:              # one result per run: a later turn is ignored
+                return []
             return [self._result(usage=ev.get("usage"))]
         if kind == "error":
             self.pending_error = ev.get("message") or self.pending_error or "error"
             return []
         if kind == "turn.failed":
+            if self.done:              # one result per run: a later turn is ignored
+                return []
             msg = ((ev.get("error") or {}).get("message")) or self.pending_error or "turn failed"
             self.pending_error = None
             return [self._result(error=msg)]

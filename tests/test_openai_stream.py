@@ -79,6 +79,7 @@ def test_a_finished_turn_ends_in_a_success_result():
                              "cache_creation_input_tokens": 0, "output_tokens": 123}
     assert last["tokens"] == {"input": 32675, "cached": 28160, "cache_write": 0,
                               "output": 123, "reasoning": 0}
+    assert "api_error_status" in last and last["api_error_status"] is None
 
 
 def test_a_command_becomes_a_bash_tool_use_and_its_result():
@@ -170,7 +171,30 @@ def test_an_unknown_model_carries_the_embedded_status_400():
     assert last["api_error_status"] == 400
     assert "not supported" in last["result"]
     assert last["cost_basis"] == "none" and last["total_cost_usd"] is None
+    assert last["usage"] == {"input_tokens": 0, "cache_read_input_tokens": 0,
+                             "cache_creation_input_tokens": 0, "output_tokens": 0}
     # the item-level error was also shown to the reader, as text
+    texts = [b["text"] for e in out if e["type"] == "assistant"
+             for b in e["message"]["content"] if b["type"] == "text"]
+    assert any(t.startswith("error: ") for t in texts)
+
+
+def test_an_item_level_error_is_shown_as_text_and_never_ends_the_run():
+    # Measured (04-unknown-model.jsonl line 2): Codex emits item.completed
+    # type "error" for a BENIGN warning ("Defaulting to fallback metadata")
+    # and keeps going. If the run is later cut off with no top-level `error`
+    # or `turn.failed`, this must not synthesize a result at finish() -- that
+    # would rob the engine of its salvage path (which only fires when there
+    # is NO result event) and turn a killed run into an error.
+    out = normalize(events=[
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "item.completed", "item": {"id": "item_0", "type": "error",
+                                            "message": "Model metadata for `x` not found."}},
+        {"type": "item.completed", "item": {"id": "item_1", "type": "agent_message",
+                                            "text": "done"}},
+    ])
+    assert out[-1]["type"] != "result"
+    assert out[-1]["message"]["content"][0] == {"type": "text", "text": "done"}
     texts = [b["text"] for e in out if e["type"] == "assistant"
              for b in e["message"]["content"] if b["type"] == "text"]
     assert any(t.startswith("error: ") for t in texts)
@@ -195,10 +219,20 @@ def test_a_run_cut_off_before_its_final_event_emits_no_result():
     assert out[-1]["type"] != "result"
 
 
+def test_only_one_result_is_ever_emitted_for_a_run():
+    usage = {"input_tokens": 1, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+             "output_tokens": 1, "reasoning_output_tokens": 0}
+    out = normalize(events=[{"type": "thread.started", "thread_id": "t"},
+                            {"type": "turn.completed", "usage": usage},
+                            {"type": "turn.completed", "usage": usage}])
+    assert sum(1 for e in out if e["type"] == "result") == 1
+
+
 def test_error_status_reads_the_embedded_json_then_the_quota_phrase():
     assert osm.error_status(json.dumps({"status": 503})) == 503
     assert osm.error_status("You've hit your usage limit. Try again later.") == 429
     assert osm.error_status("something else") is None
+    assert osm.error_status(json.dumps({"status": True})) is None   # bool is not a status
 
 
 # ------------------------------------------------------------ the estimate
@@ -221,6 +255,19 @@ def test_without_a_price_the_cost_is_null_and_the_basis_says_so():
     last = normalize("02-tool-use.jsonl", price=None)[-1]
     assert last["total_cost_usd"] is None and last["cost_basis"] == "none"
     assert last["tokens"]["input"] == 32675          # tokens are still reported
+
+
+def test_no_usage_on_turn_completed_means_no_estimate():
+    # A price IS on file here -- the point is that with no `usage` dict at
+    # all, tokens_of() defaults every counter to zero, and zero tokens must
+    # never be read as a genuine, billable turn worth an estimated $0.00.
+    out = normalize(events=[{"type": "thread.started", "thread_id": "t"},
+                            {"type": "turn.completed"}], price=PRICE)
+    last = out[-1]
+    assert last["type"] == "result" and last["subtype"] == "success"
+    assert last["total_cost_usd"] is None and last["cost_basis"] == "none"
+    assert last["tokens"] == {"input": 0, "cached": 0, "cache_write": 0,
+                              "output": 0, "reasoning": 0}
 
 
 def test_load_price_treats_null_and_missing_slugs_as_no_price(tmp_path):

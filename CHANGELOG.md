@@ -40,7 +40,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     cost ESTIMATED from `config/pricing.json` (seeded from
     `config/pricing.example.json` by `install.sh`; the numbers are the OpenAI
     price page's as read on 2026-09-07), with `cost_basis` saying so — or
-    `none`, never a fake $0.00, when the model has no price.
+    `none`, never a fake $0.00, when the model has no price. A run that is cut
+    off after a benign Codex warning still reaches the engine's salvage path:
+    item-level errors are shown as text, never treated as the run's ending; a
+    turn with no usage carries no estimate.
 
 ### Changed
 
