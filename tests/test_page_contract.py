@@ -7510,8 +7510,11 @@ def test_days_and_effort_map_form_and_job_without_loss(srv, tmp_path):
     then agree on the very same shuffled table; only checking a known value
     against its known position catches a level quietly renamed."""
     block = _app_js(srv)
+    # EFFORTS is an alias of FALLBACK_EFFORTS -- the built-in ladder the two
+    # functions default to when no list is passed -- so the extracted alias
+    # only resolves with the ladder it names standing beside it.
     deps = ("\n".join(_plainfn(block, n) for n in ("effortIndex", "effortFromIndex", "dayNumbers"))
-            + "\n" + _const(block, "EFFORTS"))
+            + "\n" + _const(block, "FALLBACK_EFFORTS") + _const(block, "EFFORTS"))
     script = tmp_path / "days-effort.js"
     script.write_text(deps + """
     const levels = ["", "low", "medium", "high", "xhigh", "max"];
@@ -7539,6 +7542,92 @@ def test_days_and_effort_map_form_and_job_without_loss(srv, tmp_path):
     assert out["days"]["none"] == []
     assert out["days"]["some"] == [1, 4, 7]
     assert out["days"]["allSeven"] == [1, 2, 3, 4, 5, 6, 7]
+
+
+_PLATFORMS_PAYLOAD = {
+    "anthropic": {"available": True, "models": ["claude-opus-5", "claude-sonnet-5"],
+                  "efforts": ["low", "medium", "high", "xhigh", "max"],
+                  "permissions": [{"v": "dontAsk", "label": "dontAsk — run tools without prompting"},
+                                  {"v": "bypassPermissions", "label": "bypassPermissions — full autonomy"}],
+                  "default_model": "opus"},
+    "openai": {"available": True, "reason": "", "catalog_at": 1,
+               "models": [{"v": "gpt-5.6-sol", "label": "GPT-5.6-Sol", "desc": "Reliable agentic workhorse for everyday tasks.",
+                           "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_effort": "low",
+                           "deprecated_by": "", "retires_at": "", "priced": True},
+                          {"v": "gpt-5.5", "label": "GPT-5.5", "desc": "", "efforts": ["low", "medium", "high", "xhigh"],
+                           "default_effort": "medium", "deprecated_by": "", "retires_at": "", "priced": False},
+                          {"v": "gpt-5.4-mini", "label": "GPT-5.4 Mini", "desc": "Old.", "efforts": ["low", "medium", "high", "xhigh"],
+                           "default_effort": "medium", "deprecated_by": "gpt-5.6-luna", "retires_at": "2026-08-31T19:00:00Z", "priced": True}],
+               "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+               "permissions": [{"v": "read-only", "label": "read-only — sandbox"}, {"v": "workspace-write", "label": "workspace-write"},
+                               {"v": "full-access", "label": "full-access"}],
+               "default_model": "gpt-5.6-sol"},
+}
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_effort_ladder_follows_the_platform_and_the_model(srv, tmp_path):
+    """effortsFor is the ONE source of the slider's stops: the platform's levels
+    from /api/models, and on OpenAI the chosen model's own. Index 0 is always
+    the unset stop. Pinned against literal payloads, as the days/effort test
+    above pins the old constant."""
+    block = _app_js(srv)
+    deps = "\n".join(_plainfn(block, n) for n in ("effortsFor", "effortIndex", "effortFromIndex")) \
+        + "\n" + _const(block, "FALLBACK_EFFORTS")
+    script = tmp_path / "efforts-for.js"
+    script.write_text(deps + "\nconst P = " + json.dumps(_PLATFORMS_PAYLOAD) + ";\n" + """
+    const sol = effortsFor("openai", "gpt-5.6-sol", P);
+    console.log(JSON.stringify({
+      sol, five: effortsFor("openai", "gpt-5.5", P), unknown: effortsFor("openai", "gpt-nope", P),
+      anth: effortsFor("anthropic", "claude-opus-5", P), noPayload: effortsFor("anthropic", "x", null),
+      ultraIndex: effortIndex("ultra", sol), ultraBack: effortFromIndex("6", sol),
+      ultraWithoutList: effortIndex("ultra"), oldIndex: effortIndex("max"),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["sol"] == ["", "low", "medium", "high", "xhigh", "max", "ultra"]
+    assert out["five"] == ["", "low", "medium", "high", "xhigh"]
+    assert out["unknown"] == ["", "low", "medium", "high", "xhigh", "max", "ultra"], "an unlisted slug gets the platform's union"
+    assert out["anth"] == ["", "low", "medium", "high", "xhigh", "max"]
+    assert out["noPayload"] == ["", "low", "medium", "high", "xhigh", "max"], "before /api/models answers, the built-in ladder"
+    assert out["ultraIndex"] == 6 and out["ultraBack"] == "ultra"
+    assert out["ultraWithoutList"] == 0, "the default ladder has no ultra: it settles on unset"
+    assert out["oldIndex"] == 5, "the old callers (no list) still read the built-in ladder"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_permissions_models_and_platform_come_from_the_payload(srv, tmp_path):
+    block = _app_js(srv)
+    deps = "\n".join(_plainfn(block, n) for n in
+                     ("permissionsFor", "defaultPermissionFor", "defaultModelFor", "modelOptionsFor",
+                      "platformOf", "platformLabel")) + "\n" + _const(block, "FALLBACK_PERMISSIONS")
+    script = tmp_path / "vocab-for.js"
+    script.write_text(deps + "\nconst P = " + json.dumps(_PLATFORMS_PAYLOAD) + ";\n" + """
+    const groupFn = (ids) => [{sec: "G"}].concat(ids.map(v => ({v, label: v})));
+    console.log(JSON.stringify({
+      oaPerms: permissionsFor("openai", P).map(o => o.v),
+      anPermsNoPayload: permissionsFor("anthropic", null).map(o => o.v),
+      defs: [defaultPermissionFor("anthropic", "job"), defaultPermissionFor("anthropic", "security"),
+             defaultPermissionFor("openai", "job"), defaultPermissionFor("openai", "security")],
+      defModels: [defaultModelFor("anthropic", P), defaultModelFor("openai", P), defaultModelFor("openai", null)],
+      oaModels: modelOptionsFor("openai", P, groupFn).map(o => o.label),
+      anModels: modelOptionsFor("anthropic", P, groupFn),
+      plat: [platformOf({platform: "openai"}, {platform: "anthropic"}), platformOf({}, {platform: "openai"}),
+             platformOf({}, null), platformOf({platform: "weird"}, {platform: "openai"})],
+      labels: [platformLabel("openai"), platformLabel("anthropic"), platformLabel("")],
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["oaPerms"] == ["read-only", "workspace-write", "full-access"]
+    assert out["anPermsNoPayload"] == ["dontAsk", "bypassPermissions", "acceptEdits", "auto", "plan", "manual"]
+    assert out["defs"] == ["dontAsk", "bypassPermissions", "workspace-write", "full-access"]
+    assert out["defModels"] == ["opus", "gpt-5.6-sol", ""]
+    assert out["oaModels"] == ["GPT-5.6-Sol — Reliable agentic workhorse for everyday tasks.",
+                               "GPT-5.5 · no price",
+                               "GPT-5.4 Mini — → gpt-5.6-luna, retires 2026-08-31"]
+    assert out["anModels"][0] == {"sec": "G"} and out["anModels"][1]["v"] == "claude-opus-5"
+    assert out["plat"] == ["openai", "openai", "anthropic", "openai"]
+    assert out["labels"] == ["OpenAI", "Anthropic", "Anthropic"]
 
 
 # ---- Artboard parity: closing four divergences between the shipped editor

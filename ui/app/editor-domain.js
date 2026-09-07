@@ -27,24 +27,117 @@ export function changedKeys(now, clean){
   return Object.keys(now).filter(k => now[k] !== clean[k]);
 }
 
-// Effort: slider position <-> CLI value. 0 leaves it unset (the CLI
-// decides). Slider stops, in order -- the job editor's "ed-effort" and the
-// project editor's Security pane's "sec-effort" are one control (effortSet/
-// effortGet, bin/dashboard.html), so a level moved to the wrong index here
-// is a level silently renamed everywhere the slider is shown.
-export const EFFORTS = ["", "low", "medium", "high", "xhigh", "max"];
+// Effort: slider position <-> CLI value. Index 0 is always "" (unset: the
+// CLI decides), so a slider's stops are [""] + the platform's levels. The
+// levels are the PLATFORM's -- and on OpenAI the chosen MODEL's -- read off
+// /api/models (its `platforms` object); FALLBACK_EFFORTS is what the page
+// opens with before that fetch answers, and what an unknown platform gets.
+// The job editor's "ed-effort" and the Security pane's "sec-effort" are one
+// control (effortSet/effortGet, bin/dashboard.html); each keeps the ladder
+// it was last built with and passes it back in here.
+export const FALLBACK_EFFORTS = ["", "low", "medium", "high", "xhigh", "max"];
+export const EFFORTS = FALLBACK_EFFORTS;   // the pre-platforms name, still read at boot and by tests
 
-// A job's effort string -> the slider index that represents it. An
-// empty/unrecognised value settles on 0 (unset), never -1.
-export function effortIndex(v){
-  return Math.max(0, EFFORTS.indexOf(v || ""));
+export function effortsFor(platform, model, platforms){
+  const p = (platforms || {})[platform || "anthropic"];
+  if(!p) return FALLBACK_EFFORTS.slice();
+  let levels = null;
+  if((platform || "anthropic") === "openai" && model){
+    const m = (p.models || []).find(x => x && x.v === model);
+    if(m && Array.isArray(m.efforts) && m.efforts.length) levels = m.efforts;
+  }
+  if(!levels && Array.isArray(p.efforts) && p.efforts.length) levels = p.efforts;
+  if(!levels) return FALLBACK_EFFORTS.slice();
+  return [""].concat(levels.filter(l => typeof l === "string" && l));
 }
 
-// The slider's own raw (string) value -> the job's effort string. An
-// out-of-range index settles on "" (unset), the same as 0 does.
-export function effortFromIndex(raw){
-  return EFFORTS[+raw || 0] || "";
+// A job's effort string -> the slider index that represents it on `list`
+// (the built-in ladder when none is given). An empty/unrecognised value
+// settles on 0 (unset), never -1.
+export function effortIndex(v, list){
+  return Math.max(0, (list || FALLBACK_EFFORTS).indexOf(v || ""));
 }
+
+// The slider's own raw (string) value -> the job's effort string on `list`.
+// An out-of-range index settles on "" (unset), the same as 0 does.
+export function effortFromIndex(raw, list){
+  return (list || FALLBACK_EFFORTS)[+raw || 0] || "";
+}
+
+// The permission modes and defaults, per platform. The engine owns both
+// vocabularies (platform_permissions, platform_default_permission) and the
+// server mirrors them on /api/models; this is the page's read of that
+// payload, with the same built-in fallback the page opened with before the
+// fetch. The labels say what a mode DOES on that CLI.
+export const FALLBACK_PERMISSIONS = {
+  anthropic: [
+    {v: "dontAsk", label: "dontAsk — run tools without prompting"},
+    {v: "bypassPermissions", label: "bypassPermissions — full autonomy (headless default)"},
+    {v: "acceptEdits", label: "acceptEdits"}, {v: "auto", label: "auto"},
+    {v: "plan", label: "plan"}, {v: "manual", label: "manual"},
+  ],
+  openai: [
+    {v: "read-only", label: "read-only — sandbox: no writes, no network"},
+    {v: "workspace-write", label: "workspace-write — sandbox: writes inside the workspace"},
+    {v: "full-access", label: "full-access — no sandbox, no approvals"},
+  ],
+};
+
+export function permissionsFor(platform, platforms){
+  const key = platform === "openai" ? "openai" : "anthropic";
+  const p = (platforms || {})[key];
+  const list = (p && Array.isArray(p.permissions) && p.permissions.length) ? p.permissions : FALLBACK_PERMISSIONS[key];
+  return list.map(o => ({v: o.v, label: o.label || o.v}));
+}
+
+// platform_default_permission's two answers, mirrored: what a job and what a
+// security analysis run as when nothing is set.
+export function defaultPermissionFor(platform, kind){
+  if(platform === "openai") return kind === "security" ? "full-access" : "workspace-write";
+  return kind === "security" ? "bypassPermissions" : "dontAsk";
+}
+
+export function defaultModelFor(platform, platforms){
+  const key = platform === "openai" ? "openai" : "anthropic";
+  const p = (platforms || {})[key];
+  if(p && p.default_model) return p.default_model;
+  return key === "anthropic" ? "opus" : "";
+}
+
+// The model combo's option list for one platform. Anthropic keeps the
+// family/generation grouping the page already draws (groupFn is the page's
+// groupModels); OpenAI is flat, in the catalog's own order, each slug with
+// its description, a deprecated slug at the end pointing at its successor,
+// and " · no price" on a slug config/pricing.json does not price.
+export function modelOptionsFor(platform, platforms, groupFn){
+  const key = platform === "openai" ? "openai" : "anthropic";
+  const p = (platforms || {})[key];
+  if(key === "anthropic"){
+    const ids = (p && Array.isArray(p.models)) ? p.models : [];
+    return groupFn ? groupFn(ids) : ids.map(v => ({v, label: v}));
+  }
+  const list = (p && Array.isArray(p.models)) ? p.models : [];
+  const noPrice = (m) => m.priced === false ? " · no price" : "";
+  const live = list.filter(m => !m.deprecated_by).map(m => ({
+    v: m.v, label: (m.label || m.v) + (m.desc ? " — " + m.desc : "") + noPrice(m)}));
+  const old = list.filter(m => m.deprecated_by).map(m => ({
+    v: m.v, label: (m.label || m.v) + " — → " + m.deprecated_by
+      + (m.retires_at ? ", retires " + String(m.retires_at).slice(0, 10) : "") + noPrice(m)}));
+  return live.concat(old);
+}
+
+// A job's effective platform: its own, else its project's, else anthropic --
+// the engine's resolve() rule, with anything unknown read as anthropic the
+// way job_platform() does.
+export function platformOf(job, project){
+  const own = job && job.platform;
+  if(own === "anthropic" || own === "openai") return own;
+  const pp = project && project.platform;
+  if(pp === "anthropic" || pp === "openai") return pp;
+  return "anthropic";
+}
+
+export function platformLabel(p){ return p === "openai" ? "OpenAI" : "Anthropic"; }
 
 // The "on" day buttons' own dataset.day strings (already read off the DOM by
 // getDays, bin/dashboard.html) -> the numbers a job's active_days is stored

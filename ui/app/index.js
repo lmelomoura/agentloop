@@ -38,7 +38,9 @@ import { visibleProjects, projFilters, projectIsolation,
 import { RF, renderRunsPage, runsSort, runsSetPage,
          runsFilterChanged, runsGotoFirstPage, runsSetPageSize, runsPageSize,
          clearRunFilters, runSearch, runProjectNames } from "./runs.js";
-import { changedKeys, EFFORTS, effortIndex, effortFromIndex,
+import { changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, effortsFor,
+         FALLBACK_PERMISSIONS, permissionsFor, defaultPermissionFor, defaultModelFor,
+         modelOptionsFor, platformOf, platformLabel,
          dayNumbers, shapeRepoRows, projectStepError } from "./editor-domain.js";
 
 function init(cc){
@@ -184,5 +186,17 @@ window.ALApp = { init, visibleJobs, jobFilters, bulkOn,
                  // plain values out -- none reaches $, document or AL.DATA,
                  // so none needed a page.js entry the way jobs-domain.js's
                  // exports do.
-                 changedKeys, EFFORTS, effortIndex, effortFromIndex,
+                 //
+                 // FALLBACK_EFFORTS, effortsFor, FALLBACK_PERMISSIONS,
+                 // permissionsFor, defaultPermissionFor, defaultModelFor,
+                 // modelOptionsFor, platformOf and platformLabel are B2's
+                 // (the platforms UI plan): pure functions over the
+                 // `platforms` payload of /api/models -- plain values in,
+                 // plain values out, no $, document or AL.DATA -- that the
+                 // page reads through ALApp to build its Platform -> Model
+                 // combos, effort ladders and permission lists instead of
+                 // keeping copies of those vocabularies itself.
+                 changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, effortsFor,
+                 FALLBACK_PERMISSIONS, permissionsFor, defaultPermissionFor, defaultModelFor,
+                 modelOptionsFor, platformOf, platformLabel,
                  dayNumbers, shapeRepoRows, projectStepError };

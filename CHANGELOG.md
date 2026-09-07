@@ -120,6 +120,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     it moves 3× or more), and the estimate's cache-write term is pinned by a
     test; every line the refresh writes to `tick.log` starts with `pricing:`,
     and a comparison that could not run says so instead of staying silent.
+- **The OpenAI platform, dashboard side.** The page chooses **Platform → Model**
+  in the job editor, the project editor and the project's security block, and
+  reads every vocabulary — models, effort levels, permission modes, defaults,
+  prices — from `/api/models` instead of its own lists. What it cost to not
+  have it: a job could run on Codex, but only from the terminal.
+  - `ui/app/editor-domain.js` computes the effort ladder per platform and
+    model (`effortsFor`), the permission modes (`permissionsFor`) and the
+    model list (`modelOptionsFor`, flat for OpenAI with the catalog's
+    descriptions, deprecations and "no price" marks) from the server's
+    payload; the page's own `EFFORTS`/`PERMS` copies are gone.
 
 ### Changed
 

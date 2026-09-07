@@ -2193,12 +2193,85 @@
   function changedKeys(now, clean) {
     return Object.keys(now).filter((k) => now[k] !== clean[k]);
   }
-  var EFFORTS = ["", "low", "medium", "high", "xhigh", "max"];
-  function effortIndex(v) {
-    return Math.max(0, EFFORTS.indexOf(v || ""));
+  var FALLBACK_EFFORTS = ["", "low", "medium", "high", "xhigh", "max"];
+  var EFFORTS = FALLBACK_EFFORTS;
+  function effortsFor(platform, model, platforms) {
+    const p = (platforms || {})[platform || "anthropic"];
+    if (!p) return FALLBACK_EFFORTS.slice();
+    let levels = null;
+    if ((platform || "anthropic") === "openai" && model) {
+      const m = (p.models || []).find((x) => x && x.v === model);
+      if (m && Array.isArray(m.efforts) && m.efforts.length) levels = m.efforts;
+    }
+    if (!levels && Array.isArray(p.efforts) && p.efforts.length) levels = p.efforts;
+    if (!levels) return FALLBACK_EFFORTS.slice();
+    return [""].concat(levels.filter((l) => typeof l === "string" && l));
   }
-  function effortFromIndex(raw) {
-    return EFFORTS[+raw || 0] || "";
+  function effortIndex(v, list) {
+    return Math.max(0, (list || FALLBACK_EFFORTS).indexOf(v || ""));
+  }
+  function effortFromIndex(raw, list) {
+    return (list || FALLBACK_EFFORTS)[+raw || 0] || "";
+  }
+  var FALLBACK_PERMISSIONS = {
+    anthropic: [
+      { v: "dontAsk", label: "dontAsk \u2014 run tools without prompting" },
+      { v: "bypassPermissions", label: "bypassPermissions \u2014 full autonomy (headless default)" },
+      { v: "acceptEdits", label: "acceptEdits" },
+      { v: "auto", label: "auto" },
+      { v: "plan", label: "plan" },
+      { v: "manual", label: "manual" }
+    ],
+    openai: [
+      { v: "read-only", label: "read-only \u2014 sandbox: no writes, no network" },
+      { v: "workspace-write", label: "workspace-write \u2014 sandbox: writes inside the workspace" },
+      { v: "full-access", label: "full-access \u2014 no sandbox, no approvals" }
+    ]
+  };
+  function permissionsFor(platform, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    const list = p && Array.isArray(p.permissions) && p.permissions.length ? p.permissions : FALLBACK_PERMISSIONS[key];
+    return list.map((o) => ({ v: o.v, label: o.label || o.v }));
+  }
+  function defaultPermissionFor(platform, kind) {
+    if (platform === "openai") return kind === "security" ? "full-access" : "workspace-write";
+    return kind === "security" ? "bypassPermissions" : "dontAsk";
+  }
+  function defaultModelFor(platform, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    if (p && p.default_model) return p.default_model;
+    return key === "anthropic" ? "opus" : "";
+  }
+  function modelOptionsFor(platform, platforms, groupFn) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    if (key === "anthropic") {
+      const ids = p && Array.isArray(p.models) ? p.models : [];
+      return groupFn ? groupFn(ids) : ids.map((v) => ({ v, label: v }));
+    }
+    const list = p && Array.isArray(p.models) ? p.models : [];
+    const noPrice = (m) => m.priced === false ? " \xB7 no price" : "";
+    const live = list.filter((m) => !m.deprecated_by).map((m) => ({
+      v: m.v,
+      label: (m.label || m.v) + (m.desc ? " \u2014 " + m.desc : "") + noPrice(m)
+    }));
+    const old = list.filter((m) => m.deprecated_by).map((m) => ({
+      v: m.v,
+      label: (m.label || m.v) + " \u2014 \u2192 " + m.deprecated_by + (m.retires_at ? ", retires " + String(m.retires_at).slice(0, 10) : "") + noPrice(m)
+    }));
+    return live.concat(old);
+  }
+  function platformOf(job, project) {
+    const own = job && job.platform;
+    if (own === "anthropic" || own === "openai") return own;
+    const pp = project && project.platform;
+    if (pp === "anthropic" || pp === "openai") return pp;
+    return "anthropic";
+  }
+  function platformLabel(p) {
+    return p === "openai" ? "OpenAI" : "Anthropic";
   }
   function dayNumbers(rawValues) {
     return rawValues.map((v) => +v);
@@ -2381,14 +2454,33 @@
     // plain values out -- none reaches $, document or AL.DATA,
     // so none needed a page.js entry the way jobs-domain.js's
     // exports do.
+    //
+    // FALLBACK_EFFORTS, effortsFor, FALLBACK_PERMISSIONS,
+    // permissionsFor, defaultPermissionFor, defaultModelFor,
+    // modelOptionsFor, platformOf and platformLabel are B2's
+    // (the platforms UI plan): pure functions over the
+    // `platforms` payload of /api/models -- plain values in,
+    // plain values out, no $, document or AL.DATA -- that the
+    // page reads through ALApp to build its Platform -> Model
+    // combos, effort ladders and permission lists instead of
+    // keeping copies of those vocabularies itself.
     changedKeys,
     EFFORTS,
+    FALLBACK_EFFORTS,
     effortIndex,
     effortFromIndex,
+    effortsFor,
+    FALLBACK_PERMISSIONS,
+    permissionsFor,
+    defaultPermissionFor,
+    defaultModelFor,
+    modelOptionsFor,
+    platformOf,
+    platformLabel,
     dayNumbers,
     shapeRepoRows,
     projectStepError
   };
 })();
-/* ui-bundle: da8781c275af1a436776b37166d48894dcb8096a3ac563ddacf0b3d566fd3330 */
-/* ui-sources: 55b58d6008704a6a9af84c7b5c09f3ae37c5b7565c3bdee3cd039a3aa57bc4e0 */
+/* ui-bundle: 0eb3e49ea13a4787aa1f84d717d21a5607226b72f59cbcbc34f24d9ceea443ef */
+/* ui-sources: cc651cc0f97f69ab2f8eddf43480aa7df3bd495173bde4e2862523a250329095 */
