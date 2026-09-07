@@ -952,6 +952,21 @@ document.documentElement.dataset.theme =
     <input id="pj-name" type="text" placeholder="e.g. my-repo" autocomplete="off"></div>
   <label>Description — passed to the agent as context on every run</label>
   <textarea id="pj-desc" style="min-height:110px"></textarea>
+  <label>Platform — which CLI this project's jobs run on unless a job sets its own</label>
+  <div class="combo" id="pj-platform-combo">
+    <button type="button" class="combo-trigger" id="pj-platform-trigger" aria-haspopup="listbox" aria-expanded="false">
+      <span class="combo-val" id="pj-platform-val">Anthropic</span>
+      <span class="combo-caret"></span>
+    </button>
+    <div class="combo-pop" id="pj-platform-pop" hidden>
+      <input type="text" class="combo-search" id="pj-platform-search" placeholder="Search platforms…" autocomplete="off">
+      <ul class="combo-list" id="pj-platform-opts" role="listbox"></ul>
+    </div>
+    <input type="hidden" id="pj-platform">
+  </div>
+  <p class="fieldhelp">Anthropic is Claude Code, OpenAI is the Codex CLI. A job with a platform of its own keeps
+    it; one that inherits this runs on it from its next start — and is refused at launch, with the
+    reason in <code>tick.log</code>, while it still names a model the new platform does not know.</p>
   <label>Working directory (cwd) — jobs in this project inherit it unless they set their own</label>
   <div class="cwdrow">
     <input id="pj-cwd" type="text" placeholder="click Browse to choose a folder" readonly data-cwd-target="pj-cwd" class="cwd-ro">
@@ -972,7 +987,8 @@ document.documentElement.dataset.theme =
          autocomplete="off" spellcheck="false">
   <p class="fieldhelp">Exported to runs as <code>CLAUDE_CONFIG_DIR</code> (e.g. <code>~/.claude-work</code>).
     Empty inherits the scheduler's own account; once runs exist, keep it stable —
-    a resumed session is looked up inside the account that created it.</p>
+    a resumed session is looked up inside the account that created it. Anthropic runs only — a run
+    on OpenAI signs in as the Codex CLI's own account (<code>codex login</code>).</p>
   </div><!-- /pane project -->
 
   <div class="tabpane" data-pjpane="repos">
@@ -1033,6 +1049,21 @@ document.documentElement.dataset.theme =
   </div>
   <input type="checkbox" id="sec-enabled" hidden>
   <p class="fieldhelp">A project can be registered for security analysis alone — no jobs required.</p>
+  <label>Platform</label>
+  <div class="combo" id="sec-platform-combo">
+    <button type="button" class="combo-trigger" id="sec-platform-trigger" aria-haspopup="listbox" aria-expanded="false">
+      <span class="combo-val" id="sec-platform-val">— Inherit the project's —</span>
+      <span class="combo-caret"></span>
+    </button>
+    <div class="combo-pop" id="sec-platform-pop" hidden>
+      <input type="text" class="combo-search" id="sec-platform-search" placeholder="Search platforms…" autocomplete="off">
+      <ul class="combo-list" id="sec-platform-opts" role="listbox"></ul>
+    </div>
+    <input type="hidden" id="sec-platform">
+  </div>
+  <p class="fieldhelp">Which CLI runs the analysis — the project's platform unless set here. On OpenAI
+    nothing can close the agent's subagents by flag, so the prompt forbids them; the run is priced
+    from tokens like any Codex run.</p>
   <div class="row2">
     <div><label>Model</label>
       <div class="combo" id="sec-model-combo">
@@ -1046,7 +1077,7 @@ document.documentElement.dataset.theme =
         </div>
         <input type="hidden" id="sec-model">
       </div>
-      <p class="fieldhelp">The model the analysis runs as — defaults to the opus family.</p></div>
+      <p class="fieldhelp" id="sec-model-help">The model the analysis runs as — defaults to the opus family.</p></div>
     <div><label>Effort <span class="efflabel" id="sec-effort-label">—</span></label>
       <input type="range" id="sec-effort" class="effslider" min="0" max="5" step="1" value="0">
       <div class="effends"><span>Faster</span><span>Smarter</span></div>
@@ -1064,12 +1095,13 @@ document.documentElement.dataset.theme =
     </div>
     <input type="hidden" id="sec-perm">
   </div>
-  <p class="fieldhelp">How the analysis agent may use tools — dontAsk without an allowlist denies
+  <p class="fieldhelp" id="sec-perm-help">How the analysis agent may use tools — dontAsk without an allowlist denies
     everything headless, but the ledger stays protected by the CLI's validating door either way.</p>
   <label>Claude account — which account signs the analysis</label>
   <input id="sec-cfgdir" type="text" placeholder="inherits the project's" autocomplete="off" spellcheck="false">
   <p class="fieldhelp">Empty inherits this project's own Claude account above; set it only when the
-    analysis itself should sign in as someone else.</p>
+    analysis itself should sign in as someone else. Anthropic runs only — a run on OpenAI signs in
+    as the Codex CLI's own account (<code>codex login</code>).</p>
   <label>Default profile — offered first when you open Analyse for this project</label>
   <div class="combo" id="sec-profile-default-combo">
     <button type="button" class="combo-trigger" id="sec-profile-default-trigger" aria-haspopup="listbox" aria-expanded="false">
@@ -2461,11 +2493,17 @@ function openProjectEditor(name){
   const sec=(p&&p.security)||{};
   $("sec-enabled").checked = sec.enabled===true || sec.enabled==="true";
   paintSecEnabled();
-  if(secModelCombo) secModelCombo.set(sec.model||"", MODELS);
-  else $("sec-model").value = sec.model||"";
+  // Platform first, on both combos -- the project's own (anthropic when it has
+  // none), then the block's override (empty = inherit) -- because everything
+  // below is read against the platform that results.
+  pjPlatformCombo.set((p&&p.platform==="openai")?"openai":"anthropic", PLATFORM_OPTS);
+  secPlatformCombo.set((sec.platform==="openai"||sec.platform==="anthropic")?sec.platform:"", PLATFORM_OPTS);
+  const splat=secEffectivePlatform();
+  applyPlatformToSecurity(splat, false);
+  secModelCombo.set(sec.model||"");
+  if(splat==="openai") secEfforts=ALApp.effortsFor("openai", $("sec-model").value, PLATFORMS);
   effortSet("sec-effort","sec-effort-label", sec.effort||"");
-  if(secPermCombo) secPermCombo.set(sec.permission_mode||"bypassPermissions", ALApp.permissionsFor("anthropic", PLATFORMS));
-  else $("sec-perm").value = sec.permission_mode||"bypassPermissions";
+  secPermCombo.set(sec.permission_mode||ALApp.defaultPermissionFor(splat,"security"));
   $("sec-cfgdir").value = sec.claude_config_dir||"";
   $("sec-profile-default").value = ALSecurity.SEC_PROFILES.includes(sec.default_profile) ? sec.default_profile : "standard";
   // The hidden input above is the value saveProject reads; the combo also
@@ -2528,6 +2566,9 @@ async function saveProject(){
     // put a project back on the default account, and project-set merges, so a key
     // that is simply omitted would keep the old account forever.
     proj.claude_config_dir=$("pj-ccd").value.trim();
+    // Always sent, like claude_config_dir: project-set merges, and a project
+    // going back to Anthropic has to be able to say so.
+    proj.platform=$("pj-platform").value||"anthropic";
     // Send only .worktree.enabled: project-set merges (jq `. * $p`), so any
     // venv/env the project declares alongside it survives the save.
     const wv=$("pj-wt").value;
@@ -2555,13 +2596,16 @@ async function saveProject(){
     const minSev=$("sec-min-severity").value, profDef=$("sec-profile-default").value;
     proj.security = {
       enabled: $("sec-enabled").checked,
+      // "" = inherit the project's; the engine's security_derived_jobs reads it that way
+      platform: $("sec-platform").value,
       model: $("sec-model").value.trim(),
-      // Through the ONE canonical list (ALApp.EFFORTS, editor-domain.js).
-      // This read used to index a page-local copy: the label beside the
-      // slider and the value saved to disk each resolved their own array,
-      // and the day the two diverged the user would confirm one effort
-      // level on screen while a different one landed in the config --
-      // silently, since project_set accepts any string.
+      // Read against the Security pane's own ladder (secEfforts, rebuilt by
+      // applyPlatformToSecurity from editor-domain.js's effortsFor) -- the
+      // list the label beside the slider was drawn from. This read used to
+      // index a page-local copy: the label and the value saved to disk each
+      // resolved their own array, and the day the two diverged the user would
+      // confirm one effort level on screen while a different one landed in
+      // the config -- silently, since project_set accepts any string.
       effort: effortGet("sec-effort"),
       permission_mode: $("sec-perm").value||"bypassPermissions",
       claude_config_dir: $("sec-cfgdir").value.trim(),
@@ -3324,7 +3368,6 @@ function modelOptions(p){ return ALApp.modelOptionsFor(p, PLATFORMS, groupModels
 function refillPlatformBound(){
   if(platformCombo) applyPlatformToJobEditor($("ed-platform").value||"anthropic", true);
   if(secPlatformCombo) applyPlatformToSecurity(secEffectivePlatform(), true);
-  else if(secModelCombo) secModelCombo.set(secModelCombo.get(), MODELS);
 }
 
 // Effort: slider position ↔ CLI value. 0 leaves it unset (the CLI decides);
@@ -3388,6 +3431,40 @@ function paintLimitsNote(p, model){
   if(m && m.priced===false) t+=" No price configured for "+model+" — dollar caps will not see this job's spend.";
   n.textContent=t; n.hidden=false;
 }
+// The security block's effective platform: its own, else the project's AS THE
+// EDITOR HAS IT NOW (saved or not), else anthropic -- security_derived_jobs'
+// own resolution, read off the two combos.
+function secEffectivePlatform(){ return $("sec-platform").value || $("pj-platform").value || "anthropic"; }
+// The Security pane's twin of applyPlatformToJobEditor: model list and default
+// label, the ladder (the model's on OpenAI), the modes and the two help lines.
+// `keep` is the re-apply after /api/models answers: nothing chosen is lost.
+function applyPlatformToSecurity(p, keep){
+  const opts=modelOptions(p);
+  const curModel=$("sec-model").value;
+  const keepModel=keep && (!curModel || opts.some(o=>!o.sec && o.v===curModel) || p!=="openai");
+  secModelCfg.allowCustom=(p!=="openai");
+  const dm=ALApp.defaultModelFor(p,PLATFORMS);
+  secModelCfg.noneLabel="— Default ("+(dm||"the catalog's first")+") —";
+  secModelCombo.set(keepModel?curModel:"", opts);
+  const effVal=keep?effortGet("sec-effort"):"";                 // read against the OLD ladder
+  secEfforts=ALApp.effortsFor(p, $("sec-model").value, PLATFORMS);
+  effortSet("sec-effort","sec-effort-label", secEfforts.includes(effVal)?effVal:"");
+  const perms=ALApp.permissionsFor(p,PLATFORMS), curPerm=$("sec-perm").value;
+  secPermCombo.set((keep&&perms.some(o=>o.v===curPerm))?curPerm:ALApp.defaultPermissionFor(p,"security"), perms);
+  $("sec-model-help").textContent = p==="openai"
+    ? "The Codex model the analysis runs as — empty takes the catalog's first ("+(dm||"none resolved yet")+"); a slug outside the catalog is refused at launch."
+    : "The model the analysis runs as — defaults to the opus family.";
+  $("sec-perm-help").textContent = p==="openai"
+    ? "full-access is the headless default here: the sandbox modes cannot write the ledger, which lives outside the worktree."
+    : "How the analysis agent may use tools — dontAsk without an allowlist denies everything headless, but the ledger stays protected by the CLI's validating door either way.";
+}
+// On OpenAI the ladder is the model's: a new model, a new ladder.
+function onSecModelPicked(v){
+  if(secEffectivePlatform()!=="openai") return;
+  const effVal=effortGet("sec-effort");
+  secEfforts=ALApp.effortsFor("openai", v, PLATFORMS);
+  effortSet("sec-effort","sec-effort-label", secEfforts.includes(effVal)?effVal:"");
+}
 // The Enabled/Disabled segmented control is paint, not state -- #sec-enabled
 // (a real, hidden checkbox) stays the one thing openProjectEditor sets and
 // saveProject reads. This just keeps the two segments in step with it,
@@ -3413,6 +3490,13 @@ let PLATFORMS={};                                          // /api/models.platfo
 // make the fallback the PLATFORM's -- "opus" is Anthropic's, and a lie on
 // OpenAI when the catalog is empty or has not arrived yet.
 const edModelCfg={id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelPicked};
+// The Security pane's model combo, configured by name so applyPlatformToSecurity
+// can flip what the widget offers: a typed-in id ("Use …") is an Anthropic
+// affordance -- a Codex slug outside the catalog is refused at launch -- and the
+// empty row's label names the platform's own default.
+const secModelCfg={id:"sec-model", allowNone:true, noneLabel:"— Default (opus) —", allowCustom:true,
+  onPick:(v)=>onSecModelPicked(v)};
+let pjPlatformCombo=null;
 let edEfforts=ALApp.FALLBACK_EFFORTS.slice(), secEfforts=ALApp.FALLBACK_EFFORTS.slice();
 let projectCombo=null, modelCombo=null, permCombo=null, wtCombo=null, platformCombo=null,
     secModelCombo=null, secPermCombo=null, secPlatformCombo=null,
@@ -3429,11 +3513,16 @@ function initCombos(){
   platformCombo.set("anthropic", PLATFORM_OPTS);
   modelCombo=createCombo(edModelCfg);
   modelCombo.set("opus", MODELS);
+  pjPlatformCombo=createCombo({id:"pj-platform", allowNone:false, def:"anthropic",
+    onPick:()=>{ if(!$("sec-platform").value) applyPlatformToSecurity(secEffectivePlatform(), false); }});
+  pjPlatformCombo.set("anthropic", PLATFORM_OPTS);
+  secPlatformCombo=createCombo({id:"sec-platform", allowNone:true, noneLabel:"— Inherit the project's —",
+    onPick:()=>applyPlatformToSecurity(secEffectivePlatform(), false)});
+  secPlatformCombo.set("", PLATFORM_OPTS);
   // Same list, same widget, one difference: empty is a real choice here — it
   // means "the engine's own default" — so the none row stays. allowCustom keeps
   // what the old free-text field could do: an exact id the CLI does not list yet.
-  secModelCombo=createCombo({id:"sec-model", allowNone:true,
-    noneLabel:"— Default (opus) —", allowCustom:true});
+  secModelCombo=createCombo(secModelCfg);
   secModelCombo.set("", MODELS);
   secPermCombo=createCombo({id:"sec-perm", allowNone:false, def:"bypassPermissions"});
   secPermCombo.set("bypassPermissions", ALApp.permissionsFor("anthropic", PLATFORMS));

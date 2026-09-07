@@ -598,7 +598,8 @@ def _run_save(srv, tmp_path, *, multi, name="save.js"):
     const effortGet = (id) => ALApp.effortFromIndex($(id).value);
     const sent = [];
     const vals = {"pj-name":"Web","pj-desc":"","pj-cwd":"%s","pj-ccd":"","pj-base":"develop",
-                  "pj-wt":"auto","pj-up":"","pj-down":"already here",
+                  "pj-wt":"auto","pj-platform":"anthropic","sec-platform":"",
+                  "pj-up":"","pj-down":"already here",
                   "sec-enabled":false,"sec-model":"","sec-effort":"0","sec-perm":"bypassPermissions","sec-cfgdir":"",
                   "sec-profile-default":"standard","sec-max-budget":"","sec-daily-budget":"",
                   "sec-min-severity":"medium","sec-ignore":""};
@@ -715,8 +716,8 @@ def test_security_model_and_effort_use_the_job_editors_controls(srv):
     assert 'id="sec-effort" class="effslider"' in page
     assert 'id="sec-effort-label"' in page
     # the combo is created and kept in step with /api/models like the job's
-    assert 'createCombo({id:"sec-model"' in page
-    assert "secModelCombo.set(secModelCombo.get(), MODELS)" in page
+    assert 'const secModelCfg={id:"sec-model"' in page and 'createCombo(secModelCfg)' in page
+    assert "applyPlatformToSecurity(secEffectivePlatform(), true)" in page
     # and the permission mode is the job editor's combo too, with the headless
     # default that actually lets a fresh worktree run tools
     assert 'createCombo({id:"sec-perm"' in page
@@ -736,12 +737,86 @@ def test_saving_always_sends_the_whole_security_block_with_a_real_boolean(srv, t
     proj = next(e["project"] for op, e in sent if op == "project_set")
     sec = proj["security"]
     assert sec["enabled"] is False, f"enabled must be a real boolean, got {sec['enabled']!r}"
-    assert set(sec) == {"enabled", "model", "effort", "permission_mode", "claude_config_dir",
+    assert set(sec) == {"enabled", "platform", "model", "effort", "permission_mode", "claude_config_dir",
                          "default_profile", "max_budget_usd", "daily_budget_usd",
                          "min_severity", "ignore_paths"}, f"security block: {sec}"
+    assert sec["platform"] == "", "an empty platform must be SENT: it is how the block goes back to inheriting"
+    assert proj["platform"] == "anthropic", "the project's platform is always sent, like claude_config_dir"
     assert sec["max_budget_usd"] == "", "an empty budget must clear, not vanish from the payload"
     assert sec["default_profile"] == "standard"
     assert sec["min_severity"] == "medium"
+
+
+def test_the_project_editor_chooses_a_platform_for_the_project_and_for_its_analyses(srv):
+    page = srv.render_page("boot-authed")
+    for part in ("pj-platform-combo", "pj-platform-trigger", "pj-platform-val", "pj-platform-pop",
+                 "pj-platform-search", "pj-platform-opts", "sec-platform-combo", "sec-platform-trigger",
+                 "sec-platform-val", "sec-platform-pop", "sec-platform-search", "sec-platform-opts",
+                 "sec-model-help", "sec-perm-help"):
+        assert f'id="{part}"' in page, f"missing {part}"
+    assert '<input type="hidden" id="pj-platform">' in page
+    assert '<input type="hidden" id="sec-platform">' in page
+    assert 'createCombo({id:"pj-platform"' in page
+    assert 'createCombo({id:"sec-platform"' in page
+    assert "noneLabel:\"— Inherit the project's —\"" in page, "the security block's empty platform reads as inheritance"
+    js = _fn(_js(srv), "saveProject")
+    assert 'proj.platform=$("pj-platform").value||"anthropic"' in js
+    assert 'platform: $("sec-platform").value' in js
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
+    """applyPlatformToSecurity over a stub DOM: the block's own platform, else
+    the project's, decides the model list, the ladder (the MODEL's, on
+    OpenAI), the modes and the default label -- and a re-apply after
+    /api/models answers (keep=true) throws nothing the operator chose away."""
+    page = _js(srv)
+    app = _app_js(srv)
+    deps = "\n".join(_plainfn(page, n) for n in
+                     ("applyPlatformToSecurity", "secEffectivePlatform", "effortSet", "effortGet",
+                      "ladderOf", "modelOptions"))
+    vocab = "\n".join(_plainfn(app, n) for n in
+                      ("effortsFor", "effortIndex", "effortFromIndex", "permissionsFor",
+                       "defaultPermissionFor", "defaultModelFor", "modelOptionsFor")) \
+        + "\n" + _const(app, "FALLBACK_EFFORTS") + _const(app, "FALLBACK_PERMISSIONS")
+    script = tmp_path / "sec-platform.js"
+    script.write_text(vocab + """
+    const ALApp = {effortsFor, effortIndex, effortFromIndex, permissionsFor, defaultPermissionFor,
+                   defaultModelFor, modelOptionsFor, FALLBACK_EFFORTS};
+    const nodes = {"pj-platform": {value: "openai"}, "sec-platform": {value: ""},
+                   "sec-model": {value: "gpt-5.5"}, "sec-effort": {value: "2", max: "5"},
+                   "sec-perm": {value: "bypassPermissions"}};
+    const $ = (id) => nodes[id] || (nodes[id] = {value: "", max: "", textContent: ""});
+    const effortLabel = (v) => v;
+    const groupModels = (ids) => ids.map(v => ({v, label: v}));
+    const PLATFORMS = """ + json.dumps(_PLATFORMS_PAYLOAD) + """;
+    let edEfforts = FALLBACK_EFFORTS.slice(), secEfforts = FALLBACK_EFFORTS.slice();
+    const secModelCfg = {id: "sec-model", allowNone: true, noneLabel: "— Default (opus) —", allowCustom: true};
+    let modelOpts = null, permOpts = null;
+    const secModelCombo = {set(v, o){ nodes["sec-model"].value = v; if(o) modelOpts = o; }, get: () => nodes["sec-model"].value};
+    const secPermCombo = {set(v, o){ nodes["sec-perm"].value = v; if(o) permOpts = o; }, get: () => nodes["sec-perm"].value};
+    """ + deps + """
+    applyPlatformToSecurity(secEffectivePlatform(), true);
+    const afterKeep = {model: $("sec-model").value, max: $("sec-effort").max, eff: $("sec-effort").value,
+      perm: $("sec-perm").value, custom: secModelCfg.allowCustom, none: secModelCfg.noneLabel,
+      labels: modelOpts.map(o => o.label), perms: permOpts.map(o => o.v),
+      help: $("sec-model-help").textContent};
+    applyPlatformToSecurity("anthropic", false);
+    const afterReset = {model: $("sec-model").value, max: $("sec-effort").max, eff: $("sec-effort").value,
+      perm: $("sec-perm").value, custom: secModelCfg.allowCustom, none: secModelCfg.noneLabel};
+    console.log(JSON.stringify({afterKeep, afterReset}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    k = out["afterKeep"]
+    assert k["model"] == "gpt-5.5", "a model the platform knows is kept on a re-apply"
+    assert k["max"] == "4" and k["eff"] == "2", "gpt-5.5's four levels; medium stays medium on the new ladder"
+    assert k["perm"] == "full-access", "an Anthropic mode is replaced by the OpenAI security default"
+    assert k["custom"] is False and k["none"] == "— Default (gpt-5.6-sol) —"
+    assert "GPT-5.5 · no price" in k["labels"] and k["perms"] == ["read-only", "workspace-write", "full-access"]
+    assert "refused at launch" in k["help"]
+    r = out["afterReset"]
+    assert r == {"model": "", "max": "5", "eff": "0", "perm": "bypassPermissions", "custom": True,
+                 "none": "— Default (opus) —"}
 
 
 # ---- the job card's kept-session notice, and the guard it must share with

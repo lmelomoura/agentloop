@@ -143,6 +143,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     editor saves `platform` before the fields it governs, and a job moved to
     a project on the other platform is saved with its platform made explicit,
     so it does not silently change CLI.
+  - The project editor gets a **Platform** for the project (its jobs inherit
+    it) and one in the Security pane (empty inherits the project's). The
+    analysis's model list, effort ladder and permission modes follow the
+    platform that results — `full-access` is the OpenAI default there, since
+    the sandbox modes cannot write the ledger — and the pane stops offering a
+    typed-in model id on OpenAI, where a slug outside the catalog is refused
+    at launch.
 
 ### Changed
 
