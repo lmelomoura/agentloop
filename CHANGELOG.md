@@ -95,8 +95,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - README: a *Platforms* section (choosing, vocabularies, what each
     platform lacks, how a Codex run is read, estimated cost and the price
     table, usage windows), and *Models*, *Effort*, *Budgets*, *usage* and
-    *CLI* updated. Accepted against Codex CLI 0.148.0 with a real run, a real
-    resume on the same thread and a refused slug, read end to end.
+    *CLI* updated; the dashboard's own view of estimated and unknown costs
+    is the next release's. Accepted against Codex CLI 0.148.0 with a real
+    run, a real resume on the same thread and a refused slug, read end to
+    end.
 
 ### Changed
 

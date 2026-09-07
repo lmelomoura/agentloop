@@ -1423,10 +1423,9 @@ def delete_run(jid, start):
         return _forget_stranded_row(jid, start, removed)
 
     # On-disk artifacts, plus the transient siblings a run can leave behind.
-    # The raw Codex copy goes here, not into _artifact_paths: that map also
-    # drives the prune-after-ingest step (a later task's to extend), and
-    # pruning the raw copy the moment a run's content reaches the DB is a
-    # different decision than erasing it here, with the run itself.
+    # The raw Codex copy is listed here as well as in `_artifact_paths`: this
+    # path deletes a run whether or not it was ever ingested, and the second
+    # `exists()` is simply false when the prune already took it.
     ap = _artifact_paths(target) or {}
     extra = []
     try:

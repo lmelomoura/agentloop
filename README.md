@@ -501,8 +501,9 @@ Three ceilings, each answering a different question.
 
 - **Per-run** (`max_budget_usd`) — passed to `claude -p --max-budget-usd`; caps a
   single run. Job value first, else the project's. On OpenAI there is no such
-  flag: the cap is compared with the estimated cost when the run ends, and only
-  warns (BUDGET LIMITED).
+  flag: when the run ends, the estimated cost is compared with the job's own
+  `max_budget_usd` (not the project's) and a run that otherwise succeeded is
+  marked BUDGET LIMITED at 90% of it — a warning, never a stop.
 - **Per-day, per job** (`daily_budget_usd`) — the engine sums today's runs for
   the job before each scheduled run and skips (status `capped`) once the total
   reaches the cap. Job value first, **else the project's** — so a project with
@@ -803,17 +804,19 @@ cache_write + output × output`, per million, from `config/pricing.json`
 the OpenAI price page's as read on 2026-09-07 — check them) — and every run
 records `cost_basis`: `reported` (Claude), `estimated`, or `none` when the
 model has no price or the run died without a final event. The daily caps sum
-estimates like any other cost; a run with `none` counts as zero and the
-dashboard says so rather than showing $0.00. `output_tokens` includes
-reasoning, so reasoning is reported (`tokens.reasoning`) but never billed
-twice.
+estimates like any other cost; a run with `none` counts as zero towards
+them. Showing `none` as a dash instead of $0.00, and the estimate as such, is
+the dashboard's part and lands with it (see the next release's notes).
+`output_tokens` includes reasoning, so reasoning is reported
+(`tokens.reasoning`) but never billed twice.
 
 **Usage windows.** `data/rate-limits.json` holds one block per platform. The
 Codex CLI reports both windows on every turn, so every OpenAI run feeds its
 block; a run that ended on a quota refusal (`rate_limited`, outside the
-failure backoff) marks the fuller window spent until its own reset. The gate
-is per platform: a spent Claude window never holds a Codex run back, nor the
-reverse.
+failure backoff) marks the fuller window spent until its own reset, when the
+refusal's rollout still reports the windows — a rollout that carries none
+leaves the file as it was. The gate is per platform: a spent Claude window
+never holds a Codex run back, nor the reverse.
 
 **Security analyses** on OpenAI are the next release's: the block already
 carries `platform`, and an analysis derived with it runs, but the prompt
