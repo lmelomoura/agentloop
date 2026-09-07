@@ -82,6 +82,7 @@ DATA_DIR="${AGENTLOOP_DATA:-$BASE_DIR/data}"
 JOBS_FILE="$CONFIG_DIR/jobs.json"
 PROJECTS_FILE="$CONFIG_DIR/projects.json"
 MODELS_FILE="$CONFIG_DIR/models.json"
+PRICING_FILE="$CONFIG_DIR/pricing.json"   # USD per 1M tokens, per OpenAI slug (install.sh seeds it)
 INTERACTIVE_GRACE=20        # seconds to wait for a human reply before ending
                             # an interactive run that has finished its turn
 MODELS_TTL=86400            # 24h — how long a family→id resolution is trusted,
@@ -115,6 +116,13 @@ SERVER_BIN="$BIN_DIR/agentloop-server"
 PORT="${AGENTLOOP_PORT:-8787}"
 
 CLAUDE_BIN="${AGENTLOOP_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+# The Codex CLI, for runs on the openai platform. On PATH from Homebrew
+# (/opt/homebrew/bin, which the launchd plists already carry); override for a
+# test stand-in or a second install. Its account and its rollouts live under
+# CODEX_HOME (the CLI's own variable, honoured as-is: `--help` says auth still
+# uses it); platform_finish reads the rollout from there after every run.
+CODEX_BIN="${AGENTLOOP_CODEX_BIN:-$(command -v codex 2>/dev/null || echo /opt/homebrew/bin/codex)}"
+CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
 # Which Claude account every run signs in as. Claude Code keeps credentials,
 # settings, plugins, MCP servers and past sessions per config directory — one
 # signed-in account each — so this variable is the only thing that chooses
@@ -1126,6 +1134,221 @@ is_due_vals() { # is_due_vals <interval> <last-start> <fail-streak> ; 0 = due
   interval="$(effective_interval "${1:-300}" "${3:-0}")"
   last="$(num "${2:-0}")"
   [ "$(( $(now_epoch) - last ))" -ge "$interval" ]
+}
+
+# --- platforms ---------------------------------------------------------------
+# Which CLI a run goes through. bash 3.2 has no associative arrays, so the
+# "table" is this contiguous block of functions, each one a `case "$platform"`
+# and nothing outside it. Adding a platform is adding one branch to each of
+# them; run_job asks these and never names a binary itself. Everything the
+# openai branch does was measured on Codex CLI 0.148.0 -- see
+# docs/superpowers/specs/2026-09-06-codex-measurements/README.md -- and where
+# the measurement contradicted the design, the measurement won (its
+# "Correcções por medição" section).
+PLATFORMS="anthropic openai"
+
+platform_known() { case "${1:-}" in anthropic|openai) return 0 ;; *) return 1 ;; esac; }
+
+platform_bin() { # platform_bin <platform> -> the CLI's path
+  case "$1" in anthropic) printf '%s' "$CLAUDE_BIN" ;; openai) printf '%s' "$CODEX_BIN" ;; esac
+}
+
+platform_ready() { # platform_ready <platform> -> 0; or 1 with the reason on stdout
+  local bin; bin="$(platform_bin "$1")"
+  case "$1" in
+    anthropic)
+      [ -x "$bin" ] || { printf 'claude not found at %s (set AGENTLOOP_CLAUDE_BIN)' "$bin"; return 1; } ;;
+    openai)
+      [ -x "$bin" ] || { printf 'codex not found at %s (set AGENTLOOP_CODEX_BIN)' "$bin"; return 1; }
+      # Any non-zero is "not signed in". The CLI's exit code when it is not was
+      # left unmeasured on purpose (measuring it meant logging the working
+      # account out); a 0 without a login fails on the first turn as api_error,
+      # which is an honest line in tick.log either way.
+      "$bin" login status >/dev/null 2>&1 \
+        || { printf 'codex is not signed in (run: codex login)'; return 1; } ;;
+    *) printf 'unknown platform %s' "$1"; return 1 ;;
+  esac
+  return 0
+}
+
+platform_caps() { # platform_caps <platform> <capability> -> 0 when the platform HAS it
+  #   interactive        a stdin protocol for a human to talk to the live run
+  #   tool_lists         --allowedTools/--disallowedTools (Codex cannot close a
+  #                      tool by flag: --disable multi_agent leaves spawn_agent
+  #                      in the roster and a spawn under it runs -- measured)
+  #   denials            permission_denials on the final event (a Codex sandbox
+  #                      refusal produces no event at all)
+  #   budget_flag        --max-budget-usd (on openai the cap is read at the end)
+  #   cost_reported      dollars on the final event (openai: estimated from tokens)
+  #   stream_rate_limits rate_limit_event on the stream (openai: the rollout)
+  #   families           opus/sonnet aliases resolved to an id (openai: exact slugs)
+  case "$1" in
+    anthropic) case "$2" in
+      interactive|tool_lists|denials|budget_flag|cost_reported|stream_rate_limits|families) return 0 ;;
+    esac ;;
+    openai) : ;;
+  esac
+  return 1
+}
+
+platform_permissions() { # platform_permissions <platform> -> one mode per line
+  case "$1" in
+    anthropic) printf '%s\n' acceptEdits auto bypassPermissions manual dontAsk plan ;;
+    openai)    printf '%s\n' read-only workspace-write full-access ;;
+  esac
+}
+
+platform_permission_ok() { # platform_permission_ok <platform> <mode>
+  platform_permissions "$1" | grep -qx -- "$2"
+}
+
+platform_default_permission() { # platform_default_permission <platform> <job|security>
+  case "$1" in
+    anthropic) case "$2" in security) printf 'bypassPermissions' ;; *) printf 'dontAsk' ;; esac ;;
+    openai)    case "$2" in security) printf 'full-access' ;; *) printf 'workspace-write' ;; esac ;;
+  esac
+}
+
+platform_efforts() { # platform_efforts <platform> [model] -> one level per line
+  case "$1" in
+    anthropic) printf '%s\n' low medium high xhigh max ;;
+    openai)    openai_catalog_efforts "${2:-}" ;;
+  esac
+}
+
+platform_effort_ok() { # platform_effort_ok <platform> <model> <effort>; "" is always ok (the CLI decides)
+  [ -z "${3:-}" ] && return 0
+  platform_efforts "$1" "$2" | grep -qx -- "$3"
+}
+
+platform_model_ok() { # platform_model_ok <platform> <model>
+  case "$1" in
+    anthropic) case "$2" in opus|sonnet|haiku|fable|claude-*) return 0 ;; *) return 1 ;; esac ;;
+    openai)    openai_catalog_slugs | grep -qx -- "$2" ;;
+    *) return 1 ;;
+  esac
+}
+
+platform_default_model() { # platform_default_model <platform> (openai: empty without a catalog)
+  case "$1" in
+    anthropic) printf 'opus' ;;
+    openai)    openai_catalog_visible | head -1 ;;
+  esac
+}
+
+platform_stderr_filter() { # platform_stderr_filter <platform> <errfile>
+  # The classifier counts stderr bytes, and `codex exec` prints one line on
+  # every run whatever happens: "Reading additional input from stdin...".
+  # Without this, every OpenAI run would be a warning. Exactly that line,
+  # whole, and nothing else: anything more is still stderr and still a warning.
+  case "$1" in
+    openai)
+      [ -s "$2" ] || return 0
+      local tmp; tmp="$(mktemp "$2.XXXXXX" 2>/dev/null)" || return 0
+      grep -vxF 'Reading additional input from stdin...' "$2" > "$tmp" 2>/dev/null
+      mv -f "$tmp" "$2" 2>/dev/null || rm -f "$tmp" ;;
+  esac
+  return 0
+}
+
+# The launch line of an OpenAI run, into PLATFORM_ARGV (bash 3.2 cannot return
+# an array). Every flag was measured; the comments say where.
+PLATFORM_ARGV=()
+platform_argv_openai() { # platform_argv_openai <resume-sid> <run_cwd> <model> <effort> <permission> <prompt>
+  local resume_sid="$1" run_cwd="$2" model="$3" effort="$4" permission="$5" prompt="$6"
+  if [ -n "$resume_sid" ]; then
+    # `exec resume` takes neither -s nor -C: the sandbox travels as a config
+    # override and the cwd is the process's own -- run_job cd's there first
+    # (measurement 11).
+    PLATFORM_ARGV=(exec resume --json --skip-git-repo-check)
+  else
+    PLATFORM_ARGV=(exec --json --skip-git-repo-check -C "$run_cwd")
+  fi
+  PLATFORM_ARGV+=(-m "$model")
+  # Bare `key=value`: the CLI tries TOML and falls back to a literal string
+  # (its --help), and that is how measurements 05b, 07 and 11 passed them.
+  [ -n "$effort" ] && PLATFORM_ARGV+=(-c "model_reasoning_effort=$effort")
+  case "$permission" in
+    read-only|workspace-write)
+      if [ -n "$resume_sid" ]; then PLATFORM_ARGV+=(-c "sandbox_mode=$permission")
+      else PLATFORM_ARGV+=(-s "$permission"); fi
+      PLATFORM_ARGV+=(-c "approval_policy=never") ;;
+    full-access) PLATFORM_ARGV+=(--dangerously-bypass-approvals-and-sandbox) ;;
+  esac
+  [ -n "$resume_sid" ] && PLATFORM_ARGV+=("$resume_sid")
+  # `--` before the prompt, as the anthropic launch does: accepted by exec (12)
+  # and by exec resume (13). No --disable multi_agent: it closes nothing.
+  PLATFORM_ARGV+=(-- "$prompt")
+}
+
+# What the stream cannot say. The Codex stream carries neither the model that
+# ran nor the usage windows; both sit in the rollout the CLI writes under
+# $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl (a resume
+# appends to the same file). Sets PF_MODEL_ID and PF_ROLLOUT; both empty when
+# the rollout is not found, with one line in tick.log saying so.
+PF_MODEL_ID=""; PF_ROLLOUT=""
+platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-id]
+  PF_MODEL_ID=""; PF_ROLLOUT=""
+  case "$1" in openai) ;; *) return 0 ;; esac
+  local tid="${3:-}" id="${4:-run}"
+  [ -n "$tid" ] || return 0
+  PF_ROLLOUT="$(openai_rollout_for "$tid")"
+  if [ -z "$PF_ROLLOUT" ]; then
+    log_tick "$id: no codex rollout for thread $tid under $CODEX_HOME_DIR/sessions — model_id stays the requested slug, no rate-limit reading"
+    return 0
+  fi
+  # The LAST turn_context: a resumed thread may have changed model.
+  PF_MODEL_ID="$("$JQ" -r 'select(.type=="turn_context") | .payload.model // empty' "$PF_ROLLOUT" 2>/dev/null | tail -1)"
+  return 0
+}
+
+openai_rollout_for() { # openai_rollout_for <thread_id> -> the rollout's path, or nothing
+  local hit
+  # A thread id is unique, so the first hit is the only hit; the glob is
+  # bounded to the three date levels the CLI uses.
+  hit="$(ls -t "$CODEX_HOME_DIR"/sessions/*/*/*/rollout-*-"$1".jsonl 2>/dev/null | head -1)"
+  [ -n "$hit" ] && [ -f "$hit" ] && printf '%s' "$hit"
+  return 0
+}
+
+# --- the OpenAI catalog, read side ------------------------------------------
+# config/models.json carries an `openai` block (written by `resolve-models
+# openai`; the writer is with the family resolver, cmd_resolve_models). These
+# read it. Without the block every reader answers nothing, which is what makes
+# an unresolved catalog REFUSE a launch rather than guess a slug.
+openai_catalog_available() { # 0 when config/models.json carries an openai catalog
+  [ -f "$MODELS_FILE" ] && "$JQ" -e '.openai.models | type == "array"' "$MODELS_FILE" >/dev/null 2>&1
+}
+
+openai_catalog_slugs() { # every slug, listed or hidden, one per line
+  openai_catalog_available || return 0
+  "$JQ" -r '.openai.models[].slug' "$MODELS_FILE" 2>/dev/null
+}
+
+openai_catalog_visible() { # the listed slugs, by ascending priority (the CLI's own order)
+  openai_catalog_available || return 0
+  "$JQ" -r '[.openai.models[] | select(.visibility == "list")] | sort_by(.priority) | .[].slug' \
+    "$MODELS_FILE" 2>/dev/null
+}
+
+openai_catalog_efforts() { # openai_catalog_efforts <slug> -> its levels, one per line
+  local got=""
+  if openai_catalog_available && [ -n "${1:-}" ]; then
+    got="$("$JQ" -r --arg s "$1" '.openai.models[] | select(.slug == $s) | .efforts[]?' "$MODELS_FILE" 2>/dev/null)"
+  fi
+  # A slug the catalog does not describe (hidden, or no catalog): the union of
+  # every level the CLI has been seen to accept, ultra included (measured).
+  if [ -n "$got" ]; then printf '%s\n' "$got"; else printf '%s\n' low medium high xhigh max ultra; fi
+}
+
+openai_catalog_default_effort() { # openai_catalog_default_effort <slug> -> the catalog's default, or nothing
+  openai_catalog_available || return 0
+  "$JQ" -r --arg s "$1" '.openai.models[] | select(.slug == $s) | .default_effort // empty' "$MODELS_FILE" 2>/dev/null
+}
+
+openai_catalog_successor() { # openai_catalog_successor <slug> -> what a deprecated slug was upgraded to, or nothing
+  openai_catalog_available || return 0
+  "$JQ" -r --arg s "$1" '.openai.models[] | select(.slug == $s) | .deprecated_by // empty' "$MODELS_FILE" 2>/dev/null
 }
 
 # The session a run reported in its transcript. The id is what binds a run dir
@@ -2293,6 +2516,102 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   : > "$tmp/s3.ndjson"
   got="$(session_from_stream "$tmp/s3.ndjson")"
   [ -z "$got" ] && ok "an empty transcript reports nothing" || bad "read '$got' from nothing"
+
+  echo "platforms — the table run_job asks instead of naming a binary"
+  platform_known openai;      want "openai is a known platform"        0 $?
+  platform_known anthropic;   want "anthropic is a known platform"     0 $?
+  platform_known gemini;      want "an unknown platform is refused"    1 $?
+  platform_caps anthropic interactive; want "anthropic has interactive" 0 $?
+  local _cap; local _openai_caps=0
+  for _cap in interactive tool_lists denials budget_flag cost_reported stream_rate_limits families; do
+    platform_caps openai "$_cap" && _openai_caps=$((_openai_caps + 1))
+  done
+  [ "$_openai_caps" -eq 0 ] && ok "openai has none of the seven capabilities" || bad "openai claims $_openai_caps capabilities"
+  platform_permission_ok openai workspace-write; want "workspace-write is an openai mode"   0 $?
+  platform_permission_ok openai dontAsk;         want "dontAsk is not an openai mode"        1 $?
+  platform_permission_ok anthropic dontAsk;      want "dontAsk is an anthropic mode"         0 $?
+  [ "$(platform_default_permission openai job)" = "workspace-write" ] && [ "$(platform_default_permission openai security)" = "full-access" ] \
+    && ok "openai defaults: workspace-write for a job, full-access for an analysis" || bad "openai default permissions"
+  platform_effort_ok anthropic opus ultra;   want "ultra is not an anthropic effort"          1 $?
+  platform_effort_ok anthropic opus "";      want "an empty effort is always fine"            0 $?
+
+  # The catalog readers, over a models.json of this test's own.
+  mkdir -p "$tmp/cat"
+  "$JQ" -n '{resolved:{}, openai:{at:1, source:"fixture", models:[
+      {slug:"gpt-b", visibility:"list", priority:7, efforts:["low","high"], default_effort:"low", deprecated_by:"", retires_at:""},
+      {slug:"gpt-a", visibility:"list", priority:6, efforts:["low","high","ultra"], default_effort:"low", deprecated_by:"", retires_at:""},
+      {slug:"gpt-hidden", visibility:"hide", priority:3, efforts:["low"], default_effort:"low", deprecated_by:"", retires_at:""},
+      {slug:"gpt-old", visibility:"list", priority:23, efforts:["low"], default_effort:"low", deprecated_by:"gpt-b", retires_at:"2026-08-31T19:00:00Z"}]}}' \
+    > "$tmp/cat/models.json"
+  ( MODELS_FILE="$tmp/cat/models.json"
+    [ "$(platform_default_model openai)" = "gpt-a" ] && ok "the default openai model is the listed slug with the lowest priority" || bad "default $(platform_default_model openai)"
+    platform_model_ok openai gpt-hidden; want "a hidden slug is accepted when written"      0 $?
+    platform_model_ok openai gpt-nope;   want "a slug outside the catalog is refused"       1 $?
+    platform_effort_ok openai gpt-a ultra; want "ultra is fine where the catalog lists it"  0 $?
+    platform_effort_ok openai gpt-b ultra; want "and refused where it does not"             1 $?
+    [ "$(openai_catalog_successor gpt-old)" = "gpt-b" ] && ok "a deprecated slug names its successor" || bad "successor $(openai_catalog_successor gpt-old)"
+    [ -z "$(openai_catalog_successor gpt-a)" ] && ok "a live slug names none" || bad "live slug has a successor" )
+  ( MODELS_FILE="$tmp/cat/none.json"
+    platform_model_ok openai gpt-a; want "without a catalog every slug is refused" 1 $?
+    [ -z "$(platform_default_model openai)" ] && ok "and there is no default model" || bad "default without a catalog"
+    platform_effort_ok openai gpt-a ultra; want "but the effort vocabulary falls back to the union" 0 $? )
+
+  echo "platform_stderr_filter() — exactly the CLI's one known line, nothing else"
+  printf 'Reading additional input from stdin...\nsomething real\n' > "$tmp/e1.err"
+  platform_stderr_filter openai "$tmp/e1.err"
+  [ "$(cat "$tmp/e1.err")" = "something real" ] && ok "the known line goes, the rest stays" || bad "left: $(cat "$tmp/e1.err")"
+  printf 'Reading additional input from stdin...\n' > "$tmp/e2.err"
+  platform_stderr_filter openai "$tmp/e2.err"
+  [ ! -s "$tmp/e2.err" ] && ok "a stderr that was only that line is now empty" || bad "not emptied"
+  printf 'Reading additional input from stdin... and more\n' > "$tmp/e3.err"
+  platform_stderr_filter openai "$tmp/e3.err"
+  [ -s "$tmp/e3.err" ] && ok "a line that merely contains the phrase is kept" || bad "a longer line was removed"
+  printf 'Reading additional input from stdin...\n' > "$tmp/e4.err"
+  platform_stderr_filter anthropic "$tmp/e4.err"
+  [ -s "$tmp/e4.err" ] && ok "anthropic stderr is never touched" || bad "anthropic stderr was filtered"
+
+  echo "platform_argv_openai() — the measured launch line, for a fresh run and a resume"
+  platform_argv_openai "" /tmp/w gpt-a high workspace-write "PROMPT"
+  local _av; _av="$(printf '%s\n' "${PLATFORM_ARGV[@]}")"
+  [ "${PLATFORM_ARGV[0]}" = "exec" ] && [ "${PLATFORM_ARGV[1]}" = "--json" ] && ok "exec --json first" || bad "argv starts ${PLATFORM_ARGV[0]} ${PLATFORM_ARGV[1]}"
+  printf '%s\n' "$_av" | grep -qx -- '-C' && ok "-C on a fresh run" || bad "no -C"
+  printf '%s\n' "$_av" | grep -qx -- 'model_reasoning_effort=high' && ok "the effort override is bare" || bad "effort override missing or quoted"
+  printf '%s\n' "$_av" | grep -qx -- 'approval_policy=never' && ok "approval_policy=never travels with a sandboxed mode" || bad "no approval_policy"
+  printf '%s\n' "$_av" | grep -qx -- '--disable' && bad "--disable is passed and closes nothing" || ok "no --disable flag"
+  [ "${PLATFORM_ARGV[$((${#PLATFORM_ARGV[@]} - 2))]}" = "--" ] && [ "${PLATFORM_ARGV[$((${#PLATFORM_ARGV[@]} - 1))]}" = "PROMPT" ] \
+    && ok "-- then the prompt, last" || bad "the prompt is not the lone argument after --"
+  platform_argv_openai "" /tmp/w gpt-a "" full-access "P"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- '--dangerously-bypass-approvals-and-sandbox' \
+    && ok "full-access is the bypass flag" || bad "full-access not translated"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- '-s' && bad "-s alongside the bypass flag" || ok "and no -s beside it"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -q 'model_reasoning_effort' && bad "an empty effort still emitted an override" || ok "an empty effort emits no override"
+  platform_argv_openai thr-1 /tmp/w gpt-a low read-only "P"
+  [ "${PLATFORM_ARGV[0]}" = "exec" ] && [ "${PLATFORM_ARGV[1]}" = "resume" ] && ok "a resume is exec resume" || bad "resume argv ${PLATFORM_ARGV[*]}"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- '-C' && bad "-C on a resume (exec resume refuses it)" || ok "no -C on a resume"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- 'sandbox_mode=read-only' && ok "the sandbox is a -c override on a resume" || bad "no sandbox_mode on the resume"
+  [ "${PLATFORM_ARGV[$((${#PLATFORM_ARGV[@]} - 3))]}" = "thr-1" ] && ok "the thread id sits right before --" || bad "thread id misplaced"
+
+  echo "platform_finish() — the model that ran comes from the rollout"
+  mkdir -p "$tmp/ch/sessions/2026/09/05"
+  cp "$BASE_DIR/test/fixtures/codex/rollout-sample.stripped.jsonl" "$tmp/ch/sessions/2026/09/05/rollout-2026-09-05T13-49-58-01a071d5-47b0-7343-bcbd-216945ef7927.jsonl"
+  ( CODEX_HOME_DIR="$tmp/ch"; RATE_LIMIT_FILE="$tmp/ch/rate-limits.json"   # T7 makes this write the gate; never the real file
+    platform_finish openai /dev/null 01a071d5-47b0-7343-bcbd-216945ef7927 selftest
+    [ "$PF_MODEL_ID" = "gpt-5.6-sol" ] && ok "turn_context.model is read" || bad "PF_MODEL_ID '$PF_MODEL_ID'"
+    platform_finish openai /dev/null thr-missing selftest
+    [ -z "$PF_MODEL_ID" ] && grep -q 'no codex rollout for thread thr-missing' "$TICK_LOG" \
+      && ok "a missing rollout leaves model_id alone and says so in tick.log" || bad "missing rollout: '$PF_MODEL_ID'"
+    platform_finish anthropic /dev/null sess-x selftest
+    [ -z "$PF_MODEL_ID" ] && ok "a no-op on anthropic" || bad "anthropic set PF_MODEL_ID" )
+
+  echo "turn_is_over() — over a normalized OpenAI stream"
+  "$PYTHON" -u "$BIN_DIR/platforms/openai_stream.py" --model gpt-5.6-sol --permission read-only --cwd /tmp \
+    < "$BASE_DIR/test/fixtures/codex/02-tool-use.jsonl" > "$tmp/oa.ndjson" 2>/dev/null
+  turn_is_over "$tmp/oa.ndjson"; want "a finished Codex turn is over" 0 $?
+  grep -v turn.completed "$BASE_DIR/test/fixtures/codex/02-tool-use.jsonl" \
+    | "$PYTHON" -u "$BIN_DIR/platforms/openai_stream.py" --model gpt-5.6-sol --permission read-only --cwd /tmp > "$tmp/ob.ndjson" 2>/dev/null
+  turn_is_over "$tmp/ob.ndjson"; want "a Codex turn cut before its end is not" 1 $?
+  [ "$(session_from_stream "$tmp/oa.ndjson")" = "01a071d5-47b0-7343-bcbd-216945ef7927" ] \
+    && ok "session_from_stream reads the thread id off the first line" || bad "session $(session_from_stream "$tmp/oa.ndjson")"
 
   echo "model_alias_baseline() — the init event is found even behind hook events"
   # The probe's first lines belong to whoever has hooks configured: a
@@ -6780,6 +7099,11 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   # -- this function runs once per job per tick, in the same shell, in a loop.
   local rname rrepo rwt rbase
   project="$(job_get "$id" '.project' '')"
+  # Which CLI this run goes through: the job's own value, else the project's,
+  # else anthropic -- which is what every job from before platforms means.
+  local platform
+  platform="$(resolve "$id" platform 'anthropic')"
+  case "$platform" in ''|null) platform="anthropic" ;; esac
   # Which account this run signs in as. A project pins one when its work belongs
   # to a different Claude login than the scheduler's default — a company account
   # for client work, a personal one for your own repos. It carries far more than
@@ -6807,11 +7131,14 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   # job doesn't set them (see resolve()).
   cwd="$(resolve "$id" cwd "$HOME")"
   prompt="$(jobs_json | "$JQ" -r --arg id "$id" '.jobs[] | select(.id==$id) | .prompt')"
-  model="$(resolve "$id" model 'opus')"
-  # A family (opus/sonnet/…) becomes the newest concrete id of that family.
+  model="$(resolve "$id" model "$(platform_default_model "$platform")")"
+  # A family (opus/sonnet/…) becomes the newest concrete id of that family --
+  # anthropic only. An OpenAI slug is used verbatim (platform_caps families).
   local model_family=""
-  case "$model" in opus|sonnet|haiku|fable) model_family="$model" ;; esac
-  model="$(effective_model "$model")"
+  if platform_caps "$platform" families; then
+    case "$model" in opus|sonnet|haiku|fable) model_family="$model" ;; esac
+    model="$(effective_model "$model")"
+  fi
   # How hard the model thinks: low|medium|high|xhigh|max (empty = the CLI default)
   effort="$(resolve "$id" effort '')"
   case "$effort" in null) effort="" ;; esac
@@ -6838,7 +7165,7 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   stall="$(resolve "$id" stall_timeout_seconds '1200')"
   case "$timeout" in ''|null) timeout=0 ;; esac
   case "$stall" in ''|null) stall=0 ;; esac
-  permission="$(resolve "$id" permission_mode 'dontAsk')"
+  permission="$(resolve "$id" permission_mode "$(platform_default_permission "$platform" job)")"
   allowed="$(job_get "$id" '.allowed_tools' '')"
   # The mirror of `allowed_tools`, and the field the derived security job is
   # built with: an allowlist has to name everything the agent needs, a denylist
@@ -6861,6 +7188,32 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   # would fail the same way with nothing saying why.
   [ -z "$run_cfgdir" ] || [ -d "$run_cfgdir" ] || {
     log_tick "$id: claude_config_dir missing ($run_cfgdir), skipped"; return 1; }
+
+  # A run that cannot start is refused HERE, before a slot, a precheck or a
+  # turn is spent, with the reason in tick.log -- the treatment `cwd missing`
+  # gets. Each of these would otherwise fail at launch with nothing saying why.
+  local not_ready
+  platform_known "$platform" || { log_tick "$id: unknown platform '$platform', skipped"; return 1; }
+  if ! not_ready="$(platform_ready "$platform")"; then
+    log_tick "$id: $platform is not ready ($not_ready), skipped"; return 1
+  fi
+  if [ "$platform" = "openai" ]; then
+    [ "$interactive" != "true" ] \
+      || { log_tick "$id: interactive is not available on openai (codex exec has no stdin protocol), skipped"; return 1; }
+    platform_model_ok openai "$model" \
+      || { log_tick "$id: model '$model' is not in the OpenAI catalog (run: agentloop resolve-models openai), skipped"; return 1; }
+    platform_permission_ok openai "$permission" \
+      || { log_tick "$id: permission_mode '$permission' is not an OpenAI mode (read-only, workspace-write, full-access), skipped"; return 1; }
+    local successor; successor="$(openai_catalog_successor "$model")"
+    [ -z "$successor" ] || log_tick "$id: model '$model' is deprecated — its successor is $successor"
+    # Codex has no tool allow/deny list and cannot close a tool by flag
+    # (measured: --disable multi_agent leaves spawn_agent in the roster), so
+    # the two fields are ignored here, and said to be.
+    [ -z "$allowed" ] || [ "$allowed" = "null" ] \
+      || log_tick "$id: allowed_tools is ignored on openai (codex has no tool allowlist)"
+    [ -z "$disallowed" ] || [ "$disallowed" = "null" ] \
+      || log_tick "$id: disallowed_tools is ignored on openai (codex cannot close a tool by flag)"
+  fi
 
   # Prepend the project's description as context, so a run carries the project's
   # purpose without repeating it in every job prompt.
@@ -7033,6 +7386,8 @@ ${prompt}"
   # and the worktree's own venv/vars are appended to it below when there is one.
   run_env=()
   [ -n "$run_cfgdir" ] && run_env+=("CLAUDE_CONFIG_DIR=$run_cfgdir")
+  # A precheck or a provisioning hook may want to know which CLI is coming.
+  run_env+=("AL_PLATFORM=$platform")
   if wt_isolation_enabled "$project" "$cwd"; then
     local reattached=""
     [ -n "$resume_sid" ] && reattached="$(wt_find_by_session "$id" "$resume_sid")"
@@ -7338,7 +7693,29 @@ If the work turns out to be already finished, or it can no longer be done at all
   fi
 
   fifo=""
-  if [ "$interactive" = "true" ]; then
+  local cli_pid="" normalizer="" rawfifo="" nrc=0
+  if [ "$platform" = "openai" ]; then
+    # The Codex CLI writes its own JSONL; every reader here wants stream-json.
+    # The CLI's stdout goes down a FIFO into the normalizer, which writes the
+    # canonical stream to $streamfile and a verbatim copy to $streamfile.raw.
+    # `exec` makes the subshell BECOME the CLI, so $child below is the CLI's
+    # own pid: stop (TERM), the watchdog's tree_cpu_seconds and wait all keep
+    # working unchanged. `< /dev/null` is what keeps `codex exec` from waiting
+    # on stdin for ever (measured).
+    rawfifo="$logfile.raw.fifo"
+    rm -f "$rawfifo"; mkfifo "$rawfifo" 2>/dev/null
+    platform_argv_openai "$resume_sid" "$run_cwd" "$model" "$effort" "$permission" "$prompt"
+    (
+      cd "$run_cwd" || exit 1
+      exec env ${run_env[@]+"${run_env[@]}"} "$CODEX_BIN" ${PLATFORM_ARGV[@]+"${PLATFORM_ARGV[@]}"} \
+        > "$rawfifo" 2> "$logfile.err" < /dev/null
+    ) &
+    cli_pid=$!
+    "$PYTHON" -u "$BIN_DIR/platforms/openai_stream.py" --model "$model" --permission "$permission" \
+      --cwd "$run_cwd" --pricing "$PRICING_FILE" --raw-out "$streamfile.raw" \
+      < "$rawfifo" > "$streamfile" 2>> "$logfile.err" &
+    normalizer=$!
+  elif [ "$interactive" = "true" ]; then
     # `--input-format stream-json` accepts further user messages on stdin while
     # the run is going, which is what makes the dashboard's terminal two-way.
     # The prompt is sent as the first message instead of as an argument.
@@ -7369,6 +7746,7 @@ If the work turns out to be already finished, or it can no longer be done at all
     ) &
   fi
   local child=$!
+  [ -z "$normalizer" ] || child="$cli_pid"   # openai: $! was the normalizer
 
   if [ "$interactive" = "true" ]; then
     exec 9> "$fifo"                       # hold it open: EOF would end the turn loop
@@ -7454,6 +7832,20 @@ If the work turns out to be already finished, or it can no longer be done at all
     done
   ) & local watchdog=$!
   wait "$child"; rc=$?
+  if [ -n "$normalizer" ]; then
+    # The normalizer ends at EOF on the FIFO. A process the CLI left behind
+    # can hold the FIFO's write end open after the CLI itself is gone (a
+    # backgrounded tool, a server it started), so the wait is bounded: what is
+    # on disk by then is the transcript, and the note says what happened.
+    local _nw=0
+    while kill -0 "$normalizer" 2>/dev/null && [ "$_nw" -lt 100 ]; do sleep 0.1; _nw=$((_nw + 1)); done
+    if kill -0 "$normalizer" 2>/dev/null; then
+      kill "$normalizer" 2>/dev/null; wait "$normalizer" 2>/dev/null; nrc=-1
+    else
+      wait "$normalizer"; nrc=$?
+    fi
+    rm -f "$rawfifo"
+  fi
   # Again, now that the transcript is final. The watchdog polls every 30s and
   # its first pass runs before the child has even exec'd, so a run that dies
   # inside that first window would otherwise never be bound — and a run that
@@ -7470,6 +7862,12 @@ If the work turns out to be already finished, or it can no longer be done at all
   local wdreason=""
   [ -s "$wdfile" ] && wdreason="$(cat "$wdfile")"
   rm -f "$wdfile"
+  case "$nrc" in
+    0) ;;
+    -1) wdreason="${wdreason:+$wdreason · }normalizer killed: the CLI's stdout stayed open 10s after it exited" ;;
+    *)  wdreason="${wdreason:+$wdreason · }normalizer exited $nrc" ;;
+  esac
+  platform_stderr_filter "$platform" "$logfile.err"
 
   # Extract the final result event; synthesize an error object if the stream
   # ended without one (crash, timeout kill) so classification still works.
@@ -7524,6 +7922,10 @@ If the work turns out to be already finished, or it can no longer be done at all
   local model_id
   model_id="$("$JQ" -r 'select(.type=="system" and .subtype=="init") | .model' "$streamfile" 2>/dev/null | head -1)"
   [ -n "$model_id" ] && [ "$model_id" != "null" ] || model_id=""
+  # On openai the init event carries the slug that was ASKED for; the model
+  # that ran is in the rollout. platform_finish also feeds the usage gate.
+  platform_finish "$platform" "$streamfile" "$session" "$id"
+  [ -z "$PF_MODEL_ID" ] || model_id="$PF_MODEL_ID"
 
   # Classify the run: error / warning / success.
   #   error   — the process failed, the CLI reported an error, or the agent had

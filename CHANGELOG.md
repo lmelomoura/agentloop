@@ -44,6 +44,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     off after a benign Codex warning still reaches the engine's salvage path:
     item-level errors are shown as text, never treated as the run's ending; a
     turn with no usage carries no estimate.
+  - The engine has a platform table (`platform_*` in `bin/agentloop`): which
+    binary, whether it is ready (for Codex: installed AND signed in), what it
+    can and cannot do, and the launch line — measured, including the resume
+    that runs in the process's own directory. An OpenAI run goes down a FIFO
+    into the normalizer; the CLI is still `$child`, so stop, the watchdog and
+    wait are unchanged. Runs that cannot start are refused in `tick.log`
+    before a slot is taken: unknown platform, Codex missing or signed out,
+    `interactive` on OpenAI, a slug outside the catalog. `test/fake-codex`
+    stands in for the CLI offline, and `test/e2e.test.sh` drives an OpenAI run
+    through complete, undeclared, dirty, resume, stop, quota and refusal.
 
 ### Changed
 
