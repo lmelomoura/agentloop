@@ -3350,6 +3350,10 @@ function getEffort(){ return effortGet("ed-effort"); }
 // note. `keep` re-applies the same platform after /api/models answered --
 // nothing the operator chose is thrown away when the fresh payload lands.
 function applyPlatformToJobEditor(p, keep){
+  // The combo's fallback for an empty model is the platform's own default --
+  // "" on OpenAI with no catalog is honest (the engine refuses and says why),
+  // where "opus" would be a Codex slug that does not exist.
+  edModelCfg.def=ALApp.defaultModelFor(p,PLATFORMS)||(p==="openai"?"":"opus");
   const opts=modelOptions(p);
   const curModel=$("ed-model").value;
   const known=opts.some(o=>!o.sec && o.v===curModel);
@@ -3404,6 +3408,11 @@ const WT_MODES=[
 ];
 const PLATFORM_OPTS=[{v:"anthropic",label:"Anthropic"},{v:"openai",label:"OpenAI"}];
 let PLATFORMS={};                                          // /api/models.platforms, as served
+// The job editor's model combo, configured by name: createCombo keeps `cfg` by
+// reference and reads cfg.def inside set(), so applyPlatformToJobEditor can
+// make the fallback the PLATFORM's -- "opus" is Anthropic's, and a lie on
+// OpenAI when the catalog is empty or has not arrived yet.
+const edModelCfg={id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelPicked};
 let edEfforts=ALApp.FALLBACK_EFFORTS.slice(), secEfforts=ALApp.FALLBACK_EFFORTS.slice();
 let projectCombo=null, modelCombo=null, permCombo=null, wtCombo=null, platformCombo=null,
     secModelCombo=null, secPermCombo=null, secPlatformCombo=null,
@@ -3418,7 +3427,7 @@ function initCombos(){
     onPick:(v)=>syncCwdField(v)});
   platformCombo=createCombo({id:"ed-platform", allowNone:false, def:"anthropic", onPick:(v)=>applyPlatformToJobEditor(v,false)});
   platformCombo.set("anthropic", PLATFORM_OPTS);
-  modelCombo=createCombo({id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelPicked});
+  modelCombo=createCombo(edModelCfg);
   modelCombo.set("opus", MODELS);
   // Same list, same widget, one difference: empty is a real choice here — it
   // means "the engine's own default" — so the none row stays. allowCustom keeps
@@ -3678,8 +3687,12 @@ async function saveEditor(){
     // the new platform's defaults when it changes, and every field below is
     // then saved on top of that -- sent after them, the rewrite would undo
     // what was just saved.
+    const np=$("ed-project").value.trim();
     const curPlat=ALApp.platformOf(j, j.project?projById(j.project):null);
-    if(f.platform!==curPlat){ if(!await api("set_field",{id,field:"platform",value:f.platform})) return; }
+    // what resolve() will answer once the new project is saved: a job with no
+    // platform of its own would silently follow it, so make the choice explicit
+    const nextPlat=ALApp.platformOf(j, np?projById(np):null);
+    if(f.platform!==curPlat || f.platform!==nextPlat){ if(!await api("set_field",{id,field:"platform",value:f.platform})) return; }
     const prompt=$("ed-prompt").value.trim();
     if(prompt && prompt!==(j.prompt||"")){ if(!await api("set_prompt",{id,prompt})) return; }
     const pc=$("ed-precheck").value;

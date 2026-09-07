@@ -1836,6 +1836,74 @@ def test_the_job_editor_saves_platform_before_the_fields_it_governs(srv):
     assert "platform:f.platform" in js, "create sends the platform in the job object"
 
 
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_job_editor_makes_the_platform_explicit_when_a_project_would_move_it(srv, tmp_path):
+    """A job with no platform of its own runs on its project's. Moved to a
+    project on the OTHER platform, it used to save only `set_field project`:
+    the page compared the platform on screen against the job's effective
+    platform under its CURRENT project, found them equal, and sent nothing --
+    and the engine's set-field project rewrites nothing, so the job landed on
+    the new CLI with the old platform's model and permission mode, refused at
+    launch. saveEditor now also asks what the job would resolve to under the
+    project about to be saved, and makes the platform explicit when either
+    answer differs from what the operator saw -- before the project, like
+    every platform write."""
+    page = _js(srv)
+    app = _app_js(srv)
+
+    def run(new_project):
+        script = tmp_path / f"save-editor-{new_project}.js"
+        script.write_text(_plainfn(app, "platformOf") + """
+        const ALApp = {platformOf};
+        const sent = [];
+        const vals = {"ed-id": "j", "ed-prompt": "", "ed-precheck": "", "ed-project": %s,
+                      "ed-desc": "", "ed-cwd": "", "ed-perm": "dontAsk"};
+        const $ = (id) => ({ get value(){ return vals[id] ?? ""; }, set value(v){ vals[id] = v; },
+                             disabled: false, close(){} });
+        async function api(op, extra){ sent.push([op, extra]); return true; }
+        // pa has no platform of its own (anthropic, the engine's rule); po runs on OpenAI
+        const DATA = {jobs: [{id: "j", model: "claude-opus-5", permission_mode: "dontAsk", project: "pa"}],
+                      projects: [{name: "pa"}, {name: "po", platform: "openai"}]};
+        const projById = (name) => DATA.projects.find(p => p.name === name) || null;
+        // What the screen showed: the job's effective platform under pa. Every
+        // other field matches the job, so only what platform/project decide is sent.
+        const readForm = () => ({platform: "anthropic", secs: 300, model: "claude-opus-5", effort: "",
+                                 interactive: false, hours: "", days: [], budget: null, maxPar: null,
+                                 daily: null, timeoutSecs: null, stallSecs: null});
+        const ED_STEPS = [], validateStep = () => "";
+        const edWiz = {markClean(){}}, toast = () => {}, refresh = () => {};
+        let creating = false, editingId = "j", editingPrecheck = "";
+        """ % json.dumps(new_project) + _fn(page, "saveEditor")
+                          + "\nsaveEditor().then(() => console.log(JSON.stringify(sent)));\n")
+        out = subprocess.run(["node", str(script)], capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)
+
+    moved = run("po")
+    assert ["set_field", {"id": "j", "field": "platform", "value": "anthropic"}] in moved, \
+        f"the platform the operator saw was not made explicit: {moved}"
+    fields = [e["field"] for op, e in moved if op == "set_field"]
+    assert fields.index("platform") < fields.index("project"), \
+        f"platform must be saved before the project that would move it: {fields}"
+    stays = run("pa")
+    assert not [e for op, e in stays if op == "set_field" and e["field"] == "platform"], \
+        f"a job whose project and platform did not change sends no platform: {stays}"
+
+
+def test_the_job_editors_model_default_is_the_platforms(srv):
+    """createCombo reads cfg.def on every set(): with the catalog empty or not
+    yet fetched, an empty model falls back to it. "opus" is Anthropic's and a
+    lie on OpenAI (the engine would refuse it), so the job editor's model
+    combo keeps its cfg by name and applyPlatformToJobEditor rewrites the
+    default to the platform's before every set -- "" on OpenAI with no
+    catalog, which the engine refuses honestly."""
+    js = _js(srv)
+    assert 'const edModelCfg={id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelPicked};' in js
+    assert "modelCombo=createCombo(edModelCfg)" in js
+    fn = _plainfn(js, "applyPlatformToJobEditor")
+    assert 'edModelCfg.def=ALApp.defaultModelFor(p,PLATFORMS)||(p==="openai"?"":"opus");' in fn
+    assert fn.index("edModelCfg.def=") < fn.index("modelCombo.set("), "the default is set before the combo is"
+
+
 def test_the_page_has_no_permission_vocabulary_of_its_own(srv):
     """Same rule as the effort ladder: the permission modes are the engine's
     (platform_permissions), mirrored by /api/models; the page keeps no copy."""

@@ -140,7 +140,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     permission modes to `read-only` / `workspace-write` / `full-access`,
     switches Interactive off (Codex exec has no stdin protocol) and notes on
     the Limits pane that cost is estimated and the per-run cap advisory. The
-    editor saves `platform` before the fields it governs.
+    editor saves `platform` before the fields it governs, and a job moved to
+    a project on the other platform is saved with its platform made explicit,
+    so it does not silently change CLI.
 
 ### Changed
 
