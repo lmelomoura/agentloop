@@ -23,6 +23,7 @@ osm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(osm)
 
 PRICE = {"input": 4.0, "cached_input": 0.4, "output": 20.0, "cache_write": 0.0}
+PRICE_CW = {"input": 4.0, "cached_input": 0.4, "output": 20.0, "cache_write": 5.0}
 THREAD_02 = "01a071d5-47b0-7343-bcbd-216945ef7927"
 
 
@@ -249,6 +250,29 @@ def test_reasoning_tokens_are_reported_but_not_billed_twice():
     assert last["tokens"]["reasoning"] == 35 and last["tokens"]["output"] == 42
     expected = round(((16252 - 12032) * 4.0 + 12032 * 0.4 + 42 * 20.0) / 1_000_000, 6)
     assert last["total_cost_usd"] == expected
+
+
+def test_cache_write_tokens_are_billed_on_top_of_the_input_tokens():
+    # SYNTHETIC, and deliberately so: every measured Codex turn reported
+    # `cache_write_input_tokens: 0`, so nothing in the fixtures exercises the
+    # cache-write term. The formula treats those tokens as DISJOINT from
+    # `input_tokens` -- the Anthropic convention the normalizer already mirrors
+    # when it reports them as `cache_creation_input_tokens` -- so the uncached
+    # input here is 1000 - 200 = 800 and the 300 written tokens are billed
+    # once, at the cache-write price, on top of it. A real Codex turn that
+    # writes cache is what would confirm the convention; until then this test
+    # is what pins the term against a silent change.
+    out = normalize(events=[{"type": "thread.started", "thread_id": "t"},
+                            {"type": "turn.completed",
+                             "usage": {"input_tokens": 1000, "cached_input_tokens": 200,
+                                       "cache_write_input_tokens": 300,
+                                       "output_tokens": 10}}], price=PRICE_CW)
+    last = out[-1]
+    assert last["tokens"]["cache_write"] == 300
+    assert last["usage"]["cache_creation_input_tokens"] == 300
+    expected = round((800 * 4.0 + 200 * 0.4 + 300 * 5.0 + 10 * 20.0) / 1_000_000, 6)
+    assert last["total_cost_usd"] == expected
+    assert last["cost_basis"] == "estimated"
 
 
 def test_without_a_price_the_cost_is_null_and_the_basis_says_so():

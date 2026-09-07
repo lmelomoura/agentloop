@@ -116,7 +116,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `pricing_at` and the visible slugs still without a price; each model
     carries its price row in `/api/models`; a failed refresh changes nothing
     and says so in `tick.log`; a malformed price table never breaks
-    `/api/models`.
+    `/api/models`; every price change is logged in `tick.log` (and flagged when
+    it moves 3× or more), and the estimate's cache-write term is pinned by a
+    test.
 
 ### Changed
 

@@ -2426,20 +2426,25 @@ def _openai_platform():
         row = priced.get(slug)
         if not isinstance(row, dict) or not all(_num(row.get(k)) for k in ("input", "cached_input", "output")):
             return None
+        source = row.get("source")
         return {"input": row["input"], "cached_input": row["cached_input"], "output": row["output"],
                 "cache_write": row.get("cache_write") if _num(row.get("cache_write")) else 0,
-                "source": row.get("source") or "", "at": row.get("at") if _num(row.get("at")) else None}
+                "source": source if isinstance(source, str) else "",
+                "at": row.get("at") if _num(row.get("at")) else None}
 
-    def has_price(slug):
-        return price_of(slug) is not None
+    def _model(m):
+        # price_of ONCE per model: `priced` is that same answer, so the two can
+        # never disagree, and a table of any size costs one pass, not two.
+        price = price_of(m["slug"])
+        return {"v": m["slug"], "label": m.get("display_name") or m["slug"],
+                "desc": m.get("description") or "", "efforts": list(m.get("efforts") or []),
+                "default_effort": m.get("default_effort") or "",
+                "deprecated_by": m.get("deprecated_by") or "", "retires_at": m.get("retires_at") or "",
+                "priced": price is not None, "price": price}
 
     visible = sorted((m for m in b["models"] if m.get("visibility", "list") == "list"),
                      key=lambda m: m.get("priority", 999))
-    models = [{"v": m["slug"], "label": m.get("display_name") or m["slug"],
-               "desc": m.get("description") or "", "efforts": list(m.get("efforts") or []),
-               "default_effort": m.get("default_effort") or "",
-               "deprecated_by": m.get("deprecated_by") or "", "retires_at": m.get("retires_at") or "",
-               "priced": has_price(m["slug"]), "price": price_of(m["slug"])} for m in visible]
+    models = [_model(m) for m in visible]
     efforts, seen = [], set()
     for m in models:                            # the union over VISIBLE models only, first-seen order
         for e in m["efforts"]:

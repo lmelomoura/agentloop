@@ -813,19 +813,27 @@ such, is the dashboard's part and lands with it (see the next release's
 notes). `output_tokens` includes reasoning, so reasoning is reported
 (`tokens.reasoning`) but never billed twice.
 
-**The price table keeps itself current.** OpenAI's pricing page refuses
-automated clients, so the table is refreshed from a machine-readable source —
-LiteLLM's `model_prices_and_context_window.json`, which listed every catalog
-slug at the page's prices on 2026-09-07 — per token there, per million here,
-cache-write price included (the 5.6 family bills it). `agentloop
-resolve-pricing` does it on demand; the tick does it daily together with the
-model refresh, so a model that appears in the Codex catalog is priced the
-same day. Each row says where it came from (`source`, `at`); a row you write
-yourself with `"source": "manual"` is never overwritten, and a slug the source
-does not carry keeps its last row. `agentloop platforms` shows `pricing_at`
-and the visible slugs still without a price (`unpriced`); a failed refresh
-leaves the table as it was and says so in `tick.log`. `AGENTLOOP_PRICING_URL`
-overrides the source (the tests point it at a fixture).
+**The price table keeps itself current.** `install.sh` seeds
+`config/pricing.json` from `config/pricing.example.json`, and from there the
+table refreshes itself. OpenAI's pricing page refuses automated clients, so it
+is refreshed from a machine-readable source — LiteLLM's
+`model_prices_and_context_window.json`, which listed every catalog slug at the
+page's prices on 2026-09-07 — per token there, per million here, cache-write
+price included (the 5.6 family bills it). Cache-write tokens are billed at the
+source's cache-write price on top of input tokens (the estimate assumes the
+two counts do not overlap; every Codex turn measured so far wrote no cache, so
+a real turn with cache writes will settle it). `agentloop resolve-pricing`
+does it on demand; the tick does it daily together with the model refresh, so
+a model that appears in the Codex catalog is priced the same day. Each row
+says where it came from (`source`, `at`); a row you write yourself with
+`"source": "manual"` is never overwritten, and a slug the source does not
+carry keeps its last row. Every number that moves is named in `tick.log`, and
+a move of 3× or more is flagged for you to check. `agentloop platforms` shows
+`pricing_at`, `pricing_checked_at` and the visible slugs still without a price
+(`unpriced`); a failed refresh leaves the table as it was and says so in
+`tick.log`. `AGENTLOOP_PRICING_URL` overrides the source (the tests point it
+at a fixture) and is remembered in the table's `_source_url`, so a debugging
+run against a mirror leaves that mirror configured until you edit it out.
 
 **Usage windows.** `data/rate-limits.json` holds one block per platform. The
 Codex CLI reports both windows on every turn, so every OpenAI run feeds its
