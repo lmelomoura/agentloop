@@ -310,6 +310,8 @@ s13="$(ls "$ROOT"/data/logs/j13/*.stream.ndjson 2>/dev/null | head -1)"
 head -1 "$s13" | jq -e '.subtype=="init" and .platform=="openai"' >/dev/null 2>&1 \
   && ok "the normalized stream opens with the init event" || bad "first line: $(head -1 "$s13")"
 [ ! -e "$ROOT"/data/logs/j13/*.raw.fifo ] && ok "the FIFO was removed" || bad "FIFO left behind"
+jq -e '.openai.five_hour.utilization == 0.05 and .openai.five_hour.source == "rollout"' "$ROOT/data/rate-limits.json" >/dev/null 2>&1 \
+  && ok "the run's rollout fed the openai usage windows" || bad "rate-limits.json: $(cat "$ROOT/data/rate-limits.json" 2>/dev/null)"
 
 echo
 echo "14. an OpenAI run that never declares an ending keeps its tree, bound to the thread id"
@@ -376,6 +378,8 @@ sleep 2
 [ "$(lastrun | jq -r .status)" = "error" ] && [ "$(lastrun | jq -r .cause)" = "rate_limited" ] \
   && ok "error / rate_limited" || bad "$(lastrun | jq -c '{status,cause}')"
 [ "$(jq -r '.j18.fail_streak' "$ROOT/data/state.json")" = "2" ] && ok "fail_streak untouched" || bad "streak $(jq -r '.j18.fail_streak' "$ROOT/data/state.json")"
+[ "$(jq -r '.openai.five_hour.status' "$ROOT/data/rate-limits.json")" = "usage_limit_reached" ] \
+  && ok "and the fuller openai window is marked spent until its reset" || bad "window status $(jq -c .openai "$ROOT/data/rate-limits.json")"
 
 echo
 echo "19. a stop ends an OpenAI run that will not end by itself"

@@ -57,7 +57,7 @@ printf '%s' "$payload" | "$JQ" -e '.rate_limits | (.five_hour? // .seven_day?) !
 
 now="$(date +%s)"
 if [ -s "$OUT" ]; then
-  last="$("$JQ" -r '[.[].seen_at // 0] | max // 0' "$OUT" 2>/dev/null || echo 0)"
+  last="$("$JQ" -r '[(.anthropic // {})[]?.seen_at // 0, .[]?.seen_at // 0] | max // 0' "$OUT" 2>/dev/null || echo 0)"
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
   [ "$(( now - last ))" -lt "$MIN_WRITE_SECONDS" ] && exit 0
 fi
@@ -72,7 +72,12 @@ tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX" 2>/dev/null)" || exit 0
 # moment it is not. Keeping a spent window's `status` against a fresh window
 # would hold the whole fleet back on a fact that expired.
 printf '%s' "$payload" | "$JQ" --slurpfile prev "$OUT" --argjson now "$now" '
-  ($prev[0] // {}) as $was
+  # A file from before platforms held the windows at the top level; they are
+  # the anthropic block now, and move there on this write.
+  (($prev[0] // {}) | if has("five_hour") or has("seven_day")
+      then {anthropic: (with_entries(select(.key == "five_hour" or .key == "seven_day")))}
+           + (with_entries(select(.key != "five_hour" and .key != "seven_day")))
+      else . end) as $was
   | .rate_limits as $rl
   | reduce ["five_hour", "seven_day"][] as $w ($was;
       # `// null`, never `// empty`: an update that yields nothing collapses a
@@ -81,9 +86,9 @@ printf '%s' "$payload" | "$JQ" --slurpfile prev "$OUT" --argjson now "$now" '
       ($rl[$w] // null) as $new
       | if $new == null or $new.used_percentage == null then .
         else
-          (.[$w] // {}) as $old
+          (.anthropic[$w] // {}) as $old
           | (if $old.resets_at == ($new.resets_at // null) then $old else {} end) as $keep
-          | .[$w] = {
+          | .anthropic[$w] = {
               status:      ($keep.status // null),
               utilization: (($new.used_percentage) / 100),
               resets_at:   ($new.resets_at // null),

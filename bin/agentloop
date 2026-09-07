@@ -1340,6 +1340,13 @@ platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-
   fi
   # The LAST turn_context: a resumed thread may have changed model.
   PF_MODEL_ID="$("$JQ" -r 'select(.type=="turn_context") | .payload.model // empty' "$PF_ROLLOUT" 2>/dev/null | tail -1)"
+  # Every OpenAI run feeds the gate from its rollout. A run that ended on a
+  # quota refusal (api_error_status 429 on the final event) marks the window
+  # spent as well -- the classifier's `rate_limited` cause says why the run
+  # failed; this says when the next one may start.
+  local refused=""
+  [ "$("$JQ" -r '.api_error_status // ""' "$2" 2>/dev/null | tail -1)" = "429" ] && refused="refused"
+  rl_capture_openai "$PF_ROLLOUT" $refused
   return 0
 }
 
@@ -2073,6 +2080,22 @@ spent_today_all() { _spend_since_midnight ""; }
 # merely showing: with no overage to fall through to, hitting the ceiling is a
 # dead stop mid-run, not a slowdown.
 
+# data/rate-limits.json has one block per platform. Before platforms it held
+# the two windows at the top level; that shape is read as anthropic and
+# rewritten the first time anything touches the file, under the same lock the
+# writers take. Every reader and writer below calls this first.
+rl_migrate() {
+  [ -s "$RATE_LIMIT_FILE" ] || return 0
+  "$JQ" -e 'has("five_hour") or has("seven_day")' "$RATE_LIMIT_FILE" >/dev/null 2>&1 || return 0
+  local tmp
+  tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX")" || return 0
+  "$JQ" '{anthropic: (with_entries(select(.key == "five_hour" or .key == "seven_day")))}
+         + (with_entries(select(.key != "five_hour" and .key != "seven_day")))' \
+    "$RATE_LIMIT_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
 # Fold every rate_limit_event in a finished run's stream into the shared file,
 # newest per window wins. Never fails a run: this is bookkeeping, and a run that
 # worked must not be reported as broken because a status file could not be
@@ -2083,6 +2106,7 @@ rl_capture() { # rl_capture <streamfile>
   grep -q rate_limit_event "$sf" 2>/dev/null || return 0
   lock="$LOCK_DIR/.ratelimit"
   lock_take "$lock" || return 0
+  rl_migrate
   [ -s "$RATE_LIMIT_FILE" ] || echo '{}' > "$RATE_LIMIT_FILE" 2>/dev/null || { lock_drop "$lock"; return 0; }
   tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX")" || { lock_drop "$lock"; return 0; }
   # `-R` with `fromjson?` for the same reason every other reader of a stream
@@ -2093,7 +2117,7 @@ rl_capture() { # rl_capture <streamfile>
     | [inputs | fromjson? | select(.type == "rate_limit_event") | .rate_limit_info // empty]
     | map(select(.rateLimitType != null))
     | reduce .[] as $e ($was;
-        .[$e.rateLimitType] = {
+        .anthropic[$e.rateLimitType] = {
           status:      ($e.status // "unknown"),
           utilization: ($e.utilization // null),
           resets_at:   ($e.resetsAt // null),
@@ -2101,6 +2125,48 @@ rl_capture() { # rl_capture <streamfile>
           seen_at:     $now
         })
   ' "$sf" > "$tmp" 2>/dev/null && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  lock_drop "$lock"
+  return 0
+}
+
+# The OpenAI reading. The Codex CLI reports both windows on EVERY turn, in
+# the rollout's token_count events: primary (300 min) is the five-hour window,
+# secondary (10080 min) the seven-day one, used_percent 0-100. So every OpenAI
+# run feeds the gate, and there is no statusline to wire. With `refused`, the
+# run ended on a quota refusal (turn.failed, "hit your usage limit"): the
+# reset time is in the rollout but not which window tripped, so the FULLER
+# one is marked spent until its own reset -- the gate then lifts by itself.
+rl_capture_openai() { # rl_capture_openai <rollout-file> [refused]
+  local roll="${1:-}" refused="${2:-}" tmp lock
+  [ -s "$roll" ] || return 0
+  grep -q token_count "$roll" 2>/dev/null || return 0
+  lock="$LOCK_DIR/.ratelimit"
+  lock_take "$lock" || return 0
+  rl_migrate
+  [ -s "$RATE_LIMIT_FILE" ] || echo '{}' > "$RATE_LIMIT_FILE" 2>/dev/null || { lock_drop "$lock"; return 0; }
+  tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX")" || { lock_drop "$lock"; return 0; }
+  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg refused "$refused" '
+    ($prev[0] // {}) as $was
+    | [inputs | fromjson? | select(.type == "event_msg" and .payload.type == "token_count") | .payload.rate_limits // empty]
+    | last // empty
+    | . as $rl
+    | (if ($rl.primary.used_percent // 0) >= ($rl.secondary.used_percent // 0) then "five_hour" else "seven_day" end) as $fuller
+    | def window($w; $name):
+        if $w == null then null else
+          { status: (if $rl.rate_limit_reached_type != null then ($rl.rate_limit_reached_type | tostring)
+                     elif $refused != "" and $name == $fuller then "usage_limit_reached"
+                     else "allowed" end),
+            utilization: (($w.used_percent // 0) / 100),
+            resets_at: ($w.resets_at // null),
+            overage: null, seen_at: $now, source: "rollout",
+            plan_type: ($rl.plan_type // null) }
+        end;
+    $was
+    | .openai = ((.openai // {})
+        + (if $rl.primary   != null then {five_hour: window($rl.primary; "five_hour")} else {} end)
+        + (if $rl.secondary != null then {seven_day: window($rl.secondary; "seven_day")} else {} end))
+  ' "$roll" > "$tmp" 2>/dev/null && [ -s "$tmp" ] && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
   rm -f "$tmp" 2>/dev/null
   lock_drop "$lock"
   return 0
@@ -2114,10 +2180,12 @@ rl_capture() { # rl_capture <streamfile>
 # about now. That is what keeps a single bad afternoon from wedging the fleet
 # for ever -- the gate expires by itself, with no operator action and no clock
 # of our own.
-rl_gate() { # rl_gate -> 0 = hold this run back (reason on stdout)
+rl_gate() { # rl_gate [platform] -> 0 = hold this run back (reason on stdout); anthropic when unnamed
+  local p="${1:-anthropic}"
+  rl_migrate
   [ -s "$RATE_LIMIT_FILE" ] || return 1
-  "$JQ" -e -r --argjson now "$(now_epoch)" --argjson stop "$RL_STOP_AT" '
-    to_entries
+  "$JQ" -e -r --arg p "$p" --argjson now "$(now_epoch)" --argjson stop "$RL_STOP_AT" '
+    (.[$p] // {}) | to_entries
     | map(select(.value.resets_at != null and .value.resets_at > $now))
     | map(. + {mins: (((.value.resets_at - $now) / 60) | floor)})
     # A refusal outranks a number: if the API has stopped saying `allowed`, the
@@ -2125,10 +2193,10 @@ rl_gate() { # rl_gate -> 0 = hold this run back (reason on stdout)
     # NO status is not a refusal — the statusline reports utilisation without
     # one, and treating its silence as a refusal would gate every healthy run.
     | ( [ .[] | select(.value.status != null and ((.value.status | startswith("allowed")) | not)) ]
-        | map("the \(.key) window is spent (API says \(.value.status)) -- it resets in \(.mins) min")
+        | map("the \($p) \(.key) window is spent (API says \(.value.status)) -- it resets in \(.mins) min")
       ) + (
         [ .[] | select((.value.utilization // 0) >= $stop) ]
-        | map("the \(.key) window is \((.value.utilization * 100) | floor)% used"
+        | map("the \($p) \(.key) window is \((.value.utilization * 100) | floor)% used"
               + (if .value.overage == "rejected" then " and overage is off, so the ceiling is a dead stop" else "" end)
               + " -- it resets in \(.mins) min")
       )
@@ -2234,28 +2302,32 @@ cmd_usage() {
   local now settings cmd
   now="$(now_epoch)"
 
+  rl_migrate
   if [ ! -s "$RATE_LIMIT_FILE" ]; then
     echo "No usage window has been recorded yet."
   else
-    "$JQ" -r --argjson now "$now" --argjson stop "$RL_STOP_AT" '
-      to_entries[]
-      | .value as $v
-      | (if $v.utilization == null then "  ?" else (($v.utilization * 100) | floor | tostring) + "%" end) as $pct
-      | (if $v.resets_at == null then "reset time unknown"
-         elif $v.resets_at <= $now then "that window has already reset — this reading no longer counts"
-         else "resets in " + (((($v.resets_at - $now) / 60) | floor) | tostring) + " min" end) as $when
-      | (((($now - ($v.seen_at // 0)) / 60) | floor) | tostring) as $age
-      | "\(.key): \($pct) used, \($when)"
-        + "\n  read \($age) min ago from the \($v.source // "run stream")"
-        + (if $v.status != null then ", API said \($v.status)" else "" end)
-        + (if $v.overage == "rejected" then ", overage off (the ceiling is a dead stop)" else "" end)
-    ' "$RATE_LIMIT_FILE" 2>/dev/null
-    local reason
-    if reason="$(rl_gate)" && [ -n "$reason" ]; then
-      echo
-      echo "SCHEDULED RUNS ARE BEING HELD BACK: $reason"
-      echo "  (\`agentloop run <job>\` still overrides this, as it does the budget.)"
-    fi
+    local p reason
+    for p in $PLATFORMS; do
+      "$JQ" -r --arg p "$p" --argjson now "$now" '
+        (.[$p] // {}) | to_entries[]
+        | .value as $v
+        | (if $v.utilization == null then "  ?" else (($v.utilization * 100) | floor | tostring) + "%" end) as $pct
+        | (if $v.resets_at == null then "reset time unknown"
+           elif $v.resets_at <= $now then "that window has already reset — this reading no longer counts"
+           else "resets in " + (((($v.resets_at - $now) / 60) | floor) | tostring) + " min" end) as $when
+        | (((($now - ($v.seen_at // 0)) / 60) | floor) | tostring) as $age
+        | "\($p) \(.key): \($pct) used, \($when)"
+          + "\n  read \($age) min ago from the \($v.source // "run stream")"
+          + (if $v.plan_type != null then " (\($v.plan_type) plan)" else "" end)
+          + (if $v.status != null then ", API said \($v.status)" else "" end)
+          + (if $v.overage == "rejected" then ", overage off (the ceiling is a dead stop)" else "" end)
+      ' "$RATE_LIMIT_FILE" 2>/dev/null
+      if reason="$(rl_gate "$p")" && [ -n "$reason" ]; then
+        echo
+        echo "SCHEDULED $p RUNS ARE BEING HELD BACK: $reason"
+        echo "  (\`agentloop run <job>\` still overrides this, as it does the budget.)"
+      fi
+    done
   fi
 
   # The other half: is the figure going to keep arriving? A window whose only
@@ -2276,7 +2348,7 @@ cmd_usage() {
   else
     echo "statusline: wired to ${cmd%% *}"
     if [ -s "$RATE_LIMIT_FILE" ] \
-       && "$JQ" -e 'any(.[]; .source == "statusline")' "$RATE_LIMIT_FILE" >/dev/null 2>&1; then
+       && "$JQ" -e 'any(.anthropic[]?; .source == "statusline")' "$RATE_LIMIT_FILE" >/dev/null 2>&1; then
       echo "  and it has fed the gate — readings above are live."
     else
       echo "  but it has never fed the gate yet. The statusLine is read when a"
@@ -2284,6 +2356,7 @@ cmd_usage() {
       echo "  never call it. Open a new interactive session and re-run this."
     fi
   fi
+  echo "openai: fed by every run's own rollout (the Codex CLI reports both windows on every turn); nothing to wire."
 }
 
 # The daily ceiling that applies to a job: its own, else its project's, else
@@ -4727,6 +4800,20 @@ NASTY
   soon="$(( $(now_epoch) + 3600 ))"
   gone="$(( $(now_epoch) - 3600 ))"
 
+  # The file from before platforms carried the two windows at the top level.
+  # It is read as anthropic and rewritten on first contact -- rl_probe above
+  # still writes the OLD shape, which is exactly what makes it a migration test.
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/mig.json"
+    "$JQ" -n '{five_hour:{status:"allowed",utilization:0.5,resets_at:1,overage:null,seen_at:0}}' > "$RATE_LIMIT_FILE"
+    rl_migrate
+    "$JQ" -e '.anthropic.five_hour.utilization == 0.5 and (has("five_hour") | not)' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "a pre-platforms file is nested under anthropic on first contact" || bad "the old shape was not migrated"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/mig2.json"
+    "$JQ" -n '{anthropic:{five_hour:{utilization:0.1}},openai:{}}' > "$RATE_LIMIT_FILE"
+    rl_migrate
+    "$JQ" -e '.anthropic.five_hour.utilization == 0.1' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "a file already in the new shape is left alone" || bad "migration damaged a migrated file"
+
   # Capture: the real seven-day warning that sat at 98% while the loop kept
   # waking runs into it, plus a truncated tail — a killed run is always cut off
   # mid-write, and one bad line must not cost us the reading.
@@ -4734,8 +4821,8 @@ NASTY
   printf '%s' '{"type":"rate_limit_ev' >> "$tmp/rl/s.ndjson"
   ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/cap.json"
     rl_capture "$tmp/rl/s.ndjson"
-    "$JQ" -e '.seven_day.utilization == 0.98 and .seven_day.status == "allowed_warning"' "$RATE_LIMIT_FILE" >/dev/null ) \
-    && ok "a window reading is lifted off the stream, truncated tail and all" \
+    "$JQ" -e '.anthropic.seven_day.utilization == 0.98 and .anthropic.seven_day.status == "allowed_warning"' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "a window reading is lifted off the stream into the anthropic block, truncated tail and all" \
     || bad "rl_capture did not record the reading"
   ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/none.json"
     printf 'not json at all\n' > "$tmp/rl/junk.ndjson"; rl_capture "$tmp/rl/junk.ndjson" ) \
@@ -4764,6 +4851,48 @@ NASTY
   got="$(rl_probe five_hour rejected null "$soon" rejected)"
   [ -n "$got" ] && ok "an API refusal gates even with no utilisation reported" || bad "a refusal did not gate"
 
+  # The OpenAI reading comes off the rollout, not a stream: primary (300 min)
+  # is the five-hour window, secondary (10080 min) the seven-day one.
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/oa.json"
+    printf '%s' '{}' > "$RATE_LIMIT_FILE"
+    rl_capture_openai "$BASE_DIR/test/fixtures/codex/rollout-sample.stripped.jsonl"
+    "$JQ" -e '.openai.five_hour.utilization == 0.05 and .openai.five_hour.resets_at == 1788617232
+              and .openai.seven_day.utilization == 0.02 and .openai.seven_day.resets_at == 1788786623
+              and .openai.five_hour.source == "rollout" and .openai.five_hour.plan_type == "plus"
+              and .openai.five_hour.status == "allowed"' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "the LAST token_count of the rollout feeds both openai windows" || bad "rl_capture_openai: $(cat "$tmp/rl/oa.json")"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/oa2.json"
+    "$JQ" -n '{anthropic:{five_hour:{utilization:0.9,resets_at:1,seen_at:0}}}' > "$RATE_LIMIT_FILE"
+    rl_capture_openai "$BASE_DIR/test/fixtures/codex/rollout-sample.stripped.jsonl"
+    "$JQ" -e '.anthropic.five_hour.utilization == 0.9 and .openai.five_hour.utilization == 0.05' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "and never touches the anthropic block" || bad "the anthropic reading was lost"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/oa3.json"
+    printf '%s' '{}' > "$RATE_LIMIT_FILE"
+    rl_capture_openai "$BASE_DIR/test/fixtures/codex/rollout-sample.stripped.jsonl" refused
+    "$JQ" -e '.openai.five_hour.status == "usage_limit_reached" and .openai.seven_day.status == "allowed"' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "a quota refusal marks the fuller window spent until its reset" || bad "refused: $(cat "$tmp/rl/oa3.json")"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/oa4.json"
+    printf 'not a rollout\n' > "$tmp/rl/junk.jsonl"; printf '%s' '{}' > "$RATE_LIMIT_FILE"
+    rl_capture_openai "$tmp/rl/junk.jsonl"
+    [ "$(cat "$RATE_LIMIT_FILE")" = "{}" ] ) \
+    && ok "a rollout with no token_count writes nothing" || bad "junk rollout changed the file"
+
+  # The gate is per platform: one spent window must not hold the other CLI back.
+  rl_at() { # rl_at <platform> <window> <utilization> <resets_at> -> rl_gate <platform-asked> output
+    ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/pp.json"
+      "$JQ" -n --arg p "$1" --arg w "$2" --argjson u "$3" --argjson r "$4" \
+        '{($p): {($w): {status:"allowed", utilization:$u, resets_at:$r, overage:null, seen_at:0}}}' > "$RATE_LIMIT_FILE"
+      rl_gate "$5" 2>/dev/null )
+  }
+  got="$(rl_at openai five_hour 0.97 "$soon" openai)"
+  case "$got" in *"the openai five_hour window is 97% used"*) ok "a spent openai window gates an openai run, and names itself" ;; *) bad "openai gate: '$got'" ;; esac
+  got="$(rl_at openai five_hour 0.97 "$soon" anthropic)"
+  [ -z "$got" ] && ok "and does not gate an anthropic run" || bad "cross-platform gate: $got"
+  got="$(rl_at anthropic seven_day 0.98 "$soon" openai)"
+  [ -z "$got" ] && ok "a spent anthropic window does not gate an openai run" || bad "cross-platform gate: $got"
+  got="$(rl_at openai five_hour 0.97 "$gone" openai)"
+  [ -z "$got" ] && ok "an openai window past its reset says nothing" || bad "expired openai window gated: $got"
+
   echo "statusline-rate-limits.sh — the figure the run stream never carries"
   # The stream only reports utilisation once the CLI has decided to warn (0.75),
   # so below that the gate is armed and blind. The statusLine payload has the
@@ -4779,10 +4908,10 @@ NASTY
   sl_get() { "$JQ" -r "$1" "$tmp/sl/rate-limits.json" 2>/dev/null; }
 
   sl_run '{"rate_limits":{"five_hour":{"used_percentage":62.5,"resets_at":111},"seven_day":{"used_percentage":18,"resets_at":222}}}'
-  [ "$(sl_get '.five_hour.utilization')" = "0.625" ] \
+  [ "$(sl_get '.anthropic.five_hour.utilization')" = "0.625" ] \
     && ok "used_percentage (0-100) is stored as the utilisation the gate reads (0-1)" \
-    || bad "five_hour utilisation -> $(sl_get '.five_hour.utilization')"
-  [ "$(sl_get '.seven_day.resets_at')" = "222" ] \
+    || bad "five_hour utilisation -> $(sl_get '.anthropic.five_hour.utilization')"
+  [ "$(sl_get '.anthropic.seven_day.resets_at')" = "222" ] \
     && ok "both windows are recorded, not just the first" || bad "seven_day missing"
 
   # An API-key account reports no windows at all. That is not a failure, and it
@@ -4796,15 +4925,15 @@ NASTY
   # they describe the window that was measured.
   "$JQ" -n '{five_hour:{status:"allowed_warning",utilization:0.9,resets_at:111,overage:"rejected",seen_at:0}}' > "$tmp/sl/rate-limits.json"
   sl_run '{"rate_limits":{"five_hour":{"used_percentage":93,"resets_at":111}}}'
-  [ "$(sl_get '.five_hour.overage')" = "rejected" ] && [ "$(sl_get '.five_hour.utilization')" = "0.93" ] \
+  [ "$(sl_get '.anthropic.five_hour.overage')" = "rejected" ] && [ "$(sl_get '.anthropic.five_hour.utilization')" = "0.93" ] \
     && ok "a fresher figure for the SAME window keeps what the stream knew" \
-    || bad "same-window merge lost the stream's fields: $(sl_get '.five_hour|tostring')"
+    || bad "same-window merge lost the stream's fields: $(sl_get '.anthropic.five_hour|tostring')"
   # ...and the moment the window rolls over, that knowledge is about a window
   # that no longer exists. Carrying it would hold the fleet back on a spent fact.
   sl_run '{"rate_limits":{"five_hour":{"used_percentage":4,"resets_at":999}}}'
-  [ "$(sl_get '.five_hour.overage')" = "null" ] && [ "$(sl_get '.five_hour.status')" = "null" ] \
+  [ "$(sl_get '.anthropic.five_hour.overage')" = "null" ] && [ "$(sl_get '.anthropic.five_hour.status')" = "null" ] \
     && ok "a NEW window drops the previous one's status and overage" \
-    || bad "stale status survived a window roll: $(sl_get '.five_hour|tostring')"
+    || bad "stale status survived a window roll: $(sl_get '.anthropic.five_hour|tostring')"
 
   # The gate must not read that null status as a refusal — the statusline never
   # reports one, so treating its silence as "not allowed" would hold back every
@@ -4919,8 +5048,8 @@ NASTY
 
   # The gate holding the whole fleet back — the case that made this exist.
   : > "$tmp/stall/tick.log"
-  stall_at 180 "a: usage limit reached — the seven_day window is 98% used — skipping"
-  stall_at 60 "a: usage limit reached — the seven_day window is 98% used — skipping"
+  stall_at 180 "a: usage limit reached — the anthropic seven_day window is 98% used — skipping"
+  stall_at 60 "a: usage limit reached — the anthropic seven_day window is 98% used — skipping"
   case "$(stall_ask)" in
     *"spent usage window"*) ok "a spent usage window holding every run back is a stall" ;;
     *) bad "the usage gate holding the fleet was not reported" ;;
@@ -5035,6 +5164,10 @@ NASTY
   case "$(usg "$wired" "$spent")" in
     *"HELD BACK"*) ok "a gate that is holding runs back says so where you look for it" ;;
     *) bad "the command did not report an active hold" ;;
+  esac
+  case "$(usg '{}' '{"anthropic":{"five_hour":{"status":"allowed","utilization":0.3,"resets_at":'"$soon2"',"seen_at":0,"source":"statusline"}},"openai":{"five_hour":{"status":"allowed","utilization":0.05,"resets_at":'"$soon2"',"seen_at":0,"source":"rollout","plan_type":"plus"}}}')" in
+    *"anthropic five_hour: 30% used"*"openai five_hour: 5% used"*"rollout"*) ok "usage lists both platforms, each window named by its platform" ;;
+    *) bad "usage output did not list both platforms" ;;
   esac
 
   echo "the Claude account comes from the setting, never from the environment"
@@ -7670,7 +7803,7 @@ $(run_ending_contract)" ;;
   # override, exactly as it is for the budget and the precheck.
   if [ "$forced" != "true" ]; then
     local rl_reason
-    if rl_reason="$(rl_gate)" && [ -n "$rl_reason" ]; then
+    if rl_reason="$(rl_gate "$platform")" && [ -n "$rl_reason" ]; then
       state_set "$id" last_status '"rate_limited"'
       state_set "$id" last_rate_limit "$("$JQ" -nc --arg r "$rl_reason" '{reason:$r}')"
       log_tick "$id: usage limit reached — $rl_reason — skipping"

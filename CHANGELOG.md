@@ -85,6 +85,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     session on the platform that run used; a job that changed platform
     since is refused with both named. The raw Codex stream is pruned with
     the run's other artifacts.
+  - `data/rate-limits.json` has one block per platform (a file from before
+    is read as `anthropic` and rewritten on first contact). Every OpenAI run
+    feeds its block from the Codex rollout — the CLI reports both windows on
+    every turn, so there is no statusline to wire — and a run that ended on
+    a quota refusal marks the fuller window spent until its reset. The gate
+    is per platform: a spent Anthropic window never holds a Codex run back,
+    nor the reverse, and `agentloop usage` lists both.
 
 ### Changed
 
