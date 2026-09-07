@@ -8,6 +8,8 @@
 #   FAKE_SESSION           the thread id reported in thread.started
 #   FAKE_MODE              complete | undeclared | dirty | hang | quota | unknown_model
 #   FAKE_ARGV_OUT          record the argv, one line per argument, "<n><TAB><first line>"
+#   FAKE_PROMPT_OUT        record the last argument (the prompt) WHOLE -- FAKE_ARGV_OUT keeps first lines only
+#   FAKE_SKIP_PREPARE      set to skip `security prepare` inside a security run (the agent that ignored its first command)
 #   FAKE_CODEX_LOGGED_OUT  set to make `login status` exit 1
 #   FAKE_USED_5H/7D        the used_percent the rollout reports (default 5.0 / 2.0)
 #   CODEX_HOME             where the rollout is written; a test sets it, never ~/.codex
@@ -29,9 +31,21 @@ if [ -n "${FAKE_ARGV_OUT:-}" ]; then
     for a in "$@"; do n=$((n + 1)); printf '%s\t%s\n' "$n" "${a%%$'\n'*}"; done
   } > "$FAKE_ARGV_OUT"
 fi
+if [ -n "${FAKE_PROMPT_OUT:-}" ]; then
+  last=""; for a in "$@"; do last="$a"; done
+  printf '%s' "$last" > "$FAKE_PROMPT_OUT"
+fi
 
 tid="${FAKE_SESSION:-01a0fake-0000-7000-8000-000000000001}"
 mode="${FAKE_MODE:-complete}"
+# A SECURITY RUN'S FIRST COMMAND, as test/fake-claude does it: the analysis
+# prompt tells the agent to run it, and the engine refuses to close an analysis
+# `done` without it. AL_SECURITY_ANALYSIS_ID reaches this process the way it
+# reaches the real CLI -- through the run's environment.
+if [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ] && [ -z "${FAKE_SKIP_PREPARE:-}" ]; then
+  "$HERE/../bin/agentloop" security prepare \
+    --analysis "$AL_SECURITY_ANALYSIS_ID" --root "$PWD" --offline >/dev/null 2>&1 || true
+fi
 # The one line the real CLI prints on every run, whatever happens.
 echo "Reading additional input from stdin..." >&2
 

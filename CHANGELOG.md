@@ -157,6 +157,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     hover; the run's dialog adds Platform and Tokens rows; the Overview's
     *Spent today* names the estimated share when there is one; the analysis
     meta grid on the Security page gains "Runs on".
+- **Security analyses run on OpenAI.** A project's security block can name
+  `"platform": "openai"` (or inherit the project's) and its analysis goes
+  through the Codex CLI. The prompt changes in the two places the platform
+  matters: the skill is named by its file path (`skills/security-analysis/
+  SKILL.md`), not by discovery, and subagents are forbidden in words — Codex
+  cannot close `spawn_agent` by flag, so the sentence is the only door; on
+  Claude Code the tool stays closed at launch as before. `agentloop skills`
+  links the skills into `~/.codex/skills` too, when that home exists.
+  `test/fake-codex` runs `security prepare` like `test/fake-claude`, and
+  `test/e2e.test.sh` drives an analysis on OpenAI to `done`. What it cost to
+  not have it: the block accepted the platform and the run still spoke of an
+  `Agent` tool Codex never had.
 
 ### Changed
 
