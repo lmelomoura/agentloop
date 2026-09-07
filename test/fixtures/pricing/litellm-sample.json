@@ -19,6 +19,11 @@
     "input_cost_per_token": 0.000005, "output_cost_per_token": 0.00003,
     "litellm_provider": "openai", "mode": "chat"
   },
+  "gpt-5.4-nano": {
+    "input_cost_per_token": 2e-7, "cache_read_input_token_cost": "2e-8",
+    "cache_creation_input_token_cost": "1e-7", "output_cost_per_token": 1.25e-6,
+    "litellm_provider": "openai", "mode": "chat"
+  },
   "gpt-reserve": {
     "input_cost_per_token": 0.000001, "cache_read_input_token_cost": 1e-7, "output_cost_per_token": 0.000002,
     "litellm_provider": "somebody-else", "mode": "chat"

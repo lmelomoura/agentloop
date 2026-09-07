@@ -455,7 +455,7 @@ jq 'del(.openai["gpt-5.4-mini"])' "$ROOT/config/pricing.json" > "$ROOT/pricing.s
 mv "$ROOT/pricing.seed" "$ROOT/config/pricing.json"
 : > "$ROOT/data/tick.log"
 "$AL" resolve-pricing >/dev/null 2>&1
-[ "$(jq -r '.openai["gpt-5.6-sol"].cache_write' "$ROOT/config/pricing.json")" = "5" ] \
+jq -e '.openai["gpt-5.6-sol"].cache_write == 5' "$ROOT/config/pricing.json" >/dev/null \
   && ok "gpt-5.6-sol's cache-write price came from the source (5 per 1M)" || bad "sol row $(jq -c '.openai["gpt-5.6-sol"]' "$ROOT/config/pricing.json")"
 [ "$(jq -r '._source_url' "$ROOT/config/pricing.json")" = "$AGENTLOOP_PRICING_URL" ] \
   && ok "the table records its source" || bad "source $(jq -r '._source_url' "$ROOT/config/pricing.json")"
