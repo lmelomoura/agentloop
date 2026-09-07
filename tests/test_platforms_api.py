@@ -179,3 +179,33 @@ def test_the_server_lets_platform_through_set_field():
     src = (REPO / "bin" / "agentloop-server").read_text()
     allow = src[src.index('elif op == "set_field"'):][:900]
     assert '"platform"' in allow
+
+
+def test_the_openai_platform_carries_its_prices_and_their_freshness(srv):
+    _write_models(srv, openai=_catalog_block())
+    (srv.CONFIG_DIR / "pricing.json").write_text(json.dumps({
+        "_source_url": "file:///fixture", "_refreshed_at": 1788800000,
+        "openai": {
+            "gpt-5.6-sol": {"input": 4, "cached_input": 0.4, "output": 20, "cache_write": 5,
+                            "source": "litellm", "at": 1788800000},
+            "gpt-5.5": {"input": 9, "cached_input": 9, "output": 9, "cache_write": 0, "source": "manual"}}}))
+    o = srv.list_models()["platforms"]["openai"]
+    assert o["pricing_at"] == 1788800000 and o["pricing_source"] == "file:///fixture"
+    by = {m["v"]: m for m in o["models"]}
+    assert by["gpt-5.6-sol"]["priced"] is True
+    assert by["gpt-5.6-sol"]["price"] == {"input": 4, "cached_input": 0.4, "output": 20,
+                                          "cache_write": 5, "source": "litellm", "at": 1788800000}
+    assert by["gpt-5.5"]["price"]["source"] == "manual" and by["gpt-5.5"]["price"]["at"] is None
+    assert by["gpt-5.6-luna"]["priced"] is False and by["gpt-5.6-luna"]["price"] is None
+    assert o["unpriced"] == ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini"]
+
+
+def test_without_a_price_table_the_platform_says_so(srv):
+    _write_models(srv, openai=_catalog_block())
+    p = srv.CONFIG_DIR / "pricing.json"
+    if p.exists():
+        p.unlink()
+    o = srv.list_models()["platforms"]["openai"]
+    assert o["pricing_at"] == 0 and o["pricing_source"] == ""
+    assert o["unpriced"] == [m["v"] for m in o["models"]]
+    assert all(m["price"] is None for m in o["models"])

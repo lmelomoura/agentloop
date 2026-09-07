@@ -113,8 +113,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     "manual"` is never overwritten; a slug the source lacks keeps its last row;
     a malformed cache price at the source counts as absent rather than
     overwriting a good row; `agentloop platforms` and `/api/models` report
-    `pricing_at` and the visible slugs still without a price; a failed
-    refresh changes nothing and says so in `tick.log`.
+    `pricing_at` and the visible slugs still without a price; each model
+    carries its price row in `/api/models`; a failed refresh changes nothing
+    and says so in `tick.log`.
 
 ### Changed
 
