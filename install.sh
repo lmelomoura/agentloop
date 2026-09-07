@@ -70,7 +70,7 @@ if [ ! -f "$HERE/config/jobs.json" ]; then
 fi
 if [ ! -f "$HERE/config/pricing.json" ]; then
   cp "$HERE/config/pricing.example.json" "$HERE/config/pricing.json"
-  say "Created config/pricing.json from the example — OpenAI runs are priced from it; check the numbers."
+  say "Created config/pricing.json from the example — OpenAI runs are priced from it, and agentloop refreshes it daily from the price source (agentloop resolve-pricing)."
 fi
 mkdir -p "$HERE/config/prechecks" "$HERE/data/logs" "$HERE/data/locks"
 echo

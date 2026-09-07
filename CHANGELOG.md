@@ -104,6 +104,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     merges a file that carries both shapes by `seen_at`; `resolve-models
     openai` exits non-zero when the catalog could not be written;
     `on-run-end.sh`'s three new variables are documented.
+  - `config/pricing.json` keeps itself current: `agentloop resolve-pricing`
+    refreshes it from LiteLLM's machine-readable price table (OpenAI's page
+    refuses automated clients), per token there, per million here, cache-write
+    price included — the 5.6 family bills it, which the seeded table had as 0.
+    The tick runs it daily with the model refresh, so a model that appears in
+    the Codex catalog is priced the same day; a row marked `"source":
+    "manual"` is never overwritten; a slug the source lacks keeps its last row;
+    `agentloop platforms` and `/api/models` report `pricing_at` and the
+    visible slugs still without a price; a failed refresh changes nothing and
+    says so in `tick.log`.
 
 ### Changed
 

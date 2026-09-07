@@ -30,6 +30,8 @@ export AGENTLOOP_CLAUDE_BIN="$E2E/fake-claude"
 # against their real ~/.codex. Every `$AL` in this file must see the stand-in.
 export AGENTLOOP_CODEX_BIN="$E2E/fake-codex"
 export CODEX_HOME="$ROOT/codex-home"        # the stand-in's rollouts; never ~/.codex
+# the price source is a fixture: no test reaches the network
+export AGENTLOOP_PRICING_URL="file://$REPO/test/fixtures/pricing/litellm-sample.json"
 mkdir -p "$CODEX_HOME"
 AL="$REPO/bin/agentloop"
 
@@ -442,6 +444,24 @@ sed -i '' 's/"platform":"openai"/"platform":"anthropic"/; s/"gpt-5.6-sol"/"opus"
 grep -q 'j22: refusing to resume thr-moved — this session belongs to openai; the job now runs on anthropic' "$ROOT/data/tick.log" \
   && ok "the resume is refused, naming both platforms" || bad "no refusal line for the moved job"
 [ -n "$(dirs j22)" ] && ok "and the open session's tree is left where it was" || bad "the tree was taken"
+
+echo
+echo "23. the price table refreshes from the source and names what it could not price"
+# The seeded example table prices gpt-5.4-mini and the source does not carry it,
+# so its row would simply be KEPT (that rule has its own selftest case). Drop it
+# here, so what this scenario asserts is the gap itself: a VISIBLE catalog slug
+# with no price at all, named by platforms and in tick.log.
+jq 'del(.openai["gpt-5.4-mini"])' "$ROOT/config/pricing.json" > "$ROOT/pricing.seed"
+mv "$ROOT/pricing.seed" "$ROOT/config/pricing.json"
+: > "$ROOT/data/tick.log"
+"$AL" resolve-pricing >/dev/null 2>&1
+[ "$(jq -r '.openai["gpt-5.6-sol"].cache_write' "$ROOT/config/pricing.json")" = "5" ] \
+  && ok "gpt-5.6-sol's cache-write price came from the source (5 per 1M)" || bad "sol row $(jq -c '.openai["gpt-5.6-sol"]' "$ROOT/config/pricing.json")"
+[ "$(jq -r '._source_url' "$ROOT/config/pricing.json")" = "$AGENTLOOP_PRICING_URL" ] \
+  && ok "the table records its source" || bad "source $(jq -r '._source_url' "$ROOT/config/pricing.json")"
+[ "$("$AL" platforms | jq -c '.openai.unpriced')" = '["gpt-5.4-mini"]' ] \
+  && ok "platforms names the one visible slug the source does not price" || bad "unpriced $("$AL" platforms | jq -c '.openai.unpriced')"
+grep -q 'pricing: no price for gpt-5.4-mini' "$ROOT/data/tick.log" && ok "and tick.log says so" || bad "no tick.log line"
 
 echo
 printf '\n  %s passed, %s failed\n' "$pass" "$fail"
