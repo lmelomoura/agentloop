@@ -1,4 +1,4 @@
-# Medições do Codex CLI 0.148.0 — 2026-09-05
+# Medições do Codex CLI 0.148.0 — 2026-09-05 e 2026-09-07
 
 Evidência da spec [`../2026-09-06-platforms-anthropic-openai-design.md`](../2026-09-06-platforms-anthropic-openai-design.md).
 Tudo aqui foi capturado a correr o CLI, não escrito de memória. Fecha a checklist
@@ -20,6 +20,14 @@ nesse dia: `gpt-5.6-sol` (lido do rollout, não do stream).
 | `07-approval-policy-never.jsonl` | `--strict-config -c approval_policy="never"` | a chave de política de aprovação é reconhecida |
 | `08-sandbox-denial-read-only.jsonl` | pedir para escrever um ficheiro em `-s read-only` | **nenhum evento** de negação: o agente diz-o em texto; nem `command_execution` apareceu |
 | `09-disable-multi-agent.jsonl` | `--strict-config --disable multi_agent` | a flag é aceite (o rollout não mostra o estado da feature; ver medições em falta na spec) |
+| `10-file-change-workspace-write.jsonl` | `-s workspace-write`, pedir para criar um ficheiro | a forma de `file_change`: `{id, type, changes:[{path, kind}], status}`, em `item.started` e `item.completed`; `reasoning_output_tokens` 27 ≤ `output_tokens` 90 |
+| `11-resume-from-other-cwd-sandbox-mode.jsonl` | `codex exec resume --json --strict-config -c sandbox_mode=workspace-write <thread_id>` lançado com o processo noutra pasta, pedindo o cwd | o resume opera no cwd do **processo** (o ficheiro nasceu na pasta nova), e `-c sandbox_mode` é aceite em `--strict-config`; o `thread_id` é o mesmo do run 10 |
+| `12-dashdash-before-prompt-exec.jsonl` | `codex exec --json … -- 'Reply with exactly: dashdash'` | `--` antes do prompt é aceite em `exec` |
+| `13-dashdash-before-prompt-resume.jsonl` | `codex exec resume --json <thread_id> -- 'Reply with exactly: dashdash-resume'` | `--` antes do prompt é aceite em `exec resume` |
+| `14-effort-ultra.jsonl` | `--strict-config -c model_reasoning_effort=ultra` em `gpt-5.6-sol` | `ultra` é aceite |
+| `15-effort-high-reasoning-tokens.jsonl` | `-c model_reasoning_effort=high`, um problema de contas | `reasoning_output_tokens` 35 > 0 e `output_tokens` 42 ≥ 35: o output **inclui** o raciocínio |
+| `16a-tool-roster-default.txt`, `16b-tool-roster-disable-multi-agent.txt` | pedir ao agente que liste as suas ferramentas, sem e com `--disable multi_agent` | `collaboration.spawn_agent` está nos dois rosters: **a flag não fecha os subagentes** |
+| `17-spawn-under-disable-multi-agent.jsonl` | `--disable multi_agent`, pedir para lançar um subagente | um `collab_tool_call` corre e responde `spawned:pong`: os subagentes **não se fecham por flag**; a forma de `collab_tool_call` |
 | `stderr-every-run.txt` | qualquer run acima | a linha `Reading additional input from stdin...` sai **sempre** em stderr, com `</dev/null` ou `<&-` |
 | `models-catalog.stripped.json` | `codex debug models` | o catálogo: slug, nome, descrição, níveis de esforço suportados e por omissão, visibilidade, prioridade, sucessor de um modelo descontinuado, janela de contexto. Os prompts (`model_messages`, `base_instructions`) foram retirados |
 | `rollout-sample.stripped.jsonl` | `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl` do run 02 e do resume 03 | `turn_context.model` diz o modelo que correu; `token_count.rate_limits` traz `primary` (300 min) e `secondary` (10080 min) com `used_percent` e `resets_at`, `plan_type` e `rate_limit_reached_type`; `session_meta` traz `cli_version` e `model_provider`. Instruções retiradas |

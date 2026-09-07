@@ -18,6 +18,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The OpenAI platform, engine side.** A job, a project or a project's
+  security block can say `"platform": "openai"` and its runs go through the
+  Codex CLI (`codex exec --json`) instead of Claude Code — same journal, same
+  dashboard, same resume and stop, same dollar caps. Measured against Codex CLI
+  0.148.0; the evidence is `docs/superpowers/specs/2026-09-06-codex-measurements/`
+  and the fixtures the tests read are copies of it under `test/fixtures/codex/`.
+  What it cost to not have it: the only agent this scheduler could run was the
+  one it was named after.
+  - The eight measurements the design left open are closed. Three corrected
+    it: Codex subagents cannot be switched off by flag (`--disable multi_agent`
+    leaves `spawn_agent` in the roster), `exec resume` works in the process's
+    own directory and takes `-c sandbox_mode=…`, and `-c` values are passed
+    bare. The design carries a *Corrections* section with the rest.
+
 ### Changed
 
 - **claude-cron is now agentloop.** The scheduler runs more than one agent from

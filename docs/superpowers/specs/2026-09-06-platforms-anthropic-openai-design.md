@@ -579,6 +579,25 @@ Cada uma é um run pequeno, guardado como fixture ao lado das outras:
    no primeiro turno com causa `api_error`, que é o que acontece hoje com o
    Claude e continua a ser uma linha honesta no `tick.log`.
 
+## Correcções por medição (2026-09-07)
+
+As oito medições em falta foram feitas a 2026-09-07 (ficheiros 10–17 na pasta
+de evidência). Cinco confirmaram a spec; três corrigem-na. Onde esta secção e
+o texto acima divergem, **esta secção manda**.
+
+| Ponto | Medido | Correcção |
+|---|---|---|
+| `--disable multi_agent` | o roster de ferramentas mantém `collaboration.spawn_agent` com a flag (16a/16b) e um spawn pedido sob a flag corre e responde (17) | **os subagentes do Codex não se fecham por flag.** `platform_argv openai` não emite `--disable multi_agent`; `disallowed_tools` e `allowed_tools` são ignorados em OpenAI, com uma linha no `tick.log`; a análise de segurança em OpenAI proíbe subagentes **no prompt** ("Do not spawn subagents; do the work in this session") e conta com o tecto estimado. A capacidade `tool_lists` continua ausente, como a tabela já dizia |
+| resume: cwd e sandbox | `exec resume` opera no cwd do **processo** e aceita `-c sandbox_mode=workspace-write` em `--strict-config` (11) | o resume faz `cd "$run_cwd"` antes de lançar e passa `-c sandbox_mode=<mode>` no lugar de `-s`; `full-access` continua a ser `--dangerously-bypass-approvals-and-sandbox` nos dois casos |
+| `--` antes do prompt | aceite em `exec` (12) e em `exec resume` (13) | confirmado; `-- <prompt>` sempre |
+| `ultra` | aceite (14) | confirmado; o vocabulário de esforço OpenAI é o do catálogo, `ultra` incluído |
+| reasoning ⊂ output | `output_tokens` 42 ≥ `reasoning_output_tokens` 35 (15); 90 ≥ 27 (10) | confirmado; a estimativa cobra `output_tokens` uma vez |
+| forma de `file_change` | `{id, type:"file_change", changes:[{path, kind}], status}` (10) | o `tool_use` genérico ganha `input.description` = "<kind> <path>" por alteração, para a Timeline mostrar o ficheiro em vez de um JSON |
+| forma de `collab_tool_call` | `{id, type, tool, sender_thread_id, receiver_thread_ids, prompt, agents_states, status}` (17) | `tool_use` genérico, sem tratamento especial |
+| valores de `-c` | as medições passaram `k=v` sem aspas; o `--help` documenta o fallback de TOML para string literal | `-c model_reasoning_effort=high`, `-c approval_policy=never`, `-c sandbox_mode=workspace-write`, sem aspas |
+| preços | lidos de https://openai.com/api/pricing/ a 2026-09-07: gpt-5.6-sol 4.00 / 0.40 / 20.00; gpt-5.6-terra 2.00 / 0.20 / 12.00; gpt-5.6-luna 0.20 / 0.02 / 1.20; gpt-5.5 5.00 / 0.50 / 30.00; gpt-5.4-mini 0.75 / 0.075 / 4.50 (USD por 1M tokens: input / cached input / output; cache write 0) | `config/pricing.example.json` nasce preenchido; **por confirmar pelo operador** |
+| `codex login status` sem login | não medido, por não se fazer logout da conta em uso | como previsto: qualquer rc ≠ 0 é "sem login" |
+
 ## Ordem de implementação, para o plano
 
 1. Medições em falta; fixtures para `test/fixtures/codex/`; entrada no

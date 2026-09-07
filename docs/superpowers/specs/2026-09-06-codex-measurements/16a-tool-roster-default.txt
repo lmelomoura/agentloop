@@ -1,0 +1,11 @@
+collaboration.followup_task
+collaboration.interrupt_agent
+collaboration.list_agents
+collaboration.send_message
+collaboration.spawn_agent
+collaboration.wait_agent
+functions.exec
+functions.request_user_input
+functions.wait
+mcp__cua_repl.js
+mcp__cua_repl.js_reset
