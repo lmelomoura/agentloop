@@ -74,7 +74,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     validate against the job's platform (an OpenAI slug outside the catalog
     is refused, naming the catalog); `create` takes the platform's defaults,
     including under an OpenAI project. `config/jobs.example.json` carries a
-    disabled OpenAI example.
+    disabled OpenAI example. `project-set` refuses a platform it does not
+    know, and a job under a project with an unreadable platform is treated
+    as Anthropic rather than emptied.
 
 ### Changed
 

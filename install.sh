@@ -66,7 +66,7 @@ echo
 # 4) seed a jobs file the first time ------------------------------------
 if [ ! -f "$HERE/config/jobs.json" ]; then
   cp "$HERE/config/jobs.example.json" "$HERE/config/jobs.json"
-  say "Created config/jobs.json from the example (one disabled demo job)."
+  say "Created config/jobs.json from the example (two disabled demo jobs, one per platform)."
 fi
 if [ ! -f "$HERE/config/pricing.json" ]; then
   cp "$HERE/config/pricing.example.json" "$HERE/config/pricing.json"

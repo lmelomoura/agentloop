@@ -319,8 +319,16 @@ security_derived_jobs() {
     esac
     smodel="$(security_get "$project" '.model' "$(platform_default_model "$splat")")"
     if ! platform_model_ok "$splat" "$smodel"; then
-      security_warn "security: project '$project' has a model $splat does not know ('$smodel') -- using $(platform_default_model "$splat")"
-      smodel="$(platform_default_model "$splat")"
+      local sdefault; sdefault="$(platform_default_model "$splat")"
+      # openai with no catalog resolved yet: platform_default_model answers
+      # NOTHING, so the generic message below would read "using " with the
+      # default missing off the end. Name the actual cause instead.
+      if [ -z "$sdefault" ]; then
+        security_warn "security: project '$project' runs on openai but no OpenAI catalog is resolved yet (run: agentloop resolve-models openai) -- the analysis will be refused at launch"
+      else
+        security_warn "security: project '$project' has a model $splat does not know ('$smodel') -- using $sdefault"
+      fi
+      smodel="$sdefault"
     fi
     seffort="$(security_get "$project" '.effort' '')"
     if ! platform_effort_ok "$splat" "$smodel" "$seffort"; then
@@ -1168,6 +1176,19 @@ is_due_vals() { # is_due_vals <interval> <last-start> <fail-streak> ; 0 = due
 PLATFORMS="anthropic openai"
 
 platform_known() { case "${1:-}" in anthropic|openai) return 0 ;; *) return 1 ;; esac; }
+
+# job_platform <id> -> the job's effective platform: resolve(), then
+# normalised. A hand-edited project can carry a platform this engine does not
+# know (e.g. "gemini"); resolve() alone would hand that word straight back,
+# and platform_default_model/platform_default_permission answer NOTHING for
+# it, so every caller that skipped this normalisation ended up writing EMPTY
+# model/permission_mode fields rather than falling back. One place decides
+# what "unknown" becomes, so every reader of a job's platform agrees.
+job_platform() { # job_platform <id>
+  local p; p="$(resolve "$1" platform 'anthropic')"
+  platform_known "$p" || p="anthropic"
+  printf '%s\n' "$p"
+}
 
 platform_bin() { # platform_bin <platform> -> the CLI's path
   case "$1" in anthropic) printf '%s' "$CLAUDE_BIN" ;; openai) printf '%s' "$CODEX_BIN" ;; esac
@@ -2841,7 +2862,14 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   [ "$(cfg_job cj .permission_mode)" = "workspace-write" ] && ok "a permission mode of the other platform is rewritten to the default" || bad "permission $(cfg_job cj .permission_mode)"
   case "$out" in *"rewritten to gpt-a"*"cleared"*"rewritten to workspace-write"*) ok "and each rewrite is printed" ;; *) bad "rewrites not printed: $out" ;; esac
   out="$(printf 'gpt-zzz' | cfg_al set-field cj model 2>&1)"; rc=$?
-  [ "$rc" -ne 0 ] && case "$out" in *"unknown OpenAI model"*"gpt-a gpt-b"*"resolve-models openai"*) ok "a slug outside the catalog is refused, naming the catalog and the refresh command" ;; *) bad "refusal text: $out" ;; esac
+  if [ "$rc" -ne 0 ]; then
+    case "$out" in
+      *"unknown OpenAI model"*"gpt-a gpt-b"*"resolve-models openai"*) ok "a slug outside the catalog is refused, naming the catalog and the refresh command" ;;
+      *) bad "refusal text: $out" ;;
+    esac
+  else
+    bad "a slug outside the catalog was accepted"
+  fi
   printf 'gpt-b' | cfg_al set-field cj model >/dev/null 2>&1; want "a catalog slug is accepted" 0 $?
   printf 'ultra' | cfg_al set-field cj effort >/dev/null 2>&1; want "ultra is refused where the model lacks it" 1 $?
   printf 'high'  | cfg_al set-field cj effort >/dev/null 2>&1; want "high is accepted" 0 $?
@@ -2863,6 +2891,38 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   [ "$(cfg_job pj '.platform // "absent"')" = "absent" ] && [ "$(cfg_job pj .model)" = "gpt-a" ] && [ "$(cfg_job pj .permission_mode)" = "workspace-write" ] \
     && ok "create under an openai project inherits the platform and takes its defaults" || bad "create under project: $(cfg_job pj '{platform,model,permission_mode}')"
   printf '{"id":"xj","platform":"openai","model":"opus","prompt":"p"}' | cfg_al create >/dev/null 2>&1; want "create refuses a model the platform does not know" 1 $?
+  printf '{"id":"ej","platform":"openai","effort":"max","prompt":"p"}' | cfg_al create >/dev/null 2>&1; want "create refuses an effort the model does not offer" 1 $?
+
+  # project-set is the only door a project's platform is written through;
+  # refuse an unknown one there, before any write -- the alternative
+  # (accepting it and relying on every reader to normalise afterwards) is
+  # exactly what let a job get emptied below.
+  before_px="$(cat "$tmp/cfg/config/projects.json")"
+  out="$(printf '{"name":"px","cwd":"/tmp","platform":"gemini"}' | cfg_al project-set 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$(cat "$tmp/cfg/config/projects.json")" = "$before_px" ] \
+    && ok "project-set refuses an unknown platform, and writes nothing" \
+    || bad "project-set gemini: rc=$rc out=$out"
+
+  # A project this corrupt can now only exist by a hand-edit (project-set
+  # itself refuses it, just above) -- standing in for a projects.json older
+  # than that guard, or edited by hand. A job that inherits from it must not
+  # be emptied, and creating one under it must not be refused either: both
+  # run on anthropic, same as a job with no project at all.
+  "$JQ" '.projects += [{"name":"corrupt","cwd":"/tmp","platform":"gemini"}]' \
+      "$tmp/cfg/config/projects.json" > "$tmp/cfg/config/projects.json.next" \
+    && mv "$tmp/cfg/config/projects.json.next" "$tmp/cfg/config/projects.json"
+  printf '{"id":"cej","project":"corrupt","prompt":"p"}' | cfg_al create >/dev/null 2>&1
+  [ "$(cfg_job cej '.platform // "absent"')" = "absent" ] && [ "$(cfg_job cej .model)" = "opus" ] && [ "$(cfg_job cej .permission_mode)" = "dontAsk" ] \
+    && ok "create under a project with an unknown platform treats it as anthropic, not a refusal" \
+    || bad "create under corrupt project: $(cfg_job cej '{platform,model,permission_mode}')"
+  "$JQ" '.jobs += [{"id":"gj","enabled":false,"cwd":"/tmp","project":"corrupt","prompt":"p","model":"gpt-b","permission_mode":"full-access"}]' \
+      "$tmp/cfg/config/jobs.json" > "$tmp/cfg/config/jobs.json.next" \
+    && mv "$tmp/cfg/config/jobs.json.next" "$tmp/cfg/config/jobs.json"
+  out="$(printf '' | cfg_al set-field gj platform 2>&1)"
+  [ "$(cfg_job gj .model)" = "opus" ] && [ "$(cfg_job gj .permission_mode)" = "dontAsk" ] \
+    && ok "clearing a job's platform under that same corrupt project rewrites to anthropic, not empty" \
+    || bad "gj after clearing platform: $(cfg_job gj '{model,permission_mode}')"
+  case "$out" in *anthropic*) ok "and the rewrites name anthropic, not the unknown platform" ;; *) bad "rewrites: $out" ;; esac
 
   echo "security_derived_jobs() — the block's platform, with the same fallback-and-warn as its permission mode"
   mkdir -p "$tmp/dplat/data"
@@ -2883,6 +2943,27 @@ JSON
     && ok "the project's platform is inherited by the block, and valid values are kept" || bad "Ob: $(dplat security-ob '{platform,model,effort,permission_mode}')"
   [ "$(dplat security-oc .platform)" = "anthropic" ] && [ "$(dplat security-oc .model)" = "opus" ] && [ "$(dplat security-oc .permission_mode)" = "bypassPermissions" ] \
     && ok "an unknown platform in the block falls back to anthropic and its defaults" || bad "Oc: $(dplat security-oc '{platform,model,permission_mode}')"
+
+  # openai with no catalog resolved yet: platform_default_model answers
+  # nothing for it, so the model must come out empty rather than some other
+  # broken value, and the warning has to name the actual cause -- not the
+  # generic "using " with nothing after it that a blind fallback prints.
+  mkdir -p "$tmp/dnocat/data"
+  cat > "$tmp/dnocat/projects.json" <<'JSON'
+{"projects":[{"name":"Od","cwd":"/tmp/od","security":{"enabled":true,"platform":"openai"}}]}
+JSON
+  printf '{"jobs":[]}\n' > "$tmp/dnocat/jobs.json"
+  dnocat() { ( JOBS_FILE="$tmp/dnocat/jobs.json"; PROJECTS_FILE="$tmp/dnocat/projects.json"; DATA_DIR="$tmp/dnocat/data"
+               MODELS_FILE="$tmp/dnocat/no-such-models.json"; job_get "$1" "$2" '' ); }
+  [ -z "$(dnocat security-od .model)" ] \
+    && ok "openai with no catalog resolved yet: the derived job's model is empty, not a broken slug" \
+    || bad "model '$(dnocat security-od .model)'"
+  warn="$(cat "$tmp/dnocat/data/security/derivation-warnings.txt" 2>/dev/null)"
+  case "$warn" in
+    *"no OpenAI catalog is resolved yet"*"resolve-models openai"*)
+      ok "and the warning names the missing catalog and the refresh command" ;;
+    *) bad "warning: $warn" ;;
+  esac
 
   echo "model_alias_baseline() — the init event is found even behind hook events"
   # The probe's first lines belong to whoever has hooks configured: a
@@ -9057,7 +9138,7 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
       # Empty clears it (the CLI then uses its own default). The levels are the
       # platform's -- and, on openai, the chosen model's (the catalog says).
       local p pm
-      p="$(resolve "$id" platform 'anthropic')"; pm="$(resolve "$id" model "$(platform_default_model "$p")")"
+      p="$(job_platform "$id")"; pm="$(resolve "$id" model "$(platform_default_model "$p")")"
       if [ -z "$value" ]; then
         write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.effort) else . end]'
       elif platform_effort_ok "$p" "$pm" "$value"; then
@@ -9096,7 +9177,7 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
       fi ;;
     model)
       local p
-      p="$(resolve "$id" platform 'anthropic')"
+      p="$(job_platform "$id")"
       [ -n "$value" ] || die "model cannot be empty"
       if ! platform_model_ok "$p" "$value"; then
         if [ "$p" = "openai" ]; then
@@ -9121,7 +9202,11 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
         anthropic|openai) eff="$value" ;;
         "") proj="$(job_get "$id" '.project' '')"; eff="anthropic"
             if [ -n "$proj" ] && [ "$proj" != "null" ]; then eff="$(project_get "$proj" '.platform' 'anthropic')"; fi
-            case "$eff" in ''|null) eff="anthropic" ;; esac ;;
+            # A hand-edited project can carry a platform this engine does not
+            # know; inherit anthropic rather than let it through unnormalised
+            # (see job_platform's comment -- the three rewrites below would
+            # otherwise write EMPTY model/permission_mode).
+            platform_known "$eff" || eff="anthropic" ;;
         *) die "platform must be anthropic or openai (or empty, to inherit the project's)" ;;
       esac
       if [ "$eff" = "openai" ] && ! openai_catalog_ensure; then
@@ -9162,7 +9247,7 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
       fi ;;
     permission_mode)
       local p
-      p="$(resolve "$id" platform 'anthropic')"
+      p="$(job_platform "$id")"
       platform_permission_ok "$p" "$value" \
         || die "invalid permission_mode for $p: $value (one of: $(platform_permissions "$p" | tr '\n' ' '))"
       write_jobs --arg id "$id" --arg v "$value" \
@@ -9307,11 +9392,20 @@ cmd_create() { # reads a partial job object (JSON) from stdin
   # old fixed `opus`/`dontAsk` would have been refused at its first launch).
   local cplat cproj
   cplat="$(echo "$partial" | "$JQ" -r '.platform // ""')"
-  if [ -z "$cplat" ]; then
-    cproj="$(echo "$partial" | "$JQ" -r '.project // ""')"
-    [ -z "$cproj" ] || cplat="$(project_get "$cproj" '.platform' '')"
-  fi
-  case "$cplat" in ''|null) cplat="anthropic" ;; anthropic|openai) ;; *) die "create: platform must be anthropic or openai" ;; esac
+  case "$cplat" in
+    "")
+      # No platform of its own: inherit the project's. A hand-edited project
+      # can carry a platform this engine does not know -- fall back to
+      # anthropic rather than refuse to create a job for an unrelated reason
+      # (see job_platform's comment); an explicit BAD platform right below,
+      # from the caller, still dies -- that one is this call's own mistake.
+      cproj="$(echo "$partial" | "$JQ" -r '.project // ""')"
+      cplat="anthropic"
+      if [ -n "$cproj" ] && [ "$cproj" != "null" ]; then cplat="$(project_get "$cproj" '.platform' 'anthropic')"; fi
+      platform_known "$cplat" || cplat="anthropic" ;;
+    anthropic|openai) : ;;
+    *) die "create: platform must be anthropic or openai" ;;
+  esac
   if [ "$cplat" = "openai" ] && ! openai_catalog_ensure; then
     die "create: no OpenAI catalog yet: install codex, sign in, and run: agentloop resolve-models openai"
   fi
@@ -9325,10 +9419,12 @@ cmd_create() { # reads a partial job object (JSON) from stdin
   merged="$(printf '%s\n%s\n' "$defaults" "$partial" | "$JQ" -s '.[0] * .[1]')"
   # What the caller wrote has to be that platform's too; a job created wrong
   # would only say so at its first launch, in tick.log, hours later.
-  local cm cp
+  local cm cp ce
   cm="$(echo "$merged" | "$JQ" -r '.model // ""')"; cp="$(echo "$merged" | "$JQ" -r '.permission_mode // ""')"
+  ce="$(echo "$merged" | "$JQ" -r '.effort // ""')"
   platform_model_ok "$cplat" "$cm" || die "create: model '$cm' is not a $cplat model"
   platform_permission_ok "$cplat" "$cp" || die "create: permission_mode '$cp' is not a $cplat mode"
+  platform_effort_ok "$cplat" "$cm" "$ce" || die "create: effort '$ce' is not a level of $cm on $cplat"
   write_jobs --argjson j "$merged" '.jobs += [$j]'
   if [ ! -f "$path" ]; then
     mkdir -p "$CONFIG_DIR/prechecks"
@@ -9340,11 +9436,21 @@ cmd_create() { # reads a partial job object (JSON) from stdin
 }
 
 cmd_project_set() { # reads a partial project object (JSON) from stdin; merges by name
-  local partial name
+  local partial name plat
   partial="$(cat)"
   echo "$partial" | "$JQ" -e 'type == "object"' >/dev/null 2>&1 || die "project-set: stdin must be a JSON object"
   name="$(echo "$partial" | "$JQ" -r '.name // ""')"
   [ -n "$name" ] || die "project-set: missing .name"
+  # Refused HERE, before any write: this is the only door a project's platform
+  # is ever set through, so closing it here is what keeps job_platform's
+  # "unknown -> anthropic" fallback (bin/agentloop, the platforms block) a
+  # RARE case rather than the normal one -- a value only a hand-edit of
+  # projects.json can still produce.
+  plat="$(echo "$partial" | "$JQ" -r '.platform // ""')"
+  case "$plat" in
+    ''|null|anthropic|openai) : ;;
+    *) die "project-set: platform must be anthropic or openai (or empty, to inherit nothing)" ;;
+  esac
   if projects_json | "$JQ" -e --arg n "$name" 'any(.projects[]; .name==$n)' >/dev/null 2>&1; then
     write_projects --arg n "$name" --argjson p "$partial" \
       '.projects = [.projects[] | if .name==$n then (. * $p) else . end]'
