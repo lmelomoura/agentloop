@@ -56,6 +56,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     through complete, undeclared, dirty, resume, stop, quota and refusal.
     Deleting a run from the dashboard removes the raw Codex copy with the
     run's other files.
+  - `agentloop resolve-models [anthropic|openai]` keeps `config/models.json`
+    current for both platforms (the tick refreshes both daily); the OpenAI
+    block comes from `codex debug models`, falling back to the bundled
+    catalog, and says `available: false` with a reason when there is no
+    Codex. `/api/models` now carries a `platforms` object — models, effort
+    levels, permission modes and defaults per platform, and whether each
+    slug has a price — while its old keys stay as they were for the current
+    page. `agentloop platforms` prints the same from the terminal.
 
 ### Changed
 

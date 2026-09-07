@@ -28,6 +28,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -2284,12 +2285,88 @@ def al(args, stdin=None, background=False):
         return False, str(e)
 
 
+# The permission vocabulary lives in the engine (platform_permissions); this
+# mirrors it with the labels the page shows, and tests/test_platforms_api.py
+# pins the two together. The label says what the mode DOES on that CLI --
+# the two vocabularies are not the same thing renamed.
+PLATFORM_PERMISSIONS = {
+    "anthropic": [
+        {"v": "acceptEdits", "label": "acceptEdits — edits allowed, commands ask"},
+        {"v": "auto", "label": "auto — the CLI decides per tool"},
+        {"v": "bypassPermissions", "label": "bypassPermissions — nothing asks"},
+        {"v": "manual", "label": "manual — everything asks (headless: everything denied)"},
+        {"v": "dontAsk", "label": "dontAsk — allowlisted tools only, no prompts"},
+        {"v": "plan", "label": "plan — read-only planning"},
+    ],
+    "openai": [
+        {"v": "read-only", "label": "read-only — sandbox: no writes, no network"},
+        {"v": "workspace-write", "label": "workspace-write — sandbox: writes inside the workspace"},
+        {"v": "full-access", "label": "full-access — no sandbox, no approvals"},
+    ],
+}
+ANTHROPIC_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+
 MODEL_FAMILIES = [
     ("opus",   "the most capable"),
     ("sonnet", "balanced capability and speed"),
     ("haiku",  "the fastest and cheapest"),
     ("fable",  "the newest generation"),
 ]
+
+
+def _openai_platform():
+    """The openai entry of /api/models, from config/models.json's `openai`
+    block. A block that is missing altogether is resolved ONCE, synchronously
+    (`codex debug models` answers in 0 s), when the CLI exists; without the CLI
+    the answer is `available: false` and the reason, never an empty list that
+    looks like "no models"."""
+    path = CONFIG_DIR / "models.json"
+
+    def block():
+        try:
+            return (json.loads(path.read_text()) or {}).get("openai")
+        except Exception:  # noqa: BLE001
+            return None
+
+    b = block()
+    if b is None:
+        codex = _env("CODEX_BIN") or shutil.which("codex")
+        if codex:
+            al(["resolve-models", "openai"])
+            b = block()
+    if not isinstance(b, dict) or not isinstance(b.get("models"), list):
+        reason = (b or {}).get("reason") if isinstance(b, dict) else None
+        return {"available": False, "reason": reason or "codex not installed: run codex login, then agentloop resolve-models openai",
+                "catalog_at": (b or {}).get("at", 0) if isinstance(b, dict) else 0,
+                "models": [], "efforts": [], "permissions": PLATFORM_PERMISSIONS["openai"],
+                "default_model": ""}
+    try:
+        priced = (json.loads((CONFIG_DIR / "pricing.json").read_text()) or {}).get("openai") or {}
+    except Exception:  # noqa: BLE001
+        priced = {}
+
+    def has_price(slug):
+        row = priced.get(slug)
+        return isinstance(row, dict) and all(
+            isinstance(row.get(k), (int, float)) and not isinstance(row.get(k), bool)
+            for k in ("input", "cached_input", "output"))
+
+    visible = sorted((m for m in b["models"] if m.get("visibility", "list") == "list"),
+                     key=lambda m: m.get("priority", 999))
+    models = [{"v": m["slug"], "label": m.get("display_name") or m["slug"],
+               "desc": m.get("description") or "", "efforts": list(m.get("efforts") or []),
+               "default_effort": m.get("default_effort") or "",
+               "deprecated_by": m.get("deprecated_by") or "", "retires_at": m.get("retires_at") or "",
+               "priced": has_price(m["slug"])} for m in visible]
+    efforts, seen = [], set()
+    for m in b["models"]:                      # the union, in first-seen order
+        for e in m.get("efforts") or []:
+            if e not in seen:
+                seen.add(e); efforts.append(e)
+    return {"available": True, "reason": "", "catalog_at": b.get("at", 0),
+            "models": models, "efforts": efforts,
+            "permissions": PLATFORM_PERMISSIONS["openai"],
+            "default_model": models[0]["v"] if models else ""}
 
 
 def list_models():
@@ -2351,8 +2428,13 @@ def list_models():
     def sort_key(v):
         f = next((i for i, x in enumerate(fam_order) if x in v), 9)
         return (f, [-int(n) for n in re.findall(r"\d+", v)])   # newest first
-    return {"models": sorted(ids, key=sort_key),
-            "efforts": ["low", "medium", "high", "xhigh", "max"]}
+    models = sorted(ids, key=sort_key)
+    return {"models": models, "efforts": list(ANTHROPIC_EFFORTS),
+            "platforms": {"anthropic": {"available": True, "reason": "", "models": models,
+                                        "efforts": list(ANTHROPIC_EFFORTS),
+                                        "permissions": PLATFORM_PERMISSIONS["anthropic"],
+                                        "default_model": "opus"},
+                          "openai": _openai_platform()}}
 
 
 def list_dirs(path):

@@ -1313,7 +1313,7 @@ openai_rollout_for() { # openai_rollout_for <thread_id> -> the rollout's path, o
 
 # --- the OpenAI catalog, read side ------------------------------------------
 # config/models.json carries an `openai` block (written by `resolve-models
-# openai`; the writer is with the family resolver, cmd_resolve_models). These
+# openai`; the writer is the next block down, resolve_models_openai). These
 # read it. Without the block every reader answers nothing, which is what makes
 # an unresolved catalog REFUSE a launch rather than guess a slug.
 openai_catalog_available() { # 0 when config/models.json carries an openai catalog
@@ -1349,6 +1349,50 @@ openai_catalog_default_effort() { # openai_catalog_default_effort <slug> -> the 
 openai_catalog_successor() { # openai_catalog_successor <slug> -> what a deprecated slug was upgraded to, or nothing
   openai_catalog_available || return 0
   "$JQ" -r --arg s "$1" '.openai.models[] | select(.slug == $s) | .deprecated_by // empty' "$MODELS_FILE" 2>/dev/null
+}
+
+# --- the OpenAI catalog, write side ------------------------------------------
+resolve_models_openai() { # refresh config/models.json's `openai` block from `codex debug models`
+  local raw source block tmp
+  tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
+  [ -f "$MODELS_FILE" ] || echo '{"resolved":{}}' > "$MODELS_FILE"
+  if [ ! -x "$CODEX_BIN" ]; then
+    block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"codex not installed"}')"
+  else
+    source="codex debug models"
+    raw="$("$CODEX_BIN" debug models 2>/dev/null)"
+    if ! printf '%s' "$raw" | "$JQ" -e '.models | type == "array"' >/dev/null 2>&1; then
+      source="bundled"
+      raw="$("$CODEX_BIN" debug models --bundled 2>/dev/null)"
+    fi
+    if ! printf '%s' "$raw" | "$JQ" -e '.models | type == "array"' >/dev/null 2>&1; then
+      block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"codex debug models returned no catalog"}')"
+    else
+      # Only what the selector and the validators need. The prompt templates
+      # the CLI ships in this JSON are not ours to keep.
+      block="$(printf '%s' "$raw" | "$JQ" -c --argjson at "$(now_epoch)" --arg src "$source" '
+        {at:$at, source:$src, models:[.models[] | {
+          slug, display_name:(.display_name // .slug), description:(.description // ""),
+          default_effort:(.default_reasoning_level // ""),
+          efforts:[(.supported_reasoning_levels // [])[] | .effort],
+          visibility:(.visibility // "list"), priority:(.priority // 999),
+          deprecated_by:(.upgrade.model // ""), retires_at:(.upgrade.retirement_at // "")}]}')"
+    fi
+  fi
+  "$JQ" --argjson b "$block" '.openai = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"
+  rm -f "$tmp"
+  if openai_catalog_available; then
+    echo "openai -> $(openai_catalog_visible | tr '\n' ' ')($(printf '%s' "$block" | "$JQ" -r .source))"
+  else
+    echo "openai -> unavailable: $(printf '%s' "$block" | "$JQ" -r .reason)"
+  fi
+}
+
+openai_catalog_ensure() { # resolve once, synchronously, when the block is missing and codex exists (0 s measured)
+  openai_catalog_available && return 0
+  [ -x "$CODEX_BIN" ] || return 1
+  resolve_models_openai >/dev/null 2>&1
+  openai_catalog_available
 }
 
 # The session a run reported in its transcript. The id is what binds a run dir
@@ -2267,11 +2311,16 @@ effective_model() { # effective_model <model> -> concrete id (families resolved)
   echo "$hit"
 }
 
-models_stale() { # 0 = the cache is missing or older than MODELS_TTL
-  local oldest
+models_stale() { # 0 = either cache is missing or older than MODELS_TTL
+  local oldest oa
   [ -f "$MODELS_FILE" ] || return 0
   oldest="$("$JQ" -r '[.resolved[]?.at // 0] | min // 0' "$MODELS_FILE" 2>/dev/null)"
   case "$oldest" in ''|null|*[!0-9]*) oldest=0 ;; esac
+  # The openai block ages the same way. Absent, it is stale by definition --
+  # which is what gets it written on the first tick after this upgrade.
+  oa="$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)"
+  case "$oa" in ''|null|*[!0-9]*) oa=0 ;; esac
+  [ "$oa" -lt "$oldest" ] && oldest="$oa"
   [ "$(( $(now_epoch) - oldest ))" -ge "$MODELS_TTL" ]
 }
 
@@ -7095,14 +7144,43 @@ cmd_precheck() { # <id> — run the job's precheck once and RECORD it, without t
   printf '%s\n(exit %s)\n' "$pc_out" "$pc_rc"
 }
 
-cmd_resolve_models() { # refresh the family→id cache (all four families)
-  local fam id
-  for fam in opus sonnet haiku fable; do
-    id="$(resolve_family "$fam")"
-    [ -n "$id" ] || id="$fam"
-    models_cache_set "$fam" "$id"
-    echo "$fam -> $id"
-  done
+cmd_resolve_models() { # cmd_resolve_models [anthropic|openai] -- no argument does both
+  local which="${1:-}" fam id
+  case "$which" in
+    ""|anthropic)
+      for fam in opus sonnet haiku fable; do
+        id="$(resolve_family "$fam")"
+        [ -n "$id" ] || id="$fam"
+        models_cache_set "$fam" "$id"
+        echo "$fam -> $id"
+      done ;;
+  esac
+  case "$which" in
+    ""|openai) resolve_models_openai ;;
+  esac
+  case "$which" in ""|anthropic|openai) ;; *) die "resolve-models: unknown platform '$which'" ;; esac
+}
+
+cmd_platforms() { # one JSON object: what each platform offers and whether it is ready
+  local p ready reason perms efforts dm dp cat_at cat_ok
+  for p in $PLATFORMS; do
+    if reason="$(platform_ready "$p")"; then ready=true; reason=""; else ready=false; fi
+    perms="$(platform_permissions "$p" | "$JQ" -R . | "$JQ" -sc .)"
+    if [ "$p" = "openai" ]; then efforts="$(openai_catalog_efforts "" | "$JQ" -R . | "$JQ" -sc .)"
+    else efforts="$(platform_efforts "$p" | "$JQ" -R . | "$JQ" -sc .)"; fi
+    dm="$(platform_default_model "$p")"; dp="$(platform_default_permission "$p" job)"
+    cat_at=0; cat_ok=false
+    if [ "$p" = "openai" ]; then
+      cat_at="$(num "$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)")"
+      openai_catalog_available && cat_ok=true
+    fi
+    "$JQ" -nc --arg p "$p" --argjson ready "$ready" --arg reason "$reason" \
+      --argjson perms "$perms" --argjson efforts "$efforts" --arg dm "$dm" --arg dp "$dp" \
+      --argjson cat_at "$cat_at" --argjson cat_ok "$cat_ok" \
+      '{($p): ({ready:$ready, reason:$reason, permissions:$perms, efforts:$efforts,
+                default_model:$dm, default_permission:$dp}
+               + (if $p == "openai" then {catalog_at:$cat_at, catalog_available:$cat_ok} else {} end))}'
+  done | "$JQ" -sc 'add'
 }
 
 # What a run that delivered nothing tells the operator. Split out of the
@@ -9192,6 +9270,11 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop security-branches <project> <repo>
                               list the branches of a project's canonical
                               checkout, local and origin's, for a branch picker
+  agentloop resolve-models [anthropic|openai]
+                              refresh the model catalogues (both, without an
+                              argument)
+  agentloop platforms       what each platform offers (permission modes,
+                              efforts, defaults) and whether it is ready
   agentloop tick            internal — what launchd calls every minute
 
 Jobs are defined in $JOBS_FILE
@@ -9271,7 +9354,8 @@ case "${1:-}" in
              esac ;;
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"
                      cmd_security_branches "$2" "$3" ;;
-  resolve-models) cmd_resolve_models ;;
+  resolve-models) cmd_resolve_models "${2:-}" ;;
+  platforms) cmd_platforms ;;
   skills)    shift; cmd_skills "${1:-status}" ;;
   selftest)  cmd_selftest ;;
   running)   [ $# -ge 2 ] || die "usage: agentloop running <job-id>"; cmd_running "$2" ;;

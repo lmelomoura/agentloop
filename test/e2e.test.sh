@@ -258,14 +258,12 @@ mi="$(idx '--' 2>/dev/null)"
 export AGENTLOOP_CODEX_BIN="$E2E/fake-codex"
 export CODEX_HOME="$ROOT/codex-home"        # the stand-in's rollouts; never ~/.codex
 mkdir -p "$CODEX_HOME"
-# The catalog a slug is validated against. `resolve-models openai` writes it
-# from `codex debug models` on a real install; here it is seeded directly.
-cat > "$ROOT/config/models.json" <<'JSON'
-{"resolved":{},"openai":{"at":1788616000,"source":"fixture","models":[
-  {"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","description":"x","default_effort":"low",
-   "efforts":["low","medium","high","xhigh","max","ultra"],"visibility":"list","priority":6,
-   "deprecated_by":"","retires_at":""}]}}
-JSON
+# The catalog a slug is validated against, obtained the way a real install
+# obtains it: `resolve-models openai` asks the CLI for `debug models`.
+"$AL" resolve-models openai >/dev/null 2>&1
+jq -e '.openai.models | length > 0' "$ROOT/config/models.json" >/dev/null \
+  && ok "resolve-models openai wrote the catalog from the stand-in's debug models" \
+  || bad "no openai catalog after resolve-models"
 mkjob_openai() { # mkjob_openai <id> [permission]
   printf '{"jobs":[{"id":"%s","project":"sandbox","enabled":false,"platform":"openai","model":"gpt-5.6-sol","effort":"high","prompt":"do the thing",
     "interval_seconds":3600,"permission_mode":"%s","max_parallel":1}]}\n' "$1" "${2:-workspace-write}" \
