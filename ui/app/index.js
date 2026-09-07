@@ -40,7 +40,7 @@ import { RF, renderRunsPage, runsSort, runsSetPage,
          clearRunFilters, runSearch, runProjectNames } from "./runs.js";
 import { changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, effortsFor,
          FALLBACK_PERMISSIONS, permissionsFor, defaultPermissionFor, defaultModelFor,
-         modelOptionsFor, platformOf, platformLabel,
+         modelOptionsFor, platformOf, platformLabel, costParts, tokensText,
          dayNumbers, shapeRepoRows, projectStepError } from "./editor-domain.js";
 
 function init(cc){
@@ -199,4 +199,9 @@ window.ALApp = { init, visibleJobs, jobFilters, bulkOn,
                  changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, effortsFor,
                  FALLBACK_PERMISSIONS, permissionsFor, defaultPermissionFor, defaultModelFor,
                  modelOptionsFor, platformOf, platformLabel,
+                 // costParts and tokensText are the same plan's Task 4: what a
+                 // run's cost cell and Tokens row say, shared by the Runs table
+                 // (runs.js, by import) and the run dialog's renderLog/costHtml
+                 // in bin/dashboard.html, which reaches them through here.
+                 costParts, tokensText,
                  dayNumbers, shapeRepoRows, projectStepError };

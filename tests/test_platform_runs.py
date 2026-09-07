@@ -103,6 +103,8 @@ def test_an_openai_record_keeps_its_fields_through_the_api(srv, clean_data):
     assert d["agent"]["tokens"] == tokens
     assert d["agent"]["cost_basis"] == "estimated"
     assert d["record"]["model_id"] == "gpt-5.6-sol"
+    assert runs[0]["model_id"] == "gpt-5.6-sol" and runs[0]["model"] == "gpt-5.6-sol", \
+        "the runs list carries the model, so a row can say what ran without opening it"
 
 
 def test_the_raw_codex_stream_is_pruned_with_the_other_artifacts(srv, clean_data):

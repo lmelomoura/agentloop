@@ -39,6 +39,7 @@
 import { $, AL, icon, eff, fmtAgo, fmtDur, money, effortLabel, fmtExpiresIn,
          resumeInFlight, markIfPending, projById } from "./page.js";
 import { jobFacts } from "./jobs-domain.js";
+import { platformOf } from "./editor-domain.js";
 import { el, pageHeader, kpiCard } from "./chrome.js";
 
 // A percentage of nothing is not 0%, it is nothing -- pulseHtml's own pct()
@@ -64,6 +65,7 @@ export function pulseKpis(k){
   const err = k.err || 0;
   const spentToday = k.spentToday || 0;
   const spentWeek = k.spentWeek || 0;
+  const estToday = k.estToday || 0;
   const pct = (n) => checks ? Math.round(n / checks * 100) + "%" : "—";
   // Mirrors page.js's money() exactly: same style, same 2-vs-4 decimal
   // switch for a sub-10-cent run. Duplicated rather than imported -- see
@@ -123,8 +125,11 @@ export function pulseKpis(k){
     // original brief. runsToday already surfaces, unreliably, through the
     // greeting sentence above this row; both counts stay one click away on
     // the Runs page regardless.
+    // The estimated share is named only when there is one: a fleet with no
+    // OpenAI run today reads exactly as it always did (pinned by test).
     {label: "Spent today", value: money(spentToday),
-     sub: money(spentWeek) + " over 7 days", tone: "", filter: "", door: false},
+     sub: money(spentWeek) + " over 7 days" + (estToday > 0 ? " · includes ~" + money(estToday) + " estimated" : ""),
+     tone: "", filter: "", door: false},
   ];
 }
 
@@ -637,7 +642,11 @@ export function jobCard(j){
   cfg.appendChild(marked("timer", bit("every " + fmtDur(j.interval_seconds || 300), own("interval_seconds"))));
   cfg.appendChild(marked("clock", bit((j.active_hours || "24h") + " "
     + fmtDays(j.active_days || [1, 2, 3, 4, 5, 6, 7]), own("active_hours") || own("active_days"))));
-  cfg.appendChild(bit(model, own("model")));
+  // The platform is named only when it is not the default -- "Anthropic ·
+  // opus" on every card would say nothing; "OpenAI · gpt-5.6-sol" says the
+  // one thing that changed.
+  const plat = platformOf(j, p);
+  cfg.appendChild(bit(plat === "openai" ? "OpenAI · " + model : model, own("model") || own("platform")));
   if(effortLabel(eff(j, "effort", "")) !== "default"){
     cfg.appendChild(bit(effortLabel(eff(j, "effort", "")), own("effort")));
   }

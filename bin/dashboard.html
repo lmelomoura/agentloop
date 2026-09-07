@@ -2757,6 +2757,8 @@ function render(){
   const nWarn=rw.filter(r=>normStatus(r.status)==="warning").length;
   const nErr =rw.filter(r=>normStatus(r.status)==="error").length;
   const kpis={runsToday:rt.length, spentToday:sum(rt,r=>r.cost),
+              // the share of today that is our own estimate, for the card's sublabel
+              estToday:sum(rt.filter(r=>r.cost_basis==="estimated"),r=>r.cost),
               runsWeek:rw.length, spentWeek:sum(rw,r=>r.cost),
               warn:nWarn, err:nErr};
   ALApp.renderOverviewHead(kpis, (CFG.user||{}).name||"");
@@ -3881,6 +3883,14 @@ function mdToHtml(src){
 
 function statusPill(s){ const n=normStatus(s); return '<span class="stat-cell s-'+esc(n)+'">'+(STATUS_ICON[n]||"")+esc(n)+'</span>'; }
 
+// The cost with its basis -- the CLI's figure, our estimate (~, tooltip), or a
+// dash for a run that has none. One implementation with the Runs table's cell
+// (ALApp.costParts, editor-domain.js).
+function costHtml(rec){
+  const c=ALApp.costParts(rec, money);
+  return '<span class="'+esc(c.cls)+'"'+(c.tip?' title="'+esc(c.tip)+'"':'')+'>'+esc(c.text)+'</span>';
+}
+
 /* What model ran, said once. A job pinned to an exact id resolves to itself, so
    the arrow only earns its place when the two sides differ. */
 function modelCell(rec){
@@ -3999,13 +4009,15 @@ function renderLog(d){
     ["Status", statusPill(rec.status)],
     ["Trigger", rec.forced ? "Run now (forced)" : "scheduled — precheck passed"],
     ["Duration", esc(fmtDur(rec.duration||0))],
-    ["Cost", esc(money(rec.cost))],
+    ["Cost", costHtml(rec)],
     // The job may store an alias ("opus"); model_id is what it actually resolved
     // to on the day of the run, so history stays truthful after a model ships.
     // The arrow is only worth drawing when the two DIFFER — a job pinned to an
     // exact id resolved to itself, and "claude-sonnet-5 → claude-sonnet-5" is a
     // resolution step rendered for a job that never took one.
     ["Model", modelCell(rec)],
+    ["Platform", esc(ALApp.platformLabel(rec.platform))],
+    ["Tokens", esc(ALApp.tokensText(a.tokens))],
     ["Session", esc(a.session||rec.session||"—")],
     ["Stop reason", stopReasonText(a, rec)],
   ];

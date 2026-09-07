@@ -2017,7 +2017,7 @@ def load_data():
         conn = db_conn()
         db_init(conn)
         for row in conn.execute(
-                "SELECT job, start, status, duration, cost, session, log, forced, precheck_note, project, note, resumed_from, cause, platform, cost_basis"
+                "SELECT job, start, status, duration, cost, session, log, forced, precheck_note, project, note, resumed_from, cause, platform, cost_basis, model, model_id"
                 " FROM runs ORDER BY start DESC, rowid DESC LIMIT 1000"):
             runs.append({"id": row["job"], "start": row["start"], "status": row["status"],
                          "duration": row["duration"], "cost": row["cost"],
@@ -2031,7 +2031,10 @@ def load_data():
                          "resumed_from": row["resumed_from"] or "",
                          "cause": row["cause"] or "",
                          "platform": row["platform"] or "anthropic",
-                         "cost_basis": row["cost_basis"] or "reported"})
+                         "cost_basis": row["cost_basis"] or "reported",
+                         # the model asked for and the one that ran, so a row
+                         # can name what ran without opening the run
+                         "model": row["model"] or "", "model_id": row["model_id"] or ""})
         conn.close()
     except Exception as exc:  # noqa: BLE001
         # Degrade to an empty list so the page still paints — but SAY SO.

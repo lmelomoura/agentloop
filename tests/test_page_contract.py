@@ -2698,6 +2698,61 @@ def test_the_spent_today_card_carries_the_week_in_its_sublabel(srv, tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_spent_today_card_names_the_estimated_share_only_when_there_is_one(srv, tmp_path):
+    block = _app_js(srv)
+    deps = _index_screen_deps(block, "pulseKpis")
+    script = tmp_path / "week-est.js"
+    script.write_text(_INDEX_DOM_HARNESS + deps + """
+    const a = pulseKpis({checks: 96, per: {woke: 23}, warn: 3, err: 1, spentToday: 9.34, spentWeek: 41.02, estToday: 2.5});
+    const b = pulseKpis({checks: 96, per: {woke: 23}, warn: 3, err: 1, spentToday: 9.34, spentWeek: 41.02, estToday: 0});
+    const sub = (cards) => cards.find(c => c.label === "Spent today").sub;
+    console.log(JSON.stringify([sub(a), sub(b)]));
+    """)
+    got = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert got == ["$41.02 over 7 days · includes ~$2.50 estimated", "$41.02 over 7 days"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_cost_says_what_kind_of_number_it_is(srv, tmp_path):
+    """reported: the CLI's figure. estimated: ours, marked ~ with the tooltip
+    saying so. none: a dash -- never $0.00, which reads as free."""
+    block = _app_js(srv)
+    deps = _plainfn(block, "costParts") + "\n" + _plainfn(block, "tokensText")
+    script = tmp_path / "cost-parts.js"
+    script.write_text(deps + """
+    const fmt = (n) => "$" + Number(n).toFixed(2);
+    console.log(JSON.stringify({
+      rep: costParts({cost: 0.5, cost_basis: "reported"}, fmt),
+      old: costParts({cost: 0.5}, fmt),
+      est: costParts({cost: 0.031784, cost_basis: "estimated"}, fmt),
+      none: costParts({cost: 0, cost_basis: "none"}, fmt),
+      toks: tokensText({input: 32675, cached: 28160, cache_write: 0, output: 123, reasoning: 0}),
+      toksAll: tokensText({input: 32675, cached: 28160, cache_write: 10, output: 123, reasoning: 50}),
+      toksNone: tokensText(null),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["rep"] == {"text": "$0.50", "cls": "", "tip": ""}
+    assert out["old"] == out["rep"], "a record from before cost_basis existed is a reported one"
+    assert out["est"]["text"] == "~$0.03" and out["est"]["cls"] == "cost-est" and "pricing.json" in out["est"]["tip"]
+    assert out["none"]["text"] == "—" and out["none"]["cls"] == "cost-none" and "no price" in out["none"]["tip"]
+    assert out["toks"] == "32,675 in (28,160 cached) · 123 out"
+    assert out["toksAll"] == "32,675 in (28,160 cached, 10 cache write) · 123 out (50 reasoning)"
+    assert out["toksNone"] == "—"
+
+
+def test_the_runs_table_the_log_and_the_security_meta_name_the_platform(srv):
+    app = _app_js(srv)
+    assert 'el("span", "platbadge", platformLabel(r.platform))' in app, "the Runs table badges an OpenAI run"
+    assert "costParts(r, money)" in app, "the Runs table's cost cell goes through costParts"
+    log = _plainfn(_js(srv), "renderLog")
+    assert '["Platform", esc(ALApp.platformLabel(rec.platform))]' in log
+    assert '["Tokens", esc(ALApp.tokensText(a.tokens))]' in log
+    assert '["Cost", costHtml(rec)]' in log
+    assert 'cell("Runs on"' in _security_js(srv), "the analysis meta grid says which CLI ran it"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 @pytest.mark.parametrize("jobs,expected", [
     ([], "There are no jobs yet."),
     ([{"enabled": False}], "All 1 jobs are disabled."),
@@ -2877,8 +2932,9 @@ def test_no_window_and_switched_off_are_different_answers(srv, tmp_path, job,
 # SCRIPT'S OWN STDOUT, so this is also where that content stops reaching the
 # HTML parser at all: the sink-scan above holds the RULE (no ui/ module may
 # reach innerHTML/outerHTML/etc.), these two hold the CONTENT. jobCard calls
-# jobFacts (jobs-domain.js), fmtDays, sessionNotices, probeVerdict,
-# nextRunNote, spendTone, checkList and el, all by their bare names -- safe
+# jobFacts (jobs-domain.js), platformOf (editor-domain.js), fmtDays,
+# sessionNotices, probeVerdict, nextRunNote, spendTone, checkList and el, all
+# by their bare names -- safe
 # here because, unlike the pinned functions above, nothing extracts jobCard
 # alone and runs it standing apart from its module (see overview.js's own
 # banner comment on the isolation rule those pinned functions keep and this
@@ -2897,7 +2953,7 @@ def test_the_job_card_is_built_from_nodes_and_shows_what_it_always_showed(
             + _index_screen_deps(block, "fmtDays", "el", "jobFacts",
                                   "nextCheckAt", "inWindow", "probeVerdict",
                                   "nextRunNote", "spendTone", "checkList",
-                                  "sessionNotices", "jobCard"))
+                                  "sessionNotices", "platformOf", "jobCard"))
     script = tmp_path / "card.js"
     script.write_text(_INDEX_DOM_HARNESS + _JOBS_DOMAIN_HARNESS + """
     // jobCard's remaining reads off the page -- a formatter each, stood up

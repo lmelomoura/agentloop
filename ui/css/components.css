@@ -419,6 +419,12 @@ code{font:11.5px ui-monospace,"SF Mono",Menlo,monospace;
   border-radius:5px;padding:1px 6px;margin-left:7px;vertical-align:1px}
 /* a run that continued an earlier one — hover to see which */
 .trigger-badge.resumed{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 40%,var(--line));cursor:help}
+/* the platform a run went through -- drawn only when it is not the default */
+.platbadge{font-size:10px;color:var(--accent);border:1px solid color-mix(in srgb,var(--accent) 40%,var(--line));
+  border-radius:5px;padding:1px 6px;margin-left:7px;vertical-align:1px;cursor:help}
+/* a cost we computed ourselves (~), and a run that has no figure at all */
+.cost-est{cursor:help}
+.cost-none{color:var(--muted);cursor:help}
 .runningbadge{display:inline-flex;align-items:center;gap:7px;color:var(--warn);font-weight:600}
 .runningbadge .pulse{width:8px;height:8px;border-radius:50%;background:var(--warn);
   animation:ccpulse 1.2s ease-in-out infinite}

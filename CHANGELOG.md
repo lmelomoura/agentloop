@@ -151,6 +151,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     typed-in model id on OpenAI, where a slug outside the catalog only falls
     back to the platform's default; re-picking the platform a pane already
     shows changes nothing.
+  - A run says where it ran and what its cost IS: an **OpenAI** badge on the
+    Runs table row (the model that ran on hover), `~$0.03` for an estimate and
+    a dash for a run with no figure — never a fake $0.00 — with the basis on
+    hover; the run's dialog adds Platform and Tokens rows; the Overview's
+    *Spent today* names the estimated share when there is one; the analysis
+    meta grid on the Security page gains "Runs on".
 
 ### Changed
 

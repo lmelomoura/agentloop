@@ -201,3 +201,32 @@ export function projectStepError(k, values){
   }
   return { ok: true };
 }
+
+// What a run's cost cell says, by cost_basis. `fmt` is the caller's money()
+// (page.js, or overview.js's own copy) so this stays free of the DOM and of
+// Intl. `reported` is the CLI's own figure; `estimated` is ours, from tokens
+// and config/pricing.json, and says so with a ~ and a tooltip; `none` is a
+// dash -- never $0.00, which would read as "free". A record from before the
+// field existed is a reported one.
+export function costParts(r, fmt){
+  const basis = (r && r.cost_basis) || "reported";
+  if(basis === "none") return {text: "—", cls: "cost-none",
+    tip: "No cost recorded: the model has no price in config/pricing.json, or the run ended without a final event"};
+  if(basis === "estimated") return {text: "~" + fmt((r && r.cost) || 0), cls: "cost-est",
+    tip: "Estimated from the run's tokens with config/pricing.json — the Codex CLI reports tokens, not dollars"};
+  return {text: fmt((r && r.cost) || 0), cls: "", tip: ""};
+}
+
+// A run's token counts in one line: "32,675 in (28,160 cached) · 123 out".
+// Reasoning tokens are INSIDE output_tokens on Codex, so they are named in
+// brackets and never added. null (a run with no usage) -> "—".
+export function tokensText(t){
+  if(!t || typeof t !== "object") return "—";
+  const n = (v) => Number(v || 0).toLocaleString("en-US");
+  const extra = [];
+  if(t.cached) extra.push(n(t.cached) + " cached");
+  if(t.cache_write) extra.push(n(t.cache_write) + " cache write");
+  let s = n(t.input) + " in" + (extra.length ? " (" + extra.join(", ") + ")" : "") + " · " + n(t.output) + " out";
+  if(t.reasoning) s += " (" + n(t.reasoning) + " reasoning)";
+  return s;
+}
