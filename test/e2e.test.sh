@@ -23,6 +23,14 @@ rm -rf "$ROOT"; mkdir -p "$ROOT"/{config,data,remote,work}
 export AGENTLOOP_CONFIG="$ROOT/config"
 export AGENTLOOP_DATA="$ROOT/data"
 export AGENTLOOP_CLAUDE_BIN="$E2E/fake-claude"
+# Here rather than beside the OpenAI scenarios below, because the FIRST `tick`
+# of this file already reaches for Codex: with no config/models.json the tick
+# finds the catalog stale and detaches `_resolve_models`, which runs `codex
+# debug models` through `$(command -v codex)` -- the operator's real CLI,
+# against their real ~/.codex. Every `$AL` in this file must see the stand-in.
+export AGENTLOOP_CODEX_BIN="$E2E/fake-codex"
+export CODEX_HOME="$ROOT/codex-home"        # the stand-in's rollouts; never ~/.codex
+mkdir -p "$CODEX_HOME"
 AL="$REPO/bin/agentloop"
 
 pass=0; fail=0
@@ -250,6 +258,190 @@ mi="$(idx '--' 2>/dev/null)"
 [ -n "${mi:-}" ] && [ "$((mi + 1))" = "${argc:-0}" ] \
   && ok "and its prompt is the one argument after --, not swallowed by the variadic flag" \
   || bad "the prompt is not a lone positional after -- (-- at '${mi:-none}', argc '${argc:-none}')"
+
+# ------------------------------------------------------- the OpenAI platform
+# The same lifecycle over the Codex stand-in: the run goes down a FIFO into
+# the normalizer, the classifier reads the normalized stream, the rollout
+# under the sandboxed CODEX_HOME exported at the top of this file supplies the
+# model that ran.
+cp "$REPO/config/pricing.example.json" "$ROOT/config/pricing.json"
+# The catalog a slug is validated against, obtained the way a real install
+# obtains it: `resolve-models openai` asks the CLI for `debug models`.
+"$AL" resolve-models openai >/dev/null 2>&1
+jq -e '.openai.models | length > 0' "$ROOT/config/models.json" >/dev/null \
+  && ok "resolve-models openai wrote the catalog from the stand-in's debug models" \
+  || bad "no openai catalog after resolve-models"
+jq -e '([.openai.models[] | select(.visibility=="list") | .slug] | index("gpt-reserve")) == null' \
+  "$ROOT/config/models.json" >/dev/null \
+  && ok "the hidden gpt-reserve never reaches the visible slug list" \
+  || bad "gpt-reserve leaked into the visible models"
+jq -e '(.openai.models[] | select(.slug=="gpt-5.6-sol") | .efforts | index("ultra")) != null' \
+  "$ROOT/config/models.json" >/dev/null \
+  && ok "gpt-5.6-sol's efforts include ultra" \
+  || bad "gpt-5.6-sol has no ultra effort"
+mkjob_openai() { # mkjob_openai <id> [permission]
+  printf '{"jobs":[{"id":"%s","project":"sandbox","enabled":false,"platform":"openai","model":"gpt-5.6-sol","effort":"high","prompt":"do the thing",
+    "interval_seconds":3600,"permission_mode":"%s","max_parallel":1}]}\n' "$1" "${2:-workspace-write}" \
+    > "$ROOT/config/jobs.json"
+  mkdir -p "$ROOT/config/prechecks"
+  printf '#!/bin/bash\nexit 0\n' > "$ROOT/config/prechecks/$1.sh"
+  chmod +x "$ROOT/config/prechecks/$1.sh"
+}
+lastrun() { tail -1 "$ROOT/data/runs.ndjson" 2>/dev/null; }
+# <index><TAB><argument> readers over a recorded argv file
+at_in()  { awk -F'\t' -v i="$2" '$1==i {print $2; exit}' "$1"; }
+idx_in() { awk -F'\t' -v w="$2" '$2==w {print $1; exit}' "$1"; }
+
+echo
+echo "13. an OpenAI run goes through the Codex stand-in and reads as a clean success"
+mkjob_openai j13
+FAKE_MODE=complete FAKE_SESSION=thr-clean "$AL" run j13 >/dev/null 2>&1
+sleep 2
+[ -z "$(dirs j13)" ] && ok "its run directory is gone (declared ending, nothing undelivered)" || bad "left $(dirs j13)"
+[ "$(lastrun | jq -r .status)" = "success" ] \
+  && ok "status success: the CLI's stdin line was filtered out of stderr" \
+  || bad "status $(lastrun | jq -r .status): $(lastrun | jq -r .note)"
+[ "$(lastrun | jq -r .session)" = "thr-clean" ] && ok "the session recorded is the thread id" || bad "session $(lastrun | jq -r .session)"
+[ "$(lastrun | jq -r .model_id)" = "gpt-5.6-sol-real" ] \
+  && ok "model_id is the model the rollout says ran, not the slug asked for" || bad "model_id $(lastrun | jq -r .model_id)"
+[ "$(lastrun | jq -r .platform)" = "openai" ] && ok "the journal names the platform" || bad "platform $(lastrun | jq -r .platform)"
+[ "$(lastrun | jq -r .cost_basis)" = "estimated" ] && [ "$(lastrun | jq -r .cost)" = "0.031784" ] \
+  && ok "the cost is the estimate from the seeded price table (\$0.031784 for 32,675 in / 28,160 cached / 123 out)" \
+  || bad "cost $(lastrun | jq -c '{cost,cost_basis}')"
+[ "$(lastrun | jq -r '.tokens.input')" = "32675" ] && [ "$(lastrun | jq -r '.tokens.reasoning')" = "0" ] \
+  && ok "the token counts ride on the record" || bad "tokens $(lastrun | jq -c .tokens)"
+s13="$(ls "$ROOT"/data/logs/j13/*.stream.ndjson 2>/dev/null | head -1)"
+[ -f "$s13.raw" ] && grep -q '"thread.started"' "$s13.raw" \
+  && ok "the raw Codex stream is kept beside the normalized one" || bad "no .raw copy"
+head -1 "$s13" | jq -e '.subtype=="init" and .platform=="openai"' >/dev/null 2>&1 \
+  && ok "the normalized stream opens with the init event" || bad "first line: $(head -1 "$s13")"
+[ ! -e "$ROOT"/data/logs/j13/*.raw.fifo ] && ok "the FIFO was removed" || bad "FIFO left behind"
+jq -e '.openai.five_hour.utilization == 0.05 and .openai.five_hour.source == "rollout"' "$ROOT/data/rate-limits.json" >/dev/null 2>&1 \
+  && ok "the run's rollout fed the openai usage windows" || bad "rate-limits.json: $(cat "$ROOT/data/rate-limits.json" 2>/dev/null)"
+
+echo
+echo "14. an OpenAI run that never declares an ending keeps its tree, bound to the thread id"
+mkjob_openai j14
+FAKE_MODE=undeclared FAKE_SESSION=thr-cut "$AL" run j14 >/dev/null 2>&1
+sleep 2
+d14="$(dirs j14 | head -1)"
+[ -n "$d14" ] && [ "$(ended j14 "$d14")" = "open" ] && ok "kept, marked open" || bad "dir '$d14' ended '$(ended j14 "$d14")'"
+[ "$(cat "$ROOT/data/worktrees/j14/$d14/.session" 2>/dev/null)" = "thr-cut" ] \
+  && ok ".session holds the thread id" || bad ".session not bound to the thread"
+
+echo
+echo "15. a resume of that thread reattaches, and launches as exec resume in the process cwd"
+argv15="$ROOT/argv-15"; rm -f "$argv15"
+FAKE_ARGV_OUT="$argv15" FAKE_MODE=complete FAKE_SESSION=thr-cut "$AL" resume j14 thr-cut >/dev/null 2>&1
+sleep 2
+grep -q "resumed thr-cut in its own tree" "$ROOT/data/tick.log" && ok "the tick log says it reattached" || bad "no reattach line"
+[ -z "$(dirs j14)" ] && ok "and the finished session took its directory with it" || bad "left $(dirs j14)"
+[ "$(at_in "$argv15" 1)" = "exec" ] && [ "$(at_in "$argv15" 2)" = "resume" ] \
+  && ok "argv opens with exec resume" || bad "argv: $(tr '\n' ' ' < "$argv15")"
+[ -z "$(idx_in "$argv15" -C)" ] && ok "no -C on a resume (exec resume refuses it; the cwd is the process's)" || bad "-C passed to exec resume"
+[ -n "$(idx_in "$argv15" sandbox_mode=workspace-write)" ] && ok "the sandbox travels as -c sandbox_mode=…" || bad "no sandbox_mode override"
+ti="$(idx_in "$argv15" thr-cut)"; mi="$(idx_in "$argv15" --)"
+[ -n "$ti" ] && [ -n "$mi" ] && [ "$ti" -lt "$mi" ] \
+  && ok "the thread id precedes --, and the prompt follows it" || bad "thread id at '$ti', -- at '$mi'"
+
+echo
+echo "16. work on no remote is reported for an OpenAI run too"
+mkjob_openai j16
+FAKE_MODE=dirty FAKE_SESSION=thr-dirty "$AL" run j16 >/dev/null 2>&1
+sleep 2
+lastrun | grep -q 'UNDELIVERED' && [ -n "$(dirs j16)" ] && ok "UNDELIVERED, and the tree is kept" || bad "no UNDELIVERED note, or tree gone"
+
+echo
+echo "17. the launch line of a fresh OpenAI run, read back off the stand-in's argv"
+argv17="$ROOT/argv-17"; rm -f "$argv17"
+mkjob_openai j17 read-only
+FAKE_ARGV_OUT="$argv17" FAKE_MODE=complete FAKE_SESSION=thr-argv "$AL" run j17 >/dev/null 2>&1
+sleep 1
+argc17="$(awk -F'\t' '$1=="ARGC" {print $2; exit}' "$argv17")"
+[ "$(at_in "$argv17" 1)" = "exec" ] && [ "$(at_in "$argv17" 2)" = "--json" ] && ok "exec --json" || bad "argv: $(tr '\n' ' ' < "$argv17")"
+ci="$(idx_in "$argv17" -C)"; cwd17="$(at_in "$argv17" $((ci + 1)))"
+# Asserted on the PATH, not with `-d`: this run declares a clean ending, so its
+# worktree is torn down by the time the argv is read back here.
+case "${ci:+$cwd17}" in
+  "$ROOT/data/worktrees/j17/"*) ok "-C names the run's working directory" ;;
+  *) bad "-C missing or not the run's worktree: '$cwd17'" ;;
+esac
+mi="$(idx_in "$argv17" -m)"; [ "$(at_in "$argv17" $((mi + 1)))" = "gpt-5.6-sol" ] && ok "-m carries the slug verbatim" || bad "-m $(at_in "$argv17" $((mi + 1)))"
+si="$(idx_in "$argv17" -s)"; [ "$(at_in "$argv17" $((si + 1)))" = "read-only" ] && ok "-s read-only" || bad "-s '$(at_in "$argv17" $((si + 1)))'"
+[ -n "$(idx_in "$argv17" approval_policy=never)" ] && ok "-c approval_policy=never, bare" || bad "no bare approval_policy=never"
+[ -n "$(idx_in "$argv17" model_reasoning_effort=high)" ] && ok "-c model_reasoning_effort=high, bare" || bad "no bare effort override"
+[ -z "$(idx_in "$argv17" --disable)" ] && ok "no --disable flag: it closes nothing (measured)" || bad "--disable was passed"
+[ -z "$(idx_in "$argv17" --skip-git-repo-check)" ] && bad "no --skip-git-repo-check" || ok "--skip-git-repo-check"
+dd="$(idx_in "$argv17" --)"; [ -n "$dd" ] && [ "$((dd + 1))" = "$argc17" ] \
+  && ok "the prompt is the one argument after --" || bad "-- at '$dd', argc $argc17"
+
+echo
+echo "18. a spent OpenAI quota is rate_limited, outside the backoff"
+mkjob_openai j18
+echo '{"j18":{"fail_streak":2}}' > "$ROOT/data/state.json"
+FAKE_MODE=quota FAKE_SESSION=thr-quota "$AL" run j18 >/dev/null 2>&1
+sleep 2
+[ "$(lastrun | jq -r .status)" = "error" ] && [ "$(lastrun | jq -r .cause)" = "rate_limited" ] \
+  && ok "error / rate_limited" || bad "$(lastrun | jq -c '{status,cause}')"
+[ "$(jq -r '.j18.fail_streak' "$ROOT/data/state.json")" = "2" ] && ok "fail_streak untouched" || bad "streak $(jq -r '.j18.fail_streak' "$ROOT/data/state.json")"
+[ "$(jq -r '.openai.five_hour.status' "$ROOT/data/rate-limits.json")" = "usage_limit_reached" ] \
+  && ok "and the fuller openai window is marked spent until its reset" || bad "window status $(jq -c .openai "$ROOT/data/rate-limits.json")"
+
+echo
+echo "19. a stop ends an OpenAI run that will not end by itself"
+mkjob_openai j19
+FAKE_MODE=hang FAKE_SESSION=thr-hang "$AL" run j19 >/dev/null 2>&1 &
+w=0; while [ "$w" -lt 20 ] && ! ls "$ROOT"/data/locks/j19/*/child >/dev/null 2>&1; do sleep 1; w=$((w + 1)); done
+sleep 1
+"$AL" stop j19 >/dev/null 2>&1
+wait
+[ "$(lastrun | jq -r .status)" = "stopped" ] && ok "status stopped (waited ${w}s for the slot)" || bad "status $(lastrun | jq -r .status)"
+[ ! -e "$ROOT"/data/logs/j19/*.raw.fifo ] && ok "the FIFO was removed" || bad "FIFO left behind"
+
+echo
+echo "20. a run that cannot start is refused in tick.log before it costs a slot"
+mkjob_openai j20
+FAKE_CODEX_LOGGED_OUT=1 "$AL" run j20 >/dev/null 2>&1
+grep -q 'j20: openai is not ready (codex is not signed in' "$ROOT/data/tick.log" && ok "no login → refused" || bad "no login refusal line"
+[ ! -d "$ROOT/data/logs/j20" ] && ok "and no log was written" || bad "a run started without a login"
+sed -i '' 's/"gpt-5.6-sol"/"gpt-nope"/' "$ROOT/config/jobs.json"
+"$AL" run j20 >/dev/null 2>&1
+grep -q "j20: model 'gpt-nope' is not in the OpenAI catalog" "$ROOT/data/tick.log" && ok "unknown slug → refused" || bad "no catalog refusal"
+mkjob_openai j20
+sed -i '' 's/"platform":"openai"/"platform":"openai","interactive":true/' "$ROOT/config/jobs.json"
+"$AL" run j20 >/dev/null 2>&1
+grep -q "j20: interactive is not available on openai" "$ROOT/data/tick.log" && ok "interactive → refused" || bad "no interactive refusal"
+mkjob_openai j20
+sed -i '' 's/"platform":"openai"/"platform":"openai","disallowed_tools":"Agent"/' "$ROOT/config/jobs.json"
+FAKE_MODE=complete FAKE_SESSION=thr-tools "$AL" run j20 >/dev/null 2>&1
+grep -q "j20: disallowed_tools is ignored on openai" "$ROOT/data/tick.log" && ok "disallowed_tools → one line, run goes on" || bad "no ignored-tools line"
+sleep 2
+[ "$(lastrun | jq -r .status)" = "success" ] && ok "and the run itself went on to finish" || bad "status $(lastrun | jq -r .status)"
+
+echo
+echo "21. the run-end hook learns the platform, the cost basis and the tokens"
+mkdir -p "$ROOT/config/hooks"
+printf '#!/bin/bash\nprintf "%%s %%s %%s\\n" "$AL_PLATFORM" "$AL_COST_BASIS" "$AL_TOKENS" > "%s/hook-21.out"\n' "$ROOT" > "$ROOT/config/hooks/on-run-end.sh"
+chmod +x "$ROOT/config/hooks/on-run-end.sh"
+mkjob_openai j21
+FAKE_MODE=complete FAKE_SESSION=thr-hook "$AL" run j21 >/dev/null 2>&1
+sleep 3
+case "$(cat "$ROOT/hook-21.out" 2>/dev/null)" in
+  "openai estimated {"*'"input":32675'*) ok "AL_PLATFORM, AL_COST_BASIS and AL_TOKENS reach the hook" ;;
+  *) bad "hook saw: $(cat "$ROOT/hook-21.out" 2>/dev/null)" ;;
+esac
+rm -f "$ROOT/config/hooks/on-run-end.sh"
+
+echo
+echo "22. a session is resumed on the platform it ran on, or not at all"
+mkjob_openai j22
+FAKE_MODE=undeclared FAKE_SESSION=thr-moved "$AL" run j22 >/dev/null 2>&1
+sleep 2
+sed -i '' 's/"platform":"openai"/"platform":"anthropic"/; s/"gpt-5.6-sol"/"opus"/; s/"workspace-write"/"dontAsk"/; s/"effort":"high"/"effort":"low"/' "$ROOT/config/jobs.json"
+"$AL" resume j22 thr-moved >/dev/null 2>&1
+grep -q 'j22: refusing to resume thr-moved — this session belongs to openai; the job now runs on anthropic' "$ROOT/data/tick.log" \
+  && ok "the resume is refused, naming both platforms" || bad "no refusal line for the moved job"
+[ -n "$(dirs j22)" ] && ok "and the open session's tree is left where it was" || bad "the tree was taken"
 
 echo
 printf '\n  %s passed, %s failed\n' "$pass" "$fail"

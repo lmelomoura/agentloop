@@ -9,6 +9,7 @@ config/jobs.json.bak*
 config/*.bak*
 config/projects.json
 config/models.json
+config/pricing.json
 
 # Personal precheck scripts (keep only the shipped examples)
 config/prechecks/*.sh

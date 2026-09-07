@@ -18,6 +18,7 @@ is generic: a job is just *a schedule + a precheck + a prompt*.
 - **macOS** (uses `launchd` and BSD `date` — not Linux/Windows).
 - **[Claude Code CLI](https://claude.com/claude-code)** on your `PATH` (`claude --version` must work and be signed in).
 - `jq`, `python3`, `curl` (python3 ships with the Xcode command-line tools; `jq` via `brew install jq`).
+- Codex CLI 0.148 or later, signed in — **optional**, for jobs on the OpenAI platform (see **Platforms**).
 
 ---
 
@@ -227,13 +228,14 @@ A job is one object in `config/jobs.json`. Fields:
 | `active_hours` | `"08:00-20:00"` (empty = 24h) |
 | `active_days` | `[1..7]`, 1=Mon |
 | `project` | optional group; the job inherits the project's `cwd` (see **Projects**) |
-| `model` | an exact model id (`claude-opus-5`, …) or a family (`opus`/`sonnet`/`haiku`/`fable`) |
-| `effort` | `low`/`medium`/`high`/`xhigh`/`max` — how hard the model thinks (omit = the CLI decides) |
+| `platform` | `anthropic` (Claude Code) or `openai` (Codex CLI); omit to inherit the project's, which defaults to `anthropic`. `model`, `effort` and `permission_mode` keep their names and take that platform's vocabulary — see **Platforms** |
+| `model` | an exact model id (`claude-opus-5`, …) or a family (`opus`/`sonnet`/`haiku`/`fable`). On `openai`: a catalog slug (`gpt-5.6-sol`), verbatim |
+| `effort` | `low`/`medium`/`high`/`xhigh`/`max` — how hard the model thinks (omit = the CLI decides). On `openai`: the model's own levels (up to `ultra`) |
 | `max_budget_usd` | hard ceiling per single run |
 | `daily_budget_usd` | ceiling on total spend per day (**omit = no cap**) |
 | `stall_timeout_seconds` | kill a run only after this long with **no output** (default 1200) |
 | `timeout_seconds` | optional absolute time cap (**omit = no limit**) |
-| `permission_mode` | `dontAsk`, `bypassPermissions` (full autonomy, needed for headless tool use), … |
+| `permission_mode` | `dontAsk`, `bypassPermissions` (full autonomy, needed for headless tool use), … On `openai`: `read-only`, `workspace-write` or `full-access` |
 | `allowed_tools` | allowlist passed as `--allowedTools`, whole and as a single argument — so a comma-separated list *and* a specifier containing a space, like `Bash(git *)`, both arrive intact (**omit = every tool**) |
 | `disallowed_tools` | denylist passed as `--disallowedTools`, same handling (**omit = nothing denied**). Set both fields and **deny wins** for any tool named in each — an allowlist can never re-open what the denylist closed. A security analysis is derived with `Agent` here (the CLI's own tool roster calls that tool `Task`), so it cannot spend its budget on subagents instead of triage |
 
@@ -498,7 +500,10 @@ once", which every project that isolates eventually meets.
 Three ceilings, each answering a different question.
 
 - **Per-run** (`max_budget_usd`) — passed to `claude -p --max-budget-usd`; caps a
-  single run. Job value first, else the project's.
+  single run. Job value first, else the project's. On OpenAI there is no such
+  flag: when the run ends, the estimated cost is compared with the job's own
+  `max_budget_usd` (not the project's) and a run that otherwise succeeded is
+  marked BUDGET LIMITED at 90% of it — a warning, never a stop.
 - **Per-day, per job** (`daily_budget_usd`) — the engine sums today's runs for
   the job before each scheduled run and skips (status `capped`) once the total
   reaches the cap. Job value first, **else the project's** — so a project with
@@ -518,7 +523,8 @@ Three ceilings, each answering a different question.
   cost me?" is the sum.
 
 All three are skipped for a **forced** run (Run now), which is a deliberate
-override — the same way it bypasses the precheck.
+override — the same way it bypasses the precheck. Estimated costs (OpenAI)
+count towards the daily caps like reported ones.
 
 ### Backing off a job that keeps failing
 
@@ -579,6 +585,10 @@ To wire it, in `~/.claude/settings.json`:
 
 It prints `5h 62% · 7d 18%`, so it still earns its place as a status line.
 
+The statusline feeds the `anthropic` block only. The `openai` block is fed by
+every Codex run's rollout, so there is nothing to wire for it; `agentloop
+usage` lists both.
+
 ### Telling someone a run ended: `config/hooks/on-run-end.sh`
 
 A loop that can only be checked by opening a web page is not really unattended.
@@ -593,6 +603,9 @@ after every run, with the outcome in its environment:
 | `AL_NOTE` | why it ended as it did (`BUDGET LIMITED: …`, `NOTHING TO DO: …`, a watchdog reason) |
 | `AL_PROJECT`, `AL_SESSION`, `AL_LOG` | |
 | `AL_START`, `AL_END`, `AL_DURATION` | epoch seconds, and the span |
+| `AL_PLATFORM` | `anthropic` or `openai` |
+| `AL_COST_BASIS` | `reported`, `estimated` or `none` — where `AL_COST` came from |
+| `AL_TOKENS` | the run's token counts as JSON (`{input, cached, cache_write, output, reasoning}`), or `null` when unknown |
 | `AL_DASHBOARD` | the dashboard URL |
 
 The engine knows nothing about notifiers, so this is where they go:
@@ -727,11 +740,90 @@ by the engine, not by the CLI alias: an alias points at the newest model the
 resolve-models` probes for the newest of each family and caches the answer in
 `config/models.json`; the tick refreshes it roughly once a day on its own.
 
+On the OpenAI platform a model is a catalog slug used verbatim (`gpt-5.6-sol`);
+`agentloop resolve-models openai` reads the catalog from `codex debug models`
+into the same `config/models.json`, and `resolve-models` with no argument
+refreshes both platforms.
+
 ### Effort
 
 `effort` maps to `claude -p --effort`. Higher levels make the model think longer —
 better results, more tokens and more time. The dashboard exposes it as a slider
 from *Faster* to *Smarter*; leave it at **Default** to let the CLI decide.
+
+On OpenAI it maps to `-c model_reasoning_effort=<level>`, and the levels are the
+model's own (the catalog says; `gpt-5.6-sol` accepts `ultra`).
+
+---
+
+## Platforms
+
+A job, a project or a project's `security` block can run on one of two
+platforms. `platform` is the field; everything else keeps its name and takes
+that platform's vocabulary.
+
+| | `anthropic` (default) | `openai` |
+|---|---|---|
+| CLI | Claude Code, `claude -p` | Codex CLI, `codex exec --json` |
+| `model` | a family (`opus`) or an id (`claude-opus-5`) | a catalog slug (`gpt-5.6-sol`), verbatim — no families |
+| `effort` | `low` `medium` `high` `xhigh` `max` | the model's own levels (`gpt-5.6-sol` goes up to `ultra`) |
+| `permission_mode` | `dontAsk`, `bypassPermissions`, … | `read-only`, `workspace-write`, `full-access` |
+| `interactive` | yes | no — `codex exec` has no stdin protocol; the run is refused |
+| `allowed_tools`, `disallowed_tools` | yes | ignored, with a line in `tick.log`: Codex cannot close a tool by flag (measured: `--disable multi_agent` leaves `spawn_agent` in the roster) |
+| `max_budget_usd` | `--max-budget-usd`, stops the run | no flag: the cap is read at the end and produces the BUDGET LIMITED warning |
+| cost | reported by the CLI | **estimated** from tokens with `config/pricing.json` |
+| usage windows | the statusline (see `agentloop usage`) | every run's own rollout — nothing to wire |
+
+**Choosing.** Set `"platform": "openai"` on the job, or on the project so its
+jobs inherit it. `agentloop set-field <id> platform openai` rewrites a
+`model`, `effort` or `permission_mode` the new platform does not know to that
+platform's default and prints each rewrite; `create` takes the platform's
+defaults. The OpenAI catalog comes from `codex debug models`: `agentloop
+resolve-models openai` writes it into `config/models.json`, the tick
+refreshes it daily, and a slug outside it is refused at launch — a
+deprecated slug still runs, with its successor named in `tick.log`.
+
+**What a run needs.** The Codex CLI installed and signed in (`codex login`);
+a job whose platform is not ready is skipped before it costs a slot, with the
+reason in `tick.log` (`codex is not signed in`, `codex not found at …`).
+`AGENTLOOP_CODEX_BIN` overrides the binary; `CODEX_HOME` is the CLI's own
+variable and picks the account and where its rollouts live.
+
+**How a Codex run is read.** `bin/platforms/openai_stream.py` translates the
+Codex event stream into the stream-json every reader here already speaks, so
+the Timeline, the Terminal, the classifier and the salvage of a killed run
+all work unchanged; the raw Codex stream is kept beside it as
+`<run>.stream.ndjson.raw` until the run is pruned. The session id is the
+Codex thread id, and a resume is `codex exec resume` on that thread — on the
+platform the run used, read from the journal; a job that changed platform
+since is refused with both named. The model that actually ran and the usage
+windows are not on the stream: both are read from the rollout under
+`$CODEX_HOME/sessions` when the run ends.
+
+**Cost.** Codex reports tokens, never dollars. The final event carries an
+estimate — `(input − cached) × input + cached × cached_input + cache_write ×
+cache_write + output × output`, per million, from `config/pricing.json`
+(seeded from `config/pricing.example.json` by `install.sh`; the numbers are
+the OpenAI price page's as read on 2026-09-07 — check them) — and every run
+records `cost_basis`: `reported` (Claude), `estimated`, or `none` when the
+model has no price or the run died without a final event. The daily caps sum
+estimates like any other cost; a run with `none` counts as zero towards
+them. Showing `none` as a dash instead of $0.00, and the estimate as such, is
+the dashboard's part and lands with it (see the next release's notes).
+`output_tokens` includes reasoning, so reasoning is reported
+(`tokens.reasoning`) but never billed twice.
+
+**Usage windows.** `data/rate-limits.json` holds one block per platform. The
+Codex CLI reports both windows on every turn, so every OpenAI run feeds its
+block; a run that ended on a quota refusal (`rate_limited`, outside the
+failure backoff) marks the fuller window spent until its own reset, when the
+refusal's rollout still reports the windows — a rollout that carries none
+leaves the file as it was. The gate is per platform: a spent Claude window
+never holds a Codex run back, nor the reverse.
+
+**Security analyses** on OpenAI are the next release's: the block already
+carries `platform`, and an analysis derived with it runs, but the prompt
+still speaks of the `Agent` tool. See `docs/superpowers/plans/`.
 
 ---
 
@@ -1472,10 +1564,10 @@ agentloop create <id>        # JSON object on stdin
 agentloop set-prompt <id>    # prompt on stdin
 agentloop set-precheck <id>  # script on stdin
 agentloop set-field <id> <field>   # value on stdin (interval_seconds, active_hours,
-                               #   active_days, model, effort, max_budget_usd,
-                               #   daily_budget_usd, stall_timeout_seconds,
-                               #   timeout_seconds, permission_mode, description,
-                               #   cwd, project)
+                               #   active_days, platform, model, effort,
+                               #   max_budget_usd, daily_budget_usd,
+                               #   stall_timeout_seconds, timeout_seconds,
+                               #   permission_mode, description, cwd, project)
 agentloop delete <id>        # remove the job (its logs are kept)
 agentloop project-set        # create/update a project (JSON on stdin)
 agentloop project-list | project-delete <name>
@@ -1485,7 +1577,8 @@ agentloop worktree-drop <id> <stamp>   # discard a preserved run dir for good
 agentloop security analyze [--detach] <project> <repo> <branch> [profile]
                                #   run an analysis (see Security analysis)
 agentloop security-branches <project> <repo>   # branches that checkout has
-agentloop resolve-models     # refresh which model each family points at
+agentloop resolve-models [anthropic|openai]  # refresh the model catalogs (both, without an argument)
+agentloop platforms          # what each platform offers, and whether it is ready
 agentloop skills             # show / link the skills the agent prompts require
 agentloop selftest           # offline checks of the logic that can kill a run
 agentloop install | uninstall
@@ -1493,6 +1586,7 @@ agentloop install | uninstall
 
 Environment overrides: `AGENTLOOP_PORT`, `AGENTLOOP_CONFIG`,
 `AGENTLOOP_DATA`, `AGENTLOOP_CLAUDE_BIN`, `AGENTLOOP_CLAUDE_CONFIG_DIR`,
+`AGENTLOOP_CODEX_BIN`, `CODEX_HOME` (this one is the Codex CLI's own),
 `AGENTLOOP_PYTHON`, `AGENTLOOP_JQ`, `AGENTLOOP_LOG_MAX` (log rotation
 threshold, default 4 MiB), `AGENTLOOP_HOOK_TIMEOUT`, `AGENTLOOP_LOCK_GRACE`,
 `AGENTLOOP_SESSION_TTL` (open-session expiry, in seconds, default 86400).

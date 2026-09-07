@@ -18,6 +18,93 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The OpenAI platform, engine side.** A job, a project or a project's
+  security block can say `"platform": "openai"` and its runs go through the
+  Codex CLI (`codex exec --json`) instead of Claude Code — same journal, same
+  dashboard, same resume and stop, same dollar caps. Measured against Codex CLI
+  0.148.0; the evidence is `docs/superpowers/specs/2026-09-06-codex-measurements/`
+  and the fixtures the tests read are copies of it under `test/fixtures/codex/`.
+  What it cost to not have it: the only agent this scheduler could run was the
+  one it was named after.
+  - The eight measurements the design left open are closed. Three corrected
+    it: Codex subagents cannot be switched off by flag (`--disable multi_agent`
+    leaves `spawn_agent` in the roster), `exec resume` works in the process's
+    own directory and takes `-c sandbox_mode=…`, and `-c` values are passed
+    bare. The design carries a *Corrections* section with the rest.
+  - `bin/platforms/openai_stream.py` translates the Codex event stream into
+    the stream-json every reader here already speaks, one line at a time and
+    unbuffered, and keeps a verbatim copy of the raw stream beside it. The
+    Codex stream carries tokens and no dollars, so the final event carries a
+    cost ESTIMATED from `config/pricing.json` (seeded from
+    `config/pricing.example.json` by `install.sh`; the numbers are the OpenAI
+    price page's as read on 2026-09-07), with `cost_basis` saying so — or
+    `none`, never a fake $0.00, when the model has no price. A run that is cut
+    off after a benign Codex warning still reaches the engine's salvage path:
+    item-level errors are shown as text, never treated as the run's ending; a
+    turn with no usage carries no estimate.
+  - The engine has a platform table (`platform_*` in `bin/agentloop`): which
+    binary, whether it is ready (for Codex: installed AND signed in), what it
+    can and cannot do, and the launch line — measured, including the resume
+    that runs in the process's own directory. An OpenAI run goes down a FIFO
+    into the normalizer; the CLI is still `$child`, so stop, the watchdog and
+    wait are unchanged. Runs that cannot start are refused in `tick.log`
+    before a slot is taken: unknown platform, Codex missing or signed out,
+    `interactive` on OpenAI, a slug outside the catalog. `test/fake-codex`
+    stands in for the CLI offline, and `test/e2e.test.sh` drives an OpenAI run
+    through complete, undeclared, dirty, resume, stop, quota and refusal.
+    Deleting a run from the dashboard removes the raw Codex copy with the
+    run's other files.
+  - `agentloop resolve-models [anthropic|openai]` keeps `config/models.json`
+    current for both platforms (the tick refreshes both daily); the OpenAI
+    block comes from `codex debug models`, falling back to the bundled
+    catalog, and says `available: false` with a reason when there is no
+    Codex. `/api/models` now carries a `platforms` object — models, effort
+    levels, permission modes and defaults per platform, and whether each
+    slug has a price — while its old keys stay as they were for the current
+    page. `agentloop platforms` prints the same from the terminal.
+    `agentloop platforms` reports the effort levels the catalog actually
+    lists, and a corrupted `config/models.json` is reseeded rather than left
+    unreadable.
+  - `platform` is a field on a job, on a project (its jobs inherit it) and on
+    a project's `security` block. `set-field platform` rewrites a model,
+    effort or permission mode the new platform does not know to that
+    platform's default and says so; `set-field model|effort|permission_mode`
+    validate against the job's platform (an OpenAI slug outside the catalog
+    is refused, naming the catalog); `create` takes the platform's defaults,
+    including under an OpenAI project. `config/jobs.example.json` carries a
+    disabled OpenAI example. `project-set` refuses a platform it does not
+    know, and a job under a project with an unreadable platform is treated
+    as Anthropic rather than emptied.
+  - Every run now records `platform`, `cost_basis` and `tokens` in the
+    journal and in `index.db` (additive columns; older rows are backfilled
+    as anthropic/reported, with tokens from the stored result), `/api/data`
+    and the run detail carry them, and `on-run-end.sh` receives
+    `AL_PLATFORM`, `AL_COST_BASIS` and `AL_TOKENS`. A resume continues its
+    session on the platform that run used; a job that changed platform
+    since is refused with both named. The raw Codex stream is pruned with
+    the run's other artifacts.
+  - `data/rate-limits.json` has one block per platform (a file from before
+    is read as `anthropic` and rewritten on first contact). Every OpenAI run
+    feeds its block from the Codex rollout — the CLI reports both windows on
+    every turn, so there is no statusline to wire — and a run that ended on
+    a quota refusal marks the fuller window spent until its reset. The gate
+    is per platform: a spent Anthropic window never holds a Codex run back,
+    nor the reverse, and `agentloop usage` lists both.
+  - README: a *Platforms* section (choosing, vocabularies, what each
+    platform lacks, how a Codex run is read, estimated cost and the price
+    table, usage windows), and *Models*, *Effort*, *Budgets*, *usage* and
+    *CLI* updated; the dashboard's own view of estimated and unknown costs
+    is the next release's. Accepted against Codex CLI 0.148.0 with a real
+    run, a real resume on the same thread and a refused slug, read end to
+    end.
+  - The old `models` key of `/api/models` lists Anthropic models only, so the
+    current dashboard never offers a Codex slug to a Claude job; `rl_migrate`
+    merges a file that carries both shapes by `seen_at`; `resolve-models
+    openai` exits non-zero when the catalog could not be written;
+    `on-run-end.sh`'s three new variables are documented.
+
 ### Changed
 
 - **claude-cron is now agentloop.** The scheduler runs more than one agent from

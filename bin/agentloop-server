@@ -28,6 +28,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -628,7 +629,7 @@ def db_conn():
     return conn
 
 
-SCHEMA_VERSION = "5"   # bumped to backfill model_id from stored streams
+SCHEMA_VERSION = "6"   # platform, cost_basis and tokens columns; backfill from result_json.usage
 STREAM_CAP = 2_000_000
 
 
@@ -646,7 +647,8 @@ def db_init(conn):
         duration INTEGER, cost REAL, session TEXT, log TEXT, forced INTEGER,
         precheck_note TEXT, result_json TEXT, stream TEXT, precheck_txt TEXT,
         stderr TEXT, doc TEXT, project TEXT, model TEXT, model_id TEXT,
-        note TEXT, resumed_from TEXT, cause TEXT, pruned INTEGER DEFAULT 0)""")
+        note TEXT, resumed_from TEXT, cause TEXT, platform TEXT, cost_basis TEXT,
+        tokens TEXT, pruned INTEGER DEFAULT 0)""")
     try:
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS runs_fts USING fts5(key UNINDEXED, content)")
         return True
@@ -677,7 +679,7 @@ def _logs_root():
 
 
 def _artifact_paths(rec):
-    """The four on-disk artifacts of one run — confined to data/logs/."""
+    """The five on-disk artifacts of one run — confined to data/logs/."""
     try:
         logp = Path(rec.get("log", "")).resolve()
     except Exception:
@@ -686,6 +688,10 @@ def _artifact_paths(rec):
         return None
     return {"json": logp,
             "stream": logp.with_name(logp.stem + ".stream.ndjson"),
+            # The raw Codex stream an OpenAI run keeps beside the normalized
+            # one. Only the prune reads it -- _read_artifacts names its own
+            # keys, so nothing here tries to store its content.
+            "raw": logp.with_name(logp.stem + ".stream.ndjson.raw"),
             "precheck": logp.with_name(logp.stem + ".precheck.txt"),
             "err": Path(str(logp) + ".err")}
 
@@ -834,6 +840,50 @@ def _salvage_from_stream(stream):
     return last_text, turns, sess
 
 
+def _tokens_json(rec, art):
+    """The run's token counts as the JSON the `tokens` column stores: what the
+    engine recorded, else what the stored result's `usage` says (older runs,
+    and every Anthropic run before the engine recorded tokens), else ""."""
+    if "tokens" in rec:                 # the engine wrote it: a dict, or null for "unknown"
+        t = rec.get("tokens")
+        return json.dumps(t) if isinstance(t, dict) else ""
+    try:
+        usage = (json.loads(art.get("result_json") or "{}") or {}).get("usage")
+    except Exception:  # noqa: BLE001
+        usage = None
+    if not isinstance(usage, dict):
+        return ""
+
+    def n(*keys):
+        for k in keys:
+            v = usage.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return int(v)
+        return 0
+    return json.dumps({"input": n("input_tokens"),
+                       "cached": n("cache_read_input_tokens", "cache_read_tokens"),
+                       "cache_write": n("cache_creation_input_tokens", "cache_write_tokens"),
+                       "output": n("output_tokens"), "reasoning": n("reasoning_output_tokens")})
+
+
+def _platform_from_stream(stream):
+    """The platform a stream came from: the init event says `openai` for a
+    normalized Codex stream; everything else is Claude Code."""
+    if not stream:
+        return "anthropic"
+    for line in stream.splitlines()[:40]:
+        line = line.strip()
+        if not line or '"init"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        if ev.get("type") == "system" and ev.get("subtype") == "init":
+            return ev.get("platform") or "anthropic"
+    return "anthropic"
+
+
 def _upsert(conn, fts, rec, preserve=None):
     """Insert or refresh one journal record. `preserve` carries the existing
     row for already-pruned runs — their files are gone, so their stored
@@ -850,13 +900,13 @@ def _upsert(conn, fts, rec, preserve=None):
     conn.execute(
         "INSERT OR REPLACE INTO runs (key, job, start, status, duration, cost, session,"
         " log, forced, precheck_note, result_json, stream, precheck_txt, stderr, doc, project,"
-        " model, model_id, note, resumed_from, cause, pruned)"
-        # 22 columns, 22 placeholders. This line shipped with 21 once (the
+        " model, model_id, note, resumed_from, cause, platform, cost_basis, tokens, pruned)"
+        # 25 columns, 25 placeholders. This line shipped with 21 once (the
         # `cause` column arrived without its `?`), and the failure mode was
         # vicious: nothing broke until the FIRST new journal line reached this
         # code, then every ingest raised, load_data's except swallowed it, and
         # the dashboard said "No runs recorded yet" over an intact journal.
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (key, rec.get("id", ""), rec.get("start", 0), rec.get("status", ""),
          rec.get("duration", 0), rec.get("cost", 0), rec.get("session", ""),
          rec.get("log", ""), 1 if rec.get("forced") else 0,
@@ -865,7 +915,13 @@ def _upsert(conn, fts, rec, preserve=None):
          rec.get("project") or "", rec.get("model") or "",
          (rec.get("model_id") or _model_id_from_stream(art["stream"])),
          (rec.get("note") or "")[:500], rec.get("resumed_from") or "",
-         (rec.get("cause") or "")[:40], pruned))
+         (rec.get("cause") or "")[:40],
+         rec.get("platform") or "anthropic",
+         # A journal line from before cost_basis existed reported its cost
+         # straight from the CLI, which is what "reported" means.
+         rec.get("cost_basis") or "reported",
+         _tokens_json(rec, art),
+         pruned))
     if fts:
         conn.execute("DELETE FROM runs_fts WHERE key=?", (key,))
         conn.execute("INSERT INTO runs_fts (key, content) VALUES (?,?)", (key, doc))
@@ -922,6 +978,9 @@ def ingest():
                 ("resumed_from", "TEXT"),
                 # WHY a failed run failed. Empty for everything that did not.
                 ("cause", "TEXT"),
+                # Which CLI ran it, how its cost is known, and its token
+                # counts as JSON. Additive, like `cause` before them.
+                ("platform", "TEXT"), ("cost_basis", "TEXT"), ("tokens", "TEXT"),
                 ("pruned", "INTEGER DEFAULT 0"),
             ]
             for name, decl in canon:
@@ -1364,12 +1423,16 @@ def delete_run(jid, start):
         return _forget_stranded_row(jid, start, removed)
 
     # On-disk artifacts, plus the transient siblings a run can leave behind.
+    # The raw Codex copy is listed here as well as in `_artifact_paths`: this
+    # path deletes a run whether or not it was ever ingested, and the second
+    # `exists()` is simply false when the prune already took it.
     ap = _artifact_paths(target) or {}
     extra = []
     try:
         logp = Path(target.get("log", ""))
         if str(logp.resolve()).startswith(str(_logs_root())):
-            extra = [Path(str(logp) + ".watchdog"), Path(str(logp) + ".stdin"),
+            extra = [logp.with_name(logp.stem + ".stream.ndjson.raw"),
+                     Path(str(logp) + ".watchdog"), Path(str(logp) + ".stdin"),
                      Path(str(logp) + ".turnend")]
     except Exception:  # noqa: BLE001
         extra = []
@@ -1424,6 +1487,7 @@ def _forget_stranded_row(jid, start, removed):
             logp = Path(row["log"] or "")
             if str(logp) and str(logp.resolve()).startswith(str(_logs_root())):
                 for p in (logp, logp.with_name(logp.stem + ".stream.ndjson"),
+                          logp.with_name(logp.stem + ".stream.ndjson.raw"),
                           logp.with_name(logp.stem + ".precheck.txt"),
                           Path(str(logp) + ".err"), Path(str(logp) + ".watchdog")):
                     if p.exists():
@@ -1953,7 +2017,7 @@ def load_data():
         conn = db_conn()
         db_init(conn)
         for row in conn.execute(
-                "SELECT job, start, status, duration, cost, session, log, forced, precheck_note, project, note, resumed_from, cause"
+                "SELECT job, start, status, duration, cost, session, log, forced, precheck_note, project, note, resumed_from, cause, platform, cost_basis"
                 " FROM runs ORDER BY start DESC, rowid DESC LIMIT 1000"):
             runs.append({"id": row["job"], "start": row["start"], "status": row["status"],
                          "duration": row["duration"], "cost": row["cost"],
@@ -1965,7 +2029,9 @@ def load_data():
                          "note": row["note"] or "",
                          # the session this run continued, when it was a resume
                          "resumed_from": row["resumed_from"] or "",
-                         "cause": row["cause"] or ""})
+                         "cause": row["cause"] or "",
+                         "platform": row["platform"] or "anthropic",
+                         "cost_basis": row["cost_basis"] or "reported"})
         conn.close()
     except Exception as exc:  # noqa: BLE001
         # Degrade to an empty list so the page still paints — but SAY SO.
@@ -2055,7 +2121,8 @@ def load_live_detail(jid, start_i):
     rec = {"id": jid, "start": start_i, "status": "running",
            "duration": max(0, int(time.time()) - start_i), "cost": None, "session": sess,
            "log": logp, "forced": False, "precheck": (pc.get("output") if isinstance(pc, dict) else "") or "",
-           "project": "", "model": "", "model_id": _model_id_from_stream(stream), "live": True}
+           "project": "", "model": "", "model_id": _model_id_from_stream(stream),
+           "platform": _platform_from_stream(stream), "cost_basis": "", "live": True}
     interactive = False
     try:
         for j in json.loads(JOBS_FILE.read_text()).get("jobs", []):
@@ -2108,7 +2175,9 @@ def load_run_detail(jid, start):
            # for a run whose journal entry said exactly why it ended.
            "note": row["note"] or "",
            "cause": row["cause"] or "",
-           "model": row["model"] or "", "model_id": row["model_id"] or ""}
+           "model": row["model"] or "", "model_id": row["model_id"] or "",
+           "platform": row["platform"] or "anthropic",
+           "cost_basis": row["cost_basis"] or "reported"}
     detail = {"record": rec, "agent": {}, "precheck": row["precheck_txt"] or "",
               "stderr": (row["stderr"] or "")[:8000], "turns": []}
     try:
@@ -2132,6 +2201,11 @@ def load_run_detail(jid, start):
             }
     except Exception as e:  # noqa: BLE001
         detail["error"] = str(e)
+    try:
+        detail["agent"]["tokens"] = json.loads(row["tokens"]) if row["tokens"] else None
+    except Exception:  # noqa: BLE001
+        detail["agent"]["tokens"] = None
+    detail["agent"]["cost_basis"] = row["cost_basis"] or "reported"
     stream = row["stream"] or ""
     # A killed/crashed run has no final result event, so its stored record can be
     # blank — but the stream still holds everything it did. Rebuild the missing
@@ -2278,6 +2352,27 @@ def al(args, stdin=None, background=False):
         return False, str(e)
 
 
+# The permission vocabulary lives in the engine (platform_permissions); this
+# mirrors it with the labels the page shows, and tests/test_platforms_api.py
+# pins the two together. The label says what the mode DOES on that CLI --
+# the two vocabularies are not the same thing renamed.
+PLATFORM_PERMISSIONS = {
+    "anthropic": [
+        {"v": "acceptEdits", "label": "acceptEdits — edits allowed, commands ask"},
+        {"v": "auto", "label": "auto — the CLI decides per tool"},
+        {"v": "bypassPermissions", "label": "bypassPermissions — nothing asks"},
+        {"v": "manual", "label": "manual — everything asks (headless: everything denied)"},
+        {"v": "dontAsk", "label": "dontAsk — allowlisted tools only, no prompts"},
+        {"v": "plan", "label": "plan — read-only planning"},
+    ],
+    "openai": [
+        {"v": "read-only", "label": "read-only — sandbox: no writes, no network"},
+        {"v": "workspace-write", "label": "workspace-write — sandbox: writes inside the workspace"},
+        {"v": "full-access", "label": "full-access — no sandbox, no approvals"},
+    ],
+}
+ANTHROPIC_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+
 MODEL_FAMILIES = [
     ("opus",   "the most capable"),
     ("sonnet", "balanced capability and speed"),
@@ -2286,8 +2381,86 @@ MODEL_FAMILIES = [
 ]
 
 
+def _openai_platform():
+    """The openai entry of /api/models, from config/models.json's `openai`
+    block. A block that is missing altogether is resolved ONCE, synchronously
+    (`codex debug models` answers in 0 s), when the CLI exists; without the CLI
+    the answer is `available: false` and the reason, never an empty list that
+    looks like "no models"."""
+    path = CONFIG_DIR / "models.json"
+
+    def block():
+        try:
+            return (json.loads(path.read_text()) or {}).get("openai")
+        except Exception:  # noqa: BLE001
+            return None
+
+    b = block()
+    if b is None:
+        codex = _env("CODEX_BIN") or shutil.which("codex") or \
+            ("/opt/homebrew/bin/codex" if os.path.exists("/opt/homebrew/bin/codex") else None)
+        if codex:
+            al(["resolve-models", "openai"])
+            b = block()
+    if not isinstance(b, dict) or not isinstance(b.get("models"), list):
+        reason = (b or {}).get("reason") if isinstance(b, dict) else None
+        return {"available": False, "reason": reason or "codex not installed: run codex login, then agentloop resolve-models openai",
+                "catalog_at": (b or {}).get("at", 0) if isinstance(b, dict) else 0,
+                "models": [], "efforts": [], "permissions": PLATFORM_PERMISSIONS["openai"],
+                "default_model": ""}
+    try:
+        priced = (json.loads((CONFIG_DIR / "pricing.json").read_text()) or {}).get("openai") or {}
+    except Exception:  # noqa: BLE001
+        priced = {}
+
+    def has_price(slug):
+        row = priced.get(slug)
+        return isinstance(row, dict) and all(
+            isinstance(row.get(k), (int, float)) and not isinstance(row.get(k), bool)
+            for k in ("input", "cached_input", "output"))
+
+    visible = sorted((m for m in b["models"] if m.get("visibility", "list") == "list"),
+                     key=lambda m: m.get("priority", 999))
+    models = [{"v": m["slug"], "label": m.get("display_name") or m["slug"],
+               "desc": m.get("description") or "", "efforts": list(m.get("efforts") or []),
+               "default_effort": m.get("default_effort") or "",
+               "deprecated_by": m.get("deprecated_by") or "", "retires_at": m.get("retires_at") or "",
+               "priced": has_price(m["slug"])} for m in visible]
+    efforts, seen = [], set()
+    for m in models:                            # the union over VISIBLE models only, first-seen order
+        for e in m["efforts"]:
+            if e not in seen:
+                seen.add(e); efforts.append(e)
+    return {"available": True, "reason": "", "catalog_at": b.get("at", 0),
+            "models": models, "efforts": efforts,
+            "permissions": PLATFORM_PERMISSIONS["openai"],
+            "default_model": models[0]["v"] if models else ""}
+
+
+def _anthropic_model(value):
+    """The engine's `platform_model_ok anthropic` rule, mirrored: a family name
+    or a `claude-*` id, and nothing else. The families are stripped out again
+    further down; this is only about keeping a foreign id out of the list."""
+    return isinstance(value, str) and (
+        value in {f[0] for f in MODEL_FAMILIES} or value.startswith("claude-"))
+
+
+def _job_platform(job, projects):
+    """A job's effective platform, the way the engine's job_platform() resolves
+    it: the job's own value, else its project's, else anthropic — and anything
+    this server does not know normalises to anthropic too."""
+    p = job.get("platform") or ""
+    if not p:
+        proj = job.get("project") or ""
+        for entry in projects:
+            if entry.get("name") == proj:
+                p = entry.get("platform") or ""
+                break
+    return p if p in PLATFORM_PERMISSIONS else "anthropic"
+
+
 def list_models():
-    """Every concrete model id a job can be pinned to.
+    """Every concrete model id an ANTHROPIC job can be pinned to.
 
     Only exact ids are offered: the user removed the family entries
     (opus/sonnet/…) from the picker on 2026-07-24, wanting each job to say
@@ -2295,6 +2468,13 @@ def list_models():
     and their resolutions are folded in here, which is how an id the installed
     CLI has never heard of (claude-opus-5) still appears. The engine keeps
     honouring a family value if some job still carries one.
+
+    Anthropic-only is the whole point of the filtering below. `models` is what
+    the CURRENT dashboard fills its model selector from, and every job it edits
+    is an Anthropic one — so a Codex slug arriving from the example OpenAI job
+    a fresh install seeds, or from one OpenAI run already in the history, would
+    be offered for a Claude job and then refused by `set-field model` with a
+    500. `platforms.openai.models` is where those slugs belong.
     """
     resolved = {}
     try:
@@ -2324,15 +2504,20 @@ def list_models():
         if f["id"]:
             ids.add(f["id"])
     try:
+        projects = read_json(PROJECTS_FILE, {}).get("projects", [])
         for j in json.loads(JOBS_FILE.read_text()).get("jobs", []):
-            if j.get("model"):
+            if _job_platform(j, projects) != "anthropic":
+                continue
+            if _anthropic_model(j.get("model")):
                 ids.add(j["model"])
     except Exception:  # noqa: BLE001
         pass
     try:
         conn = db_conn()
         try:
-            for row in conn.execute("SELECT DISTINCT model_id FROM runs WHERE coalesce(model_id,'')<>''"):
+            for row in conn.execute(
+                    "SELECT DISTINCT model_id FROM runs"
+                    " WHERE coalesce(model_id,'')<>'' AND model_id LIKE 'claude-%'"):
                 ids.add(row["model_id"])
         finally:
             conn.close()
@@ -2345,8 +2530,13 @@ def list_models():
     def sort_key(v):
         f = next((i for i, x in enumerate(fam_order) if x in v), 9)
         return (f, [-int(n) for n in re.findall(r"\d+", v)])   # newest first
-    return {"models": sorted(ids, key=sort_key),
-            "efforts": ["low", "medium", "high", "xhigh", "max"]}
+    models = sorted(ids, key=sort_key)
+    return {"models": models, "efforts": list(ANTHROPIC_EFFORTS),
+            "platforms": {"anthropic": {"available": True, "reason": "", "models": models,
+                                        "efforts": list(ANTHROPIC_EFFORTS),
+                                        "permissions": PLATFORM_PERMISSIONS["anthropic"],
+                                        "default_model": "opus"},
+                          "openai": _openai_platform()}}
 
 
 def list_dirs(path):
@@ -3504,7 +3694,7 @@ class Handler(BaseHTTPRequestHandler):
             if field not in ("interval_seconds", "active_hours", "active_days",
                              "max_budget_usd", "daily_budget_usd", "model", "timeout_seconds",
                              "stall_timeout_seconds", "effort", "interactive", "max_parallel",
-                             "description", "cwd", "permission_mode", "project"):
+                             "description", "cwd", "permission_mode", "project", "platform"):
                 return self._send(400, {"error": "bad field"})
             ok, out = al(["set-field", jid, field], stdin=value)
         else:

@@ -15,6 +15,24 @@
       "timeout_seconds": 300,
       "permission_mode": "dontAsk",
       "prompt": "Run the shell command `rm -f /tmp/agentloop-hello` to clear the trigger, then reply with one friendly line confirming agentloop is working and the current date."
+    },
+    {
+      "id": "example-codex",
+      "description": "Demo job on the OpenAI platform (disabled). Needs `codex login`; enable it, then `touch /tmp/agentloop-codex` to see one run.",
+      "enabled": false,
+      "platform": "openai",
+      "cwd": "/tmp",
+      "interval_seconds": 300,
+      "active_days": [1, 2, 3, 4, 5, 6, 7],
+      "active_hours": "",
+      "precheck": "test -f /tmp/agentloop-codex",
+      "model": "gpt-5.6-luna",
+      "effort": "low",
+      "max_budget_usd": 0.25,
+      "daily_budget_usd": 1,
+      "timeout_seconds": 300,
+      "permission_mode": "workspace-write",
+      "prompt": "Run the shell command `rm -f /tmp/agentloop-codex` to clear the trigger, then reply with one friendly line confirming agentloop can run Codex and the current date."
     }
   ]
 }

@@ -82,6 +82,7 @@ DATA_DIR="${AGENTLOOP_DATA:-$BASE_DIR/data}"
 JOBS_FILE="$CONFIG_DIR/jobs.json"
 PROJECTS_FILE="$CONFIG_DIR/projects.json"
 MODELS_FILE="$CONFIG_DIR/models.json"
+PRICING_FILE="$CONFIG_DIR/pricing.json"   # USD per 1M tokens, per OpenAI slug (install.sh seeds it)
 INTERACTIVE_GRACE=20        # seconds to wait for a human reply before ending
                             # an interactive run that has finished its turn
 MODELS_TTL=86400            # 24h — how long a family→id resolution is trusted,
@@ -115,6 +116,13 @@ SERVER_BIN="$BIN_DIR/agentloop-server"
 PORT="${AGENTLOOP_PORT:-8787}"
 
 CLAUDE_BIN="${AGENTLOOP_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+# The Codex CLI, for runs on the openai platform. On PATH from Homebrew
+# (/opt/homebrew/bin, which the launchd plists already carry); override for a
+# test stand-in or a second install. Its account and its rollouts live under
+# CODEX_HOME (the CLI's own variable, honoured as-is: `--help` says auth still
+# uses it); platform_finish reads the rollout from there after every run.
+CODEX_BIN="${AGENTLOOP_CODEX_BIN:-$(command -v codex 2>/dev/null || echo /opt/homebrew/bin/codex)}"
+CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
 # Which Claude account every run signs in as. Claude Code keeps credentials,
 # settings, plugins, MCP servers and past sessions per config directory — one
 # signed-in account each — so this variable is the only thing that chooses
@@ -287,24 +295,51 @@ security_derived_jobs() {
     security_check_number "$project" max_budget_usd "$budget" "$SECURITY_FALLBACK_BUDGET_USD" \
       || budget="$SECURITY_FALLBACK_BUDGET_USD"
     security_check_number "$project" daily_budget_usd "$daily" || daily=""
-    # The permission mode the analysis runs under. bypassPermissions by
-    # default -- the same headless default every real job here uses -- and
-    # NOT dontAsk: in a headless run dontAsk DENIES every tool that is not
-    # allowlisted, and a fresh worktree has no allowlist, so the agent could
-    # not run a single command (the first live analysis burnt $0.56 probing
-    # the walls and ended BLOCKED). Containment does not come from the
-    # permission mode: the worktree is disposable, the ledger only accepts
-    # writes through the CLI's validating door, and AL_SECURITY_AGENT keeps
-    # the human-authority verbs shut. A project that wants a tighter mode
-    # sets security.permission_mode, and an unknown value falls back rather
-    # than launching a run that dies at the first tool call.
-    local perm
-    perm="$(security_get "$project" '.permission_mode' 'bypassPermissions')"
-    case "$perm" in
-      acceptEdits|auto|bypassPermissions|manual|dontAsk|plan) : ;;
-      *) security_warn "security: project '$project' has a permission_mode the CLI does not know ('$perm') -- using bypassPermissions"
-         perm="bypassPermissions" ;;
+    # Which CLI the analysis runs on: the block's own, else the project's,
+    # else anthropic. The model, effort and permission mode it carries have
+    # to be that platform's, with the same fallback-and-warn the permission
+    # mode already had: a value the CLI does not know falls back rather than
+    # launching a run that dies at its first tool call.
+    #
+    # The permission default is the platform's headless-everything mode
+    # (bypassPermissions / full-access), NOT dontAsk: in a headless run
+    # dontAsk DENIES every tool that is not allowlisted, and a fresh worktree
+    # has no allowlist, so the agent could not run a single command (the
+    # first live analysis burnt $0.56 probing the walls and ended BLOCKED).
+    # Containment does not come from the permission mode: the worktree is
+    # disposable, the ledger only accepts writes through the CLI's validating
+    # door, and AL_SECURITY_AGENT keeps the human-authority verbs shut.
+    local splat smodel seffort perm
+    splat="$(security_get "$project" '.platform' '')"
+    [ -n "$splat" ] || splat="$(project_get "$project" '.platform' 'anthropic')"
+    case "$splat" in
+      anthropic|openai) : ;;
+      *) security_warn "security: project '$project' names a platform the engine does not know ('$splat') -- using anthropic"
+         splat="anthropic" ;;
     esac
+    smodel="$(security_get "$project" '.model' "$(platform_default_model "$splat")")"
+    if ! platform_model_ok "$splat" "$smodel"; then
+      local sdefault; sdefault="$(platform_default_model "$splat")"
+      # openai with no catalog resolved yet: platform_default_model answers
+      # NOTHING, so the generic message below would read "using " with the
+      # default missing off the end. Name the actual cause instead.
+      if [ -z "$sdefault" ]; then
+        security_warn "security: project '$project' runs on openai but no OpenAI catalog is resolved yet (run: agentloop resolve-models openai) -- the analysis will be refused at launch"
+      else
+        security_warn "security: project '$project' has a model $splat does not know ('$smodel') -- using $sdefault"
+      fi
+      smodel="$sdefault"
+    fi
+    seffort="$(security_get "$project" '.effort' '')"
+    if ! platform_effort_ok "$splat" "$smodel" "$seffort"; then
+      security_warn "security: project '$project' has an effort '$seffort' that $smodel does not offer on $splat -- cleared"
+      seffort=""
+    fi
+    perm="$(security_get "$project" '.permission_mode' "$(platform_default_permission "$splat" security)")"
+    if ! platform_permission_ok "$splat" "$perm"; then
+      security_warn "security: project '$project' has a permission_mode the CLI does not know ('$perm') -- using $(platform_default_permission "$splat" security)"
+      perm="$(platform_default_permission "$splat" security)"
+    fi
     # Build the element FIRST and only then commit to it. The separator used to
     # be printed before this jq ran, so anything that made jq exit without
     # stdout -- a `tonumber` on a budget the user typed as "abc" was enough --
@@ -315,14 +350,15 @@ security_derived_jobs() {
     # failed element is now one project missing, which is what it always was.
     elem="$("$JQ" -nc \
       --arg id "$jid" --arg project "$project" --arg prompt "$prompt" \
-      --arg model "$(security_get "$project" '.model' 'opus')" \
-      --arg effort "$(security_get "$project" '.effort' '')" \
+      --arg model "$smodel" \
+      --arg platform "$splat" \
+      --arg effort "$seffort" \
       --arg budget "$budget" \
       --arg daily "$daily" \
       --arg cfgdir "$(security_get "$project" '.claude_config_dir' '')" \
       --arg perm "$perm" \
       --arg notools "$SECURITY_DISALLOWED_TOOLS" \
-      '{id:$id, project:$project, prompt:$prompt, model:$model,
+      '{id:$id, project:$project, prompt:$prompt, model:$model, platform:$platform,
         description:"Security analysis (derived from the project, not a job you created).",
         enabled:false, precheck:"", permission_mode:$perm,
         disallowed_tools:$notools,
@@ -1128,6 +1164,302 @@ is_due_vals() { # is_due_vals <interval> <last-start> <fail-streak> ; 0 = due
   [ "$(( $(now_epoch) - last ))" -ge "$interval" ]
 }
 
+# --- platforms ---------------------------------------------------------------
+# Which CLI a run goes through. bash 3.2 has no associative arrays, so the
+# "table" is this contiguous block of functions, each one a `case "$platform"`
+# and nothing outside it. Adding a platform is adding one branch to each of
+# them; run_job asks these and never names a binary itself. Everything the
+# openai branch does was measured on Codex CLI 0.148.0 -- see
+# docs/superpowers/specs/2026-09-06-codex-measurements/README.md -- and where
+# the measurement contradicted the design, the measurement won (its
+# "Correcções por medição" section).
+PLATFORMS="anthropic openai"
+
+platform_known() { case "${1:-}" in anthropic|openai) return 0 ;; *) return 1 ;; esac; }
+
+# job_platform <id> -> the job's effective platform: resolve(), then
+# normalised. A hand-edited project can carry a platform this engine does not
+# know (e.g. "gemini"); resolve() alone would hand that word straight back,
+# and platform_default_model/platform_default_permission answer NOTHING for
+# it, so every caller that skipped this normalisation ended up writing EMPTY
+# model/permission_mode fields rather than falling back. One place decides
+# what "unknown" becomes, so every reader of a job's platform agrees.
+job_platform() { # job_platform <id>
+  local p; p="$(resolve "$1" platform 'anthropic')"
+  platform_known "$p" || p="anthropic"
+  printf '%s\n' "$p"
+}
+
+platform_bin() { # platform_bin <platform> -> the CLI's path
+  case "$1" in anthropic) printf '%s' "$CLAUDE_BIN" ;; openai) printf '%s' "$CODEX_BIN" ;; esac
+}
+
+platform_ready() { # platform_ready <platform> -> 0; or 1 with the reason on stdout
+  local bin; bin="$(platform_bin "$1")"
+  case "$1" in
+    anthropic)
+      [ -x "$bin" ] || { printf 'claude not found at %s (set AGENTLOOP_CLAUDE_BIN)' "$bin"; return 1; } ;;
+    openai)
+      [ -x "$bin" ] || { printf 'codex not found at %s (set AGENTLOOP_CODEX_BIN)' "$bin"; return 1; }
+      # Any non-zero is "not signed in". The CLI's exit code when it is not was
+      # left unmeasured on purpose (measuring it meant logging the working
+      # account out); a 0 without a login fails on the first turn as api_error,
+      # which is an honest line in tick.log either way.
+      "$bin" login status >/dev/null 2>&1 \
+        || { printf 'codex is not signed in (run: codex login)'; return 1; } ;;
+    *) printf 'unknown platform %s' "$1"; return 1 ;;
+  esac
+  return 0
+}
+
+platform_caps() { # platform_caps <platform> <capability> -> 0 when the platform HAS it
+  #   interactive        a stdin protocol for a human to talk to the live run
+  #   tool_lists         --allowedTools/--disallowedTools (Codex cannot close a
+  #                      tool by flag: --disable multi_agent leaves spawn_agent
+  #                      in the roster and a spawn under it runs -- measured)
+  #   denials            permission_denials on the final event (a Codex sandbox
+  #                      refusal produces no event at all)
+  #   budget_flag        --max-budget-usd (on openai the cap is read at the end)
+  #   cost_reported      dollars on the final event (openai: estimated from tokens)
+  #   stream_rate_limits rate_limit_event on the stream (openai: the rollout)
+  #   families           opus/sonnet aliases resolved to an id (openai: exact slugs)
+  case "$1" in
+    anthropic) case "$2" in
+      interactive|tool_lists|denials|budget_flag|cost_reported|stream_rate_limits|families) return 0 ;;
+    esac ;;
+    openai) : ;;
+  esac
+  return 1
+}
+
+platform_permissions() { # platform_permissions <platform> -> one mode per line
+  case "$1" in
+    anthropic) printf '%s\n' acceptEdits auto bypassPermissions manual dontAsk plan ;;
+    openai)    printf '%s\n' read-only workspace-write full-access ;;
+  esac
+}
+
+platform_permission_ok() { # platform_permission_ok <platform> <mode>
+  platform_permissions "$1" | grep -qxF -- "$2"
+}
+
+platform_default_permission() { # platform_default_permission <platform> <job|security>
+  case "$1" in
+    anthropic) case "$2" in security) printf 'bypassPermissions' ;; *) printf 'dontAsk' ;; esac ;;
+    openai)    case "$2" in security) printf 'full-access' ;; *) printf 'workspace-write' ;; esac ;;
+  esac
+}
+
+platform_efforts() { # platform_efforts <platform> [model] -> one level per line
+  case "$1" in
+    anthropic) printf '%s\n' low medium high xhigh max ;;
+    openai)    openai_catalog_efforts "${2:-}" ;;
+  esac
+}
+
+platform_effort_ok() { # platform_effort_ok <platform> <model> <effort>; "" is always ok (the CLI decides)
+  [ -z "${3:-}" ] && return 0
+  platform_efforts "$1" "$2" | grep -qxF -- "$3"
+}
+
+platform_model_ok() { # platform_model_ok <platform> <model>
+  case "$1" in
+    anthropic) case "$2" in opus|sonnet|haiku|fable|claude-*) return 0 ;; *) return 1 ;; esac ;;
+    openai)    openai_catalog_slugs | grep -qxF -- "$2" ;;
+    *) return 1 ;;
+  esac
+}
+
+platform_default_model() { # platform_default_model <platform> (openai: empty without a catalog)
+  case "$1" in
+    anthropic) printf 'opus' ;;
+    openai)    openai_catalog_visible | head -1 ;;
+  esac
+}
+
+platform_stderr_filter() { # platform_stderr_filter <platform> <errfile>
+  # The classifier counts stderr bytes, and `codex exec` prints one line on
+  # every run whatever happens: "Reading additional input from stdin...".
+  # Without this, every OpenAI run would be a warning. Exactly that line,
+  # whole, and nothing else: anything more is still stderr and still a warning.
+  case "$1" in
+    openai)
+      [ -s "$2" ] || return 0
+      local tmp; tmp="$(mktemp "$2.XXXXXX" 2>/dev/null)" || return 0
+      grep -vxF 'Reading additional input from stdin...' "$2" > "$tmp" 2>/dev/null
+      mv -f "$tmp" "$2" 2>/dev/null || rm -f "$tmp" ;;
+  esac
+  return 0
+}
+
+# The launch line of an OpenAI run, into PLATFORM_ARGV (bash 3.2 cannot return
+# an array). Every flag was measured; the comments say where.
+PLATFORM_ARGV=()
+platform_argv_openai() { # platform_argv_openai <resume-sid> <run_cwd> <model> <effort> <permission> <prompt>
+  local resume_sid="$1" run_cwd="$2" model="$3" effort="$4" permission="$5" prompt="$6"
+  if [ -n "$resume_sid" ]; then
+    # `exec resume` takes neither -s nor -C: the sandbox travels as a config
+    # override and the cwd is the process's own -- run_job cd's there first
+    # (measurement 11).
+    PLATFORM_ARGV=(exec resume --json --skip-git-repo-check)
+  else
+    PLATFORM_ARGV=(exec --json --skip-git-repo-check -C "$run_cwd")
+  fi
+  PLATFORM_ARGV+=(-m "$model")
+  # Bare `key=value`: the CLI tries TOML and falls back to a literal string
+  # (its --help), and that is how measurements 05b, 07 and 11 passed them.
+  [ -n "$effort" ] && PLATFORM_ARGV+=(-c "model_reasoning_effort=$effort")
+  case "$permission" in
+    read-only|workspace-write)
+      if [ -n "$resume_sid" ]; then PLATFORM_ARGV+=(-c "sandbox_mode=$permission")
+      else PLATFORM_ARGV+=(-s "$permission"); fi
+      PLATFORM_ARGV+=(-c "approval_policy=never") ;;
+    full-access) PLATFORM_ARGV+=(--dangerously-bypass-approvals-and-sandbox) ;;
+  esac
+  [ -n "$resume_sid" ] && PLATFORM_ARGV+=("$resume_sid")
+  # `--` before the prompt, as the anthropic launch does: accepted by exec (12)
+  # and by exec resume (13). No --disable multi_agent: it closes nothing.
+  PLATFORM_ARGV+=(-- "$prompt")
+}
+
+# What the stream cannot say. The Codex stream carries neither the model that
+# ran nor the usage windows; both sit in the rollout the CLI writes under
+# $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl (a resume
+# appends to the same file). Sets PF_MODEL_ID and PF_ROLLOUT; both empty when
+# the rollout is not found, with one line in tick.log saying so.
+PF_MODEL_ID=""; PF_ROLLOUT=""
+platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-id]
+  PF_MODEL_ID=""; PF_ROLLOUT=""
+  case "$1" in openai) ;; *) return 0 ;; esac
+  local tid="${3:-}" id="${4:-run}"
+  [ -n "$tid" ] || return 0
+  PF_ROLLOUT="$(openai_rollout_for "$tid")"
+  if [ -z "$PF_ROLLOUT" ]; then
+    log_tick "$id: no codex rollout for thread $tid under $CODEX_HOME_DIR/sessions — model_id stays the requested slug, no rate-limit reading"
+    return 0
+  fi
+  # The LAST turn_context: a resumed thread may have changed model.
+  PF_MODEL_ID="$("$JQ" -r 'select(.type=="turn_context") | .payload.model // empty' "$PF_ROLLOUT" 2>/dev/null | tail -1)"
+  # Every OpenAI run feeds the gate from its rollout. A run that ended on a
+  # quota refusal (api_error_status 429 on the final event) marks the window
+  # spent as well -- the classifier's `rate_limited` cause says why the run
+  # failed; this says when the next one may start.
+  local refused=""
+  [ "$("$JQ" -r '.api_error_status // ""' "$2" 2>/dev/null | tail -1)" = "429" ] && refused="refused"
+  rl_capture_openai "$PF_ROLLOUT" $refused
+  return 0
+}
+
+openai_rollout_for() { # openai_rollout_for <thread_id> -> the rollout's path, or nothing
+  local hit
+  # A thread id is unique, so the first hit is the only hit; the glob is
+  # bounded to the three date levels the CLI uses.
+  hit="$(ls -t "$CODEX_HOME_DIR"/sessions/*/*/*/rollout-*-"$1".jsonl 2>/dev/null | head -1)"
+  [ -n "$hit" ] && [ -f "$hit" ] && printf '%s' "$hit"
+  return 0
+}
+
+# --- the OpenAI catalog, read side ------------------------------------------
+# config/models.json carries an `openai` block (written by `resolve-models
+# openai`; the writer is the next block down, resolve_models_openai). These
+# read it. Without the block every reader answers nothing, which is what makes
+# an unresolved catalog REFUSE a launch rather than guess a slug.
+openai_catalog_available() { # 0 when config/models.json carries an openai catalog
+  [ -f "$MODELS_FILE" ] && "$JQ" -e '.openai.models | type == "array"' "$MODELS_FILE" >/dev/null 2>&1
+}
+
+openai_catalog_slugs() { # every slug, listed or hidden, one per line
+  openai_catalog_available || return 0
+  "$JQ" -r '.openai.models[].slug' "$MODELS_FILE" 2>/dev/null
+}
+
+openai_catalog_visible() { # the listed slugs, by ascending priority (the CLI's own order)
+  openai_catalog_available || return 0
+  "$JQ" -r '[.openai.models[] | select(.visibility == "list")] | sort_by(.priority) | .[].slug' \
+    "$MODELS_FILE" 2>/dev/null
+}
+
+openai_catalog_efforts() { # openai_catalog_efforts <slug> -> its levels, one per line
+  local got=""
+  if openai_catalog_available && [ -n "${1:-}" ]; then
+    got="$("$JQ" -r --arg s "$1" '.openai.models[] | select(.slug == $s) | .efforts[]?' "$MODELS_FILE" 2>/dev/null)"
+  fi
+  # A slug the catalog does not describe (hidden, or no catalog): the union of
+  # every level the CLI has been seen to accept, ultra included (measured).
+  if [ -n "$got" ]; then printf '%s\n' "$got"; else printf '%s\n' low medium high xhigh max ultra; fi
+}
+
+openai_catalog_default_effort() { # openai_catalog_default_effort <slug> -> the catalog's default, or nothing
+  openai_catalog_available || return 0
+  "$JQ" -r --arg s "$1" '.openai.models[] | select(.slug == $s) | .default_effort // empty' "$MODELS_FILE" 2>/dev/null
+}
+
+openai_catalog_successor() { # openai_catalog_successor <slug> -> what a deprecated slug was upgraded to, or nothing
+  openai_catalog_available || return 0
+  "$JQ" -r --arg s "$1" '.openai.models[] | select(.slug == $s) | .deprecated_by // empty' "$MODELS_FILE" 2>/dev/null
+}
+
+openai_catalog_all_efforts() { # the union of every VISIBLE model's efforts, first-seen order; nothing without a catalog
+  openai_catalog_available || return 0
+  "$JQ" -r '
+    [.openai.models[] | select(.visibility == "list") | .efforts[]?]
+    | reduce .[] as $e ([]; if index($e) then . else . + [$e] end)
+    | .[]' "$MODELS_FILE" 2>/dev/null
+}
+
+# --- the OpenAI catalog, write side ------------------------------------------
+resolve_models_openai() { # refresh config/models.json's `openai` block from `codex debug models`
+  local raw source block tmp
+  tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
+  if [ ! -f "$MODELS_FILE" ]; then
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  elif ! "$JQ" -e . "$MODELS_FILE" >/dev/null 2>&1; then
+    echo "models.json was not valid JSON — reseeded"
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  fi
+  if [ ! -x "$CODEX_BIN" ]; then
+    block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"codex not installed"}')"
+  else
+    source="codex debug models"
+    raw="$("$CODEX_BIN" debug models 2>/dev/null)"
+    if ! printf '%s' "$raw" | "$JQ" -e '.models | type == "array"' >/dev/null 2>&1; then
+      source="bundled"
+      raw="$("$CODEX_BIN" debug models --bundled 2>/dev/null)"
+    fi
+    if ! printf '%s' "$raw" | "$JQ" -e '.models | type == "array"' >/dev/null 2>&1; then
+      block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"codex debug models returned no catalog"}')"
+    else
+      # Only what the selector and the validators need. The prompt templates
+      # the CLI ships in this JSON are not ours to keep.
+      block="$(printf '%s' "$raw" | "$JQ" -c --argjson at "$(now_epoch)" --arg src "$source" '
+        {at:$at, source:$src, models:[.models[] | {
+          slug, display_name:(.display_name // .slug), description:(.description // ""),
+          default_effort:(.default_reasoning_level // ""),
+          efforts:[(.supported_reasoning_levels // [])[] | .effort],
+          visibility:(.visibility // "list"), priority:(.priority // 999),
+          deprecated_by:(.upgrade.model // ""), retires_at:(.upgrade.retirement_at // "")}]}')"
+    fi
+  fi
+  if ! { "$JQ" --argjson b "$block" '.openai = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
+    rm -f "$tmp"
+    echo "openai -> could not write $MODELS_FILE"
+    return 1
+  fi
+  rm -f "$tmp"
+  if openai_catalog_available; then
+    echo "openai -> $(openai_catalog_visible | tr '\n' ' ')($(printf '%s' "$block" | "$JQ" -r .source))"
+  else
+    echo "openai -> unavailable: $(printf '%s' "$block" | "$JQ" -r .reason)"
+  fi
+}
+
+openai_catalog_ensure() { # resolve once, synchronously, when the block is missing and codex exists (0 s measured)
+  openai_catalog_available && return 0
+  [ -x "$CODEX_BIN" ] || return 1
+  resolve_models_openai >/dev/null 2>&1
+  openai_catalog_available
+}
+
 # The session a run reported in its transcript. The id is what binds a run dir
 # to the conversation that owns it: a resume looks the directory up by this, so
 # the agent continues in the tree it was working in rather than in a fresh
@@ -1603,7 +1935,7 @@ run_record_stopped_early() { # <id> <slot-dir>
   state_set_many "$id" "$("$JQ" -nc --argjson end "$end" --argjson start "$start" \
     '{last_end:$end, last_status:"stopped", last_run_start:$start, last_run_status:"stopped"}')"
   record_run "$id" "stopped" "$start" "$end" "0" "0" "$sid" "${logf:-}" "$note" "false" "" "$project" \
-             "${model_family:-$model}" "" ""
+             "${model_family:-$model}" "" "" "" "$(job_platform "$id")" "none" "null"
   if [ -f "$slot/child" ]; then
     log_tick "$id: stopped by the user after its agent had already run"
   else
@@ -1663,13 +1995,14 @@ lock_active() { # 0 = a run is currently holding the lock for <id> (single mutex
 journal_lock()   { lock_take "$LOCK_DIR/.journal.lock"; }
 journal_unlock() { lock_drop "$LOCK_DIR/.journal.lock"; }
 
-record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> <note> <forced> <precheck> <project> <model> <model_id> <resumed_from> <cause>
+record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> <note> <forced> <precheck> <project> <model> <model_id> <resumed_from> <cause> <platform> <cost_basis> <tokens-json>
   "$JQ" -nc \
     --arg id "$1" --arg status "$2" --argjson start "$3" --argjson end "$4" \
     --arg cost "$5" --arg turns "$6" --arg session "$7" --arg logfile "$8" --arg note "$9" \
     --arg forced "${10:-false}" --arg precheck "${11:-}" --arg project "${12:-}" \
     --arg model "${13:-}" --arg model_id "${14:-}" --arg resumed_from "${15:-}" \
     --arg cause "${16:-}" \
+    --arg platform "${17:-anthropic}" --arg cost_basis "${18:-reported}" --argjson tokens "${19:-null}" \
     '{id:$id, status:$status, start:$start, end:$end, duration:($end-$start),
       cost:($cost|tonumber? // 0), turns:($turns|tonumber? // 0),
       session:$session, log:$logfile, note:$note,
@@ -1681,7 +2014,11 @@ record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> 
       # WHY it failed, for a failed run. Empty on anything that did not fail:
       # a success has no cause, and inventing one would put a word on the page
       # that means nothing.
-      cause:$cause}' > "$LOCK_DIR/.rec.$$"
+      cause:$cause,
+      # Which CLI ran it; how its cost is known (reported by the CLI,
+      # estimated from tokens, or none); its token counts, or null when the
+      # run died without a final event -- unknown is not zero.
+      platform:$platform, cost_basis:$cost_basis, tokens:$tokens}' > "$LOCK_DIR/.rec.$$"
   # Append under the journal lock, so a concurrent rewrite cannot drop this
   # record on the floor (build the line first — the lock is held for the append
   # alone, never across the jq run).
@@ -1689,6 +2026,14 @@ record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> 
   cat "$LOCK_DIR/.rec.$$" >> "$RUNS_FILE"
   journal_unlock
   rm -f "$LOCK_DIR/.rec.$$"
+}
+
+journal_platform_of_session() { # journal_platform_of_session <session-id> -> anthropic|openai, or nothing when unrecorded
+  [ -s "$RUNS_FILE" ] && [ -n "${1:-}" ] || return 0
+  # Compact records: `"session":"<sid>"` is one token. A record from before
+  # platforms existed carries none, and is anthropic by definition.
+  grep -F "\"session\":\"$1\"" "$RUNS_FILE" 2>/dev/null | tail -1 \
+    | "$JQ" -r 'select(type == "object") | .platform // "anthropic"' 2>/dev/null
 }
 
 # How much of the journal the daily-spend scan reads. Records are appended in
@@ -1735,6 +2080,33 @@ spent_today_all() { _spend_since_midnight ""; }
 # merely showing: with no overage to fall through to, hitting the ceiling is a
 # dead stop mid-run, not a slowdown.
 
+# data/rate-limits.json has one block per platform. Before platforms it held
+# the two windows at the top level; that shape is read as anthropic and
+# rewritten the first time anything touches the file, under the same lock the
+# writers take. Every reader and writer below calls this first.
+#
+# A file can carry BOTH shapes -- the live install ended up there, with an
+# unmerged binary nesting the windows once while the installed engine and the
+# statusline kept writing the top-level ones. The first version of this merged
+# with `{anthropic: (top-level)} + (rest)`, and the right operand of `+` wins:
+# the nested block was kept whatever its age, and the fresher reading -- the
+# one the gate needs -- was silently discarded. So: per window, and the greater
+# `seen_at` wins (absent counts as 0, which is what an ancient reading is).
+rl_migrate() {
+  [ -s "$RATE_LIMIT_FILE" ] || return 0
+  "$JQ" -e 'has("five_hour") or has("seven_day")' "$RATE_LIMIT_FILE" >/dev/null 2>&1 || return 0
+  local tmp
+  tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX")" || return 0
+  "$JQ" '(with_entries(select(.key == "five_hour" or .key == "seven_day"))) as $top
+         | (with_entries(select(.key != "five_hour" and .key != "seven_day")))
+         | .anthropic = (reduce ($top | keys_unsorted[]) as $w ((.anthropic // {});
+             if .[$w] != null and (.[$w].seen_at // 0) >= ($top[$w].seen_at // 0)
+             then . else .[$w] = $top[$w] end))' \
+    "$RATE_LIMIT_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
 # Fold every rate_limit_event in a finished run's stream into the shared file,
 # newest per window wins. Never fails a run: this is bookkeeping, and a run that
 # worked must not be reported as broken because a status file could not be
@@ -1745,6 +2117,7 @@ rl_capture() { # rl_capture <streamfile>
   grep -q rate_limit_event "$sf" 2>/dev/null || return 0
   lock="$LOCK_DIR/.ratelimit"
   lock_take "$lock" || return 0
+  rl_migrate
   [ -s "$RATE_LIMIT_FILE" ] || echo '{}' > "$RATE_LIMIT_FILE" 2>/dev/null || { lock_drop "$lock"; return 0; }
   tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX")" || { lock_drop "$lock"; return 0; }
   # `-R` with `fromjson?` for the same reason every other reader of a stream
@@ -1755,7 +2128,7 @@ rl_capture() { # rl_capture <streamfile>
     | [inputs | fromjson? | select(.type == "rate_limit_event") | .rate_limit_info // empty]
     | map(select(.rateLimitType != null))
     | reduce .[] as $e ($was;
-        .[$e.rateLimitType] = {
+        .anthropic[$e.rateLimitType] = {
           status:      ($e.status // "unknown"),
           utilization: ($e.utilization // null),
           resets_at:   ($e.resetsAt // null),
@@ -1763,6 +2136,48 @@ rl_capture() { # rl_capture <streamfile>
           seen_at:     $now
         })
   ' "$sf" > "$tmp" 2>/dev/null && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  lock_drop "$lock"
+  return 0
+}
+
+# The OpenAI reading. The Codex CLI reports both windows on EVERY turn, in
+# the rollout's token_count events: primary (300 min) is the five-hour window,
+# secondary (10080 min) the seven-day one, used_percent 0-100. So every OpenAI
+# run feeds the gate, and there is no statusline to wire. With `refused`, the
+# run ended on a quota refusal (turn.failed, "hit your usage limit"): the
+# reset time is in the rollout but not which window tripped, so the FULLER
+# one is marked spent until its own reset -- the gate then lifts by itself.
+rl_capture_openai() { # rl_capture_openai <rollout-file> [refused]
+  local roll="${1:-}" refused="${2:-}" tmp lock
+  [ -s "$roll" ] || return 0
+  grep -q token_count "$roll" 2>/dev/null || return 0
+  lock="$LOCK_DIR/.ratelimit"
+  lock_take "$lock" || return 0
+  rl_migrate
+  [ -s "$RATE_LIMIT_FILE" ] || echo '{}' > "$RATE_LIMIT_FILE" 2>/dev/null || { lock_drop "$lock"; return 0; }
+  tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX")" || { lock_drop "$lock"; return 0; }
+  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg refused "$refused" '
+    ($prev[0] // {}) as $was
+    | [inputs | fromjson? | select(.type == "event_msg" and .payload.type == "token_count") | .payload.rate_limits // empty]
+    | last // empty
+    | . as $rl
+    | (if ($rl.primary.used_percent // 0) >= ($rl.secondary.used_percent // 0) then "five_hour" else "seven_day" end) as $fuller
+    | def window($w; $name):
+        if $w == null then null else
+          { status: (if $rl.rate_limit_reached_type != null then ($rl.rate_limit_reached_type | tostring)
+                     elif $refused != "" and $name == $fuller then "usage_limit_reached"
+                     else "allowed" end),
+            utilization: (($w.used_percent // 0) / 100),
+            resets_at: ($w.resets_at // null),
+            overage: null, seen_at: $now, source: "rollout",
+            plan_type: ($rl.plan_type // null) }
+        end;
+    $was
+    | .openai = ((.openai // {})
+        + (if $rl.primary   != null then {five_hour: window($rl.primary; "five_hour")} else {} end)
+        + (if $rl.secondary != null then {seven_day: window($rl.secondary; "seven_day")} else {} end))
+  ' "$roll" > "$tmp" 2>/dev/null && [ -s "$tmp" ] && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
   rm -f "$tmp" 2>/dev/null
   lock_drop "$lock"
   return 0
@@ -1776,10 +2191,12 @@ rl_capture() { # rl_capture <streamfile>
 # about now. That is what keeps a single bad afternoon from wedging the fleet
 # for ever -- the gate expires by itself, with no operator action and no clock
 # of our own.
-rl_gate() { # rl_gate -> 0 = hold this run back (reason on stdout)
+rl_gate() { # rl_gate [platform] -> 0 = hold this run back (reason on stdout); anthropic when unnamed
+  local p="${1:-anthropic}"
+  rl_migrate
   [ -s "$RATE_LIMIT_FILE" ] || return 1
-  "$JQ" -e -r --argjson now "$(now_epoch)" --argjson stop "$RL_STOP_AT" '
-    to_entries
+  "$JQ" -e -r --arg p "$p" --argjson now "$(now_epoch)" --argjson stop "$RL_STOP_AT" '
+    (.[$p] // {}) | to_entries
     | map(select(.value.resets_at != null and .value.resets_at > $now))
     | map(. + {mins: (((.value.resets_at - $now) / 60) | floor)})
     # A refusal outranks a number: if the API has stopped saying `allowed`, the
@@ -1787,10 +2204,10 @@ rl_gate() { # rl_gate -> 0 = hold this run back (reason on stdout)
     # NO status is not a refusal — the statusline reports utilisation without
     # one, and treating its silence as a refusal would gate every healthy run.
     | ( [ .[] | select(.value.status != null and ((.value.status | startswith("allowed")) | not)) ]
-        | map("the \(.key) window is spent (API says \(.value.status)) -- it resets in \(.mins) min")
+        | map("the \($p) \(.key) window is spent (API says \(.value.status)) -- it resets in \(.mins) min")
       ) + (
         [ .[] | select((.value.utilization // 0) >= $stop) ]
-        | map("the \(.key) window is \((.value.utilization * 100) | floor)% used"
+        | map("the \($p) \(.key) window is \((.value.utilization * 100) | floor)% used"
               + (if .value.overage == "rejected" then " and overage is off, so the ceiling is a dead stop" else "" end)
               + " -- it resets in \(.mins) min")
       )
@@ -1896,28 +2313,32 @@ cmd_usage() {
   local now settings cmd
   now="$(now_epoch)"
 
+  rl_migrate
   if [ ! -s "$RATE_LIMIT_FILE" ]; then
     echo "No usage window has been recorded yet."
   else
-    "$JQ" -r --argjson now "$now" --argjson stop "$RL_STOP_AT" '
-      to_entries[]
-      | .value as $v
-      | (if $v.utilization == null then "  ?" else (($v.utilization * 100) | floor | tostring) + "%" end) as $pct
-      | (if $v.resets_at == null then "reset time unknown"
-         elif $v.resets_at <= $now then "that window has already reset — this reading no longer counts"
-         else "resets in " + (((($v.resets_at - $now) / 60) | floor) | tostring) + " min" end) as $when
-      | (((($now - ($v.seen_at // 0)) / 60) | floor) | tostring) as $age
-      | "\(.key): \($pct) used, \($when)"
-        + "\n  read \($age) min ago from the \($v.source // "run stream")"
-        + (if $v.status != null then ", API said \($v.status)" else "" end)
-        + (if $v.overage == "rejected" then ", overage off (the ceiling is a dead stop)" else "" end)
-    ' "$RATE_LIMIT_FILE" 2>/dev/null
-    local reason
-    if reason="$(rl_gate)" && [ -n "$reason" ]; then
-      echo
-      echo "SCHEDULED RUNS ARE BEING HELD BACK: $reason"
-      echo "  (\`agentloop run <job>\` still overrides this, as it does the budget.)"
-    fi
+    local p reason
+    for p in $PLATFORMS; do
+      "$JQ" -r --arg p "$p" --argjson now "$now" '
+        (.[$p] // {}) | to_entries[]
+        | .value as $v
+        | (if $v.utilization == null then "  ?" else (($v.utilization * 100) | floor | tostring) + "%" end) as $pct
+        | (if $v.resets_at == null then "reset time unknown"
+           elif $v.resets_at <= $now then "that window has already reset — this reading no longer counts"
+           else "resets in " + (((($v.resets_at - $now) / 60) | floor) | tostring) + " min" end) as $when
+        | (((($now - ($v.seen_at // 0)) / 60) | floor) | tostring) as $age
+        | "\($p) \(.key): \($pct) used, \($when)"
+          + "\n  read \($age) min ago from the \($v.source // "run stream")"
+          + (if $v.plan_type != null then " (\($v.plan_type) plan)" else "" end)
+          + (if $v.status != null then ", API said \($v.status)" else "" end)
+          + (if $v.overage == "rejected" then ", overage off (the ceiling is a dead stop)" else "" end)
+      ' "$RATE_LIMIT_FILE" 2>/dev/null
+      if reason="$(rl_gate "$p")" && [ -n "$reason" ]; then
+        echo
+        echo "SCHEDULED $p RUNS ARE BEING HELD BACK: $reason"
+        echo "  (\`agentloop run <job>\` still overrides this, as it does the budget.)"
+      fi
+    done
   fi
 
   # The other half: is the figure going to keep arriving? A window whose only
@@ -1938,7 +2359,7 @@ cmd_usage() {
   else
     echo "statusline: wired to ${cmd%% *}"
     if [ -s "$RATE_LIMIT_FILE" ] \
-       && "$JQ" -e 'any(.[]; .source == "statusline")' "$RATE_LIMIT_FILE" >/dev/null 2>&1; then
+       && "$JQ" -e 'any(.anthropic[]?; .source == "statusline")' "$RATE_LIMIT_FILE" >/dev/null 2>&1; then
       echo "  and it has fed the gate — readings above are live."
     else
       echo "  but it has never fed the gate yet. The statusLine is read when a"
@@ -1946,6 +2367,7 @@ cmd_usage() {
       echo "  never call it. Open a new interactive session and re-run this."
     fi
   fi
+  echo "openai: fed by every run's own rollout (the Codex CLI reports both windows on every turn); nothing to wire."
 }
 
 # The daily ceiling that applies to a job: its own, else its project's, else
@@ -2044,11 +2466,16 @@ effective_model() { # effective_model <model> -> concrete id (families resolved)
   echo "$hit"
 }
 
-models_stale() { # 0 = the cache is missing or older than MODELS_TTL
-  local oldest
+models_stale() { # 0 = either cache is missing or older than MODELS_TTL
+  local oldest oa
   [ -f "$MODELS_FILE" ] || return 0
   oldest="$("$JQ" -r '[.resolved[]?.at // 0] | min // 0' "$MODELS_FILE" 2>/dev/null)"
   case "$oldest" in ''|null|*[!0-9]*) oldest=0 ;; esac
+  # The openai block ages the same way. Absent, it is stale by definition --
+  # which is what gets it written on the first tick after this upgrade.
+  oa="$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)"
+  case "$oa" in ''|null|*[!0-9]*) oa=0 ;; esac
+  [ "$oa" -lt "$oldest" ] && oldest="$oa"
   [ "$(( $(now_epoch) - oldest ))" -ge "$MODELS_TTL" ]
 }
 
@@ -2293,6 +2720,360 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   : > "$tmp/s3.ndjson"
   got="$(session_from_stream "$tmp/s3.ndjson")"
   [ -z "$got" ] && ok "an empty transcript reports nothing" || bad "read '$got' from nothing"
+
+  echo "platforms — the table run_job asks instead of naming a binary"
+  platform_known openai;      want "openai is a known platform"        0 $?
+  platform_known anthropic;   want "anthropic is a known platform"     0 $?
+  platform_known gemini;      want "an unknown platform is refused"    1 $?
+  platform_caps anthropic interactive; want "anthropic has interactive" 0 $?
+  local _cap; local _openai_caps=0
+  for _cap in interactive tool_lists denials budget_flag cost_reported stream_rate_limits families; do
+    platform_caps openai "$_cap" && _openai_caps=$((_openai_caps + 1))
+  done
+  [ "$_openai_caps" -eq 0 ] && ok "openai has none of the seven capabilities" || bad "openai claims $_openai_caps capabilities"
+  platform_permission_ok openai workspace-write; want "workspace-write is an openai mode"   0 $?
+  platform_permission_ok openai dontAsk;         want "dontAsk is not an openai mode"        1 $?
+  platform_permission_ok anthropic dontAsk;      want "dontAsk is an anthropic mode"         0 $?
+  [ "$(platform_default_permission openai job)" = "workspace-write" ] && [ "$(platform_default_permission openai security)" = "full-access" ] \
+    && ok "openai defaults: workspace-write for a job, full-access for an analysis" || bad "openai default permissions"
+  platform_effort_ok anthropic opus ultra;   want "ultra is not an anthropic effort"          1 $?
+  platform_effort_ok anthropic opus "";      want "an empty effort is always fine"            0 $?
+
+  # The catalog readers, over a models.json of this test's own.
+  mkdir -p "$tmp/cat"
+  "$JQ" -n '{resolved:{}, openai:{at:1, source:"fixture", models:[
+      {slug:"gpt-b", visibility:"list", priority:7, efforts:["low","high"], default_effort:"low", deprecated_by:"", retires_at:""},
+      {slug:"gpt-a", visibility:"list", priority:6, efforts:["low","high","ultra"], default_effort:"low", deprecated_by:"", retires_at:""},
+      {slug:"gpt-hidden", visibility:"hide", priority:3, efforts:["low"], default_effort:"low", deprecated_by:"", retires_at:""},
+      {slug:"gpt-old", visibility:"list", priority:23, efforts:["low"], default_effort:"low", deprecated_by:"gpt-b", retires_at:"2026-08-31T19:00:00Z"}]}}' \
+    > "$tmp/cat/models.json"
+  # Each of these runs inside a SUBSHELL, because MODELS_FILE must not leak
+  # into the rest of the suite. That used to mean a bad() in here bumped a
+  # $fail that vanished with the subshell -- FAIL printed, the gate never saw
+  # it, and `selftest` exited 0 regardless. ok()/bad() are redefined for the
+  # length of the subshell to count into _upass/_ufail (discarded with it) and
+  # print exactly what they always printed; the parent replays those lines
+  # verbatim and then asserts, on its OWN real ok/bad, that the RESULT line
+  # the subshell prints last says bad=0 and the expected ok=count.
+  local _catout
+  _catout="$(
+    MODELS_FILE="$tmp/cat/models.json"
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+    [ "$(platform_default_model openai)" = "gpt-a" ] && ok "the default openai model is the listed slug with the lowest priority" || bad "default $(platform_default_model openai)"
+    platform_model_ok openai gpt-hidden; want "a hidden slug is accepted when written"      0 $?
+    platform_model_ok openai gpt-nope;   want "a slug outside the catalog is refused"       1 $?
+    platform_effort_ok openai gpt-a ultra; want "ultra is fine where the catalog lists it"  0 $?
+    platform_effort_ok openai gpt-b ultra; want "and refused where it does not"             1 $?
+    [ "$(openai_catalog_successor gpt-old)" = "gpt-b" ] && ok "a deprecated slug names its successor" || bad "successor $(openai_catalog_successor gpt-old)"
+    [ -z "$(openai_catalog_successor gpt-a)" ] && ok "a live slug names none" || bad "live slug has a successor"
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_catout" | grep -v '^RESULT '
+  printf '%s\n' "$_catout" | grep -qx 'RESULT ok=7 bad=0' \
+    && ok "openai catalog reader over models.json: all 7 assertions reach the gate" \
+    || bad "openai catalog reader over models.json did not: $(printf '%s\n' "$_catout" | tail -1)"
+
+  local _noneout
+  _noneout="$(
+    MODELS_FILE="$tmp/cat/none.json"
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+    platform_model_ok openai gpt-a; want "without a catalog every slug is refused" 1 $?
+    [ -z "$(platform_default_model openai)" ] && ok "and there is no default model" || bad "default without a catalog"
+    platform_effort_ok openai gpt-a ultra; want "but the effort vocabulary falls back to the union" 0 $?
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_noneout" | grep -v '^RESULT '
+  printf '%s\n' "$_noneout" | grep -qx 'RESULT ok=3 bad=0' \
+    && ok "openai catalog reader with no catalog file: all 3 assertions reach the gate" \
+    || bad "openai catalog reader with no catalog file did not: $(printf '%s\n' "$_noneout" | tail -1)"
+
+  # resolve_models_openai() itself -- the writer, over the real fixture (the
+  # same one `test/fake-codex debug models` prints), and the recovery paths
+  # nothing above exercises: a written .resolved surviving an .openai-only
+  # refresh, and no-codex producing available:false rather than a crash.
+  local _rmout
+  _rmout="$(
+    mkdir -p "$tmp/rm"
+    CODEX_BIN="$BASE_DIR/test/fake-codex"
+    CONFIG_DIR="$tmp/rm"
+    MODELS_FILE="$tmp/rm/models.json"
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+
+    resolve_models_openai >/dev/null
+
+    [ "$("$JQ" -r '.openai.source' "$MODELS_FILE")" = "codex debug models" ] \
+      && ok "resolve_models_openai: .openai.source is codex debug models" \
+      || bad "source '$("$JQ" -r '.openai.source' "$MODELS_FILE")'"
+    [ "$(num "$("$JQ" -r '.openai.models | length' "$MODELS_FILE")")" = "7" ] \
+      && ok "resolve_models_openai: the catalog carries all 7 models" \
+      || bad "model count '$("$JQ" -r '.openai.models | length' "$MODELS_FILE")'"
+    [ "$(openai_catalog_visible | tr '\n' ' ')" = "gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna gpt-5.5 gpt-5.4-mini " ] \
+      && ok "resolve_models_openai: openai_catalog_visible lists the priority order" \
+      || bad "visible order '$(openai_catalog_visible | tr '\n' ' ')'"
+    openai_catalog_slugs | grep -qxF gpt-reserve
+    want "resolve_models_openai: the hidden gpt-reserve is still in openai_catalog_slugs" 0 $?
+    openai_catalog_visible | grep -qxF gpt-reserve
+    want "resolve_models_openai: but not in openai_catalog_visible" 1 $?
+    [ "$(openai_catalog_default_effort gpt-5.6-sol)" = "low" ] \
+      && ok "resolve_models_openai: gpt-5.6-sol's default effort is low" \
+      || bad "default effort '$(openai_catalog_default_effort gpt-5.6-sol)'"
+    [ "$(openai_catalog_efforts gpt-5.6-sol | tail -1)" = "ultra" ] \
+      && ok "resolve_models_openai: gpt-5.6-sol's efforts end with ultra" \
+      || bad "last effort '$(openai_catalog_efforts gpt-5.6-sol | tail -1)'"
+    [ "$(num "$(openai_catalog_efforts gpt-5.6-sol | wc -l)")" = "6" ] \
+      && ok "resolve_models_openai: gpt-5.6-sol has 6 effort levels" \
+      || bad "sol effort count '$(num "$(openai_catalog_efforts gpt-5.6-sol | wc -l)")'"
+    [ "$(num "$(openai_catalog_efforts gpt-5.5 | wc -l)")" = "4" ] \
+      && ok "resolve_models_openai: gpt-5.5 has 4 effort levels" \
+      || bad "5.5 effort count '$(num "$(openai_catalog_efforts gpt-5.5 | wc -l)")'"
+    [ "$(openai_catalog_successor gpt-5.4-mini)" = "gpt-5.6-luna" ] \
+      && ok "resolve_models_openai: gpt-5.4-mini's successor is gpt-5.6-luna" \
+      || bad "successor '$(openai_catalog_successor gpt-5.4-mini)'"
+    _retires="$("$JQ" -r '.openai.models[] | select(.slug == "gpt-5.4-mini") | .retires_at' "$MODELS_FILE")"
+    [ "${_retires#2026-08-31}" != "$_retires" ] \
+      && ok "resolve_models_openai: gpt-5.4-mini's retires_at starts 2026-08-31" \
+      || bad "retires_at '$_retires'"
+    [ "$(openai_catalog_all_efforts | tr '\n' ' ')" = "low medium high xhigh max ultra " ] \
+      && ok "resolve_models_openai: openai_catalog_all_efforts unions the visible models' efforts" \
+      || bad "all efforts '$(openai_catalog_all_efforts | tr '\n' ' ')'"
+
+    # .resolved must survive a write that only ever touches .openai.
+    "$JQ" -n '{resolved:{opus:{id:"x", at:1}}}' > "$MODELS_FILE"
+    resolve_models_openai >/dev/null
+    [ "$("$JQ" -r '.resolved.opus.id' "$MODELS_FILE")" = "x" ] \
+      && ok "resolve_models_openai: .resolved survives a refresh of .openai" \
+      || bad ".resolved.opus.id '$("$JQ" -r '.resolved.opus.id' "$MODELS_FILE")'"
+
+    # No codex at all: available:false with a reason, never a crash.
+    CODEX_BIN=/nonexistent
+    MODELS_FILE="$tmp/rm/no-codex.json"
+    resolve_models_openai >/dev/null
+    [ "$("$JQ" -r '.openai.available' "$MODELS_FILE")" = "false" ] \
+      && ok "resolve_models_openai: no codex -> .openai.available is false" \
+      || bad "available '$("$JQ" -r '.openai.available' "$MODELS_FILE")'"
+    [ "$("$JQ" -r '.openai.reason' "$MODELS_FILE")" = "codex not installed" ] \
+      && ok "resolve_models_openai: no codex -> .openai.reason says so" \
+      || bad "reason '$("$JQ" -r '.openai.reason' "$MODELS_FILE")'"
+
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_rmout" | grep -v '^RESULT '
+  printf '%s\n' "$_rmout" | grep -qx 'RESULT ok=15 bad=0' \
+    && ok "resolve_models_openai over the fixture catalog: all 15 assertions reach the gate" \
+    || bad "resolve_models_openai over the fixture catalog did not: $(printf '%s\n' "$_rmout" | tail -1)"
+
+  # cmd_resolve_models must hand the caller resolve_models_openai's status:
+  # `agentloop resolve-models openai` exiting 0 after failing to write the
+  # catalog is a silent no-op an operator (or install.sh) cannot notice. The
+  # subshells exist only to shadow CODEX_BIN/CONFIG_DIR/MODELS_FILE -- the
+  # assertion is on $? out here, where a bad() still counts.
+  mkdir -p "$tmp/rmrc"
+  ( CODEX_BIN=/nonexistent; CONFIG_DIR="$tmp/rmrc"; MODELS_FILE="$tmp/rmrc/models.json"
+    cmd_resolve_models openai ) >/dev/null 2>&1
+  want "resolve-models openai: no codex is a written available:false, not a failure" 0 $?
+  ( CODEX_BIN=/nonexistent; CONFIG_DIR="$tmp/rmrc"; MODELS_FILE="$tmp/rmrc/nodir/x/models.json"
+    cmd_resolve_models openai ) >/dev/null 2>&1
+  want "resolve-models openai: a catalog that could not be written exits non-zero" 1 $?
+
+  echo "platform_stderr_filter() — exactly the CLI's one known line, nothing else"
+  printf 'Reading additional input from stdin...\nsomething real\n' > "$tmp/e1.err"
+  platform_stderr_filter openai "$tmp/e1.err"
+  [ "$(cat "$tmp/e1.err")" = "something real" ] && ok "the known line goes, the rest stays" || bad "left: $(cat "$tmp/e1.err")"
+  printf 'Reading additional input from stdin...\n' > "$tmp/e2.err"
+  platform_stderr_filter openai "$tmp/e2.err"
+  [ ! -s "$tmp/e2.err" ] && ok "a stderr that was only that line is now empty" || bad "not emptied"
+  printf 'Reading additional input from stdin... and more\n' > "$tmp/e3.err"
+  platform_stderr_filter openai "$tmp/e3.err"
+  [ -s "$tmp/e3.err" ] && ok "a line that merely contains the phrase is kept" || bad "a longer line was removed"
+  printf 'Reading additional input from stdin...\n' > "$tmp/e4.err"
+  platform_stderr_filter anthropic "$tmp/e4.err"
+  [ -s "$tmp/e4.err" ] && ok "anthropic stderr is never touched" || bad "anthropic stderr was filtered"
+
+  echo "platform_argv_openai() — the measured launch line, for a fresh run and a resume"
+  platform_argv_openai "" /tmp/w gpt-a high workspace-write "PROMPT"
+  local _av; _av="$(printf '%s\n' "${PLATFORM_ARGV[@]}")"
+  [ "${PLATFORM_ARGV[0]}" = "exec" ] && [ "${PLATFORM_ARGV[1]}" = "--json" ] && ok "exec --json first" || bad "argv starts ${PLATFORM_ARGV[0]} ${PLATFORM_ARGV[1]}"
+  printf '%s\n' "$_av" | grep -qx -- '-C' && ok "-C on a fresh run" || bad "no -C"
+  printf '%s\n' "$_av" | grep -qx -- 'model_reasoning_effort=high' && ok "the effort override is bare" || bad "effort override missing or quoted"
+  printf '%s\n' "$_av" | grep -qx -- 'approval_policy=never' && ok "approval_policy=never travels with a sandboxed mode" || bad "no approval_policy"
+  printf '%s\n' "$_av" | grep -qx -- '--disable' && bad "--disable is passed and closes nothing" || ok "no --disable flag"
+  [ "${PLATFORM_ARGV[$((${#PLATFORM_ARGV[@]} - 2))]}" = "--" ] && [ "${PLATFORM_ARGV[$((${#PLATFORM_ARGV[@]} - 1))]}" = "PROMPT" ] \
+    && ok "-- then the prompt, last" || bad "the prompt is not the lone argument after --"
+  platform_argv_openai "" /tmp/w gpt-a "" full-access "P"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- '--dangerously-bypass-approvals-and-sandbox' \
+    && ok "full-access is the bypass flag" || bad "full-access not translated"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- '-s' && bad "-s alongside the bypass flag" || ok "and no -s beside it"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -q 'model_reasoning_effort' && bad "an empty effort still emitted an override" || ok "an empty effort emits no override"
+  platform_argv_openai thr-1 /tmp/w gpt-a low read-only "P"
+  [ "${PLATFORM_ARGV[0]}" = "exec" ] && [ "${PLATFORM_ARGV[1]}" = "resume" ] && ok "a resume is exec resume" || bad "resume argv ${PLATFORM_ARGV[*]}"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- '-C' && bad "-C on a resume (exec resume refuses it)" || ok "no -C on a resume"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- 'sandbox_mode=read-only' && ok "the sandbox is a -c override on a resume" || bad "no sandbox_mode on the resume"
+  [ "${PLATFORM_ARGV[$((${#PLATFORM_ARGV[@]} - 3))]}" = "thr-1" ] && ok "the thread id sits right before --" || bad "thread id misplaced"
+
+  echo "platform_finish() — the model that ran comes from the rollout"
+  mkdir -p "$tmp/ch/sessions/2026/09/05"
+  cp "$BASE_DIR/test/fixtures/codex/rollout-sample.stripped.jsonl" "$tmp/ch/sessions/2026/09/05/rollout-2026-09-05T13-49-58-01a071d5-47b0-7343-bcbd-216945ef7927.jsonl"
+  # Same subshell-counting fix as the catalog readers above -- see that
+  # comment. CODEX_HOME_DIR and RATE_LIMIT_FILE stay shadowed HERE, inside the
+  # subshell: a later task makes platform_finish write the rate-limit file,
+  # and the real one must never be touched by this suite.
+  local _pfout
+  _pfout="$(
+    CODEX_HOME_DIR="$tmp/ch"; RATE_LIMIT_FILE="$tmp/ch/rate-limits.json"   # T7 makes this write the gate; never the real file
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+    platform_finish openai /dev/null 01a071d5-47b0-7343-bcbd-216945ef7927 selftest
+    [ "$PF_MODEL_ID" = "gpt-5.6-sol" ] && ok "turn_context.model is read" || bad "PF_MODEL_ID '$PF_MODEL_ID'"
+    platform_finish openai /dev/null thr-missing selftest
+    [ -z "$PF_MODEL_ID" ] && grep -q 'no codex rollout for thread thr-missing' "$TICK_LOG" \
+      && ok "a missing rollout leaves model_id alone and says so in tick.log" || bad "missing rollout: '$PF_MODEL_ID'"
+    platform_finish anthropic /dev/null sess-x selftest
+    [ -z "$PF_MODEL_ID" ] && ok "a no-op on anthropic" || bad "anthropic set PF_MODEL_ID"
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_pfout" | grep -v '^RESULT '
+  printf '%s\n' "$_pfout" | grep -qx 'RESULT ok=3 bad=0' \
+    && ok "platform_finish: all 3 assertions reach the gate" \
+    || bad "platform_finish did not: $(printf '%s\n' "$_pfout" | tail -1)"
+
+  echo "turn_is_over() — over a normalized OpenAI stream"
+  "$PYTHON" -u "$BIN_DIR/platforms/openai_stream.py" --model gpt-5.6-sol --permission read-only --cwd /tmp \
+    < "$BASE_DIR/test/fixtures/codex/02-tool-use.jsonl" > "$tmp/oa.ndjson" 2>/dev/null
+  turn_is_over "$tmp/oa.ndjson"; want "a finished Codex turn is over" 0 $?
+  grep -v turn.completed "$BASE_DIR/test/fixtures/codex/02-tool-use.jsonl" \
+    | "$PYTHON" -u "$BIN_DIR/platforms/openai_stream.py" --model gpt-5.6-sol --permission read-only --cwd /tmp > "$tmp/ob.ndjson" 2>/dev/null
+  turn_is_over "$tmp/ob.ndjson"; want "a Codex turn cut before its end is not" 1 $?
+  [ "$(session_from_stream "$tmp/oa.ndjson")" = "01a071d5-47b0-7343-bcbd-216945ef7927" ] \
+    && ok "session_from_stream reads the thread id off the first line" || bad "session $(session_from_stream "$tmp/oa.ndjson")"
+
+  echo "configuration — platform is a field, and model, effort and permission_mode are validated on it"
+  mkdir -p "$tmp/cfg/config" "$tmp/cfg/data"
+  printf '{"projects":[{"name":"oa","cwd":"/tmp","platform":"openai"}]}\n' > "$tmp/cfg/config/projects.json"
+  "$JQ" -n '{resolved:{}, openai:{at:1, source:"fixture", models:[
+      {slug:"gpt-a", display_name:"A", description:"", visibility:"list", priority:6, efforts:["low","high","ultra"], default_effort:"low", deprecated_by:"", retires_at:""},
+      {slug:"gpt-b", display_name:"B", description:"", visibility:"list", priority:7, efforts:["low","high"], default_effort:"low", deprecated_by:"", retires_at:""}]}}' \
+    > "$tmp/cfg/config/models.json"
+  printf '{"jobs":[{"id":"cj","enabled":false,"cwd":"/tmp","prompt":"p","model":"opus","effort":"max","permission_mode":"dontAsk"}]}\n' \
+    > "$tmp/cfg/config/jobs.json"
+  cfg_al()  { AGENTLOOP_CONFIG="$tmp/cfg/config" AGENTLOOP_DATA="$tmp/cfg/data" AGENTLOOP_CODEX_BIN=/nonexistent "$BIN_DIR/agentloop" "$@"; }
+  cfg_job() { "$JQ" -r --arg id "$1" ".jobs[] | select(.id==\$id) | $2" "$tmp/cfg/config/jobs.json"; }
+  printf 'gemini' | cfg_al set-field cj platform >/dev/null 2>&1; want "an unknown platform is refused" 1 $?
+  out="$(printf 'openai' | cfg_al set-field cj platform 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(cfg_job cj .platform)" = "openai" ] && ok "platform openai is written" || bad "platform openai: rc=$rc $out"
+  [ "$(cfg_job cj .model)" = "gpt-a" ] && ok "a model the new platform does not know is rewritten to its default" || bad "model $(cfg_job cj .model)"
+  [ "$(cfg_job cj '.effort // "cleared"')" = "cleared" ] && ok "an effort that model does not offer is cleared" || bad "effort $(cfg_job cj .effort)"
+  [ "$(cfg_job cj .permission_mode)" = "workspace-write" ] && ok "a permission mode of the other platform is rewritten to the default" || bad "permission $(cfg_job cj .permission_mode)"
+  case "$out" in *"rewritten to gpt-a"*"cleared"*"rewritten to workspace-write"*) ok "and each rewrite is printed" ;; *) bad "rewrites not printed: $out" ;; esac
+  out="$(printf 'gpt-zzz' | cfg_al set-field cj model 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    case "$out" in
+      *"unknown OpenAI model"*"gpt-a gpt-b"*"resolve-models openai"*) ok "a slug outside the catalog is refused, naming the catalog and the refresh command" ;;
+      *) bad "refusal text: $out" ;;
+    esac
+  else
+    bad "a slug outside the catalog was accepted"
+  fi
+  printf 'gpt-b' | cfg_al set-field cj model >/dev/null 2>&1; want "a catalog slug is accepted" 0 $?
+  printf 'ultra' | cfg_al set-field cj effort >/dev/null 2>&1; want "ultra is refused where the model lacks it" 1 $?
+  printf 'high'  | cfg_al set-field cj effort >/dev/null 2>&1; want "high is accepted" 0 $?
+  printf 'dontAsk' | cfg_al set-field cj permission_mode >/dev/null 2>&1; want "an anthropic mode is refused on openai" 1 $?
+  printf 'full-access' | cfg_al set-field cj permission_mode >/dev/null 2>&1; want "full-access is accepted" 0 $?
+  out="$(printf 'anthropic' | cfg_al set-field cj platform 2>&1)"
+  [ "$(cfg_job cj .model)" = "opus" ] && [ "$(cfg_job cj .permission_mode)" = "dontAsk" ] && [ "$(cfg_job cj .effort)" = "high" ] \
+    && ok "back to anthropic: model and permission rewritten, a valid effort kept" || bad "back to anthropic: $(cfg_job cj '{model,effort,permission_mode}')"
+  printf '' | cfg_al set-field cj platform >/dev/null 2>&1
+  [ "$(cfg_job cj '.platform // "absent"')" = "absent" ] && ok "an empty platform clears the field (the job inherits)" || bad "platform not cleared"
+  # create: the defaults follow the platform the job will run on
+  printf '{"id":"oj","platform":"openai","prompt":"p"}' | cfg_al create >/dev/null 2>&1
+  [ "$(cfg_job oj .platform)" = "openai" ] && [ "$(cfg_job oj .model)" = "gpt-a" ] && [ "$(cfg_job oj .permission_mode)" = "workspace-write" ] \
+    && ok "create with platform openai defaults to its model and permission" || bad "create openai: $(cfg_job oj '{platform,model,permission_mode}')"
+  printf '{"id":"aj","prompt":"p"}' | cfg_al create >/dev/null 2>&1
+  [ "$(cfg_job aj '.platform // "absent"')" = "absent" ] && [ "$(cfg_job aj .model)" = "opus" ] && [ "$(cfg_job aj .permission_mode)" = "dontAsk" ] \
+    && ok "create without a platform is anthropic, and writes no platform key" || bad "create default: $(cfg_job aj '{platform,model,permission_mode}')"
+  printf '{"id":"pj","project":"oa","prompt":"p"}' | cfg_al create >/dev/null 2>&1
+  [ "$(cfg_job pj '.platform // "absent"')" = "absent" ] && [ "$(cfg_job pj .model)" = "gpt-a" ] && [ "$(cfg_job pj .permission_mode)" = "workspace-write" ] \
+    && ok "create under an openai project inherits the platform and takes its defaults" || bad "create under project: $(cfg_job pj '{platform,model,permission_mode}')"
+  printf '{"id":"xj","platform":"openai","model":"opus","prompt":"p"}' | cfg_al create >/dev/null 2>&1; want "create refuses a model the platform does not know" 1 $?
+  printf '{"id":"ej","platform":"openai","effort":"max","prompt":"p"}' | cfg_al create >/dev/null 2>&1; want "create refuses an effort the model does not offer" 1 $?
+
+  # project-set is the only door a project's platform is written through;
+  # refuse an unknown one there, before any write -- the alternative
+  # (accepting it and relying on every reader to normalise afterwards) is
+  # exactly what let a job get emptied below.
+  before_px="$(cat "$tmp/cfg/config/projects.json")"
+  out="$(printf '{"name":"px","cwd":"/tmp","platform":"gemini"}' | cfg_al project-set 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$(cat "$tmp/cfg/config/projects.json")" = "$before_px" ] \
+    && ok "project-set refuses an unknown platform, and writes nothing" \
+    || bad "project-set gemini: rc=$rc out=$out"
+
+  # A project this corrupt can now only exist by a hand-edit (project-set
+  # itself refuses it, just above) -- standing in for a projects.json older
+  # than that guard, or edited by hand. A job that inherits from it must not
+  # be emptied, and creating one under it must not be refused either: both
+  # run on anthropic, same as a job with no project at all.
+  "$JQ" '.projects += [{"name":"corrupt","cwd":"/tmp","platform":"gemini"}]' \
+      "$tmp/cfg/config/projects.json" > "$tmp/cfg/config/projects.json.next" \
+    && mv "$tmp/cfg/config/projects.json.next" "$tmp/cfg/config/projects.json"
+  printf '{"id":"cej","project":"corrupt","prompt":"p"}' | cfg_al create >/dev/null 2>&1
+  [ "$(cfg_job cej '.platform // "absent"')" = "absent" ] && [ "$(cfg_job cej .model)" = "opus" ] && [ "$(cfg_job cej .permission_mode)" = "dontAsk" ] \
+    && ok "create under a project with an unknown platform treats it as anthropic, not a refusal" \
+    || bad "create under corrupt project: $(cfg_job cej '{platform,model,permission_mode}')"
+  "$JQ" '.jobs += [{"id":"gj","enabled":false,"cwd":"/tmp","project":"corrupt","prompt":"p","model":"gpt-b","permission_mode":"full-access"}]' \
+      "$tmp/cfg/config/jobs.json" > "$tmp/cfg/config/jobs.json.next" \
+    && mv "$tmp/cfg/config/jobs.json.next" "$tmp/cfg/config/jobs.json"
+  out="$(printf '' | cfg_al set-field gj platform 2>&1)"
+  [ "$(cfg_job gj .model)" = "opus" ] && [ "$(cfg_job gj .permission_mode)" = "dontAsk" ] \
+    && ok "clearing a job's platform under that same corrupt project rewrites to anthropic, not empty" \
+    || bad "gj after clearing platform: $(cfg_job gj '{model,permission_mode}')"
+  case "$out" in *anthropic*) ok "and the rewrites name anthropic, not the unknown platform" ;; *) bad "rewrites: $out" ;; esac
+
+  echo "security_derived_jobs() — the block's platform, with the same fallback-and-warn as its permission mode"
+  mkdir -p "$tmp/dplat/data"
+  cat > "$tmp/dplat/projects.json" <<'JSON'
+{"projects":[
+ {"name":"Oa","cwd":"/tmp/oa","security":{"enabled":true,"platform":"openai","model":"gpt-zzz","effort":"max","permission_mode":"dontAsk"}},
+ {"name":"Ob","cwd":"/tmp/ob","platform":"openai","security":{"enabled":true,"model":"gpt-b","effort":"high"}},
+ {"name":"Oc","cwd":"/tmp/oc","security":{"enabled":true,"platform":"martian"}}]}
+JSON
+  printf '{"jobs":[]}\n' > "$tmp/dplat/jobs.json"
+  dplat() { ( JOBS_FILE="$tmp/dplat/jobs.json"; PROJECTS_FILE="$tmp/dplat/projects.json"; DATA_DIR="$tmp/dplat/data"
+              MODELS_FILE="$tmp/cfg/config/models.json"; job_get "$1" "$2" '' ); }
+  [ "$(dplat security-oa .platform)" = "openai" ] && ok "security.platform reaches the derived job" || bad "platform $(dplat security-oa .platform)"
+  [ "$(dplat security-oa .model)" = "gpt-a" ] && ok "a model the platform does not know falls back to its default" || bad "model $(dplat security-oa .model)"
+  [ "$(dplat security-oa '.effort // "cleared"')" = "cleared" ] && ok "an effort the default model lacks is cleared" || bad "effort $(dplat security-oa .effort)"
+  [ "$(dplat security-oa .permission_mode)" = "full-access" ] && ok "an anthropic mode on openai falls back to full-access" || bad "permission $(dplat security-oa .permission_mode)"
+  [ "$(dplat security-ob .platform)" = "openai" ] && [ "$(dplat security-ob .model)" = "gpt-b" ] && [ "$(dplat security-ob .effort)" = "high" ] && [ "$(dplat security-ob .permission_mode)" = "full-access" ] \
+    && ok "the project's platform is inherited by the block, and valid values are kept" || bad "Ob: $(dplat security-ob '{platform,model,effort,permission_mode}')"
+  [ "$(dplat security-oc .platform)" = "anthropic" ] && [ "$(dplat security-oc .model)" = "opus" ] && [ "$(dplat security-oc .permission_mode)" = "bypassPermissions" ] \
+    && ok "an unknown platform in the block falls back to anthropic and its defaults" || bad "Oc: $(dplat security-oc '{platform,model,permission_mode}')"
+
+  # openai with no catalog resolved yet: platform_default_model answers
+  # nothing for it, so the model must come out empty rather than some other
+  # broken value, and the warning has to name the actual cause -- not the
+  # generic "using " with nothing after it that a blind fallback prints.
+  mkdir -p "$tmp/dnocat/data"
+  cat > "$tmp/dnocat/projects.json" <<'JSON'
+{"projects":[{"name":"Od","cwd":"/tmp/od","security":{"enabled":true,"platform":"openai"}}]}
+JSON
+  printf '{"jobs":[]}\n' > "$tmp/dnocat/jobs.json"
+  dnocat() { ( JOBS_FILE="$tmp/dnocat/jobs.json"; PROJECTS_FILE="$tmp/dnocat/projects.json"; DATA_DIR="$tmp/dnocat/data"
+               MODELS_FILE="$tmp/dnocat/no-such-models.json"; job_get "$1" "$2" '' ); }
+  [ -z "$(dnocat security-od .model)" ] \
+    && ok "openai with no catalog resolved yet: the derived job's model is empty, not a broken slug" \
+    || bad "model '$(dnocat security-od .model)'"
+  warn="$(cat "$tmp/dnocat/data/security/derivation-warnings.txt" 2>/dev/null)"
+  case "$warn" in
+    *"no OpenAI catalog is resolved yet"*"resolve-models openai"*)
+      ok "and the warning names the missing catalog and the refresh command" ;;
+    *) bad "warning: $warn" ;;
+  esac
 
   echo "model_alias_baseline() — the init event is found even behind hook events"
   # The probe's first lines belong to whoever has hooks configured: a
@@ -2990,7 +3771,11 @@ EOF
   [ "${got:-0}" -eq 1 ] \
     && ok "the refusal's condition (resume requested, no directory found) appears exactly once ($got)" \
     || bad "the resume-not-found guard is missing or duplicated (found $got)"
-  got="$(printf '%s\n' "$body" | grep -c 'refusing to resume')"
+  # Named by its reason, not just by "refusing to resume": run_job refuses a
+  # resume for more than one reason now (a session that belongs to the other
+  # platform is the other), and a bare count would rise with every new one
+  # while saying nothing about THIS refusal.
+  got="$(printf '%s\n' "$body" | grep -c 'refusing to resume \$resume_sid — no open session directory')"
   [ "${got:-0}" -eq 1 ] \
     && ok "the refusal logs its reason ($got)" \
     || bad "the refusal's log_tick is missing or duplicated (found $got)"
@@ -4039,6 +4824,37 @@ NASTY
   soon="$(( $(now_epoch) + 3600 ))"
   gone="$(( $(now_epoch) - 3600 ))"
 
+  # The file from before platforms carried the two windows at the top level.
+  # It is read as anthropic and rewritten on first contact -- rl_probe above
+  # still writes the OLD shape, which is exactly what makes it a migration test.
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/mig.json"
+    "$JQ" -n '{five_hour:{status:"allowed",utilization:0.5,resets_at:1,overage:null,seen_at:0}}' > "$RATE_LIMIT_FILE"
+    rl_migrate
+    "$JQ" -e '.anthropic.five_hour.utilization == 0.5 and (has("five_hour") | not)' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "a pre-platforms file is nested under anthropic on first contact" || bad "the old shape was not migrated"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/mig2.json"
+    "$JQ" -n '{anthropic:{five_hour:{utilization:0.1}},openai:{}}' > "$RATE_LIMIT_FILE"
+    rl_migrate
+    "$JQ" -e '.anthropic.five_hour.utilization == 0.1' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "a file already in the new shape is left alone" || bad "migration damaged a migrated file"
+  # A file carrying BOTH shapes at once, which is what the live install ended up
+  # with: an unmerged binary nested the windows once while the installed engine
+  # and the statusline kept writing the top-level ones. `{anthropic: top} + rest`
+  # let the NESTED block win whatever its age, throwing away the reading the gate
+  # actually needs. Per window now, and the greater seen_at wins.
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/mig3.json"
+    "$JQ" -n '{five_hour:{utilization:0.4,seen_at:200},
+               anthropic:{five_hour:{utilization:0.9,seen_at:100}}}' > "$RATE_LIMIT_FILE"
+    rl_migrate
+    "$JQ" -e '.anthropic.five_hour.utilization == 0.4 and (has("five_hour") | not)' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "both shapes at once: the fresher top-level window wins" || bad "the fresher top-level reading was discarded"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/mig4.json"
+    "$JQ" -n '{five_hour:{utilization:0.4,seen_at:100},
+               anthropic:{five_hour:{utilization:0.9,seen_at:200}}}' > "$RATE_LIMIT_FILE"
+    rl_migrate
+    "$JQ" -e '.anthropic.five_hour.utilization == 0.9 and (has("five_hour") | not)' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "and the nested one is kept when it is the fresher" || bad "a fresher nested reading was overwritten"
+
   # Capture: the real seven-day warning that sat at 98% while the loop kept
   # waking runs into it, plus a truncated tail — a killed run is always cut off
   # mid-write, and one bad line must not cost us the reading.
@@ -4046,8 +4862,8 @@ NASTY
   printf '%s' '{"type":"rate_limit_ev' >> "$tmp/rl/s.ndjson"
   ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/cap.json"
     rl_capture "$tmp/rl/s.ndjson"
-    "$JQ" -e '.seven_day.utilization == 0.98 and .seven_day.status == "allowed_warning"' "$RATE_LIMIT_FILE" >/dev/null ) \
-    && ok "a window reading is lifted off the stream, truncated tail and all" \
+    "$JQ" -e '.anthropic.seven_day.utilization == 0.98 and .anthropic.seven_day.status == "allowed_warning"' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "a window reading is lifted off the stream into the anthropic block, truncated tail and all" \
     || bad "rl_capture did not record the reading"
   ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/none.json"
     printf 'not json at all\n' > "$tmp/rl/junk.ndjson"; rl_capture "$tmp/rl/junk.ndjson" ) \
@@ -4076,6 +4892,48 @@ NASTY
   got="$(rl_probe five_hour rejected null "$soon" rejected)"
   [ -n "$got" ] && ok "an API refusal gates even with no utilisation reported" || bad "a refusal did not gate"
 
+  # The OpenAI reading comes off the rollout, not a stream: primary (300 min)
+  # is the five-hour window, secondary (10080 min) the seven-day one.
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/oa.json"
+    printf '%s' '{}' > "$RATE_LIMIT_FILE"
+    rl_capture_openai "$BASE_DIR/test/fixtures/codex/rollout-sample.stripped.jsonl"
+    "$JQ" -e '.openai.five_hour.utilization == 0.05 and .openai.five_hour.resets_at == 1788617232
+              and .openai.seven_day.utilization == 0.02 and .openai.seven_day.resets_at == 1788786623
+              and .openai.five_hour.source == "rollout" and .openai.five_hour.plan_type == "plus"
+              and .openai.five_hour.status == "allowed"' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "the LAST token_count of the rollout feeds both openai windows" || bad "rl_capture_openai: $(cat "$tmp/rl/oa.json")"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/oa2.json"
+    "$JQ" -n '{anthropic:{five_hour:{utilization:0.9,resets_at:1,seen_at:0}}}' > "$RATE_LIMIT_FILE"
+    rl_capture_openai "$BASE_DIR/test/fixtures/codex/rollout-sample.stripped.jsonl"
+    "$JQ" -e '.anthropic.five_hour.utilization == 0.9 and .openai.five_hour.utilization == 0.05' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "and never touches the anthropic block" || bad "the anthropic reading was lost"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/oa3.json"
+    printf '%s' '{}' > "$RATE_LIMIT_FILE"
+    rl_capture_openai "$BASE_DIR/test/fixtures/codex/rollout-sample.stripped.jsonl" refused
+    "$JQ" -e '.openai.five_hour.status == "usage_limit_reached" and .openai.seven_day.status == "allowed"' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "a quota refusal marks the fuller window spent until its reset" || bad "refused: $(cat "$tmp/rl/oa3.json")"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/oa4.json"
+    printf 'not a rollout\n' > "$tmp/rl/junk.jsonl"; printf '%s' '{}' > "$RATE_LIMIT_FILE"
+    rl_capture_openai "$tmp/rl/junk.jsonl"
+    [ "$(cat "$RATE_LIMIT_FILE")" = "{}" ] ) \
+    && ok "a rollout with no token_count writes nothing" || bad "junk rollout changed the file"
+
+  # The gate is per platform: one spent window must not hold the other CLI back.
+  rl_at() { # rl_at <platform> <window> <utilization> <resets_at> -> rl_gate <platform-asked> output
+    ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/pp.json"
+      "$JQ" -n --arg p "$1" --arg w "$2" --argjson u "$3" --argjson r "$4" \
+        '{($p): {($w): {status:"allowed", utilization:$u, resets_at:$r, overage:null, seen_at:0}}}' > "$RATE_LIMIT_FILE"
+      rl_gate "$5" 2>/dev/null )
+  }
+  got="$(rl_at openai five_hour 0.97 "$soon" openai)"
+  case "$got" in *"the openai five_hour window is 97% used"*) ok "a spent openai window gates an openai run, and names itself" ;; *) bad "openai gate: '$got'" ;; esac
+  got="$(rl_at openai five_hour 0.97 "$soon" anthropic)"
+  [ -z "$got" ] && ok "and does not gate an anthropic run" || bad "cross-platform gate: $got"
+  got="$(rl_at anthropic seven_day 0.98 "$soon" openai)"
+  [ -z "$got" ] && ok "a spent anthropic window does not gate an openai run" || bad "cross-platform gate: $got"
+  got="$(rl_at openai five_hour 0.97 "$gone" openai)"
+  [ -z "$got" ] && ok "an openai window past its reset says nothing" || bad "expired openai window gated: $got"
+
   echo "statusline-rate-limits.sh — the figure the run stream never carries"
   # The stream only reports utilisation once the CLI has decided to warn (0.75),
   # so below that the gate is armed and blind. The statusLine payload has the
@@ -4091,10 +4949,10 @@ NASTY
   sl_get() { "$JQ" -r "$1" "$tmp/sl/rate-limits.json" 2>/dev/null; }
 
   sl_run '{"rate_limits":{"five_hour":{"used_percentage":62.5,"resets_at":111},"seven_day":{"used_percentage":18,"resets_at":222}}}'
-  [ "$(sl_get '.five_hour.utilization')" = "0.625" ] \
+  [ "$(sl_get '.anthropic.five_hour.utilization')" = "0.625" ] \
     && ok "used_percentage (0-100) is stored as the utilisation the gate reads (0-1)" \
-    || bad "five_hour utilisation -> $(sl_get '.five_hour.utilization')"
-  [ "$(sl_get '.seven_day.resets_at')" = "222" ] \
+    || bad "five_hour utilisation -> $(sl_get '.anthropic.five_hour.utilization')"
+  [ "$(sl_get '.anthropic.seven_day.resets_at')" = "222" ] \
     && ok "both windows are recorded, not just the first" || bad "seven_day missing"
 
   # An API-key account reports no windows at all. That is not a failure, and it
@@ -4108,21 +4966,33 @@ NASTY
   # they describe the window that was measured.
   "$JQ" -n '{five_hour:{status:"allowed_warning",utilization:0.9,resets_at:111,overage:"rejected",seen_at:0}}' > "$tmp/sl/rate-limits.json"
   sl_run '{"rate_limits":{"five_hour":{"used_percentage":93,"resets_at":111}}}'
-  [ "$(sl_get '.five_hour.overage')" = "rejected" ] && [ "$(sl_get '.five_hour.utilization')" = "0.93" ] \
+  [ "$(sl_get '.anthropic.five_hour.overage')" = "rejected" ] && [ "$(sl_get '.anthropic.five_hour.utilization')" = "0.93" ] \
     && ok "a fresher figure for the SAME window keeps what the stream knew" \
-    || bad "same-window merge lost the stream's fields: $(sl_get '.five_hour|tostring')"
+    || bad "same-window merge lost the stream's fields: $(sl_get '.anthropic.five_hour|tostring')"
   # ...and the moment the window rolls over, that knowledge is about a window
   # that no longer exists. Carrying it would hold the fleet back on a spent fact.
   sl_run '{"rate_limits":{"five_hour":{"used_percentage":4,"resets_at":999}}}'
-  [ "$(sl_get '.five_hour.overage')" = "null" ] && [ "$(sl_get '.five_hour.status')" = "null" ] \
+  [ "$(sl_get '.anthropic.five_hour.overage')" = "null" ] && [ "$(sl_get '.anthropic.five_hour.status')" = "null" ] \
     && ok "a NEW window drops the previous one's status and overage" \
-    || bad "stale status survived a window roll: $(sl_get '.five_hour|tostring')"
+    || bad "stale status survived a window roll: $(sl_get '.anthropic.five_hour|tostring')"
 
   # The gate must not read that null status as a refusal — the statusline never
   # reports one, so treating its silence as "not allowed" would hold back every
   # healthy run the moment this script was installed.
   got="$( DATA_DIR="$tmp/sl"; RATE_LIMIT_FILE="$tmp/sl/rate-limits.json"; rl_gate 2>/dev/null )"
   [ -z "$got" ] && ok "a reading with no status is not a refusal" || bad "gated on a status-less reading: $got"
+
+  # Its `$was` migration carries rl_migrate's precedence rule, for the same
+  # reason: a file holding BOTH shapes must not lose the fresher top-level
+  # window to a stale nested one merely because nested is the shape being
+  # written. The payload touches seven_day only, so five_hour is decided
+  # entirely by the migration.
+  "$JQ" -n '{five_hour:{utilization:0.4,resets_at:111,seen_at:200},
+             anthropic:{five_hour:{utilization:0.9,resets_at:111,seen_at:100}}}' > "$tmp/sl/rate-limits.json"
+  sl_run '{"rate_limits":{"seven_day":{"used_percentage":10,"resets_at":222}}}'
+  [ "$(sl_get '.anthropic.five_hour.utilization')" = "0.4" ] && [ "$(sl_get 'has("five_hour")')" = "false" ] \
+    && ok "the statusline migration keeps the fresher of the two shapes too" \
+    || bad "statusline migration lost the fresher window: $(sl_get '.|tostring')"
 
   echo "failure causes — an outage is not the job's fault, and must not slow it down"
   # `error` covered a 529 the API returned and an agent that got its tools taken
@@ -4231,8 +5101,8 @@ NASTY
 
   # The gate holding the whole fleet back — the case that made this exist.
   : > "$tmp/stall/tick.log"
-  stall_at 180 "a: usage limit reached — the seven_day window is 98% used — skipping"
-  stall_at 60 "a: usage limit reached — the seven_day window is 98% used — skipping"
+  stall_at 180 "a: usage limit reached — the anthropic seven_day window is 98% used — skipping"
+  stall_at 60 "a: usage limit reached — the anthropic seven_day window is 98% used — skipping"
   case "$(stall_ask)" in
     *"spent usage window"*) ok "a spent usage window holding every run back is a stall" ;;
     *) bad "the usage gate holding the fleet was not reported" ;;
@@ -4347,6 +5217,10 @@ NASTY
   case "$(usg "$wired" "$spent")" in
     *"HELD BACK"*) ok "a gate that is holding runs back says so where you look for it" ;;
     *) bad "the command did not report an active hold" ;;
+  esac
+  case "$(usg '{}' '{"anthropic":{"five_hour":{"status":"allowed","utilization":0.3,"resets_at":'"$soon2"',"seen_at":0,"source":"statusline"}},"openai":{"five_hour":{"status":"allowed","utilization":0.05,"resets_at":'"$soon2"',"seen_at":0,"source":"rollout","plan_type":"plus"}}}')" in
+    *"anthropic five_hour: 30% used"*"openai five_hour: 5% used"*"rollout"*) ok "usage lists both platforms, each window named by its platform" ;;
+    *) bad "usage output did not list both platforms" ;;
   esac
 
   echo "the Claude account comes from the setting, never from the environment"
@@ -6730,14 +7604,48 @@ cmd_precheck() { # <id> — run the job's precheck once and RECORD it, without t
   printf '%s\n(exit %s)\n' "$pc_out" "$pc_rc"
 }
 
-cmd_resolve_models() { # refresh the family→id cache (all four families)
-  local fam id
-  for fam in opus sonnet haiku fable; do
-    id="$(resolve_family "$fam")"
-    [ -n "$id" ] || id="$fam"
-    models_cache_set "$fam" "$id"
-    echo "$fam -> $id"
-  done
+cmd_resolve_models() { # cmd_resolve_models [anthropic|openai] -- no argument does both
+  # `rc` carries resolve_models_openai's status past the validation case below,
+  # whose own 0 used to be the function's answer -- so a catalog that could not
+  # be written exited 0 and the failure was invisible to the operator and to
+  # install.sh. An UNAVAILABLE codex is not a failure: that is a written
+  # {available:false} block, and resolve_models_openai already returns 0 for it.
+  local which="${1:-}" fam id rc=0
+  case "$which" in
+    ""|anthropic)
+      for fam in opus sonnet haiku fable; do
+        id="$(resolve_family "$fam")"
+        [ -n "$id" ] || id="$fam"
+        models_cache_set "$fam" "$id"
+        echo "$fam -> $id"
+      done ;;
+  esac
+  case "$which" in
+    ""|openai) resolve_models_openai || rc=$? ;;
+  esac
+  case "$which" in ""|anthropic|openai) ;; *) die "resolve-models: unknown platform '$which'" ;; esac
+  return "$rc"
+}
+
+cmd_platforms() { # one JSON object: what each platform offers and whether it is ready
+  local p ready reason perms efforts dm dp cat_at cat_ok
+  for p in $PLATFORMS; do
+    if reason="$(platform_ready "$p")"; then ready=true; reason=""; else ready=false; fi
+    perms="$(platform_permissions "$p" | "$JQ" -R . | "$JQ" -sc .)"
+    if [ "$p" = "openai" ]; then efforts="$(openai_catalog_all_efforts | "$JQ" -R . | "$JQ" -sc .)"; else efforts="$(platform_efforts "$p" | "$JQ" -R . | "$JQ" -sc .)"; fi
+    dm="$(platform_default_model "$p")"; dp="$(platform_default_permission "$p" job)"
+    cat_at=0; cat_ok=false
+    if [ "$p" = "openai" ]; then
+      cat_at="$(num "$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)")"
+      openai_catalog_available && cat_ok=true
+    fi
+    "$JQ" -nc --arg p "$p" --argjson ready "$ready" --arg reason "$reason" \
+      --argjson perms "$perms" --argjson efforts "$efforts" --arg dm "$dm" --arg dp "$dp" \
+      --argjson cat_at "$cat_at" --argjson cat_ok "$cat_ok" \
+      '{($p): ({ready:$ready, reason:$reason, permissions:$perms, efforts:$efforts,
+                default_model:$dm, default_permission:$dp}
+               + (if $p == "openai" then {catalog_at:$cat_at, catalog_available:$cat_ok} else {} end))}'
+  done | "$JQ" -sc 'add'
 }
 
 # What a run that delivered nothing tells the operator. Split out of the
@@ -6780,6 +7688,11 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   # -- this function runs once per job per tick, in the same shell, in a loop.
   local rname rrepo rwt rbase
   project="$(job_get "$id" '.project' '')"
+  # Which CLI this run goes through: the job's own value, else the project's,
+  # else anthropic -- which is what every job from before platforms means.
+  local platform
+  platform="$(resolve "$id" platform 'anthropic')"
+  case "$platform" in ''|null) platform="anthropic" ;; esac
   # Which account this run signs in as. A project pins one when its work belongs
   # to a different Claude login than the scheduler's default — a company account
   # for client work, a personal one for your own repos. It carries far more than
@@ -6807,11 +7720,14 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   # job doesn't set them (see resolve()).
   cwd="$(resolve "$id" cwd "$HOME")"
   prompt="$(jobs_json | "$JQ" -r --arg id "$id" '.jobs[] | select(.id==$id) | .prompt')"
-  model="$(resolve "$id" model 'opus')"
-  # A family (opus/sonnet/…) becomes the newest concrete id of that family.
+  model="$(resolve "$id" model "$(platform_default_model "$platform")")"
+  # A family (opus/sonnet/…) becomes the newest concrete id of that family --
+  # anthropic only. An OpenAI slug is used verbatim (platform_caps families).
   local model_family=""
-  case "$model" in opus|sonnet|haiku|fable) model_family="$model" ;; esac
-  model="$(effective_model "$model")"
+  if platform_caps "$platform" families; then
+    case "$model" in opus|sonnet|haiku|fable) model_family="$model" ;; esac
+    model="$(effective_model "$model")"
+  fi
   # How hard the model thinks: low|medium|high|xhigh|max (empty = the CLI default)
   effort="$(resolve "$id" effort '')"
   case "$effort" in null) effort="" ;; esac
@@ -6838,7 +7754,7 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   stall="$(resolve "$id" stall_timeout_seconds '1200')"
   case "$timeout" in ''|null) timeout=0 ;; esac
   case "$stall" in ''|null) stall=0 ;; esac
-  permission="$(resolve "$id" permission_mode 'dontAsk')"
+  permission="$(resolve "$id" permission_mode "$(platform_default_permission "$platform" job)")"
   allowed="$(job_get "$id" '.allowed_tools' '')"
   # The mirror of `allowed_tools`, and the field the derived security job is
   # built with: an allowlist has to name everything the agent needs, a denylist
@@ -6861,6 +7777,45 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   # would fail the same way with nothing saying why.
   [ -z "$run_cfgdir" ] || [ -d "$run_cfgdir" ] || {
     log_tick "$id: claude_config_dir missing ($run_cfgdir), skipped"; return 1; }
+
+  # A run that cannot start is refused HERE, before a slot, a precheck or a
+  # turn is spent, with the reason in tick.log -- the treatment `cwd missing`
+  # gets. Each of these would otherwise fail at launch with nothing saying why.
+  local not_ready
+  platform_known "$platform" || { log_tick "$id: unknown platform '$platform', skipped"; return 1; }
+  if ! not_ready="$(platform_ready "$platform")"; then
+    log_tick "$id: $platform is not ready ($not_ready), skipped"; return 1
+  fi
+  if [ "$platform" = "openai" ]; then
+    [ "$interactive" != "true" ] \
+      || { log_tick "$id: interactive is not available on openai (codex exec has no stdin protocol), skipped"; return 1; }
+    platform_model_ok openai "$model" \
+      || { log_tick "$id: model '$model' is not in the OpenAI catalog (run: agentloop resolve-models openai), skipped"; return 1; }
+    platform_permission_ok openai "$permission" \
+      || { log_tick "$id: permission_mode '$permission' is not an OpenAI mode (read-only, workspace-write, full-access), skipped"; return 1; }
+    local successor; successor="$(openai_catalog_successor "$model")"
+    [ -z "$successor" ] || log_tick "$id: model '$model' is deprecated — its successor is $successor"
+    # Codex has no tool allow/deny list and cannot close a tool by flag
+    # (measured: --disable multi_agent leaves spawn_agent in the roster), so
+    # the two fields are ignored here, and said to be.
+    [ -z "$allowed" ] || [ "$allowed" = "null" ] \
+      || log_tick "$id: allowed_tools is ignored on openai (codex has no tool allowlist)"
+    [ -z "$disallowed" ] || [ "$disallowed" = "null" ] \
+      || log_tick "$id: disallowed_tools is ignored on openai (codex cannot close a tool by flag)"
+  fi
+
+  # A resume continues the session of the run that was cut short, on the
+  # platform that run used -- read from the journal, not from the job as it
+  # is now. If the job changed platform since, the session belongs to the
+  # other CLI and there is nothing to continue it with.
+  if [ -n "$resume_sid" ]; then
+    local sess_platform
+    sess_platform="$(journal_platform_of_session "$resume_sid")"
+    if [ -n "$sess_platform" ] && [ "$sess_platform" != "$platform" ]; then
+      log_tick "$id: refusing to resume $resume_sid — this session belongs to $sess_platform; the job now runs on $platform"
+      return 1
+    fi
+  fi
 
   # Prepend the project's description as context, so a run carries the project's
   # purpose without repeating it in every job prompt.
@@ -6907,7 +7862,7 @@ $(run_ending_contract)" ;;
   # override, exactly as it is for the budget and the precheck.
   if [ "$forced" != "true" ]; then
     local rl_reason
-    if rl_reason="$(rl_gate)" && [ -n "$rl_reason" ]; then
+    if rl_reason="$(rl_gate "$platform")" && [ -n "$rl_reason" ]; then
       state_set "$id" last_status '"rate_limited"'
       state_set "$id" last_rate_limit "$("$JQ" -nc --arg r "$rl_reason" '{reason:$r}')"
       log_tick "$id: usage limit reached — $rl_reason — skipping"
@@ -7033,6 +7988,10 @@ ${prompt}"
   # and the worktree's own venv/vars are appended to it below when there is one.
   run_env=()
   [ -n "$run_cfgdir" ] && run_env+=("CLAUDE_CONFIG_DIR=$run_cfgdir")
+  # The agent's own process environment -- not the precheck (it already ran,
+  # before run_env existed) and not a provisioning hook (those run before this
+  # array is finished and read exported AL_* variables).
+  run_env+=("AL_PLATFORM=$platform")
   if wt_isolation_enabled "$project" "$cwd"; then
     local reattached=""
     [ -n "$resume_sid" ] && reattached="$(wt_find_by_session "$id" "$resume_sid")"
@@ -7338,7 +8297,29 @@ If the work turns out to be already finished, or it can no longer be done at all
   fi
 
   fifo=""
-  if [ "$interactive" = "true" ]; then
+  local cli_pid="" normalizer="" rawfifo="" nrc=0
+  if [ "$platform" = "openai" ]; then
+    # The Codex CLI writes its own JSONL; every reader here wants stream-json.
+    # The CLI's stdout goes down a FIFO into the normalizer, which writes the
+    # canonical stream to $streamfile and a verbatim copy to $streamfile.raw.
+    # `exec` makes the subshell BECOME the CLI, so $child below is the CLI's
+    # own pid: stop (TERM), the watchdog's tree_cpu_seconds and wait all keep
+    # working unchanged. `< /dev/null` is what keeps `codex exec` from waiting
+    # on stdin for ever (measured).
+    rawfifo="$logfile.raw.fifo"
+    rm -f "$rawfifo"; mkfifo "$rawfifo" 2>/dev/null
+    platform_argv_openai "$resume_sid" "$run_cwd" "$model" "$effort" "$permission" "$prompt"
+    (
+      cd "$run_cwd" || exit 1
+      exec env ${run_env[@]+"${run_env[@]}"} "$CODEX_BIN" ${PLATFORM_ARGV[@]+"${PLATFORM_ARGV[@]}"} \
+        > "$rawfifo" 2> "$logfile.err" < /dev/null
+    ) &
+    cli_pid=$!
+    "$PYTHON" -u "$BIN_DIR/platforms/openai_stream.py" --model "$model" --permission "$permission" \
+      --cwd "$run_cwd" --pricing "$PRICING_FILE" --raw-out "$streamfile.raw" \
+      < "$rawfifo" > "$streamfile" 2>> "$logfile.err" &
+    normalizer=$!
+  elif [ "$interactive" = "true" ]; then
     # `--input-format stream-json` accepts further user messages on stdin while
     # the run is going, which is what makes the dashboard's terminal two-way.
     # The prompt is sent as the first message instead of as an argument.
@@ -7369,6 +8350,7 @@ If the work turns out to be already finished, or it can no longer be done at all
     ) &
   fi
   local child=$!
+  [ -z "$normalizer" ] || child="$cli_pid"   # openai: $! was the normalizer
 
   if [ "$interactive" = "true" ]; then
     exec 9> "$fifo"                       # hold it open: EOF would end the turn loop
@@ -7454,6 +8436,20 @@ If the work turns out to be already finished, or it can no longer be done at all
     done
   ) & local watchdog=$!
   wait "$child"; rc=$?
+  if [ -n "$normalizer" ]; then
+    # The normalizer ends at EOF on the FIFO. A process the CLI left behind
+    # can hold the FIFO's write end open after the CLI itself is gone (a
+    # backgrounded tool, a server it started), so the wait is bounded: what is
+    # on disk by then is the transcript, and the note says what happened.
+    local _nw=0
+    while kill -0 "$normalizer" 2>/dev/null && [ "$_nw" -lt 100 ]; do sleep 0.1; _nw=$((_nw + 1)); done
+    if kill -0 "$normalizer" 2>/dev/null; then
+      kill "$normalizer" 2>/dev/null; wait "$normalizer" 2>/dev/null; nrc=-1
+    else
+      wait "$normalizer"; nrc=$?
+    fi
+    rm -f "$rawfifo"
+  fi
   # Again, now that the transcript is final. The watchdog polls every 30s and
   # its first pass runs before the child has even exec'd, so a run that dies
   # inside that first window would otherwise never be bound — and a run that
@@ -7470,6 +8466,12 @@ If the work turns out to be already finished, or it can no longer be done at all
   local wdreason=""
   [ -s "$wdfile" ] && wdreason="$(cat "$wdfile")"
   rm -f "$wdfile"
+  case "$nrc" in
+    0) ;;
+    -1) wdreason="${wdreason:+$wdreason · }normalizer killed: the CLI's stdout stayed open 10s after it exited" ;;
+    *)  wdreason="${wdreason:+$wdreason · }normalizer exited $nrc" ;;
+  esac
+  platform_stderr_filter "$platform" "$logfile.err"
 
   # Extract the final result event; synthesize an error object if the stream
   # ended without one (crash, timeout kill) so classification still works.
@@ -7517,6 +8519,31 @@ If the work turns out to be already finished, or it can no longer be done at all
   turns="$("$JQ" -r '.num_turns // 0' "$logfile" 2>/dev/null || echo 0)"
   session="$("$JQ" -r '.session_id // ""' "$logfile" 2>/dev/null || echo "")"
 
+  # How the cost is known, and the token counts. Anthropic reports dollars
+  # (`reported`); the normalizer estimates them from tokens (`estimated`) or
+  # says it cannot (`none`); a run that died without a final event knows
+  # neither, and records null tokens rather than a zero that reads as free.
+  local cost_basis tokens_json
+  cost_basis="$("$JQ" -r '.cost_basis // empty' "$logfile" 2>/dev/null)"
+  if [ -z "$cost_basis" ]; then
+    if [ "$("$JQ" -r '.subtype // ""' "$logfile" 2>/dev/null)" = "no_result_event" ]; then cost_basis="none"
+    elif [ "$platform" = "anthropic" ]; then cost_basis="reported"
+    else cost_basis="none"; fi
+  fi
+  tokens_json="$("$JQ" -c '
+    # The normalizer always writes `tokens` (an object, or null for "unknown"
+    # -- a failed Codex turn reports no usage); its word is final. Only a
+    # result without the key (Claude) derives the counts from `usage`.
+    if has("tokens") then .tokens
+    elif (.subtype // "") == "no_result_event" and (.usage.input_tokens // 0) == 0 then null
+    elif (.usage | type) == "object" then
+      {input:(.usage.input_tokens // 0),
+       cached:(.usage.cache_read_input_tokens // .usage.cache_read_tokens // 0),
+       cache_write:(.usage.cache_creation_input_tokens // .usage.cache_write_tokens // 0),
+       output:(.usage.output_tokens // 0), reasoning:0}
+    else null end' "$logfile" 2>/dev/null)"
+  [ -n "$tokens_json" ] || tokens_json="null"
+
   # Which model actually ran. `$model` is what the job asked for and is usually an
   # ALIAS ("opus") that resolves to whatever is newest, so record the resolved id
   # too — the stream's system/init event reports it (e.g. claude-opus-4-8).
@@ -7524,6 +8551,10 @@ If the work turns out to be already finished, or it can no longer be done at all
   local model_id
   model_id="$("$JQ" -r 'select(.type=="system" and .subtype=="init") | .model' "$streamfile" 2>/dev/null | head -1)"
   [ -n "$model_id" ] && [ "$model_id" != "null" ] || model_id=""
+  # On openai the init event carries the slug that was ASKED for; the model
+  # that ran is in the rollout. platform_finish also feeds the usage gate.
+  platform_finish "$platform" "$streamfile" "$session" "$id"
+  [ -z "$PF_MODEL_ID" ] || model_id="$PF_MODEL_ID"
 
   # Classify the run: error / warning / success.
   #   error   — the process failed, the CLI reported an error, or the agent had
@@ -7764,11 +8795,11 @@ If the work turns out to be already finished, or it can no longer be done at all
       last_cost:($cost|tonumber? // 0),
       last_session:$session, fail_streak:$streak}')"
   # Record what was CHOSEN (the family, when one was) plus what actually ran.
-  record_run "$id" "$status" "$start" "$end" "${cost:-0}" "${turns:-0}" "$session" "$logfile" "$wdreason" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$model_id" "$resume_sid" "$cause"
+  record_run "$id" "$status" "$start" "$end" "${cost:-0}" "${turns:-0}" "$session" "$logfile" "$wdreason" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$model_id" "$resume_sid" "$cause" "$platform" "$cost_basis" "$tokens_json"
   # Tells the EXIT path this run has already filed its record, so a stop that
   # lands while we are finishing here cannot produce a second one.
   : > "$slot/journaled" 2>/dev/null || true
-  log_tick "$id: finished status=$status${cause:+ cause=$cause} rc=$rc denials=${denials:-0} cost=\$$cost turns=$turns model=$model${model_id:+ ($model_id)} forced=$forced${wdreason:+ — $wdreason}"
+  log_tick "$id: finished status=$status${cause:+ cause=$cause} rc=$rc denials=${denials:-0} cost=\$$cost turns=$turns model=$model${model_id:+ ($model_id)} forced=$forced platform=$platform cost_basis=$cost_basis${wdreason:+ — $wdreason}"
   # BEFORE the user hook, and synchronous. run_end_hook detaches into the
   # background with a timeout and only exists at all if the operator wrote the
   # script; an analysis whose agent died has to end up closed on an install
@@ -7779,7 +8810,7 @@ If the work turns out to be already finished, or it can no longer be done at all
   security_close_analysis "$id" "$status" "${cost:-0}" "$wdreason"
   # Fired after the record exists, so a hook that opens the dashboard or reads
   # the journal sees this run already in it.
-  run_end_hook "$id" "$status" "${cost:-0}" "$wdreason" "$project" "$session" "$logfile" "$start" "$end"
+  run_end_hook "$id" "$status" "${cost:-0}" "$wdreason" "$project" "$session" "$logfile" "$start" "$end" "$platform" "$cost_basis" "$tokens_json"
 
   run_cleanup "$id" "$slot"; trap - EXIT
   [ "$status" != "error" ]
@@ -7796,7 +8827,7 @@ If the work turns out to be already finished, or it can no longer be done at all
 # Detached AND time-limited: a notifier that hangs must not hold the run's slot,
 # and a run must never be kept alive by something that only reports on it.
 RUN_HOOK_TIMEOUT="${AGENTLOOP_HOOK_TIMEOUT:-60}"
-run_end_hook() { # <id> <status> <cost> <note> <project> <session> <log> <start> <end>
+run_end_hook() { # <id> <status> <cost> <note> <project> <session> <log> <start> <end> <platform> <cost_basis> <tokens-json>
   local script="$CONFIG_DIR/hooks/on-run-end.sh"
   [ -f "$script" ] || return 0
   (
@@ -7806,6 +8837,7 @@ run_end_hook() { # <id> <status> <cost> <note> <project> <session> <log> <start>
       AL_SESSION="$6" CC_SESSION="$6" AL_LOG="$7" CC_LOG="$7" \
       AL_START="$8" CC_START="$8" AL_END="$9" CC_END="$9" \
       AL_DURATION="$(( ${9:-0} - ${8:-0} ))" CC_DURATION="$(( ${9:-0} - ${8:-0} ))" \
+      AL_PLATFORM="${10:-anthropic}" AL_COST_BASIS="${11:-reported}" AL_TOKENS="${12:-null}" \
       AL_DASHBOARD="http://127.0.0.1:$PORT/" CC_DASHBOARD="http://127.0.0.1:$PORT/" \
         bash "$script" >>"$DATA_DIR/exec.log" 2>&1
     }
@@ -8352,14 +9384,18 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
           '.jobs = [.jobs[] | if .id == $id then .max_parallel = $v else . end]'
       fi ;;
     effort)
-      # empty clears it (the CLI then uses its own default)
-      case "$value" in
-        "") write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.effort) else . end]' ;;
-        low|medium|high|xhigh|max)
-          write_jobs --arg id "$id" --arg v "$value" \
-            '.jobs = [.jobs[] | if .id == $id then .effort = $v else . end]' ;;
-        *) die "effort must be one of: low, medium, high, xhigh, max (or empty)" ;;
-      esac ;;
+      # Empty clears it (the CLI then uses its own default). The levels are the
+      # platform's -- and, on openai, the chosen model's (the catalog says).
+      local p pm
+      p="$(job_platform "$id")"; pm="$(resolve "$id" model "$(platform_default_model "$p")")"
+      if [ -z "$value" ]; then
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.effort) else . end]'
+      elif platform_effort_ok "$p" "$pm" "$value"; then
+        write_jobs --arg id "$id" --arg v "$value" \
+          '.jobs = [.jobs[] | if .id == $id then .effort = $v else . end]'
+      else
+        die "effort must be one of: $(platform_efforts "$p" "$pm" | tr '\n' ',' | sed 's/,$//; s/,/, /g') (or empty)"
+      fi ;;
     timeout_seconds|stall_timeout_seconds)
       # Both are optional: empty clears them (no absolute cap / no stall guard).
       if [ -z "$value" ]; then
@@ -8388,7 +9424,67 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
         write_jobs --arg id "$id" --argjson v "$value" \
           '.jobs = [.jobs[] | if .id == $id then .daily_budget_usd = $v else . end]'
       fi ;;
-    model|active_hours|description|cwd)
+    model)
+      local p
+      p="$(job_platform "$id")"
+      [ -n "$value" ] || die "model cannot be empty"
+      if ! platform_model_ok "$p" "$value"; then
+        if [ "$p" = "openai" ]; then
+          openai_catalog_ensure >/dev/null 2>&1 || true      # a stale miss: refresh once, then decide
+          platform_model_ok openai "$value" \
+            || die "unknown OpenAI model '$value' — the catalog lists: $(openai_catalog_visible | tr '\n' ' ')(refresh with: agentloop resolve-models openai)"
+        else
+          die "model must be a family (opus, sonnet, haiku, fable) or a claude-* id"
+        fi
+      fi
+      write_jobs --arg id "$id" --arg v "$value" \
+        '.jobs = [.jobs[] | if .id == $id then .model = $v else . end]' ;;
+    platform)
+      # The other three fields have a vocabulary PER platform. Whatever the
+      # job carries that the platform it is moving to does not know is
+      # rewritten to that platform's default, and every rewrite is printed --
+      # the editor saves platform FIRST precisely so this runs before it
+      # saves the rest. Empty clears the field: the job inherits its
+      # project's platform, and the rewrites are checked against THAT.
+      local eff cur dm proj
+      case "$value" in
+        anthropic|openai) eff="$value" ;;
+        "") proj="$(job_get "$id" '.project' '')"; eff="anthropic"
+            if [ -n "$proj" ] && [ "$proj" != "null" ]; then eff="$(project_get "$proj" '.platform' 'anthropic')"; fi
+            # A hand-edited project can carry a platform this engine does not
+            # know; inherit anthropic rather than let it through unnormalised
+            # (see job_platform's comment -- the three rewrites below would
+            # otherwise write EMPTY model/permission_mode).
+            platform_known "$eff" || eff="anthropic" ;;
+        *) die "platform must be anthropic or openai (or empty, to inherit the project's)" ;;
+      esac
+      if [ "$eff" = "openai" ] && ! openai_catalog_ensure; then
+        die "no OpenAI catalog yet: install codex, sign in, and run: agentloop resolve-models openai"
+      fi
+      if [ -n "$value" ]; then
+        write_jobs --arg id "$id" --arg v "$value" '.jobs = [.jobs[] | if .id == $id then .platform = $v else . end]'
+      else
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.platform) else . end]'
+      fi
+      cur="$(job_get "$id" '.model' '')"
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! platform_model_ok "$eff" "$cur"; then
+        dm="$(platform_default_model "$eff")"
+        write_jobs --arg id "$id" --arg v "$dm" '.jobs = [.jobs[] | if .id == $id then .model = $v else . end]'
+        echo "model '$cur' is not a $eff model — rewritten to $dm"
+      fi
+      cur="$(job_get "$id" '.effort' '')"
+      if [ -n "$cur" ] && [ "$cur" != "null" ] \
+         && ! platform_effort_ok "$eff" "$(resolve "$id" model "$(platform_default_model "$eff")")" "$cur"; then
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.effort) else . end]'
+        echo "effort '$cur' is not a level of that model on $eff — cleared (the CLI decides)"
+      fi
+      cur="$(job_get "$id" '.permission_mode' '')"
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! platform_permission_ok "$eff" "$cur"; then
+        dm="$(platform_default_permission "$eff" job)"
+        write_jobs --arg id "$id" --arg v "$dm" '.jobs = [.jobs[] | if .id == $id then .permission_mode = $v else . end]'
+        echo "permission_mode '$cur' is not a $eff mode — rewritten to $dm"
+      fi ;;
+    active_hours|description|cwd)
       write_jobs --arg id "$id" --arg f "$field" --arg v "$value" \
         '.jobs = [.jobs[] | if .id == $id then .[$f] = $v else . end]' ;;
     project)
@@ -8399,10 +9495,10 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
           '.jobs = [.jobs[] | if .id == $id then .project = $v else . end]'
       fi ;;
     permission_mode)
-      case "$value" in
-        acceptEdits|auto|bypassPermissions|manual|dontAsk|plan) : ;;
-        *) die "invalid permission_mode: $value" ;;
-      esac
+      local p
+      p="$(job_platform "$id")"
+      platform_permission_ok "$p" "$value" \
+        || die "invalid permission_mode for $p: $value (one of: $(platform_permissions "$p" | tr '\n' ' '))"
       write_jobs --arg id "$id" --arg v "$value" \
         '.jobs = [.jobs[] | if .id == $id then .permission_mode = $v else . end]' ;;
     active_days)
@@ -8538,13 +9634,46 @@ cmd_create() { # reads a partial job object (JSON) from stdin
   # cwd is intentionally NOT defaulted here: an unset cwd inherits from the
   # job's project (resolve()); it only falls back to $HOME at run time when the
   # job has no project either.
-  defaults="$("$JQ" -n --arg id "$id" --arg pc "bash $path" '{
+  # The defaults follow the platform the job will run on: its own `platform`,
+  # else its project's, else anthropic. The platform itself is written only
+  # when the caller gave one -- a job under an openai project INHERITS it and
+  # still gets a model and a permission mode that platform understands (the
+  # old fixed `opus`/`dontAsk` would have been refused at its first launch).
+  local cplat cproj
+  cplat="$(echo "$partial" | "$JQ" -r '.platform // ""')"
+  case "$cplat" in
+    "")
+      # No platform of its own: inherit the project's. A hand-edited project
+      # can carry a platform this engine does not know -- fall back to
+      # anthropic rather than refuse to create a job for an unrelated reason
+      # (see job_platform's comment); an explicit BAD platform right below,
+      # from the caller, still dies -- that one is this call's own mistake.
+      cproj="$(echo "$partial" | "$JQ" -r '.project // ""')"
+      cplat="anthropic"
+      if [ -n "$cproj" ] && [ "$cproj" != "null" ]; then cplat="$(project_get "$cproj" '.platform' 'anthropic')"; fi
+      platform_known "$cplat" || cplat="anthropic" ;;
+    anthropic|openai) : ;;
+    *) die "create: platform must be anthropic or openai" ;;
+  esac
+  if [ "$cplat" = "openai" ] && ! openai_catalog_ensure; then
+    die "create: no OpenAI catalog yet: install codex, sign in, and run: agentloop resolve-models openai"
+  fi
+  defaults="$("$JQ" -n --arg id "$id" --arg pc "bash $path" \
+      --arg model "$(platform_default_model "$cplat")" --arg perm "$(platform_default_permission "$cplat" job)" '{
     id: $id, description: "", enabled: true,
     interval_seconds: 300, active_days: [1,2,3,4,5], active_hours: "08:00-20:00",
-    precheck: $pc, model: "opus", max_budget_usd: 2, stall_timeout_seconds: 1200,
-    permission_mode: "dontAsk", prompt: ""
+    precheck: $pc, model: $model, max_budget_usd: 2, stall_timeout_seconds: 1200,
+    permission_mode: $perm, prompt: ""
   }')"
   merged="$(printf '%s\n%s\n' "$defaults" "$partial" | "$JQ" -s '.[0] * .[1]')"
+  # What the caller wrote has to be that platform's too; a job created wrong
+  # would only say so at its first launch, in tick.log, hours later.
+  local cm cp ce
+  cm="$(echo "$merged" | "$JQ" -r '.model // ""')"; cp="$(echo "$merged" | "$JQ" -r '.permission_mode // ""')"
+  ce="$(echo "$merged" | "$JQ" -r '.effort // ""')"
+  platform_model_ok "$cplat" "$cm" || die "create: model '$cm' is not a $cplat model"
+  platform_permission_ok "$cplat" "$cp" || die "create: permission_mode '$cp' is not a $cplat mode"
+  platform_effort_ok "$cplat" "$cm" "$ce" || die "create: effort '$ce' is not a level of $cm on $cplat"
   write_jobs --argjson j "$merged" '.jobs += [$j]'
   if [ ! -f "$path" ]; then
     mkdir -p "$CONFIG_DIR/prechecks"
@@ -8556,11 +9685,21 @@ cmd_create() { # reads a partial job object (JSON) from stdin
 }
 
 cmd_project_set() { # reads a partial project object (JSON) from stdin; merges by name
-  local partial name
+  local partial name plat
   partial="$(cat)"
   echo "$partial" | "$JQ" -e 'type == "object"' >/dev/null 2>&1 || die "project-set: stdin must be a JSON object"
   name="$(echo "$partial" | "$JQ" -r '.name // ""')"
   [ -n "$name" ] || die "project-set: missing .name"
+  # Refused HERE, before any write: this is the only door a project's platform
+  # is ever set through, so closing it here is what keeps job_platform's
+  # "unknown -> anthropic" fallback (bin/agentloop, the platforms block) a
+  # RARE case rather than the normal one -- a value only a hand-edit of
+  # projects.json can still produce.
+  plat="$(echo "$partial" | "$JQ" -r '.platform // ""')"
+  case "$plat" in
+    ''|null|anthropic|openai) : ;;
+    *) die "project-set: platform must be anthropic or openai (or empty, to inherit nothing)" ;;
+  esac
   if projects_json | "$JQ" -e --arg n "$name" 'any(.projects[]; .name==$n)' >/dev/null 2>&1; then
     write_projects --arg n "$name" --argjson p "$partial" \
       '.projects = [.projects[] | if .name==$n then (. * $p) else . end]'
@@ -8717,7 +9856,7 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop create <id>     create a job from a partial JSON object on stdin
   agentloop set-prompt <id> replace a job's prompt, read from stdin
   agentloop set-field <id> <field>   set interval_seconds|active_hours|active_days|
-                              model|max_budget_usd|timeout_seconds|
+                              platform|model|max_budget_usd|timeout_seconds|
                               stall_timeout_seconds, value from stdin
   agentloop set-precheck <id>   replace a job's precheck script, read from stdin
   agentloop provision-set <project> <up|down>   replace a worktree provisioning hook (stdin)
@@ -8743,6 +9882,11 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop security-branches <project> <repo>
                               list the branches of a project's canonical
                               checkout, local and origin's, for a branch picker
+  agentloop resolve-models [anthropic|openai]
+                              refresh the model catalogues (both, without an
+                              argument)
+  agentloop platforms       what each platform offers (permission modes,
+                              efforts, defaults) and whether it is ready
   agentloop tick            internal — what launchd calls every minute
 
 Jobs are defined in $JOBS_FILE
@@ -8822,7 +9966,8 @@ case "${1:-}" in
              esac ;;
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"
                      cmd_security_branches "$2" "$3" ;;
-  resolve-models) cmd_resolve_models ;;
+  resolve-models) cmd_resolve_models "${2:-}" ;;
+  platforms) cmd_platforms ;;
   skills)    shift; cmd_skills "${1:-status}" ;;
   selftest)  cmd_selftest ;;
   running)   [ $# -ge 2 ] || die "usage: agentloop running <job-id>"; cmd_running "$2" ;;

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# A stand-in for the Codex CLI (`codex`), emitting the JSONL shapes measured on
+# codex-cli 0.148.0 -- test/fixtures/codex/ is the evidence -- so an OpenAI run
+# can be driven end to end offline. Same caveat as test/fake-claude: unless
+# FAKE_ARGV_OUT is set this never reads "$@", so a green run proves nothing
+# about the launch line; scenarios 15 and 17 in e2e.test.sh read one back.
+#
+#   FAKE_SESSION           the thread id reported in thread.started
+#   FAKE_MODE              complete | undeclared | dirty | hang | quota | unknown_model
+#   FAKE_ARGV_OUT          record the argv, one line per argument, "<n><TAB><first line>"
+#   FAKE_CODEX_LOGGED_OUT  set to make `login status` exit 1
+#   FAKE_USED_5H/7D        the used_percent the rollout reports (default 5.0 / 2.0)
+#   CODEX_HOME             where the rollout is written; a test sets it, never ~/.codex
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+case "${1:-}" in
+  login)     [ -z "${FAKE_CODEX_LOGGED_OUT:-}" ] || exit 1
+             echo "Logged in using ChatGPT"; exit 0 ;;
+  debug)     cat "$HERE/fixtures/codex/models-catalog.stripped.json"; exit 0 ;;   # debug models [--bundled]
+  --version) echo "codex-cli 0.148.0"; exit 0 ;;
+  exec)      ;;
+  *)         echo "fake-codex: unexpected invocation: $*" >&2; exit 2 ;;
+esac
+
+if [ -n "${FAKE_ARGV_OUT:-}" ]; then
+  { printf 'ARGC\t%s\n' "$#"
+    n=0
+    for a in "$@"; do n=$((n + 1)); printf '%s\t%s\n' "$n" "${a%%$'\n'*}"; done
+  } > "$FAKE_ARGV_OUT"
+fi
+
+tid="${FAKE_SESSION:-01a0fake-0000-7000-8000-000000000001}"
+mode="${FAKE_MODE:-complete}"
+# The one line the real CLI prints on every run, whatever happens.
+echo "Reading additional input from stdin..." >&2
+
+# The rollout the real CLI writes, carrying the two facts the stream lacks: the
+# model that ran and the usage windows. A resume appends to the existing file.
+if [ -n "${CODEX_HOME:-}" ]; then
+  roll="$(ls "$CODEX_HOME"/sessions/*/*/*/rollout-*-"$tid".jsonl 2>/dev/null | head -1)"
+  if [ -z "$roll" ]; then
+    day="$(date -u +%Y/%m/%d)"
+    mkdir -p "$CODEX_HOME/sessions/$day"
+    roll="$CODEX_HOME/sessions/$day/rollout-$(date -u +%Y-%m-%dT%H-%M-%S)-$tid.jsonl"
+  fi
+  now="$(date +%s)"
+  printf '{"timestamp":"t","type":"turn_context","payload":{"model":"gpt-5.6-sol-real","cwd":"%s"}}\n' "$PWD" >> "$roll"
+  printf '{"timestamp":"t","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":%s,"window_minutes":300,"resets_at":%s},"secondary":{"used_percent":%s,"window_minutes":10080,"resets_at":%s},"plan_type":"plus","rate_limit_reached_type":null}}}\n' \
+    "${FAKE_USED_5H:-5.0}" "$((now + 3600))" "${FAKE_USED_7D:-2.0}" "$((now + 86400))" >> "$roll"
+fi
+
+printf '{"type":"thread.started","thread_id":"%s"}\n' "$tid"
+case "$mode" in
+  unknown_model)
+    cat <<'JSON'
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `gpt-nope` not found. Defaulting to fallback metadata."}}
+{"type":"turn.started"}
+{"type":"error","message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-nope' model is not supported.\"}}"}
+{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-nope' model is not supported.\"}}"}}
+JSON
+    exit 1 ;;
+  quota)
+    cat <<'JSON'
+{"type":"turn.started"}
+{"type":"error","message":"You have hit your usage limit. Try again at Aug 21st, 2026 6:32 AM."}
+{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again at Aug 21st, 2026 6:32 AM."}}
+JSON
+    exit 1 ;;
+esac
+cat <<'JSON'
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"working"}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc ls","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc ls","aggregated_output":"README\n","exit_code":0,"status":"completed"}}
+JSON
+case "$mode" in
+  dirty)
+    echo "the agent was here" > agent-left-this.txt
+    result="RUN COMPLETE: made a change and did not push it." ;;
+  undeclared) result="I did some work." ;;
+  hang)
+    # BECOME the sleep: the engine's TERM then reaches the process that holds
+    # the FIFO's write end, so the normalizer sees EOF the moment the run is
+    # stopped (a `sleep` left as a child would keep the FIFO open for 600s).
+    exec sleep 600 ;;
+  *) result="RUN COMPLETE: nothing needed doing." ;;
+esac
+printf '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"%s"}}\n' "$result"
+printf '{"type":"turn.completed","usage":{"input_tokens":32675,"cached_input_tokens":28160,"cache_write_input_tokens":0,"output_tokens":123,"reasoning_output_tokens":0}}\n'
+exit 0
