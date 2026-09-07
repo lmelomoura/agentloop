@@ -2412,7 +2412,11 @@ def _openai_platform():
         table = json.loads((CONFIG_DIR / "pricing.json").read_text()) or {}
     except Exception:  # noqa: BLE001
         table = {}
-    priced = table.get("openai") or {}
+    if not isinstance(table, dict):
+        table = {}
+    priced = table.get("openai")
+    if not isinstance(priced, dict):
+        priced = {}
 
     def _num(v):
         return isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -2441,12 +2445,13 @@ def _openai_platform():
         for e in m["efforts"]:
             if e not in seen:
                 seen.add(e); efforts.append(e)
+    source_url = table.get("_source_url")
     return {"available": True, "reason": "", "catalog_at": b.get("at", 0),
             "models": models, "efforts": efforts,
             "permissions": PLATFORM_PERMISSIONS["openai"],
             "default_model": models[0]["v"] if models else "",
             "pricing_at": table.get("_refreshed_at") if _num(table.get("_refreshed_at")) else 0,
-            "pricing_source": table.get("_source_url") or "",
+            "pricing_source": source_url if isinstance(source_url, str) else "",
             "unpriced": [m["v"] for m in models if not m["priced"]]}
 
 

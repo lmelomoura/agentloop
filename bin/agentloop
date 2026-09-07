@@ -1503,7 +1503,7 @@ resolve_pricing_openai() { # refresh config/pricing.json from the source; 0 = cu
   # successful refresh ever writes PRICING_FILE (the mv below creates it).
   if [ ! -s "$PRICING_FILE" ] || ! "$JQ" -e 'type == "object"' "$PRICING_FILE" >/dev/null 2>&1; then
     echo "pricing.json missing or not valid JSON — a successful refresh will write a fresh table"
-    printf '{"openai":{}}\n' > "$tmp.base" || { log_tick "pricing: cannot write under $CONFIG_DIR — refresh skipped"; rm -f "$tmp" "$src" "$hdr"; return 1; }
+    printf '{"openai":{}}\n' > "$tmp.base" || { log_tick "pricing: cannot write under $CONFIG_DIR — refresh skipped"; rm -f "$tmp" "$src" "$hdr" "$tmp.base"; return 1; }
     base="$tmp.base"
   fi
   etag="$("$JQ" -r '._source_etag // empty' "$base" 2>/dev/null)"

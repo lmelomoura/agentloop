@@ -115,7 +115,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     overwriting a good row; `agentloop platforms` and `/api/models` report
     `pricing_at` and the visible slugs still without a price; each model
     carries its price row in `/api/models`; a failed refresh changes nothing
-    and says so in `tick.log`.
+    and says so in `tick.log`; a malformed price table never breaks
+    `/api/models`.
 
 ### Changed
 
