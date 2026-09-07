@@ -129,7 +129,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     model (`effortsFor`), the permission modes (`permissionsFor`) and the
     model list (`modelOptionsFor`, flat for OpenAI with the catalog's
     descriptions, deprecations and "no price" marks) from the server's
-    payload; the page's own `EFFORTS`/`PERMS` copies are gone.
+    payload; the page's own `EFFORTS`/`PERMS` copies are gone; a job whose
+    platform the engine does not know reads as Anthropic here too, the
+    engine's own rule.
 
 ### Changed
 

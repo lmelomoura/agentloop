@@ -2204,7 +2204,7 @@
       if (m && Array.isArray(m.efforts) && m.efforts.length) levels = m.efforts;
     }
     if (!levels && Array.isArray(p.efforts) && p.efforts.length) levels = p.efforts;
-    if (!levels) return FALLBACK_EFFORTS.slice();
+    if (!levels) return [""];
     return [""].concat(levels.filter((l) => typeof l === "string" && l));
   }
   function effortIndex(v, list) {
@@ -2215,12 +2215,12 @@
   }
   var FALLBACK_PERMISSIONS = {
     anthropic: [
-      { v: "dontAsk", label: "dontAsk \u2014 run tools without prompting" },
-      { v: "bypassPermissions", label: "bypassPermissions \u2014 full autonomy (headless default)" },
-      { v: "acceptEdits", label: "acceptEdits" },
-      { v: "auto", label: "auto" },
-      { v: "plan", label: "plan" },
-      { v: "manual", label: "manual" }
+      { v: "acceptEdits", label: "acceptEdits \u2014 edits allowed, commands ask" },
+      { v: "auto", label: "auto \u2014 the CLI decides per tool" },
+      { v: "bypassPermissions", label: "bypassPermissions \u2014 nothing asks" },
+      { v: "manual", label: "manual \u2014 everything asks (headless: everything denied)" },
+      { v: "dontAsk", label: "dontAsk \u2014 allowlisted tools only, no prompts" },
+      { v: "plan", label: "plan \u2014 read-only planning" }
     ],
     openai: [
       { v: "read-only", label: "read-only \u2014 sandbox: no writes, no network" },
@@ -2265,7 +2265,7 @@
   }
   function platformOf(job, project) {
     const own = job && job.platform;
-    if (own === "anthropic" || own === "openai") return own;
+    if (own) return own === "openai" ? "openai" : "anthropic";
     const pp = project && project.platform;
     if (pp === "anthropic" || pp === "openai") return pp;
     return "anthropic";
@@ -2482,5 +2482,5 @@
     projectStepError
   };
 })();
-/* ui-bundle: 0eb3e49ea13a4787aa1f84d717d21a5607226b72f59cbcbc34f24d9ceea443ef */
-/* ui-sources: cc651cc0f97f69ab2f8eddf43480aa7df3bd495173bde4e2862523a250329095 */
+/* ui-bundle: 1d6b9e202ffbda9df8450b3d79578d0fc7d3df7ee5d2f800da65c3d2a3a2f64c */
+/* ui-sources: 3b577a02462e5ff0b6677783d4a265bf379482f906c0c7a713794a36eacb2172 */

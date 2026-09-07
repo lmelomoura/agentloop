@@ -6,6 +6,7 @@ cheap guards: it parses, the elements the new code reaches for exist, and the
 arithmetic it duplicates from the engine still agrees with the engine.
 """
 
+import ast
 import json
 import re
 import shutil
@@ -7582,6 +7583,7 @@ def test_the_effort_ladder_follows_the_platform_and_the_model(srv, tmp_path):
       anth: effortsFor("anthropic", "claude-opus-5", P), noPayload: effortsFor("anthropic", "x", null),
       ultraIndex: effortIndex("ultra", sol), ultraBack: effortFromIndex("6", sol),
       ultraWithoutList: effortIndex("ultra"), oldIndex: effortIndex("max"),
+      empty: effortsFor("openai", "x", {openai: {available: false, models: [], efforts: []}}),
     }));
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
@@ -7593,6 +7595,7 @@ def test_the_effort_ladder_follows_the_platform_and_the_model(srv, tmp_path):
     assert out["ultraIndex"] == 6 and out["ultraBack"] == "ultra"
     assert out["ultraWithoutList"] == 0, "the default ladder has no ultra: it settles on unset"
     assert out["oldIndex"] == 5, "the old callers (no list) still read the built-in ladder"
+    assert out["empty"] == [""], "an unavailable platform offers only the unset stop"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -7619,15 +7622,44 @@ def test_permissions_models_and_platform_come_from_the_payload(srv, tmp_path):
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
     assert out["oaPerms"] == ["read-only", "workspace-write", "full-access"]
-    assert out["anPermsNoPayload"] == ["dontAsk", "bypassPermissions", "acceptEdits", "auto", "plan", "manual"]
+    # The server's own order (PLATFORM_PERMISSIONS, bin/agentloop-server): the
+    # fallback is that list verbatim, so the combo does not reorder when
+    # /api/models answers. The labels are pinned against the server below.
+    assert out["anPermsNoPayload"] == ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"]
     assert out["defs"] == ["dontAsk", "bypassPermissions", "workspace-write", "full-access"]
     assert out["defModels"] == ["opus", "gpt-5.6-sol", ""]
     assert out["oaModels"] == ["GPT-5.6-Sol — Reliable agentic workhorse for everyday tasks.",
                                "GPT-5.5 · no price",
                                "GPT-5.4 Mini — → gpt-5.6-luna, retires 2026-08-31"]
     assert out["anModels"][0] == {"sec": "G"} and out["anModels"][1]["v"] == "claude-opus-5"
-    assert out["plat"] == ["openai", "openai", "anthropic", "openai"]
+    # The 4th: a job's OWN unknown platform reads as anthropic, not as its
+    # project's -- job_platform() normalises what resolve() picked, and
+    # resolve() picks the job's own word whenever it is non-empty.
+    assert out["plat"] == ["openai", "openai", "anthropic", "anthropic"]
     assert out["labels"] == ["OpenAI", "Anthropic", "Anthropic"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_anthropic_fallback_permissions_say_what_the_server_says(srv, tmp_path):
+    """The page opens on the fallback and swaps to the server's list on the
+    first fetch; if the two differed, the labels would flip on screen. So
+    FALLBACK_PERMISSIONS is PLATFORM_PERMISSIONS (bin/agentloop-server)
+    verbatim -- v AND label, in the server's order -- for both platforms, not
+    only the Anthropic one that drifted. The JS object is read by node,
+    exactly as the page reads it (turning its source into JSON by string
+    replacement would trip on the trailing commas); the server's is the
+    literal in its source."""
+    script = tmp_path / "fallback-perms.js"
+    script.write_text(_const(_app_js(srv), "FALLBACK_PERMISSIONS")
+                      + "console.log(JSON.stringify(FALLBACK_PERMISSIONS));\n")
+    fallback = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    server = (REPO / "bin" / "agentloop-server").read_text()
+    brace = server.index("{", server.index("\nPLATFORM_PERMISSIONS = "))
+    table = ast.literal_eval(server[brace:_scan_balanced(server, brace)])
+    assert set(fallback) == set(table) == {"anthropic", "openai"}
+    for platform in ("anthropic", "openai"):
+        assert [(o["v"], o["label"]) for o in fallback[platform]] \
+            == [(o["v"], o["label"]) for o in table[platform]], platform
 
 
 # ---- Artboard parity: closing four divergences between the shipped editor

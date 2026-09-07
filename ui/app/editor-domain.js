@@ -31,7 +31,11 @@ export function changedKeys(now, clean){
 // CLI decides), so a slider's stops are [""] + the platform's levels. The
 // levels are the PLATFORM's -- and on OpenAI the chosen MODEL's -- read off
 // /api/models (its `platforms` object); FALLBACK_EFFORTS is what the page
-// opens with before that fetch answers, and what an unknown platform gets.
+// opens with before that fetch answers, and what a platform the payload does
+// not carry gets. A platform the payload DOES carry but with no levels (the
+// server's "codex unavailable" shape: available false, empty lists) offers
+// only the unset stop -- the built-in ladder is Anthropic's, and the engine
+// would refuse its stops on OpenAI.
 // The job editor's "ed-effort" and the Security pane's "sec-effort" are one
 // control (effortSet/effortGet, bin/dashboard.html); each keeps the ladder
 // it was last built with and passes it back in here.
@@ -47,7 +51,7 @@ export function effortsFor(platform, model, platforms){
     if(m && Array.isArray(m.efforts) && m.efforts.length) levels = m.efforts;
   }
   if(!levels && Array.isArray(p.efforts) && p.efforts.length) levels = p.efforts;
-  if(!levels) return FALLBACK_EFFORTS.slice();
+  if(!levels) return [""];   // listed, but with no levels: nothing to offer beyond unset
   return [""].concat(levels.filter(l => typeof l === "string" && l));
 }
 
@@ -67,14 +71,19 @@ export function effortFromIndex(raw, list){
 // The permission modes and defaults, per platform. The engine owns both
 // vocabularies (platform_permissions, platform_default_permission) and the
 // server mirrors them on /api/models; this is the page's read of that
-// payload, with the same built-in fallback the page opened with before the
-// fetch. The labels say what a mode DOES on that CLI.
+// payload, with a built-in fallback for before the fetch answers. The
+// fallback is the server's PLATFORM_PERMISSIONS (bin/agentloop-server)
+// verbatim -- labels AND order -- so nothing flips on screen when the
+// payload arrives; tests/test_page_contract.py pins the two together. The
+// labels say what a mode DOES on that CLI.
 export const FALLBACK_PERMISSIONS = {
   anthropic: [
-    {v: "dontAsk", label: "dontAsk — run tools without prompting"},
-    {v: "bypassPermissions", label: "bypassPermissions — full autonomy (headless default)"},
-    {v: "acceptEdits", label: "acceptEdits"}, {v: "auto", label: "auto"},
-    {v: "plan", label: "plan"}, {v: "manual", label: "manual"},
+    {v: "acceptEdits", label: "acceptEdits — edits allowed, commands ask"},
+    {v: "auto", label: "auto — the CLI decides per tool"},
+    {v: "bypassPermissions", label: "bypassPermissions — nothing asks"},
+    {v: "manual", label: "manual — everything asks (headless: everything denied)"},
+    {v: "dontAsk", label: "dontAsk — allowlisted tools only, no prompts"},
+    {v: "plan", label: "plan — read-only planning"},
   ],
   openai: [
     {v: "read-only", label: "read-only — sandbox: no writes, no network"},
@@ -126,12 +135,14 @@ export function modelOptionsFor(platform, platforms, groupFn){
   return live.concat(old);
 }
 
-// A job's effective platform: its own, else its project's, else anthropic --
-// the engine's resolve() rule, with anything unknown read as anthropic the
-// way job_platform() does.
+// A job's effective platform, the engine's way: resolve() hands back the
+// job's OWN platform whenever it is non-empty -- the project's only fills an
+// EMPTY one -- and job_platform() then reads any word the engine does not
+// know as anthropic. So an unknown own value is anthropic here too, never the
+// project's platform; an unknown project value is anthropic as well.
 export function platformOf(job, project){
   const own = job && job.platform;
-  if(own === "anthropic" || own === "openai") return own;
+  if(own) return own === "openai" ? "openai" : "anthropic";
   const pp = project && project.platform;
   if(pp === "anthropic" || pp === "openai") return pp;
   return "anthropic";
