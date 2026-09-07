@@ -68,6 +68,10 @@ if [ ! -f "$HERE/config/jobs.json" ]; then
   cp "$HERE/config/jobs.example.json" "$HERE/config/jobs.json"
   say "Created config/jobs.json from the example (one disabled demo job)."
 fi
+if [ ! -f "$HERE/config/pricing.json" ]; then
+  cp "$HERE/config/pricing.example.json" "$HERE/config/pricing.json"
+  say "Created config/pricing.json from the example — OpenAI runs are priced from it; check the numbers."
+fi
 mkdir -p "$HERE/config/prechecks" "$HERE/data/logs" "$HERE/data/locks"
 echo
 

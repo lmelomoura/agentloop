@@ -33,6 +33,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     leaves `spawn_agent` in the roster), `exec resume` works in the process's
     own directory and takes `-c sandbox_mode=…`, and `-c` values are passed
     bare. The design carries a *Corrections* section with the rest.
+  - `bin/platforms/openai_stream.py` translates the Codex event stream into
+    the stream-json every reader here already speaks, one line at a time and
+    unbuffered, and keeps a verbatim copy of the raw stream beside it. The
+    Codex stream carries tokens and no dollars, so the final event carries a
+    cost ESTIMATED from `config/pricing.json` (seeded from
+    `config/pricing.example.json` by `install.sh`; the numbers are the OpenAI
+    price page's as read on 2026-09-07), with `cost_basis` saying so — or
+    `none`, never a fake $0.00, when the model has no price.
 
 ### Changed
 
