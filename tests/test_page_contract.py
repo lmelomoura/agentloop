@@ -813,7 +813,7 @@ def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
     assert k["perm"] == "full-access", "an Anthropic mode is replaced by the OpenAI security default"
     assert k["custom"] is False and k["none"] == "— Default (gpt-5.6-sol) —"
     assert "GPT-5.5 · no price" in k["labels"] and k["perms"] == ["read-only", "workspace-write", "full-access"]
-    assert "refused at launch" in k["help"]
+    assert "falls back to the platform's default" in k["help"]
     r = out["afterReset"]
     assert r == {"model": "", "max": "5", "eff": "0", "perm": "bypassPermissions", "custom": True,
                  "none": "— Default (opus) —"}

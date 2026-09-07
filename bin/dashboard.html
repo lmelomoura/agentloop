@@ -829,7 +829,7 @@ document.documentElement.dataset.theme =
     </div>
     <input type="hidden" id="ed-platform">
   </div>
-  <p class="fieldhelp" id="ed-platform-note">Which CLI runs this job: Claude Code (Anthropic) or the Codex CLI (OpenAI). Changing it resets the model, effort and permission mode to that platform's defaults.</p>
+  <p class="fieldhelp" id="ed-platform-note">Which CLI runs this job: Claude Code (Anthropic) or the Codex CLI (OpenAI). Changing it resets the model, effort and permission mode to that platform's defaults. Moving the job to a project on the other platform keeps this choice and sets it on the job.</p>
   <div class="row2">
     <div><label>Model</label>
       <div class="combo" id="ed-model-combo">
@@ -965,8 +965,9 @@ document.documentElement.dataset.theme =
     <input type="hidden" id="pj-platform">
   </div>
   <p class="fieldhelp">Anthropic is Claude Code, OpenAI is the Codex CLI. A job with a platform of its own keeps
-    it; one that inherits this runs on it from its next start — and is refused at launch, with the
-    reason in <code>tick.log</code>, while it still names a model the new platform does not know.</p>
+    it; one that inherits this runs on it from its next start — and, while it still names a model the
+    new platform does not know, fails there (towards OpenAI, refused in <code>tick.log</code> before a
+    slot is taken).</p>
   <label>Working directory (cwd) — jobs in this project inherit it unless they set their own</label>
   <div class="cwdrow">
     <input id="pj-cwd" type="text" placeholder="click Browse to choose a folder" readonly data-cwd-target="pj-cwd" class="cwd-ro">
@@ -2435,6 +2436,7 @@ function collectRepos(){
 }
 function openProjectEditor(name){
   editingProject=name||null;
+  secPlatApplied="";   // a freshly opened project always applies its platform
   const p=name?projById(name):null;
   $("pj-halo").innerHTML=name?I.pencil:I.plus;
   $("pj-title").textContent=name?("Edit project — "+name):"New project";
@@ -3349,14 +3351,12 @@ function groupModels(ids){
   }
   return out;
 }
-let MODELS=[];
 async function loadModels(){
   try{
     const r=await fetch("/api/models",{headers:{"X-AL-Token":TOKEN}});
     if(!r.ok) return;
     const d=await r.json();
     PLATFORMS=d.platforms||{};
-    if(d.models&&d.models.length) MODELS=groupModels(d.models);
     refillPlatformBound();
   }catch(e){ /* keep the built-in fallback lists */ }
 }
@@ -3413,6 +3413,7 @@ function applyPlatformToJobEditor(p, keep){
     ? "Codex exec has no stdin protocol; runs on OpenAI end by themselves"
     : "You can interact with the agent while the job is running.";
   paintLimitsNote(p, $("ed-model").value);
+  edPlatApplied=p;
 }
 // On OpenAI the effort ladder is the MODEL's; a new model means a new ladder.
 function onJobModelPicked(v){
@@ -3452,11 +3453,12 @@ function applyPlatformToSecurity(p, keep){
   const perms=ALApp.permissionsFor(p,PLATFORMS), curPerm=$("sec-perm").value;
   secPermCombo.set((keep&&perms.some(o=>o.v===curPerm))?curPerm:ALApp.defaultPermissionFor(p,"security"), perms);
   $("sec-model-help").textContent = p==="openai"
-    ? "The Codex model the analysis runs as — empty takes the catalog's first ("+(dm||"none resolved yet")+"); a slug outside the catalog is refused at launch."
+    ? "The Codex model the analysis runs as — empty takes the catalog's first ("+(dm||"none resolved yet")+"); a slug outside the catalog falls back to the platform's default, with a warning in tick.log."
     : "The model the analysis runs as — defaults to the opus family.";
   $("sec-perm-help").textContent = p==="openai"
     ? "full-access is the headless default here: the sandbox modes cannot write the ledger, which lives outside the worktree."
     : "How the analysis agent may use tools — dontAsk without an allowlist denies everything headless, but the ledger stays protected by the CLI's validating door either way.";
+  secPlatApplied=p;
 }
 // On OpenAI the ladder is the model's: a new model, a new ladder.
 function onSecModelPicked(v){
@@ -3492,12 +3494,18 @@ let PLATFORMS={};                                          // /api/models.platfo
 const edModelCfg={id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelPicked};
 // The Security pane's model combo, configured by name so applyPlatformToSecurity
 // can flip what the widget offers: a typed-in id ("Use …") is an Anthropic
-// affordance -- a Codex slug outside the catalog is refused at launch -- and the
-// empty row's label names the platform's own default.
+// affordance -- the engine swaps a Codex slug outside the catalog for the
+// platform's default -- and the empty row's label names that default.
 const secModelCfg={id:"sec-model", allowNone:true, noneLabel:"— Default (opus) —", allowCustom:true,
   onPick:(v)=>onSecModelPicked(v)};
 let pjPlatformCombo=null;
 let edEfforts=ALApp.FALLBACK_EFFORTS.slice(), secEfforts=ALApp.FALLBACK_EFFORTS.slice();
+// The platform each pane was last built for (applyPlatformToJobEditor /
+// applyPlatformToSecurity set these on their way out). Re-picking it is not a
+// change: the combos' onPick skips the apply, so the model, effort and mode on
+// screen survive a click that chose what was already there. "" until the pane
+// is first built, and reset when an editor opens so a fresh one always applies.
+let edPlatApplied="", secPlatApplied="";
 let projectCombo=null, modelCombo=null, permCombo=null, wtCombo=null, platformCombo=null,
     secModelCombo=null, secPermCombo=null, secPlatformCombo=null,
     secProfileCombo=null, secMinSevCombo=null;
@@ -3509,21 +3517,25 @@ function titleOpt(v){ return {v, label: v.charAt(0).toUpperCase()+v.slice(1)}; }
 function initCombos(){
   projectCombo=createCombo({id:"ed-project", allowNone:true, noneLabel:"— None —", withIcon:true,
     onPick:(v)=>syncCwdField(v)});
-  platformCombo=createCombo({id:"ed-platform", allowNone:false, def:"anthropic", onPick:(v)=>applyPlatformToJobEditor(v,false)});
+  platformCombo=createCombo({id:"ed-platform", allowNone:false, def:"anthropic",
+    onPick:(v)=>{ if(v!==edPlatApplied) applyPlatformToJobEditor(v,false); }});
   platformCombo.set("anthropic", PLATFORM_OPTS);
   modelCombo=createCombo(edModelCfg);
-  modelCombo.set("opus", MODELS);
+  modelCombo.set("opus", modelOptions("anthropic"));
+  // The two security-side combos apply only when the EFFECTIVE platform moved:
+  // the project's own pick reaches the pane only while the block inherits, and
+  // neither pick is a change when it names what the pane already shows.
   pjPlatformCombo=createCombo({id:"pj-platform", allowNone:false, def:"anthropic",
-    onPick:()=>{ if(!$("sec-platform").value) applyPlatformToSecurity(secEffectivePlatform(), false); }});
+    onPick:()=>{ if(!$("sec-platform").value && secEffectivePlatform()!==secPlatApplied) applyPlatformToSecurity(secEffectivePlatform(), false); }});
   pjPlatformCombo.set("anthropic", PLATFORM_OPTS);
   secPlatformCombo=createCombo({id:"sec-platform", allowNone:true, noneLabel:"— Inherit the project's —",
-    onPick:()=>applyPlatformToSecurity(secEffectivePlatform(), false)});
+    onPick:()=>{ if(secEffectivePlatform()!==secPlatApplied) applyPlatformToSecurity(secEffectivePlatform(), false); }});
   secPlatformCombo.set("", PLATFORM_OPTS);
   // Same list, same widget, one difference: empty is a real choice here — it
   // means "the engine's own default" — so the none row stays. allowCustom keeps
   // what the old free-text field could do: an exact id the CLI does not list yet.
   secModelCombo=createCombo(secModelCfg);
-  secModelCombo.set("", MODELS);
+  secModelCombo.set("", modelOptions("anthropic"));
   secPermCombo=createCombo({id:"sec-perm", allowNone:false, def:"bypassPermissions"});
   secPermCombo.set("bypassPermissions", ALApp.permissionsFor("anthropic", PLATFORMS));
   secProfileCombo=createCombo({id:"sec-profile-default", allowNone:false, def:"standard"});
@@ -3572,6 +3584,7 @@ function initFolderPicker(){
 }
 
 function fill(j){
+  edPlatApplied="";   // a freshly opened job always applies its platform
   // project combobox (searchable select of existing projects, or None)
   const projs=[...new Set((DATA.projects||[]).map(p=>p.name).concat((DATA.jobs||[]).map(x=>x.project||"")).filter(Boolean))].sort();
   projectCombo.set(j.project||"", projs);

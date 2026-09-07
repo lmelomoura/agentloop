@@ -148,8 +148,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     analysis's model list, effort ladder and permission modes follow the
     platform that results — `full-access` is the OpenAI default there, since
     the sandbox modes cannot write the ledger — and the pane stops offering a
-    typed-in model id on OpenAI, where a slug outside the catalog is refused
-    at launch.
+    typed-in model id on OpenAI, where a slug outside the catalog only falls
+    back to the platform's default; re-picking the platform a pane already
+    shows changes nothing.
 
 ### Changed
 
