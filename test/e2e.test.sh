@@ -258,6 +258,7 @@ mi="$(idx '--' 2>/dev/null)"
 export AGENTLOOP_CODEX_BIN="$E2E/fake-codex"
 export CODEX_HOME="$ROOT/codex-home"        # the stand-in's rollouts; never ~/.codex
 mkdir -p "$CODEX_HOME"
+cp "$REPO/config/pricing.example.json" "$ROOT/config/pricing.json"
 # The catalog a slug is validated against, obtained the way a real install
 # obtains it: `resolve-models openai` asks the CLI for `debug models`.
 "$AL" resolve-models openai >/dev/null 2>&1
@@ -297,6 +298,12 @@ sleep 2
 [ "$(lastrun | jq -r .session)" = "thr-clean" ] && ok "the session recorded is the thread id" || bad "session $(lastrun | jq -r .session)"
 [ "$(lastrun | jq -r .model_id)" = "gpt-5.6-sol-real" ] \
   && ok "model_id is the model the rollout says ran, not the slug asked for" || bad "model_id $(lastrun | jq -r .model_id)"
+[ "$(lastrun | jq -r .platform)" = "openai" ] && ok "the journal names the platform" || bad "platform $(lastrun | jq -r .platform)"
+[ "$(lastrun | jq -r .cost_basis)" = "estimated" ] && [ "$(lastrun | jq -r .cost)" = "0.031784" ] \
+  && ok "the cost is the estimate from the seeded price table (\$0.031784 for 32,675 in / 28,160 cached / 123 out)" \
+  || bad "cost $(lastrun | jq -c '{cost,cost_basis}')"
+[ "$(lastrun | jq -r '.tokens.input')" = "32675" ] && [ "$(lastrun | jq -r '.tokens.reasoning')" = "0" ] \
+  && ok "the token counts ride on the record" || bad "tokens $(lastrun | jq -c .tokens)"
 s13="$(ls "$ROOT"/data/logs/j13/*.stream.ndjson 2>/dev/null | head -1)"
 [ -f "$s13.raw" ] && grep -q '"thread.started"' "$s13.raw" \
   && ok "the raw Codex stream is kept beside the normalized one" || bad "no .raw copy"
@@ -400,6 +407,31 @@ FAKE_MODE=complete FAKE_SESSION=thr-tools "$AL" run j20 >/dev/null 2>&1
 grep -q "j20: disallowed_tools is ignored on openai" "$ROOT/data/tick.log" && ok "disallowed_tools → one line, run goes on" || bad "no ignored-tools line"
 sleep 2
 [ "$(lastrun | jq -r .status)" = "success" ] && ok "and the run itself went on to finish" || bad "status $(lastrun | jq -r .status)"
+
+echo
+echo "21. the run-end hook learns the platform, the cost basis and the tokens"
+mkdir -p "$ROOT/config/hooks"
+printf '#!/bin/bash\nprintf "%%s %%s %%s\\n" "$AL_PLATFORM" "$AL_COST_BASIS" "$AL_TOKENS" > "%s/hook-21.out"\n' "$ROOT" > "$ROOT/config/hooks/on-run-end.sh"
+chmod +x "$ROOT/config/hooks/on-run-end.sh"
+mkjob_openai j21
+FAKE_MODE=complete FAKE_SESSION=thr-hook "$AL" run j21 >/dev/null 2>&1
+sleep 3
+case "$(cat "$ROOT/hook-21.out" 2>/dev/null)" in
+  "openai estimated {"*'"input":32675'*) ok "AL_PLATFORM, AL_COST_BASIS and AL_TOKENS reach the hook" ;;
+  *) bad "hook saw: $(cat "$ROOT/hook-21.out" 2>/dev/null)" ;;
+esac
+rm -f "$ROOT/config/hooks/on-run-end.sh"
+
+echo
+echo "22. a session is resumed on the platform it ran on, or not at all"
+mkjob_openai j22
+FAKE_MODE=undeclared FAKE_SESSION=thr-moved "$AL" run j22 >/dev/null 2>&1
+sleep 2
+sed -i '' 's/"platform":"openai"/"platform":"anthropic"/; s/"gpt-5.6-sol"/"opus"/; s/"workspace-write"/"dontAsk"/; s/"effort":"high"/"effort":"low"/' "$ROOT/config/jobs.json"
+"$AL" resume j22 thr-moved >/dev/null 2>&1
+grep -q 'j22: refusing to resume thr-moved — this session belongs to openai; the job now runs on anthropic' "$ROOT/data/tick.log" \
+  && ok "the resume is refused, naming both platforms" || bad "no refusal line for the moved job"
+[ -n "$(dirs j22)" ] && ok "and the open session's tree is left where it was" || bad "the tree was taken"
 
 echo
 printf '\n  %s passed, %s failed\n' "$pass" "$fail"

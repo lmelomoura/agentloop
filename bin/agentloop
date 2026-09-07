@@ -1928,7 +1928,7 @@ run_record_stopped_early() { # <id> <slot-dir>
   state_set_many "$id" "$("$JQ" -nc --argjson end "$end" --argjson start "$start" \
     '{last_end:$end, last_status:"stopped", last_run_start:$start, last_run_status:"stopped"}')"
   record_run "$id" "stopped" "$start" "$end" "0" "0" "$sid" "${logf:-}" "$note" "false" "" "$project" \
-             "${model_family:-$model}" "" ""
+             "${model_family:-$model}" "" "" "" "$(resolve "$id" platform 'anthropic')" "none" "null"
   if [ -f "$slot/child" ]; then
     log_tick "$id: stopped by the user after its agent had already run"
   else
@@ -1988,13 +1988,14 @@ lock_active() { # 0 = a run is currently holding the lock for <id> (single mutex
 journal_lock()   { lock_take "$LOCK_DIR/.journal.lock"; }
 journal_unlock() { lock_drop "$LOCK_DIR/.journal.lock"; }
 
-record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> <note> <forced> <precheck> <project> <model> <model_id> <resumed_from> <cause>
+record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> <note> <forced> <precheck> <project> <model> <model_id> <resumed_from> <cause> <platform> <cost_basis> <tokens-json>
   "$JQ" -nc \
     --arg id "$1" --arg status "$2" --argjson start "$3" --argjson end "$4" \
     --arg cost "$5" --arg turns "$6" --arg session "$7" --arg logfile "$8" --arg note "$9" \
     --arg forced "${10:-false}" --arg precheck "${11:-}" --arg project "${12:-}" \
     --arg model "${13:-}" --arg model_id "${14:-}" --arg resumed_from "${15:-}" \
     --arg cause "${16:-}" \
+    --arg platform "${17:-anthropic}" --arg cost_basis "${18:-reported}" --argjson tokens "${19:-null}" \
     '{id:$id, status:$status, start:$start, end:$end, duration:($end-$start),
       cost:($cost|tonumber? // 0), turns:($turns|tonumber? // 0),
       session:$session, log:$logfile, note:$note,
@@ -2006,7 +2007,11 @@ record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> 
       # WHY it failed, for a failed run. Empty on anything that did not fail:
       # a success has no cause, and inventing one would put a word on the page
       # that means nothing.
-      cause:$cause}' > "$LOCK_DIR/.rec.$$"
+      cause:$cause,
+      # Which CLI ran it; how its cost is known (reported by the CLI,
+      # estimated from tokens, or none); its token counts, or null when the
+      # run died without a final event -- unknown is not zero.
+      platform:$platform, cost_basis:$cost_basis, tokens:$tokens}' > "$LOCK_DIR/.rec.$$"
   # Append under the journal lock, so a concurrent rewrite cannot drop this
   # record on the floor (build the line first — the lock is held for the append
   # alone, never across the jq run).
@@ -2014,6 +2019,14 @@ record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> 
   cat "$LOCK_DIR/.rec.$$" >> "$RUNS_FILE"
   journal_unlock
   rm -f "$LOCK_DIR/.rec.$$"
+}
+
+journal_platform_of_session() { # journal_platform_of_session <session-id> -> anthropic|openai, or nothing when unrecorded
+  [ -s "$RUNS_FILE" ] && [ -n "${1:-}" ] || return 0
+  # Compact records: `"session":"<sid>"` is one token. A record from before
+  # platforms existed carries none, and is anthropic by definition.
+  grep -F "\"session\":\"$1\"" "$RUNS_FILE" 2>/dev/null | tail -1 \
+    | "$JQ" -r 'select(type == "object") | .platform // "anthropic"' 2>/dev/null
 }
 
 # How much of the journal the daily-spend scan reads. Records are appended in
@@ -3661,7 +3674,11 @@ EOF
   [ "${got:-0}" -eq 1 ] \
     && ok "the refusal's condition (resume requested, no directory found) appears exactly once ($got)" \
     || bad "the resume-not-found guard is missing or duplicated (found $got)"
-  got="$(printf '%s\n' "$body" | grep -c 'refusing to resume')"
+  # Named by its reason, not just by "refusing to resume": run_job refuses a
+  # resume for more than one reason now (a session that belongs to the other
+  # platform is the other), and a bare count would rise with every new one
+  # while saying nothing about THIS refusal.
+  got="$(printf '%s\n' "$body" | grep -c 'refusing to resume \$resume_sid — no open session directory')"
   [ "${got:-0}" -eq 1 ] \
     && ok "the refusal logs its reason ($got)" \
     || bad "the refusal's log_tick is missing or duplicated (found $got)"
@@ -7595,6 +7612,19 @@ run_job() { # run_job <id> [--force] [resume-session-id]
       || log_tick "$id: disallowed_tools is ignored on openai (codex cannot close a tool by flag)"
   fi
 
+  # A resume continues the session of the run that was cut short, on the
+  # platform that run used -- read from the journal, not from the job as it
+  # is now. If the job changed platform since, the session belongs to the
+  # other CLI and there is nothing to continue it with.
+  if [ -n "$resume_sid" ]; then
+    local sess_platform
+    sess_platform="$(journal_platform_of_session "$resume_sid")"
+    if [ -n "$sess_platform" ] && [ "$sess_platform" != "$platform" ]; then
+      log_tick "$id: refusing to resume $resume_sid — this session belongs to $sess_platform; the job now runs on $platform"
+      return 1
+    fi
+  fi
+
   # Prepend the project's description as context, so a run carries the project's
   # purpose without repeating it in every job prompt.
   if [ -n "$project" ] && [ "$project" != "null" ]; then
@@ -7766,8 +7796,9 @@ ${prompt}"
   # and the worktree's own venv/vars are appended to it below when there is one.
   run_env=()
   [ -n "$run_cfgdir" ] && run_env+=("CLAUDE_CONFIG_DIR=$run_cfgdir")
-  # The agent's own process environment, and any provisioning hook that reads
-  # run_env -- not the precheck: it already ran above, before run_env existed.
+  # The agent's own process environment -- not the precheck (it already ran,
+  # before run_env existed) and not a provisioning hook (those run before this
+  # array is finished and read exported AL_* variables).
   run_env+=("AL_PLATFORM=$platform")
   if wt_isolation_enabled "$project" "$cwd"; then
     local reattached=""
@@ -8296,6 +8327,31 @@ If the work turns out to be already finished, or it can no longer be done at all
   turns="$("$JQ" -r '.num_turns // 0' "$logfile" 2>/dev/null || echo 0)"
   session="$("$JQ" -r '.session_id // ""' "$logfile" 2>/dev/null || echo "")"
 
+  # How the cost is known, and the token counts. Anthropic reports dollars
+  # (`reported`); the normalizer estimates them from tokens (`estimated`) or
+  # says it cannot (`none`); a run that died without a final event knows
+  # neither, and records null tokens rather than a zero that reads as free.
+  local cost_basis tokens_json
+  cost_basis="$("$JQ" -r '.cost_basis // empty' "$logfile" 2>/dev/null)"
+  if [ -z "$cost_basis" ]; then
+    if [ "$("$JQ" -r '.subtype // ""' "$logfile" 2>/dev/null)" = "no_result_event" ]; then cost_basis="none"
+    elif [ "$platform" = "anthropic" ]; then cost_basis="reported"
+    else cost_basis="none"; fi
+  fi
+  tokens_json="$("$JQ" -c '
+    # The normalizer always writes `tokens` (an object, or null for "unknown"
+    # -- a failed Codex turn reports no usage); its word is final. Only a
+    # result without the key (Claude) derives the counts from `usage`.
+    if has("tokens") then .tokens
+    elif (.subtype // "") == "no_result_event" and (.usage.input_tokens // 0) == 0 then null
+    elif (.usage | type) == "object" then
+      {input:(.usage.input_tokens // 0),
+       cached:(.usage.cache_read_input_tokens // .usage.cache_read_tokens // 0),
+       cache_write:(.usage.cache_creation_input_tokens // .usage.cache_write_tokens // 0),
+       output:(.usage.output_tokens // 0), reasoning:0}
+    else null end' "$logfile" 2>/dev/null)"
+  [ -n "$tokens_json" ] || tokens_json="null"
+
   # Which model actually ran. `$model` is what the job asked for and is usually an
   # ALIAS ("opus") that resolves to whatever is newest, so record the resolved id
   # too — the stream's system/init event reports it (e.g. claude-opus-4-8).
@@ -8547,11 +8603,11 @@ If the work turns out to be already finished, or it can no longer be done at all
       last_cost:($cost|tonumber? // 0),
       last_session:$session, fail_streak:$streak}')"
   # Record what was CHOSEN (the family, when one was) plus what actually ran.
-  record_run "$id" "$status" "$start" "$end" "${cost:-0}" "${turns:-0}" "$session" "$logfile" "$wdreason" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$model_id" "$resume_sid" "$cause"
+  record_run "$id" "$status" "$start" "$end" "${cost:-0}" "${turns:-0}" "$session" "$logfile" "$wdreason" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$model_id" "$resume_sid" "$cause" "$platform" "$cost_basis" "$tokens_json"
   # Tells the EXIT path this run has already filed its record, so a stop that
   # lands while we are finishing here cannot produce a second one.
   : > "$slot/journaled" 2>/dev/null || true
-  log_tick "$id: finished status=$status${cause:+ cause=$cause} rc=$rc denials=${denials:-0} cost=\$$cost turns=$turns model=$model${model_id:+ ($model_id)} forced=$forced${wdreason:+ — $wdreason}"
+  log_tick "$id: finished status=$status${cause:+ cause=$cause} rc=$rc denials=${denials:-0} cost=\$$cost turns=$turns model=$model${model_id:+ ($model_id)} forced=$forced platform=$platform cost_basis=$cost_basis${wdreason:+ — $wdreason}"
   # BEFORE the user hook, and synchronous. run_end_hook detaches into the
   # background with a timeout and only exists at all if the operator wrote the
   # script; an analysis whose agent died has to end up closed on an install
@@ -8562,7 +8618,7 @@ If the work turns out to be already finished, or it can no longer be done at all
   security_close_analysis "$id" "$status" "${cost:-0}" "$wdreason"
   # Fired after the record exists, so a hook that opens the dashboard or reads
   # the journal sees this run already in it.
-  run_end_hook "$id" "$status" "${cost:-0}" "$wdreason" "$project" "$session" "$logfile" "$start" "$end"
+  run_end_hook "$id" "$status" "${cost:-0}" "$wdreason" "$project" "$session" "$logfile" "$start" "$end" "$platform" "$cost_basis" "$tokens_json"
 
   run_cleanup "$id" "$slot"; trap - EXIT
   [ "$status" != "error" ]
@@ -8579,7 +8635,7 @@ If the work turns out to be already finished, or it can no longer be done at all
 # Detached AND time-limited: a notifier that hangs must not hold the run's slot,
 # and a run must never be kept alive by something that only reports on it.
 RUN_HOOK_TIMEOUT="${AGENTLOOP_HOOK_TIMEOUT:-60}"
-run_end_hook() { # <id> <status> <cost> <note> <project> <session> <log> <start> <end>
+run_end_hook() { # <id> <status> <cost> <note> <project> <session> <log> <start> <end> <platform> <cost_basis> <tokens-json>
   local script="$CONFIG_DIR/hooks/on-run-end.sh"
   [ -f "$script" ] || return 0
   (
@@ -8589,6 +8645,7 @@ run_end_hook() { # <id> <status> <cost> <note> <project> <session> <log> <start>
       AL_SESSION="$6" CC_SESSION="$6" AL_LOG="$7" CC_LOG="$7" \
       AL_START="$8" CC_START="$8" AL_END="$9" CC_END="$9" \
       AL_DURATION="$(( ${9:-0} - ${8:-0} ))" CC_DURATION="$(( ${9:-0} - ${8:-0} ))" \
+      AL_PLATFORM="${10:-anthropic}" AL_COST_BASIS="${11:-reported}" AL_TOKENS="${12:-null}" \
       AL_DASHBOARD="http://127.0.0.1:$PORT/" CC_DASHBOARD="http://127.0.0.1:$PORT/" \
         bash "$script" >>"$DATA_DIR/exec.log" 2>&1
     }

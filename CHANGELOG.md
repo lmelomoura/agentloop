@@ -77,6 +77,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     disabled OpenAI example. `project-set` refuses a platform it does not
     know, and a job under a project with an unreadable platform is treated
     as Anthropic rather than emptied.
+  - Every run now records `platform`, `cost_basis` and `tokens` in the
+    journal and in `index.db` (additive columns; older rows are backfilled
+    as anthropic/reported, with tokens from the stored result), `/api/data`
+    and the run detail carry them, and `on-run-end.sh` receives
+    `AL_PLATFORM`, `AL_COST_BASIS` and `AL_TOKENS`. A resume continues its
+    session on the platform that run used; a job that changed platform
+    since is refused with both named. The raw Codex stream is pruned with
+    the run's other artifacts.
 
 ### Changed
 
