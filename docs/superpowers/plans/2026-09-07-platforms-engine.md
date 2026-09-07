@@ -2564,9 +2564,9 @@ def _tokens_json(rec, art):
     """The run's token counts as the JSON the `tokens` column stores: what the
     engine recorded, else what the stored result's `usage` says (older runs,
     and every Anthropic run before the engine recorded tokens), else ""."""
-    t = rec.get("tokens")
-    if isinstance(t, dict):
-        return json.dumps(t)
+    if "tokens" in rec:                 # the engine wrote it: a dict, or null for "unknown"
+        t = rec.get("tokens")
+        return json.dumps(t) if isinstance(t, dict) else ""
     try:
         usage = (json.loads(art.get("result_json") or "{}") or {}).get("usage")
     except Exception:  # noqa: BLE001
@@ -2686,7 +2686,10 @@ journal_platform_of_session() { # journal_platform_of_session <session-id> -> an
     else cost_basis="none"; fi
   fi
   tokens_json="$("$JQ" -c '
-    if (.tokens | type) == "object" then .tokens
+    # The normalizer always writes `tokens` (an object, or null for "unknown"
+    # -- a failed Codex turn reports no usage); its word is final. Only a
+    # result without the key (Claude) derives the counts from `usage`.
+    if has("tokens") then .tokens
     elif (.subtype // "") == "no_result_event" and (.usage.input_tokens // 0) == 0 then null
     elif (.usage | type) == "object" then
       {input:(.usage.input_tokens // 0),
@@ -3324,3 +3327,49 @@ Plano completo em `docs/superpowers/plans/2026-09-07-platforms-engine.md`. Duas 
 
 1. **Subagent-Driven (recomendado)** — um subagente novo por tarefa, revisão entre tarefas (`superpowers:subagent-driven-development`), num worktree `feat/platforms-engine`.
 2. **Inline** — as oito tarefas nesta sessão, com checkpoints (`superpowers:executing-plans`).
+
+---
+
+## Correcções encontradas na execução (2026-09-07)
+
+O plano foi executado no branch `feat/platforms-engine` (PR #30), uma tarefa por subagente com revisão por tarefa e revisão final de todo o branch. Onde a revisão apanhou um defeito **no código do próprio plano**, a correcção está na commit indicada e fica aqui registada para que uma re-execução não a repita. O texto das tarefas acima é o original; esta secção manda onde diverge.
+
+**Tarefa 2 — normalizador** (fix `ff57421`, fix final `b93181f`):
+- Um `item.completed{type:"error"}` é um aviso benigno do Codex (fixture 04, linha 2): é mostrado como texto `error: …` e **nunca** fica em `pending_error`; só o evento `error` de topo o faz. Caso contrário `finish()` transformava um run cortado num `error_during_execution` e roubava o salvamento do engine.
+- O `result` leva sempre o conjunto completo: `api_error_status: null` no sucesso; `usage` a zeros no erro (`tokens` fica `null`).
+- `turn.completed` sem `usage` **ou com `usage: {}`** → `total_cost_usd: null`, `cost_basis: "none"` (a guarda é `isinstance(usage, dict) and usage`).
+- Depois de um `result`, um segundo `turn.completed`/`turn.failed` é ignorado; um booleano não é um `status`.
+- Testes correspondentes em `tests/test_openai_stream.py` (24, depois 25 casos).
+
+**Tarefa 3 — tabela de plataformas** (fix `8a03cc3`):
+- As asserções do selftest **dentro de `( … )`** não movem `pass`/`fail` (locals de `cmd_selftest`): os três blocos (leitores do catálogo ×2, `platform_finish`) usam o padrão da casa — `ok`/`bad` redefinidos para `_upass`/`_ufail` dentro da subshell, linha `RESULT ok=N bad=M` no fim, o pai assere a linha exacta. Aplicar o mesmo a qualquer caso novo.
+- `platform_permission_ok`, `platform_effort_ok`, `platform_model_ok` usam `grep -qxF` (um valor como `.*` passava e chegava ao lançamento sem sandbox).
+- O servidor apaga `<stem>.stream.ndjson.raw` também nos dois caminhos de eliminação de um run (`delete_run`, `_forget_stranded_row`), com `tests/test_run_delete_raw.py`.
+- e2e 17: a verificação de `-C` é um prefixo `data/worktrees/j17/` (o worktree já foi desmontado quando o argv é lido); e2e 20 assere também que o run com `disallowed_tools` prosseguiu (`success`).
+- O comentário de `AL_PLATFORM` em `run_env`: só o processo do agente o vê (prechecks correm antes; hooks de provisioning lêem variáveis exportadas).
+
+**Tarefa 4 — catálogo** (fix `77d2fa7`):
+- `cmd_platforms` devolve para `openai` a **união dos `efforts` dos modelos visíveis** (leitor novo `openai_catalog_all_efforts`; vazio sem catálogo), não a lista fixa; o servidor calcula a mesma união só sobre os visíveis.
+- `tests/test_platforms_api.py` corre o engine com `AGENTLOOP_CODEX_BIN=test/fake-codex` e `CODEX_HOME`/`AGENTLOOP_CONFIG`/`AGENTLOOP_DATA` temporários — nunca o codex nem o `~/.codex` reais.
+- Um caso de selftest corre `resolve_models_openai` sobre `test/fake-codex` e pina os campos escritos (ordem dos visíveis, `default_effort`, `efforts`, `visibility`, `deprecated_by`/`retires_at`, `.resolved` preservado, `available:false` sem codex); o e2e assere o slug escondido ausente e `ultra` em `gpt-5.6-sol`.
+- `resolve_models_openai` ressemeia um `models.json` que não é JSON válido e devolve 1 numa escrita falhada; `cmd_resolve_models` devolve esse rc (fix final `b93181f`). O servidor descobre o codex também em `/opt/homebrew/bin/codex` (PATH mínimo do launchd).
+
+**Tarefa 5 — esquema de configuração** (fix `e0632ee`):
+- Helper `job_platform <id>` (= `resolve` normalizado para `anthropic` quando desconhecido), usado pelos ramos `model`/`effort`/`permission_mode` do `set-field`, pelo ramo vazio de `set-field platform` e por `create`; sem ele, um projecto com `"platform":"gemini"` esvaziava `model` e `permission_mode` com rc 0.
+- `project-set` recusa uma `platform` que não seja `anthropic`, `openai` ou vazia.
+- `create` valida também `effort`; o job derivado sem catálogo OpenAI avisa de forma legível (nomeia `resolve-models openai`); `install.sh` diz "two disabled demo jobs, one per platform".
+
+**Tarefa 6 — journal e servidor** (já no texto acima): o `tokens_json` do engine usa `has("tokens")` (um `tokens` presente, objecto **ou null**, é tomado como está — null é "desconhecido", nunca zero) e o `_tokens_json` do servidor usa `"tokens" in rec`. `_stop_slot` usa `job_platform` (fix final `b93181f`).
+
+**Tarefa 7 — rate limits** (fix final `b93181f`):
+- `rl_migrate` (engine e statusline) funde um ficheiro que traga **as duas formas** janela a janela, ganhando o maior `seen_at` (ausente = 0), com guarda `!= null` para nunca deixar cair uma janela; casos de selftest para as duas direcções e para o statusline.
+- **O passo 5 não deve correr `bin/agentloop usage` no checkout real:** um binário por fundir não escreve nos dados vivos. A execução fê-lo e o `rate-limits.json` real ficou na forma nova enquanto o engine instalado escrevia a antiga — daí a fusão acima.
+
+**Tarefa 8 — aceitação e README** (fixes `cca7eff`, `b93181f`):
+- A receita de rascunho **não faz `git init`** no `work/app`: um cwd que é repo git liga a isolação `auto` de worktrees e, sem base, o run aborta antes do CLI (o engine já passa `--skip-git-repo-check`).
+- Três frases do README descreviam B2, não este branch: o dashboard a mostrar `none` como "—" é B2; a quota só marca a janela "when the refusal's rollout still reports the windows" (um 429 real trouxe `primary`/`secondary` null); o tecto por run em OpenAI compara com o `max_budget_usd` **do próprio job**, a 90%, num run que de resto teve sucesso.
+- A tabela de `on-run-end.sh` documenta `AL_PLATFORM`, `AL_COST_BASIS`, `AL_TOKENS`.
+
+**Revisão final do branch** (fix `b93181f`): `list_models()` filtra a chave antiga `models` (e `platforms.anthropic.models`) a famílias e ids `claude-*` — um job ou run OpenAI punha `gpt-*` no selector da página actual; o e2e exporta `AGENTLOOP_CODEX_BIN`/`CODEX_HOME` no topo (três `tick` corriam antes do bloco OpenAI e o refresh diário destacado chamava o codex real).
+
+**Deferido para B2, registado no PR #30:** o editor actual não envia `platform` e faz 500 em `set-field model` num job OpenAI (que `config/jobs.example.json` passa a semear em instalações novas) — B2 tem de aterrar antes de qualquer release, gravando `platform` antes de `model`/`effort`/`permission_mode`.
