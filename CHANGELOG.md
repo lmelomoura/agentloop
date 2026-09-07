@@ -62,6 +62,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`selftest` no longer trips its own home-directory rule on the migration case, and
+  runs that rule inside a git worktree too.** The fake `HOME` the case builds was a
+  path segment named `home`, which the rule reads as a real home directory; and the
+  rule was skipped wherever `.git` is a file rather than a directory, which is every
+  worktree, exactly where the case was written and tested green. The fake home is now
+  `fakehome`, and the rule keys on `.git` existing, not on it being a directory.
+
+- **`agentloop install` no longer prints `running: command not found`.** The XML
+  comment inside the server plist heredoc spelled the word in backticks, and an
+  unquoted heredoc runs backticks as a command substitution: every install since
+  the comment was written printed the error and dropped one word from the comment
+  it wrote into the plist. The backticks are gone.
+- **`install.sh` no longer flips the mode of every file under `bin/`.** It made
+  `bin/dashboard.html`, `bin/board-probe.sh` and the two sourced libraries
+  executable on every run, which left the checkout showing four modified files
+  after each install. It now marks only what git tracks as executable.
+
 - **Every side-effecting button in the dashboard is held from the click until
   its action finishes.** One guard, one hole, eleven buttons. `b.disabled` holds
   the element the handler is looking at; `setInterval(refresh, 5000)` rebuilds
