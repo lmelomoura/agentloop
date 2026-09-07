@@ -24,7 +24,11 @@ fi
 if xattr -rd com.apple.quarantine "$HERE" 2>/dev/null; then
   say "Cleared macOS quarantine from the folder."
 fi
-chmod +x "$HERE"/bin/* "$HERE"/*.sh 2>/dev/null || true
+# Only what git tracks as executable: +x on everything under bin/ made the page
+# and the sourced libraries executable too, and left the checkout showing four
+# modified files after every install.
+chmod +x "$HERE/bin/agentloop" "$HERE/bin/agentloop-server" "$HERE/bin/statusline-rate-limits.sh" \
+         "$HERE/bin/provision-lib.sh" "$HERE/bin/security/cli.py" "$HERE"/*.sh 2>/dev/null || true
 
 # 2) dependencies --------------------------------------------------------
 echo "Checking dependencies…"

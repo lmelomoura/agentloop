@@ -223,12 +223,16 @@ perl -pi -e 's/claude-cron/agentloop/g' \
   bin/security/cli.py bin/security/deps.py bin/security/adapters.py bin/security/engines.py \
   ui/app/*.js ui/security/*.js ui/css/*.css \
   test/e2e.test.sh test/fake-claude test/round-cap.test.sh \
-  tests/*.py tests/security/*.py \
+  tests/conftest.py tests/test_checks_24h.py tests/test_journal_lock.py tests/test_page_contract.py \
+  tests/test_profile.py tests/test_resume_gate.py tests/test_retained_worktrees.py tests/test_security_api.py \
+  tests/test_session_from_log.py tests/test_slot_lease.py tests/test_static_route.py tests/security/*.py \
   build/build-ui.sh build/ui-digest.sh build/ui-bundle-digest.sh \
   install.sh uninstall.sh CONTRIBUTING.md .github/workflows/ci.yml .github/pull_request_template.md \
   package.json config/jobs.example.json config/prechecks/example-hello.sh .gitignore \
   skills/*/SKILL.md README.md
 ```
+
+Os ficheiros de `tests/` vão nomeados um a um, nunca `tests/*.py`: o glob apanharia `tests/test_no_old_name_survives.py`, cujo regex nomeia o nome antigo de propósito, e a substituição desfazia o guarda.
 
 Isto trata de uma vez `bin/claude-cron` → `bin/agentloop`, `claude-cron-server` → `agentloop-server`, `com.claude-cron.tick` → `com.agentloop.tick`, `/tmp/claude-cron-hello` → `/tmp/agentloop-hello`, `.before-claude-cron.` → `.before-agentloop.`, `lmelomoura/claude-cron` → `lmelomoura/agentloop`, `"name": "claude-cron-ui"` → `"agentloop-ui"`, `prog="claude-cron security"` → `prog="agentloop security"`, `vendor: "claude-cron"` → `"agentloop"`, o título e o rodapé da página, e todos os comentários.
 
@@ -419,9 +423,12 @@ Em `CHANGELOG.md`, logo a seguir a `## [Unreleased]` e antes de `### Fixed`, ins
 
 Nas tarefas 2 a 5 acrescentam-se sub-pontos a esta entrada.
 
-- [ ] **Step 7: Correr tudo**
+- [ ] **Step 7: Reconstruir os artefactos da UI, e correr tudo**
+
+O passo 4 tocou em comentários de `ui/app`, `ui/security` e `ui/css`, e o selftest compara o digest das fontes com o gravado em `bin/static/*`. Reconstrói antes de correr (precisa de rede na primeira vez: `npx` descarrega o esbuild 0.25.0 fixado):
 
 ```bash
+bash build/build-ui.sh
 bin/agentloop selftest 2>&1 | tail -3
 python3 -m pytest tests/ -q --ignore=tests/security 2>&1 | tail -3
 python3 -m pytest tests/security -q 2>&1 | tail -3
@@ -687,15 +694,18 @@ perl -pi -e 's/\bCC_/AL_/g' \
   bin/agentloop bin/worktree-lib.sh bin/provision-lib.sh bin/round-cap.sh \
   bin/security/adapters.py bin/security/cli.py \
   test/fake-claude test/e2e.test.sh test/round-cap.test.sh \
-  tests/*.py tests/security/*.py .github/workflows/ci.yml \
+  tests/conftest.py tests/test_checks_24h.py tests/test_journal_lock.py tests/test_page_contract.py \
+  tests/test_profile.py tests/test_resume_gate.py tests/test_retained_worktrees.py tests/test_security_api.py \
+  tests/test_session_from_log.py tests/test_slot_lease.py tests/test_static_route.py \
+  tests/security/*.py .github/workflows/ci.yml \
   config/provision/example-hello.up.sh README.md
 perl -pi -e 's/\bcc_(port|env_set|env_ports|copy_ignored)\b/al_$1/g; s/cc-ports\./al-ports./g' \
   bin/provision-lib.sh bin/worktree-lib.sh bin/agentloop config/provision/example-hello.up.sh README.md
 grep -rnE '\bCC_|\bcc_(port|env)' bin ui test tests .github config/provision/example-hello.up.sh README.md \
-  --exclude-dir=__pycache__ --exclude-dir=fixtures --exclude-dir=static | grep -v test_no_old_name_survives
+  --exclude-dir=__pycache__ --exclude-dir=fixtures --exclude-dir=static | grep -v test_no_old_name_survives | grep -v test_rename_transition
 bin/agentloop selftest 2>&1 | tail -1
 ```
-Esperado: o `grep` não devolve nada; o selftest continua verde (só nomes mudaram).
+Esperado: o `grep` não devolve nada; o selftest continua verde (só nomes mudaram). Os ficheiros de `tests/` vão nomeados um a um, nunca `tests/*.py`: o glob apanharia `tests/test_no_old_name_survives.py`, cujo regex nomeia `CC_` de propósito, e `tests/test_rename_transition.py` da Task 2.
 
 - [ ] **Step 2: Os testes que vão falhar — selftest**
 
@@ -1169,6 +1179,7 @@ perl -pi -e 's/CCApp/ALApp/g; s/CCSecurity/ALSecurity/g' \
 perl -pi -e 's/\bCC\b/AL/g' \
   bin/dashboard.html ui/app/*.js ui/security/*.js tests/test_page_contract.py
 perl -pi -e 's/\bcc\(/al(/g' bin/agentloop-server
+perl -pi -e 's/\bcc\(/al(/g; s/"cc"/"al"/g' tests/test_security_api.py tests/test_resume_gate.py
 perl -pi -e 's/cc_server/al_server/g' tests/conftest.py
 perl -pi -e 's/\bcc-(logo|g1|g2)\b/al-$1/g' bin/dashboard.html
 grep -c 'ALApp' bin/dashboard.html          # expected: 179
@@ -1254,10 +1265,10 @@ Em `bin/agentloop`, dentro de `cmd_selftest`, imediatamente antes de `echo "the 
 
 ```bash
   echo "the rename — install retires the pre-rename agents and symlinks, and keeps the pinned account"
-  mkdir -p "$tmp/mig/home/Library/LaunchAgents" "$tmp/mig/home/.local/bin" "$tmp/mig/fakebin"
+  mkdir -p "$tmp/mig/fakehome/Library/LaunchAgents" "$tmp/mig/fakehome/.local/bin" "$tmp/mig/fakebin"
   printf '%s\n' '#!/bin/sh' 'echo "launchctl $*" >> "$MIG_LOG"' > "$tmp/mig/fakebin/launchctl"
   chmod +x "$tmp/mig/fakebin/launchctl"
-  cat > "$tmp/mig/home/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist" <<'PLIST'
+  cat > "$tmp/mig/fakehome/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -1265,32 +1276,32 @@ Em `bin/agentloop`, dentro de `cmd_selftest`, imediatamente antes de `echo "the 
   <key>EnvironmentVariables</key><dict><key>CLAUDE_CONFIG_DIR</key><string>/tmp/pinned-account</string></dict>
 </dict></plist>
 PLIST
-  : > "$tmp/mig/home/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist"
-  ln -s "$BASE_DIR/bin/$LEGACY_CLI_NAME" "$tmp/mig/home/.local/bin/$LEGACY_CLI_NAME"
-  ln -s "/somewhere/else/$LEGACY_CLI_NAME-server" "$tmp/mig/home/.local/bin/$LEGACY_CLI_NAME-server"
-  got="$( HOME="$tmp/mig/home" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
+  : > "$tmp/mig/fakehome/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist"
+  ln -s "$BASE_DIR/bin/$LEGACY_CLI_NAME" "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME"
+  ln -s "/somewhere/else/$LEGACY_CLI_NAME-server" "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME-server"
+  got="$( HOME="$tmp/mig/fakehome" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
   [ "$got" = "/tmp/pinned-account" ] && ok "the account pinned in the old agent is handed on" || bad "install_migrate_legacy printed '$got'"
-  [ ! -e "$tmp/mig/home/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist" ] \
-    && [ ! -e "$tmp/mig/home/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist" ] \
+  [ ! -e "$tmp/mig/fakehome/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist" ] \
+    && [ ! -e "$tmp/mig/fakehome/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist" ] \
     && ok "both old plists are gone" || bad "an old plist survived"
   grep -q "launchctl unload .*$LEGACY_PLIST_LABEL" "$tmp/mig/log" 2>/dev/null \
     && grep -q "launchctl unload .*$LEGACY_SERVER_LABEL" "$tmp/mig/log" 2>/dev/null \
     && ok "and both were unloaded before being removed" || bad "unload was not called: $(cat "$tmp/mig/log" 2>/dev/null)"
-  [ ! -L "$tmp/mig/home/.local/bin/$LEGACY_CLI_NAME" ] && ok "the old symlink into this folder is removed" || bad "the old symlink was kept"
-  [ -L "$tmp/mig/home/.local/bin/$LEGACY_CLI_NAME-server" ] && ok "a symlink pointing elsewhere is left alone" || bad "somebody else's symlink was removed"
-  got="$( HOME="$tmp/mig/home" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
+  [ ! -L "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME" ] && ok "the old symlink into this folder is removed" || bad "the old symlink was kept"
+  [ -L "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME-server" ] && ok "a symlink pointing elsewhere is left alone" || bad "somebody else's symlink was removed"
+  got="$( HOME="$tmp/mig/fakehome" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
   [ -z "$got" ] && ok "a second run finds nothing to migrate" || bad "second run printed '$got'"
 
   echo "the rename — the statusline that still points at the old folder is named"
-  mkdir -p "$tmp/mig/home2/.claude"
+  mkdir -p "$tmp/mig/fakehome2/.claude"
   printf '{"statusLine":{"type":"command","command":"/Users/me/%s/bin/statusline-rate-limits.sh"}}\n' "$LEGACY_CLI_NAME" \
-    > "$tmp/mig/home2/.claude/settings.json"
-  got="$( HOME="$tmp/mig/home2" statusline_path_warning )"
+    > "$tmp/mig/fakehome2/.claude/settings.json"
+  got="$( HOME="$tmp/mig/fakehome2" statusline_path_warning )"
   case "$got" in *"statusline-rate-limits.sh"*"$BIN_DIR/statusline-rate-limits.sh"*) ok "the warning names the old path and the new one" ;;
                  *) bad "the warning was: '$got'" ;; esac
   printf '{"statusLine":{"type":"command","command":"%s/statusline-rate-limits.sh"}}\n' "$BIN_DIR" \
-    > "$tmp/mig/home2/.claude/settings.json"
-  got="$( HOME="$tmp/mig/home2" statusline_path_warning )"
+    > "$tmp/mig/fakehome2/.claude/settings.json"
+  got="$( HOME="$tmp/mig/fakehome2" statusline_path_warning )"
   [ -z "$got" ] && ok "a statusline already on the new path gets no warning" || bad "warned anyway: '$got'"
 
 ```
@@ -1324,7 +1335,8 @@ install_migrate_legacy() { # retire the pre-rename agents and symlinks; prints t
   if [ -f "$old_tick" ]; then
     # The account pinned into the old agent has to reach the new one: dropping
     # it would sign every run in as the CLI default from the next tick on.
-    "$PYTHON" - "$old_tick" <<'PY'
+    local pinned
+    pinned="$("$PYTHON" - "$old_tick" <<'PY'
 import plistlib, sys
 try:
     v = plistlib.load(open(sys.argv[1], "rb")).get("EnvironmentVariables", {}).get("CLAUDE_CONFIG_DIR")
@@ -1333,6 +1345,9 @@ except Exception:
 if v:
     print(v)
 PY
+)"
+    [ -n "$pinned" ] && printf '%s\n' "$pinned"
+    [ -n "$pinned" ] && echo "carrying the account pinned in $LEGACY_PLIST_LABEL: $pinned" >&2
     launchctl unload "$old_tick" 2>/dev/null
     rm -f "$old_tick"
     echo "retired $LEGACY_PLIST_LABEL" >&2
@@ -1347,6 +1362,7 @@ PY
     [ -L "$link" ] || continue
     case "$(readlink "$link")" in
       "$BASE_DIR"/*) rm -f "$link"; echo "removed $link" >&2 ;;
+      *) echo "left $link alone: it points outside this folder" >&2 ;;
     esac
   done
 }
@@ -1355,6 +1371,8 @@ statusline_path_warning() { # ~/.claude/settings.json may still run the statusli
   local settings="$HOME/.claude/settings.json" cmd
   [ -f "$settings" ] || return 0
   cmd="$("$JQ" -r '.statusLine.command // ""' "$settings" 2>/dev/null)"
+  # This install's own script is never wrong, whatever the folder is called.
+  [ "$cmd" = "$BIN_DIR/statusline-rate-limits.sh" ] && return 0
   case "$cmd" in
     *"/$LEGACY_CLI_NAME/"*)
       echo "WARNING: the statusLine in $settings runs $cmd — that folder was renamed; point it at $BIN_DIR/statusline-rate-limits.sh" ;;
@@ -1379,7 +1397,7 @@ Em `cmd_install`, o início:
   if [ -n "${AGENTLOOP_CLAUDE_CONFIG_DIR:-}" ]; then
 ```
 
-e o fim desse `if` (a seguir ao heredoc `PY` que lê o plist novo):
+e o fim desse `if` (a seguir ao heredoc `PY` que lê o plist novo). O plist novo pode existir e não fixar conta nenhuma — o ramo que o lê tem de cair para a conta antiga nesse caso, senão a conta perde-se no exacto momento em que o plist antigo já foi apagado:
 ```bash
 )"
   fi
@@ -1389,7 +1407,10 @@ e o fim desse `if` (a seguir ao heredoc `PY` que lê o plist novo):
 →
 ```bash
 )"
-  elif [ -n "$legacy_cfgdir" ]; then
+  fi
+  # The old agent's pinned account is the last resort: only when neither the
+  # variable nor the new plist named one.
+  if [ -z "$plist_cfgdir" ] && [ -n "$legacy_cfgdir" ]; then
     plist_cfgdir="
     <key>CLAUDE_CONFIG_DIR</key><string>$legacy_cfgdir</string>"
   fi
@@ -1440,13 +1461,13 @@ No fim de `cmd_status`, a seguir a `legacy_scripts_warnings`, acrescenta `status
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# The symlinks an install made under the pre-rename name; removed too.
-LEGACY_CLI_NAME="claude-cron"
 
 echo "agentloop · uninstaller"
+# `bin/agentloop uninstall` also retires the symlinks an install made under the
+# pre-rename name — but only the ones that point into THIS folder (see
+# install_migrate_legacy); nothing here removes a link ungated.
 "$HERE/bin/agentloop" uninstall || true
-rm -f "$HOME/.local/bin/agentloop" "$HOME/.local/bin/agentloop-server" \
-      "$HOME/.local/bin/$LEGACY_CLI_NAME" "$HOME/.local/bin/$LEGACY_CLI_NAME-server"
+rm -f "$HOME/.local/bin/agentloop" "$HOME/.local/bin/agentloop-server"
 echo "Removed the agents and the PATH symlinks."
 echo "Kept: config/ (jobs, prechecks) and data/ (history, index.db) under $HERE."
 echo "Delete the whole folder to remove everything."

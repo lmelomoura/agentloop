@@ -2525,7 +2525,7 @@ EOF
   # see the shape of is a change they cannot trust or adopt. Writing the entry
   # afterwards never happens, so the check is here -- if the code moved and
   # CHANGELOG.md did not, this fails while the reason is still known.
-  if [ -d "$BASE_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+  if [ -e "$BASE_DIR/.git" ] && command -v git >/dev/null 2>&1; then
     local _code _log
     # --no-merges: a merge commit touches bin/ by definition, and is always newer
     # than the changelog entry that came in WITH the branch it merges. Counting it
@@ -2569,7 +2569,7 @@ EOF
   # home directory with a space in it), plus the generic `example`, `runner`
   # and `user`. Keep this list short — every name on it is a name the check
   # will not catch.
-  if [ -d "$BASE_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+  if [ -e "$BASE_DIR/.git" ] && command -v git >/dev/null 2>&1; then
     local _homes _ok='|Jane|example|me|runner|user|'
     # -I so a committed binary is never scanned as text; no revision, so this
     # reads the tracked working tree -- exactly what a clone would get. The
@@ -6502,10 +6502,10 @@ JSON
     || bad "the swap was not caught the way it should: $(cat "$tmp/uiswap-after.out")"
 
   echo "the rename — install retires the pre-rename agents and symlinks, and keeps the pinned account"
-  mkdir -p "$tmp/mig/home/Library/LaunchAgents" "$tmp/mig/home/.local/bin" "$tmp/mig/fakebin"
+  mkdir -p "$tmp/mig/fakehome/Library/LaunchAgents" "$tmp/mig/fakehome/.local/bin" "$tmp/mig/fakebin"
   printf '%s\n' '#!/bin/sh' 'echo "launchctl $*" >> "$MIG_LOG"' > "$tmp/mig/fakebin/launchctl"
   chmod +x "$tmp/mig/fakebin/launchctl"
-  cat > "$tmp/mig/home/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist" <<'PLIST'
+  cat > "$tmp/mig/fakehome/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -6513,36 +6513,36 @@ JSON
   <key>EnvironmentVariables</key><dict><key>CLAUDE_CONFIG_DIR</key><string>/tmp/pinned-account</string></dict>
 </dict></plist>
 PLIST
-  : > "$tmp/mig/home/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist"
-  ln -s "$BASE_DIR/bin/$LEGACY_CLI_NAME" "$tmp/mig/home/.local/bin/$LEGACY_CLI_NAME"
-  ln -s "/somewhere/else/$LEGACY_CLI_NAME-server" "$tmp/mig/home/.local/bin/$LEGACY_CLI_NAME-server"
-  got="$( HOME="$tmp/mig/home" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
+  : > "$tmp/mig/fakehome/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist"
+  ln -s "$BASE_DIR/bin/$LEGACY_CLI_NAME" "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME"
+  ln -s "/somewhere/else/$LEGACY_CLI_NAME-server" "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME-server"
+  got="$( HOME="$tmp/mig/fakehome" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
   [ "$got" = "/tmp/pinned-account" ] && ok "the account pinned in the old agent is handed on" || bad "install_migrate_legacy printed '$got'"
-  [ ! -e "$tmp/mig/home/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist" ] \
-    && [ ! -e "$tmp/mig/home/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist" ] \
+  [ ! -e "$tmp/mig/fakehome/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist" ] \
+    && [ ! -e "$tmp/mig/fakehome/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist" ] \
     && ok "both old plists are gone" || bad "an old plist survived"
   grep -q "launchctl unload .*$LEGACY_PLIST_LABEL" "$tmp/mig/log" 2>/dev/null \
     && grep -q "launchctl unload .*$LEGACY_SERVER_LABEL" "$tmp/mig/log" 2>/dev/null \
     && ok "and both were unloaded" || bad "unload was not called: $(cat "$tmp/mig/log" 2>/dev/null)"
-  [ ! -L "$tmp/mig/home/.local/bin/$LEGACY_CLI_NAME" ] && ok "the old symlink into this folder is removed" || bad "the old symlink was kept"
-  [ -L "$tmp/mig/home/.local/bin/$LEGACY_CLI_NAME-server" ] && ok "a symlink pointing elsewhere is left alone" || bad "somebody else's symlink was removed"
+  [ ! -L "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME" ] && ok "the old symlink into this folder is removed" || bad "the old symlink was kept"
+  [ -L "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME-server" ] && ok "a symlink pointing elsewhere is left alone" || bad "somebody else's symlink was removed"
   loglines_before="$(num "$(wc -l < "$tmp/mig/log" 2>/dev/null)")"
-  got="$( HOME="$tmp/mig/home" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
+  got="$( HOME="$tmp/mig/fakehome" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
   loglines_after="$(num "$(wc -l < "$tmp/mig/log" 2>/dev/null)")"
   [ -z "$got" ] && [ "$loglines_after" -eq "$loglines_before" ] \
     && ok "a second run finds nothing to migrate" \
     || bad "second run printed '$got', log went from $loglines_before to $loglines_after lines"
 
   echo "the rename — the statusline that still points at the old folder is named"
-  mkdir -p "$tmp/mig/home2/.claude"
+  mkdir -p "$tmp/mig/fakehome2/.claude"
   printf '{"statusLine":{"type":"command","command":"/Users/me/%s/bin/statusline-rate-limits.sh"}}\n' "$LEGACY_CLI_NAME" \
-    > "$tmp/mig/home2/.claude/settings.json"
-  got="$( HOME="$tmp/mig/home2" statusline_path_warning )"
+    > "$tmp/mig/fakehome2/.claude/settings.json"
+  got="$( HOME="$tmp/mig/fakehome2" statusline_path_warning )"
   case "$got" in *"statusline-rate-limits.sh"*"$BIN_DIR/statusline-rate-limits.sh"*) ok "the warning names the old path and the new one" ;;
                  *) bad "the warning was: '$got'" ;; esac
   printf '{"statusLine":{"type":"command","command":"%s/statusline-rate-limits.sh"}}\n' "$BIN_DIR" \
-    > "$tmp/mig/home2/.claude/settings.json"
-  got="$( HOME="$tmp/mig/home2" statusline_path_warning )"
+    > "$tmp/mig/fakehome2/.claude/settings.json"
+  got="$( HOME="$tmp/mig/fakehome2" statusline_path_warning )"
   [ -z "$got" ] && ok "a statusline already on the new path gets no warning" || bad "warned anyway: '$got'"
 
   echo "the rename — a run, its hooks and its prechecks see AL_* and CC_* alike for one release"
@@ -8058,7 +8058,7 @@ PLIST
        then EXITS WHENEVER ITS OWN FILE CHANGES on disk (the self-watch that
        picks new code up). Without this, that routine restart had launchd reap
        the server's whole process group -- killing a detached analysis mid-run
-       with no journal, no teardown, and a ledger row stuck on `running`. The
+       with no journal, no teardown, and a ledger row stuck on running. The
        tick's plist has carried the same key for the same reason all along. -->
   <key>AbandonProcessGroup</key><true/>
   <key>EnvironmentVariables</key>
