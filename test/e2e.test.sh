@@ -23,6 +23,14 @@ rm -rf "$ROOT"; mkdir -p "$ROOT"/{config,data,remote,work}
 export AGENTLOOP_CONFIG="$ROOT/config"
 export AGENTLOOP_DATA="$ROOT/data"
 export AGENTLOOP_CLAUDE_BIN="$E2E/fake-claude"
+# Here rather than beside the OpenAI scenarios below, because the FIRST `tick`
+# of this file already reaches for Codex: with no config/models.json the tick
+# finds the catalog stale and detaches `_resolve_models`, which runs `codex
+# debug models` through `$(command -v codex)` -- the operator's real CLI,
+# against their real ~/.codex. Every `$AL` in this file must see the stand-in.
+export AGENTLOOP_CODEX_BIN="$E2E/fake-codex"
+export CODEX_HOME="$ROOT/codex-home"        # the stand-in's rollouts; never ~/.codex
+mkdir -p "$CODEX_HOME"
 AL="$REPO/bin/agentloop"
 
 pass=0; fail=0
@@ -254,10 +262,8 @@ mi="$(idx '--' 2>/dev/null)"
 # ------------------------------------------------------- the OpenAI platform
 # The same lifecycle over the Codex stand-in: the run goes down a FIFO into
 # the normalizer, the classifier reads the normalized stream, the rollout
-# under a sandboxed CODEX_HOME supplies the model that ran.
-export AGENTLOOP_CODEX_BIN="$E2E/fake-codex"
-export CODEX_HOME="$ROOT/codex-home"        # the stand-in's rollouts; never ~/.codex
-mkdir -p "$CODEX_HOME"
+# under the sandboxed CODEX_HOME exported at the top of this file supplies the
+# model that ran.
 cp "$REPO/config/pricing.example.json" "$ROOT/config/pricing.json"
 # The catalog a slug is validated against, obtained the way a real install
 # obtains it: `resolve-models openai` asks the CLI for `debug models`.

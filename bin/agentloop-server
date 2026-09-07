@@ -2437,8 +2437,30 @@ def _openai_platform():
             "default_model": models[0]["v"] if models else ""}
 
 
+def _anthropic_model(value):
+    """The engine's `platform_model_ok anthropic` rule, mirrored: a family name
+    or a `claude-*` id, and nothing else. The families are stripped out again
+    further down; this is only about keeping a foreign id out of the list."""
+    return isinstance(value, str) and (
+        value in {f[0] for f in MODEL_FAMILIES} or value.startswith("claude-"))
+
+
+def _job_platform(job, projects):
+    """A job's effective platform, the way the engine's job_platform() resolves
+    it: the job's own value, else its project's, else anthropic — and anything
+    this server does not know normalises to anthropic too."""
+    p = job.get("platform") or ""
+    if not p:
+        proj = job.get("project") or ""
+        for entry in projects:
+            if entry.get("name") == proj:
+                p = entry.get("platform") or ""
+                break
+    return p if p in PLATFORM_PERMISSIONS else "anthropic"
+
+
 def list_models():
-    """Every concrete model id a job can be pinned to.
+    """Every concrete model id an ANTHROPIC job can be pinned to.
 
     Only exact ids are offered: the user removed the family entries
     (opus/sonnet/…) from the picker on 2026-07-24, wanting each job to say
@@ -2446,6 +2468,13 @@ def list_models():
     and their resolutions are folded in here, which is how an id the installed
     CLI has never heard of (claude-opus-5) still appears. The engine keeps
     honouring a family value if some job still carries one.
+
+    Anthropic-only is the whole point of the filtering below. `models` is what
+    the CURRENT dashboard fills its model selector from, and every job it edits
+    is an Anthropic one — so a Codex slug arriving from the example OpenAI job
+    a fresh install seeds, or from one OpenAI run already in the history, would
+    be offered for a Claude job and then refused by `set-field model` with a
+    500. `platforms.openai.models` is where those slugs belong.
     """
     resolved = {}
     try:
@@ -2475,15 +2504,20 @@ def list_models():
         if f["id"]:
             ids.add(f["id"])
     try:
+        projects = read_json(PROJECTS_FILE, {}).get("projects", [])
         for j in json.loads(JOBS_FILE.read_text()).get("jobs", []):
-            if j.get("model"):
+            if _job_platform(j, projects) != "anthropic":
+                continue
+            if _anthropic_model(j.get("model")):
                 ids.add(j["model"])
     except Exception:  # noqa: BLE001
         pass
     try:
         conn = db_conn()
         try:
-            for row in conn.execute("SELECT DISTINCT model_id FROM runs WHERE coalesce(model_id,'')<>''"):
+            for row in conn.execute(
+                    "SELECT DISTINCT model_id FROM runs"
+                    " WHERE coalesce(model_id,'')<>'' AND model_id LIKE 'claude-%'"):
                 ids.add(row["model_id"])
         finally:
             conn.close()

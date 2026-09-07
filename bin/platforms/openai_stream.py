@@ -154,7 +154,9 @@ class Normalizer:
             # as a turn that genuinely used zero tokens: tokens_of() defaults
             # every counter to zero either way, so without this guard a priced
             # model with no usage data would still get an "estimated" $0.00.
-            cost = estimate(toks, self.price) if isinstance(usage, dict) else None
+            # An EMPTY dict is that same absence wearing the key -- `{}` carries
+            # no more information than no key at all, so it fails the guard too.
+            cost = estimate(toks, self.price) if isinstance(usage, dict) and usage else None
             base.update({"subtype": "success", "is_error": False, "result": self.last_text,
                          # the names the engine's salvage and the modal already sum
                          "usage": {"input_tokens": toks["input"],

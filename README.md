@@ -603,6 +603,9 @@ after every run, with the outcome in its environment:
 | `AL_NOTE` | why it ended as it did (`BUDGET LIMITED: …`, `NOTHING TO DO: …`, a watchdog reason) |
 | `AL_PROJECT`, `AL_SESSION`, `AL_LOG` | |
 | `AL_START`, `AL_END`, `AL_DURATION` | epoch seconds, and the span |
+| `AL_PLATFORM` | `anthropic` or `openai` |
+| `AL_COST_BASIS` | `reported`, `estimated` or `none` — where `AL_COST` came from |
+| `AL_TOKENS` | the run's token counts as JSON (`{input, cached, cache_write, output, reasoning}`), or `null` when unknown |
 | `AL_DASHBOARD` | the dashboard URL |
 
 The engine knows nothing about notifiers, so this is where they go:

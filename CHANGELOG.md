@@ -99,6 +99,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     is the next release's. Accepted against Codex CLI 0.148.0 with a real
     run, a real resume on the same thread and a refused slug, read end to
     end.
+  - The old `models` key of `/api/models` lists Anthropic models only, so the
+    current dashboard never offers a Codex slug to a Claude job; `rl_migrate`
+    merges a file that carries both shapes by `seen_at`; `resolve-models
+    openai` exits non-zero when the catalog could not be written;
+    `on-run-end.sh`'s three new variables are documented.
 
 ### Changed
 

@@ -62,6 +62,40 @@ def test_the_old_keys_are_still_there_for_the_current_page(srv):
     assert out["efforts"] == ["low", "medium", "high", "xhigh", "max"]
 
 
+def test_the_old_models_key_lists_anthropic_models_only(srv, tmp_path, monkeypatch):
+    """The dashboard that exists today drives its model selector off the old
+    `models` key, and every job it edits is an Anthropic one. A Codex slug
+    reaching that list -- from the example OpenAI job a fresh install seeds
+    into jobs.json, or from a single OpenAI run already in the history -- is a
+    value the page will happily offer and `set-field model` then refuses (500).
+    So `models` carries what `platform_model_ok anthropic` accepts, nothing
+    else, and `platforms.anthropic.models` stays the same list.
+    """
+    monkeypatch.setattr(srv, "JOBS_FILE", tmp_path / "jobs.json")
+    monkeypatch.setattr(srv, "DB_FILE", tmp_path / "index.db")
+    # No CLI to scan, so every id below has one traceable source.
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_BIN", str(tmp_path / "no-claude"))
+    _write_models(srv, openai=_catalog_block(),
+                  resolved={"sonnet": {"id": "claude-sonnet-9", "at": 1788585387}})
+    srv.JOBS_FILE.write_text(json.dumps({"jobs": [
+        {"id": "a", "model": "claude-opus-5"},
+        {"id": "o", "platform": "openai", "model": "gpt-5.6-luna"}]}))
+    conn = srv.db_conn()
+    srv.db_init(conn)
+    conn.execute("INSERT INTO runs (key, job, model_id, platform)"
+                 " VALUES ('o|1|x.json', 'o', 'gpt-5.6-sol', 'openai')")
+    conn.commit()
+    conn.close()
+
+    out = srv.list_models()
+    assert "claude-opus-5" in out["models"]          # the anthropic job's own model
+    assert "claude-sonnet-9" in out["models"]        # what the family resolved to
+    assert [m for m in out["models"] if m.startswith("gpt-")] == []
+    assert out["platforms"]["anthropic"]["models"] == out["models"]
+    # and the slugs are still offered where they belong
+    assert "gpt-5.6-luna" in [m["v"] for m in out["platforms"]["openai"]["models"]]
+
+
 def test_platforms_carry_the_catalog_visible_models_in_priority_order(srv):
     _write_models(srv, openai=_catalog_block())
     (srv.CONFIG_DIR / "pricing.json").write_text(

@@ -270,6 +270,18 @@ def test_no_usage_on_turn_completed_means_no_estimate():
                               "output": 0, "reasoning": 0}
 
 
+def test_an_empty_usage_dict_is_the_same_absence_as_no_usage_at_all():
+    # `turn.completed {"usage": {}}` -- the CLI sent the key with nothing in
+    # it. `isinstance(usage, dict)` alone waves that through, and a priced
+    # model then gets an "estimated" $0.00 off five zeroed counters, which is
+    # exactly the false report the guard above exists to prevent.
+    out = normalize(events=[{"type": "thread.started", "thread_id": "t"},
+                            {"type": "turn.completed", "usage": {}}], price=PRICE)
+    last = out[-1]
+    assert last["type"] == "result" and last["subtype"] == "success"
+    assert last["total_cost_usd"] is None and last["cost_basis"] == "none"
+
+
 def test_load_price_treats_null_and_missing_slugs_as_no_price(tmp_path):
     table = tmp_path / "p.json"
     table.write_text(json.dumps({"openai": {

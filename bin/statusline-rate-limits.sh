@@ -73,10 +73,16 @@ tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX" 2>/dev/null)" || exit 0
 # would hold the whole fleet back on a fact that expired.
 printf '%s' "$payload" | "$JQ" --slurpfile prev "$OUT" --argjson now "$now" '
   # A file from before platforms held the windows at the top level; they are
-  # the anthropic block now, and move there on this write.
+  # the anthropic block now, and move there on this write. A file carrying BOTH
+  # shapes is merged per window, greater seen_at wins — the same rule, and for
+  # the same reason, as rl_migrate in the engine: `{anthropic: top} + rest` let
+  # the nested block win whatever its age and threw the fresher reading away.
   (($prev[0] // {}) | if has("five_hour") or has("seven_day")
-      then {anthropic: (with_entries(select(.key == "five_hour" or .key == "seven_day")))}
-           + (with_entries(select(.key != "five_hour" and .key != "seven_day")))
+      then ((with_entries(select(.key == "five_hour" or .key == "seven_day"))) as $top
+            | (with_entries(select(.key != "five_hour" and .key != "seven_day")))
+            | .anthropic = (reduce ($top | keys_unsorted[]) as $w ((.anthropic // {});
+                if .[$w] != null and (.[$w].seen_at // 0) >= ($top[$w].seen_at // 0)
+                then . else .[$w] = $top[$w] end)))
       else . end) as $was
   | .rate_limits as $rl
   | reduce ["five_hour", "seven_day"][] as $w ($was;

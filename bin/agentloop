@@ -1935,7 +1935,7 @@ run_record_stopped_early() { # <id> <slot-dir>
   state_set_many "$id" "$("$JQ" -nc --argjson end "$end" --argjson start "$start" \
     '{last_end:$end, last_status:"stopped", last_run_start:$start, last_run_status:"stopped"}')"
   record_run "$id" "stopped" "$start" "$end" "0" "0" "$sid" "${logf:-}" "$note" "false" "" "$project" \
-             "${model_family:-$model}" "" "" "" "$(resolve "$id" platform 'anthropic')" "none" "null"
+             "${model_family:-$model}" "" "" "" "$(job_platform "$id")" "none" "null"
   if [ -f "$slot/child" ]; then
     log_tick "$id: stopped by the user after its agent had already run"
   else
@@ -2084,13 +2084,24 @@ spent_today_all() { _spend_since_midnight ""; }
 # the two windows at the top level; that shape is read as anthropic and
 # rewritten the first time anything touches the file, under the same lock the
 # writers take. Every reader and writer below calls this first.
+#
+# A file can carry BOTH shapes -- the live install ended up there, with an
+# unmerged binary nesting the windows once while the installed engine and the
+# statusline kept writing the top-level ones. The first version of this merged
+# with `{anthropic: (top-level)} + (rest)`, and the right operand of `+` wins:
+# the nested block was kept whatever its age, and the fresher reading -- the
+# one the gate needs -- was silently discarded. So: per window, and the greater
+# `seen_at` wins (absent counts as 0, which is what an ancient reading is).
 rl_migrate() {
   [ -s "$RATE_LIMIT_FILE" ] || return 0
   "$JQ" -e 'has("five_hour") or has("seven_day")' "$RATE_LIMIT_FILE" >/dev/null 2>&1 || return 0
   local tmp
   tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX")" || return 0
-  "$JQ" '{anthropic: (with_entries(select(.key == "five_hour" or .key == "seven_day")))}
-         + (with_entries(select(.key != "five_hour" and .key != "seven_day")))' \
+  "$JQ" '(with_entries(select(.key == "five_hour" or .key == "seven_day"))) as $top
+         | (with_entries(select(.key != "five_hour" and .key != "seven_day")))
+         | .anthropic = (reduce ($top | keys_unsorted[]) as $w ((.anthropic // {});
+             if .[$w] != null and (.[$w].seen_at // 0) >= ($top[$w].seen_at // 0)
+             then . else .[$w] = $top[$w] end))' \
     "$RATE_LIMIT_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
   rm -f "$tmp" 2>/dev/null
   return 0
@@ -2856,6 +2867,19 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   printf '%s\n' "$_rmout" | grep -qx 'RESULT ok=15 bad=0' \
     && ok "resolve_models_openai over the fixture catalog: all 15 assertions reach the gate" \
     || bad "resolve_models_openai over the fixture catalog did not: $(printf '%s\n' "$_rmout" | tail -1)"
+
+  # cmd_resolve_models must hand the caller resolve_models_openai's status:
+  # `agentloop resolve-models openai` exiting 0 after failing to write the
+  # catalog is a silent no-op an operator (or install.sh) cannot notice. The
+  # subshells exist only to shadow CODEX_BIN/CONFIG_DIR/MODELS_FILE -- the
+  # assertion is on $? out here, where a bad() still counts.
+  mkdir -p "$tmp/rmrc"
+  ( CODEX_BIN=/nonexistent; CONFIG_DIR="$tmp/rmrc"; MODELS_FILE="$tmp/rmrc/models.json"
+    cmd_resolve_models openai ) >/dev/null 2>&1
+  want "resolve-models openai: no codex is a written available:false, not a failure" 0 $?
+  ( CODEX_BIN=/nonexistent; CONFIG_DIR="$tmp/rmrc"; MODELS_FILE="$tmp/rmrc/nodir/x/models.json"
+    cmd_resolve_models openai ) >/dev/null 2>&1
+  want "resolve-models openai: a catalog that could not be written exits non-zero" 1 $?
 
   echo "platform_stderr_filter() — exactly the CLI's one known line, nothing else"
   printf 'Reading additional input from stdin...\nsomething real\n' > "$tmp/e1.err"
@@ -4813,6 +4837,23 @@ NASTY
     rl_migrate
     "$JQ" -e '.anthropic.five_hour.utilization == 0.1' "$RATE_LIMIT_FILE" >/dev/null ) \
     && ok "a file already in the new shape is left alone" || bad "migration damaged a migrated file"
+  # A file carrying BOTH shapes at once, which is what the live install ended up
+  # with: an unmerged binary nested the windows once while the installed engine
+  # and the statusline kept writing the top-level ones. `{anthropic: top} + rest`
+  # let the NESTED block win whatever its age, throwing away the reading the gate
+  # actually needs. Per window now, and the greater seen_at wins.
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/mig3.json"
+    "$JQ" -n '{five_hour:{utilization:0.4,seen_at:200},
+               anthropic:{five_hour:{utilization:0.9,seen_at:100}}}' > "$RATE_LIMIT_FILE"
+    rl_migrate
+    "$JQ" -e '.anthropic.five_hour.utilization == 0.4 and (has("five_hour") | not)' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "both shapes at once: the fresher top-level window wins" || bad "the fresher top-level reading was discarded"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/mig4.json"
+    "$JQ" -n '{five_hour:{utilization:0.4,seen_at:100},
+               anthropic:{five_hour:{utilization:0.9,seen_at:200}}}' > "$RATE_LIMIT_FILE"
+    rl_migrate
+    "$JQ" -e '.anthropic.five_hour.utilization == 0.9 and (has("five_hour") | not)' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "and the nested one is kept when it is the fresher" || bad "a fresher nested reading was overwritten"
 
   # Capture: the real seven-day warning that sat at 98% while the loop kept
   # waking runs into it, plus a truncated tail — a killed run is always cut off
@@ -4940,6 +4981,18 @@ NASTY
   # healthy run the moment this script was installed.
   got="$( DATA_DIR="$tmp/sl"; RATE_LIMIT_FILE="$tmp/sl/rate-limits.json"; rl_gate 2>/dev/null )"
   [ -z "$got" ] && ok "a reading with no status is not a refusal" || bad "gated on a status-less reading: $got"
+
+  # Its `$was` migration carries rl_migrate's precedence rule, for the same
+  # reason: a file holding BOTH shapes must not lose the fresher top-level
+  # window to a stale nested one merely because nested is the shape being
+  # written. The payload touches seven_day only, so five_hour is decided
+  # entirely by the migration.
+  "$JQ" -n '{five_hour:{utilization:0.4,resets_at:111,seen_at:200},
+             anthropic:{five_hour:{utilization:0.9,resets_at:111,seen_at:100}}}' > "$tmp/sl/rate-limits.json"
+  sl_run '{"rate_limits":{"seven_day":{"used_percentage":10,"resets_at":222}}}'
+  [ "$(sl_get '.anthropic.five_hour.utilization')" = "0.4" ] && [ "$(sl_get 'has("five_hour")')" = "false" ] \
+    && ok "the statusline migration keeps the fresher of the two shapes too" \
+    || bad "statusline migration lost the fresher window: $(sl_get '.|tostring')"
 
   echo "failure causes — an outage is not the job's fault, and must not slow it down"
   # `error` covered a 529 the API returned and an agent that got its tools taken
@@ -7552,7 +7605,12 @@ cmd_precheck() { # <id> — run the job's precheck once and RECORD it, without t
 }
 
 cmd_resolve_models() { # cmd_resolve_models [anthropic|openai] -- no argument does both
-  local which="${1:-}" fam id
+  # `rc` carries resolve_models_openai's status past the validation case below,
+  # whose own 0 used to be the function's answer -- so a catalog that could not
+  # be written exited 0 and the failure was invisible to the operator and to
+  # install.sh. An UNAVAILABLE codex is not a failure: that is a written
+  # {available:false} block, and resolve_models_openai already returns 0 for it.
+  local which="${1:-}" fam id rc=0
   case "$which" in
     ""|anthropic)
       for fam in opus sonnet haiku fable; do
@@ -7563,9 +7621,10 @@ cmd_resolve_models() { # cmd_resolve_models [anthropic|openai] -- no argument do
       done ;;
   esac
   case "$which" in
-    ""|openai) resolve_models_openai ;;
+    ""|openai) resolve_models_openai || rc=$? ;;
   esac
   case "$which" in ""|anthropic|openai) ;; *) die "resolve-models: unknown platform '$which'" ;; esac
+  return "$rc"
 }
 
 cmd_platforms() { # one JSON object: what each platform offers and whether it is ready
