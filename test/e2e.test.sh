@@ -392,6 +392,8 @@ mkjob_openai j20
 sed -i '' 's/"platform":"openai"/"platform":"openai","disallowed_tools":"Agent"/' "$ROOT/config/jobs.json"
 FAKE_MODE=complete FAKE_SESSION=thr-tools "$AL" run j20 >/dev/null 2>&1
 grep -q "j20: disallowed_tools is ignored on openai" "$ROOT/data/tick.log" && ok "disallowed_tools → one line, run goes on" || bad "no ignored-tools line"
+sleep 2
+[ "$(lastrun | jq -r .status)" = "success" ] && ok "and the run itself went on to finish" || bad "status $(lastrun | jq -r .status)"
 
 echo
 printf '\n  %s passed, %s failed\n' "$pass" "$fail"

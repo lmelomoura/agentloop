@@ -1364,12 +1364,17 @@ def delete_run(jid, start):
         return _forget_stranded_row(jid, start, removed)
 
     # On-disk artifacts, plus the transient siblings a run can leave behind.
+    # The raw Codex copy goes here, not into _artifact_paths: that map also
+    # drives the prune-after-ingest step (a later task's to extend), and
+    # pruning the raw copy the moment a run's content reaches the DB is a
+    # different decision than erasing it here, with the run itself.
     ap = _artifact_paths(target) or {}
     extra = []
     try:
         logp = Path(target.get("log", ""))
         if str(logp.resolve()).startswith(str(_logs_root())):
-            extra = [Path(str(logp) + ".watchdog"), Path(str(logp) + ".stdin"),
+            extra = [logp.with_name(logp.stem + ".stream.ndjson.raw"),
+                     Path(str(logp) + ".watchdog"), Path(str(logp) + ".stdin"),
                      Path(str(logp) + ".turnend")]
     except Exception:  # noqa: BLE001
         extra = []
@@ -1424,6 +1429,7 @@ def _forget_stranded_row(jid, start, removed):
             logp = Path(row["log"] or "")
             if str(logp) and str(logp.resolve()).startswith(str(_logs_root())):
                 for p in (logp, logp.with_name(logp.stem + ".stream.ndjson"),
+                          logp.with_name(logp.stem + ".stream.ndjson.raw"),
                           logp.with_name(logp.stem + ".precheck.txt"),
                           Path(str(logp) + ".err"), Path(str(logp) + ".watchdog")):
                     if p.exists():

@@ -1199,7 +1199,7 @@ platform_permissions() { # platform_permissions <platform> -> one mode per line
 }
 
 platform_permission_ok() { # platform_permission_ok <platform> <mode>
-  platform_permissions "$1" | grep -qx -- "$2"
+  platform_permissions "$1" | grep -qxF -- "$2"
 }
 
 platform_default_permission() { # platform_default_permission <platform> <job|security>
@@ -1218,13 +1218,13 @@ platform_efforts() { # platform_efforts <platform> [model] -> one level per line
 
 platform_effort_ok() { # platform_effort_ok <platform> <model> <effort>; "" is always ok (the CLI decides)
   [ -z "${3:-}" ] && return 0
-  platform_efforts "$1" "$2" | grep -qx -- "$3"
+  platform_efforts "$1" "$2" | grep -qxF -- "$3"
 }
 
 platform_model_ok() { # platform_model_ok <platform> <model>
   case "$1" in
     anthropic) case "$2" in opus|sonnet|haiku|fable|claude-*) return 0 ;; *) return 1 ;; esac ;;
-    openai)    openai_catalog_slugs | grep -qx -- "$2" ;;
+    openai)    openai_catalog_slugs | grep -qxF -- "$2" ;;
     *) return 1 ;;
   esac
 }
@@ -2543,18 +2543,49 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
       {slug:"gpt-hidden", visibility:"hide", priority:3, efforts:["low"], default_effort:"low", deprecated_by:"", retires_at:""},
       {slug:"gpt-old", visibility:"list", priority:23, efforts:["low"], default_effort:"low", deprecated_by:"gpt-b", retires_at:"2026-08-31T19:00:00Z"}]}}' \
     > "$tmp/cat/models.json"
-  ( MODELS_FILE="$tmp/cat/models.json"
+  # Each of these runs inside a SUBSHELL, because MODELS_FILE must not leak
+  # into the rest of the suite. That used to mean a bad() in here bumped a
+  # $fail that vanished with the subshell -- FAIL printed, the gate never saw
+  # it, and `selftest` exited 0 regardless. ok()/bad() are redefined for the
+  # length of the subshell to count into _upass/_ufail (discarded with it) and
+  # print exactly what they always printed; the parent replays those lines
+  # verbatim and then asserts, on its OWN real ok/bad, that the RESULT line
+  # the subshell prints last says bad=0 and the expected ok=count.
+  local _catout
+  _catout="$(
+    MODELS_FILE="$tmp/cat/models.json"
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
     [ "$(platform_default_model openai)" = "gpt-a" ] && ok "the default openai model is the listed slug with the lowest priority" || bad "default $(platform_default_model openai)"
     platform_model_ok openai gpt-hidden; want "a hidden slug is accepted when written"      0 $?
     platform_model_ok openai gpt-nope;   want "a slug outside the catalog is refused"       1 $?
     platform_effort_ok openai gpt-a ultra; want "ultra is fine where the catalog lists it"  0 $?
     platform_effort_ok openai gpt-b ultra; want "and refused where it does not"             1 $?
     [ "$(openai_catalog_successor gpt-old)" = "gpt-b" ] && ok "a deprecated slug names its successor" || bad "successor $(openai_catalog_successor gpt-old)"
-    [ -z "$(openai_catalog_successor gpt-a)" ] && ok "a live slug names none" || bad "live slug has a successor" )
-  ( MODELS_FILE="$tmp/cat/none.json"
+    [ -z "$(openai_catalog_successor gpt-a)" ] && ok "a live slug names none" || bad "live slug has a successor"
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_catout" | grep -v '^RESULT '
+  printf '%s\n' "$_catout" | grep -qx 'RESULT ok=7 bad=0' \
+    && ok "openai catalog reader over models.json: all 7 assertions reach the gate" \
+    || bad "openai catalog reader over models.json did not: $(printf '%s\n' "$_catout" | tail -1)"
+
+  local _noneout
+  _noneout="$(
+    MODELS_FILE="$tmp/cat/none.json"
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
     platform_model_ok openai gpt-a; want "without a catalog every slug is refused" 1 $?
     [ -z "$(platform_default_model openai)" ] && ok "and there is no default model" || bad "default without a catalog"
-    platform_effort_ok openai gpt-a ultra; want "but the effort vocabulary falls back to the union" 0 $? )
+    platform_effort_ok openai gpt-a ultra; want "but the effort vocabulary falls back to the union" 0 $?
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_noneout" | grep -v '^RESULT '
+  printf '%s\n' "$_noneout" | grep -qx 'RESULT ok=3 bad=0' \
+    && ok "openai catalog reader with no catalog file: all 3 assertions reach the gate" \
+    || bad "openai catalog reader with no catalog file did not: $(printf '%s\n' "$_noneout" | tail -1)"
 
   echo "platform_stderr_filter() — exactly the CLI's one known line, nothing else"
   printf 'Reading additional input from stdin...\nsomething real\n' > "$tmp/e1.err"
@@ -2594,14 +2625,29 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   echo "platform_finish() — the model that ran comes from the rollout"
   mkdir -p "$tmp/ch/sessions/2026/09/05"
   cp "$BASE_DIR/test/fixtures/codex/rollout-sample.stripped.jsonl" "$tmp/ch/sessions/2026/09/05/rollout-2026-09-05T13-49-58-01a071d5-47b0-7343-bcbd-216945ef7927.jsonl"
-  ( CODEX_HOME_DIR="$tmp/ch"; RATE_LIMIT_FILE="$tmp/ch/rate-limits.json"   # T7 makes this write the gate; never the real file
+  # Same subshell-counting fix as the catalog readers above -- see that
+  # comment. CODEX_HOME_DIR and RATE_LIMIT_FILE stay shadowed HERE, inside the
+  # subshell: a later task makes platform_finish write the rate-limit file,
+  # and the real one must never be touched by this suite.
+  local _pfout
+  _pfout="$(
+    CODEX_HOME_DIR="$tmp/ch"; RATE_LIMIT_FILE="$tmp/ch/rate-limits.json"   # T7 makes this write the gate; never the real file
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
     platform_finish openai /dev/null 01a071d5-47b0-7343-bcbd-216945ef7927 selftest
     [ "$PF_MODEL_ID" = "gpt-5.6-sol" ] && ok "turn_context.model is read" || bad "PF_MODEL_ID '$PF_MODEL_ID'"
     platform_finish openai /dev/null thr-missing selftest
     [ -z "$PF_MODEL_ID" ] && grep -q 'no codex rollout for thread thr-missing' "$TICK_LOG" \
       && ok "a missing rollout leaves model_id alone and says so in tick.log" || bad "missing rollout: '$PF_MODEL_ID'"
     platform_finish anthropic /dev/null sess-x selftest
-    [ -z "$PF_MODEL_ID" ] && ok "a no-op on anthropic" || bad "anthropic set PF_MODEL_ID" )
+    [ -z "$PF_MODEL_ID" ] && ok "a no-op on anthropic" || bad "anthropic set PF_MODEL_ID"
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_pfout" | grep -v '^RESULT '
+  printf '%s\n' "$_pfout" | grep -qx 'RESULT ok=3 bad=0' \
+    && ok "platform_finish: all 3 assertions reach the gate" \
+    || bad "platform_finish did not: $(printf '%s\n' "$_pfout" | tail -1)"
 
   echo "turn_is_over() — over a normalized OpenAI stream"
   "$PYTHON" -u "$BIN_DIR/platforms/openai_stream.py" --model gpt-5.6-sol --permission read-only --cwd /tmp \
@@ -7386,7 +7432,8 @@ ${prompt}"
   # and the worktree's own venv/vars are appended to it below when there is one.
   run_env=()
   [ -n "$run_cfgdir" ] && run_env+=("CLAUDE_CONFIG_DIR=$run_cfgdir")
-  # A precheck or a provisioning hook may want to know which CLI is coming.
+  # The agent's own process environment, and any provisioning hook that reads
+  # run_env -- not the precheck: it already ran above, before run_env existed.
   run_env+=("AL_PLATFORM=$platform")
   if wt_isolation_enabled "$project" "$cwd"; then
     local reattached=""

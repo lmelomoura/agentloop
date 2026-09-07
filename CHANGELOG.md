@@ -54,6 +54,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `interactive` on OpenAI, a slug outside the catalog. `test/fake-codex`
     stands in for the CLI offline, and `test/e2e.test.sh` drives an OpenAI run
     through complete, undeclared, dirty, resume, stop, quota and refusal.
+    Deleting a run from the dashboard removes the raw Codex copy with the
+    run's other files.
 
 ### Changed
 
