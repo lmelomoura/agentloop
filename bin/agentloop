@@ -1351,11 +1351,24 @@ openai_catalog_successor() { # openai_catalog_successor <slug> -> what a depreca
   "$JQ" -r --arg s "$1" '.openai.models[] | select(.slug == $s) | .deprecated_by // empty' "$MODELS_FILE" 2>/dev/null
 }
 
+openai_catalog_all_efforts() { # the union of every VISIBLE model's efforts, first-seen order; nothing without a catalog
+  openai_catalog_available || return 0
+  "$JQ" -r '
+    [.openai.models[] | select(.visibility == "list") | .efforts[]?]
+    | reduce .[] as $e ([]; if index($e) then . else . + [$e] end)
+    | .[]' "$MODELS_FILE" 2>/dev/null
+}
+
 # --- the OpenAI catalog, write side ------------------------------------------
 resolve_models_openai() { # refresh config/models.json's `openai` block from `codex debug models`
   local raw source block tmp
   tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
-  [ -f "$MODELS_FILE" ] || echo '{"resolved":{}}' > "$MODELS_FILE"
+  if [ ! -f "$MODELS_FILE" ]; then
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  elif ! "$JQ" -e . "$MODELS_FILE" >/dev/null 2>&1; then
+    echo "models.json was not valid JSON — reseeded"
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  fi
   if [ ! -x "$CODEX_BIN" ]; then
     block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"codex not installed"}')"
   else
@@ -1379,7 +1392,11 @@ resolve_models_openai() { # refresh config/models.json's `openai` block from `co
           deprecated_by:(.upgrade.model // ""), retires_at:(.upgrade.retirement_at // "")}]}')"
     fi
   fi
-  "$JQ" --argjson b "$block" '.openai = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"
+  if ! { "$JQ" --argjson b "$block" '.openai = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
+    rm -f "$tmp"
+    echo "openai -> could not write $MODELS_FILE"
+    return 1
+  fi
   rm -f "$tmp"
   if openai_catalog_available; then
     echo "openai -> $(openai_catalog_visible | tr '\n' ' ')($(printf '%s' "$block" | "$JQ" -r .source))"
@@ -2635,6 +2652,83 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   printf '%s\n' "$_noneout" | grep -qx 'RESULT ok=3 bad=0' \
     && ok "openai catalog reader with no catalog file: all 3 assertions reach the gate" \
     || bad "openai catalog reader with no catalog file did not: $(printf '%s\n' "$_noneout" | tail -1)"
+
+  # resolve_models_openai() itself -- the writer, over the real fixture (the
+  # same one `test/fake-codex debug models` prints), and the recovery paths
+  # nothing above exercises: a written .resolved surviving an .openai-only
+  # refresh, and no-codex producing available:false rather than a crash.
+  local _rmout
+  _rmout="$(
+    mkdir -p "$tmp/rm"
+    CODEX_BIN="$BASE_DIR/test/fake-codex"
+    CONFIG_DIR="$tmp/rm"
+    MODELS_FILE="$tmp/rm/models.json"
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+
+    resolve_models_openai >/dev/null
+
+    [ "$("$JQ" -r '.openai.source' "$MODELS_FILE")" = "codex debug models" ] \
+      && ok "resolve_models_openai: .openai.source is codex debug models" \
+      || bad "source '$("$JQ" -r '.openai.source' "$MODELS_FILE")'"
+    [ "$(num "$("$JQ" -r '.openai.models | length' "$MODELS_FILE")")" = "7" ] \
+      && ok "resolve_models_openai: the catalog carries all 7 models" \
+      || bad "model count '$("$JQ" -r '.openai.models | length' "$MODELS_FILE")'"
+    [ "$(openai_catalog_visible | tr '\n' ' ')" = "gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna gpt-5.5 gpt-5.4-mini " ] \
+      && ok "resolve_models_openai: openai_catalog_visible lists the priority order" \
+      || bad "visible order '$(openai_catalog_visible | tr '\n' ' ')'"
+    openai_catalog_slugs | grep -qxF gpt-reserve
+    want "resolve_models_openai: the hidden gpt-reserve is still in openai_catalog_slugs" 0 $?
+    openai_catalog_visible | grep -qxF gpt-reserve
+    want "resolve_models_openai: but not in openai_catalog_visible" 1 $?
+    [ "$(openai_catalog_default_effort gpt-5.6-sol)" = "low" ] \
+      && ok "resolve_models_openai: gpt-5.6-sol's default effort is low" \
+      || bad "default effort '$(openai_catalog_default_effort gpt-5.6-sol)'"
+    [ "$(openai_catalog_efforts gpt-5.6-sol | tail -1)" = "ultra" ] \
+      && ok "resolve_models_openai: gpt-5.6-sol's efforts end with ultra" \
+      || bad "last effort '$(openai_catalog_efforts gpt-5.6-sol | tail -1)'"
+    [ "$(num "$(openai_catalog_efforts gpt-5.6-sol | wc -l)")" = "6" ] \
+      && ok "resolve_models_openai: gpt-5.6-sol has 6 effort levels" \
+      || bad "sol effort count '$(num "$(openai_catalog_efforts gpt-5.6-sol | wc -l)")'"
+    [ "$(num "$(openai_catalog_efforts gpt-5.5 | wc -l)")" = "4" ] \
+      && ok "resolve_models_openai: gpt-5.5 has 4 effort levels" \
+      || bad "5.5 effort count '$(num "$(openai_catalog_efforts gpt-5.5 | wc -l)")'"
+    [ "$(openai_catalog_successor gpt-5.4-mini)" = "gpt-5.6-luna" ] \
+      && ok "resolve_models_openai: gpt-5.4-mini's successor is gpt-5.6-luna" \
+      || bad "successor '$(openai_catalog_successor gpt-5.4-mini)'"
+    _retires="$("$JQ" -r '.openai.models[] | select(.slug == "gpt-5.4-mini") | .retires_at' "$MODELS_FILE")"
+    [ "${_retires#2026-08-31}" != "$_retires" ] \
+      && ok "resolve_models_openai: gpt-5.4-mini's retires_at starts 2026-08-31" \
+      || bad "retires_at '$_retires'"
+    [ "$(openai_catalog_all_efforts | tr '\n' ' ')" = "low medium high xhigh max ultra " ] \
+      && ok "resolve_models_openai: openai_catalog_all_efforts unions the visible models' efforts" \
+      || bad "all efforts '$(openai_catalog_all_efforts | tr '\n' ' ')'"
+
+    # .resolved must survive a write that only ever touches .openai.
+    "$JQ" -n '{resolved:{opus:{id:"x", at:1}}}' > "$MODELS_FILE"
+    resolve_models_openai >/dev/null
+    [ "$("$JQ" -r '.resolved.opus.id' "$MODELS_FILE")" = "x" ] \
+      && ok "resolve_models_openai: .resolved survives a refresh of .openai" \
+      || bad ".resolved.opus.id '$("$JQ" -r '.resolved.opus.id' "$MODELS_FILE")'"
+
+    # No codex at all: available:false with a reason, never a crash.
+    CODEX_BIN=/nonexistent
+    MODELS_FILE="$tmp/rm/no-codex.json"
+    resolve_models_openai >/dev/null
+    [ "$("$JQ" -r '.openai.available' "$MODELS_FILE")" = "false" ] \
+      && ok "resolve_models_openai: no codex -> .openai.available is false" \
+      || bad "available '$("$JQ" -r '.openai.available' "$MODELS_FILE")'"
+    [ "$("$JQ" -r '.openai.reason' "$MODELS_FILE")" = "codex not installed" ] \
+      && ok "resolve_models_openai: no codex -> .openai.reason says so" \
+      || bad "reason '$("$JQ" -r '.openai.reason' "$MODELS_FILE")'"
+
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_rmout" | grep -v '^RESULT '
+  printf '%s\n' "$_rmout" | grep -qx 'RESULT ok=15 bad=0' \
+    && ok "resolve_models_openai over the fixture catalog: all 15 assertions reach the gate" \
+    || bad "resolve_models_openai over the fixture catalog did not: $(printf '%s\n' "$_rmout" | tail -1)"
 
   echo "platform_stderr_filter() — exactly the CLI's one known line, nothing else"
   printf 'Reading additional input from stdin...\nsomething real\n' > "$tmp/e1.err"
@@ -7166,8 +7260,7 @@ cmd_platforms() { # one JSON object: what each platform offers and whether it is
   for p in $PLATFORMS; do
     if reason="$(platform_ready "$p")"; then ready=true; reason=""; else ready=false; fi
     perms="$(platform_permissions "$p" | "$JQ" -R . | "$JQ" -sc .)"
-    if [ "$p" = "openai" ]; then efforts="$(openai_catalog_efforts "" | "$JQ" -R . | "$JQ" -sc .)"
-    else efforts="$(platform_efforts "$p" | "$JQ" -R . | "$JQ" -sc .)"; fi
+    if [ "$p" = "openai" ]; then efforts="$(openai_catalog_all_efforts | "$JQ" -R . | "$JQ" -sc .)"; else efforts="$(platform_efforts "$p" | "$JQ" -R . | "$JQ" -sc .)"; fi
     dm="$(platform_default_model "$p")"; dp="$(platform_default_permission "$p" job)"
     cat_at=0; cat_ok=false
     if [ "$p" = "openai" ]; then

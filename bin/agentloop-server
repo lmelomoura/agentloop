@@ -2330,7 +2330,8 @@ def _openai_platform():
 
     b = block()
     if b is None:
-        codex = _env("CODEX_BIN") or shutil.which("codex")
+        codex = _env("CODEX_BIN") or shutil.which("codex") or \
+            ("/opt/homebrew/bin/codex" if os.path.exists("/opt/homebrew/bin/codex") else None)
         if codex:
             al(["resolve-models", "openai"])
             b = block()
@@ -2359,8 +2360,8 @@ def _openai_platform():
                "deprecated_by": m.get("deprecated_by") or "", "retires_at": m.get("retires_at") or "",
                "priced": has_price(m["slug"])} for m in visible]
     efforts, seen = [], set()
-    for m in b["models"]:                      # the union, in first-seen order
-        for e in m.get("efforts") or []:
+    for m in models:                            # the union over VISIBLE models only, first-seen order
+        for e in m["efforts"]:
             if e not in seen:
                 seen.add(e); efforts.append(e)
     return {"available": True, "reason": "", "catalog_at": b.get("at", 0),

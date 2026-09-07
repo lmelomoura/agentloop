@@ -264,6 +264,14 @@ mkdir -p "$CODEX_HOME"
 jq -e '.openai.models | length > 0' "$ROOT/config/models.json" >/dev/null \
   && ok "resolve-models openai wrote the catalog from the stand-in's debug models" \
   || bad "no openai catalog after resolve-models"
+jq -e '([.openai.models[] | select(.visibility=="list") | .slug] | index("gpt-reserve")) == null' \
+  "$ROOT/config/models.json" >/dev/null \
+  && ok "the hidden gpt-reserve never reaches the visible slug list" \
+  || bad "gpt-reserve leaked into the visible models"
+jq -e '(.openai.models[] | select(.slug=="gpt-5.6-sol") | .efforts | index("ultra")) != null' \
+  "$ROOT/config/models.json" >/dev/null \
+  && ok "gpt-5.6-sol's efforts include ultra" \
+  || bad "gpt-5.6-sol has no ultra effort"
 mkjob_openai() { # mkjob_openai <id> [permission]
   printf '{"jobs":[{"id":"%s","project":"sandbox","enabled":false,"platform":"openai","model":"gpt-5.6-sol","effort":"high","prompt":"do the thing",
     "interval_seconds":3600,"permission_mode":"%s","max_parallel":1}]}\n' "$1" "${2:-workspace-write}" \

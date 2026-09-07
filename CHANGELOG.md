@@ -64,6 +64,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     levels, permission modes and defaults per platform, and whether each
     slug has a price — while its old keys stay as they were for the current
     page. `agentloop platforms` prints the same from the terminal.
+    `agentloop platforms` reports the effort levels the catalog actually
+    lists, and a corrupted `config/models.json` is reseeded rather than left
+    unreadable.
 
 ### Changed
 

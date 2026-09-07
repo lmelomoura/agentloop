@@ -9,11 +9,13 @@ server repeats it with labels: `test_the_permission_vocabulary_matches_the_engin
 is what keeps the two from drifting, the way the backoff curve test does.
 """
 import json
+import os
 import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 ENGINE = REPO / "bin" / "agentloop"
+FAKE_CODEX = REPO / "test" / "fake-codex"
 FIX = REPO / "test" / "fixtures" / "codex"
 
 
@@ -34,6 +36,23 @@ def _write_models(srv, openai=None, resolved=None):
     if openai is not None:
         data["openai"] = openai
     (srv.CONFIG_DIR / "models.json").write_text(json.dumps(data))
+
+
+def _run_platforms(tmp_path, seed_catalog=False):
+    """Run `agentloop platforms` the way a real install would -- except the
+    CLI is the fake and every path is a scratch dir under tmp_path, so this
+    NEVER reaches the real ~/.codex or runs the real codex (platform_ready
+    openai shells out to `codex login status`, which the fixture answers)."""
+    config_dir, data_dir, codex_home = (tmp_path / "config"), (tmp_path / "data"), (tmp_path / "codex-home")
+    for d in (config_dir, data_dir, codex_home):
+        d.mkdir(parents=True, exist_ok=True)
+    if seed_catalog:
+        (config_dir / "models.json").write_text(json.dumps({"resolved": {}, "openai": _catalog_block()}))
+    env = dict(os.environ, AGENTLOOP_CODEX_BIN=str(FAKE_CODEX), CODEX_HOME=str(codex_home),
+               AGENTLOOP_CONFIG=str(config_dir), AGENTLOOP_DATA=str(data_dir))
+    out = subprocess.run(["/bin/bash", str(ENGINE), "platforms"],
+                         capture_output=True, text=True, env=env, check=True).stdout
+    return json.loads(out)
 
 
 def test_the_old_keys_are_still_there_for_the_current_page(srv):
@@ -95,15 +114,28 @@ def test_a_missing_block_without_codex_is_reported_not_resolved(srv, monkeypatch
     _write_models(srv, openai=None)
     monkeypatch.setattr(srv, "al", lambda *a, **k: (_ for _ in ()).throw(AssertionError("al called")))
     monkeypatch.setattr(srv.shutil, "which", lambda name: None)
+    # _openai_platform's last-resort discovery checks this exact path too
+    # (launchd gives a job a minimal PATH, so shutil.which("codex") alone
+    # misses a real install); a dev machine that actually has Codex there
+    # must not make "no codex" a host-dependent result.
+    monkeypatch.setattr(srv.os.path, "exists", lambda p: False)
     monkeypatch.delenv("AGENTLOOP_CODEX_BIN", raising=False)
     o = srv.list_models()["platforms"]["openai"]
     assert o["available"] is False and "codex" in o["reason"]
 
 
-def test_the_permission_vocabulary_matches_the_engine(srv):
-    out = subprocess.run(["/bin/bash", str(ENGINE), "platforms"],
-                         capture_output=True, text=True, check=True).stdout
-    engine = json.loads(out)
+def test_the_permission_vocabulary_matches_the_engine(srv, tmp_path):
+    engine = _run_platforms(tmp_path)
     for platform, modes in srv.PLATFORM_PERMISSIONS.items():
         assert [m["v"] for m in modes] == engine[platform]["permissions"], platform
     assert engine["anthropic"]["efforts"] == ["low", "medium", "high", "xhigh", "max"]
+    assert engine["openai"]["efforts"] == []                  # no catalog resolved in this scratch config
+
+
+def test_the_engines_openai_efforts_are_the_visible_catalogs_union(tmp_path):
+    # Same rule cmd_platforms and the server's _openai_platform both apply:
+    # the union of the VISIBLE models' efforts, not the fixed six levels a
+    # bare `openai_catalog_efforts ""` used to fall back to regardless of
+    # whether a catalog was even resolved.
+    engine = _run_platforms(tmp_path, seed_catalog=True)
+    assert engine["openai"]["efforts"] == ["low", "medium", "high", "xhigh", "max", "ultra"]
