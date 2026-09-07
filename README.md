@@ -227,13 +227,14 @@ A job is one object in `config/jobs.json`. Fields:
 | `active_hours` | `"08:00-20:00"` (empty = 24h) |
 | `active_days` | `[1..7]`, 1=Mon |
 | `project` | optional group; the job inherits the project's `cwd` (see **Projects**) |
-| `model` | an exact model id (`claude-opus-5`, …) or a family (`opus`/`sonnet`/`haiku`/`fable`) |
-| `effort` | `low`/`medium`/`high`/`xhigh`/`max` — how hard the model thinks (omit = the CLI decides) |
+| `platform` | `anthropic` (Claude Code) or `openai` (Codex CLI); omit to inherit the project's, which defaults to `anthropic`. `model`, `effort` and `permission_mode` keep their names and take that platform's vocabulary — see **Platforms** |
+| `model` | an exact model id (`claude-opus-5`, …) or a family (`opus`/`sonnet`/`haiku`/`fable`). On `openai`: a catalog slug (`gpt-5.6-sol`), verbatim |
+| `effort` | `low`/`medium`/`high`/`xhigh`/`max` — how hard the model thinks (omit = the CLI decides). On `openai`: the model's own levels (up to `ultra`) |
 | `max_budget_usd` | hard ceiling per single run |
 | `daily_budget_usd` | ceiling on total spend per day (**omit = no cap**) |
 | `stall_timeout_seconds` | kill a run only after this long with **no output** (default 1200) |
 | `timeout_seconds` | optional absolute time cap (**omit = no limit**) |
-| `permission_mode` | `dontAsk`, `bypassPermissions` (full autonomy, needed for headless tool use), … |
+| `permission_mode` | `dontAsk`, `bypassPermissions` (full autonomy, needed for headless tool use), … On `openai`: `read-only`, `workspace-write` or `full-access` |
 | `allowed_tools` | allowlist passed as `--allowedTools`, whole and as a single argument — so a comma-separated list *and* a specifier containing a space, like `Bash(git *)`, both arrive intact (**omit = every tool**) |
 | `disallowed_tools` | denylist passed as `--disallowedTools`, same handling (**omit = nothing denied**). Set both fields and **deny wins** for any tool named in each — an allowlist can never re-open what the denylist closed. A security analysis is derived with `Agent` here (the CLI's own tool roster calls that tool `Task`), so it cannot spend its budget on subagents instead of triage |
 
@@ -1472,10 +1473,10 @@ agentloop create <id>        # JSON object on stdin
 agentloop set-prompt <id>    # prompt on stdin
 agentloop set-precheck <id>  # script on stdin
 agentloop set-field <id> <field>   # value on stdin (interval_seconds, active_hours,
-                               #   active_days, model, effort, max_budget_usd,
-                               #   daily_budget_usd, stall_timeout_seconds,
-                               #   timeout_seconds, permission_mode, description,
-                               #   cwd, project)
+                               #   active_days, platform, model, effort,
+                               #   max_budget_usd, daily_budget_usd,
+                               #   stall_timeout_seconds, timeout_seconds,
+                               #   permission_mode, description, cwd, project)
 agentloop delete <id>        # remove the job (its logs are kept)
 agentloop project-set        # create/update a project (JSON on stdin)
 agentloop project-list | project-delete <name>

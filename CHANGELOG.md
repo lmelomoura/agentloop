@@ -67,6 +67,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `agentloop platforms` reports the effort levels the catalog actually
     lists, and a corrupted `config/models.json` is reseeded rather than left
     unreadable.
+  - `platform` is a field on a job, on a project (its jobs inherit it) and on
+    a project's `security` block. `set-field platform` rewrites a model,
+    effort or permission mode the new platform does not know to that
+    platform's default and says so; `set-field model|effort|permission_mode`
+    validate against the job's platform (an OpenAI slug outside the catalog
+    is refused, naming the catalog); `create` takes the platform's defaults,
+    including under an OpenAI project. `config/jobs.example.json` carries a
+    disabled OpenAI example.
 
 ### Changed
 

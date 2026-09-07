@@ -139,3 +139,9 @@ def test_the_engines_openai_efforts_are_the_visible_catalogs_union(tmp_path):
     # whether a catalog was even resolved.
     engine = _run_platforms(tmp_path, seed_catalog=True)
     assert engine["openai"]["efforts"] == ["low", "medium", "high", "xhigh", "max", "ultra"]
+
+
+def test_the_server_lets_platform_through_set_field():
+    src = (REPO / "bin" / "agentloop-server").read_text()
+    allow = src[src.index('elif op == "set_field"'):][:900]
+    assert '"platform"' in allow

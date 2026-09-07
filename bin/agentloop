@@ -295,24 +295,43 @@ security_derived_jobs() {
     security_check_number "$project" max_budget_usd "$budget" "$SECURITY_FALLBACK_BUDGET_USD" \
       || budget="$SECURITY_FALLBACK_BUDGET_USD"
     security_check_number "$project" daily_budget_usd "$daily" || daily=""
-    # The permission mode the analysis runs under. bypassPermissions by
-    # default -- the same headless default every real job here uses -- and
-    # NOT dontAsk: in a headless run dontAsk DENIES every tool that is not
-    # allowlisted, and a fresh worktree has no allowlist, so the agent could
-    # not run a single command (the first live analysis burnt $0.56 probing
-    # the walls and ended BLOCKED). Containment does not come from the
-    # permission mode: the worktree is disposable, the ledger only accepts
-    # writes through the CLI's validating door, and AL_SECURITY_AGENT keeps
-    # the human-authority verbs shut. A project that wants a tighter mode
-    # sets security.permission_mode, and an unknown value falls back rather
-    # than launching a run that dies at the first tool call.
-    local perm
-    perm="$(security_get "$project" '.permission_mode' 'bypassPermissions')"
-    case "$perm" in
-      acceptEdits|auto|bypassPermissions|manual|dontAsk|plan) : ;;
-      *) security_warn "security: project '$project' has a permission_mode the CLI does not know ('$perm') -- using bypassPermissions"
-         perm="bypassPermissions" ;;
+    # Which CLI the analysis runs on: the block's own, else the project's,
+    # else anthropic. The model, effort and permission mode it carries have
+    # to be that platform's, with the same fallback-and-warn the permission
+    # mode already had: a value the CLI does not know falls back rather than
+    # launching a run that dies at its first tool call.
+    #
+    # The permission default is the platform's headless-everything mode
+    # (bypassPermissions / full-access), NOT dontAsk: in a headless run
+    # dontAsk DENIES every tool that is not allowlisted, and a fresh worktree
+    # has no allowlist, so the agent could not run a single command (the
+    # first live analysis burnt $0.56 probing the walls and ended BLOCKED).
+    # Containment does not come from the permission mode: the worktree is
+    # disposable, the ledger only accepts writes through the CLI's validating
+    # door, and AL_SECURITY_AGENT keeps the human-authority verbs shut.
+    local splat smodel seffort perm
+    splat="$(security_get "$project" '.platform' '')"
+    [ -n "$splat" ] || splat="$(project_get "$project" '.platform' 'anthropic')"
+    case "$splat" in
+      anthropic|openai) : ;;
+      *) security_warn "security: project '$project' names a platform the engine does not know ('$splat') -- using anthropic"
+         splat="anthropic" ;;
     esac
+    smodel="$(security_get "$project" '.model' "$(platform_default_model "$splat")")"
+    if ! platform_model_ok "$splat" "$smodel"; then
+      security_warn "security: project '$project' has a model $splat does not know ('$smodel') -- using $(platform_default_model "$splat")"
+      smodel="$(platform_default_model "$splat")"
+    fi
+    seffort="$(security_get "$project" '.effort' '')"
+    if ! platform_effort_ok "$splat" "$smodel" "$seffort"; then
+      security_warn "security: project '$project' has an effort '$seffort' that $smodel does not offer on $splat -- cleared"
+      seffort=""
+    fi
+    perm="$(security_get "$project" '.permission_mode' "$(platform_default_permission "$splat" security)")"
+    if ! platform_permission_ok "$splat" "$perm"; then
+      security_warn "security: project '$project' has a permission_mode the CLI does not know ('$perm') -- using $(platform_default_permission "$splat" security)"
+      perm="$(platform_default_permission "$splat" security)"
+    fi
     # Build the element FIRST and only then commit to it. The separator used to
     # be printed before this jq ran, so anything that made jq exit without
     # stdout -- a `tonumber` on a budget the user typed as "abc" was enough --
@@ -323,14 +342,15 @@ security_derived_jobs() {
     # failed element is now one project missing, which is what it always was.
     elem="$("$JQ" -nc \
       --arg id "$jid" --arg project "$project" --arg prompt "$prompt" \
-      --arg model "$(security_get "$project" '.model' 'opus')" \
-      --arg effort "$(security_get "$project" '.effort' '')" \
+      --arg model "$smodel" \
+      --arg platform "$splat" \
+      --arg effort "$seffort" \
       --arg budget "$budget" \
       --arg daily "$daily" \
       --arg cfgdir "$(security_get "$project" '.claude_config_dir' '')" \
       --arg perm "$perm" \
       --arg notools "$SECURITY_DISALLOWED_TOOLS" \
-      '{id:$id, project:$project, prompt:$prompt, model:$model,
+      '{id:$id, project:$project, prompt:$prompt, model:$model, platform:$platform,
         description:"Security analysis (derived from the project, not a job you created).",
         enabled:false, precheck:"", permission_mode:$perm,
         disallowed_tools:$notools,
@@ -2801,6 +2821,68 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   turn_is_over "$tmp/ob.ndjson"; want "a Codex turn cut before its end is not" 1 $?
   [ "$(session_from_stream "$tmp/oa.ndjson")" = "01a071d5-47b0-7343-bcbd-216945ef7927" ] \
     && ok "session_from_stream reads the thread id off the first line" || bad "session $(session_from_stream "$tmp/oa.ndjson")"
+
+  echo "configuration — platform is a field, and model, effort and permission_mode are validated on it"
+  mkdir -p "$tmp/cfg/config" "$tmp/cfg/data"
+  printf '{"projects":[{"name":"oa","cwd":"/tmp","platform":"openai"}]}\n' > "$tmp/cfg/config/projects.json"
+  "$JQ" -n '{resolved:{}, openai:{at:1, source:"fixture", models:[
+      {slug:"gpt-a", display_name:"A", description:"", visibility:"list", priority:6, efforts:["low","high","ultra"], default_effort:"low", deprecated_by:"", retires_at:""},
+      {slug:"gpt-b", display_name:"B", description:"", visibility:"list", priority:7, efforts:["low","high"], default_effort:"low", deprecated_by:"", retires_at:""}]}}' \
+    > "$tmp/cfg/config/models.json"
+  printf '{"jobs":[{"id":"cj","enabled":false,"cwd":"/tmp","prompt":"p","model":"opus","effort":"max","permission_mode":"dontAsk"}]}\n' \
+    > "$tmp/cfg/config/jobs.json"
+  cfg_al()  { AGENTLOOP_CONFIG="$tmp/cfg/config" AGENTLOOP_DATA="$tmp/cfg/data" AGENTLOOP_CODEX_BIN=/nonexistent "$BIN_DIR/agentloop" "$@"; }
+  cfg_job() { "$JQ" -r --arg id "$1" ".jobs[] | select(.id==\$id) | $2" "$tmp/cfg/config/jobs.json"; }
+  printf 'gemini' | cfg_al set-field cj platform >/dev/null 2>&1; want "an unknown platform is refused" 1 $?
+  out="$(printf 'openai' | cfg_al set-field cj platform 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(cfg_job cj .platform)" = "openai" ] && ok "platform openai is written" || bad "platform openai: rc=$rc $out"
+  [ "$(cfg_job cj .model)" = "gpt-a" ] && ok "a model the new platform does not know is rewritten to its default" || bad "model $(cfg_job cj .model)"
+  [ "$(cfg_job cj '.effort // "cleared"')" = "cleared" ] && ok "an effort that model does not offer is cleared" || bad "effort $(cfg_job cj .effort)"
+  [ "$(cfg_job cj .permission_mode)" = "workspace-write" ] && ok "a permission mode of the other platform is rewritten to the default" || bad "permission $(cfg_job cj .permission_mode)"
+  case "$out" in *"rewritten to gpt-a"*"cleared"*"rewritten to workspace-write"*) ok "and each rewrite is printed" ;; *) bad "rewrites not printed: $out" ;; esac
+  out="$(printf 'gpt-zzz' | cfg_al set-field cj model 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && case "$out" in *"unknown OpenAI model"*"gpt-a gpt-b"*"resolve-models openai"*) ok "a slug outside the catalog is refused, naming the catalog and the refresh command" ;; *) bad "refusal text: $out" ;; esac
+  printf 'gpt-b' | cfg_al set-field cj model >/dev/null 2>&1; want "a catalog slug is accepted" 0 $?
+  printf 'ultra' | cfg_al set-field cj effort >/dev/null 2>&1; want "ultra is refused where the model lacks it" 1 $?
+  printf 'high'  | cfg_al set-field cj effort >/dev/null 2>&1; want "high is accepted" 0 $?
+  printf 'dontAsk' | cfg_al set-field cj permission_mode >/dev/null 2>&1; want "an anthropic mode is refused on openai" 1 $?
+  printf 'full-access' | cfg_al set-field cj permission_mode >/dev/null 2>&1; want "full-access is accepted" 0 $?
+  out="$(printf 'anthropic' | cfg_al set-field cj platform 2>&1)"
+  [ "$(cfg_job cj .model)" = "opus" ] && [ "$(cfg_job cj .permission_mode)" = "dontAsk" ] && [ "$(cfg_job cj .effort)" = "high" ] \
+    && ok "back to anthropic: model and permission rewritten, a valid effort kept" || bad "back to anthropic: $(cfg_job cj '{model,effort,permission_mode}')"
+  printf '' | cfg_al set-field cj platform >/dev/null 2>&1
+  [ "$(cfg_job cj '.platform // "absent"')" = "absent" ] && ok "an empty platform clears the field (the job inherits)" || bad "platform not cleared"
+  # create: the defaults follow the platform the job will run on
+  printf '{"id":"oj","platform":"openai","prompt":"p"}' | cfg_al create >/dev/null 2>&1
+  [ "$(cfg_job oj .platform)" = "openai" ] && [ "$(cfg_job oj .model)" = "gpt-a" ] && [ "$(cfg_job oj .permission_mode)" = "workspace-write" ] \
+    && ok "create with platform openai defaults to its model and permission" || bad "create openai: $(cfg_job oj '{platform,model,permission_mode}')"
+  printf '{"id":"aj","prompt":"p"}' | cfg_al create >/dev/null 2>&1
+  [ "$(cfg_job aj '.platform // "absent"')" = "absent" ] && [ "$(cfg_job aj .model)" = "opus" ] && [ "$(cfg_job aj .permission_mode)" = "dontAsk" ] \
+    && ok "create without a platform is anthropic, and writes no platform key" || bad "create default: $(cfg_job aj '{platform,model,permission_mode}')"
+  printf '{"id":"pj","project":"oa","prompt":"p"}' | cfg_al create >/dev/null 2>&1
+  [ "$(cfg_job pj '.platform // "absent"')" = "absent" ] && [ "$(cfg_job pj .model)" = "gpt-a" ] && [ "$(cfg_job pj .permission_mode)" = "workspace-write" ] \
+    && ok "create under an openai project inherits the platform and takes its defaults" || bad "create under project: $(cfg_job pj '{platform,model,permission_mode}')"
+  printf '{"id":"xj","platform":"openai","model":"opus","prompt":"p"}' | cfg_al create >/dev/null 2>&1; want "create refuses a model the platform does not know" 1 $?
+
+  echo "security_derived_jobs() — the block's platform, with the same fallback-and-warn as its permission mode"
+  mkdir -p "$tmp/dplat/data"
+  cat > "$tmp/dplat/projects.json" <<'JSON'
+{"projects":[
+ {"name":"Oa","cwd":"/tmp/oa","security":{"enabled":true,"platform":"openai","model":"gpt-zzz","effort":"max","permission_mode":"dontAsk"}},
+ {"name":"Ob","cwd":"/tmp/ob","platform":"openai","security":{"enabled":true,"model":"gpt-b","effort":"high"}},
+ {"name":"Oc","cwd":"/tmp/oc","security":{"enabled":true,"platform":"martian"}}]}
+JSON
+  printf '{"jobs":[]}\n' > "$tmp/dplat/jobs.json"
+  dplat() { ( JOBS_FILE="$tmp/dplat/jobs.json"; PROJECTS_FILE="$tmp/dplat/projects.json"; DATA_DIR="$tmp/dplat/data"
+              MODELS_FILE="$tmp/cfg/config/models.json"; job_get "$1" "$2" '' ); }
+  [ "$(dplat security-oa .platform)" = "openai" ] && ok "security.platform reaches the derived job" || bad "platform $(dplat security-oa .platform)"
+  [ "$(dplat security-oa .model)" = "gpt-a" ] && ok "a model the platform does not know falls back to its default" || bad "model $(dplat security-oa .model)"
+  [ "$(dplat security-oa '.effort // "cleared"')" = "cleared" ] && ok "an effort the default model lacks is cleared" || bad "effort $(dplat security-oa .effort)"
+  [ "$(dplat security-oa .permission_mode)" = "full-access" ] && ok "an anthropic mode on openai falls back to full-access" || bad "permission $(dplat security-oa .permission_mode)"
+  [ "$(dplat security-ob .platform)" = "openai" ] && [ "$(dplat security-ob .model)" = "gpt-b" ] && [ "$(dplat security-ob .effort)" = "high" ] && [ "$(dplat security-ob .permission_mode)" = "full-access" ] \
+    && ok "the project's platform is inherited by the block, and valid values are kept" || bad "Ob: $(dplat security-ob '{platform,model,effort,permission_mode}')"
+  [ "$(dplat security-oc .platform)" = "anthropic" ] && [ "$(dplat security-oc .model)" = "opus" ] && [ "$(dplat security-oc .permission_mode)" = "bypassPermissions" ] \
+    && ok "an unknown platform in the block falls back to anthropic and its defaults" || bad "Oc: $(dplat security-oc '{platform,model,permission_mode}')"
 
   echo "model_alias_baseline() — the init event is found even behind hook events"
   # The probe's first lines belong to whoever has hooks configured: a
@@ -8972,14 +9054,18 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
           '.jobs = [.jobs[] | if .id == $id then .max_parallel = $v else . end]'
       fi ;;
     effort)
-      # empty clears it (the CLI then uses its own default)
-      case "$value" in
-        "") write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.effort) else . end]' ;;
-        low|medium|high|xhigh|max)
-          write_jobs --arg id "$id" --arg v "$value" \
-            '.jobs = [.jobs[] | if .id == $id then .effort = $v else . end]' ;;
-        *) die "effort must be one of: low, medium, high, xhigh, max (or empty)" ;;
-      esac ;;
+      # Empty clears it (the CLI then uses its own default). The levels are the
+      # platform's -- and, on openai, the chosen model's (the catalog says).
+      local p pm
+      p="$(resolve "$id" platform 'anthropic')"; pm="$(resolve "$id" model "$(platform_default_model "$p")")"
+      if [ -z "$value" ]; then
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.effort) else . end]'
+      elif platform_effort_ok "$p" "$pm" "$value"; then
+        write_jobs --arg id "$id" --arg v "$value" \
+          '.jobs = [.jobs[] | if .id == $id then .effort = $v else . end]'
+      else
+        die "effort must be one of: $(platform_efforts "$p" "$pm" | tr '\n' ',' | sed 's/,$//; s/,/, /g') (or empty)"
+      fi ;;
     timeout_seconds|stall_timeout_seconds)
       # Both are optional: empty clears them (no absolute cap / no stall guard).
       if [ -z "$value" ]; then
@@ -9008,7 +9094,63 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
         write_jobs --arg id "$id" --argjson v "$value" \
           '.jobs = [.jobs[] | if .id == $id then .daily_budget_usd = $v else . end]'
       fi ;;
-    model|active_hours|description|cwd)
+    model)
+      local p
+      p="$(resolve "$id" platform 'anthropic')"
+      [ -n "$value" ] || die "model cannot be empty"
+      if ! platform_model_ok "$p" "$value"; then
+        if [ "$p" = "openai" ]; then
+          openai_catalog_ensure >/dev/null 2>&1 || true      # a stale miss: refresh once, then decide
+          platform_model_ok openai "$value" \
+            || die "unknown OpenAI model '$value' — the catalog lists: $(openai_catalog_visible | tr '\n' ' ')(refresh with: agentloop resolve-models openai)"
+        else
+          die "model must be a family (opus, sonnet, haiku, fable) or a claude-* id"
+        fi
+      fi
+      write_jobs --arg id "$id" --arg v "$value" \
+        '.jobs = [.jobs[] | if .id == $id then .model = $v else . end]' ;;
+    platform)
+      # The other three fields have a vocabulary PER platform. Whatever the
+      # job carries that the platform it is moving to does not know is
+      # rewritten to that platform's default, and every rewrite is printed --
+      # the editor saves platform FIRST precisely so this runs before it
+      # saves the rest. Empty clears the field: the job inherits its
+      # project's platform, and the rewrites are checked against THAT.
+      local eff cur dm proj
+      case "$value" in
+        anthropic|openai) eff="$value" ;;
+        "") proj="$(job_get "$id" '.project' '')"; eff="anthropic"
+            if [ -n "$proj" ] && [ "$proj" != "null" ]; then eff="$(project_get "$proj" '.platform' 'anthropic')"; fi
+            case "$eff" in ''|null) eff="anthropic" ;; esac ;;
+        *) die "platform must be anthropic or openai (or empty, to inherit the project's)" ;;
+      esac
+      if [ "$eff" = "openai" ] && ! openai_catalog_ensure; then
+        die "no OpenAI catalog yet: install codex, sign in, and run: agentloop resolve-models openai"
+      fi
+      if [ -n "$value" ]; then
+        write_jobs --arg id "$id" --arg v "$value" '.jobs = [.jobs[] | if .id == $id then .platform = $v else . end]'
+      else
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.platform) else . end]'
+      fi
+      cur="$(job_get "$id" '.model' '')"
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! platform_model_ok "$eff" "$cur"; then
+        dm="$(platform_default_model "$eff")"
+        write_jobs --arg id "$id" --arg v "$dm" '.jobs = [.jobs[] | if .id == $id then .model = $v else . end]'
+        echo "model '$cur' is not a $eff model — rewritten to $dm"
+      fi
+      cur="$(job_get "$id" '.effort' '')"
+      if [ -n "$cur" ] && [ "$cur" != "null" ] \
+         && ! platform_effort_ok "$eff" "$(resolve "$id" model "$(platform_default_model "$eff")")" "$cur"; then
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.effort) else . end]'
+        echo "effort '$cur' is not a level of that model on $eff — cleared (the CLI decides)"
+      fi
+      cur="$(job_get "$id" '.permission_mode' '')"
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! platform_permission_ok "$eff" "$cur"; then
+        dm="$(platform_default_permission "$eff" job)"
+        write_jobs --arg id "$id" --arg v "$dm" '.jobs = [.jobs[] | if .id == $id then .permission_mode = $v else . end]'
+        echo "permission_mode '$cur' is not a $eff mode — rewritten to $dm"
+      fi ;;
+    active_hours|description|cwd)
       write_jobs --arg id "$id" --arg f "$field" --arg v "$value" \
         '.jobs = [.jobs[] | if .id == $id then .[$f] = $v else . end]' ;;
     project)
@@ -9019,10 +9161,10 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
           '.jobs = [.jobs[] | if .id == $id then .project = $v else . end]'
       fi ;;
     permission_mode)
-      case "$value" in
-        acceptEdits|auto|bypassPermissions|manual|dontAsk|plan) : ;;
-        *) die "invalid permission_mode: $value" ;;
-      esac
+      local p
+      p="$(resolve "$id" platform 'anthropic')"
+      platform_permission_ok "$p" "$value" \
+        || die "invalid permission_mode for $p: $value (one of: $(platform_permissions "$p" | tr '\n' ' '))"
       write_jobs --arg id "$id" --arg v "$value" \
         '.jobs = [.jobs[] | if .id == $id then .permission_mode = $v else . end]' ;;
     active_days)
@@ -9158,13 +9300,35 @@ cmd_create() { # reads a partial job object (JSON) from stdin
   # cwd is intentionally NOT defaulted here: an unset cwd inherits from the
   # job's project (resolve()); it only falls back to $HOME at run time when the
   # job has no project either.
-  defaults="$("$JQ" -n --arg id "$id" --arg pc "bash $path" '{
+  # The defaults follow the platform the job will run on: its own `platform`,
+  # else its project's, else anthropic. The platform itself is written only
+  # when the caller gave one -- a job under an openai project INHERITS it and
+  # still gets a model and a permission mode that platform understands (the
+  # old fixed `opus`/`dontAsk` would have been refused at its first launch).
+  local cplat cproj
+  cplat="$(echo "$partial" | "$JQ" -r '.platform // ""')"
+  if [ -z "$cplat" ]; then
+    cproj="$(echo "$partial" | "$JQ" -r '.project // ""')"
+    [ -z "$cproj" ] || cplat="$(project_get "$cproj" '.platform' '')"
+  fi
+  case "$cplat" in ''|null) cplat="anthropic" ;; anthropic|openai) ;; *) die "create: platform must be anthropic or openai" ;; esac
+  if [ "$cplat" = "openai" ] && ! openai_catalog_ensure; then
+    die "create: no OpenAI catalog yet: install codex, sign in, and run: agentloop resolve-models openai"
+  fi
+  defaults="$("$JQ" -n --arg id "$id" --arg pc "bash $path" \
+      --arg model "$(platform_default_model "$cplat")" --arg perm "$(platform_default_permission "$cplat" job)" '{
     id: $id, description: "", enabled: true,
     interval_seconds: 300, active_days: [1,2,3,4,5], active_hours: "08:00-20:00",
-    precheck: $pc, model: "opus", max_budget_usd: 2, stall_timeout_seconds: 1200,
-    permission_mode: "dontAsk", prompt: ""
+    precheck: $pc, model: $model, max_budget_usd: 2, stall_timeout_seconds: 1200,
+    permission_mode: $perm, prompt: ""
   }')"
   merged="$(printf '%s\n%s\n' "$defaults" "$partial" | "$JQ" -s '.[0] * .[1]')"
+  # What the caller wrote has to be that platform's too; a job created wrong
+  # would only say so at its first launch, in tick.log, hours later.
+  local cm cp
+  cm="$(echo "$merged" | "$JQ" -r '.model // ""')"; cp="$(echo "$merged" | "$JQ" -r '.permission_mode // ""')"
+  platform_model_ok "$cplat" "$cm" || die "create: model '$cm' is not a $cplat model"
+  platform_permission_ok "$cplat" "$cp" || die "create: permission_mode '$cp' is not a $cplat mode"
   write_jobs --argjson j "$merged" '.jobs += [$j]'
   if [ ! -f "$path" ]; then
     mkdir -p "$CONFIG_DIR/prechecks"
@@ -9337,7 +9501,7 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop create <id>     create a job from a partial JSON object on stdin
   agentloop set-prompt <id> replace a job's prompt, read from stdin
   agentloop set-field <id> <field>   set interval_seconds|active_hours|active_days|
-                              model|max_budget_usd|timeout_seconds|
+                              platform|model|max_budget_usd|timeout_seconds|
                               stall_timeout_seconds, value from stdin
   agentloop set-precheck <id>   replace a job's precheck script, read from stdin
   agentloop provision-set <project> <up|down>   replace a worktree provisioning hook (stdin)

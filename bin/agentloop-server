@@ -3593,7 +3593,7 @@ class Handler(BaseHTTPRequestHandler):
             if field not in ("interval_seconds", "active_hours", "active_days",
                              "max_budget_usd", "daily_budget_usd", "model", "timeout_seconds",
                              "stall_timeout_seconds", "effort", "interactive", "max_parallel",
-                             "description", "cwd", "permission_mode", "project"):
+                             "description", "cwd", "permission_mode", "project", "platform"):
                 return self._send(400, {"error": "bad field"})
             ok, out = al(["set-field", jid, field], stdin=value)
         else:
