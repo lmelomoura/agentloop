@@ -92,6 +92,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     a quota refusal marks the fuller window spent until its reset. The gate
     is per platform: a spent Anthropic window never holds a Codex run back,
     nor the reverse, and `agentloop usage` lists both.
+  - README: a *Platforms* section (choosing, vocabularies, what each
+    platform lacks, how a Codex run is read, estimated cost and the price
+    table, usage windows), and *Models*, *Effort*, *Budgets*, *usage* and
+    *CLI* updated. Accepted against Codex CLI 0.148.0 with a real run, a real
+    resume on the same thread and a refused slug, read end to end.
 
 ### Changed
 
