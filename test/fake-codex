@@ -3,7 +3,8 @@
 # codex-cli 0.148.0 -- test/fixtures/codex/ is the evidence -- so an OpenAI run
 # can be driven end to end offline. Same caveat as test/fake-claude: unless
 # FAKE_ARGV_OUT is set this never reads "$@", so a green run proves nothing
-# about the launch line; scenarios 15 and 17 in e2e.test.sh read one back.
+# about the launch line; scenarios 15, 17 and 24 in e2e.test.sh read one back
+# (24 reads the whole prompt too, through FAKE_PROMPT_OUT).
 #
 #   FAKE_SESSION           the thread id reported in thread.started
 #   FAKE_MODE              complete | undeclared | dirty | hang | quota | unknown_model

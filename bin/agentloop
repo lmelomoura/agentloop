@@ -469,7 +469,9 @@ SECURITY_FALLBACK_BUDGET_USD=2
 # deterministic findings waiting for them -- the triage this entire design
 # rests on -- because the budget had already gone to SAST. Asking in the prompt
 # is precisely what failed, so the tool is closed AT LAUNCH instead. The prompt
-# line (see security_prompt) exists to explain the absence, not to enforce it.
+# line (see security_prompt) exists to explain the absence, not to enforce it;
+# on Codex, where nothing closes `spawn_agent` by flag, that same prompt is the
+# only door there is.
 #
 # A DENYLIST, not the allowlist `allowed_tools` already offers. --allowedTools
 # would mean enumerating every tool the analysis needs (Read, Grep, Glob, Bash,
@@ -588,7 +590,10 @@ security_prompt() { # security_prompt <project> <repo> <branch> <profile> <analy
   # every caller before platforms passed six.
   local skill_para agents_para
   if [ "${7:-anthropic}" = "openai" ]; then
-    skill_para="Read \`$SKILLS_DIR/security-analysis/SKILL.md\` and follow it exactly. It is mandatory."
+    skill_para="Your first shell command is the \`agentloop security prepare\` line below --
+run it before you read anything else, the skill file included, and keep the
+coverage note it prints. Read \`$SKILLS_DIR/security-analysis/SKILL.md\` next
+and follow it exactly. It is mandatory."
     agents_para="Do not spawn subagents. There are no subagents in this run: Codex offers you
 \`spawn_agent\`, nothing closes it at launch, and this instruction is the only
 door -- do the whole analysis yourself, in this one thread. Two earlier analyses
@@ -3504,6 +3509,8 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     && ok "security_prompt anthropic: names the Agent tool it closed" || bad "anthropic prompt lacks the Agent paragraph"
   printf '%s\n' "$_po" | grep -qF "Read \`$SKILLS_DIR/security-analysis/SKILL.md\`" \
     && ok "security_prompt openai: names the skill file by path, not by discovery" || bad "openai head: $(printf '%s\n' "$_po" | head -1)"
+  printf '%s\n' "$_po" | grep -qF 'Your first shell command is' \
+    && ok "security_prompt openai: the prepare command comes before the skill file, in words" || bad "openai head: $(printf '%s\n' "$_po" | head -1)"
   printf '%s\n' "$_po" | grep -qF 'Do not spawn subagents' \
     && ok "security_prompt openai: forbids subagents in words (nothing closes them by flag)" || bad "openai prompt lacks the ban"
   printf '%s\n' "$_po" | grep -q 'Agent. tool' \
@@ -6625,7 +6632,9 @@ JSON
 
   # The `Agent` tool is closed at LAUNCH, not asked for in the prompt -- asking
   # is what already failed twice ($51.44, six subagents, zero of 40
-  # deterministic findings triaged; see SECURITY_DISALLOWED_TOOLS). Three
+  # deterministic findings triaged; see SECURITY_DISALLOWED_TOOLS). That is the
+  # Claude Code half: on Codex nothing closes `spawn_agent` by flag, so there
+  # the prompt is the only door (security_prompt, checked above). Three
   # separate things have to hold, and each has its own way of silently
   # regressing: the field on the derived job, the field NOT leaking onto
   # ordinary jobs, and run_job actually turning the field into a CLI flag.

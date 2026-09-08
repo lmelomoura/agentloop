@@ -161,15 +161,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Security analyses run on OpenAI.** A project's security block can name
   `"platform": "openai"` (or inherit the project's) and its analysis goes
   through the Codex CLI. The prompt changes in the two places the platform
-  matters: the skill is named by its file path (`skills/security-analysis/
-  SKILL.md`), not by discovery, and subagents are forbidden in words — Codex
-  cannot close `spawn_agent` by flag, so the sentence is the only door; on
-  Claude Code the tool stays closed at launch as before. `agentloop skills`
-  links the skills into `~/.codex/skills` too, when that home exists.
-  `test/fake-codex` runs `security prepare` like `test/fake-claude`, and
-  `test/e2e.test.sh` drives an analysis on OpenAI to `done`. What it cost to
-  not have it: the block accepted the platform and the run still spoke of an
-  `Agent` tool Codex never had.
+  matters: the skill is named by its file path
+  (`skills/security-analysis/SKILL.md`), not by discovery, and subagents are
+  forbidden in words — Codex cannot close `spawn_agent` by flag, so the
+  sentence is the only door; on Claude Code the tool stays closed at launch
+  as before; on Codex the prompt also puts the prepare command before the
+  skill file, because there reading the skill is itself a shell command and a
+  small model took `read the skill` as its first command and never ran
+  `prepare`. `agentloop skills` links the skills into `~/.codex/skills` too,
+  when that home exists. `test/fake-codex` runs `security prepare` like
+  `test/fake-claude`, and `test/e2e.test.sh` drives an analysis on OpenAI to
+  `done`. What it cost to not have it: the block accepted the platform and
+  the run still spoke of an `Agent` tool Codex never had.
 - **Install and status know about Codex.** `install.sh` reports the Codex CLI
   as optional (present with its version, or how to get it) instead of saying
   nothing; `agentloop install` and `agentloop status` print one line per

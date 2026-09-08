@@ -69,8 +69,9 @@ ended() { cat "$ROOT/data/worktrees/$1/$2/.ended" 2>/dev/null; }
 
 # secid <analyze-stdout> -- the analysis id out of whichever shape it came in:
 # bash's own `printf '{"analysis_id":%s}'` (--detach, no space), Python's
-# `json.dumps` (open-analysis, a space after the colon), or the one line a
-# foreground `security analyze` prints once its run has ended:
+# `json.dumps` (open-analysis, a space after the colon), or the one line
+# `security analyze` prints as it OPENS the analysis -- before the run starts,
+# in the foreground and --detach forms alike:
 # `analysis N — project/repo @ branch (sha) — job id`.
 secid() { printf '%s\n' "$1" | grep -Eo '"analysis_id" *: *[0-9]+|^analysis [0-9]+' | tail -1 | grep -Eo '[0-9]+$'; }
 # secstate <project> <analysis-id> -- that one row's state, straight off the
