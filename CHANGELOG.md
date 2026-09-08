@@ -165,14 +165,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`skills/security-analysis/SKILL.md`), not by discovery, and subagents are
   forbidden in words — Codex cannot close `spawn_agent` by flag, so the
   sentence is the only door; on Claude Code the tool stays closed at launch
-  as before; on Codex the prompt also puts the prepare command before the
-  skill file, because there reading the skill is itself a shell command and a
-  small model took `read the skill` as its first command and never ran
-  `prepare`. `agentloop skills` links the skills into `~/.codex/skills` too,
-  when that home exists. `test/fake-codex` runs `security prepare` like
-  `test/fake-claude`, and `test/e2e.test.sh` drives an analysis on OpenAI to
-  `done`. What it cost to not have it: the block accepted the platform and
-  the run still spoke of an `Agent` tool Codex never had.
+  as before; on Codex the engine runs `security prepare` itself, in the
+  worktree, before launching the CLI — a real run showed the model skipping
+  it once and the Codex shell tool cutting it once before it finished — and
+  the prompt tells the agent the phase already ran. `agentloop skills` links
+  the skills into `~/.codex/skills` too, when that home exists.
+  `test/fake-codex` leaves `security prepare` to the engine, and
+  `test/e2e.test.sh` drives an analysis on OpenAI to `done` with the stand-in
+  skipping it — the close proves the engine ran it. What it cost to not have
+  it: the block accepted the platform and the run still spoke of an `Agent`
+  tool Codex never had.
 - **Install and status know about Codex.** `install.sh` reports the Codex CLI
   as optional (present with its version, or how to get it) instead of saying
   nothing; `agentloop install` and `agentloop status` print one line per

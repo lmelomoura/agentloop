@@ -848,11 +848,15 @@ leaves the file as it was. The gate is per platform: a spent Claude window
 never holds a Codex run back, nor the reverse.
 
 **Security analyses** run on either platform. The block's own `platform` wins,
-else the project's. On OpenAI the prompt names the skill by file path
+else the project's. On OpenAI the engine runs the deterministic phase
+(`agentloop security prepare`) itself, in the run's worktree, before
+launching the agent — the Codex shell tool cannot be trusted to wait for it —
+and the prompt says so; the prompt names the skill by file path
 (`skills/security-analysis/SKILL.md`) rather than relying on discovery, and
 forbids subagents in words — Codex cannot close `spawn_agent` by flag, so the
-sentence is the only door; on Claude Code the `Agent` tool is closed at
-launch as before. The permission default is `full-access`: the sandbox modes
+sentence is the only door. On Claude Code `prepare` stays the agent's own
+first command and the `Agent` tool is closed at launch, as before. The
+permission default is `full-access`: the sandbox modes
 cannot write the ledger, which lives outside the worktree. `agentloop skills`
 links the skills into `~/.codex/skills` too, when that home exists.
 `agentloop status` prints both platforms' readiness, and for Codex the age of

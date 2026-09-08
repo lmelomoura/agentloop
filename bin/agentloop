@@ -581,19 +581,29 @@ EOF
 }
 
 security_prompt() { # security_prompt <project> <repo> <branch> <profile> <analysis-id> <ignore> <platform>
-  # Two paragraphs depend on the platform. On Claude Code the skill is invoked
-  # by name (the CLI finds it under ~/.claude/skills) and the Agent tool is
-  # closed by flag at launch. On the Codex CLI the skill is named by PATH --
-  # discovery is not relied on -- and nothing closes spawn_agent by flag
-  # (measured: `--disable multi_agent` leaves it in the roster), so the prompt
-  # is the only door and says so. A missing seventh argument is anthropic:
-  # every caller before platforms passed six.
-  local skill_para agents_para
+  # Three paragraphs depend on the platform. On Claude Code the skill is
+  # invoked by name (the CLI finds it under ~/.claude/skills), the Agent tool
+  # is closed by flag at launch, and `security prepare` is the agent's own
+  # first command -- its Bash tool waits for it, however long it takes. On the
+  # Codex CLI the skill is named by PATH -- discovery is not relied on --
+  # nothing closes spawn_agent by flag (measured: `--disable multi_agent`
+  # leaves it in the roster), so the prompt is the only door and says so; and
+  # the ENGINE has already run prepare in the worktree before the launch
+  # (run_job), so the prompt says the phase ran instead of asking for it --
+  # measured on two real analyses: the model skipped the command once, and
+  # the Codex shell tool cut it once before it finished. A missing seventh
+  # argument is anthropic: every caller before platforms passed six.
+  local skill_para agents_para prepare_para
   if [ "${7:-anthropic}" = "openai" ]; then
-    skill_para="Your first shell command is the \`agentloop security prepare\` line below --
-run it before you read anything else, the skill file included, and keep the
-coverage note it prints. Read \`$SKILLS_DIR/security-analysis/SKILL.md\` next
-and follow it exactly. It is mandatory."
+    skill_para="The deterministic phases -- secrets, dependency CVEs, SBOM, hygiene and
+infrastructure-as-code misconfigurations -- ALREADY RAN for this analysis,
+before you started: the engine ran \`agentloop security prepare\` in this
+worktree. Do not run it again; the skill file's first step is done.
+Read \`$SKILLS_DIR/security-analysis/SKILL.md\` next and follow the rest of it
+exactly. It is mandatory."
+    prepare_para="The coverage note of that deterministic phase is on the analysis
+(\`agentloop security checklist --analysis $5\` prints it as coverage_note); if
+it is not empty you must repeat it in your final message."
     agents_para="Do not spawn subagents. There are no subagents in this run: Codex offers you
 \`spawn_agent\`, nothing closes it at launch, and this instruction is the only
 door -- do the whole analysis yourself, in this one thread. Two earlier analyses
@@ -602,6 +612,14 @@ none of the deterministic findings -- which is the part that matters most. Spend
 the budget on triage first."
   else
     skill_para="Invoke the \`security-analysis\` skill and follow it exactly. It is mandatory."
+    prepare_para="YOUR FIRST COMMAND, before anything else:
+
+  agentloop security prepare --analysis $5 --root \"\$PWD\" --ignore '$6'
+
+It runs the deterministic phases inside this worktree -- secrets, dependency
+CVEs, SBOM, hygiene and infrastructure-as-code misconfigurations -- in seconds
+and at no token cost, and prints a coverage note you must repeat in your final
+message if it is not empty."
     agents_para="You have no \`Agent\` tool in this run -- the CLI's own tool roster calls it
 \`Task\`, and it is the same tool under both names. It is closed at launch, on
 purpose. Two earlier analyses spent their whole budget fanning the SAST pass out
@@ -620,14 +638,7 @@ You are analysing:
 
 analysis id : $5
 
-YOUR FIRST COMMAND, before anything else:
-
-  agentloop security prepare --analysis $5 --root "\$PWD" --ignore '$6'
-
-It runs the deterministic phases inside this worktree -- secrets, dependency
-CVEs, SBOM, hygiene and infrastructure-as-code misconfigurations -- in seconds
-and at no token cost, and prints a coverage note you must repeat in your final
-message if it is not empty.
+$prepare_para
 
 Then read what it found with \`agentloop security checklist --analysis $5\` --
 NOT \`findings\`. \`findings\` returns only THIS analysis's own rows; \`checklist\`
@@ -3509,14 +3520,16 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     && ok "security_prompt anthropic: names the Agent tool it closed" || bad "anthropic prompt lacks the Agent paragraph"
   printf '%s\n' "$_po" | grep -qF "Read \`$SKILLS_DIR/security-analysis/SKILL.md\`" \
     && ok "security_prompt openai: names the skill file by path, not by discovery" || bad "openai head: $(printf '%s\n' "$_po" | head -1)"
-  printf '%s\n' "$_po" | grep -qF 'Your first shell command is' \
-    && ok "security_prompt openai: the prepare command comes before the skill file, in words" || bad "openai head: $(printf '%s\n' "$_po" | head -1)"
+  printf '%s\n' "$_po" | grep -qF 'ALREADY RAN for this analysis' \
+    && ok "security_prompt openai: says the deterministic phase already ran, engine-side" || bad "openai head: $(printf '%s\n' "$_po" | head -1)"
+  printf '%s\n' "$_po" | grep -qF 'YOUR FIRST COMMAND' \
+    && bad "openai prompt still asks the agent to run prepare" || ok "security_prompt openai: never asks the agent to run prepare"
   printf '%s\n' "$_po" | grep -qF 'Do not spawn subagents' \
     && ok "security_prompt openai: forbids subagents in words (nothing closes them by flag)" || bad "openai prompt lacks the ban"
   printf '%s\n' "$_po" | grep -q 'Agent. tool' \
     && bad "openai prompt still speaks of the Agent tool" || ok "security_prompt openai: never speaks of the Agent tool"
-  printf '%s\n' "$_pa" | grep -qF 'security prepare --analysis 7' && printf '%s\n' "$_po" | grep -qF 'security prepare --analysis 7' \
-    && ok "security_prompt: both platforms get the same first command" || bad "the prepare line differs between platforms"
+  printf '%s\n' "$_pa" | grep -qF 'security prepare --analysis 7' && printf '%s\n' "$_pa" | grep -qF 'YOUR FIRST COMMAND' \
+    && ok "security_prompt anthropic: prepare is still the agent's first command, with the analysis id filled in" || bad "the anthropic prompt lost its prepare line"
 
   echo "security_derived_jobs() — the block's platform, with the same fallback-and-warn as its permission mode"
   mkdir -p "$tmp/dplat/data"
@@ -8797,6 +8810,42 @@ ${prompt}"
   if [ -n "$resume_sid" ]; then
     prompt="Continue exactly where you stopped. This is the same task, resumed after the previous run ended early — re-read your own last messages and carry on from there; do NOT start over.
 If the work turns out to be already finished, or it can no longer be done at all (the ticket is gone, the card moved on, another run took it), then do NOT invent new work: stop and answer with one line starting exactly with 'NOTHING TO DO: ' followed by the reason."
+  fi
+
+  # THE DETERMINISTIC PHASE, ENGINE-SIDE, ON CODEX ONLY. `security prepare`
+  # (secrets, dependency CVEs, SBOM, hygiene, IaC) is the analysis prompt's
+  # first command on Claude Code, and there the agent's Bash tool waits for
+  # it however long it takes -- that flow works and is not touched here. On
+  # the Codex CLI it did not, measured on two real analyses (gpt-5.6-luna):
+  # the model skipped the command once, and with a prompt naming it as the
+  # first command the Codex shell tool cut it before it finished -- a
+  # hand-timed prepare on that repository ran for over ten minutes (trivy's
+  # misconfiguration scan hung on a network fetch), and that tool's timeout
+  # is not ours to set. Both analyses closed `capped` over a phase the engine
+  # could have run itself. So on openai the engine runs it here, in the run's
+  # own worktree, before the CLI is launched, and security_prompt tells the
+  # agent the phase already ran. Never on a resume: that session already had
+  # its prepare, and a second one only rewrites the coverage record.
+  #
+  # A failure does not abort the run. The close is what tells the truth --
+  # `finish` lowers `done` to `capped` while `prepared` is 0 -- and tick.log
+  # says what happened and how long it took. The output goes to its own
+  # sidecar, never to $logfile.err: a byte on that file turns a clean run
+  # into `warning` (errbytes, below), and this is not the agent's stderr.
+  if [ "$platform" = "openai" ] && [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ] && [ -z "$resume_sid" ]; then
+    local _prep_ignore _prep_t0 _prep_t1 _prep_secs _prep_rc=0
+    _prep_ignore="$("$JQ" -r '.ignore // ""' "$(security_request_path "$id")" 2>/dev/null)"
+    _prep_t0="$(now_epoch)"
+    ( cd "$run_cwd" || exit 1
+      security_py prepare --analysis "$AL_SECURITY_ANALYSIS_ID" --root "$run_cwd" \
+        --ignore "$_prep_ignore" ) >> "$logfile.prepare" 2>&1 || _prep_rc=$?
+    _prep_t1="$(now_epoch)"
+    _prep_secs=$((_prep_t1 - _prep_t0))
+    if [ "$_prep_rc" -eq 0 ]; then
+      log_tick "$id: deterministic phase ran before the agent (prepare, ${_prep_secs}s) — the Codex shell tool cannot be trusted to wait for it"
+    else
+      log_tick "$id: prepare failed before the agent (rc $_prep_rc, ${_prep_secs}s) — the close will cap the analysis"
+    fi
   fi
 
   fifo=""
