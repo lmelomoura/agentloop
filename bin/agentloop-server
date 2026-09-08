@@ -2407,34 +2407,57 @@ def _openai_platform():
         return {"available": False, "reason": reason or "codex not installed: run codex login, then agentloop resolve-models openai",
                 "catalog_at": (b or {}).get("at", 0) if isinstance(b, dict) else 0,
                 "models": [], "efforts": [], "permissions": PLATFORM_PERMISSIONS["openai"],
-                "default_model": ""}
+                "default_model": "", "pricing_at": 0, "pricing_source": "", "unpriced": []}
     try:
-        priced = (json.loads((CONFIG_DIR / "pricing.json").read_text()) or {}).get("openai") or {}
+        table = json.loads((CONFIG_DIR / "pricing.json").read_text()) or {}
     except Exception:  # noqa: BLE001
+        table = {}
+    if not isinstance(table, dict):
+        table = {}
+    priced = table.get("openai")
+    if not isinstance(priced, dict):
         priced = {}
 
-    def has_price(slug):
+    def _num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    def price_of(slug):
+        """The row as the page will show it, or None when it is not a price."""
         row = priced.get(slug)
-        return isinstance(row, dict) and all(
-            isinstance(row.get(k), (int, float)) and not isinstance(row.get(k), bool)
-            for k in ("input", "cached_input", "output"))
+        if not isinstance(row, dict) or not all(_num(row.get(k)) for k in ("input", "cached_input", "output")):
+            return None
+        source = row.get("source")
+        return {"input": row["input"], "cached_input": row["cached_input"], "output": row["output"],
+                "cache_write": row.get("cache_write") if _num(row.get("cache_write")) else 0,
+                "source": source if isinstance(source, str) else "",
+                "at": row.get("at") if _num(row.get("at")) else None}
+
+    def _model(m):
+        # price_of ONCE per model: `priced` is that same answer, so the two can
+        # never disagree, and a table of any size costs one pass, not two.
+        price = price_of(m["slug"])
+        return {"v": m["slug"], "label": m.get("display_name") or m["slug"],
+                "desc": m.get("description") or "", "efforts": list(m.get("efforts") or []),
+                "default_effort": m.get("default_effort") or "",
+                "deprecated_by": m.get("deprecated_by") or "", "retires_at": m.get("retires_at") or "",
+                "priced": price is not None, "price": price}
 
     visible = sorted((m for m in b["models"] if m.get("visibility", "list") == "list"),
                      key=lambda m: m.get("priority", 999))
-    models = [{"v": m["slug"], "label": m.get("display_name") or m["slug"],
-               "desc": m.get("description") or "", "efforts": list(m.get("efforts") or []),
-               "default_effort": m.get("default_effort") or "",
-               "deprecated_by": m.get("deprecated_by") or "", "retires_at": m.get("retires_at") or "",
-               "priced": has_price(m["slug"])} for m in visible]
+    models = [_model(m) for m in visible]
     efforts, seen = [], set()
     for m in models:                            # the union over VISIBLE models only, first-seen order
         for e in m["efforts"]:
             if e not in seen:
                 seen.add(e); efforts.append(e)
+    source_url = table.get("_source_url")
     return {"available": True, "reason": "", "catalog_at": b.get("at", 0),
             "models": models, "efforts": efforts,
             "permissions": PLATFORM_PERMISSIONS["openai"],
-            "default_model": models[0]["v"] if models else ""}
+            "default_model": models[0]["v"] if models else "",
+            "pricing_at": table.get("_refreshed_at") if _num(table.get("_refreshed_at")) else 0,
+            "pricing_source": source_url if isinstance(source_url, str) else "",
+            "unpriced": [m["v"] for m in models if not m["priced"]]}
 
 
 def _anthropic_model(value):

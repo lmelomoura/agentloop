@@ -65,7 +65,12 @@ def tokens_of(usage):
 def estimate(tokens, price):
     """USD for one turn at `price` (USD per 1,000,000 tokens); None without a
     price. `output` already INCLUDES `reasoning` (measured: 15-effort-high),
-    so reasoning is never billed a second time."""
+    so reasoning is never billed a second time.
+
+    cache_write tokens are billed at the cache-write price and are assumed NOT
+    to be part of input_tokens (the Anthropic convention; every Codex turn
+    measured so far reported 0, so a real turn with cache writes should
+    confirm before the number is trusted)."""
     if price is None:
         return None
     uncached = max(0, tokens["input"] - tokens["cached"])

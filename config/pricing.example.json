@@ -1,13 +1,13 @@
 {
-  "_source": "https://openai.com/api/pricing/",
-  "_read_on": "2026-09-07",
-  "_unit": "USD per 1,000,000 tokens: input, cached input, output. cache_write is 0 because OpenAI does not bill cache writes.",
-  "_note": "Confirm these against the page before trusting an estimate. A null, or a missing slug, means no price: such a run is recorded with cost_basis none and the dollar caps do not see its spend.",
+  "_source_url": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+  "_refreshed_at": 1788800000,
+  "_unit": "USD per 1,000,000 tokens: input, cached input, output, cache write (0 when the source lists none)",
+  "_note": "Refreshed by agentloop resolve-pricing (daily, with the model refresh). A row with \"source\": \"manual\" is never overwritten; a slug the source does not price keeps its last row, or has none — such a run records cost_basis none and the dollar caps do not see its spend. These rows were read from the source on 2026-09-07 and matched openai.com/api/pricing that day.",
   "openai": {
-    "gpt-5.6-sol":   {"input": 4.00, "cached_input": 0.40,  "output": 20.00, "cache_write": 0},
-    "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20,  "output": 12.00, "cache_write": 0},
-    "gpt-5.6-luna":  {"input": 0.20, "cached_input": 0.02,  "output": 1.20,  "cache_write": 0},
-    "gpt-5.5":       {"input": 5.00, "cached_input": 0.50,  "output": 30.00, "cache_write": 0},
-    "gpt-5.4-mini":  {"input": 0.75, "cached_input": 0.075, "output": 4.50,  "cache_write": 0}
+    "gpt-5.6-sol":   {"input": 4.0,  "cached_input": 0.4,   "output": 20.0, "cache_write": 5.0,  "source": "litellm", "at": 1788800000},
+    "gpt-5.6-terra": {"input": 2.0,  "cached_input": 0.2,   "output": 12.0, "cache_write": 2.5,  "source": "litellm", "at": 1788800000},
+    "gpt-5.6-luna":  {"input": 0.2,  "cached_input": 0.02,  "output": 1.2,  "cache_write": 0.25, "source": "litellm", "at": 1788800000},
+    "gpt-5.5":       {"input": 5.0,  "cached_input": 0.5,   "output": 30.0, "cache_write": 0,    "source": "litellm", "at": 1788800000},
+    "gpt-5.4-mini":  {"input": 0.75, "cached_input": 0.075, "output": 4.5,  "cache_write": 0,    "source": "litellm", "at": 1788800000}
   }
 }

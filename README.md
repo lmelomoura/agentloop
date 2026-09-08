@@ -743,7 +743,9 @@ resolve-models` probes for the newest of each family and caches the answer in
 On the OpenAI platform a model is a catalog slug used verbatim (`gpt-5.6-sol`);
 `agentloop resolve-models openai` reads the catalog from `codex debug models`
 into the same `config/models.json`, and `resolve-models` with no argument
-refreshes both platforms.
+refreshes both platforms. New OpenAI models need no step here: `codex debug
+models` refreshes the catalog from OpenAI's servers, the tick runs
+`resolve-models` daily, and the price refresh runs right after it.
 
 ### Effort
 
@@ -802,16 +804,36 @@ windows are not on the stream: both are read from the rollout under
 
 **Cost.** Codex reports tokens, never dollars. The final event carries an
 estimate — `(input − cached) × input + cached × cached_input + cache_write ×
-cache_write + output × output`, per million, from `config/pricing.json`
-(seeded from `config/pricing.example.json` by `install.sh`; the numbers are
-the OpenAI price page's as read on 2026-09-07 — check them) — and every run
-records `cost_basis`: `reported` (Claude), `estimated`, or `none` when the
-model has no price or the run died without a final event. The daily caps sum
-estimates like any other cost; a run with `none` counts as zero towards
-them. Showing `none` as a dash instead of $0.00, and the estimate as such, is
-the dashboard's part and lands with it (see the next release's notes).
-`output_tokens` includes reasoning, so reasoning is reported
+cache_write + output × output`, per million, from `config/pricing.json` — and
+every run records `cost_basis`: `reported` (Claude), `estimated`, or `none`
+when the model has no price or the run died without a final event. The daily
+caps sum estimates like any other cost; a run with `none` counts as zero
+towards them. Showing `none` as a dash instead of $0.00, and the estimate as
+such, is the dashboard's part and lands with it (see the next release's
+notes). `output_tokens` includes reasoning, so reasoning is reported
 (`tokens.reasoning`) but never billed twice.
+
+**The price table keeps itself current.** `install.sh` seeds
+`config/pricing.json` from `config/pricing.example.json`, and from there the
+table refreshes itself. OpenAI's pricing page refuses automated clients, so it
+is refreshed from a machine-readable source — LiteLLM's
+`model_prices_and_context_window.json`, which listed every catalog slug at the
+page's prices on 2026-09-07 — per token there, per million here, cache-write
+price included (the 5.6 family bills it). Cache-write tokens are billed at the
+source's cache-write price on top of input tokens (the estimate assumes the
+two counts do not overlap; every Codex turn measured so far wrote no cache, so
+a real turn with cache writes will settle it). `agentloop resolve-pricing`
+does it on demand; the tick does it daily together with the model refresh, so
+a model that appears in the Codex catalog is priced the same day. Each row
+says where it came from (`source`, `at`); a row you write yourself with
+`"source": "manual"` is never overwritten, and a slug the source does not
+carry keeps its last row. Every number that moves is named in `tick.log`, and
+a move of 3× or more is flagged for you to check. `agentloop platforms` shows
+`pricing_at`, `pricing_checked_at` and the visible slugs still without a price
+(`unpriced`); a failed refresh leaves the table as it was and says so in
+`tick.log`. `AGENTLOOP_PRICING_URL` overrides the source (the tests point it
+at a fixture) and is remembered in the table's `_source_url`, so a debugging
+run against a mirror leaves that mirror configured until you edit it out.
 
 **Usage windows.** `data/rate-limits.json` holds one block per platform. The
 Codex CLI reports both windows on every turn, so every OpenAI run feeds its
@@ -1578,6 +1600,7 @@ agentloop security analyze [--detach] <project> <repo> <branch> [profile]
                                #   run an analysis (see Security analysis)
 agentloop security-branches <project> <repo>   # branches that checkout has
 agentloop resolve-models [anthropic|openai]  # refresh the model catalogs (both, without an argument)
+agentloop resolve-pricing    # refresh config/pricing.json from the price source (daily on its own)
 agentloop platforms          # what each platform offers, and whether it is ready
 agentloop skills             # show / link the skills the agent prompts require
 agentloop selftest           # offline checks of the logic that can kill a run
@@ -1587,6 +1610,7 @@ agentloop install | uninstall
 Environment overrides: `AGENTLOOP_PORT`, `AGENTLOOP_CONFIG`,
 `AGENTLOOP_DATA`, `AGENTLOOP_CLAUDE_BIN`, `AGENTLOOP_CLAUDE_CONFIG_DIR`,
 `AGENTLOOP_CODEX_BIN`, `CODEX_HOME` (this one is the Codex CLI's own),
+`AGENTLOOP_PRICING_URL` (where the price table refreshes from),
 `AGENTLOOP_PYTHON`, `AGENTLOOP_JQ`, `AGENTLOOP_LOG_MAX` (log rotation
 threshold, default 4 MiB), `AGENTLOOP_HOOK_TIMEOUT`, `AGENTLOOP_LOCK_GRACE`,
 `AGENTLOOP_SESSION_TTL` (open-session expiry, in seconds, default 86400).

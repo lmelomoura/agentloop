@@ -1460,6 +1460,180 @@ openai_catalog_ensure() { # resolve once, synchronously, when the block is missi
   openai_catalog_available
 }
 
+# --- the price table -----------------------------------------------------------
+# config/pricing.json prices OpenAI runs: the Codex stream carries tokens and
+# no dollars, so the estimate is tokens × this table. The official page
+# (openai.com/api/pricing) refuses automated clients (403 to curl and to
+# fetchers alike), so the table refreshes itself from a machine-readable
+# source: LiteLLM's model_prices_and_context_window.json — per token there,
+# per million here — which matched the page for every catalog slug on
+# 2026-09-07. A row the operator marks "source": "manual" is never touched; a
+# slug the source does not carry keeps its last row. The refresh rides the
+# daily model refresh (the detached `_resolve_models` job) and runs on demand
+# as `agentloop resolve-pricing`; it never runs inside a request or a launch.
+PRICING_SOURCE_DEFAULT="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+
+pricing_source_url() { # the env override, else the table's own _source_url, else the default
+  if [ -n "${AGENTLOOP_PRICING_URL:-}" ]; then printf '%s' "$AGENTLOOP_PRICING_URL"; return; fi
+  local u=""
+  [ -s "$PRICING_FILE" ] && u="$("$JQ" -r '._source_url // empty' "$PRICING_FILE" 2>/dev/null)"
+  printf '%s' "${u:-$PRICING_SOURCE_DEFAULT}"
+}
+
+pricing_unpriced() { # the visible catalog slugs with no numeric price, one per line
+  local s
+  [ -s "$PRICING_FILE" ] || { openai_catalog_visible; return 0; }
+  for s in $(openai_catalog_visible); do
+    "$JQ" -e --arg s "$s" '.openai[$s] | (.input|type) == "number" and (.cached_input|type) == "number" and (.output|type) == "number"' \
+      "$PRICING_FILE" >/dev/null 2>&1 || printf '%s\n' "$s"
+  done
+}
+
+pricing_report_missing() { # pricing_report_missing <slugs> — the daily warning, when a visible slug still has no price
+  [ -n "${1:-}" ] || return 0
+  log_tick "pricing: no price for ${1}— those runs record cost_basis none and the dollar caps do not see their spend (add a manual row to config/pricing.json, or wait for the source)"
+}
+
+_pricing_cleanup() { # the temporaries of the caller, by dynamic scope: $tmp is already gone after a successful mv, and rm -f does not mind
+  rm -f "$tmp" "$src" "$hdr" "$tmp.err" "$tmp.base"
+}
+
+resolve_pricing_openai() { # refresh config/pricing.json from the source; 0 = current (or unchanged), 1 = could not refresh
+  local url tmp src hdr base code now etag refreshed_at age_text new_etag slugs changes
+  local -a hopt=()
+  url="$(pricing_source_url)"
+  now="$(now_epoch)"
+  tmp="$(mktemp "$CONFIG_DIR/.pricing.XXXXXX")" || { log_tick "pricing: cannot write under $CONFIG_DIR — refresh skipped"; return 1; }
+  src="$tmp.src"; hdr="$tmp.hdr"
+  base="$PRICING_FILE"
+  # A missing or corrupt table is never reseeded on disk before the fetch: a
+  # fetch that then fails must find the real file exactly as it was, not an
+  # emptied one. Build the merge from an in-memory base instead; only a
+  # successful refresh ever writes PRICING_FILE (the mv below creates it).
+  if [ ! -s "$PRICING_FILE" ] || ! "$JQ" -e 'type == "object"' "$PRICING_FILE" >/dev/null 2>&1; then
+    echo "pricing.json missing or not valid JSON — a successful refresh will write a fresh table"
+    log_tick "pricing: pricing.json missing or not valid JSON — a successful refresh will write a fresh table"
+    printf '{"openai":{}}\n' > "$tmp.base" || { log_tick "pricing: cannot write under $CONFIG_DIR — refresh skipped"; _pricing_cleanup; return 1; }
+    base="$tmp.base"
+  fi
+  etag="$("$JQ" -r '._source_etag // empty' "$base" 2>/dev/null)"
+  # The conditional request is an optimisation, and it is only sound while the
+  # table is complete: a source that has not changed still carries the row a
+  # visible slug is missing, so when anything is unpriced ask for the body.
+  [ -z "$etag" ] || [ -n "$(pricing_unpriced)" ] || hopt=(-H "If-None-Match: $etag")
+  refreshed_at="$(num "$("$JQ" -r '._refreshed_at // 0' "$base" 2>/dev/null)")"
+  if [ "$refreshed_at" -eq 0 ]; then
+    age_text="never refreshed"
+  else
+    age_text="last refreshed $(( (now - refreshed_at) / 3600 ))h ago"
+  fi
+  # `-w` prints the status last; a file:// source (the tests) reports 000 and
+  # its body is the whole file. Anything but a body we can parse is a failure
+  # that leaves the table exactly as it was — an old price is a price, a
+  # half-written table is not.
+  code="$(curl -sSL --max-time 30 -o "$src" -D "$hdr" -w '%{http_code}' ${hopt[@]+"${hopt[@]}"} "$url" 2>"$tmp.err")" || code="curl-rc-$?"
+  # No offline test can reach this branch: curl answers 000 for a file:// URL,
+  # never 304, and the suites are forbidden the network. It is exercised only
+  # against the real source; pricing_report_missing, the part that could be
+  # wrong quietly, is covered by the success path's own assertion.
+  if [ "$code" = "304" ]; then
+    if "$JQ" --argjson now "$now" --arg url "$url" '._checked_at = $now | ._source_url = $url' "$base" > "$tmp"; then
+      mv "$tmp" "$PRICING_FILE" || { _pricing_cleanup; return 1; }
+      _pricing_cleanup
+      echo "pricing -> unchanged at the source (etag), checked"
+      # An unchanged source is not the same as a complete table: the daily
+      # warning belongs here too, or a slug that has no price never gets one
+      # named for as long as the etag holds.
+      pricing_report_missing "$(pricing_unpriced | tr '\n' ' ')"
+      return 0
+    fi
+    log_tick "pricing: could not stamp $PRICING_FILE — table unchanged"
+    echo "pricing -> could not stamp the table; the table is unchanged"
+    _pricing_cleanup; return 1
+  fi
+  case "$code" in 200|000) ;; *)
+    log_tick "pricing: refresh from $url failed ($code) — table unchanged, ${age_text}"
+    echo "pricing -> refresh failed ($code); the table is unchanged"
+    _pricing_cleanup; return 1 ;;
+  esac
+  if ! "$JQ" -e 'type == "object"' "$src" >/dev/null 2>&1; then
+    log_tick "pricing: refresh from $url failed (the source is not a JSON object) — table unchanged, ${age_text}"
+    echo "pricing -> the source is not a JSON object; the table is unchanged"
+    _pricing_cleanup; return 1
+  fi
+  new_etag="$(grep -i '^etag:' "$hdr" 2>/dev/null | tail -1 | sed 's/^[Ee][Tt][Aa][Gg]: *//' | tr -d '\r')"
+  # The slugs worth a price: everything the catalog knows, listed or hidden,
+  # plus whatever the table already carries (a job may pin a slug the catalog
+  # since dropped).
+  slugs="$( { openai_catalog_slugs; "$JQ" -r '.openai // {} | if type == "object" then . else {} end | keys[]' "$base" 2>/dev/null; } | sort -u | "$JQ" -R . | "$JQ" -sc .)"
+  if ! "$JQ" --slurpfile s "$src" --argjson now "$now" --arg url "$url" --arg etag "$new_etag" --argjson slugs "$slugs" '
+      ($s[0]) as $src
+      | def per_m: if type == "number" then ((. * 1000000 * 1000000) | round) / 1000000 else null end;
+      .openai = (reduce $slugs[] as $slug (((.openai // {}) | if type == "object" then . else {} end);
+          ((.[$slug] // {}) | if type == "object" then . else {} end) as $old
+          | $src[$slug] as $row
+          | if ($old.source // "") == "manual" then .
+            elif ($row | type) == "object" and (($row.litellm_provider // "") == "openai")
+                 and (($row.input_cost_per_token | type) == "number") and (($row.output_cost_per_token | type) == "number") then
+              .[$slug] = ({input: ($row.input_cost_per_token | per_m),
+                           cached_input: ((if ($row.cache_read_input_token_cost | type) == "number" then $row.cache_read_input_token_cost else $row.input_cost_per_token end) | per_m),
+                           output: ($row.output_cost_per_token | per_m),
+                           cache_write: ((if ($row.cache_creation_input_token_cost | type) == "number" then $row.cache_creation_input_token_cost else 0 end) | per_m),
+                           source: "litellm", at: $now}
+                          + (if ($row.cache_read_input_token_cost | type) == "number" then {} else {cached_input_assumed: true} end))
+            else . end))
+      | ._source_url = $url | ._source_etag = $etag | ._refreshed_at = $now | ._checked_at = $now
+      | ._unit = "USD per 1,000,000 tokens: input, cached input, output, cache write (0 when the source lists none)"
+      | ._note = "Refreshed by agentloop resolve-pricing (daily, with the model refresh). A row with \"source\": \"manual\" is never overwritten; a slug the source does not price keeps its last row, or has none — such a run records cost_basis none and the dollar caps do not see its spend."
+    ' "$base" > "$tmp" 2>"$tmp.err"; then
+    log_tick "pricing: could not rewrite $PRICING_FILE ($(head -c 200 "$tmp.err" 2>/dev/null)) — table unchanged"
+    _pricing_cleanup; return 1
+  fi
+  # Every number that moved, named in the log, BEFORE the mv puts the new
+  # table where the old one was: a price adopted in silence is a bill nobody
+  # predicted. One jq over the two files writes the lines; the loop stamps.
+  changes="$("$JQ" -r --slurpfile old "$base" '
+      ((($old[0] // {}).openai // {}) | if type == "object" then . else {} end) as $o
+      | ((.openai // {}) | if type == "object" then . else {} end)
+      | to_entries[]
+      | .key as $slug | .value as $new
+      | ($o[$slug]) as $prev
+      | if ($new | type) != "object" then empty
+        elif ($prev | type) != "object" then
+          "\($slug) priced: input \($new.input) cached \($new.cached_input) output \($new.output) cache_write \($new.cache_write)"
+        else
+          ("input", "cached_input", "output", "cache_write") as $f
+          | ($prev[$f]) as $a | ($new[$f]) as $b
+          | select(($b | type) == "number" and (($a | type) != "number" or $a != $b))
+          | "\($slug) \($f) \($a) -> \($b)"
+            + (if ($a | type) != "number" or $a == 0 then ""
+               elif $b == 0 then " — now free at the source; runs will estimate $0"
+               elif ($b / $a) >= 3 or ($b / $a) <= (1 / 3) then " — check the source"
+               else "" end)
+        end' "$tmp" 2>/dev/null)" || log_tick "pricing: could not compare the old and new tables — their changes are not listed below"
+  if [ -n "$changes" ]; then
+    printf '%s\n' "$changes" | while IFS= read -r line; do
+      [ -z "$line" ] || log_tick "pricing: $line"
+    done
+  fi
+  mv "$tmp" "$PRICING_FILE" || { _pricing_cleanup; return 1; }
+  _pricing_cleanup
+  local priced manual missing
+  priced="$(num "$("$JQ" -r '[.openai[] | select(.source == "litellm")] | length' "$PRICING_FILE")")"
+  manual="$(num "$("$JQ" -r '[.openai[] | select(.source == "manual")] | length' "$PRICING_FILE")")"
+  missing="$(pricing_unpriced | tr '\n' ' ')"
+  echo "pricing -> $priced row(s) from the source, $manual manual, refreshed $(date -u -r "$now" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)${missing:+; no price for: $missing}"
+  pricing_report_missing "$missing"
+  return 0
+}
+
+cmd_resolve_pricing() { # the CLI entry point: serialized against the daily job and against itself
+  acquire_lock "_models" || { echo "pricing: another refresh is running (the daily job or a second resolve-pricing) — try again in a minute"; return 1; }
+  resolve_pricing_openai; local rc=$?
+  release_lock "_models"
+  return $rc
+}
+
 # The session a run reported in its transcript. The id is what binds a run dir
 # to the conversation that owns it: a resume looks the directory up by this, so
 # the agent continues in the tree it was working in rather than in a fresh
@@ -2868,6 +3042,140 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     && ok "resolve_models_openai over the fixture catalog: all 15 assertions reach the gate" \
     || bad "resolve_models_openai over the fixture catalog did not: $(printf '%s\n' "$_rmout" | tail -1)"
 
+  echo "resolve_pricing_openai() — the price table refreshes itself from the source, never inventing a number"
+  local _prout
+  _prout="$(
+    mkdir -p "$tmp/pr"
+    CODEX_BIN="$BASE_DIR/test/fake-codex"
+    CONFIG_DIR="$tmp/pr"
+    MODELS_FILE="$tmp/pr/models.json"
+    PRICING_FILE="$tmp/pr/pricing.json"
+    TICK_LOG="$tmp/pr/tick.log"
+    AGENTLOOP_PRICING_URL="file://$BASE_DIR/test/fixtures/pricing/litellm-sample.json"
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+    resolve_models_openai >/dev/null                     # the catalog the slugs come from (fake-codex)
+    # A table with one row the source does not carry (gpt-5.4-mini) and one the
+    # operator wrote by hand (gpt-5.5, deliberately wrong so a rewrite would show).
+    "$JQ" -n '{openai:{"gpt-5.4-mini":{input:0.75,cached_input:0.075,output:4.5,cache_write:0,source:"litellm",at:1},
+                       "gpt-5.4-nano":{input:1,cached_input:1,output:1,cache_write:1,source:"litellm",at:1},
+                       "gpt-5.5":{input:9,cached_input:9,output:9,cache_write:0,source:"manual"}}}' > "$PRICING_FILE"
+    resolve_pricing_openai >/dev/null; _rc=$?
+    [ "$_rc" -eq 0 ] && ok "resolve_pricing_openai: a good source returns 0" || bad "rc $_rc"
+    pr() { "$JQ" -r "$1" "$PRICING_FILE"; }
+    [ "$(pr '.openai["gpt-5.6-sol"] | [.input,.cached_input,.output,.cache_write] | join(" ")')" = "4 0.4 20 5" ] \
+      && ok "resolve_pricing_openai: gpt-5.6-sol is 4 / 0.4 / 20 per 1M, cache write 5 (per-token × 1M)" \
+      || bad "sol row '$(pr '.openai["gpt-5.6-sol"]')'"
+    [ "$(pr '.openai["gpt-5.6-luna"] | [.input,.cached_input,.output,.cache_write] | join(" ")')" = "0.2 0.02 1.2 0" ] \
+      && ok "resolve_pricing_openai: gpt-5.6-luna keeps its small numbers exact and cache write 0 when the source lists none" \
+      || bad "luna row '$(pr '.openai["gpt-5.6-luna"]')'"
+    # gpt-5.4-nano at the source has its cache prices as STRINGS, not numbers
+    # (a malformed row): the merge must treat a non-number cache field as
+    # absent, not hand it to per_m as though it were a real price.
+    [ "$(pr '.openai["gpt-5.4-nano"] | [.input,.cached_input,.cache_write,.output,.cached_input_assumed] | join(" ")')" = "0.2 0.2 0 1.25 true" ] \
+      && ok "resolve_pricing_openai: a cache price that is a string, not a number, is treated as absent, never as null" \
+      || bad "nano row '$(pr '.openai["gpt-5.4-nano"]')'"
+    [ "$(pr '.openai["gpt-5.6-sol"].source')" = "litellm" ] && [ "$(num "$(pr '.openai["gpt-5.6-sol"].at')")" -gt 1 ] \
+      && ok "resolve_pricing_openai: a written row names its source and when" || bad "source/at '$(pr '.openai["gpt-5.6-sol"] | [.source,.at]')'"
+    [ "$(pr '.openai["gpt-5.5"] | [.input,.source] | join(" ")')" = "9 manual" ] \
+      && ok "resolve_pricing_openai: a manual row is never overwritten" || bad "manual row '$(pr '.openai["gpt-5.5"]')'"
+    [ "$(pr '.openai["gpt-5.4-mini"] | [.input,.at] | join(" ")')" = "0.75 1" ] \
+      && ok "resolve_pricing_openai: a slug the source lacks keeps its last row" || bad "kept row '$(pr '.openai["gpt-5.4-mini"]')'"
+    [ "$(pr '.openai["gpt-reserve"] // "absent"')" = "absent" ] \
+      && ok "resolve_pricing_openai: an entry of another provider is not a price" || bad "gpt-reserve was priced: $(pr '.openai["gpt-reserve"]')"
+    [ "$(num "$(pr '._refreshed_at // 0')")" -gt 1 ] && [ "$(pr '._source_url')" = "$AGENTLOOP_PRICING_URL" ] \
+      && ok "resolve_pricing_openai: the table records when and where from" || bad "meta '$(pr '[._refreshed_at,._source_url]')'"
+    [ -z "$(pricing_unpriced)" ] && ok "pricing_unpriced: every visible slug has a price (the kept row counts)" || bad "unpriced '$(pricing_unpriced | tr '\n' ' ')'"
+    # gpt-5.5 has no cache_read in the sample: the manual row shields it here, so
+    # test the fallback on a fresh table.
+    "$JQ" -n '{openai:{}}' > "$PRICING_FILE"
+    resolve_pricing_openai >/dev/null
+    [ "$(pr '.openai["gpt-5.5"] | [.input,.cached_input,.cached_input_assumed] | join(" ")')" = "5 5 true" ] \
+      && ok "resolve_pricing_openai: no cache price at the source → charged at the input rate, and said so" \
+      || bad "5.5 row '$(pr '.openai["gpt-5.5"]')'"
+    [ "$(pricing_unpriced | tr '\n' ' ')" = "gpt-5.4-mini " ] \
+      && ok "pricing_unpriced: names the visible slug that has no row" || bad "unpriced '$(pricing_unpriced | tr '\n' ' ')'"
+    grep -q 'pricing: no price for gpt-5.4-mini' "$TICK_LOG" \
+      && ok "resolve_pricing_openai: and tick.log says so" || bad "no tick.log line: $(cat "$TICK_LOG" 2>/dev/null)"
+    # A table whose .openai is not an object, or whose row is not one, is
+    # repaired by the next refresh instead of killing every refresh from here
+    # on with a jq type error over a file nobody is watching.
+    "$JQ" -n '{openai:{"gpt-5.6-sol":7}}' > "$PRICING_FILE"
+    resolve_pricing_openai >/dev/null 2>&1; _rc=$?
+    [ "$_rc" -eq 0 ] && [ "$(pr '.openai["gpt-5.6-sol"].input')" = "4" ] \
+      && ok "resolve_pricing_openai: a row that is not an object is replaced by a real row, not a jq error" \
+      || bad "scalar row: rc $_rc, sol '$(pr '.openai["gpt-5.6-sol"]')'"
+    "$JQ" -n '{openai:[1,2]}' > "$PRICING_FILE"
+    resolve_pricing_openai >/dev/null 2>&1; _rc=$?
+    [ "$_rc" -eq 0 ] && [ "$(pr '.openai | type')" = "object" ] && [ "$(pr '.openai["gpt-5.6-sol"].input')" = "4" ] \
+      && ok "resolve_pricing_openai: an .openai that is an array is rebuilt as an object of priced rows" \
+      || bad "array .openai: rc $_rc, .openai is '$(pr '.openai | type')'"
+    # A price that MOVED is in the log, one line per number that changed, with
+    # a flag when it moved by 3x or more: a silent change is a bill nobody
+    # predicted. A row that did not exist before is logged whole.
+    "$JQ" -n '{openai:{"gpt-5.6-sol":{input:40,cached_input:0.4,output:20,cache_write:5,source:"litellm",at:1}}}' > "$PRICING_FILE"
+    : > "$TICK_LOG"
+    resolve_pricing_openai >/dev/null
+    grep -q 'pricing: gpt-5.6-sol input 40 -> 4 — check the source' "$TICK_LOG" \
+      && ok "resolve_pricing_openai: a changed price is logged, and a move of 3x or more is flagged" \
+      || bad "no change line: $(grep 'pricing:' "$TICK_LOG" 2>/dev/null | tr '\n' '|')"
+    grep -q 'pricing: gpt-5.6-terra priced: input 2 cached 0.2 output 12 cache_write 2.5' "$TICK_LOG" \
+      && ok "resolve_pricing_openai: a row that did not exist before is logged with all four numbers" \
+      || bad "no priced line: $(grep 'pricing:' "$TICK_LOG" 2>/dev/null | tr '\n' '|')"
+    # Failure keeps the table exactly as it was, and says so.
+    _before="$(cat "$PRICING_FILE")"
+    AGENTLOOP_PRICING_URL="file:///nonexistent/dir/prices.json" resolve_pricing_openai >/dev/null; _rc=$?
+    [ "$_rc" -ne 0 ] && [ "$(cat "$PRICING_FILE")" = "$_before" ] \
+      && ok "resolve_pricing_openai: an unreachable source returns 1 and leaves the table untouched" || bad "unreachable: rc $_rc, changed=$([ "$(cat "$PRICING_FILE")" = "$_before" ] && echo no || echo yes)"
+    grep -q 'pricing: refresh from file:///nonexistent/dir/prices.json failed.*table unchanged, last refreshed [0-9]*h ago' "$TICK_LOG" \
+      && ok "resolve_pricing_openai: the failure is in tick.log, with a plain hour count for a table refreshed before" || bad "no failure line: $(cat "$TICK_LOG" 2>/dev/null)"
+    printf 'not json\n' > "$tmp/pr/junk.txt"
+    AGENTLOOP_PRICING_URL="file://$tmp/pr/junk.txt" resolve_pricing_openai >/dev/null; _rc=$?
+    [ "$_rc" -ne 0 ] && [ "$(cat "$PRICING_FILE")" = "$_before" ] \
+      && ok "resolve_pricing_openai: a source that is not a JSON object returns 1 and leaves the table untouched" || bad "junk: rc $_rc"
+    # A table that is corrupt (or missing) to begin with must not be reseeded
+    # to an empty object before the fetch: a fetch that then fails would
+    # otherwise report success at leaving the table alone, over a table that
+    # was in fact just emptied.
+    printf 'not json either' > "$tmp/pr/corrupt.json"
+    PRICING_FILE="$tmp/pr/corrupt.json" AGENTLOOP_PRICING_URL="file:///nonexistent/dir/prices.json" resolve_pricing_openai >/dev/null; _rc=$?
+    [ "$_rc" -ne 0 ] && [ "$(cat "$tmp/pr/corrupt.json")" = "not json either" ] \
+      && ok "resolve_pricing_openai: a corrupt table is left exactly as it was when the fetch then fails, never reseeded first" \
+      || bad "corrupt: rc $_rc, content '$(cat "$tmp/pr/corrupt.json" 2>/dev/null)'"
+    # A table that was never refreshed says so in plain words in the log, not
+    # a huge hour count computed from a zero timestamp.
+    printf '{"openai":{}}\n' > "$tmp/pr/never.json"
+    PRICING_FILE="$tmp/pr/never.json" AGENTLOOP_PRICING_URL="file:///nonexistent/dir/prices.json" resolve_pricing_openai >/dev/null
+    grep -q 'pricing: refresh from file:///nonexistent/dir/prices.json failed.*table unchanged, never refreshed' "$TICK_LOG" \
+      && ok "resolve_pricing_openai: a table that was never refreshed says so, not a huge number of hours" \
+      || bad "no never-refreshed line: $(tail -3 "$TICK_LOG" 2>/dev/null)"
+    # A CONFIG_DIR that cannot hold a temp file is a silent-failure path: it
+    # must log and refuse, not just return 1 with nothing to show for it.
+    CONFIG_DIR="$tmp/pr/absent-parent-for-mktemp" PRICING_FILE="$tmp/pr/mktempfail.json" resolve_pricing_openai >/dev/null 2>&1; _rc=$?
+    [ "$_rc" -ne 0 ] && grep -q 'pricing: cannot write under .*absent-parent-for-mktemp — refresh skipped' "$TICK_LOG" \
+      && ok "resolve_pricing_openai: a CONFIG_DIR it cannot write under is logged and refused, not crashed past" \
+      || bad "mktemp failure: rc $_rc, log: $(tail -3 "$TICK_LOG" 2>/dev/null)"
+    # The source of the URL: env, else the _source_url of the table, else the
+    # default. (No apostrophe in a comment inside a $( ): bash reads it as an
+    # opening quote and the parse of the whole file goes wrong.)
+    ( unset AGENTLOOP_PRICING_URL; [ "$(pricing_source_url)" = "file://$BASE_DIR/test/fixtures/pricing/litellm-sample.json" ] ) \
+      && ok "pricing_source_url: without the env override, the table's _source_url is used" || bad "url '$(unset AGENTLOOP_PRICING_URL; pricing_source_url)'"
+    ( unset AGENTLOOP_PRICING_URL; "$JQ" 'del(._source_url)' "$PRICING_FILE" > "$PRICING_FILE.x"; PRICING_FILE="$PRICING_FILE.x"; [ "$(pricing_source_url)" = "$PRICING_SOURCE_DEFAULT" ] ) \
+      && ok "pricing_source_url: and the default when the table has none" || bad "default url"
+    # platforms carries the freshness and the gap.
+    _pl="$(cmd_platforms 2>/dev/null)"
+    [ "$(num "$(printf '%s' "$_pl" | "$JQ" -r '.openai.pricing_at // 0')")" -gt 1 ] \
+      && ok "cmd_platforms: openai.pricing_at is the table's refresh time" || bad "pricing_at '$(printf '%s' "$_pl" | "$JQ" -c '.openai.pricing_at')'"
+    [ "$(printf '%s' "$_pl" | "$JQ" -c '.openai.unpriced')" = '["gpt-5.4-mini"]' ] \
+      && ok "cmd_platforms: openai.unpriced names the visible slug without a price" || bad "unpriced '$(printf '%s' "$_pl" | "$JQ" -c '.openai.unpriced')'"
+    printf 'RESULT ok=%s bad=%s\n' "$_upass" "$_ufail"
+  )"
+  printf '%s\n' "$_prout" | grep -v '^RESULT '
+  printf '%s\n' "$_prout" | grep -qx 'RESULT ok=27 bad=0' \
+    && ok "resolve_pricing_openai: all 27 refresh assertions passed" \
+    || bad "resolve_pricing_openai over the sample source did not: $(printf '%s\n' "$_prout" | tail -1)"
+
   # cmd_resolve_models must hand the caller resolve_models_openai's status:
   # `agentloop resolve-models openai` exiting 0 after failing to write the
   # catalog is a silent no-op an operator (or install.sh) cannot notice. The
@@ -2880,6 +3188,31 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   ( CODEX_BIN=/nonexistent; CONFIG_DIR="$tmp/rmrc"; MODELS_FILE="$tmp/rmrc/nodir/x/models.json"
     cmd_resolve_models openai ) >/dev/null 2>&1
   want "resolve-models openai: a catalog that could not be written exits non-zero" 1 $?
+
+  echo "cmd_resolve_pricing() — will not race the daily job or a second resolve-pricing"
+  # Take the _models lock by hand, the way acquire_lock itself would (a pid
+  # file and a boot file under LOCK_DIR/_models), shadowed to a private
+  # directory under $tmp so this cannot collide with any other lock the rest
+  # of the suite takes or leaves behind.
+  mkdir -p "$tmp/prlock/_models"
+  echo $$ > "$tmp/prlock/_models/pid"
+  boot_id > "$tmp/prlock/_models/boot"
+  _lockout="$(
+    LOCK_DIR="$tmp/prlock" CONFIG_DIR="$tmp/pr" MODELS_FILE="$tmp/pr/models.json" \
+    PRICING_FILE="$tmp/pr/pricing.json" TICK_LOG="$tmp/pr/tick.log" \
+    AGENTLOOP_PRICING_URL="file://$BASE_DIR/test/fixtures/pricing/litellm-sample.json" \
+    cmd_resolve_pricing 2>&1
+  )"
+  _lockrc=$?
+  [ "$_lockrc" -ne 0 ] && printf '%s' "$_lockout" | grep -q 'pricing: another refresh is running (the daily job or a second resolve-pricing) — try again in a minute' \
+    && ok "cmd_resolve_pricing: refused while the _models lock is held, naming why" \
+    || bad "held: rc=$_lockrc out='$_lockout'"
+  rm -rf "$tmp/prlock/_models"
+  LOCK_DIR="$tmp/prlock" CONFIG_DIR="$tmp/pr" MODELS_FILE="$tmp/pr/models.json" \
+    PRICING_FILE="$tmp/pr/pricing.json" TICK_LOG="$tmp/pr/tick.log" \
+    AGENTLOOP_PRICING_URL="file://$BASE_DIR/test/fixtures/pricing/litellm-sample.json" \
+    cmd_resolve_pricing >/dev/null 2>&1
+  want "cmd_resolve_pricing: once the lock is released, the refresh proceeds" 0 $?
 
   echo "platform_stderr_filter() — exactly the CLI's one known line, nothing else"
   printf 'Reading additional input from stdin...\nsomething real\n' > "$tmp/e1.err"
@@ -7628,23 +7961,34 @@ cmd_resolve_models() { # cmd_resolve_models [anthropic|openai] -- no argument do
 }
 
 cmd_platforms() { # one JSON object: what each platform offers and whether it is ready
-  local p ready reason perms efforts dm dp cat_at cat_ok
+  local p ready reason perms efforts dm dp cat_at cat_ok pr_at pr_ck pr_src unpriced
   for p in $PLATFORMS; do
     if reason="$(platform_ready "$p")"; then ready=true; reason=""; else ready=false; fi
     perms="$(platform_permissions "$p" | "$JQ" -R . | "$JQ" -sc .)"
     if [ "$p" = "openai" ]; then efforts="$(openai_catalog_all_efforts | "$JQ" -R . | "$JQ" -sc .)"; else efforts="$(platform_efforts "$p" | "$JQ" -R . | "$JQ" -sc .)"; fi
     dm="$(platform_default_model "$p")"; dp="$(platform_default_permission "$p" job)"
     cat_at=0; cat_ok=false
+    pr_at=0; pr_ck=0; pr_src=""; unpriced="[]"
     if [ "$p" = "openai" ]; then
       cat_at="$(num "$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)")"
       openai_catalog_available && cat_ok=true
+      pr_at="$(num "$("$JQ" -r '._refreshed_at // 0' "$PRICING_FILE" 2>/dev/null)")"
+      # When the last refresh CHECKED, as against when it last changed
+      # anything: a source that answers 304 stamps only this one, and without
+      # it a table that is current looks stale for as long as the etag holds.
+      pr_ck="$(num "$("$JQ" -r '._checked_at // 0' "$PRICING_FILE" 2>/dev/null)")"
+      pr_src="$("$JQ" -r '._source_url | if type == "string" then . else "" end' "$PRICING_FILE" 2>/dev/null)"
+      unpriced="$(pricing_unpriced | "$JQ" -R . | "$JQ" -sc .)"
     fi
     "$JQ" -nc --arg p "$p" --argjson ready "$ready" --arg reason "$reason" \
       --argjson perms "$perms" --argjson efforts "$efforts" --arg dm "$dm" --arg dp "$dp" \
       --argjson cat_at "$cat_at" --argjson cat_ok "$cat_ok" \
+      --argjson pr_at "$pr_at" --argjson pr_ck "$pr_ck" --arg pr_src "$pr_src" --argjson unpriced "$unpriced" \
       '{($p): ({ready:$ready, reason:$reason, permissions:$perms, efforts:$efforts,
                 default_model:$dm, default_permission:$dp}
-               + (if $p == "openai" then {catalog_at:$cat_at, catalog_available:$cat_ok} else {} end))}'
+               + (if $p == "openai" then {catalog_at:$cat_at, catalog_available:$cat_ok,
+                                          pricing_at:$pr_at, pricing_checked_at:$pr_ck,
+                                          pricing_source:$pr_src, unpriced:$unpriced} else {} end))}'
   done | "$JQ" -sc 'add'
 }
 
@@ -9885,6 +10229,9 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop resolve-models [anthropic|openai]
                               refresh the model catalogues (both, without an
                               argument)
+  agentloop resolve-pricing
+                              refresh config/pricing.json from the price
+                              source (daily on its own)
   agentloop platforms       what each platform offers (permission modes,
                               efforts, defaults) and whether it is ready
   agentloop tick            internal — what launchd calls every minute
@@ -9918,6 +10265,7 @@ case "${1:-}" in
     acquire_lock "_models" || exit 0
     trap 'release_lock "_models"' EXIT
     cmd_resolve_models
+    resolve_pricing_openai   # not cmd_resolve_pricing: this branch already holds the _models lock
     ;;
   run)       [ $# -ge 2 ] || die "usage: agentloop run <job-id>"; run_job "$2" --force ;;
   resume)    [ $# -ge 3 ] || die "usage: agentloop resume <job-id> <session-id>"; run_job "$2" --force "$3" ;;
@@ -9967,6 +10315,7 @@ case "${1:-}" in
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"
                      cmd_security_branches "$2" "$3" ;;
   resolve-models) cmd_resolve_models "${2:-}" ;;
+  resolve-pricing) cmd_resolve_pricing ;;
   platforms) cmd_platforms ;;
   skills)    shift; cmd_skills "${1:-status}" ;;
   selftest)  cmd_selftest ;;

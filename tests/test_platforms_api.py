@@ -179,3 +179,87 @@ def test_the_server_lets_platform_through_set_field():
     src = (REPO / "bin" / "agentloop-server").read_text()
     allow = src[src.index('elif op == "set_field"'):][:900]
     assert '"platform"' in allow
+
+
+def test_the_openai_platform_carries_its_prices_and_their_freshness(srv):
+    _write_models(srv, openai=_catalog_block())
+    (srv.CONFIG_DIR / "pricing.json").write_text(json.dumps({
+        "_source_url": "file:///fixture", "_refreshed_at": 1788800000,
+        "openai": {
+            "gpt-5.6-sol": {"input": 4, "cached_input": 0.4, "output": 20, "cache_write": 5,
+                            "source": "litellm", "at": 1788800000},
+            "gpt-5.5": {"input": 9, "cached_input": 9, "output": 9, "cache_write": 0, "source": "manual"}}}))
+    o = srv.list_models()["platforms"]["openai"]
+    assert o["pricing_at"] == 1788800000 and o["pricing_source"] == "file:///fixture"
+    by = {m["v"]: m for m in o["models"]}
+    assert by["gpt-5.6-sol"]["priced"] is True
+    assert by["gpt-5.6-sol"]["price"] == {"input": 4, "cached_input": 0.4, "output": 20,
+                                          "cache_write": 5, "source": "litellm", "at": 1788800000}
+    assert by["gpt-5.5"]["price"]["source"] == "manual" and by["gpt-5.5"]["price"]["at"] is None
+    assert by["gpt-5.6-luna"]["priced"] is False and by["gpt-5.6-luna"]["price"] is None
+    assert o["unpriced"] == ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini"]
+
+
+def test_without_a_price_table_the_platform_says_so(srv):
+    _write_models(srv, openai=_catalog_block())
+    p = srv.CONFIG_DIR / "pricing.json"
+    if p.exists():
+        p.unlink()
+    o = srv.list_models()["platforms"]["openai"]
+    assert o["pricing_at"] == 0 and o["pricing_source"] == ""
+    assert o["unpriced"] == [m["v"] for m in o["models"]]
+    assert all(m["price"] is None for m in o["models"])
+
+
+def test_a_malformed_price_table_never_breaks_the_platform(srv):
+    """pricing.json can be valid JSON and still not be {"openai": {slug:
+    row}} -- a list at the top, or an "openai" block that is a list. Either
+    used to raise AttributeError out of list_models() (table.get("openai")
+    on a list, then priced.get(slug) on a list), taking /api/models down
+    with it. The platform must instead answer exactly as if there were no
+    price table at all."""
+    _write_models(srv, openai=_catalog_block())
+    pricing = srv.CONFIG_DIR / "pricing.json"
+    for content in (json.dumps([1, 2, 3]), json.dumps({"openai": [1, 2, 3]}),
+                    json.dumps("just a string"), "not json at all"):
+        pricing.write_text(content)
+        o = srv.list_models()["platforms"]["openai"]
+        assert o["pricing_at"] == 0 and o["pricing_source"] == "", content
+        assert all(m["price"] is None and m["priced"] is False for m in o["models"]), content
+        assert o["unpriced"] == [m["v"] for m in o["models"]], content
+
+
+def test_a_non_string_source_url_is_never_the_pricing_source(srv):
+    _write_models(srv, openai=_catalog_block())
+    (srv.CONFIG_DIR / "pricing.json").write_text(json.dumps({"_source_url": 7, "openai": {}}))
+    assert srv.list_models()["platforms"]["openai"]["pricing_source"] == ""
+
+
+def test_price_of_falls_back_to_defaults_row_by_row(srv):
+    """Each field price_of trusts only when it has the right type; anything
+    else gets the same default a missing field would, or -- for `input`, or
+    a row that is not even a dict -- drops the whole row. Pinned per field so
+    a future edit to price_of cannot silently loosen one of these checks."""
+    _write_models(srv, openai=_catalog_block())
+    pricing = srv.CONFIG_DIR / "pricing.json"
+    pricing.write_text(json.dumps({"openai": {
+        "gpt-5.6-sol": {"input": 1, "cached_input": 1, "output": 1},                        # no cache_write
+        "gpt-5.6-terra": {"input": 1, "cached_input": 1, "output": 1, "cache_write": "5"},   # cache_write: string
+        "gpt-5.6-luna": 7,                                                                   # row is not a dict
+        "gpt-5.5": {"input": 1, "cached_input": 1, "output": 1, "cache_write": 2},           # no at
+        "gpt-5.4-mini": {"input": True, "cached_input": 1, "output": 1}}}))                  # input: bool
+    by = {m["v"]: m for m in srv.list_models()["platforms"]["openai"]["models"]}
+    assert by["gpt-5.6-sol"]["price"]["cache_write"] == 0
+    assert by["gpt-5.6-terra"]["price"]["cache_write"] == 0
+    assert by["gpt-5.6-luna"]["price"] is None and by["gpt-5.6-luna"]["priced"] is False
+    assert by["gpt-5.5"]["price"]["at"] is None
+    assert by["gpt-5.4-mini"]["price"] is None
+
+    pricing.write_text(json.dumps({"openai": {
+        "gpt-5.6-sol": {"input": 1, "cached_input": 1, "output": 1, "cache_write": True},   # cache_write: bool
+        "gpt-5.6-terra": {"input": 1, "cached_input": 1, "output": 1, "at": "yesterday"},   # at: string
+        "gpt-5.4-mini": {"input": "4", "cached_input": 1, "output": 1}}}))                  # input: string
+    by = {m["v"]: m for m in srv.list_models()["platforms"]["openai"]["models"]}
+    assert by["gpt-5.6-sol"]["price"]["cache_write"] == 0
+    assert by["gpt-5.6-terra"]["price"]["at"] is None
+    assert by["gpt-5.4-mini"]["price"] is None
