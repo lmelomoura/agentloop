@@ -9542,13 +9542,110 @@ def test_every_side_effecting_button_is_held_from_the_click(srv):
             line = src[:m.start()].count("\n") + 1
             if "markIfPending" not in src[m.start():m.start() + 700]:
                 missing.append(f"{path.name}:{line}")
-    # The two builders that compose their button as an HTML string ask through
-    # pendingAttr instead, in the page itself.
-    for op, key in [("toggle_many", "bulkBtn"), ("worktree_drop", "renderRetained")]:
+    # The builders that compose their button as an HTML string ask in the page
+    # itself: the bulk switch through pendingAttr (a disabled button), the
+    # Sessions dialog's Discard through isPending, which puts a "Discarding…"
+    # badge where the button was. Either is an answer to "is this already in
+    # flight"; what would not be is composing the button without asking.
+    for key, ask in [("bulkBtn", 'pendingAttr("toggle_many"'),
+                     ("renderRetained", 'isPending("worktree_drop"')]:
         i = js.index("function " + key)
-        assert f'pendingAttr("{op}"' in js[i:i + 3000], (
+        assert ask in js[i:i + 3000], (
             f"{key} composes its button without asking whether that action is already "
             f"in flight, so the poll hands it back mid-request")
     assert not missing, (
         "these action buttons are built without asking whether the action is already "
         "in flight: " + ", ".join(missing))
+
+
+def test_a_run_being_deleted_offers_nothing_else_to_click(srv):
+    """Holding the trash was never enough.
+
+    The operator clicked delete on a failed run and reported that "the other
+    action buttons stayed active, besides the delay and nothing saying it was
+    being deleted". Both halves are real. View, Stop and Resume were built
+    exactly as usual on a row whose deletion was already in flight — Resume on
+    a run being erased is a race with no good outcome — and the one button that
+    DID go down went grey, which is the same thing this page shows for "this
+    action does not apply here".
+
+    So the row hands its actions back for the duration and says what is
+    happening to it. Pinned as an ORDER: the question has to be asked before
+    any of the four buttons is built, since a button built first is a button
+    that exists.
+    """
+    row = _plainfn(_app_js(srv), "runRow")
+    i = row.index('isPending("run_delete", r.id, String(r.start))')
+    for label, mark in [("view", 'const view = el("button"'),
+                        ("stop", 'const stop = el("button"'),
+                        ("retry", 'const retry = el("button"'),
+                        ("delete", 'const del = el("button"')]:
+        assert i < row.index(mark), (
+            f"the {label} button is built before the row asks whether this run is "
+            f"already being deleted, so it ships on a row that is going")
+    branch = row[i:row.index("// View the log")]
+    assert "return tr;" in branch, "the row falls through and builds its buttons anyway"
+    assert "goingbadge" in branch and "Deleting…" in branch, (
+        "the row goes quiet without saying why — indistinguishable from a click "
+        "that never registered")
+
+
+def test_a_session_being_discarded_says_so(srv):
+    """The same defect in the Sessions dialog, where the wait is far longer.
+
+    Discarding runs the project's `down` hook: seconds to minutes. A Discard
+    button that only greys for all that time reads as a click that did not
+    take, and the second click is how the same tree gets discarded twice.
+    """
+    fn = _plainfn(_js(srv), "renderRetained")
+    assert 'isPending("worktree_drop", w.job, w.stamp)' in fn
+    assert "goingbadge" in fn and "Discarding…" in fn, (
+        "the Sessions row gives no sign that a discard is under way")
+
+
+def test_releasing_a_destructive_action_repaints_the_row_it_held(srv):
+    """clearPending re-enables the buttons it can FIND — and these rows have none.
+
+    Its sweep matches `button[data-del-id]` and `button[data-wtdrop]`. Both are
+    gone while the action is in flight: a "Deleting…"/"Discarding…" badge stands
+    where the button was. So on the paths that do not already refresh — a
+    cancelled confirm, a refusal from the engine — nothing would put the row
+    back until the next poll noticed, up to five seconds of a row claiming to be
+    going nowhere. The repaint belongs in the same `finally` as the release.
+    """
+    js = _js(srv)
+    for what, line in [("a run delete", "finally{ clearPending(...dk); refresh(); }"),
+                       ("a session discard", "finally{ clearPending(...wk); refresh(); }")]:
+        assert line in js, (
+            f"{what} lets go of its pending mark without repainting the row it was "
+            f"holding, which has no button left for clearPending to hand back")
+
+
+def test_the_runs_header_never_presents_a_stale_listing_as_a_fresh_one(srv, tmp_path):
+    """`runs_stale` reaches the reader, in both the empty and the full case.
+
+    The server serves the last listing it managed to read when the index will
+    not answer (bin/agentloop-server, `_LAST_RUNS`). That is the right payload —
+    an empty table over an intact journal is worse — but a table minutes behind
+    looks exactly like a current one, so the page has to say which it has.
+    """
+    fn = _plainfn(_app_js(srv), "runsHeaderSubtitle")
+    script = tmp_path / "subtitle.js"
+    script.write_text("let AL = {DATA:{}};\n" + fn + """
+    const out = {};
+    AL.DATA = {runs_stale: false};
+    out.fresh = runsHeaderSubtitle([{start: 1}], 0);
+    out.fresh_empty = runsHeaderSubtitle([], 0);
+    AL.DATA = {runs_stale: true};
+    out.stale = runsHeaderSubtitle([{start: 1}], 0);
+    out.stale_empty = runsHeaderSubtitle([], 0);
+    console.log(JSON.stringify(out));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert "busy" not in out["fresh"] and "busy" not in out["fresh_empty"], (
+        "an ordinary poll warns about an index that is answering perfectly well")
+    assert "busy" in out["stale"], "a stale listing is presented as a fresh one"
+    assert "busy" in out["stale_empty"] and "Nothing recorded yet" not in out["stale_empty"], (
+        "an index that would not answer is reported as an empty history, which is "
+        "the exact lie this flag exists to stop")

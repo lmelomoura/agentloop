@@ -37,7 +37,7 @@
 import { $, AL, icon, money, fmtAgo, fmtDur, fmtWhen, normStatus,
          openLog, resumeTarget, resumeTip, continuedRun, resumedBadgeTip,
          runKey, isStopping, unjournaledLive, paintRunPickers, runDateLabel,
-         toast, TOKEN, markIfPending } from "./page.js";
+         toast, TOKEN, markIfPending, isPending } from "./page.js";
 import { costParts, platformLabel } from "./editor-domain.js";
 import { el, pageHeader, kpiCard, filterBar, tableCard, tableFooter } from "./chrome.js";
 
@@ -115,11 +115,21 @@ export function filteredRuns(rf, liveRows, searchKeys, sortKey, sortDir){
 
 /* -------------------------------------------------------------- the header */
 function runsHeaderSubtitle(runs, liveCount){
+  // The server could not read the index and served the last listing it managed
+  // to (bin/agentloop-server, `runs_stale`). Rare, and never silent: a table
+  // that is minutes behind looks exactly like one that is current, and "0 runs"
+  // over an intact journal is the version of that lie this page used to tell.
+  const stale = !!(AL.DATA && AL.DATA.runs_stale);
   const total = runs.length + liveCount;
-  if(!total) return "Nothing recorded yet — a run appears here the moment a job wakes.";
+  if(!total){
+    return stale
+      ? "The run index is busy — nothing can be listed until it answers."
+      : "Nothing recorded yet — a run appears here the moment a job wakes.";
+  }
   const t0 = Math.floor(new Date().setHours(0,0,0,0)/1000);
   const today = runs.filter(r => r.start >= t0).length + liveCount;
-  return total + " run" + (total===1?"":"s") + " on record, " + today + " today.";
+  return total + " run" + (total===1?"":"s") + " on record, " + today + " today."
+       + (stale ? " The index is busy — this list is the last one it gave, and may be behind." : "");
 }
 
 /* --------------------------------------------------------------- the KPIs
@@ -510,6 +520,24 @@ function runRow(r){
   tr.appendChild(tdSession);
 
   const tdActs = el("td", "rowacts");
+
+  // A delete is a request with a round trip behind it, and until it comes back
+  // this run is neither here nor gone. Only the trash itself used to go down
+  // for that -- View, Stop and Resume stayed live on a row being erased, and a
+  // greyed button says nothing about WHY it is greyed. So the whole row hands
+  // back its actions and says what is happening to it instead. The state is
+  // read from the page's pending map, not from a flag on this element: a poll
+  // rebuilds this row from scratch every five seconds, and anything kept on the
+  // element is thrown away with it.
+  if(isPending("run_delete", r.id, String(r.start))){
+    tr.classList.add("row-going");
+    const going = el("span", "goingbadge");
+    going.appendChild(el("span", "pulse"));
+    going.appendChild(document.createTextNode("Deleting…"));
+    tdActs.appendChild(going);
+    tr.appendChild(tdActs);
+    return tr;
+  }
 
   // View the log. Reaches openLog directly (through the page.js interface)
   // rather than through a `data-log-id` attribute a central listener used

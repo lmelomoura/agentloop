@@ -433,6 +433,18 @@ code{font:11.5px ui-monospace,"SF Mono",Menlo,monospace;
 .runningbadge .pulse{width:8px;height:8px;border-radius:50%;background:var(--warn);
   animation:ccpulse 1.2s ease-in-out infinite}
 @keyframes ccpulse{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1.2)}}
+/* Something destructive is in flight for this row and has not come back yet --
+   a run being deleted, a kept session being discarded. It takes the place of
+   the row's action buttons rather than greying them: the wait is a round trip
+   nobody can shorten, so the row's job while it lasts is to say what is
+   happening to it, and to offer nothing else to click. Same pulse as the
+   running badge above, in the danger colour, because it is the same idea --
+   this row is mid-something. */
+.goingbadge{display:inline-flex;align-items:center;gap:7px;color:var(--err);
+  font-size:12px;font-weight:600;white-space:nowrap}
+.goingbadge .pulse{width:8px;height:8px;border-radius:50%;background:var(--err);
+  animation:ccpulse 1.2s ease-in-out infinite}
+.row-going{opacity:.55}
 /* A kill has been asked for and the wrapper is winding down. Its own colour so
    the row does not keep claiming to be running after you told it to stop. */
 .runningbadge.stopping{color:var(--err)}

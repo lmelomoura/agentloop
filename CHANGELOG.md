@@ -230,6 +230,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Deleting a run no longer rewrites the whole index, and no longer freezes
+  the page while it does.** Every delete ended in an unconditional `VACUUM`.
+  Its cost is the size of the index; its return is the size of the freelist —
+  two numbers with nothing to do with each other. Measured on a live install
+  (513 MB, 405 runs): one delete spent **5.7 s** in that rewrite, handed back
+  **0 bytes**, and left a concurrent `/api/data` poll waiting **12.8 s** behind
+  the lock. The same delete now takes **20 ms** and the worst poll beside it
+  **0.08 s**. The rewrite waits for a freelist actually worth reclaiming
+  (`COMPACT_MIN_FREE_BYTES`, 64 MB); nothing is lost in the meantime, since
+  SQLite reuses free pages for the next run ingested. What it cost to not have
+  it: the trash button appeared to hang, and the Runs list stopped updating
+  every time anyone used it.
+
+- **A row being deleted hands back its buttons and says what is happening to
+  it.** Clicking the trash on a failed run left View, Stop and Resume live on a
+  row that was already being erased — Resume on a run mid-delete is a race with
+  no good outcome — while the only button that did go down went grey, which is
+  what this page shows for "this action does not apply here". The row now shows
+  a pulsing **Deleting…** in place of its actions for as long as the request is
+  in flight, and the Sessions dialog's Discard does the same (**Discarding…**),
+  where the wait is a `down` hook that can run for minutes. Both repaint the
+  moment the action is released, including when the confirm is cancelled. What
+  it cost to not have it: a delete looked like a click that had not registered,
+  and the way to find out was to click something else on a row that was going.
+
+- **A busy index no longer paints "No runs recorded yet" over an intact
+  journal.** A read that could not get the index — because a compaction or a
+  large ingest was holding it — raised `database is locked` after `timeout=5`
+  and the listing degraded to an EMPTY list, indistinguishable from having no
+  runs at all (twice in one operator's `server.log`). Broken and busy now get
+  different answers: the read is retried once, and if the index is still busy
+  the last listing that genuinely came back is served instead, flagged
+  `runs_stale` so the page can say the table may be behind. An index that has
+  never answered has nothing cached and still shows nothing, still loudly.
+
 - **A job no longer comes back from a platform change unable to use a single
   tool.** `dontAsk` was the Anthropic default for a job, and `dontAsk` means
   *allowlisted tools only* — headless, with no allowlist, that is every tool
