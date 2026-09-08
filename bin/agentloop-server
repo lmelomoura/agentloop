@@ -882,11 +882,19 @@ def _tokens_json(rec, art):
                        "output": n("output_tokens"), "reasoning": n("reasoning_output_tokens")})
 
 
-def _platform_from_stream(stream):
+def _platform_from_stream(stream, default="anthropic"):
     """The platform a stream came from: the init event says `openai` for a
-    normalized Codex stream; everything else is Claude Code."""
+    normalized Codex stream; everything else is Claude Code.
+
+    `default` is what a stream that has not said yet answers — a run whose
+    first line has not been written, which is every run for the first seconds
+    of its life. It is NOT the same question as "which platform is this": a
+    live run knows the answer from its job long before its stream does, and
+    answering `anthropic` there put a Claude badge and a Claude resume line on
+    a Codex run for as long as it was starting up.
+    """
     if not stream:
-        return "anthropic"
+        return default
     for line in stream.splitlines()[:40]:
         line = line.strip()
         if not line or '"init"' not in line:
@@ -896,8 +904,10 @@ def _platform_from_stream(stream):
         except Exception:  # noqa: BLE001
             continue
         if ev.get("type") == "system" and ev.get("subtype") == "init":
+            # An init line that names no platform is Claude Code's own: the
+            # normalizer stamps `openai` on every line it writes.
             return ev.get("platform") or "anthropic"
-    return "anthropic"
+    return default
 
 
 def _upsert(conn, fts, rec, preserve=None):
@@ -2140,19 +2150,30 @@ def load_live_detail(jid, start_i):
         stream = ""
     last_text, turns, sess = _salvage_from_stream(stream)
     pc = st.get("last_precheck") or {}
-    rec = {"id": jid, "start": start_i, "status": "running",
-           "duration": max(0, int(time.time()) - start_i), "cost": None, "session": sess,
-           "log": logp, "forced": False, "precheck": (pc.get("output") if isinstance(pc, dict) else "") or "",
-           "project": "", "model": "", "model_id": _model_id_from_stream(stream),
-           "platform": _platform_from_stream(stream), "cost_basis": "", "live": True}
-    interactive = False
+    # What the run was LAUNCHED with, for the seconds before its stream says so
+    # itself. The job is the honest source until then: the platform decides the
+    # badge and which CLI the reopen line names, and neither may guess.
+    job = {}
     try:
         for j in json.loads(JOBS_FILE.read_text()).get("jobs", []):
             if j.get("id") == jid:
-                interactive = bool(j.get("interactive"))
+                job = j
                 break
     except Exception:  # noqa: BLE001
-        pass
+        job = {}
+    try:
+        projects = json.loads(PROJECTS_FILE.read_text()).get("projects", [])
+    except Exception:  # noqa: BLE001
+        projects = []
+    job_platform = _job_platform(job, projects) if job else "anthropic"
+    rec = {"id": jid, "start": start_i, "status": "running",
+           "duration": max(0, int(time.time()) - start_i), "cost": None, "session": sess,
+           "log": logp, "forced": False, "precheck": (pc.get("output") if isinstance(pc, dict) else "") or "",
+           "project": job.get("project") or "", "model": job.get("model") or "",
+           "model_id": _model_id_from_stream(stream),
+           "platform": _platform_from_stream(stream, job_platform),
+           "cost_basis": "", "live": True}
+    interactive = bool(job.get("interactive"))
     return {"record": rec, "live": True, "interactive": interactive,
             "api_retries": _api_retries(stream),
             "agent": {"result": last_text, "num_turns": turns, "session": sess,

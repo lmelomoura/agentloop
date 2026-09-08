@@ -7,6 +7,7 @@ pruned runs whose files are gone), old journal lines are backfilled, and the
 raw Codex stream kept beside the normalized one is pruned with the rest.
 """
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -160,3 +161,40 @@ def test_a_live_run_reports_its_platform_from_the_stream(srv):
     assert srv._platform_from_stream('{"type":"system","subtype":"init","platform":"openai"}\n') == "openai"
     assert srv._platform_from_stream('{"type":"system","subtype":"init","model":"claude-opus-5"}\n') == "anthropic"
     assert srv._platform_from_stream("") == "anthropic"
+
+
+def test_a_stream_that_has_not_spoken_yet_answers_with_what_the_caller_knows(srv):
+    """A run's first stream line lands a moment after it launches, and for that
+    moment the file is empty or half-written. Answering `anthropic` there is a
+    guess dressed as a fact: the caller knows the job's platform already, and
+    it is what the badge and the reopen line must use until the stream says
+    otherwise. A stream that HAS spoken always wins over the default."""
+    assert srv._platform_from_stream("", "openai") == "openai"
+    assert srv._platform_from_stream('{"type":"assistant"}\n', "openai") == "openai", \
+        "lines before the init event do not settle it either"
+    assert srv._platform_from_stream(
+        '{"type":"system","subtype":"init","model":"claude-opus-5"}\n', "openai") == "anthropic", \
+        "an init event that names no platform is Claude Code's own, and it wins"
+
+
+def test_a_live_run_is_described_by_its_job_until_its_stream_speaks(srv, clean_data):
+    """The seconds between launch and the first stream line: the run dialog used
+    to call an OpenAI run Anthropic, and offer `claude --resume` for a Codex
+    thread. The job is the source until the stream is."""
+    srv.JOBS_FILE.write_text(json.dumps({"jobs": [
+        {"id": "jlive", "project": "P", "model": "gpt-5.6-sol", "interactive": True},
+    ]}))
+    srv.PROJECTS_FILE.write_text(json.dumps({"projects": [{"name": "P", "platform": "openai"}]}))
+    start = 1700000500
+    slot = srv.DATA_DIR / "locks" / "jlive" / "4242"
+    slot.mkdir(parents=True, exist_ok=True)
+    (slot / "pid").write_text(str(os.getpid()))       # this process is alive, so the slot is
+    (slot / "start").write_text(str(start))
+    (slot / "boot").write_text(srv.boot_id())
+    (slot / "log").write_text("")
+    d = srv.load_run_detail("jlive", start)
+    assert d is not None and d["live"] is True
+    assert d["record"]["platform"] == "openai", "a live run takes its platform from its job"
+    assert d["record"]["model"] == "gpt-5.6-sol", "and the model it was launched with"
+    assert d["record"]["project"] == "P"
+    assert d["interactive"] is True, "the job is read once, for every field it answers"

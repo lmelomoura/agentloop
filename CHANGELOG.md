@@ -230,6 +230,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A run that is still going says which CLI is spending the money.** The
+  platform of a live run was read off its stream, and a stream says nothing
+  until its first line lands — so for the opening seconds of every OpenAI run
+  the dialog called it Anthropic, and the Runs table drew no platform badge at
+  all until the run had ENDED and been journaled. Both now take the platform
+  from the job the moment it launches, resolved the way the engine resolves it
+  (the job's own, else its project's, else Anthropic), and the stream still
+  wins the instant it speaks. The live record carries the model it was launched
+  with too, and the run dialog stops accusing a run in flight of having lost
+  the model it resolved — that caveat is a verdict on history, not on work in
+  progress.
+
+- **A finished OpenAI run is reopened with the CLI it actually ran on.** The
+  run dialog offered `claude --resume <id>` for every run, Codex threads
+  included — sending the operator to a CLI that has never heard of that
+  session. An OpenAI run now reads `codex exec resume <thread>`.
+
 - **The Claude account pinned at install time finally reaches the runs.** The
   installer wrote it into both `launchd` plists as `CLAUDE_CONFIG_DIR` and
   printed it back as `Claude account : …`, but the engine reads
