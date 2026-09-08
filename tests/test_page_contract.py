@@ -2831,6 +2831,77 @@ def test_the_runs_table_the_log_and_the_security_meta_name_the_platform(srv):
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_run_still_going_already_knows_which_cli_is_spending(srv, tmp_path):
+    """A live row is built from the slot directory, which says nothing about the
+    platform — so the badge used to appear only once the run had ENDED and the
+    journal had it. The job knows from the moment it launches, and it is the
+    same resolution the editor uses (own, else the project's, else anthropic)."""
+    page = _js(srv)
+    deps = _plainfn(page, "liveRuns") + "\n" + _plainfn(_app_js(srv), "platformOf")
+    script = tmp_path / "live-platform.js"
+    script.write_text("""
+    const ALApp = {platformOf};
+    const DATA = {
+      active_runs: {oa: [{start: 100, pid: 7, session: "thr"}], an: [{start: 90, pid: 8}]},
+      jobs: [{id: "oa", project: "P", model: "gpt-5.6-sol"}, {id: "an", model: "opus"}],
+      projects: [{name: "P", platform: "openai"}],
+    };
+    const projById = (n) => DATA.projects.find(p => p.name === n) || null;
+    const forgetDeadStops = () => {};
+    """ + deps + """
+    const by = {}; liveRuns().forEach(r => { by[r.id] = r; });
+    console.log(JSON.stringify({oa: by.oa.platform, an: by.an.platform,
+                                model: by.oa.model, live: by.oa.live}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert out["oa"] == "openai", "a live run of a job whose project is on OpenAI is badged now, not later"
+    assert out["an"] == "anthropic"
+    assert out["model"] == "gpt-5.6-sol" and out["live"] is True
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_reopen_line_names_the_cli_the_run_actually_ran_on(srv, tmp_path):
+    """`claude --resume <id>` on a Codex thread sends the operator to a CLI that
+    has never heard of that session. Each platform resumes with its own verb."""
+    script = tmp_path / "reopen.js"
+    script.write_text(_plainfn(_js(srv), "reopenCommand") + """
+    console.log(JSON.stringify([
+      reopenCommand({platform: "openai", session: "01a0-thread"}, {}),
+      reopenCommand({platform: "anthropic", session: "sess-1"}, {}),
+      reopenCommand({session: "sess-2"}, {}),
+      reopenCommand({platform: "openai", session: "ignored"}, {session: "01a0-live"}),
+    ]));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert out[0] == "codex exec resume 01a0-thread"
+    assert out[1] == "claude --resume sess-1"
+    assert out[2] == "claude --resume sess-2", "a record from before platforms is a Claude run"
+    assert out[3] == "codex exec resume 01a0-live", "the agent's own session id wins, as it does today"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_live_run_is_not_accused_of_losing_the_model_it_resolved(srv, tmp_path):
+    """`(resolved id not recorded)` is a verdict on history: the run ended and
+    never said which model answered. A run still going has not said YET."""
+    script = tmp_path / "model-cell.js"
+    script.write_text("const esc = (s) => String(s);\n"
+                      + _plainfn(_js(srv), "modelCell") + """
+    console.log(JSON.stringify([
+      modelCell({model: "gpt-5.6-sol", model_id: ""}, true),
+      modelCell({model: "gpt-5.6-sol", model_id: ""}, false),
+      modelCell({model: "gpt-5.6-sol", model_id: "gpt-5.6-sol"}, true),
+    ]));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert out[0] == "gpt-5.6-sol", "no caveat while the run is still going"
+    assert "resolved id not recorded" in out[1], "and the caveat stays for a run that ended"
+    assert out[2] == "gpt-5.6-sol"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 @pytest.mark.parametrize("jobs,expected", [
     ([], "There are no jobs yet."),
     ([{"enabled": False}], "All 1 jobs are disabled."),

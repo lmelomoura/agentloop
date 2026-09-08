@@ -2947,8 +2947,15 @@ function liveRuns(){
     const j=(DATA.jobs||[]).find(x=>x.id===id)||{};
     for(const s of (slots||[])){
       const started=s.start||0;
+      // The platform is the job's, resolved the way the engine resolves it --
+      // a live run has one from the moment it launches, and the row's badge is
+      // the only place the operator can see WHICH CLI is spending their money
+      // while it spends it. Reading it off the journal instead meant the badge
+      // appeared only once the run had already ended.
       out.push({id, start:started, status:"running",
                 duration:started?Math.max(0,now-started):0,
+                platform:ALApp.platformOf(j, j.project?projById(j.project):null),
+                model:j.model||"", model_id:"",
                 cost:null, session:s.session||"", project:j.project||"", live:true, pid:s.pid});
     }
   }
@@ -3903,7 +3910,7 @@ function costHtml(rec){
 
 /* What model ran, said once. A job pinned to an exact id resolves to itself, so
    the arrow only earns its place when the two sides differ. */
-function modelCell(rec){
+function modelCell(rec, live){
   const asked=rec.model||"", ran=rec.model_id||"";
   if(asked && ran) return (asked===ran) ? esc(ran)
     : esc(asked)+' <span class="muted">→ '+esc(ran)+'</span>';
@@ -3911,9 +3918,21 @@ function modelCell(rec){
   // A job pinned to a concrete id has nothing to resolve, so the caveat would be
   // wrong: it ran that model, or would have. Only an ALIAS whose resolution went
   // unrecorded needs saying — a run stopped before it started is one such case.
-  if(asked) return /^claude-/.test(asked) ? esc(asked)
+  // A run still going has not recorded it YET, which is a different thing and
+  // says nothing about the run: no caveat while it is live.
+  if(asked) return (live || /^claude-/.test(asked)) ? esc(asked)
     : esc(asked)+' <span class="muted">(resolved id not recorded)</span>';
   return "—";
+}
+
+/* How to pick this run's session back up by hand, in the CLI it actually ran
+   on. Both CLIs resume by the id this run recorded — `--resume` on Claude
+   Code, `exec resume` on Codex — and naming the wrong one sends the operator
+   to a CLI that has never heard of the session. The engine's own resume does
+   the same thing on the run's own platform (see `cmd_resume`). */
+function reopenCommand(rec, a){
+  const sid=(a&&a.session)||rec.session||"";
+  return ((rec&&rec.platform)==="openai" ? "codex exec resume " : "claude --resume ") + sid;
 }
 
 /* How a run ended, in words. Every ending gets the same shape — a short label
@@ -4025,7 +4044,7 @@ function renderLog(d){
     // The arrow is only worth drawing when the two DIFFER — a job pinned to an
     // exact id resolved to itself, and "claude-sonnet-5 → claude-sonnet-5" is a
     // resolution step rendered for a job that never took one.
-    ["Model", modelCell(rec)],
+    ["Model", modelCell(rec, d.live)],
     ["Platform", esc(ALApp.platformLabel(rec.platform))],
     ["Tokens", esc(ALApp.tokensText(a.tokens))],
     ["Session", esc(a.session||rec.session||"—")],
@@ -4101,8 +4120,8 @@ function renderLog(d){
           + '<button type="button" class="btn primary" id="term-send">'+I.play+'Send</button></div>'
         : (d.live
             ? '<div class="termnote">This run is read-only — turn on <b>Interactive</b> on the job to talk to it while it works.</div>'
-            : '<div class="termnote">This run has finished. Reopen it in the real CLI with <code>claude --resume '
-              + esc(a.session||rec.session||"") + '</code></div>'))
+            : '<div class="termnote">This run has finished. Reopen it in the real CLI with <code>'
+              + esc(reopenCommand(rec, a)) + '</code></div>'))
     + '</div>';
 
   const tabs=[
