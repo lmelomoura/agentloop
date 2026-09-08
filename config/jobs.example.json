@@ -13,7 +13,7 @@
       "max_budget_usd": 0.25,
       "daily_budget_usd": 1,
       "timeout_seconds": 300,
-      "permission_mode": "dontAsk",
+      "permission_mode": "bypassPermissions",
       "prompt": "Run the shell command `rm -f /tmp/agentloop-hello` to clear the trigger, then reply with one friendly line confirming agentloop is working and the current date."
     },
     {

@@ -103,7 +103,11 @@ export function permissionsFor(platform, platforms){
 // security analysis run as when nothing is set.
 export function defaultPermissionFor(platform, kind){
   if(platform === "openai") return kind === "security" ? "full-access" : "workspace-write";
-  return kind === "security" ? "bypassPermissions" : "dontAsk";
+  // Both kinds, for the reason the engine's platform_default_permission gives:
+  // every run here is headless, and dontAsk denies every tool it has no
+  // allowlist for -- a job left on it can do nothing and spends a session
+  // finding out.
+  return "bypassPermissions";
 }
 
 export function defaultModelFor(platform, platforms){

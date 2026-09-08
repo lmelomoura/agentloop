@@ -422,13 +422,19 @@ function runRow(r){
 
   const tdJob = el("td");
   tdJob.appendChild(el("code", null, r.id));
-  // Named only when it is not the default: every run was an Anthropic run
-  // until this badge existed, and a badge on all of them would say nothing.
-  if(r.platform === "openai"){
-    const b = el("span", "platbadge", platformLabel(r.platform));
-    b.title = "Ran on the Codex CLI" + (r.model_id ? " · " + r.model_id : "");
-    tdJob.appendChild(b);
-  }
+  // EVERY row, both platforms. It was drawn for OpenAI alone at first, on the
+  // reasoning that every run used to be an Anthropic one so a badge on all of
+  // them said nothing. That stopped being true the moment one job started
+  // moving between platforms: an unbadged row then means either "Anthropic" or
+  // "we do not know yet", and those are not the same answer to the question
+  // the operator is asking — which CLI is spending this money. Anthropic gets
+  // the quieter variant, so the eye still catches the one that changed.
+  const plat = r.platform || "anthropic";
+  const b = el("span", "platbadge" + (plat === "openai" ? "" : " alt"), platformLabel(plat));
+  b.title = (r.live ? "Runs on " : "Ran on ")
+    + (plat === "openai" ? "the Codex CLI" : "Claude Code")
+    + (r.model_id ? " · " + r.model_id : (r.model ? " · " + r.model : ""));
+  tdJob.appendChild(b);
   tr.appendChild(tdJob);
 
   const tdProject = el("td");
