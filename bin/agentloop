@@ -3256,6 +3256,51 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     && ok "cmd_skills over two scratch roots: all 6 assertions reach the gate" \
     || bad "cmd_skills over two scratch roots did not: $(printf '%s\n' "$_skout" | tail -1)"
 
+  echo "status_platforms_block() — one line per platform, with the Codex facts a refused run needs"
+  local _spout
+  _spout="$(
+    mkdir -p "$tmp/sp"
+    printf '#!/bin/bash\necho "2.1.0 (Claude Code)"\n' > "$tmp/sp/claude"; chmod +x "$tmp/sp/claude"
+    CLAUDE_BIN="$tmp/sp/claude"
+    CLAUDE_CONFIG_DIR=""                          # the install default, whatever account the operator pinned in the shell
+    CODEX_BIN="$BASE_DIR/test/fake-codex"
+    CONFIG_DIR="$tmp/sp"
+    MODELS_FILE="$tmp/sp/models.json"
+    PRICING_FILE="$tmp/sp/pricing.json"
+    TICK_LOG="$tmp/sp/tick.log"
+    cp "$BASE_DIR/config/pricing.example.json" "$PRICING_FILE"
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+    resolve_models_openai >/dev/null
+    _b="$(status_platforms_block)"
+    printf '%s\n' "$_b" | grep -q '^anthropic : 2.1.0 (Claude Code), account the CLI default' \
+      && ok "status_platforms_block: the Claude line carries the version and the account" \
+      || bad "anthropic line: $(printf '%s\n' "$_b" | head -1)"
+    printf '%s\n' "$_b" | grep -q '^openai    : codex-cli 0.148.0, signed in; catalog [0-9]*m ago (5 models); prices [0-9]*[mhd] ago; unpriced: none$' \
+      && ok "status_platforms_block: the Codex line carries version, sign-in, catalog age and size, price age, unpriced" \
+      || bad "openai line: $(printf '%s\n' "$_b" | tail -1)"
+    # A table with no stamp at all (hand-written), and one visible slug dropped.
+    "$JQ" 'del(.openai["gpt-5.4-mini"]) | del(._refreshed_at, ._checked_at)' "$PRICING_FILE" > "$PRICING_FILE.next"; mv "$PRICING_FILE.next" "$PRICING_FILE"
+    status_platforms_block | grep -q 'prices never refreshed; unpriced: gpt-5.4-mini$' \
+      && ok "status_platforms_block: an unstamped table says so, and an unpriced visible slug is named" \
+      || bad "after the edit: $(status_platforms_block | tail -1)"
+    _b="$(FAKE_CODEX_LOGGED_OUT=1 status_platforms_block)"
+    printf '%s\n' "$_b" | grep -q '^openai    : codex is not signed in (run: codex login)$' \
+      && ok "status_platforms_block: signed out reads as platform_ready's own sentence" \
+      || bad "signed-out line: $(printf '%s\n' "$_b" | tail -1)"
+    CODEX_BIN=/nonexistent
+    _b="$(status_platforms_block)"
+    printf '%s\n' "$_b" | grep -q '^openai    : codex not found at /nonexistent (set AGENTLOOP_CODEX_BIN)$' \
+      && ok "status_platforms_block: no codex reads as not found, never a crash" \
+      || bad "no-codex line: $(printf '%s\n' "$_b" | tail -1)"
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_spout" | grep -v '^RESULT '
+  printf '%s\n' "$_spout" | grep -qx 'RESULT ok=5 bad=0' \
+    && ok "status_platforms_block over the stand-ins: all 5 assertions reach the gate" \
+    || bad "status_platforms_block did not: $(printf '%s\n' "$_spout" | tail -1)"
+
   # cmd_resolve_models must hand the caller resolve_models_openai's status:
   # `agentloop resolve-models openai` exiting 0 after failing to write the
   # catalog is a silent no-op an operator (or install.sh) cannot notice. The
@@ -9566,6 +9611,8 @@ PLIST
   else
     echo "Claude account : the CLI default (~/.claude) — set AGENTLOOP_CLAUDE_CONFIG_DIR and re-run to change it"
   fi
+  echo "Platforms      :"
+  status_platforms_block | sed 's/^/  /'
   # The agent prompts make these skills mandatory by name. A fresh clone whose
   # ~/.claude/skills lacks them runs agents that cite standards they cannot read,
   # and nothing anywhere says so -- the run just quietly holds a lower bar. So a
@@ -9587,6 +9634,48 @@ cmd_uninstall() {
   echo "Unloaded and removed both agents. Jobs, state and logs were kept."
 }
 
+# "3h ago" from an epoch, and the caller's own word for 0 ("never" by default)
+# -- for the two freshness stamps the platforms block prints.
+age_label() { # age_label <epoch> [zero-label]
+  local at d; at="$(num "$1")"
+  [ "$at" -gt 0 ] || { printf '%s' "${2:-never}"; return 0; }
+  d=$(( $(now_epoch) - at ))
+  if   [ "$d" -lt 3600 ];  then printf '%sm ago' "$(( d / 60 ))"
+  elif [ "$d" -lt 86400 ]; then printf '%sh ago' "$(( d / 3600 ))"
+  else                          printf '%sd ago' "$(( d / 86400 ))"; fi
+}
+
+# The two CLIs, one line each: version and readiness (platform_ready's own
+# sentence when not ready), and for Codex the age of the catalog and of the
+# price table plus the visible slugs still unpriced -- the facts a "why did my
+# openai job not run" question needs, printed where people already look
+# (`agentloop status`, the end of `agentloop install`).
+status_platforms_block() {
+  local bin ver reason n u
+  bin="$(platform_bin anthropic)"
+  if reason="$(platform_ready anthropic)"; then
+    ver="$("$bin" --version 2>/dev/null | head -1)"
+    printf 'anthropic : %s, account %s\n' "${ver:-claude}" "${CLAUDE_CONFIG_DIR:-the CLI default (~/.claude)}"
+  else
+    printf 'anthropic : %s\n' "$reason"
+  fi
+  bin="$(platform_bin openai)"
+  if reason="$(platform_ready openai)"; then
+    ver="$("$bin" --version 2>/dev/null | head -1)"
+    n="$(openai_catalog_visible 2>/dev/null | grep -c . || true)"
+    # Empty when every visible slug is priced -- sed sees no line at all then,
+    # so the "none" is the parameter expansion's, not a substitution's.
+    u="$(pricing_unpriced | tr '\n' ' ' | sed 's/ *$//')"
+    printf 'openai    : %s, signed in; catalog %s (%s models); prices %s; unpriced: %s\n' \
+      "${ver:-codex}" \
+      "$(age_label "$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)")" "${n:-0}" \
+      "$(age_label "$("$JQ" -r '._checked_at // ._refreshed_at // 0' "$PRICING_FILE" 2>/dev/null)" 'never refreshed')" \
+      "${u:-none}"
+  else
+    printf 'openai    : %s\n' "$reason"
+  fi
+}
+
 cmd_status() {
   local loaded="not loaded"
   launchctl list 2>/dev/null | grep -q "$PLIST_LABEL" && loaded="loaded"
@@ -9594,6 +9683,8 @@ cmd_status() {
   echo "plist     : $PLIST_PATH"
   echo "jobs file : $JOBS_FILE"
   echo "data      : $DATA_DIR"
+  echo "platforms :"
+  status_platforms_block | sed 's/^/  /'
   echo
   printf '%-20s %-8s %-9s %-11s %-9s %s\n' JOB ENABLED EVERY LAST STATUS COST
   # One jq over both files, for the same reason the tick does it (see

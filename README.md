@@ -36,7 +36,8 @@ download, AirDrop or email, macOS flags it with a quarantine attribute and
 flag from the whole folder (so `bin/agentloop` can run later). If you ever hit
 that error anyway, clear it by hand once: `xattr -cr agentloop`.
 
-It checks dependencies, links `agentloop` into `~/.local/bin`, seeds a
+It checks dependencies (the Codex CLI is optional and only reported — see
+[Platforms](#platforms)), links `agentloop` into `~/.local/bin`, seeds a
 `config/jobs.json` from the example, and loads two `launchd` agents (a scheduler
 that ticks every 60 s and a control server for the dashboard). Both start
 automatically on login. Re-run it any time — it is idempotent, and you must
@@ -147,6 +148,9 @@ Skills live in `~/.claude/skills`, which is not version controlled. So the ones
 this loop depends on and **we** maintain live in `skills/` here and are linked
 into `~/.claude/skills` — `agentloop install` does it, and `install.sh` runs
 that, so a fresh clone is ready without a documented step for someone to skip.
+When the Codex CLI has a home (`~/.codex` exists), the same links go into
+`~/.codex/skills`; an analysis on OpenAI is also pointed at its skill file by
+path, so it does not depend on discovery.
 
 ```bash
 agentloop skills           # what is linked, diverged, or missing
@@ -808,9 +812,9 @@ cache_write + output × output`, per million, from `config/pricing.json` — and
 every run records `cost_basis`: `reported` (Claude), `estimated`, or `none`
 when the model has no price or the run died without a final event. The daily
 caps sum estimates like any other cost; a run with `none` counts as zero
-towards them. Showing `none` as a dash instead of $0.00, and the estimate as
-such, is the dashboard's part and lands with it (see the next release's
-notes). `output_tokens` includes reasoning, so reasoning is reported
+towards them. The dashboard shows an estimate as `~$0.03` and `none` as a
+dash, with the basis on hover, and the Overview's *Spent today* names the
+estimated share. `output_tokens` includes reasoning, so reasoning is reported
 (`tokens.reasoning`) but never billed twice.
 
 **The price table keeps itself current.** `install.sh` seeds
@@ -843,9 +847,16 @@ refusal's rollout still reports the windows — a rollout that carries none
 leaves the file as it was. The gate is per platform: a spent Claude window
 never holds a Codex run back, nor the reverse.
 
-**Security analyses** on OpenAI are the next release's: the block already
-carries `platform`, and an analysis derived with it runs, but the prompt
-still speaks of the `Agent` tool. See `docs/superpowers/plans/`.
+**Security analyses** run on either platform. The block's own `platform` wins,
+else the project's. On OpenAI the prompt names the skill by file path
+(`skills/security-analysis/SKILL.md`) rather than relying on discovery, and
+forbids subagents in words — Codex cannot close `spawn_agent` by flag, so the
+sentence is the only door; on Claude Code the `Agent` tool is closed at
+launch as before. The permission default is `full-access`: the sandbox modes
+cannot write the ledger, which lives outside the worktree. `agentloop skills`
+links the skills into `~/.codex/skills` too, when that home exists.
+`agentloop status` prints both platforms' readiness, and for Codex the age of
+the catalog and of the price table and the slugs still unpriced.
 
 ---
 
@@ -1251,6 +1262,7 @@ presenting a partial read as coverage.
 ```json
 "security": {
   "enabled": true,
+  "platform": "",
   "model": "opus",
   "effort": "",
   "permission_mode": "bypassPermissions",
@@ -1273,6 +1285,11 @@ value falls back to it too, with a warning) and is carried onto the derived
 job the same way. `default_profile` and `min_severity` belong to the
 **dashboard** alone — the profile Analyse offers first, and a display floor —
 and no part of the engine looks at either.
+
+`platform` — `anthropic`, `openai`, or empty to inherit the project's — decides
+which CLI runs the analysis; with it, `model`, `effort` and `permission_mode`
+take that platform's vocabulary and defaults (`full-access` on OpenAI, where the
+sandbox modes cannot write the ledger). See [Platforms](#platforms).
 
 `model` left empty means the `opus` family; `effort` left empty leaves the
 decision to the CLI, as in a job. `claude_config_dir` is carried on the derived
@@ -1531,15 +1548,25 @@ fastest way to teach everybody to ignore a selftest.
 - **Jobs** — one card each: schedule, last check (with the precheck's output),
   checks in the last 24h (proof the loop runs even when idle), last run, today's
   spend vs cap, and **Run now / Enable / Disable / Edit / Delete**. Destructive or
-  wasteful actions confirm first. A job holding a session from a run that was
-  cut short says so right on the card — when it expires, and a **Resume**
-  button when there is a session id to continue — rather than only a count on
-  the Sessions tab below.
+  wasteful actions confirm first.
+  The editor chooses the **platform first, then the model** — Anthropic
+  (Claude Code) or OpenAI (Codex CLI) — and every list it offers (models,
+  effort levels, permission modes) is that platform's, read from
+  `/api/models`; on OpenAI a model without a price is marked, Interactive is
+  off and the Limits pane says the cost is estimated. A card names the
+  platform only when it is OpenAI.
+  A job holding a session from a run that was cut short says so right on the
+  card — when it expires, and a **Resume** button when there is a session id
+  to continue — rather than only a count on the Sessions tab below.
 - **Recent runs** — full-text **search** across run results, per-turn traces and
   precheck output; **Filters** (job, status, date range) behind a button;
   pagination. The 🔍 on each row opens the run: did the precheck pass, which tools
   were blocked, a **timeline with one line per agent turn**, the final answer, and
   stderr.
+  A run on OpenAI carries an **OpenAI** badge (the model that ran on hover);
+  an estimated cost reads `~$0.03` and a run with no figure a dash, with the
+  basis on hover; the run dialog adds Platform and Tokens rows, and *Spent
+  today* names its estimated share.
 - **Sessions** — every run directory still on disk, kept because its session
   was cut short or still holds work that exists on no remote; see [Sessions
   that are still open](#sessions-that-are-still-open). Size, age and time left
@@ -1547,7 +1574,8 @@ fastest way to teach everybody to ignore a selftest.
 - **Security** — the four screens of the [security analysis](#four-screens)
   area: the fleet index, a project with its five tabs, the findings browser and
   the activity log. It needs no jobs, and nothing here appears until a project
-  turns it on.
+  turns it on. The project editor's Security pane picks the analysis's platform
+  (empty inherits the project's); the analysis meta grid says which CLI ran it.
 - **Theme** — light/dark toggle in the header.
 
 ### Signing in
@@ -1577,7 +1605,7 @@ can already run commands as you can read `data/app.db` and mint their own sessio
 
 ```bash
 agentloop dashboard          # open the control UI
-agentloop status             # jobs + last run + cost, in the terminal
+agentloop status             # jobs + last run + cost, and both platforms' readiness
 agentloop run <id>           # force a run now (ignores precheck + daily cap)
 agentloop check <id>         # run only the precheck, report what it saw
 agentloop enable|disable <id>

@@ -43,6 +43,13 @@ else
   say "  Jobs cannot run until it is. Install it, then re-run this script."
   missing=1
 fi
+# Optional: only a job that says "platform": "openai" needs it. Reported, never
+# required -- an install without it runs Claude Code jobs exactly as before.
+if command -v codex >/dev/null 2>&1; then
+  say "✓ codex ($(codex --version 2>/dev/null | head -1)) — optional, for jobs on the OpenAI platform"
+else
+  say "· codex — not on your PATH. Optional: only jobs with \"platform\": \"openai\" need it (npm i -g @openai/codex, then codex login)."
+fi
 if [ "$missing" -ne 0 ]; then
   echo; echo "Install the missing tools and run ./install.sh again." >&2
   exit 1

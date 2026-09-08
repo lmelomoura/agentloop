@@ -170,6 +170,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `test/e2e.test.sh` drives an analysis on OpenAI to `done`. What it cost to
   not have it: the block accepted the platform and the run still spoke of an
   `Agent` tool Codex never had.
+- **Install and status know about Codex.** `install.sh` reports the Codex CLI
+  as optional (present with its version, or how to get it) instead of saying
+  nothing; `agentloop install` and `agentloop status` print one line per
+  platform — version and sign-in, and for Codex the age of the catalog and of
+  the price table and the visible slugs still unpriced. What it cost to not
+  have it: an OpenAI job refused in `tick.log` for a signed-out Codex had no
+  place in the terminal that said so.
 
 ### Changed
 
