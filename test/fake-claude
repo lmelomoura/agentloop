@@ -20,7 +20,15 @@
 #                      i.e. to play the agent that ignored its first command
 #   FAKE_ARGV_OUT      a path to record the launch argv in, one line per
 #                      ARGUMENT, "<n><TAB><that argument's first line>"
+#   FAKE_ACCOUNT_OUT   a path to record the account this launch signs in as
+#                      (CLAUDE_CONFIG_DIR, empty line when it has none) — the
+#                      one fact the argv cannot show, since it travels in the
+#                      environment
 set -u
+
+if [ -n "${FAKE_ACCOUNT_OUT:-}" ]; then
+  printf '%s\n' "${CLAUDE_CONFIG_DIR:-}" > "$FAKE_ACCOUNT_OUT"
+fi
 
 # The one place this file reads its own arguments. First line only, because the
 # prompt is a paragraph — but one line here is still exactly one argument there,

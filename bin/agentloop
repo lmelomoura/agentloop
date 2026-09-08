@@ -5882,6 +5882,78 @@ NASTY
     && ok "no setting anywhere leaves the CLI's own default" \
     || bad "no setting -> '$got'"
 
+  # ...and the half nobody tested: does the account the INSTALLER pinned ever
+  # reach a scheduled run? launchd hands the tick exactly what the plist's
+  # EnvironmentVariables say, and the rule above discards an ambient
+  # CLAUDE_CONFIG_DIR by design -- so a plist that names only that key pins an
+  # account the engine then throws away, while `install` prints it as though it
+  # were in force. The plist has to speak the variable the engine actually
+  # reads. cmd_install is driven for real here, in a shadowed home with a
+  # launchctl stub, and the plist it wrote is read back with plistlib.
+  echo "cmd_install() — the account it pins is the one the engine reads back"
+  local _instout
+  _instout="$(
+    mkdir -p "$tmp/inst/fakehome/Library/LaunchAgents" "$tmp/inst/fakebin" \
+             "$tmp/inst/data" "$tmp/inst/config" "$tmp/inst/codexhome"
+    printf '%s\n' '#!/bin/sh' 'exit 0' > "$tmp/inst/fakebin/launchctl"
+    chmod +x "$tmp/inst/fakebin/launchctl"
+    printf '%s\n' '#!/bin/sh' 'echo 0.0.0' > "$tmp/inst/fakebin/claude"
+    chmod +x "$tmp/inst/fakebin/claude"
+    HOME="$tmp/inst/fakehome"; PATH="$tmp/inst/fakebin:$PATH"
+    PLIST_PATH="$tmp/inst/fakehome/Library/LaunchAgents/tick.plist"
+    SERVER_PLIST="$tmp/inst/fakehome/Library/LaunchAgents/server.plist"
+    DATA_DIR="$tmp/inst/data"; CONFIG_DIR="$tmp/inst/config"
+    MODELS_FILE="$tmp/inst/config/models.json"; PRICING_FILE="$tmp/inst/config/pricing.json"
+    TICK_LOG="$tmp/inst/data/tick.log"
+    USER_SKILLS="$tmp/inst/fakehome/.claude/skills"
+    CODEX_HOME_DIR="$tmp/inst/codexhome"; CODEX_SKILLS="$CODEX_HOME_DIR/skills"
+    CLAUDE_BIN="$tmp/inst/fakebin/claude"; CODEX_BIN="$BASE_DIR/test/fake-codex"
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+    # plist_key <file> <key> -- what launchd would hand the tick for that name
+    plist_key() {
+      "$PYTHON" - "$1" "$2" <<'PY'
+import plistlib, sys
+try:
+    v = plistlib.load(open(sys.argv[1], "rb")).get("EnvironmentVariables", {}).get(sys.argv[2])
+except Exception:
+    v = None
+print(v if v else "")
+PY
+    }
+    AGENTLOOP_CLAUDE_CONFIG_DIR=/tmp/al-pinned cmd_install >/dev/null 2>&1
+    [ "$(plist_key "$PLIST_PATH" AGENTLOOP_CLAUDE_CONFIG_DIR)" = "/tmp/al-pinned" ] \
+      && ok "the tick's plist names the variable the engine reads" \
+      || bad "tick plist AGENTLOOP_CLAUDE_CONFIG_DIR '$(plist_key "$PLIST_PATH" AGENTLOOP_CLAUDE_CONFIG_DIR)'"
+    [ "$(plist_key "$SERVER_PLIST" AGENTLOOP_CLAUDE_CONFIG_DIR)" = "/tmp/al-pinned" ] \
+      && ok "and so does the server's" \
+      || bad "server plist AGENTLOOP_CLAUDE_CONFIG_DIR '$(plist_key "$SERVER_PLIST" AGENTLOOP_CLAUDE_CONFIG_DIR)'"
+    [ "$(plist_key "$PLIST_PATH" CLAUDE_CONFIG_DIR)" = "/tmp/al-pinned" ] \
+      && ok "CLAUDE_CONFIG_DIR stays beside it, for anything that reads the CLI's own name" \
+      || bad "tick plist CLAUDE_CONFIG_DIR '$(plist_key "$PLIST_PATH" CLAUDE_CONFIG_DIR)'"
+    # The pin survives a re-run that names nothing -- read back from the plist.
+    got="$( AGENTLOOP_CLAUDE_CONFIG_DIR="" installed_config_dir )"
+    [ "$got" = "/tmp/al-pinned" ] && ok "installed_config_dir reads it back off the plist" \
+      || bad "installed_config_dir -> '$got'"
+    # An install written before this fix names only CLAUDE_CONFIG_DIR; the
+    # reader must still find it, or re-running the installer drops the pin.
+    "$PYTHON" - "$PLIST_PATH" <<'PY'
+import plistlib, sys
+p = plistlib.load(open(sys.argv[1], "rb"))
+p.get("EnvironmentVariables", {}).pop("AGENTLOOP_CLAUDE_CONFIG_DIR", None)
+plistlib.dump(p, open(sys.argv[1], "wb"))
+PY
+    got="$( AGENTLOOP_CLAUDE_CONFIG_DIR="" installed_config_dir )"
+    [ "$got" = "/tmp/al-pinned" ] && ok "and off an older plist that carries only CLAUDE_CONFIG_DIR" \
+      || bad "older plist -> '$got'"
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_instout" | grep -v '^RESULT '
+  printf '%s\n' "$_instout" | grep -qx 'RESULT ok=5 bad=0' \
+    && ok "cmd_install over a shadowed home: all 5 assertions reach the gate" \
+    || bad "cmd_install over a shadowed home did not: $(printf '%s\n' "$_instout" | tail -1)"
+
   echo "spent_today() — today's spend is summed without reading all of history"
   local midnight; midnight="$(date -v0H -v0M -v0S +%s)"
   : > "$tmp/runs.ndjson"
@@ -9699,12 +9771,16 @@ installed_config_dir() {
     return 0
   fi
   [ -f "$PLIST_PATH" ] || return 0
+  # Either name: the engine's own first, and the CLI's as the fallback, so an
+  # install written before the plists carried AGENTLOOP_CLAUDE_CONFIG_DIR still
+  # hands its pin to the next run of the installer instead of losing it.
   "$PYTHON" - "$PLIST_PATH" <<'PY'
 import plistlib, sys
 try:
-    v = plistlib.load(open(sys.argv[1], "rb")).get("EnvironmentVariables", {}).get("CLAUDE_CONFIG_DIR")
+    env = plistlib.load(open(sys.argv[1], "rb")).get("EnvironmentVariables", {})
 except Exception:
-    v = None
+    env = {}
+v = env.get("AGENTLOOP_CLAUDE_CONFIG_DIR") or env.get("CLAUDE_CONFIG_DIR")
 if v:
     print(v)
 PY
@@ -9729,7 +9805,17 @@ cmd_install() {
     cfgdir="$legacy_cfgdir"
   fi
   if [ -n "$cfgdir" ]; then
+    # BOTH names, and the engine's own first. launchd hands the tick exactly
+    # what this block says, and the engine reads AGENTLOOP_CLAUDE_CONFIG_DIR
+    # alone -- an ambient CLAUDE_CONFIG_DIR is discarded on purpose, so that a
+    # run typed inside a Claude Code session does not inherit that session's
+    # account. A plist that named only the CLI's variable therefore pinned an
+    # account every scheduled run then threw away, while this command printed
+    # it as though it were in force. CLAUDE_CONFIG_DIR stays beside it for
+    # everything else launchd starts that reads the CLI's own name (the
+    # control server, and the CLI itself when nothing overrides it).
     plist_cfgdir="
+    <key>AGENTLOOP_CLAUDE_CONFIG_DIR</key><string>$cfgdir</string>
     <key>CLAUDE_CONFIG_DIR</key><string>$cfgdir</string>"
   fi
 
@@ -9779,7 +9865,7 @@ PLIST
   <!-- The dashboard's Analyse button detaches a security run and the server
        then EXITS WHENEVER ITS OWN FILE CHANGES on disk (the self-watch that
        picks new code up). Without this, that routine restart had launchd reap
-       the server's whole process group -- killing a detached analysis mid-run
+       the server's whole process group, killing a detached analysis mid-run
        with no journal, no teardown, and a ledger row stuck on running. The
        tick's plist has carried the same key for the same reason all along. -->
   <key>AbandonProcessGroup</key><true/>

@@ -918,9 +918,19 @@ are two levels:
 AGENTLOOP_CLAUDE_CONFIG_DIR=~/.claude-work bash install.sh
 ```
 
-The value is written into both `launchd` plists, so it survives logout and
-reboot; re-running the installer without the variable keeps whatever is already
-pinned. A project's own setting wins over it, and an empty one inherits it.
+The value is written into both `launchd` plists — under `AGENTLOOP_CLAUDE_CONFIG_DIR`,
+the name the engine reads, and under `CLAUDE_CONFIG_DIR` beside it for everything
+else those agents start — so it survives logout and reboot; re-running the
+installer without the variable keeps whatever is already pinned. A project's own
+setting wins over it, and an empty one inherits it.
+
+The pin reaches everything `launchd` starts: the tick, and therefore every
+scheduled run, a **Run now** from the dashboard, and the model probes. A run you
+type yourself (`agentloop run <id>`) does **not** pick it up — the engine reads
+only the explicit variable, and never the `CLAUDE_CONFIG_DIR` your shell happens
+to export, so a run typed inside a Claude Code session cannot silently bill that
+session's account. Put the variable in front of the command when you want the
+pinned account by hand: `AGENTLOOP_CLAUDE_CONFIG_DIR=~/.claude-work agentloop run <id>`.
 
 Three things to know before splitting jobs across accounts:
 
