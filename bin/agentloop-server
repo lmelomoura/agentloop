@@ -1247,14 +1247,32 @@ def checks_24h(now=None):
                     "outcomes": list(TICK_OUTCOMES), "buckets": band}
 
 
+# How much has to be reclaimable before rewriting the whole index is worth it.
+#
+# VACUUM rewrites the file end to end and holds the database while it does, so
+# its cost is the size of the INDEX and its return is the size of the FREELIST —
+# two numbers with nothing to do with each other. Measured on the operator's own
+# install (513 MB, 405 runs): one delete spent 5.7 s in here, handed back 0
+# bytes, and left a concurrent /api/data poll waiting 12.8 s behind the lock.
+# Without the rewrite the same delete takes 20 ms, and one run frees under a
+# megabyte — so per delete the rewrite can never pay for itself.
+#
+# It waits for a freelist worth the trouble instead. `PRAGMA freelist_count` is
+# a header read, so asking costs nothing, and the space is not lost in the
+# meantime: SQLite reuses free pages for the next run ingested.
+COMPACT_MIN_FREE_BYTES = 64 * 1024 * 1024
+
+
 def compact_db():
-    """Give the deleted pages back to the filesystem.
+    """Give the deleted pages back to the filesystem, when there are enough.
 
     SQLite keeps the pages a DELETE frees in its own freelist and reuses them
     later, so the file never shrinks on its own — after deleting runs the index
     can sit at twice the size of what it actually holds. VACUUM rewrites it at
     its true size; the FTS optimise first is what lets the index give up its
-    own pages too. Returns (bytes_before, bytes_after).
+    own pages too. Returns (bytes_before, bytes_after) — equal when the freelist
+    was too small to pay for the rewrite (see COMPACT_MIN_FREE_BYTES) and
+    nothing was done.
     """
     def _size():
         n = 0
@@ -1269,6 +1287,11 @@ def compact_db():
     try:
         conn = db_conn()
         conn.isolation_level = None          # VACUUM cannot run inside a transaction
+        free = (conn.execute("PRAGMA freelist_count").fetchone()[0]
+                * conn.execute("PRAGMA page_size").fetchone()[0])
+        if free < COMPACT_MIN_FREE_BYTES:
+            conn.close()
+            return before, before             # not worth the rewrite, and its lock
         try:
             conn.execute("INSERT INTO runs_fts(runs_fts) VALUES('optimize')")
         except sqlite3.OperationalError:
@@ -2037,42 +2060,73 @@ def load_config():
             "prefs": load_prefs()}
 
 
+# The last listing that actually came back. A read of the index can fail because
+# the index is BROKEN, or because something is holding it for a moment — an
+# ingest of a large transcript, a compaction — and the two used to get the same
+# answer: an empty list, painted as "No runs recorded yet" over an intact
+# journal of hundreds of runs. Contention is the common one (twice in the
+# operator's own server.log, as `database is locked` after timeout=5), so the
+# momentary case replays what was last served instead of erasing the table.
+#
+# It can only ever replay something this process genuinely read: an index that
+# has never worked leaves it empty, and still shows nothing, loudly.
+_LAST_RUNS = []
+
+
+def _list_runs():
+    """The runs the page lists, newest first. Raises whatever the index raises."""
+    runs = []
+    ingest()  # cheap when the journal has not grown
+    conn = db_conn()
+    db_init(conn)
+    for row in conn.execute(
+            "SELECT job, start, status, duration, cost, session, log, forced, precheck_note, project, note, resumed_from, cause, platform, cost_basis, model, model_id"
+            " FROM runs ORDER BY start DESC, rowid DESC LIMIT 1000"):
+        runs.append({"id": row["job"], "start": row["start"], "status": row["status"],
+                     "duration": row["duration"], "cost": row["cost"],
+                     "session": row["session"], "log": row["log"],
+                     "forced": bool(row["forced"]), "precheck": row["precheck_note"],
+                     "project": row["project"] or "",
+                     # Why a run ended as it did. Carries "NOTHING TO DO: …"
+                     # for a run that succeeded without any work to do.
+                     "note": row["note"] or "",
+                     # the session this run continued, when it was a resume
+                     "resumed_from": row["resumed_from"] or "",
+                     "cause": row["cause"] or "",
+                     "platform": row["platform"] or "anthropic",
+                     "cost_basis": row["cost_basis"] or "reported",
+                     # the model asked for and the one that ran, so a row
+                     # can name what ran without opening the run
+                     "model": row["model"] or "", "model_id": row["model_id"] or ""})
+    conn.close()
+    return runs
+
+
 def load_data():
+    global _LAST_RUNS
     jobs = read_json(JOBS_FILE, {}).get("jobs", [])
     state = read_json(STATE_FILE, {})
-    runs = []
+    stale = False
     try:
-        ingest()  # cheap when the journal has not grown
-        conn = db_conn()
-        db_init(conn)
-        for row in conn.execute(
-                "SELECT job, start, status, duration, cost, session, log, forced, precheck_note, project, note, resumed_from, cause, platform, cost_basis, model, model_id"
-                " FROM runs ORDER BY start DESC, rowid DESC LIMIT 1000"):
-            runs.append({"id": row["job"], "start": row["start"], "status": row["status"],
-                         "duration": row["duration"], "cost": row["cost"],
-                         "session": row["session"], "log": row["log"],
-                         "forced": bool(row["forced"]), "precheck": row["precheck_note"],
-                         "project": row["project"] or "",
-                         # Why a run ended as it did. Carries "NOTHING TO DO: …"
-                         # for a run that succeeded without any work to do.
-                         "note": row["note"] or "",
-                         # the session this run continued, when it was a resume
-                         "resumed_from": row["resumed_from"] or "",
-                         "cause": row["cause"] or "",
-                         "platform": row["platform"] or "anthropic",
-                         "cost_basis": row["cost_basis"] or "reported",
-                         # the model asked for and the one that ran, so a row
-                         # can name what ran without opening the run
-                         "model": row["model"] or "", "model_id": row["model_id"] or ""})
-        conn.close()
+        runs = _list_runs()
+        _LAST_RUNS = runs
     except Exception as exc:  # noqa: BLE001
-        # Degrade to an empty list so the page still paints — but SAY SO.
-        # This except once hid a broken INSERT for a whole morning: the page
-        # showed "No runs recorded yet" over 223 intact journal lines and
-        # nothing anywhere named the exception.
-        print(f"agentloop-server: run listing failed, showing none: {exc!r}",
-              flush=True)
-        runs = []
+        # One retry first: the lock that blocks a read is usually milliseconds
+        # from being let go, and a poll that waits a quarter of a second beats
+        # one that reports the wrong thing for the next five.
+        try:
+            time.sleep(0.25)
+            runs = _list_runs()
+            _LAST_RUNS = runs
+        except Exception as exc2:  # noqa: BLE001
+            # Degrade, but SAY SO. This except once hid a broken INSERT for a
+            # whole morning: the page showed "No runs recorded yet" over 223
+            # intact journal lines and nothing anywhere named the exception.
+            # It still names it — and now also says which of the two it did.
+            print("agentloop-server: run listing failed, %s: %r"
+                  % ("serving the last one" if _LAST_RUNS else "showing none", exc2),
+                  flush=True)
+            runs, stale = list(_LAST_RUNS), True
     db_bytes = 0
     for p in (DB_FILE, Path(str(DB_FILE) + "-wal"), Path(str(DB_FILE) + "-shm")):
         try:
@@ -2097,6 +2151,11 @@ def load_data():
     return {"generated": now, "launchd_loaded": launchd_loaded(), "build": current_build_id(),
             "config_sig": config_sig(),
             "state": state, "runs": runs,
+            # False on every ordinary poll. True means the index would not
+            # answer and this list is the last one that did — so the page can
+            # say the runs it is showing may be behind, rather than presenting
+            # a frozen table as a fresh one.
+            "runs_stale": stale,
             # Job ids PLUS the derived security jobs. Those never appear in
             # jobs.json -- that is the isolation property doing its job -- but
             # their runs are as real as any other, and this map is the only way
