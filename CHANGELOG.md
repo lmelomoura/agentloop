@@ -156,7 +156,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     a dash for a run with no figure — never a fake $0.00 — with the basis on
     hover; the run's dialog adds Platform and Tokens rows; the Overview's
     *Spent today* names the estimated share when there is one; the analysis
-    meta grid on the Security page gains "Runs on".
+    meta grid on the Security page gains "Runs on"; the guards that keep a
+    re-pick from resetting a pane are pinned by tests.
 - **Security analyses run on OpenAI.** A project's security block can name
   `"platform": "openai"` (or inherit the project's) and its analysis goes
   through the Codex CLI. The prompt changes in the two places the platform

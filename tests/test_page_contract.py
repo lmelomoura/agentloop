@@ -791,6 +791,7 @@ def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
     const groupModels = (ids) => ids.map(v => ({v, label: v}));
     const PLATFORMS = """ + json.dumps(_PLATFORMS_PAYLOAD) + """;
     let edEfforts = FALLBACK_EFFORTS.slice(), secEfforts = FALLBACK_EFFORTS.slice();
+    let edPlatApplied = "", secPlatApplied = "";
     const secModelCfg = {id: "sec-model", allowNone: true, noneLabel: "— Default (opus) —", allowCustom: true};
     let modelOpts = null, permOpts = null;
     const secModelCombo = {set(v, o){ nodes["sec-model"].value = v; if(o) modelOpts = o; }, get: () => nodes["sec-model"].value};
@@ -803,7 +804,8 @@ def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
       help: $("sec-model-help").textContent};
     applyPlatformToSecurity("anthropic", false);
     const afterReset = {model: $("sec-model").value, max: $("sec-effort").max, eff: $("sec-effort").value,
-      perm: $("sec-perm").value, custom: secModelCfg.allowCustom, none: secModelCfg.noneLabel};
+      perm: $("sec-perm").value, custom: secModelCfg.allowCustom, none: secModelCfg.noneLabel,
+      secPlatApplied};
     console.log(JSON.stringify({afterKeep, afterReset}));
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
@@ -816,7 +818,26 @@ def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
     assert "falls back to the platform's default" in k["help"]
     r = out["afterReset"]
     assert r == {"model": "", "max": "5", "eff": "0", "perm": "bypassPermissions", "custom": True,
-                 "none": "— Default (opus) —"}
+                 "none": "— Default (opus) —", "secPlatApplied": "anthropic"}, \
+        "the pane records the platform it was built for on its way out"
+
+
+def test_re_picking_the_platform_a_pane_already_shows_changes_nothing(srv):
+    """The three platform combos apply a platform only when the pick MOVES the
+    effective platform: the job editor's against edPlatApplied, the project's
+    and the security block's against secPlatApplied (the project's only while
+    the block inherits). Without a guard, a click that chose what was already
+    there resets the model, effort and mode on screen -- so the three guards
+    are pinned as written, inside initCombos."""
+    combos = _plainfn(_js(srv), "initCombos")
+    assert 'onPick:(v)=>{ if(v!==edPlatApplied) applyPlatformToJobEditor(v,false); }' in combos, \
+        "the job editor's platform combo lost its re-pick guard"
+    assert ('onPick:()=>{ if(!$("sec-platform").value && secEffectivePlatform()!==secPlatApplied) '
+            'applyPlatformToSecurity(secEffectivePlatform(), false); }') in combos, \
+        "the project's platform combo must reach the Security pane only while the block inherits, and only on a move"
+    assert ('onPick:()=>{ if(secEffectivePlatform()!==secPlatApplied) '
+            'applyPlatformToSecurity(secEffectivePlatform(), false); }') in combos, \
+        "the security block's platform combo lost its re-pick guard"
 
 
 # ---- the job card's kept-session notice, and the guard it must share with
@@ -2744,6 +2765,12 @@ def test_a_cost_says_what_kind_of_number_it_is(srv, tmp_path):
 def test_the_runs_table_the_log_and_the_security_meta_name_the_platform(srv):
     app = _app_js(srv)
     assert 'el("span", "platbadge", platformLabel(r.platform))' in app, "the Runs table badges an OpenAI run"
+    # The badge is drawn for OpenAI runs only -- every run was an Anthropic run
+    # until it existed, and a badge on all of them would say nothing -- so the
+    # guard is pinned as source, and pinned AHEAD of the badge it guards.
+    assert 'if(r.platform === "openai"){' in app, "the Runs badge has no OpenAI-only guard"
+    assert app.index('if(r.platform === "openai"){') < app.index('el("span", "platbadge"'), \
+        "the OpenAI guard must come before the badge it guards"
     assert "costParts(r, money)" in app, "the Runs table's cost cell goes through costParts"
     log = _plainfn(_js(srv), "renderLog")
     assert '["Platform", esc(ALApp.platformLabel(rec.platform))]' in log
@@ -2949,19 +2976,9 @@ def test_the_job_card_is_built_from_nodes_and_shows_what_it_always_showed(
     probeVerdict/nextRunNote/spendTone's own wording, so this pins the one
     fact that is jobCard's alone to get right: the card names its own job."""
     block = _app_js(srv)
-    deps = (_const(block, "DOW")
-            + _index_screen_deps(block, "fmtDays", "el", "jobFacts",
-                                  "nextCheckAt", "inWindow", "probeVerdict",
-                                  "nextRunNote", "spendTone", "checkList",
-                                  "sessionNotices", "platformOf", "jobCard"))
     script = tmp_path / "card.js"
-    script.write_text(_INDEX_DOM_HARNESS + _JOBS_DOMAIN_HARNESS + """
-    // jobCard's remaining reads off the page -- a formatter each, stood up
-    // the same honest, minimal way _JOBS_DOMAIN_HARNESS stands up eff above.
-    function money(n){ return "$" + n; }
-    function effortLabel(v){ return v || "default"; }
-    function projById(_name){ return null; }
-    """ + deps + """
+    script.write_text(_INDEX_DOM_HARNESS + _JOBS_DOMAIN_HARNESS + _JOB_CARD_PAGE_STUBS
+                      + _job_card_deps(block) + """
     const n = jobCard({id: "qg-dev-agent", project: "Quality Gate",
                        enabled: true, interval_minutes: 15});
     console.log(JSON.stringify(collectAll(n, [])));
@@ -2970,6 +2987,54 @@ def test_the_job_card_is_built_from_nodes_and_shows_what_it_always_showed(
                                     text=True, check=True).stdout)
     txt = " ".join(r["text"] for r in got)
     assert "qg-dev-agent" in txt, "the card did not name its own job"
+
+
+# jobCard's remaining reads off the page -- a formatter each, stood up the
+# same honest, minimal way _JOBS_DOMAIN_HARNESS stands up eff above. projById
+# answers null: the cards below stand on their own, with no project behind
+# them, so what they show is the job's own.
+_JOB_CARD_PAGE_STUBS = """
+    function money(n){ return "$" + n; }
+    function effortLabel(v){ return v || "default"; }
+    function projById(_name){ return null; }
+    """
+
+
+def _job_card_deps(block):
+    """jobCard and everything it reaches in the bundle, plus the DOW table."""
+    return (_const(block, "DOW")
+            + _index_screen_deps(block, "fmtDays", "el", "jobFacts",
+                                 "nextCheckAt", "inWindow", "probeVerdict",
+                                 "nextRunNote", "spendTone", "checkList",
+                                 "sessionNotices", "platformOf", "jobCard"))
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_job_card_names_the_platform_only_when_it_is_openai(srv, tmp_path):
+    """The settings line names the platform only when it is not the default:
+    "Anthropic · opus" on every card would say nothing, "OpenAI · gpt-5.6-sol"
+    says the one thing that changed. Both cards are built with no project
+    behind them (projById is null here), so the platform read is the job's
+    own -- the engine's rule, via platformOf."""
+    block = _app_js(srv)
+    script = tmp_path / "card-platform.js"
+    script.write_text(_INDEX_DOM_HARNESS + _JOBS_DOMAIN_HARNESS + _JOB_CARD_PAGE_STUBS
+                      + _job_card_deps(block) + """
+    const cfgOf = (j) => collectAll(jobCard(j), []).filter(r => r.cls === "cfgline").map(r => r.text);
+    console.log(JSON.stringify({
+      openai: cfgOf({id: "codex-agent", project: "Quality Gate", enabled: true,
+                     interval_minutes: 15, platform: "openai", model: "gpt-5.6-sol"}),
+      anthropic: cfgOf({id: "claude-agent", project: "Quality Gate", enabled: true,
+                        interval_minutes: 15, platform: "anthropic", model: "opus"}),
+    }));
+    """)
+    got = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert len(got["openai"]) == 1, f"one settings line per card, got {got['openai']}"
+    assert "OpenAI · gpt-5.6-sol" in got["openai"][0], got["openai"]
+    assert len(got["anthropic"]) == 1, f"one settings line per card, got {got['anthropic']}"
+    assert "Anthropic ·" not in got["anthropic"][0], got["anthropic"]
+    assert "opus" in got["anthropic"][0], "the Anthropic card still names its model, bare"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
