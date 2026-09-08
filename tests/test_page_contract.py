@@ -2815,13 +2815,13 @@ def test_a_cost_says_what_kind_of_number_it_is(srv, tmp_path):
 
 def test_the_runs_table_the_log_and_the_security_meta_name_the_platform(srv):
     app = _app_js(srv)
-    assert 'el("span", "platbadge", platformLabel(r.platform))' in app, "the Runs table badges an OpenAI run"
-    # The badge is drawn for OpenAI runs only -- every run was an Anthropic run
-    # until it existed, and a badge on all of them would say nothing -- so the
-    # guard is pinned as source, and pinned AHEAD of the badge it guards.
-    assert 'if(r.platform === "openai"){' in app, "the Runs badge has no OpenAI-only guard"
-    assert app.index('if(r.platform === "openai"){') < app.index('el("span", "platbadge"'), \
-        "the OpenAI guard must come before the badge it guards"
+    # EVERY row carries it, both platforms: an unbadged row would mean either
+    # "Anthropic" or "not known yet", and those are different answers to the
+    # question the operator is asking. Anthropic takes the quiet variant.
+    assert 'el("span", "platbadge" + (plat === "openai" ? "" : " alt"), platformLabel(plat))' in app, \
+        "the Runs table must badge every run, not only the OpenAI ones"
+    assert 'if(r.platform === "openai"){' not in app, "the OpenAI-only guard is gone"
+    assert 'const plat = r.platform || "anthropic";' in app, "a run with no platform recorded reads as Anthropic"
     assert "costParts(r, money)" in app, "the Runs table's cost cell goes through costParts"
     log = _plainfn(_js(srv), "renderLog")
     assert '["Platform", esc(ALApp.platformLabel(rec.platform))]' in log
@@ -8044,7 +8044,8 @@ def test_permissions_models_and_platform_come_from_the_payload(srv, tmp_path):
     # fallback is that list verbatim, so the combo does not reorder when
     # /api/models answers. The labels are pinned against the server below.
     assert out["anPermsNoPayload"] == ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"]
-    assert out["defs"] == ["dontAsk", "bypassPermissions", "workspace-write", "full-access"]
+    assert out["defs"] == ["bypassPermissions", "bypassPermissions", "workspace-write", "full-access"], \
+        "a job and an analysis both default to the only Anthropic mode that works headless"
     assert out["defModels"] == ["opus", "gpt-5.6-sol", ""]
     assert out["oaModels"] == ["GPT-5.6-Sol — Reliable agentic workhorse for everyday tasks.",
                                "GPT-5.5 · no price",

@@ -230,6 +230,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A job no longer comes back from a platform change unable to use a single
+  tool.** `dontAsk` was the Anthropic default for a job, and `dontAsk` means
+  *allowlisted tools only* — headless, with no allowlist, that is every tool
+  denied. So moving a job to OpenAI and back rewrote a working
+  `bypassPermissions` into it, and the next run of a real dev agent ended
+  `tools_denied` after burning a session to discover that `git status` was
+  refused. The shipped `example-hello` demo had the same combination and could
+  never have run its own prompt. The Anthropic default is now
+  `bypassPermissions` for a job as it already was for an analysis — the
+  security block reached this conclusion first, and for the same reason — the
+  dashboard's editor follows, and a job left on `dontAsk` with no
+  `allowed_tools` is named in `tick.log` before it runs rather than after. The
+  narrow modes stay available; they just need to say which tools they allow.
+
+- **Every run row names its platform, not only the OpenAI ones.** A badge on
+  the OpenAI rows alone was fine while every other run was Anthropic by
+  definition. Once one job moves between platforms, an unbadged row means
+  either "Anthropic" or "not known yet", and the operator cannot tell which —
+  so both are named, Anthropic in a quieter variant.
+
 - **A run that is still going says which CLI is spending the money.** The
   platform of a live run was read off its stream, and a stream says nothing
   until its first line lands — so for the opening seconds of every OpenAI run

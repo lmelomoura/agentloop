@@ -239,7 +239,7 @@ A job is one object in `config/jobs.json`. Fields:
 | `daily_budget_usd` | ceiling on total spend per day (**omit = no cap**) |
 | `stall_timeout_seconds` | kill a run only after this long with **no output** (default 1200) |
 | `timeout_seconds` | optional absolute time cap (**omit = no limit**) |
-| `permission_mode` | `dontAsk`, `bypassPermissions` (full autonomy, needed for headless tool use), … On `openai`: `read-only` (no writes, no network), `workspace-write` (writes inside the worktree, network open) or `full-access` (no sandbox) |
+| `permission_mode` | **defaults to `bypassPermissions`** (full autonomy, and the only Anthropic mode that can use a tool headless). `dontAsk` means *allowlisted tools only*, so without an `allowed_tools` list it denies everything and the run says so after spending a session — a job on it is warned about in `tick.log`. On `openai`: `read-only` (no writes, no network), `workspace-write` (writes inside the worktree, network open) or `full-access` (no sandbox) |
 | `allowed_tools` | allowlist passed as `--allowedTools`, whole and as a single argument — so a comma-separated list *and* a specifier containing a space, like `Bash(git *)`, both arrive intact (**omit = every tool**) |
 | `disallowed_tools` | denylist passed as `--disallowedTools`, same handling (**omit = nothing denied**). Set both fields and **deny wins** for any tool named in each — an allowlist can never re-open what the denylist closed. A security analysis is derived with `Agent` here (the CLI's own tool roster calls that tool `Task`), so it cannot spend its budget on subagents instead of triage |
 

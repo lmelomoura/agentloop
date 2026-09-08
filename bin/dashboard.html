@@ -852,7 +852,7 @@ document.documentElement.dataset.theme =
   <label>Permission mode</label>
   <div class="combo" id="ed-perm-combo">
     <button type="button" class="combo-trigger" id="ed-perm-trigger" aria-haspopup="listbox" aria-expanded="false">
-      <span class="combo-val" id="ed-perm-val">dontAsk — allowlisted tools only, no prompts</span>
+      <span class="combo-val" id="ed-perm-val">bypassPermissions — nothing asks</span>
       <span class="combo-caret"></span>
     </button>
     <div class="combo-pop" id="ed-perm-pop" hidden>
@@ -3557,10 +3557,10 @@ function initCombos(){
   // The real list is fetched once there is a session — asking for it at boot
   // just 401s on a signed-out page and leaves the editor on the fallback list
   // for the rest of the visit.
-  permCombo=createCombo({id:"ed-perm", allowNone:false, def:"dontAsk"});
+  permCombo=createCombo({id:"ed-perm", allowNone:false, def:"bypassPermissions"});
   wtCombo=createCombo({id:"pj-wt", allowNone:false, def:"auto"});
   wtCombo.set("auto", WT_MODES);
-  permCombo.set("dontAsk", ALApp.permissionsFor("anthropic", PLATFORMS));
+  permCombo.set("bypassPermissions", ALApp.permissionsFor("anthropic", PLATFORMS));
 }
 
 /* ---- system folder picker (backend lists dirs; browser can't expose abs paths) ---- */
@@ -3706,7 +3706,7 @@ function openCreator(){
   $("ed-id").value="";
   fill({_precheck:DEFAULT_PRECHECK, interval_seconds:300, platform:"anthropic", model:"opus",
         active_hours:"08:00-20:00", active_days:[1,2,3,4,5],
-        max_budget_usd:2, stall_timeout_seconds:1200, permission_mode:"dontAsk"});
+        max_budget_usd:2, stall_timeout_seconds:1200, permission_mode:"bypassPermissions"});
   paintEditorNav();
   // No id yet, so no state and no runs — only the prompt/precheck flags can fire
   editingJob={id:""};
@@ -3841,7 +3841,7 @@ async function saveEditor(){
     if(!await setF("description",$("ed-desc").value.trim(),j.description||"")) return;
     const cwdVal = $("ed-cwd").disabled ? "" : $("ed-cwd").value.trim();
     if(!await setF("cwd",cwdVal,j.cwd||"")) return;
-    if(!await setF("permission_mode",$("ed-perm").value,j.permission_mode||"dontAsk",platSent)) return;
+    if(!await setF("permission_mode",$("ed-perm").value,j.permission_mode||"bypassPermissions",platSent)) return;
     edWiz.markClean(); $("editor").close(); toast("Saved "+id); refresh();
   } finally { btn.disabled=false; }
 }

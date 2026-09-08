@@ -420,7 +420,7 @@
   }
   function defaultPermissionFor(platform, kind) {
     if (platform === "openai") return kind === "security" ? "full-access" : "workspace-write";
-    return kind === "security" ? "bypassPermissions" : "dontAsk";
+    return "bypassPermissions";
   }
   function defaultModelFor(platform, platforms) {
     const key = platform === "openai" ? "openai" : "anthropic";
@@ -2124,11 +2124,10 @@
     tr.appendChild(tdWhen);
     const tdJob = el("td");
     tdJob.appendChild(el("code", null, r.id));
-    if (r.platform === "openai") {
-      const b = el("span", "platbadge", platformLabel(r.platform));
-      b.title = "Ran on the Codex CLI" + (r.model_id ? " \xB7 " + r.model_id : "");
-      tdJob.appendChild(b);
-    }
+    const plat = r.platform || "anthropic";
+    const b = el("span", "platbadge" + (plat === "openai" ? "" : " alt"), platformLabel(plat));
+    b.title = (r.live ? "Runs on " : "Ran on ") + (plat === "openai" ? "the Codex CLI" : "Claude Code") + (r.model_id ? " \xB7 " + r.model_id : r.model ? " \xB7 " + r.model : "");
+    tdJob.appendChild(b);
     tr.appendChild(tdJob);
     const tdProject = el("td");
     if (r.project) {
@@ -2529,5 +2528,5 @@
     projectStepError
   };
 })();
-/* ui-bundle: 6fe97e02b9abcfac2def21c338c5996c810f4f4b8940817cd4b46359f94110e9 */
-/* ui-sources: d23edc78a056ecdce2e354450025d21da04d4e84676c16c2529cb511b4d99728 */
+/* ui-bundle: f0f2898f6c4030ba7665b7632e4bca3cd2a665e0fb8fa47ebcff6010701da5e8 */
+/* ui-sources: ea07ded1b0d1d804c23b09e35ca69c05ecfbe4496d78c9d6bff1953a08686302 */

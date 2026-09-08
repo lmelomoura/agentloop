@@ -1281,11 +1281,32 @@ platform_permission_ok() { # platform_permission_ok <platform> <mode>
   platform_permissions "$1" | grep -qxF -- "$2"
 }
 
+# The mode a run gets when nothing names one. EVERY run here is headless, and
+# that is what decides this: `dontAsk` denies every tool it has no allowlist
+# for, so a job created on it, or rewritten onto it by a platform change, can
+# do nothing at all and spends a whole session finding out (the security block
+# reached this conclusion first -- see security_derived_jobs, where an analysis
+# on dontAsk burnt $0.56 probing the walls and ended BLOCKED). A job that needs
+# no tools is unharmed by the wider default; a job that needs one is dead
+# without it. The narrow modes remain a deliberate choice, with an
+# `allowed_tools` list to make them work.
 platform_default_permission() { # platform_default_permission <platform> <job|security>
   case "$1" in
-    anthropic) case "$2" in security) printf 'bypassPermissions' ;; *) printf 'dontAsk' ;; esac ;;
+    anthropic) printf 'bypassPermissions' ;;
     openai)    case "$2" in security) printf 'full-access' ;; *) printf 'workspace-write' ;; esac ;;
   esac
+}
+
+# A job that cannot use a single tool, said before it spends a session finding
+# out. `dontAsk` is the CLI's "allowlisted tools only" mode: headless, with no
+# allowlist, that is every tool denied -- which is how a real dev run ended
+# `tools_denied` after a platform change rewrote its mode. Not a refusal: a
+# prompt that needs no tools is a legitimate thing to run.
+permission_inert_warning() { # permission_inert_warning <platform> <mode> <allowed_tools>
+  [ "$1" = "anthropic" ] || return 0
+  [ "$2" = "dontAsk" ] || return 0
+  case "${3:-}" in ""|null) ;; *) return 0 ;; esac
+  printf 'permission_mode dontAsk with no allowed_tools: every tool is denied in a headless run — set bypassPermissions, or list the tools this job may use'
 }
 
 platform_efforts() { # platform_efforts <platform> [model] -> one level per line
@@ -3024,6 +3045,17 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   platform_permission_ok anthropic dontAsk;      want "dontAsk is an anthropic mode"         0 $?
   [ "$(platform_default_permission openai job)" = "workspace-write" ] && [ "$(platform_default_permission openai security)" = "full-access" ] \
     && ok "openai defaults: workspace-write for a job, full-access for an analysis" || bad "openai default permissions"
+  # Every run here is headless, so the default has to be a mode that can use a
+  # tool without an allowlist. dontAsk is not one, and a job that lands on it
+  # spends a session discovering that.
+  [ "$(platform_default_permission anthropic job)" = "bypassPermissions" ] && [ "$(platform_default_permission anthropic security)" = "bypassPermissions" ] \
+    && ok "anthropic defaults to bypassPermissions for both, the only mode that works headless" || bad "anthropic default permissions"
+  [ -n "$(permission_inert_warning anthropic dontAsk '')" ] \
+    && ok "permission_inert_warning: dontAsk with no allowlist is called out" || bad "dontAsk with no allowlist passed silently"
+  [ -z "$(permission_inert_warning anthropic dontAsk 'Bash,Read')" ] \
+    && ok "and stays quiet once the job says which tools it may use" || bad "an allowlisted dontAsk was warned about"
+  [ -z "$(permission_inert_warning anthropic bypassPermissions '')" ] && [ -z "$(permission_inert_warning openai read-only '')" ] \
+    && ok "and never fires for a mode it does not describe" || bad "the inert warning fired for the wrong mode"
   platform_effort_ok anthropic opus ultra;   want "ultra is not an anthropic effort"          1 $?
   platform_effort_ok anthropic opus "";      want "an empty effort is always fine"            0 $?
 
@@ -3585,8 +3617,12 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   printf 'dontAsk' | cfg_al set-field cj permission_mode >/dev/null 2>&1; want "an anthropic mode is refused on openai" 1 $?
   printf 'full-access' | cfg_al set-field cj permission_mode >/dev/null 2>&1; want "full-access is accepted" 0 $?
   out="$(printf 'anthropic' | cfg_al set-field cj platform 2>&1)"
-  [ "$(cfg_job cj .model)" = "opus" ] && [ "$(cfg_job cj .permission_mode)" = "dontAsk" ] && [ "$(cfg_job cj .effort)" = "high" ] \
-    && ok "back to anthropic: model and permission rewritten, a valid effort kept" || bad "back to anthropic: $(cfg_job cj '{model,effort,permission_mode}')"
+  # The round trip a real job took: anthropic (bypassPermissions) -> openai
+  # (full-access) -> anthropic. It has to come back able to use a tool. It came
+  # back on dontAsk instead, and the next run of that job died `tools_denied`
+  # after burning a session on it.
+  [ "$(cfg_job cj .model)" = "opus" ] && [ "$(cfg_job cj .permission_mode)" = "bypassPermissions" ] && [ "$(cfg_job cj .effort)" = "high" ] \
+    && ok "back to anthropic: the rewrite lands on a mode that can work headless, a valid effort kept" || bad "back to anthropic: $(cfg_job cj '{model,effort,permission_mode}')"
   printf '' | cfg_al set-field cj platform >/dev/null 2>&1
   [ "$(cfg_job cj '.platform // "absent"')" = "absent" ] && ok "an empty platform clears the field (the job inherits)" || bad "platform not cleared"
   # create: the defaults follow the platform the job will run on
@@ -3594,7 +3630,7 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   [ "$(cfg_job oj .platform)" = "openai" ] && [ "$(cfg_job oj .model)" = "gpt-a" ] && [ "$(cfg_job oj .permission_mode)" = "workspace-write" ] \
     && ok "create with platform openai defaults to its model and permission" || bad "create openai: $(cfg_job oj '{platform,model,permission_mode}')"
   printf '{"id":"aj","prompt":"p"}' | cfg_al create >/dev/null 2>&1
-  [ "$(cfg_job aj '.platform // "absent"')" = "absent" ] && [ "$(cfg_job aj .model)" = "opus" ] && [ "$(cfg_job aj .permission_mode)" = "dontAsk" ] \
+  [ "$(cfg_job aj '.platform // "absent"')" = "absent" ] && [ "$(cfg_job aj .model)" = "opus" ] && [ "$(cfg_job aj .permission_mode)" = "bypassPermissions" ] \
     && ok "create without a platform is anthropic, and writes no platform key" || bad "create default: $(cfg_job aj '{platform,model,permission_mode}')"
   printf '{"id":"pj","project":"oa","prompt":"p"}' | cfg_al create >/dev/null 2>&1
   [ "$(cfg_job pj '.platform // "absent"')" = "absent" ] && [ "$(cfg_job pj .model)" = "gpt-a" ] && [ "$(cfg_job pj .permission_mode)" = "workspace-write" ] \
@@ -3621,14 +3657,14 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
       "$tmp/cfg/config/projects.json" > "$tmp/cfg/config/projects.json.next" \
     && mv "$tmp/cfg/config/projects.json.next" "$tmp/cfg/config/projects.json"
   printf '{"id":"cej","project":"corrupt","prompt":"p"}' | cfg_al create >/dev/null 2>&1
-  [ "$(cfg_job cej '.platform // "absent"')" = "absent" ] && [ "$(cfg_job cej .model)" = "opus" ] && [ "$(cfg_job cej .permission_mode)" = "dontAsk" ] \
+  [ "$(cfg_job cej '.platform // "absent"')" = "absent" ] && [ "$(cfg_job cej .model)" = "opus" ] && [ "$(cfg_job cej .permission_mode)" = "bypassPermissions" ] \
     && ok "create under a project with an unknown platform treats it as anthropic, not a refusal" \
     || bad "create under corrupt project: $(cfg_job cej '{platform,model,permission_mode}')"
   "$JQ" '.jobs += [{"id":"gj","enabled":false,"cwd":"/tmp","project":"corrupt","prompt":"p","model":"gpt-b","permission_mode":"full-access"}]' \
       "$tmp/cfg/config/jobs.json" > "$tmp/cfg/config/jobs.json.next" \
     && mv "$tmp/cfg/config/jobs.json.next" "$tmp/cfg/config/jobs.json"
   out="$(printf '' | cfg_al set-field gj platform 2>&1)"
-  [ "$(cfg_job gj .model)" = "opus" ] && [ "$(cfg_job gj .permission_mode)" = "dontAsk" ] \
+  [ "$(cfg_job gj .model)" = "opus" ] && [ "$(cfg_job gj .permission_mode)" = "bypassPermissions" ] \
     && ok "clearing a job's platform under that same corrupt project rewrites to anthropic, not empty" \
     || bad "gj after clearing platform: $(cfg_job gj '{model,permission_mode}')"
   case "$out" in *anthropic*) ok "and the rewrites name anthropic, not the unknown platform" ;; *) bad "rewrites: $out" ;; esac
@@ -8485,6 +8521,8 @@ run_job() { # run_job <id> [--force] [resume-session-id]
 
   [ -n "$prompt" ] && [ "$prompt" != "null" ] || { log_tick "$id: no prompt, skipped"; return 1; }
   [ -d "$cwd" ] || { log_tick "$id: cwd missing ($cwd), skipped"; return 1; }
+  local _inert; _inert="$(permission_inert_warning "$platform" "$permission" "$allowed")"
+  [ -z "$_inert" ] || log_tick "$id: $_inert"
   # Refuse rather than let the CLI create the directory and find no credentials
   # in it: that spends a launch to fail at the login prompt, and every later run
   # would fail the same way with nothing saying why.
