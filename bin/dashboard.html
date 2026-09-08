@@ -1614,6 +1614,9 @@ async function refresh(){
       sessionStorage.ccReloadedFor=d.build; location.reload(); return;
     }
     if(CFG.sig!==d.config_sig) await loadConfig();
+    // The catalog heals itself the same way the config does -- see
+    // retryModelsIfMissing on why it is not simply fetched on every tick.
+    retryModelsIfMissing();
     // Everything downstream still reads DATA.jobs / DATA.projects, so the split
     // stays invisible to the rest of the page.
     DATA = Object.assign(d, {jobs:CFG.jobs, projects:CFG.projects});
@@ -3250,7 +3253,17 @@ function createCombo(cfg){
   }
   function renderList(q){
     const its=items(q), ul=g("opts");
-    if(!its.length){ ul.innerHTML='<div class="combo-empty">No match</div>'; return; }
+    if(!its.length){
+      // "No match" is an answer to a SEARCH. It was also the answer to "there
+      // is nothing in this list at all", which is not the operator's doing and
+      // not something they can fix by clearing a box they never typed in --
+      // and on the Model combo, which has no allowCustom, it is a dead end
+      // rather than an inconvenience.
+      ul.innerHTML='<div class="combo-empty">'
+        +esc(st.opts.some(o=>!o.sec) ? "No match" : (cfg.emptyLabel||"Nothing to choose from"))
+        +'</div>';
+      return;
+    }
     if(st.active>its.length-1) st.active=its.length-1;
     if(st.active<0) st.active=0;
     ul.innerHTML=its.map((it,i)=>
@@ -3377,6 +3390,33 @@ async function loadModels(){
     PLATFORMS=d.platforms||{};
     refillPlatformBound();
   }catch(e){ /* keep the built-in fallback lists */ }
+}
+// Whether this page still has to be told what the platforms offer. The server
+// always names `anthropic` in the payload, so its absence means the payload
+// never arrived -- not that the platform is unavailable, which the payload says
+// with `available:false` instead.
+function modelCatalogMissing(){ return !(PLATFORMS && PLATFORMS.anthropic); }
+// /api/models was fetched ONCE, at boot, and every failure was swallowed. A
+// single miss therefore cost the tab its Model field for good: with no catalog
+// the job editor's combo is an empty list reading "No match", and it has no
+// allowCustom to type an id into, so the field cannot be used at all and
+// nothing says why. A miss is not exotic -- the server exits and relaunches
+// whenever its own file changes, which is what install.sh does, and a tab
+// fetching during that window gets nothing.
+//
+// So the poll re-asks, exactly as it has always re-asked for the config
+// payload. Not on every tick forever, though: list_models reads and scans the
+// CLI binary looking for model ids, which is not a five-second job. A
+// restarting server is back within seconds, so the first handful of tries ride
+// the poll's own cadence and anything after that drops to once a minute.
+let modelTries=0, nextModelTry=0;
+function retryModelsIfMissing(){
+  if(!modelCatalogMissing()) return;
+  const now=Date.now();
+  if(now<nextModelTry) return;
+  nextModelTry=now+(modelTries<6?4000:60000);
+  modelTries++;
+  loadModels();
 }
 // The option list of the model combo for one platform (editor-domain.js does
 // the shaping; groupModels is the page's own Anthropic grouping).
@@ -3509,7 +3549,8 @@ let PLATFORMS={};                                          // /api/models.platfo
 // reference and reads cfg.def inside set(), so applyPlatformToJobEditor can
 // make the fallback the PLATFORM's -- "opus" is Anthropic's, and a lie on
 // OpenAI when the catalog is empty or has not arrived yet.
-const edModelCfg={id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelPicked};
+const edModelCfg={id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelPicked,
+  emptyLabel:"The model list has not arrived yet — the page is asking again."};
 // The Security pane's model combo, configured by name so applyPlatformToSecurity
 // can flip what the widget offers: a typed-in id ("Use …") is an Anthropic
 // affordance -- the engine swaps a Codex slug outside the catalog for the

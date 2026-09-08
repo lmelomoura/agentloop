@@ -230,6 +230,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **One failed `/api/models` no longer costs a tab its Model field for good.**
+  The catalog was fetched once, at boot, and every failure was swallowed
+  silently. A single miss left `PLATFORMS` empty for the life of the tab — and
+  with no catalog the job editor's Model combo is an empty list reading "No
+  match", with no way to type an id into it either, so the field simply cannot
+  be used and nothing says why. A miss is not exotic: the server exits and
+  relaunches whenever its own file changes, which is exactly what `install.sh`
+  does (eight times in one afternoon of one install's `server.log`), and any
+  open tab fetching in that window gets nothing. The poll now re-asks for the
+  catalog the same way it has always re-asked for the config payload — the
+  first few tries at the poll's own cadence, then once a minute, because
+  `list_models` reads and scans the CLI binary and is not a five-second job.
+  A combo with nothing in it also says so now instead of reporting "No match",
+  which is an answer to a search the operator never made.
+
 - **Deleting a run no longer rewrites the whole index, and no longer freezes
   the page while it does.** Every delete ended in an unconditional `VACUUM`.
   Its cost is the size of the index; its return is the size of the freelist —

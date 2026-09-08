@@ -2044,7 +2044,14 @@ def test_the_job_editors_model_default_is_the_platforms(srv):
     default to the platform's before every set -- "" on OpenAI with no
     catalog, which the engine refuses honestly."""
     js = _js(srv)
-    assert 'const edModelCfg={id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelPicked};' in js
+    # The cfg gained an emptyLabel (see
+    # test_an_empty_combo_says_which_kind_of_empty_it_is), so the three fields
+    # this test is actually about are pinned individually rather than as one
+    # exact line that any neighbouring addition would break.
+    i = js.index("const edModelCfg=")
+    cfg = js[i:i + 400]
+    for part in ('id:"ed-model"', "allowNone:false", 'def:"opus"', "onPick:onJobModelPicked"):
+        assert part in cfg, f"the job editor's model combo lost {part}"
     assert "modelCombo=createCombo(edModelCfg)" in js
     fn = _plainfn(js, "applyPlatformToJobEditor")
     assert 'edModelCfg.def=ALApp.defaultModelFor(p,PLATFORMS)||(p==="openai"?"":"opus");' in fn
@@ -9556,6 +9563,94 @@ def test_every_side_effecting_button_is_held_from_the_click(srv):
     assert not missing, (
         "these action buttons are built without asking whether the action is already "
         "in flight: " + ", ".join(missing))
+
+
+def test_the_model_catalog_is_asked_for_again_until_it_arrives(srv, tmp_path):
+    """One failed fetch used to cost the tab its Model field, permanently.
+
+    `/api/models` is fetched once at boot. Nothing retried it and nothing said
+    it had failed, so a single miss left `PLATFORMS` empty for the life of the
+    tab — and an empty catalog makes the job editor's Model combo an empty list
+    that reads "No match", with no `allowCustom` to type an id into either. The
+    field simply cannot be used, and the page gives no hint why.
+
+    A miss is not exotic: the server exits and relaunches whenever its own file
+    changes (`install.sh` does exactly that, eight times in one afternoon of
+    this install's `server.log`), and any open tab fetching during that window
+    gets nothing. The config payload has always healed itself on the poll
+    (`CFG.sig !== d.config_sig`); the catalog now does the same.
+
+    Retried, but not hammered: `list_models` reads and scans the CLI binary,
+    which is not a five-second job. A restarting server is back within seconds,
+    so the first few tries ride the poll's own cadence and the rest slow down.
+    """
+    js = _js(srv)
+    assert "retryModelsIfMissing()" in _anyfn(js, "refresh"), (
+        "the poll does not re-ask for the model catalog, so one failed fetch is "
+        "permanent for this tab")
+    script = tmp_path / "models-retry.js"
+    script.write_text(
+        "let PLATFORMS={}, modelTries=0, nextModelTry=0, calls=0;\n"
+        "function loadModels(){ calls++; }\n"
+        "let NOW=1000; Date.now=()=>NOW;\n"
+        + _plainfn(js, "modelCatalogMissing") + "\n"
+        + _plainfn(js, "retryModelsIfMissing") + """
+    const out = {};
+    out.missing_empty = modelCatalogMissing();
+    // Ten polls, five seconds apart, with the catalog never arriving.
+    for(let i=0;i<10;i++){ retryModelsIfMissing(); NOW += 5000; }
+    out.tries_first_50s = calls;
+    // Another two minutes of polling: the slow lane, not the poll's cadence.
+    for(let i=0;i<24;i++){ retryModelsIfMissing(); NOW += 5000; }
+    out.tries_after_170s = calls;
+    // The payload lands. Nothing asks again.
+    PLATFORMS = {anthropic: {models: ["claude-opus-5"]}};
+    out.missing_after = modelCatalogMissing();
+    const before = calls;
+    for(let i=0;i<10;i++){ retryModelsIfMissing(); NOW += 5000; }
+    out.tries_once_loaded = calls - before;
+    console.log(JSON.stringify(out));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert out["missing_empty"] is True, "an empty PLATFORMS is not recognised as missing"
+    assert out["missing_after"] is False, "the arrived catalog is still read as missing"
+    assert out["tries_first_50s"] >= 5, (
+        "the first polls after a miss do not re-ask, so a server that restarted "
+        "for two seconds costs the tab its model list for far longer")
+    assert out["tries_after_170s"] < out["tries_first_50s"] + 24, (
+        "every poll re-asks forever — list_models reads and scans the CLI binary, "
+        "which is not something to do twelve times a minute indefinitely")
+    assert out["tries_after_170s"] > out["tries_first_50s"], (
+        "it gives up completely instead of slowing down, so a server that comes "
+        "back late is never noticed")
+    assert out["tries_once_loaded"] == 0, "it keeps fetching a catalog it already has"
+
+
+def test_an_empty_combo_says_which_kind_of_empty_it_is(srv):
+    """"No match" is an answer to a search. It was also the answer to "there is
+    nothing here at all", which is not the operator's doing and not something
+    they can fix by clearing the search box they never typed in.
+
+    The job editor's Model combo has no `allowCustom`, so an empty list is a
+    dead end rather than an inconvenience — all the more reason for it to say
+    what happened instead of implying the operator filtered everything out.
+    """
+    js = _js(srv)
+    combo = _plainfn(js, "createCombo")
+    assert "cfg.emptyLabel" in combo, (
+        "the combo has one empty state for both 'your search matched nothing' and "
+        "'this list never loaded'")
+    # Pinned as the expression rather than as two positions: "No match" also
+    # appears in the comment that explains it, and st.opts.some() is how
+    # allowCustom already asks a different question a few lines above.
+    assert '(st.opts.some(o=>!o.sec) ? "No match" : (cfg.emptyLabel||' in combo, (
+        "the two empty states are not told apart -- a list with no options at all "
+        "still reports the operator's search as the reason")
+    i = js.index("const edModelCfg=")
+    assert "emptyLabel" in js[i:i + 400], (
+        "the Model combo, the one with no way to type an id, does not say why it "
+        "is empty")
 
 
 def test_a_run_being_deleted_offers_nothing_else_to_click(srv):
