@@ -1351,7 +1351,20 @@ platform_argv_openai() { # platform_argv_openai <resume-sid> <run_cwd> <model> <
     read-only|workspace-write)
       if [ -n "$resume_sid" ]; then PLATFORM_ARGV+=(-c "sandbox_mode=$permission")
       else PLATFORM_ARGV+=(-s "$permission"); fi
-      PLATFORM_ARGV+=(-c "approval_policy=never") ;;
+      PLATFORM_ARGV+=(-c "approval_policy=never")
+      # workspace-write seals the NETWORK as well as the filesystem, which is
+      # not what it says and not what this scheduler needs: measured on
+      # codex-cli 0.153.4, a curl inside it returns 000 and the same curl with
+      # this override returns 200. Every job here talks to an issue tracker or
+      # a forge, and the Anthropic side's own headless default
+      # (bypassPermissions) has the network open -- a first real run of a
+      # promote job on OpenAI ended BLOCKED with "Live Jira and Bitbucket APIs
+      # are unreachable (DNS failure)" and cost a session to say so. So the
+      # mode keeps the filesystem sandbox it is named for and gets the network
+      # back; read-only stays sealed to both, which is what makes it the
+      # look-only mode, and full-access has no sandbox at all.
+      [ "$permission" = "workspace-write" ] \
+        && PLATFORM_ARGV+=(-c "sandbox_workspace_write.network_access=true") ;;
     full-access) PLATFORM_ARGV+=(--dangerously-bypass-approvals-and-sandbox) ;;
   esac
   [ -n "$resume_sid" ] && PLATFORM_ARGV+=("$resume_sid")
@@ -3396,6 +3409,8 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   printf '%s\n' "$_av" | grep -qx -- '-C' && ok "-C on a fresh run" || bad "no -C"
   printf '%s\n' "$_av" | grep -qx -- 'model_reasoning_effort=high' && ok "the effort override is bare" || bad "effort override missing or quoted"
   printf '%s\n' "$_av" | grep -qx -- 'approval_policy=never' && ok "approval_policy=never travels with a sandboxed mode" || bad "no approval_policy"
+  printf '%s\n' "$_av" | grep -qx -- 'sandbox_workspace_write.network_access=true' \
+    && ok "workspace-write opens the network back up (measured: sealed without this)" || bad "workspace-write left without network"
   printf '%s\n' "$_av" | grep -qx -- '--disable' && bad "--disable is passed and closes nothing" || ok "no --disable flag"
   [ "${PLATFORM_ARGV[$((${#PLATFORM_ARGV[@]} - 2))]}" = "--" ] && [ "${PLATFORM_ARGV[$((${#PLATFORM_ARGV[@]} - 1))]}" = "PROMPT" ] \
     && ok "-- then the prompt, last" || bad "the prompt is not the lone argument after --"
@@ -3403,12 +3418,20 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- '--dangerously-bypass-approvals-and-sandbox' \
     && ok "full-access is the bypass flag" || bad "full-access not translated"
   printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- '-s' && bad "-s alongside the bypass flag" || ok "and no -s beside it"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -q 'network_access' \
+    && bad "full-access carries a sandbox override it has no sandbox for" || ok "and no network override: full-access has no sandbox"
   printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -q 'model_reasoning_effort' && bad "an empty effort still emitted an override" || ok "an empty effort emits no override"
   platform_argv_openai thr-1 /tmp/w gpt-a low read-only "P"
   [ "${PLATFORM_ARGV[0]}" = "exec" ] && [ "${PLATFORM_ARGV[1]}" = "resume" ] && ok "a resume is exec resume" || bad "resume argv ${PLATFORM_ARGV[*]}"
   printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- '-C' && bad "-C on a resume (exec resume refuses it)" || ok "no -C on a resume"
   printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- 'sandbox_mode=read-only' && ok "the sandbox is a -c override on a resume" || bad "no sandbox_mode on the resume"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -q 'network_access' \
+    && bad "read-only was given the network" || ok "read-only stays sealed to the network too"
   [ "${PLATFORM_ARGV[$((${#PLATFORM_ARGV[@]} - 3))]}" = "thr-1" ] && ok "the thread id sits right before --" || bad "thread id misplaced"
+  # Last, because it REPLACES the argv every assertion above reads.
+  platform_argv_openai thr-2 /tmp/w gpt-a low workspace-write "P"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- 'sandbox_workspace_write.network_access=true' \
+    && ok "and a resumed workspace-write run keeps its network" || bad "the resume lost the network override"
 
   echo "platform_finish() — the model that ran comes from the rollout"
   mkdir -p "$tmp/ch/sessions/2026/09/05"

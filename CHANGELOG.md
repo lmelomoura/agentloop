@@ -230,6 +230,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **An OpenAI run on `workspace-write` can reach the network again.** The Codex
+  sandbox seals the network as well as the filesystem in that mode, which its
+  name does not say and this scheduler cannot live with: every job here talks
+  to an issue tracker or a forge. The first real promote run on OpenAI ended
+  `BLOCKED: Live Jira and Bitbucket APIs are unreachable (DNS failure)` and
+  spent a session to report it. The launch line now carries
+  `-c sandbox_workspace_write.network_access=true` for that mode, on a fresh
+  run and on a resume; `read-only` stays sealed to both, which is what makes it
+  the look-only mode, and `full-access` has no sandbox to open. Measured on
+  codex-cli 0.153.4: the same `curl` returns 000 inside the mode and 200 with
+  the override.
+
 - **`selftest` no longer trips its own home-directory rule on the migration case, and
   runs that rule inside a git worktree too.** The fake `HOME` the case builds was a
   path segment named `home`, which the rule reads as a real home directory; and the

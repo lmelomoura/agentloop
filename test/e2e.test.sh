@@ -378,8 +378,21 @@ si="$(idx_in "$argv17" -s)"; [ "$(at_in "$argv17" $((si + 1)))" = "read-only" ] 
 [ -n "$(idx_in "$argv17" model_reasoning_effort=high)" ] && ok "-c model_reasoning_effort=high, bare" || bad "no bare effort override"
 [ -z "$(idx_in "$argv17" --disable)" ] && ok "no --disable flag: it closes nothing (measured)" || bad "--disable was passed"
 [ -z "$(idx_in "$argv17" --skip-git-repo-check)" ] && bad "no --skip-git-repo-check" || ok "--skip-git-repo-check"
+[ -z "$(idx_in "$argv17" sandbox_workspace_write.network_access=true)" ] \
+  && ok "read-only is sealed to the network too: no override" || bad "read-only was given the network"
 dd="$(idx_in "$argv17" --)"; [ -n "$dd" ] && [ "$((dd + 1))" = "$argc17" ] \
   && ok "the prompt is the one argument after --" || bad "-- at '$dd', argc $argc17"
+
+echo
+echo "17b. a workspace-write run gets its network back, which the sandbox seals by default"
+argv17b="$ROOT/argv-17b"; rm -f "$argv17b"
+mkjob_openai j17b workspace-write
+FAKE_ARGV_OUT="$argv17b" FAKE_MODE=complete FAKE_SESSION=thr-argv-net "$AL" run j17b >/dev/null 2>&1
+sleep 1
+si="$(idx_in "$argv17b" -s)"; [ "$(at_in "$argv17b" $((si + 1)))" = "workspace-write" ] \
+  && ok "-s workspace-write" || bad "-s '$(at_in "$argv17b" $((si + 1)))'"
+[ -n "$(idx_in "$argv17b" sandbox_workspace_write.network_access=true)" ] \
+  && ok "-c sandbox_workspace_write.network_access=true, bare" || bad "no network override: every API this fleet talks to is unreachable"
 
 echo
 echo "18. a spent OpenAI quota is rate_limited, outside the backoff"
