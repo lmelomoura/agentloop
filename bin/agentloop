@@ -3278,7 +3278,8 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     mkdir -p "$tmp/sp"
     printf '#!/bin/bash\necho "2.1.0 (Claude Code)"\n' > "$tmp/sp/claude"; chmod +x "$tmp/sp/claude"
     CLAUDE_BIN="$tmp/sp/claude"
-    CLAUDE_CONFIG_DIR=""                          # the install default, whatever account the operator pinned in the shell
+    AGENTLOOP_CLAUDE_CONFIG_DIR=""                # no pin from the shell and no plist from ~/Library:
+    PLIST_PATH=/nonexistent                       # installed_config_dir answers nothing, the CLI default
     CODEX_BIN="$BASE_DIR/test/fake-codex"
     CONFIG_DIR="$tmp/sp"
     MODELS_FILE="$tmp/sp/models.json"
@@ -3296,6 +3297,21 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     printf '%s\n' "$_b" | grep -q '^openai    : codex-cli 0.148.0, signed in; catalog [0-9]*m ago (5 models); prices [0-9]*[mhd] ago; unpriced: none$' \
       && ok "status_platforms_block: the Codex line carries version, sign-in, catalog age and size, price age, unpriced" \
       || bad "openai line: $(printf '%s\n' "$_b" | tail -1)"
+    # The pin the install carries, by either route (the variable; the plist a
+    # previous install wrote), never the CLAUDE_CONFIG_DIR of this process.
+    _b="$(AGENTLOOP_CLAUDE_CONFIG_DIR=/pinned/home status_platforms_block)"
+    printf '%s\n' "$_b" | grep -q '^anthropic : 2.1.0 (Claude Code), account /pinned/home$' \
+      && ok "status_platforms_block: a pinned account is named" \
+      || bad "pinned anthropic line: $(printf '%s\n' "$_b" | head -1)"
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+      '<plist version="1.0"><dict><key>Label</key><string>x</string>' \
+      '<key>EnvironmentVariables</key><dict><key>CLAUDE_CONFIG_DIR</key><string>/plist/home</string></dict>' \
+      '</dict></plist>' > "$tmp/sp/tick.plist"
+    _b="$(PLIST_PATH="$tmp/sp/tick.plist" status_platforms_block)"
+    printf '%s\n' "$_b" | grep -q '^anthropic : 2.1.0 (Claude Code), account /plist/home$' \
+      && ok "status_platforms_block: the account a previous install wrote into the plist is named" \
+      || bad "plist-pinned anthropic line: $(printf '%s\n' "$_b" | head -1)"
     # A table with no stamp at all (hand-written), and one visible slug dropped.
     "$JQ" 'del(.openai["gpt-5.4-mini"]) | del(._refreshed_at, ._checked_at)' "$PRICING_FILE" > "$PRICING_FILE.next"; mv "$PRICING_FILE.next" "$PRICING_FILE"
     status_platforms_block | grep -q 'prices never refreshed; unpriced: gpt-5.4-mini$' \
@@ -3313,9 +3329,13 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_spout" | grep -v '^RESULT '
-  printf '%s\n' "$_spout" | grep -qx 'RESULT ok=5 bad=0' \
-    && ok "status_platforms_block over the stand-ins: all 5 assertions reach the gate" \
+  printf '%s\n' "$_spout" | grep -qx 'RESULT ok=7 bad=0' \
+    && ok "status_platforms_block over the stand-ins: all 7 assertions reach the gate" \
     || bad "status_platforms_block did not: $(printf '%s\n' "$_spout" | tail -1)"
+  got="$(age_label "$(( $(now_epoch) + 600 ))")"
+  [ "$got" = "0m ago" ] \
+    && ok "age_label: a stamp from the future reads 0m ago, never a negative age" \
+    || bad "a stamp 10 minutes ahead read '$got'"
 
   # cmd_resolve_models must hand the caller resolve_models_openai's status:
   # `agentloop resolve-models openai` exiting 0 after failing to write the
@@ -9561,6 +9581,29 @@ statusline_path_warning() { # ~/.claude/settings.json may still run the statusli
   esac
 }
 
+# The account the install pins into launchd, as a plain path: the explicit
+# variable, else the CLAUDE_CONFIG_DIR the last install wrote into the tick
+# agent's plist; nothing when neither names one (the CLI default, ~/.claude).
+# Never an ambient CLAUDE_CONFIG_DIR -- see the top of the file. cmd_install
+# writes what this answers and status_platforms_block reports it, so the two
+# cannot disagree about which account the scheduler signs in as.
+installed_config_dir() {
+  if [ -n "${AGENTLOOP_CLAUDE_CONFIG_DIR:-}" ]; then
+    expand_home "$AGENTLOOP_CLAUDE_CONFIG_DIR"
+    return 0
+  fi
+  [ -f "$PLIST_PATH" ] || return 0
+  "$PYTHON" - "$PLIST_PATH" <<'PY'
+import plistlib, sys
+try:
+    v = plistlib.load(open(sys.argv[1], "rb")).get("EnvironmentVariables", {}).get("CLAUDE_CONFIG_DIR")
+except Exception:
+    v = None
+if v:
+    print(v)
+PY
+}
+
 cmd_install() {
   # A global default account, carried into launchd — which inherits nothing from
   # the shell, so without this every run signs in as ~/.claude however the
@@ -9569,30 +9612,19 @@ cmd_install() {
   # otherwise silently pin that session's account for every job, forever.
   # An install that predates the rename is retired first, and the account it
   # had pinned is read out of it before it goes.
-  local legacy_cfgdir
+  local legacy_cfgdir cfgdir plist_cfgdir=""
   legacy_cfgdir="$(install_migrate_legacy)"
-  local plist_cfgdir=""
-  if [ -n "${AGENTLOOP_CLAUDE_CONFIG_DIR:-}" ]; then
-    plist_cfgdir="
-    <key>CLAUDE_CONFIG_DIR</key><string>$(expand_home "$AGENTLOOP_CLAUDE_CONFIG_DIR")</string>"
-  elif [ -f "$PLIST_PATH" ]; then
-    # Re-running the installer must not quietly drop an account pinned earlier.
-    plist_cfgdir="$("$PYTHON" - "$PLIST_PATH" <<'PY'
-import plistlib, sys
-try:
-    v = plistlib.load(open(sys.argv[1], "rb")).get("EnvironmentVariables", {}).get("CLAUDE_CONFIG_DIR")
-except Exception:
-    v = None
-if v:
-    print("\n    <key>CLAUDE_CONFIG_DIR</key><string>%s</string>" % v, end="")
-PY
-)"
-  fi
+  # Re-running the installer must not quietly drop an account pinned earlier:
+  # the variable, else the one already in the plist.
+  cfgdir="$(installed_config_dir)"
   # The old agent's pinned account is the last resort: only when neither the
   # variable nor the new plist named one.
-  if [ -z "$plist_cfgdir" ] && [ -n "$legacy_cfgdir" ]; then
+  if [ -z "$cfgdir" ] && [ -n "$legacy_cfgdir" ]; then
+    cfgdir="$legacy_cfgdir"
+  fi
+  if [ -n "$cfgdir" ]; then
     plist_cfgdir="
-    <key>CLAUDE_CONFIG_DIR</key><string>$legacy_cfgdir</string>"
+    <key>CLAUDE_CONFIG_DIR</key><string>$cfgdir</string>"
   fi
 
   # 1) the tick agent — fires the scheduler once a minute
@@ -9664,12 +9696,17 @@ PLIST
   echo "Installed and loaded:"
   echo "  $PLIST_LABEL   — ticks every 60s (survives logout and reboot)"
   echo "  $SERVER_LABEL  — control dashboard on http://127.0.0.1:$PORT/"
-  if [ -n "$plist_cfgdir" ]; then
-    echo "Claude account : ${plist_cfgdir##*<string>}" | sed 's|</string>||'
+  if [ -n "$cfgdir" ]; then
+    echo "Claude account : $cfgdir"
   else
     echo "Claude account : the CLI default (~/.claude) — set AGENTLOOP_CLAUDE_CONFIG_DIR and re-run to change it"
   fi
   echo "Platforms      :"
+  # A fresh install with Codex signed in has no catalog yet, and the block
+  # would read "catalog never (0 models)" on the one occasion somebody looks at
+  # it. Resolve once here -- the real codex, which platform_ready just ran
+  # anyway. `agentloop status` stays read-only.
+  openai_catalog_ensure >/dev/null 2>&1 || true
   status_platforms_block | sed 's/^/  /'
   # The agent prompts make these skills mandatory by name. A fresh clone whose
   # ~/.claude/skills lacks them runs agents that cite standards they cannot read,
@@ -9698,22 +9735,28 @@ age_label() { # age_label <epoch> [zero-label]
   local at d; at="$(num "$1")"
   [ "$at" -gt 0 ] || { printf '%s' "${2:-never}"; return 0; }
   d=$(( $(now_epoch) - at ))
+  [ "$d" -ge 0 ] || d=0     # a stamp from the future (a clock set back) is 0m ago, never -10m ago
   if   [ "$d" -lt 3600 ];  then printf '%sm ago' "$(( d / 60 ))"
   elif [ "$d" -lt 86400 ]; then printf '%sh ago' "$(( d / 3600 ))"
   else                          printf '%sd ago' "$(( d / 86400 ))"; fi
 }
 
 # The two CLIs, one line each: version and readiness (platform_ready's own
-# sentence when not ready), and for Codex the age of the catalog and of the
-# price table plus the visible slugs still unpriced -- the facts a "why did my
-# openai job not run" question needs, printed where people already look
-# (`agentloop status`, the end of `agentloop install`).
+# sentence when not ready), for Claude the account the install pinned, and for
+# Codex the age of the catalog and of the price table plus the visible slugs
+# still unpriced -- the facts a "why did my openai job not run" question needs,
+# printed where people already look (`agentloop status`, the end of
+# `agentloop install`).
 status_platforms_block() {
-  local bin ver reason n u
+  local bin ver reason acct n u
   bin="$(platform_bin anthropic)"
   if reason="$(platform_ready anthropic)"; then
     ver="$("$bin" --version 2>/dev/null | head -1)"
-    printf 'anthropic : %s, account %s\n' "${ver:-claude}" "${CLAUDE_CONFIG_DIR:-the CLI default (~/.claude)}"
+    # The pin the INSTALL carries (the variable, then the plist), not this
+    # process's CLAUDE_CONFIG_DIR: `agentloop status` typed in a plain shell
+    # has none, and would call a pinned install the CLI default.
+    acct="$(installed_config_dir)"
+    printf 'anthropic : %s, account %s\n' "${ver:-claude}" "${acct:-the CLI default (~/.claude)}"
   else
     printf 'anthropic : %s\n' "$reason"
   fi

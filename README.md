@@ -1282,7 +1282,7 @@ presenting a partial read as coverage.
 The **Security** tab of the project editor writes all of it. A project with no
 block gets no analysis, and no derived job either.
 
-The engine reads `enabled`, `model`, `effort`, `permission_mode`,
+The engine reads `enabled`, `platform`, `model`, `effort`, `permission_mode`,
 `claude_config_dir`, `max_budget_usd`, `daily_budget_usd` and `ignore_paths` —
 `permission_mode` defaults to `bypassPermissions` when absent (an unrecognised
 value falls back to it too, with a warning) and is carried onto the derived

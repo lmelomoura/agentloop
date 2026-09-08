@@ -150,14 +150,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     the sandbox modes cannot write the ledger — and the pane stops offering a
     typed-in model id on OpenAI, where a slug outside the catalog only falls
     back to the platform's default; re-picking the platform a pane already
-    shows changes nothing.
+    shows changes nothing; the guards that keep a re-pick from resetting a
+    pane are pinned by tests.
   - A run says where it ran and what its cost IS: an **OpenAI** badge on the
     Runs table row (the model that ran on hover), `~$0.03` for an estimate and
     a dash for a run with no figure — never a fake $0.00 — with the basis on
     hover; the run's dialog adds Platform and Tokens rows; the Overview's
     *Spent today* names the estimated share when there is one; the analysis
-    meta grid on the Security page gains "Runs on"; the guards that keep a
-    re-pick from resetting a pane are pinned by tests.
+    meta grid on the Security page gains "Runs on".
 - **Security analyses run on OpenAI.** A project's security block can name
   `"platform": "openai"` (or inherit the project's) and its analysis goes
   through the Codex CLI. The prompt changes in the two places the platform
