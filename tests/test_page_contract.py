@@ -1985,6 +1985,57 @@ def test_the_job_editor_makes_the_platform_explicit_when_a_project_would_move_it
         f"a job whose project and platform did not change sends no platform: {stays}"
 
 
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_job_editor_re_sends_what_a_platform_change_governs(srv, tmp_path):
+    """`set_field platform` makes the engine rewrite or clear the model, effort
+    and permission mode the new platform does not know -- and the saves that
+    follow compared the screen against the PRE-save job, so a value equal to
+    the old one was skipped although the engine had just changed it on disk:
+    an Anthropic job at effort `xhigh` moved to an OpenAI model that also has
+    `xhigh` ended without an effort while the screen kept showing it. After a
+    platform write the governed fields are sent unconditionally; without one,
+    the comparison still keeps an unchanged job from sending anything."""
+    page = _js(srv)
+    app = _app_js(srv)
+
+    def run(form):
+        script = tmp_path / f"save-editor-governed-{form['platform']}.js"
+        script.write_text(_plainfn(app, "platformOf") + """
+        const ALApp = {platformOf};
+        const sent = [];
+        const vals = {"ed-id": "j", "ed-prompt": "", "ed-precheck": "", "ed-project": "",
+                      "ed-desc": "", "ed-cwd": "", "ed-perm": "dontAsk"};
+        const $ = (id) => ({ get value(){ return vals[id] ?? ""; }, set value(v){ vals[id] = v; },
+                             disabled: false, close(){} });
+        async function api(op, extra){ sent.push([op, extra]); return true; }
+        const DATA = {jobs: [{id: "j", platform: "anthropic", model: "claude-opus-5", effort: "xhigh",
+                              permission_mode: "dontAsk"}],
+                      projects: []};
+        const projById = (name) => DATA.projects.find(p => p.name === name) || null;
+        const readForm = () => (%s);
+        const ED_STEPS = [], validateStep = () => "";
+        const edWiz = {markClean(){}}, toast = () => {}, refresh = () => {};
+        let creating = false, editingId = "j", editingPrecheck = "";
+        """ % json.dumps(form) + _fn(page, "saveEditor")
+                          + "\nsaveEditor().then(() => console.log(JSON.stringify(sent)));\n")
+        out = subprocess.run(["node", str(script)], capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)
+
+    # Everything the job already has, except what the platform change brings.
+    base = {"secs": 300, "effort": "xhigh", "interactive": False, "hours": "", "days": [],
+            "budget": None, "maxPar": None, "daily": None, "timeoutSecs": None, "stallSecs": None}
+    moved = run({**base, "platform": "openai", "model": "gpt-5.6-sol"})
+    fields = {e["field"]: e["value"] for op, e in moved if op == "set_field"}
+    assert fields.get("platform") == "openai", f"the platform change was not sent: {moved}"
+    for field, value in (("effort", "xhigh"), ("permission_mode", "dontAsk"),
+                         ("interactive", "false"), ("model", "gpt-5.6-sol")):
+        assert fields.get(field) == value, \
+            f"{field} was not re-sent after the platform change, though the engine rewrote it: {moved}"
+    same = run({**base, "platform": "anthropic", "model": "claude-opus-5"})
+    assert not [e for op, e in same if op == "set_field"], \
+        f"a job saved unchanged sends no set_field at all: {same}"
+
+
 def test_the_job_editors_model_default_is_the_platforms(srv):
     """createCombo reads cfg.def on every set(): with the catalog empty or not
     yet fetched, an empty model falls back to it. "opus" is Anthropic's and a

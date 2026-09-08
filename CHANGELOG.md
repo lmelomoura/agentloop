@@ -142,7 +142,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     the Limits pane that cost is estimated and the per-run cap advisory. The
     editor saves `platform` before the fields it governs, and a job moved to
     a project on the other platform is saved with its platform made explicit,
-    so it does not silently change CLI.
+    so it does not silently change CLI; after a platform change the governed
+    fields are always re-sent, since the engine rewrites them.
   - The project editor gets a **Platform** for the project (its jobs inherit
     it) and one in the Security pane (empty inherits the project's). The
     analysis's model list, effort ladder and permission modes follow the
@@ -168,8 +169,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   as before; on Codex the engine runs `security prepare` itself, in the
   worktree, before launching the CLI — a real run showed the model skipping
   it once and the Codex shell tool cutting it once before it finished — and
-  the prompt tells the agent the phase already ran. `agentloop skills` links
-  the skills into `~/.codex/skills` too, when that home exists.
+  the prompt tells the agent the phase already ran; the run's `.prepare`
+  sidecar is pruned and deleted with the run's other files and shown in the
+  run dialog. `agentloop skills` links the skills into `~/.codex/skills` too,
+  when that home exists.
   `test/fake-codex` leaves `security prepare` to the engine, and
   `test/e2e.test.sh` drives an analysis on OpenAI to `done` with the stand-in
   skipping it — the close proves the engine ran it. What it cost to not have

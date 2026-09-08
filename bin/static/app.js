@@ -2485,8 +2485,11 @@
     // code, pulled out of bin/dashboard.html ahead of their
     // restyle so each can be pinned under Node. makeWizard's own
     // W.changed calls changedKeys; effortSet/effortGet call
-    // effortIndex/effortFromIndex and read EFFORTS for the
-    // "unset" check; getDays calls dayNumbers; collectRepos
+    // effortIndex/effortFromIndex against the ladder their pane
+    // was last built with (effortsFor's, seeded from
+    // FALLBACK_EFFORTS -- the page no longer reads EFFORTS
+    // itself; that alias survives for the round-trip test);
+    // getDays calls dayNumbers; collectRepos
     // calls shapeRepoRows; validateProjectStep calls
     // projectStepError. Every one of them is plain values in,
     // plain values out -- none reaches $, document or AL.DATA,
@@ -2526,5 +2529,5 @@
     projectStepError
   };
 })();
-/* ui-bundle: 136302e36142b867d3011dfa53a502c307eda088126da5b1c283b5b4240682b9 */
-/* ui-sources: f6e4e27e5bb1a7a603959c55840ef0d3e828007e041a6f5eeabf1440614a5cc3 */
+/* ui-bundle: 6fe97e02b9abcfac2def21c338c5996c810f4f4b8940817cd4b46359f94110e9 */
+/* ui-sources: d23edc78a056ecdce2e354450025d21da04d4e84676c16c2529cb511b4d99728 */

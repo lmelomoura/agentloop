@@ -179,8 +179,11 @@ window.ALApp = { init, visibleJobs, jobFilters, bulkOn,
                  // code, pulled out of bin/dashboard.html ahead of their
                  // restyle so each can be pinned under Node. makeWizard's own
                  // W.changed calls changedKeys; effortSet/effortGet call
-                 // effortIndex/effortFromIndex and read EFFORTS for the
-                 // "unset" check; getDays calls dayNumbers; collectRepos
+                 // effortIndex/effortFromIndex against the ladder their pane
+                 // was last built with (effortsFor's, seeded from
+                 // FALLBACK_EFFORTS -- the page no longer reads EFFORTS
+                 // itself; that alias survives for the round-trip test);
+                 // getDays calls dayNumbers; collectRepos
                  // calls shapeRepoRows; validateProjectStep calls
                  // projectStepError. Every one of them is plain values in,
                  // plain values out -- none reaches $, document or AL.DATA,

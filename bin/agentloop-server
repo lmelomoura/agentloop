@@ -679,7 +679,7 @@ def _logs_root():
 
 
 def _artifact_paths(rec):
-    """The five on-disk artifacts of one run — confined to data/logs/."""
+    """The six on-disk artifacts of one run — confined to data/logs/."""
     try:
         logp = Path(rec.get("log", "")).resolve()
     except Exception:
@@ -693,7 +693,12 @@ def _artifact_paths(rec):
             # keys, so nothing here tries to store its content.
             "raw": logp.with_name(logp.stem + ".stream.ndjson.raw"),
             "precheck": logp.with_name(logp.stem + ".precheck.txt"),
-            "err": Path(str(logp) + ".err")}
+            "err": Path(str(logp) + ".err"),
+            # The `security prepare` output of an OpenAI analysis, written by
+            # run_job's engine-side prepare block beside the log -- its own
+            # file, never .err, whose bytes would turn a clean run into a
+            # warning. Read into the run's stderr below, pruned with the rest.
+            "prepare": Path(str(logp) + ".prepare")}
 
 
 def _read_artifacts(rec):
@@ -728,6 +733,17 @@ def _read_artifacts(rec):
     art["stream"] = slurp(ap["stream"], STREAM_CAP)
     art["precheck_txt"] = slurp(ap["precheck"], 20_000)
     art["stderr"] = slurp(ap["err"], 20_000)
+    # The engine-side `security prepare` of an OpenAI analysis writes to its
+    # own sidecar. It rides along under the run's stderr, behind a header that
+    # keeps it apart from the agent's own, so a `prepare failed (rc N)` in
+    # tick.log can be read from the run dialog -- the prune deletes the file
+    # right after this, and the DB row is then all that is left of it.
+    prep = slurp(ap["prepare"], 20_000)
+    if prep.strip():
+        err = art["stderr"]
+        if err and not err.endswith("\n"):
+            err += "\n"
+        art["stderr"] = err + "--- prepare ---\n" + prep
     return art
 
 
@@ -1423,15 +1439,17 @@ def delete_run(jid, start):
         return _forget_stranded_row(jid, start, removed)
 
     # On-disk artifacts, plus the transient siblings a run can leave behind.
-    # The raw Codex copy is listed here as well as in `_artifact_paths`: this
-    # path deletes a run whether or not it was ever ingested, and the second
-    # `exists()` is simply false when the prune already took it.
+    # The raw Codex copy and the prepare sidecar are listed here as well as in
+    # `_artifact_paths`: this path deletes a run whether or not it was ever
+    # ingested, and the second `exists()` is simply false when the prune
+    # already took them.
     ap = _artifact_paths(target) or {}
     extra = []
     try:
         logp = Path(target.get("log", ""))
         if str(logp.resolve()).startswith(str(_logs_root())):
             extra = [logp.with_name(logp.stem + ".stream.ndjson.raw"),
+                     Path(str(logp) + ".prepare"),
                      Path(str(logp) + ".watchdog"), Path(str(logp) + ".stdin"),
                      Path(str(logp) + ".turnend")]
     except Exception:  # noqa: BLE001
@@ -1489,7 +1507,8 @@ def _forget_stranded_row(jid, start, removed):
                 for p in (logp, logp.with_name(logp.stem + ".stream.ndjson"),
                           logp.with_name(logp.stem + ".stream.ndjson.raw"),
                           logp.with_name(logp.stem + ".precheck.txt"),
-                          Path(str(logp) + ".err"), Path(str(logp) + ".watchdog")):
+                          Path(str(logp) + ".err"), Path(str(logp) + ".prepare"),
+                          Path(str(logp) + ".watchdog")):
                     if p.exists():
                         p.unlink()
                         removed["files"] += 1

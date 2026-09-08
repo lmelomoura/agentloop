@@ -8864,7 +8864,7 @@ If the work turns out to be already finished, or it can no longer be done at all
     if [ "$_prep_rc" -eq 0 ]; then
       log_tick "$id: deterministic phase ran before the agent (prepare, ${_prep_secs}s) — the Codex shell tool cannot be trusted to wait for it"
     else
-      log_tick "$id: prepare failed before the agent (rc $_prep_rc, ${_prep_secs}s) — the close will cap the analysis"
+      log_tick "$id: prepare failed before the agent (rc $_prep_rc, ${_prep_secs}s) — the close will cap the analysis — output in ${logfile##*/}.prepare"
     fi
   fi
 
@@ -9704,8 +9704,8 @@ PLIST
   echo "Platforms      :"
   # A fresh install with Codex signed in has no catalog yet, and the block
   # would read "catalog never (0 models)" on the one occasion somebody looks at
-  # it. Resolve once here -- the real codex, which platform_ready just ran
-  # anyway. `agentloop status` stays read-only.
+  # it. Resolve once here -- the real codex, which the platforms block below
+  # runs anyway. `agentloop status` stays read-only.
   openai_catalog_ensure >/dev/null 2>&1 || true
   status_platforms_block | sed 's/^/  /'
   # The agent prompts make these skills mandatory by name. A fresh clone whose

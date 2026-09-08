@@ -3786,7 +3786,11 @@ async function saveEditor(){
       id=wantId; editingId=wantId;
       toast("Renamed to "+wantId, false, "check");
     }
-    const setF=async(field,value,cur)=> String(value)===String(cur) ? true : api("set_field",{id,field,value:String(value)});
+    // `force` sends the field even when the screen matches `j`: `j` is the job
+    // BEFORE this save, and a platform write below makes the engine rewrite
+    // what it governs on disk -- a value equal to the old one is then exactly
+    // the one that must be sent again.
+    const setF=async(field,value,cur,force)=> (String(value)===String(cur) && !force) ? true : api("set_field",{id,field,value:String(value)});
     // Platform FIRST: the engine rewrites model, effort and permission_mode to
     // the new platform's defaults when it changes, and every field below is
     // then saved on top of that -- sent after them, the rewrite would undo
@@ -3796,16 +3800,22 @@ async function saveEditor(){
     // what resolve() will answer once the new project is saved: a job with no
     // platform of its own would silently follow it, so make the choice explicit
     const nextPlat=ALApp.platformOf(j, np?projById(np):null);
-    if(f.platform!==curPlat || f.platform!==nextPlat){ if(!await api("set_field",{id,field:"platform",value:f.platform})) return; }
+    const platSent=(f.platform!==curPlat || f.platform!==nextPlat);
+    if(platSent){ if(!await api("set_field",{id,field:"platform",value:f.platform})) return; }
     const prompt=$("ed-prompt").value.trim();
     if(prompt && prompt!==(j.prompt||"")){ if(!await api("set_prompt",{id,prompt})) return; }
     const pc=$("ed-precheck").value;
     if(pc.trim() && pc!=="loading…" && pc!==editingPrecheck){
       if(!await api("set_precheck",{id,script:pc})) return; }
     if(!await setF("interval_seconds",f.secs,j.interval_seconds||300)) return;
-    if(!await setF("model",f.model,j.model||"opus")) return;
-    if(!await setF("effort",f.effort,j.effort||"")) return;
-    if(!await setF("interactive",String(f.interactive),String(j.interactive===true))) return;
+    // The four the platform governs are re-sent whenever it was: the engine
+    // cleared or rewrote them the moment the platform changed, so what the
+    // screen shows is only what the job has if it is sent again (an effort
+    // both platforms' models know, say, would otherwise be skipped as
+    // "unchanged" and end up cleared on disk while the page still shows it).
+    if(!await setF("model",f.model,j.model||"opus",platSent)) return;
+    if(!await setF("effort",f.effort,j.effort||"",platSent)) return;
+    if(!await setF("interactive",String(f.interactive),String(j.interactive===true),platSent)) return;
     if(!await setF("active_hours",f.hours,j.active_hours||"")) return;
     if(!await setF("active_days",f.days.join(","),(j.active_days||[]).join(","))) return;
     const curBudget=(j.max_budget_usd!=null?+j.max_budget_usd:null);
@@ -3824,7 +3834,7 @@ async function saveEditor(){
     if(!await setF("description",$("ed-desc").value.trim(),j.description||"")) return;
     const cwdVal = $("ed-cwd").disabled ? "" : $("ed-cwd").value.trim();
     if(!await setF("cwd",cwdVal,j.cwd||"")) return;
-    if(!await setF("permission_mode",$("ed-perm").value,j.permission_mode||"dontAsk")) return;
+    if(!await setF("permission_mode",$("ed-perm").value,j.permission_mode||"dontAsk",platSent)) return;
     edWiz.markClean(); $("editor").close(); toast("Saved "+id); refresh();
   } finally { btn.disabled=false; }
 }
