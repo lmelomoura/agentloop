@@ -239,7 +239,7 @@ A job is one object in `config/jobs.json`. Fields:
 | `daily_budget_usd` | ceiling on total spend per day (**omit = no cap**) |
 | `stall_timeout_seconds` | kill a run only after this long with **no output** (default 1200) |
 | `timeout_seconds` | optional absolute time cap (**omit = no limit**) |
-| `permission_mode` | `dontAsk`, `bypassPermissions` (full autonomy, needed for headless tool use), … On `openai`: `read-only`, `workspace-write` or `full-access` |
+| `permission_mode` | `dontAsk`, `bypassPermissions` (full autonomy, needed for headless tool use), … On `openai`: `read-only` (no writes, no network), `workspace-write` (writes inside the worktree, network open) or `full-access` (no sandbox) |
 | `allowed_tools` | allowlist passed as `--allowedTools`, whole and as a single argument — so a comma-separated list *and* a specifier containing a space, like `Bash(git *)`, both arrive intact (**omit = every tool**) |
 | `disallowed_tools` | denylist passed as `--disallowedTools`, same handling (**omit = nothing denied**). Set both fields and **deny wins** for any tool named in each — an allowlist can never re-open what the denylist closed. A security analysis is derived with `Agent` here (the CLI's own tool roster calls that tool `Task`), so it cannot spend its budget on subagents instead of triage |
 
@@ -774,6 +774,7 @@ that platform's vocabulary.
 | `model` | a family (`opus`) or an id (`claude-opus-5`) | a catalog slug (`gpt-5.6-sol`), verbatim — no families |
 | `effort` | `low` `medium` `high` `xhigh` `max` | the model's own levels (`gpt-5.6-sol` goes up to `ultra`) |
 | `permission_mode` | `dontAsk`, `bypassPermissions`, … | `read-only`, `workspace-write`, `full-access` |
+| the network | open in every mode | `workspace-write` sandboxes the filesystem and **keeps the network** (the CLI seals it by default; the engine passes `sandbox_workspace_write.network_access=true`, because every job here talks to a tracker or a forge). `read-only` is sealed to both. `full-access` has no sandbox |
 | `interactive` | yes | no — `codex exec` has no stdin protocol; the run is refused |
 | `allowed_tools`, `disallowed_tools` | yes | ignored, with a line in `tick.log`: Codex cannot close a tool by flag (measured: `--disable multi_agent` leaves `spawn_agent` in the roster) |
 | `max_budget_usd` | `--max-budget-usd`, stops the run | no flag: the cap is read at the end and produces the BUDGET LIMITED warning |
