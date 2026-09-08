@@ -242,6 +242,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   codex-cli 0.153.4: the same `curl` returns 000 inside the mode and 200 with
   the override.
 
+- **An OpenAI run can commit again in the worktree it was isolated into.** A
+  run works in a `git worktree add` checkout, whose `.git` is a FILE pointing
+  at the canonical repo's `.git/worktrees/<name>` — so the index, the refs and
+  every object a commit writes land OUTSIDE the run's tree, which the
+  `workspace-write` sandbox refuses: `fatal: Unable to create
+  '<repo>/.git/worktrees/<name>/index.lock': Operation not permitted`. No
+  commit, no branch, no `git fetch` — for a dev or promote agent, nothing at
+  all. The launch line now declares each repo's git directory (and only that,
+  never the canonical checkout) in `sandbox_workspace_write.writable_roots`,
+  one entry per repo of a multi-repo run. Measured through the engine: an
+  OpenAI job on `workspace-write` now lands its commit in an isolated
+  worktree, and the run is warned as UNDELIVERED because it was never pushed —
+  which is the classifier working, not the sandbox. A probe written under
+  `/tmp` proves nothing here: the sandbox allows that directory by default.
+
 - **`selftest` no longer trips its own home-directory rule on the migration case, and
   runs that rule inside a git worktree too.** The fake `HOME` the case builds was a
   path segment named `home`, which the rule reads as a real home directory; and the

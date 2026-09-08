@@ -1330,11 +1330,45 @@ platform_stderr_filter() { # platform_stderr_filter <platform> <errfile>
   return 0
 }
 
+# Where a run's git writes actually land. A run works in `git worktree add`
+# checkouts, and such a checkout's `.git` is a FILE pointing at the canonical
+# repo's `.git/worktrees/<name>` -- so the index, the refs and every new object
+# a commit creates are written OUTSIDE the run's own tree. The workspace-write
+# sandbox only makes the tree writable, so git dies there:
+#
+#   fatal: Unable to create '<repo>/.git/worktrees/<name>/index.lock':
+#          Operation not permitted
+#
+# (measured on codex-cli 0.153.4: a plain `git commit --allow-empty` fails in a
+# worktree checkout under -s workspace-write, and succeeds with the directory
+# below declared writable. It passes silently under /tmp, which the sandbox
+# allows by default -- so a probe written there proves nothing.)
+#
+# One line per repo the run touches: the primary checkout plus, on a multi-repo
+# project, every sibling worktree in the run directory. Only the git DIRECTORY
+# is opened, never the canonical checkout: the run still cannot write into the
+# working copy it was isolated from.
+openai_writable_roots() { # openai_writable_roots <run_cwd> [run_dir] -> absolute paths, one per line
+  local cwd="$1" run_dir="${2:-}"
+  {
+    printf '%s\n' "$cwd"
+    [ -n "$run_dir" ] && [ -d "$run_dir" ] \
+      && find "$run_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null
+  } | while IFS= read -r d; do
+        [ -n "$d" ] && [ -d "$d" ] || continue
+        gcd="$(git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || continue
+        [ -n "$gcd" ] || continue
+        case "$gcd" in /*) ;; *) gcd="$d/$gcd" ;; esac
+        gcd="$(cd "$gcd" 2>/dev/null && pwd -P)" || continue
+        printf '%s\n' "$gcd"
+      done | sort -u
+}
+
 # The launch line of an OpenAI run, into PLATFORM_ARGV (bash 3.2 cannot return
 # an array). Every flag was measured; the comments say where.
 PLATFORM_ARGV=()
-platform_argv_openai() { # platform_argv_openai <resume-sid> <run_cwd> <model> <effort> <permission> <prompt>
-  local resume_sid="$1" run_cwd="$2" model="$3" effort="$4" permission="$5" prompt="$6"
+platform_argv_openai() { # platform_argv_openai <resume-sid> <run_cwd> <model> <effort> <permission> <prompt> [writable-roots]
+  local resume_sid="$1" run_cwd="$2" model="$3" effort="$4" permission="$5" prompt="$6" roots="${7:-}"
   if [ -n "$resume_sid" ]; then
     # `exec resume` takes neither -s nor -C: the sandbox travels as a config
     # override and the cwd is the process's own -- run_job cd's there first
@@ -1363,8 +1397,18 @@ platform_argv_openai() { # platform_argv_openai <resume-sid> <run_cwd> <model> <
       # mode keeps the filesystem sandbox it is named for and gets the network
       # back; read-only stays sealed to both, which is what makes it the
       # look-only mode, and full-access has no sandbox at all.
-      [ "$permission" = "workspace-write" ] \
-        && PLATFORM_ARGV+=(-c "sandbox_workspace_write.network_access=true") ;;
+      if [ "$permission" = "workspace-write" ]; then
+        PLATFORM_ARGV+=(-c "sandbox_workspace_write.network_access=true")
+        # The git directories the run's own commits have to reach (see
+        # openai_writable_roots). A JSON array is valid TOML for the CLI's
+        # `-c` parser, and jq is what quotes a path with a space in it.
+        if [ -n "$roots" ]; then
+          local _wr
+          _wr="$(printf '%s\n' "$roots" | grep -v '^$' | "$JQ" -R . | "$JQ" -sc .)"
+          [ -n "$_wr" ] && [ "$_wr" != "[]" ] \
+            && PLATFORM_ARGV+=(-c "sandbox_workspace_write.writable_roots=$_wr")
+        fi
+      fi ;;
     full-access) PLATFORM_ARGV+=(--dangerously-bypass-approvals-and-sandbox) ;;
   esac
   [ -n "$resume_sid" ] && PLATFORM_ARGV+=("$resume_sid")
@@ -3428,10 +3472,48 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -q 'network_access' \
     && bad "read-only was given the network" || ok "read-only stays sealed to the network too"
   [ "${PLATFORM_ARGV[$((${#PLATFORM_ARGV[@]} - 3))]}" = "thr-1" ] && ok "the thread id sits right before --" || bad "thread id misplaced"
-  # Last, because it REPLACES the argv every assertion above reads.
+  # Last, because these REPLACE the argv every assertion above reads.
   platform_argv_openai thr-2 /tmp/w gpt-a low workspace-write "P"
   printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qx -- 'sandbox_workspace_write.network_access=true' \
     && ok "and a resumed workspace-write run keeps its network" || bad "the resume lost the network override"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -q 'writable_roots' \
+    && bad "writable_roots emitted with no roots to declare" || ok "no writable_roots when the caller names none"
+  platform_argv_openai "" /tmp/w gpt-a low workspace-write "P" "$(printf '/a b/.git\n/c/.git\n')"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -qxF -- 'sandbox_workspace_write.writable_roots=["/a b/.git","/c/.git"]' \
+    && ok "the git dirs are declared writable, as a TOML array jq quoted" || bad "writable_roots: $(printf '%s\n' "${PLATFORM_ARGV[@]}" | grep writable_roots)"
+  platform_argv_openai "" /tmp/w gpt-a low read-only "P" "$(printf '/a/.git\n')"
+  printf '%s\n' "${PLATFORM_ARGV[@]}" | grep -q 'writable_roots' \
+    && bad "read-only was handed a writable root" || ok "read-only writes nowhere, roots or no roots"
+
+  echo "openai_writable_roots() — the git directory a worktree checkout really writes to"
+  local _wrout
+  _wrout="$(
+    mkdir -p "$tmp/wr"
+    git init -q "$tmp/wr/repo"
+    printf 'seed\n' > "$tmp/wr/repo/README"
+    git -C "$tmp/wr/repo" add -A
+    git -C "$tmp/wr/repo" -c user.email=t@local -c user.name=t commit -qm seed
+    mkdir -p "$tmp/wr/run"
+    git -C "$tmp/wr/repo" worktree add -q -b wrbranch "$tmp/wr/run/repo" >/dev/null 2>&1
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+    _real="$(cd "$tmp/wr/repo/.git" && pwd -P)"
+    [ "$(openai_writable_roots "$tmp/wr/run/repo")" = "$_real" ] \
+      && ok "a worktree checkout resolves to the canonical repo's git directory" \
+      || bad "got '$(openai_writable_roots "$tmp/wr/run/repo")' want '$_real'"
+    [ "$(openai_writable_roots "$tmp/wr/run/repo" "$tmp/wr/run" | wc -l | tr -d ' ')" = "1" ] \
+      && ok "the same repo listed twice is declared once" \
+      || bad "duplicates: $(openai_writable_roots "$tmp/wr/run/repo" "$tmp/wr/run" | tr '\n' ' ')"
+    mkdir -p "$tmp/wr/plain"
+    [ -z "$(openai_writable_roots "$tmp/wr/plain")" ] \
+      && ok "a directory that is no repo declares nothing" || bad "a non-repo produced a root"
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_wrout" | grep -v '^RESULT '
+  printf '%s\n' "$_wrout" | grep -qx 'RESULT ok=3 bad=0' \
+    && ok "openai_writable_roots over a real worktree: all 3 assertions reach the gate" \
+    || bad "openai_writable_roots did not: $(printf '%s\n' "$_wrout" | tail -1)"
 
   echo "platform_finish() — the model that ran comes from the rollout"
   mkdir -p "$tmp/ch/sessions/2026/09/05"
@@ -8903,7 +8985,8 @@ If the work turns out to be already finished, or it can no longer be done at all
     # on stdin for ever (measured).
     rawfifo="$logfile.raw.fifo"
     rm -f "$rawfifo"; mkfifo "$rawfifo" 2>/dev/null
-    platform_argv_openai "$resume_sid" "$run_cwd" "$model" "$effort" "$permission" "$prompt"
+    platform_argv_openai "$resume_sid" "$run_cwd" "$model" "$effort" "$permission" "$prompt" \
+      "$(openai_writable_roots "$run_cwd" "$run_dir")"
     (
       cd "$run_cwd" || exit 1
       exec env ${run_env[@]+"${run_env[@]}"} "$CODEX_BIN" ${PLATFORM_ARGV[@]+"${PLATFORM_ARGV[@]}"} \
