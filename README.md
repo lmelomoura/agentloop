@@ -775,6 +775,7 @@ that platform's vocabulary.
 | `effort` | `low` `medium` `high` `xhigh` `max` | the model's own levels (`gpt-5.6-sol` goes up to `ultra`) |
 | `permission_mode` | `dontAsk`, `bypassPermissions`, … | `read-only`, `workspace-write`, `full-access` |
 | the network | open in every mode | `workspace-write` sandboxes the filesystem and **keeps the network** (the CLI seals it by default; the engine passes `sandbox_workspace_write.network_access=true`, because every job here talks to a tracker or a forge). `read-only` is sealed to both. `full-access` has no sandbox |
+| writing git history | anywhere the account can | a run's checkout is a `git worktree`, so its commits write into the canonical repo's `.git` — outside the sandbox, and refused there. The engine declares that directory (only it, never the canonical checkout) in `sandbox_workspace_write.writable_roots`, one entry per repo of the run |
 | `interactive` | yes | no — `codex exec` has no stdin protocol; the run is refused |
 | `allowed_tools`, `disallowed_tools` | yes | ignored, with a line in `tick.log`: Codex cannot close a tool by flag (measured: `--disable multi_agent` leaves `spawn_agent` in the roster) |
 | `max_budget_usd` | `--max-budget-usd`, stops the run | no flag: the cap is read at the end and produces the BUDGET LIMITED warning |

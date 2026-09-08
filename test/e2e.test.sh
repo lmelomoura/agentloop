@@ -384,7 +384,7 @@ dd="$(idx_in "$argv17" --)"; [ -n "$dd" ] && [ "$((dd + 1))" = "$argc17" ] \
   && ok "the prompt is the one argument after --" || bad "-- at '$dd', argc $argc17"
 
 echo
-echo "17b. a workspace-write run gets its network back, which the sandbox seals by default"
+echo "17b. a workspace-write run gets back the network AND the git directory its commits write to"
 argv17b="$ROOT/argv-17b"; rm -f "$argv17b"
 mkjob_openai j17b workspace-write
 FAKE_ARGV_OUT="$argv17b" FAKE_MODE=complete FAKE_SESSION=thr-argv-net "$AL" run j17b >/dev/null 2>&1
@@ -393,6 +393,13 @@ si="$(idx_in "$argv17b" -s)"; [ "$(at_in "$argv17b" $((si + 1)))" = "workspace-w
   && ok "-s workspace-write" || bad "-s '$(at_in "$argv17b" $((si + 1)))'"
 [ -n "$(idx_in "$argv17b" sandbox_workspace_write.network_access=true)" ] \
   && ok "-c sandbox_workspace_write.network_access=true, bare" || bad "no network override: every API this fleet talks to is unreachable"
+# The run works in a `git worktree add` checkout, so its commits write into
+# $ROOT/work/app/.git -- outside the tree, and denied without this.
+wr17b="$(awk -F'\t' '$2 ~ /^sandbox_workspace_write.writable_roots=/ {print $2; exit}' "$argv17b")"
+case "$wr17b" in
+  *"\"$ROOT/work/app/.git\""*) ok "-c writable_roots names the canonical repo's git directory" ;;
+  *) bad "writable_roots is '${wr17b:-missing}'" ;;
+esac
 
 echo
 echo "18. a spent OpenAI quota is rate_limited, outside the backoff"
