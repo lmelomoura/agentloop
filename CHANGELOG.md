@@ -230,6 +230,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The Claude account pinned at install time finally reaches the runs.** The
+  installer wrote it into both `launchd` plists as `CLAUDE_CONFIG_DIR` and
+  printed it back as `Claude account : …`, but the engine reads
+  `AGENTLOOP_CLAUDE_CONFIG_DIR` alone and discards an ambient
+  `CLAUDE_CONFIG_DIR` on purpose — so `launchd` handed the tick a pin the
+  engine threw away, and every scheduled run signed in as the CLI's own
+  `~/.claude` instead. Only a project's `claude_config_dir` ever worked. The
+  entry that introduced the anti-ambient rule claimed "scheduled runs were
+  never affected, `launchd` inheriting no shell environment"; that overlooked
+  the plists' own `EnvironmentVariables`, which is exactly the shell
+  environment `launchd` does hand over. Both plists now carry
+  `AGENTLOOP_CLAUDE_CONFIG_DIR` as well, `installed_config_dir` reads a pin
+  under either name (so an install written before this keeps it), and the
+  anti-ambient rule is untouched: a run typed inside a Claude Code session
+  still cannot borrow that session's account. What it cost to not have it: two
+  accounts on one Mac, an installer that said which one was in force, and every
+  scheduled run using the other one — with nothing in the run record naming it.
+  `test/e2e.test.sh` now drives the whole chain and reads the account back off
+  the stand-in CLI, which is the test that was missing.
+
+- **The control server's `launchd` plist is valid XML again.** Its comment
+  carried a `--`, which XML forbids inside a comment. Apple's own parser
+  tolerates it — `plutil -lint` says OK and the agent loads — but every
+  standard reader refuses the file, `plistlib` included, which is what this
+  engine uses to read a pinned account back out of a plist.
+
 - **An OpenAI run on `workspace-write` can reach the network again.** The Codex
   sandbox seals the network as well as the filesystem in that mode, which its
   name does not say and this scheduler cannot live with: every job here talks

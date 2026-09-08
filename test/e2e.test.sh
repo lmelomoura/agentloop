@@ -529,5 +529,27 @@ grep -q 'ALREADY RAN for this analysis' "$prompt24" && ! grep -q 'YOUR FIRST COM
 sleep 1
 
 echo
+echo "25. the account the installer pinned is the account the agent signs in as"
+# The chain nobody had driven end to end: launchd hands the tick the plist's
+# EnvironmentVariables, the engine reads AGENTLOOP_CLAUDE_CONFIG_DIR (and
+# discards an ambient CLAUDE_CONFIG_DIR on purpose), and the CLI inherits it.
+# The plists used to name only the CLI's variable, so the pin died at the door
+# and every scheduled run signed in as the default account instead.
+mkjob j25
+acct25="$ROOT/account-25"; rm -f "$acct25"
+FAKE_ACCOUNT_OUT="$acct25" AGENTLOOP_CLAUDE_CONFIG_DIR="$ROOT/pinned-account" \
+  FAKE_MODE=complete FAKE_SESSION=sess-acct "$AL" run j25 >/dev/null 2>&1
+[ "$(cat "$acct25" 2>/dev/null)" = "$ROOT/pinned-account" ] \
+  && ok "the agent runs under the pinned account" || bad "the agent saw '$(cat "$acct25" 2>/dev/null)'"
+# ...and an account nobody pinned stays the CLI's own default, so a run never
+# borrows whichever account the shell that started it happened to export.
+rm -f "$acct25"
+FAKE_ACCOUNT_OUT="$acct25" CLAUDE_CONFIG_DIR="$ROOT/someones-session" \
+  FAKE_MODE=complete FAKE_SESSION=sess-acct2 "$AL" run j25 >/dev/null 2>&1
+[ -z "$(cat "$acct25" 2>/dev/null)" ] \
+  && ok "and an ambient one is not borrowed" || bad "the agent inherited '$(cat "$acct25" 2>/dev/null)'"
+sleep 1
+
+echo
 printf '\n  %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
