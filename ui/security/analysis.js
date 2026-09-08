@@ -3,8 +3,8 @@ import { $, AL, api, toast, projById, fmtDur, fmtWhen, money, createCombo,
          makePicker, pushNav, markPending, clearPending, isPending } from "./page.js";
 import { secIcon, secIconHTML, secEl, secFetch } from "./dom.js";
 import { SEC_POLL_MS, SEC_PROFILES, SEC_STATES, SEC_STATE_HELP, SEC_STATE_LABEL,
-         SEC_NEVER, secCategoryMeta, secDefaultProfile, secMinSeverity,
-         secRepos, secSevKey, secSevRank, secStateKey, secVisible } from "./vocabulary.js";
+         SEC_NEVER, secCategoryMeta, secCfg, secDefaultProfile, secMinSeverity,
+         secPlatformLabel, secRepos, secSevKey, secSevRank, secStateKey, secVisible } from "./vocabulary.js";
 import { secState } from "./state.js";
 import { secInvalidateIndex, secRenderIndex, secLoadIndex } from "./index-screen.js";
 import { secRunFor, secRenderHistory } from "./history.js";
@@ -374,6 +374,12 @@ function secRenderRunMeta(a){
   grid.appendChild(cell("Date", document.createTextNode(fmtWhen(a.started))));
   grid.appendChild(cell("Cost", document.createTextNode(
     a.spend_usd ? money(a.spend_usd) : "—")));
+  // Which CLI ran it: the run's own platform when the journal has it, else
+  // what the project's security block would launch today. A cell worth
+  // having only now that there are two answers.
+  const run = secRunFor(a), proj = projById(secState.project) || {};
+  const plat = (run && run.platform) || secCfg(secState.project).platform || proj.platform || "anthropic";
+  grid.appendChild(cell("Runs on", document.createTextNode(secPlatformLabel(plat))));
   host.appendChild(grid);
 }
 

@@ -817,6 +817,19 @@ document.documentElement.dataset.theme =
   </div><!-- /pane when -->
 
   <div class="tabpane" data-edpane="agent">
+  <label>Platform</label>
+  <div class="combo" id="ed-platform-combo">
+    <button type="button" class="combo-trigger" id="ed-platform-trigger" aria-haspopup="listbox" aria-expanded="false">
+      <span class="combo-val" id="ed-platform-val">Anthropic</span>
+      <span class="combo-caret"></span>
+    </button>
+    <div class="combo-pop" id="ed-platform-pop" hidden>
+      <input type="text" class="combo-search" id="ed-platform-search" placeholder="Search platforms…" autocomplete="off">
+      <ul class="combo-list" id="ed-platform-opts" role="listbox"></ul>
+    </div>
+    <input type="hidden" id="ed-platform">
+  </div>
+  <p class="fieldhelp" id="ed-platform-note">Which CLI runs this job: Claude Code (Anthropic) or the Codex CLI (OpenAI). Changing it resets the model, effort and permission mode to that platform's defaults. Moving the job to a project on the other platform keeps this choice and sets it on the job. A job being created takes its project's.</p>
   <div class="row2">
     <div><label>Model</label>
       <div class="combo" id="ed-model-combo">
@@ -839,7 +852,7 @@ document.documentElement.dataset.theme =
   <label>Permission mode</label>
   <div class="combo" id="ed-perm-combo">
     <button type="button" class="combo-trigger" id="ed-perm-trigger" aria-haspopup="listbox" aria-expanded="false">
-      <span class="combo-val" id="ed-perm-val">dontAsk — run tools without prompting</span>
+      <span class="combo-val" id="ed-perm-val">dontAsk — allowlisted tools only, no prompts</span>
       <span class="combo-caret"></span>
     </button>
     <div class="combo-pop" id="ed-perm-pop" hidden>
@@ -851,12 +864,13 @@ document.documentElement.dataset.theme =
   <p class="fieldhelp">Controls how the agent can use tools during the run.</p>
   <label class="checkline"><input type="checkbox" id="ed-interactive">
     Interactive — keep a terminal open so you can talk to the run while it works</label>
-  <p class="fieldhelp">You can interact with the agent while the job is running.</p>
+  <p class="fieldhelp" id="ed-interactive-help">You can interact with the agent while the job is running.</p>
   </div><!-- /pane agent -->
 
   <div class="tabpane" data-edpane="limits">
   <p class="sechint">Every one of these is optional. Left empty, the job runs until it is
     done and spends what it spends.</p>
+  <p class="hint" id="ed-limits-note" hidden></p>
   <div class="row2">
     <div><label>Max budget per run — empty = no cap</label>
       <div class="moneyin"><span class="cur">$</span>
@@ -938,6 +952,22 @@ document.documentElement.dataset.theme =
     <input id="pj-name" type="text" placeholder="e.g. my-repo" autocomplete="off"></div>
   <label>Description — passed to the agent as context on every run</label>
   <textarea id="pj-desc" style="min-height:110px"></textarea>
+  <label>Platform — which CLI this project's jobs run on unless a job sets its own</label>
+  <div class="combo" id="pj-platform-combo">
+    <button type="button" class="combo-trigger" id="pj-platform-trigger" aria-haspopup="listbox" aria-expanded="false">
+      <span class="combo-val" id="pj-platform-val">Anthropic</span>
+      <span class="combo-caret"></span>
+    </button>
+    <div class="combo-pop" id="pj-platform-pop" hidden>
+      <input type="text" class="combo-search" id="pj-platform-search" placeholder="Search platforms…" autocomplete="off">
+      <ul class="combo-list" id="pj-platform-opts" role="listbox"></ul>
+    </div>
+    <input type="hidden" id="pj-platform">
+  </div>
+  <p class="fieldhelp">Anthropic is Claude Code, OpenAI is the Codex CLI. A job with a platform of its own keeps
+    it; one that inherits this runs on it from its next start — and, while it still names a model the
+    new platform does not know, fails there (towards OpenAI, refused in <code>tick.log</code> before a
+    slot is taken).</p>
   <label>Working directory (cwd) — jobs in this project inherit it unless they set their own</label>
   <div class="cwdrow">
     <input id="pj-cwd" type="text" placeholder="click Browse to choose a folder" readonly data-cwd-target="pj-cwd" class="cwd-ro">
@@ -958,7 +988,8 @@ document.documentElement.dataset.theme =
          autocomplete="off" spellcheck="false">
   <p class="fieldhelp">Exported to runs as <code>CLAUDE_CONFIG_DIR</code> (e.g. <code>~/.claude-work</code>).
     Empty inherits the scheduler's own account; once runs exist, keep it stable —
-    a resumed session is looked up inside the account that created it.</p>
+    a resumed session is looked up inside the account that created it. Anthropic runs only — a run
+    on OpenAI signs in as the Codex CLI's own account (<code>codex login</code>).</p>
   </div><!-- /pane project -->
 
   <div class="tabpane" data-pjpane="repos">
@@ -1019,6 +1050,21 @@ document.documentElement.dataset.theme =
   </div>
   <input type="checkbox" id="sec-enabled" hidden>
   <p class="fieldhelp">A project can be registered for security analysis alone — no jobs required.</p>
+  <label>Platform</label>
+  <div class="combo" id="sec-platform-combo">
+    <button type="button" class="combo-trigger" id="sec-platform-trigger" aria-haspopup="listbox" aria-expanded="false">
+      <span class="combo-val" id="sec-platform-val">— Inherit the project's —</span>
+      <span class="combo-caret"></span>
+    </button>
+    <div class="combo-pop" id="sec-platform-pop" hidden>
+      <input type="text" class="combo-search" id="sec-platform-search" placeholder="Search platforms…" autocomplete="off">
+      <ul class="combo-list" id="sec-platform-opts" role="listbox"></ul>
+    </div>
+    <input type="hidden" id="sec-platform">
+  </div>
+  <p class="fieldhelp">Which CLI runs the analysis — the project's platform unless set here. On OpenAI
+    nothing can close the agent's subagents by flag, so the prompt forbids them; the run is priced
+    from tokens like any Codex run.</p>
   <div class="row2">
     <div><label>Model</label>
       <div class="combo" id="sec-model-combo">
@@ -1032,7 +1078,7 @@ document.documentElement.dataset.theme =
         </div>
         <input type="hidden" id="sec-model">
       </div>
-      <p class="fieldhelp">The model the analysis runs as — defaults to the opus family.</p></div>
+      <p class="fieldhelp" id="sec-model-help">The model the analysis runs as — defaults to the opus family.</p></div>
     <div><label>Effort <span class="efflabel" id="sec-effort-label">—</span></label>
       <input type="range" id="sec-effort" class="effslider" min="0" max="5" step="1" value="0">
       <div class="effends"><span>Faster</span><span>Smarter</span></div>
@@ -1041,7 +1087,7 @@ document.documentElement.dataset.theme =
   <label>Permission mode</label>
   <div class="combo" id="sec-perm-combo">
     <button type="button" class="combo-trigger" id="sec-perm-trigger" aria-haspopup="listbox" aria-expanded="false">
-      <span class="combo-val" id="sec-perm-val">bypassPermissions — full autonomy (headless default)</span>
+      <span class="combo-val" id="sec-perm-val">bypassPermissions — nothing asks</span>
       <span class="combo-caret"></span>
     </button>
     <div class="combo-pop" id="sec-perm-pop" hidden>
@@ -1050,12 +1096,13 @@ document.documentElement.dataset.theme =
     </div>
     <input type="hidden" id="sec-perm">
   </div>
-  <p class="fieldhelp">How the analysis agent may use tools — dontAsk without an allowlist denies
+  <p class="fieldhelp" id="sec-perm-help">How the analysis agent may use tools — dontAsk without an allowlist denies
     everything headless, but the ledger stays protected by the CLI's validating door either way.</p>
   <label>Claude account — which account signs the analysis</label>
   <input id="sec-cfgdir" type="text" placeholder="inherits the project's" autocomplete="off" spellcheck="false">
   <p class="fieldhelp">Empty inherits this project's own Claude account above; set it only when the
-    analysis itself should sign in as someone else.</p>
+    analysis itself should sign in as someone else. Anthropic runs only — a run on OpenAI signs in
+    as the Codex CLI's own account (<code>codex login</code>).</p>
   <label>Default profile — offered first when you open Analyse for this project</label>
   <div class="combo" id="sec-profile-default-combo">
     <button type="button" class="combo-trigger" id="sec-profile-default-trigger" aria-haspopup="listbox" aria-expanded="false">
@@ -1495,7 +1542,7 @@ function backoffMultiplier(streak){
   return Math.min(BACKOFF_MAX, Math.pow(2, s-BACKOFF_AFTER+1));
 }
 // effort level → human label (empty = the flag is omitted and the CLI decides)
-const EFFORT_LABELS={"":"default","low":"Low","medium":"Medium","high":"High","xhigh":"Extra high","max":"Max"};
+const EFFORT_LABELS={"":"default","low":"Low","medium":"Medium","high":"High","xhigh":"Extra high","max":"Max","ultra":"Ultra"};
 const effortLabel=(v)=>EFFORT_LABELS[v||""]||v;
 const fmtBytes=(b)=>{ if(!b) return "0 B"; const u=["B","KB","MB","GB"]; let i=0;
   while(b>=1024 && i<u.length-1){ b/=1024; i++; } return (i?b.toFixed(1):b)+" "+u[i]; };
@@ -2389,6 +2436,7 @@ function collectRepos(){
 }
 function openProjectEditor(name){
   editingProject=name||null;
+  secPlatApplied="";   // a freshly opened project always applies its platform
   const p=name?projById(name):null;
   $("pj-halo").innerHTML=name?I.pencil:I.plus;
   $("pj-title").textContent=name?("Edit project — "+name):"New project";
@@ -2447,11 +2495,17 @@ function openProjectEditor(name){
   const sec=(p&&p.security)||{};
   $("sec-enabled").checked = sec.enabled===true || sec.enabled==="true";
   paintSecEnabled();
-  if(secModelCombo) secModelCombo.set(sec.model||"", MODELS);
-  else $("sec-model").value = sec.model||"";
+  // Platform first, on both combos -- the project's own (anthropic when it has
+  // none), then the block's override (empty = inherit) -- because everything
+  // below is read against the platform that results.
+  pjPlatformCombo.set((p&&p.platform==="openai")?"openai":"anthropic", PLATFORM_OPTS);
+  secPlatformCombo.set((sec.platform==="openai"||sec.platform==="anthropic")?sec.platform:"", PLATFORM_OPTS);
+  const splat=secEffectivePlatform();
+  applyPlatformToSecurity(splat, false);
+  secModelCombo.set(sec.model||"");
+  if(splat==="openai") secEfforts=ALApp.effortsFor("openai", $("sec-model").value, PLATFORMS);
   effortSet("sec-effort","sec-effort-label", sec.effort||"");
-  if(secPermCombo) secPermCombo.set(sec.permission_mode||"bypassPermissions", PERMS);
-  else $("sec-perm").value = sec.permission_mode||"bypassPermissions";
+  secPermCombo.set(sec.permission_mode||ALApp.defaultPermissionFor(splat,"security"));
   $("sec-cfgdir").value = sec.claude_config_dir||"";
   $("sec-profile-default").value = ALSecurity.SEC_PROFILES.includes(sec.default_profile) ? sec.default_profile : "standard";
   // The hidden input above is the value saveProject reads; the combo also
@@ -2514,6 +2568,9 @@ async function saveProject(){
     // put a project back on the default account, and project-set merges, so a key
     // that is simply omitted would keep the old account forever.
     proj.claude_config_dir=$("pj-ccd").value.trim();
+    // Always sent, like claude_config_dir: project-set merges, and a project
+    // going back to Anthropic has to be able to say so.
+    proj.platform=$("pj-platform").value||"anthropic";
     // Send only .worktree.enabled: project-set merges (jq `. * $p`), so any
     // venv/env the project declares alongside it survives the save.
     const wv=$("pj-wt").value;
@@ -2541,13 +2598,16 @@ async function saveProject(){
     const minSev=$("sec-min-severity").value, profDef=$("sec-profile-default").value;
     proj.security = {
       enabled: $("sec-enabled").checked,
+      // "" = inherit the project's; the engine's security_derived_jobs reads it that way
+      platform: $("sec-platform").value,
       model: $("sec-model").value.trim(),
-      // Through the ONE canonical list (ALApp.EFFORTS, editor-domain.js).
-      // This read used to index a page-local copy: the label beside the
-      // slider and the value saved to disk each resolved their own array,
-      // and the day the two diverged the user would confirm one effort
-      // level on screen while a different one landed in the config --
-      // silently, since project_set accepts any string.
+      // Read against the Security pane's own ladder (secEfforts, rebuilt by
+      // applyPlatformToSecurity from editor-domain.js's effortsFor) -- the
+      // list the label beside the slider was drawn from. This read used to
+      // index a page-local copy: the label and the value saved to disk each
+      // resolved their own array, and the day the two diverged the user would
+      // confirm one effort level on screen while a different one landed in
+      // the config -- silently, since project_set accepts any string.
       effort: effortGet("sec-effort"),
       permission_mode: $("sec-perm").value||"bypassPermissions",
       claude_config_dir: $("sec-cfgdir").value.trim(),
@@ -2697,6 +2757,8 @@ function render(){
   const nWarn=rw.filter(r=>normStatus(r.status)==="warning").length;
   const nErr =rw.filter(r=>normStatus(r.status)==="error").length;
   const kpis={runsToday:rt.length, spentToday:sum(rt,r=>r.cost),
+              // the share of today that is our own estimate, for the card's sublabel
+              estToday:sum(rt.filter(r=>r.cost_basis==="estimated"),r=>r.cost),
               runsWeek:rw.length, spentWeek:sum(rw,r=>r.cost),
               warn:nWarn, err:nErr};
   ALApp.renderOverviewHead(kpis, (CFG.user||{}).name||"");
@@ -3120,6 +3182,10 @@ function syncCwdField(projectName){
     if(btn) btn.disabled = false;
     note.hidden = true; note.textContent = "";
   }
+  // A new job takes its project's platform the moment the project is picked
+  // (the engine's create does the same); an existing job keeps its own.
+  if(creating){ const plat=ALApp.platformOf({}, p);
+    if(plat!==$("ed-platform").value){ platformCombo.set(plat, PLATFORM_OPTS); applyPlatformToJobEditor(plat,false); } }
 }
 
 function initPromptEditor(){
@@ -3287,32 +3353,122 @@ function groupModels(ids){
   }
   return out;
 }
-let MODELS=[];
 async function loadModels(){
   try{
     const r=await fetch("/api/models",{headers:{"X-AL-Token":TOKEN}});
     if(!r.ok) return;
     const d=await r.json();
-    if(!d.models||!d.models.length) return;
-    MODELS=groupModels(d.models);
-    if(modelCombo) modelCombo.set(modelCombo.get(), MODELS);
-    if(secModelCombo) secModelCombo.set(secModelCombo.get(), MODELS);
-  }catch(e){ /* keep the built-in fallback list */ }
+    PLATFORMS=d.platforms||{};
+    refillPlatformBound();
+  }catch(e){ /* keep the built-in fallback lists */ }
+}
+// The option list of the model combo for one platform (editor-domain.js does
+// the shaping; groupModels is the page's own Anthropic grouping).
+function modelOptions(p){ return ALApp.modelOptionsFor(p, PLATFORMS, groupModels); }
+// Everything a platform governs, re-derived from the payload just fetched
+// without losing what the operator already has on screen.
+function refillPlatformBound(){
+  if(platformCombo) applyPlatformToJobEditor($("ed-platform").value||"anthropic", true);
+  if(secPlatformCombo) applyPlatformToSecurity(secEffectivePlatform(), true);
 }
 
-// Effort: slider position ↔ CLI value. 0 leaves it unset (the CLI decides).
-// slider stops, in order; labels come from the shared EFFORT_LABELS map
-// One slider, two homes: the job editor and the project editor's Security tab
-// share the exact control, so the same value reads the same everywhere.
-function effortSet(id,labelId,v){
-  const i=ALApp.effortIndex(v);
-  const level=ALApp.EFFORTS[i];
+// Effort: slider position ↔ CLI value. 0 leaves it unset (the CLI decides);
+// labels come from the shared EFFORT_LABELS map.
+// One slider, two homes, each with the ladder it was last built with: the
+// job editor reads edEfforts, the Security pane secEfforts. A ladder is the
+// platform's -- and on OpenAI the chosen model's -- so it is rebuilt whenever
+// either changes (applyPlatformToJobEditor / applyPlatformToSecurity).
+function ladderOf(id){ return id==="sec-effort" ? secEfforts : edEfforts; }
+function effortSet(id,labelId,v,list){
+  const L=list||ladderOf(id);
+  const i=ALApp.effortIndex(v,L);
+  $(id).max=String(L.length-1);
   $(id).value=String(i);
-  $(labelId).textContent=(level===""?"Default (CLI decides)":effortLabel(level));
+  $(labelId).textContent=(L[i]===""?"Default (CLI decides)":effortLabel(L[i]));
 }
-function effortGet(id){ return ALApp.effortFromIndex($(id).value); }
+function effortGet(id,list){ return ALApp.effortFromIndex($(id).value, list||ladderOf(id)); }
 function setEffort(v){ effortSet("ed-effort","ed-effort-label",v); }
 function getEffort(){ return effortGet("ed-effort"); }
+// What a platform governs in the job editor: the model list and default,
+// the effort ladder (the model's, on OpenAI), the permission modes and
+// default, Interactive (Codex exec has no stdin protocol) and the Limits
+// note. `keep` re-applies the same platform after /api/models answered --
+// nothing the operator chose is thrown away when the fresh payload lands.
+function applyPlatformToJobEditor(p, keep){
+  // The combo's fallback for an empty model is the platform's own default --
+  // "" on OpenAI with no catalog is honest (the engine refuses and says why),
+  // where "opus" would be a Codex slug that does not exist.
+  edModelCfg.def=ALApp.defaultModelFor(p,PLATFORMS)||(p==="openai"?"":"opus");
+  const opts=modelOptions(p);
+  const curModel=$("ed-model").value;
+  const known=opts.some(o=>!o.sec && o.v===curModel);
+  modelCombo.set((keep&&known)?curModel:ALApp.defaultModelFor(p,PLATFORMS), opts);
+  const effVal=keep?effortGet("ed-effort"):"";                  // read against the OLD ladder
+  edEfforts=ALApp.effortsFor(p, $("ed-model").value, PLATFORMS);
+  setEffort(edEfforts.includes(effVal)?effVal:"");
+  const perms=ALApp.permissionsFor(p,PLATFORMS), curPerm=$("ed-perm").value;
+  permCombo.set((keep&&perms.some(o=>o.v===curPerm))?curPerm:ALApp.defaultPermissionFor(p,"job"), perms);
+  const oa=(p==="openai"), ic=$("ed-interactive");
+  if(oa) ic.checked=false;
+  ic.disabled=oa;
+  $("ed-interactive-help").textContent = oa
+    ? "Codex exec has no stdin protocol; runs on OpenAI end by themselves"
+    : "You can interact with the agent while the job is running.";
+  paintLimitsNote(p, $("ed-model").value);
+  edPlatApplied=p;
+}
+// On OpenAI the effort ladder is the MODEL's; a new model means a new ladder.
+function onJobModelPicked(v){
+  if($("ed-platform").value==="openai"){
+    const effVal=getEffort();
+    edEfforts=ALApp.effortsFor("openai", v, PLATFORMS);
+    setEffort(edEfforts.includes(effVal)?effVal:"");
+  }
+  paintLimitsNote($("ed-platform").value||"anthropic", v);
+}
+function paintLimitsNote(p, model){
+  const n=$("ed-limits-note");
+  if(p!=="openai"){ n.hidden=true; n.textContent=""; return; }
+  const m=((PLATFORMS.openai||{}).models||[]).find(x=>x.v===model);
+  let t="Cost is estimated from tokens with config/pricing.json; the per-run cap is advisory on OpenAI (checked when the run ends).";
+  if(m && m.priced===false) t+=" No price configured for "+model+" — dollar caps will not see this job's spend.";
+  n.textContent=t; n.hidden=false;
+}
+// The security block's effective platform: its own, else the project's AS THE
+// EDITOR HAS IT NOW (saved or not), else anthropic -- security_derived_jobs'
+// own resolution, read off the two combos.
+function secEffectivePlatform(){ return $("sec-platform").value || $("pj-platform").value || "anthropic"; }
+// The Security pane's twin of applyPlatformToJobEditor: model list and default
+// label, the ladder (the model's on OpenAI), the modes and the two help lines.
+// `keep` is the re-apply after /api/models answers: nothing chosen is lost.
+function applyPlatformToSecurity(p, keep){
+  const opts=modelOptions(p);
+  const curModel=$("sec-model").value;
+  const keepModel=keep && (!curModel || opts.some(o=>!o.sec && o.v===curModel) || p!=="openai");
+  secModelCfg.allowCustom=(p!=="openai");
+  const dm=ALApp.defaultModelFor(p,PLATFORMS);
+  secModelCfg.noneLabel="— Default ("+(dm||"the catalog's first")+") —";
+  secModelCombo.set(keepModel?curModel:"", opts);
+  const effVal=keep?effortGet("sec-effort"):"";                 // read against the OLD ladder
+  secEfforts=ALApp.effortsFor(p, $("sec-model").value, PLATFORMS);
+  effortSet("sec-effort","sec-effort-label", secEfforts.includes(effVal)?effVal:"");
+  const perms=ALApp.permissionsFor(p,PLATFORMS), curPerm=$("sec-perm").value;
+  secPermCombo.set((keep&&perms.some(o=>o.v===curPerm))?curPerm:ALApp.defaultPermissionFor(p,"security"), perms);
+  $("sec-model-help").textContent = p==="openai"
+    ? "The Codex model the analysis runs as — empty takes the catalog's first ("+(dm||"none resolved yet")+"); a slug outside the catalog falls back to the platform's default, with a warning in tick.log."
+    : "The model the analysis runs as — defaults to the opus family.";
+  $("sec-perm-help").textContent = p==="openai"
+    ? "full-access is the headless default here: the sandbox modes cannot write the ledger, which lives outside the worktree."
+    : "How the analysis agent may use tools — dontAsk without an allowlist denies everything headless, but the ledger stays protected by the CLI's validating door either way.";
+  secPlatApplied=p;
+}
+// On OpenAI the ladder is the model's: a new model, a new ladder.
+function onSecModelPicked(v){
+  if(secEffectivePlatform()!=="openai") return;
+  const effVal=effortGet("sec-effort");
+  secEfforts=ALApp.effortsFor("openai", v, PLATFORMS);
+  effortSet("sec-effort","sec-effort-label", secEfforts.includes(effVal)?effVal:"");
+}
 // The Enabled/Disabled segmented control is paint, not state -- #sec-enabled
 // (a real, hidden checkbox) stays the one thing openProjectEditor sets and
 // saveProject reads. This just keeps the two segments in step with it,
@@ -3331,15 +3487,29 @@ const WT_MODES=[
   {v:"true", label:"Always — never run in the cwd"},
   {v:"false",label:"Off — every run works directly in the cwd"},
 ];
-const PERMS=[
-  {v:"dontAsk",label:"dontAsk — run tools without prompting"},
-  {v:"bypassPermissions",label:"bypassPermissions — full autonomy (headless default)"},
-  {v:"acceptEdits",label:"acceptEdits"},
-  {v:"auto",label:"auto"},
-  {v:"plan",label:"plan"},
-  {v:"manual",label:"manual"},
-];
-let projectCombo=null, modelCombo=null, permCombo=null, wtCombo=null, secModelCombo=null, secPermCombo=null,
+const PLATFORM_OPTS=[{v:"anthropic",label:"Anthropic"},{v:"openai",label:"OpenAI"}];
+let PLATFORMS={};                                          // /api/models.platforms, as served
+// The job editor's model combo, configured by name: createCombo keeps `cfg` by
+// reference and reads cfg.def inside set(), so applyPlatformToJobEditor can
+// make the fallback the PLATFORM's -- "opus" is Anthropic's, and a lie on
+// OpenAI when the catalog is empty or has not arrived yet.
+const edModelCfg={id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelPicked};
+// The Security pane's model combo, configured by name so applyPlatformToSecurity
+// can flip what the widget offers: a typed-in id ("Use …") is an Anthropic
+// affordance -- the engine swaps a Codex slug outside the catalog for the
+// platform's default -- and the empty row's label names that default.
+const secModelCfg={id:"sec-model", allowNone:true, noneLabel:"— Default (opus) —", allowCustom:true,
+  onPick:(v)=>onSecModelPicked(v)};
+let pjPlatformCombo=null;
+let edEfforts=ALApp.FALLBACK_EFFORTS.slice(), secEfforts=ALApp.FALLBACK_EFFORTS.slice();
+// The platform each pane was last built for (applyPlatformToJobEditor /
+// applyPlatformToSecurity set these on their way out). Re-picking it is not a
+// change: the combos' onPick skips the apply, so the model, effort and mode on
+// screen survive a click that chose what was already there. "" until the pane
+// is first built, and reset when an editor opens so a fresh one always applies.
+let edPlatApplied="", secPlatApplied="";
+let projectCombo=null, modelCombo=null, permCombo=null, wtCombo=null, platformCombo=null,
+    secModelCombo=null, secPermCombo=null, secPlatformCombo=null,
     secProfileCombo=null, secMinSevCombo=null;
 // Quick/Standard/Deep and Info..Critical are both just Titlecase of the
 // value -- so the two fixed-enum security combos can map straight off
@@ -3349,16 +3519,27 @@ function titleOpt(v){ return {v, label: v.charAt(0).toUpperCase()+v.slice(1)}; }
 function initCombos(){
   projectCombo=createCombo({id:"ed-project", allowNone:true, noneLabel:"— None —", withIcon:true,
     onPick:(v)=>syncCwdField(v)});
-  modelCombo=createCombo({id:"ed-model", allowNone:false, def:"opus"});
-  modelCombo.set("opus", MODELS);
+  platformCombo=createCombo({id:"ed-platform", allowNone:false, def:"anthropic",
+    onPick:(v)=>{ if(v!==edPlatApplied) applyPlatformToJobEditor(v,false); }});
+  platformCombo.set("anthropic", PLATFORM_OPTS);
+  modelCombo=createCombo(edModelCfg);
+  modelCombo.set("opus", modelOptions("anthropic"));
+  // The two security-side combos apply only when the EFFECTIVE platform moved:
+  // the project's own pick reaches the pane only while the block inherits, and
+  // neither pick is a change when it names what the pane already shows.
+  pjPlatformCombo=createCombo({id:"pj-platform", allowNone:false, def:"anthropic",
+    onPick:()=>{ if(!$("sec-platform").value && secEffectivePlatform()!==secPlatApplied) applyPlatformToSecurity(secEffectivePlatform(), false); }});
+  pjPlatformCombo.set("anthropic", PLATFORM_OPTS);
+  secPlatformCombo=createCombo({id:"sec-platform", allowNone:true, noneLabel:"— Inherit the project's —",
+    onPick:()=>{ if(secEffectivePlatform()!==secPlatApplied) applyPlatformToSecurity(secEffectivePlatform(), false); }});
+  secPlatformCombo.set("", PLATFORM_OPTS);
   // Same list, same widget, one difference: empty is a real choice here — it
   // means "the engine's own default" — so the none row stays. allowCustom keeps
   // what the old free-text field could do: an exact id the CLI does not list yet.
-  secModelCombo=createCombo({id:"sec-model", allowNone:true,
-    noneLabel:"— Default (opus) —", allowCustom:true});
-  secModelCombo.set("", MODELS);
+  secModelCombo=createCombo(secModelCfg);
+  secModelCombo.set("", modelOptions("anthropic"));
   secPermCombo=createCombo({id:"sec-perm", allowNone:false, def:"bypassPermissions"});
-  secPermCombo.set("bypassPermissions", PERMS);
+  secPermCombo.set("bypassPermissions", ALApp.permissionsFor("anthropic", PLATFORMS));
   secProfileCombo=createCombo({id:"sec-profile-default", allowNone:false, def:"standard"});
   secProfileCombo.set("standard", ALSecurity.SEC_PROFILES.map(titleOpt));
   // "low" (not "medium") is the structural def -- it matches the save-time
@@ -3372,7 +3553,7 @@ function initCombos(){
   permCombo=createCombo({id:"ed-perm", allowNone:false, def:"dontAsk"});
   wtCombo=createCombo({id:"pj-wt", allowNone:false, def:"auto"});
   wtCombo.set("auto", WT_MODES);
-  permCombo.set("dontAsk", PERMS);
+  permCombo.set("dontAsk", ALApp.permissionsFor("anthropic", PLATFORMS));
 }
 
 /* ---- system folder picker (backend lists dirs; browser can't expose abs paths) ---- */
@@ -3405,6 +3586,7 @@ function initFolderPicker(){
 }
 
 function fill(j){
+  edPlatApplied="";   // a freshly opened job always applies its platform
   // project combobox (searchable select of existing projects, or None)
   const projs=[...new Set((DATA.projects||[]).map(p=>p.name).concat((DATA.jobs||[]).map(x=>x.project||"")).filter(Boolean))].sort();
   projectCombo.set(j.project||"", projs);
@@ -3418,9 +3600,17 @@ function fill(j){
   $("ed-precheck").value=j._precheck||"";
   editingPrecheck=j._precheck||"";
   $("ed-interval").value=Math.round((j.interval_seconds||300)/60);
-  modelCombo.set(j.model||"opus");
+  // Platform first: it decides which model list, ladder and modes the three
+  // fields below are read against. The job's own value, else its project's,
+  // else anthropic -- the engine's own resolution.
+  const plat=ALApp.platformOf(j, j.project?projById(j.project):null);
+  platformCombo.set(plat, PLATFORM_OPTS);
+  applyPlatformToJobEditor(plat, false);
+  modelCombo.set(j.model||ALApp.defaultModelFor(plat,PLATFORMS));
+  if(plat==="openai") edEfforts=ALApp.effortsFor("openai", $("ed-model").value, PLATFORMS);
   setEffort(j.effort||"");
-  $("ed-interactive").checked = j.interactive===true;
+  $("ed-interactive").checked = (plat!=="openai") && j.interactive===true;
+  paintLimitsNote(plat, $("ed-model").value);
   const hp=String(j.active_hours||"").split("-");
   $("ed-hours-start").value=hp[0]||""; $("ed-hours-end").value=hp[1]||"";
   setDays(j.active_days||[]);
@@ -3434,7 +3624,7 @@ function fill(j){
   // Both optional: empty means "no hard limit" / "no stall guard".
   $("ed-timeout").value=j.timeout_seconds?Math.max(1,Math.round(j.timeout_seconds/60)):"";
   $("ed-stall").value=j.stall_timeout_seconds?Math.max(1,Math.round(j.stall_timeout_seconds/60)):"";
-  permCombo.set(j.permission_mode||"dontAsk");
+  permCombo.set(j.permission_mode||ALApp.defaultPermissionFor(plat,"job"));
 }
 
 /* The precheck script of the job being edited. It is no longer shipped with
@@ -3507,7 +3697,7 @@ function openCreator(){
   $("ed-delete").style.display="none";
   $("ed-id-row").style.display="";
   $("ed-id").value="";
-  fill({_precheck:DEFAULT_PRECHECK, interval_seconds:300, model:"opus",
+  fill({_precheck:DEFAULT_PRECHECK, interval_seconds:300, platform:"anthropic", model:"opus",
         active_hours:"08:00-20:00", active_days:[1,2,3,4,5],
         max_budget_usd:2, stall_timeout_seconds:1200, permission_mode:"dontAsk"});
   paintEditorNav();
@@ -3526,7 +3716,8 @@ function readForm(){
   const dailyRaw=$("ed-daily").value.trim().replace(/[^0-9.]/g,"");
   return {
     secs: Math.max(60,(parseInt($("ed-interval").value,10)||5)*60),
-    model: $("ed-model").value||"opus",
+    platform: $("ed-platform").value||"anthropic",
+    model: $("ed-model").value||ALApp.defaultModelFor($("ed-platform").value||"anthropic",PLATFORMS),
     effort: getEffort(),
     interactive: $("ed-interactive").checked,
     hours: hs && he ? hs+"-"+he : "",
@@ -3566,7 +3757,7 @@ async function saveEditor(){
     if(creating){
       const id=$("ed-id").value.trim();
       const prompt=$("ed-prompt").value.trim();
-      const job={id, description:$("ed-desc").value.trim(), prompt, interval_seconds:f.secs,
+      const job={id, description:$("ed-desc").value.trim(), prompt, interval_seconds:f.secs, platform:f.platform,
         model:f.model, active_hours:f.hours, active_days:f.days, max_budget_usd:f.budget,
         ...(f.maxPar!=null?{max_parallel:f.maxPar}:{}),
         permission_mode:$("ed-perm").value};
@@ -3595,16 +3786,36 @@ async function saveEditor(){
       id=wantId; editingId=wantId;
       toast("Renamed to "+wantId, false, "check");
     }
-    const setF=async(field,value,cur)=> String(value)===String(cur) ? true : api("set_field",{id,field,value:String(value)});
+    // `force` sends the field even when the screen matches `j`: `j` is the job
+    // BEFORE this save, and a platform write below makes the engine rewrite
+    // what it governs on disk -- a value equal to the old one is then exactly
+    // the one that must be sent again.
+    const setF=async(field,value,cur,force)=> (String(value)===String(cur) && !force) ? true : api("set_field",{id,field,value:String(value)});
+    // Platform FIRST: the engine rewrites model, effort and permission_mode to
+    // the new platform's defaults when it changes, and every field below is
+    // then saved on top of that -- sent after them, the rewrite would undo
+    // what was just saved.
+    const np=$("ed-project").value.trim();
+    const curPlat=ALApp.platformOf(j, j.project?projById(j.project):null);
+    // what resolve() will answer once the new project is saved: a job with no
+    // platform of its own would silently follow it, so make the choice explicit
+    const nextPlat=ALApp.platformOf(j, np?projById(np):null);
+    const platSent=(f.platform!==curPlat || f.platform!==nextPlat);
+    if(platSent){ if(!await api("set_field",{id,field:"platform",value:f.platform})) return; }
     const prompt=$("ed-prompt").value.trim();
     if(prompt && prompt!==(j.prompt||"")){ if(!await api("set_prompt",{id,prompt})) return; }
     const pc=$("ed-precheck").value;
     if(pc.trim() && pc!=="loading…" && pc!==editingPrecheck){
       if(!await api("set_precheck",{id,script:pc})) return; }
     if(!await setF("interval_seconds",f.secs,j.interval_seconds||300)) return;
-    if(!await setF("model",f.model,j.model||"opus")) return;
-    if(!await setF("effort",f.effort,j.effort||"")) return;
-    if(!await setF("interactive",String(f.interactive),String(j.interactive===true))) return;
+    // The four the platform governs are re-sent whenever it was: the engine
+    // cleared or rewrote them the moment the platform changed, so what the
+    // screen shows is only what the job has if it is sent again (an effort
+    // both platforms' models know, say, would otherwise be skipped as
+    // "unchanged" and end up cleared on disk while the page still shows it).
+    if(!await setF("model",f.model,j.model||"opus",platSent)) return;
+    if(!await setF("effort",f.effort,j.effort||"",platSent)) return;
+    if(!await setF("interactive",String(f.interactive),String(j.interactive===true),platSent)) return;
     if(!await setF("active_hours",f.hours,j.active_hours||"")) return;
     if(!await setF("active_days",f.days.join(","),(j.active_days||[]).join(","))) return;
     const curBudget=(j.max_budget_usd!=null?+j.max_budget_usd:null);
@@ -3623,7 +3834,7 @@ async function saveEditor(){
     if(!await setF("description",$("ed-desc").value.trim(),j.description||"")) return;
     const cwdVal = $("ed-cwd").disabled ? "" : $("ed-cwd").value.trim();
     if(!await setF("cwd",cwdVal,j.cwd||"")) return;
-    if(!await setF("permission_mode",$("ed-perm").value,j.permission_mode||"dontAsk")) return;
+    if(!await setF("permission_mode",$("ed-perm").value,j.permission_mode||"dontAsk",platSent)) return;
     edWiz.markClean(); $("editor").close(); toast("Saved "+id); refresh();
   } finally { btn.disabled=false; }
 }
@@ -3681,6 +3892,14 @@ function mdToHtml(src){
 }
 
 function statusPill(s){ const n=normStatus(s); return '<span class="stat-cell s-'+esc(n)+'">'+(STATUS_ICON[n]||"")+esc(n)+'</span>'; }
+
+// The cost with its basis -- the CLI's figure, our estimate (~, tooltip), or a
+// dash for a run that has none. One implementation with the Runs table's cell
+// (ALApp.costParts, editor-domain.js).
+function costHtml(rec){
+  const c=ALApp.costParts(rec, money);
+  return '<span class="'+esc(c.cls)+'"'+(c.tip?' title="'+esc(c.tip)+'"':'')+'>'+esc(c.text)+'</span>';
+}
 
 /* What model ran, said once. A job pinned to an exact id resolves to itself, so
    the arrow only earns its place when the two sides differ. */
@@ -3800,13 +4019,15 @@ function renderLog(d){
     ["Status", statusPill(rec.status)],
     ["Trigger", rec.forced ? "Run now (forced)" : "scheduled — precheck passed"],
     ["Duration", esc(fmtDur(rec.duration||0))],
-    ["Cost", esc(money(rec.cost))],
+    ["Cost", costHtml(rec)],
     // The job may store an alias ("opus"); model_id is what it actually resolved
     // to on the day of the run, so history stays truthful after a model ships.
     // The arrow is only worth drawing when the two DIFFER — a job pinned to an
     // exact id resolved to itself, and "claude-sonnet-5 → claude-sonnet-5" is a
     // resolution step rendered for a job that never took one.
     ["Model", modelCell(rec)],
+    ["Platform", esc(ALApp.platformLabel(rec.platform))],
+    ["Tokens", esc(ALApp.tokensText(a.tokens))],
     ["Session", esc(a.session||rec.session||"—")],
     ["Stop reason", stopReasonText(a, rec)],
   ];

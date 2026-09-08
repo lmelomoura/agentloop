@@ -120,6 +120,71 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     it moves 3× or more), and the estimate's cache-write term is pinned by a
     test; every line the refresh writes to `tick.log` starts with `pricing:`,
     and a comparison that could not run says so instead of staying silent.
+- **The OpenAI platform, dashboard side.** The page chooses **Platform → Model**
+  in the job editor, the project editor and the project's security block, and
+  reads every vocabulary — models, effort levels, permission modes, defaults,
+  prices — from `/api/models` instead of its own lists. What it cost to not
+  have it: a job could run on Codex, but only from the terminal.
+  - `ui/app/editor-domain.js` computes the effort ladder per platform and
+    model (`effortsFor`), the permission modes (`permissionsFor`) and the
+    model list (`modelOptionsFor`, flat for OpenAI with the catalog's
+    descriptions, deprecations and "no price" marks) from the server's
+    payload; the page's own `EFFORTS`/`PERMS` copies are gone; a job whose
+    platform the engine does not know reads as Anthropic here too, the
+    engine's own rule.
+  - The job editor's Agent pane opens with **Platform**: picking OpenAI
+    repopulates the model list from the Codex catalog (with the catalog's
+    descriptions, a deprecated slug's successor and retirement date, and
+    "no price" where `config/pricing.json` has none), rebuilds the effort
+    slider with that model's own levels (up to `ultra`), swaps the
+    permission modes to `read-only` / `workspace-write` / `full-access`,
+    switches Interactive off (Codex exec has no stdin protocol) and notes on
+    the Limits pane that cost is estimated and the per-run cap advisory. The
+    editor saves `platform` before the fields it governs, and a job moved to
+    a project on the other platform is saved with its platform made explicit,
+    so it does not silently change CLI; after a platform change the governed
+    fields are always re-sent, since the engine rewrites them.
+  - The project editor gets a **Platform** for the project (its jobs inherit
+    it) and one in the Security pane (empty inherits the project's). The
+    analysis's model list, effort ladder and permission modes follow the
+    platform that results — `full-access` is the OpenAI default there, since
+    the sandbox modes cannot write the ledger — and the pane stops offering a
+    typed-in model id on OpenAI, where a slug outside the catalog only falls
+    back to the platform's default; re-picking the platform a pane already
+    shows changes nothing; the guards that keep a re-pick from resetting a
+    pane are pinned by tests.
+  - A run says where it ran and what its cost IS: an **OpenAI** badge on the
+    Runs table row (the model that ran on hover), `~$0.03` for an estimate and
+    a dash for a run with no figure — never a fake $0.00 — with the basis on
+    hover; the run's dialog adds Platform and Tokens rows; the Overview's
+    *Spent today* names the estimated share when there is one; the analysis
+    meta grid on the Security page gains "Runs on".
+- **Security analyses run on OpenAI.** A project's security block can name
+  `"platform": "openai"` (or inherit the project's) and its analysis goes
+  through the Codex CLI. The prompt changes in the two places the platform
+  matters: the skill is named by its file path
+  (`skills/security-analysis/SKILL.md`), not by discovery, and subagents are
+  forbidden in words — Codex cannot close `spawn_agent` by flag, so the
+  sentence is the only door; on Claude Code the tool stays closed at launch
+  as before; on Codex the engine runs `security prepare` itself, in the
+  worktree, before launching the CLI — a real run showed the model skipping
+  it once and the Codex shell tool cutting it once before it finished — and
+  the prompt tells the agent the phase already ran; the run's `.prepare`
+  sidecar is pruned and deleted with the run's other files and shown in the
+  run dialog. `agentloop skills` links the skills into `~/.codex/skills` too,
+  when that home exists.
+  `test/fake-codex` leaves `security prepare` to the engine, and
+  `test/e2e.test.sh` drives an analysis on OpenAI to `done` with the stand-in
+  skipping it — the close proves the engine ran it. What it cost to not have
+  it: the block accepted the platform and the run still spoke of an `Agent`
+  tool Codex never had.
+- **Install and status know about Codex.** `install.sh` reports the Codex CLI
+  as optional (present with its version, or how to get it) instead of saying
+  nothing; `agentloop install` and `agentloop status` print one line per
+  platform — version and sign-in, and for Codex the age of the catalog and of
+  the price table and the visible slugs still unpriced. What it cost to not
+  have it: an OpenAI job refused in `tick.log` for a signed-out Codex had no
+  place in the terminal that said so.
 
 ### Changed
 

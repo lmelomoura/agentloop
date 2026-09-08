@@ -134,6 +134,7 @@
     const v = secCfg(name).default_profile;
     return SEC_PROFILES.includes(v) ? v : "standard";
   };
+  var secPlatformLabel = (p) => p === "openai" ? "OpenAI" : "Anthropic";
   var secSevRank = (s) => {
     const i = SEV_ORDER.indexOf(s);
     return i < 0 ? SEV_ORDER.length : i;
@@ -612,6 +613,9 @@
     grid.appendChild(cell("Cost", document.createTextNode(
       a.spend_usd ? money(a.spend_usd) : "\u2014"
     )));
+    const run = secRunFor(a), proj = projById(secState.project) || {};
+    const plat = run && run.platform || secCfg(secState.project).platform || proj.platform || "anthropic";
+    grid.appendChild(cell("Runs on", document.createTextNode(secPlatformLabel(plat))));
     host.appendChild(grid);
   }
   function secRenderRunNotice(a) {
@@ -5181,5 +5185,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: 06947c6a8dfa55bdaed23a711b4d842abb1512277c07ad2a3602cdbba132715b */
-/* ui-sources: 55b58d6008704a6a9af84c7b5c09f3ae37c5b7565c3bdee3cd039a3aa57bc4e0 */
+/* ui-bundle: 20a79c744bffe82c21b79d103546d78595f23f9f117db57365c009a88216cfdd */
+/* ui-sources: d23edc78a056ecdce2e354450025d21da04d4e84676c16c2529cb511b4d99728 */

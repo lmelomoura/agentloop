@@ -103,6 +103,8 @@ def test_an_openai_record_keeps_its_fields_through_the_api(srv, clean_data):
     assert d["agent"]["tokens"] == tokens
     assert d["agent"]["cost_basis"] == "estimated"
     assert d["record"]["model_id"] == "gpt-5.6-sol"
+    assert runs[0]["model_id"] == "gpt-5.6-sol" and runs[0]["model"] == "gpt-5.6-sol", \
+        "the runs list carries the model, so a row can say what ran without opening it"
 
 
 def test_the_raw_codex_stream_is_pruned_with_the_other_artifacts(srv, clean_data):
@@ -113,6 +115,34 @@ def test_the_raw_codex_stream_is_pruned_with_the_other_artifacts(srv, clean_data
     _write_journal(srv, _record(srv, id="j3", log=str(logp)))
     srv.ingest()
     assert not raw.exists() and not logp.exists()
+
+
+def test_the_prepare_sidecar_is_shown_in_the_run_and_pruned_with_the_other_artifacts(srv, clean_data):
+    """On OpenAI the engine runs `security prepare` itself before the CLI and
+    writes its output to `<log>.prepare` -- never to `.err`, whose bytes turn a
+    clean run into a warning. The run's stderr carries it behind a one-line
+    header, so a `prepare failed (rc N)` in tick.log can be diagnosed from the
+    run dialog; the prune then takes the file with the run's other artifacts,
+    as it takes the raw Codex stream. An empty sidecar adds nothing."""
+    logp = _artifacts(srv, "j5", "20260907T000000Z-5", {"result": "x", "total_cost_usd": 0},
+                      stream='{"type":"result","result":"x"}\n')
+    prep = Path(str(logp) + ".prepare")
+    rec = _record(srv, id="j5", log=str(logp), platform="openai")
+    prep.write_text("")
+    assert srv._read_artifacts(rec)["stderr"] == ""
+    prep.write_text("trivy: misconfiguration scan timed out\nprepare failed (rc 1)\n")
+    art = srv._read_artifacts(rec)
+    assert art["stderr"] == "--- prepare ---\ntrivy: misconfiguration scan timed out\nprepare failed (rc 1)\n"
+    Path(str(logp) + ".err").write_text("codex: warning\n")
+    assert srv._read_artifacts(rec)["stderr"] == (
+        "codex: warning\n--- prepare ---\ntrivy: misconfiguration scan timed out\nprepare failed (rc 1)\n"
+    ), "the agent's own stderr comes first, the header keeps the two apart"
+    _write_journal(srv, rec)
+    srv.ingest()
+    assert not prep.exists() and not logp.exists()
+    d = srv.load_run_detail("j5", 1700000000)
+    assert "--- prepare ---\ntrivy: misconfiguration scan timed out" in d["stderr"], \
+        "the DB row is all that is left of the sidecar once the prune took it"
 
 
 def test_a_record_with_no_tokens_stores_null_and_none(srv, clean_data):

@@ -38,6 +38,7 @@ import { $, AL, icon, money, fmtAgo, fmtDur, fmtWhen, normStatus,
          openLog, resumeTarget, resumeTip, continuedRun, resumedBadgeTip,
          runKey, isStopping, unjournaledLive, paintRunPickers, runDateLabel,
          toast, TOKEN, markIfPending } from "./page.js";
+import { costParts, platformLabel } from "./editor-domain.js";
 import { el, pageHeader, kpiCard, filterBar, tableCard, tableFooter } from "./chrome.js";
 
 // One object rather than five `let`s, the same reason jobFilters/projFilters
@@ -421,6 +422,13 @@ function runRow(r){
 
   const tdJob = el("td");
   tdJob.appendChild(el("code", null, r.id));
+  // Named only when it is not the default: every run was an Anthropic run
+  // until this badge existed, and a badge on all of them would say nothing.
+  if(r.platform === "openai"){
+    const b = el("span", "platbadge", platformLabel(r.platform));
+    b.title = "Ran on the Codex CLI" + (r.model_id ? " · " + r.model_id : "");
+    tdJob.appendChild(b);
+  }
   tr.appendChild(tdJob);
 
   const tdProject = el("td");
@@ -483,7 +491,12 @@ function runRow(r){
 
   const tdCost = el("td", "num");
   if(r.live) tdCost.appendChild(el("span", "muted", "—"));
-  else tdCost.appendChild(document.createTextNode(money(r.cost)));
+  else{
+    const c = costParts(r, money);
+    const s = el("span", c.cls || null, c.text);
+    if(c.tip) s.title = c.tip;
+    tdCost.appendChild(s);
+  }
   tr.appendChild(tdCost);
 
   const tdSession = el("td");

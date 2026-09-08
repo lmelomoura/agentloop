@@ -38,7 +38,9 @@ import { visibleProjects, projFilters, projectIsolation,
 import { RF, renderRunsPage, runsSort, runsSetPage,
          runsFilterChanged, runsGotoFirstPage, runsSetPageSize, runsPageSize,
          clearRunFilters, runSearch, runProjectNames } from "./runs.js";
-import { changedKeys, EFFORTS, effortIndex, effortFromIndex,
+import { changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, effortsFor,
+         FALLBACK_PERMISSIONS, permissionsFor, defaultPermissionFor, defaultModelFor,
+         modelOptionsFor, platformOf, platformLabel, costParts, tokensText,
          dayNumbers, shapeRepoRows, projectStepError } from "./editor-domain.js";
 
 function init(cc){
@@ -177,12 +179,32 @@ window.ALApp = { init, visibleJobs, jobFilters, bulkOn,
                  // code, pulled out of bin/dashboard.html ahead of their
                  // restyle so each can be pinned under Node. makeWizard's own
                  // W.changed calls changedKeys; effortSet/effortGet call
-                 // effortIndex/effortFromIndex and read EFFORTS for the
-                 // "unset" check; getDays calls dayNumbers; collectRepos
+                 // effortIndex/effortFromIndex against the ladder their pane
+                 // was last built with (effortsFor's, seeded from
+                 // FALLBACK_EFFORTS -- the page no longer reads EFFORTS
+                 // itself; that alias survives for the round-trip test);
+                 // getDays calls dayNumbers; collectRepos
                  // calls shapeRepoRows; validateProjectStep calls
                  // projectStepError. Every one of them is plain values in,
                  // plain values out -- none reaches $, document or AL.DATA,
                  // so none needed a page.js entry the way jobs-domain.js's
                  // exports do.
-                 changedKeys, EFFORTS, effortIndex, effortFromIndex,
+                 //
+                 // FALLBACK_EFFORTS, effortsFor, FALLBACK_PERMISSIONS,
+                 // permissionsFor, defaultPermissionFor, defaultModelFor,
+                 // modelOptionsFor, platformOf and platformLabel are B2's
+                 // (the platforms UI plan): pure functions over the
+                 // `platforms` payload of /api/models -- plain values in,
+                 // plain values out, no $, document or AL.DATA -- that the
+                 // page reads through ALApp to build its Platform -> Model
+                 // combos, effort ladders and permission lists instead of
+                 // keeping copies of those vocabularies itself.
+                 changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, effortsFor,
+                 FALLBACK_PERMISSIONS, permissionsFor, defaultPermissionFor, defaultModelFor,
+                 modelOptionsFor, platformOf, platformLabel,
+                 // costParts and tokensText are the same plan's Task 4: what a
+                 // run's cost cell and Tokens row say, shared by the Runs table
+                 // (runs.js, by import) and the run dialog's renderLog/costHtml
+                 // in bin/dashboard.html, which reaches them through here.
+                 costParts, tokensText,
                  dayNumbers, shapeRepoRows, projectStepError };

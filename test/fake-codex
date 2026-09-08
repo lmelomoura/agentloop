@@ -3,11 +3,16 @@
 # codex-cli 0.148.0 -- test/fixtures/codex/ is the evidence -- so an OpenAI run
 # can be driven end to end offline. Same caveat as test/fake-claude: unless
 # FAKE_ARGV_OUT is set this never reads "$@", so a green run proves nothing
-# about the launch line; scenarios 15 and 17 in e2e.test.sh read one back.
+# about the launch line; scenarios 15, 17 and 24 in e2e.test.sh read one back
+# (24 reads the whole prompt too, through FAKE_PROMPT_OUT).
 #
 #   FAKE_SESSION           the thread id reported in thread.started
 #   FAKE_MODE              complete | undeclared | dirty | hang | quota | unknown_model
 #   FAKE_ARGV_OUT          record the argv, one line per argument, "<n><TAB><first line>"
+#   FAKE_PROMPT_OUT        record the last argument (the prompt) WHOLE -- FAKE_ARGV_OUT keeps first lines only
+#   FAKE_SKIP_PREPARE      set to skip `security prepare` inside a security run -- see the hook below:
+#                          on openai the ENGINE runs prepare before it launches the CLI, so the hook
+#                          only fires for a launch that carries no AL_PLATFORM=openai marker
 #   FAKE_CODEX_LOGGED_OUT  set to make `login status` exit 1
 #   FAKE_USED_5H/7D        the used_percent the rollout reports (default 5.0 / 2.0)
 #   CODEX_HOME             where the rollout is written; a test sets it, never ~/.codex
@@ -29,9 +34,32 @@ if [ -n "${FAKE_ARGV_OUT:-}" ]; then
     for a in "$@"; do n=$((n + 1)); printf '%s\t%s\n' "$n" "${a%%$'\n'*}"; done
   } > "$FAKE_ARGV_OUT"
 fi
+if [ -n "${FAKE_PROMPT_OUT:-}" ]; then
+  last=""; for a in "$@"; do last="$a"; done
+  printf '%s' "$last" > "$FAKE_PROMPT_OUT"
+fi
 
 tid="${FAKE_SESSION:-01a0fake-0000-7000-8000-000000000001}"
 mode="${FAKE_MODE:-complete}"
+# A SECURITY RUN'S FIRST COMMAND, as test/fake-claude does it -- for a launch
+# WITHOUT the openai platform marker only. On openai the engine runs `security
+# prepare` itself, in the worktree, before it launches the CLI (bin/agentloop
+# run_job), and every launch the engine makes carries AL_PLATFORM=openai, so
+# the hook is skipped there. A second prepare on a running analysis is not
+# refused by the ledger (the findings upsert onto their own fingerprints and
+# `triaged` is kept), but it rewrites the coverage note, the coverage table and
+# `produced` with the second run's reading -- an `--offline` reading over the
+# engine's real one -- and a scanner write landing after the agent's re-report
+# puts the scanner's rationale back over the agent's. The hook stays for the
+# stand-in played by hand, or by a test that launches it without the marker to
+# play an agent that runs the command anyway; FAKE_SKIP_PREPARE turns it off
+# there as before. AL_SECURITY_ANALYSIS_ID reaches this process the way it
+# reaches the real CLI -- through the run's environment.
+if [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ] && [ -z "${FAKE_SKIP_PREPARE:-}" ] \
+   && [ "${AL_PLATFORM:-}" != "openai" ]; then
+  "$HERE/../bin/agentloop" security prepare \
+    --analysis "$AL_SECURITY_ANALYSIS_ID" --root "$PWD" --offline >/dev/null 2>&1 || true
+fi
 # The one line the real CLI prints on every run, whatever happens.
 echo "Reading additional input from stdin..." >&2
 

@@ -68,9 +68,12 @@ dirs() { ls -1 "$ROOT/data/worktrees/$1" 2>/dev/null | grep -v '^\.' ; }
 ended() { cat "$ROOT/data/worktrees/$1/$2/.ended" 2>/dev/null; }
 
 # secid <analyze-stdout> -- the analysis id out of whichever shape it came in:
-# bash's own `printf '{"analysis_id":%s}'` (--detach, no space) or Python's
-# `json.dumps` (open-analysis, a space after the colon).
-secid() { printf '%s' "$1" | grep -Eo '"analysis_id" *: *[0-9]+' | tail -1 | grep -Eo '[0-9]+$'; }
+# bash's own `printf '{"analysis_id":%s}'` (--detach, no space), Python's
+# `json.dumps` (open-analysis, a space after the colon), or the one line
+# `security analyze` prints as it OPENS the analysis -- before the run starts,
+# in the foreground and --detach forms alike:
+# `analysis N — project/repo @ branch (sha) — job id`.
+secid() { printf '%s\n' "$1" | grep -Eo '"analysis_id" *: *[0-9]+|^analysis [0-9]+' | tail -1 | grep -Eo '[0-9]+$'; }
 # secstate <project> <analysis-id> -- that one row's state, straight off the
 # ledger `security list` reads, never guessed from the run that carried it.
 secstate() {
@@ -215,7 +218,8 @@ AGENTLOOP_SECURITY_STALE_GRACE=0 FAKE_MODE=complete FAKE_SESSION=sess-sec-fresh 
 
 echo
 echo "11. an agent that never ran the deterministic phases cannot close done"
-# Nothing engine-side runs `prepare`. An agent that skips its first command
+# Nothing engine-side runs `prepare` on Claude Code (on Codex the engine does
+# -- scenario 24). An agent that skips its first command
 # exits cleanly, so the engine's own close-out closes the row with `success` --
 # and the result was a `done` analysis with no findings, no coverage note and
 # no banner, which then became the baseline every later analysis is diffed
@@ -463,6 +467,46 @@ jq -e '.openai["gpt-5.6-sol"].cache_write == 5' "$ROOT/config/pricing.json" >/de
 [ "$("$AL" platforms | jq -c '.openai.unpriced')" = '["gpt-5.4-mini"]' ] \
   && ok "platforms names the one visible slug the source does not price" || bad "unpriced $("$AL" platforms | jq -c '.openai.unpriced')"
 grep -q 'pricing: no price for gpt-5.4-mini' "$ROOT/data/tick.log" && ok "and tick.log says so" || bad "no tick.log line"
+
+echo
+echo "24. a security analysis on OpenAI goes through the Codex stand-in, forbids subagents in words, and closes done"
+# A second project, on the openai platform, over the same repository. Its
+# derived job takes the block's platform and the platform's security default
+# (full-access: the ledger lives outside the worktree).
+jq --arg cwd "$ROOT/work/app" '.projects += [{"name":"sandbox-oa","cwd":$cwd,"base":"main","worktree":{"enabled":true},
+   "security":{"enabled":true,"platform":"openai","model":"gpt-5.6-sol","max_budget_usd":5}}]' \
+   "$ROOT/config/projects.json" > "$ROOT/projects.next" && mv "$ROOT/projects.next" "$ROOT/config/projects.json"
+# The stand-in does NOT run prepare here (FAKE_SKIP_PREPARE), so a `done`
+# close can only mean the ENGINE ran the deterministic phase before launching
+# it -- which is what run_job does on openai. AL_SECURITY_ENGINES=off keeps
+# that engine-side prepare off the network, the way `--offline` keeps the
+# stand-ins' own; the fixture has no lockfile, so nothing else reaches for
+# one either.
+argv24="$ROOT/argv-24"; prompt24="$ROOT/prompt-24"; rm -f "$argv24" "$prompt24"
+out24="$(AL_SECURITY_ENGINES=off FAKE_SKIP_PREPARE=1 FAKE_ARGV_OUT="$argv24" FAKE_PROMPT_OUT="$prompt24" \
+  FAKE_MODE=complete FAKE_SESSION=thr-sec \
+  "$AL" security analyze sandbox-oa anything main quick 2>&1)"
+aid24="$(secid "$out24")"
+[ -n "$aid24" ] && ok "the analysis opened: $aid24" || bad "no analysis id in: $out24"
+[ "$(secstate sandbox-oa "$aid24")" = "done" ] \
+  && ok "and closed done: the engine ran security prepare before the agent, and the close found nothing untriaged" \
+  || bad "state '$(secstate sandbox-oa "$aid24")'"
+grep -q 'deterministic phase ran before the agent' "$ROOT/data/tick.log" \
+  && ok "the engine ran prepare before launching codex" || bad "no engine-side prepare line in tick.log"
+[ "$(at_in "$argv24" 1)" = "exec" ] && ok "it went down the Codex launch line" || bad "argv: $(tr '\n' ' ' < "$argv24" 2>/dev/null)"
+mi="$(idx_in "$argv24" -m)"; [ -n "${mi:-}" ] && [ "$(at_in "$argv24" $((mi + 1)))" = "gpt-5.6-sol" ] \
+  && ok "-m carries the block's model" || bad "-m '$(at_in "$argv24" $((${mi:-0} + 1)))'"
+[ -n "$(idx_in "$argv24" --dangerously-bypass-approvals-and-sandbox)" ] \
+  && ok "full-access, the security default on openai" || bad "no bypass flag in the launch line"
+[ -z "$(idx_in "$argv24" --disallowedTools)" ] && ok "no --disallowedTools: Codex cannot close a tool by flag" || bad "--disallowedTools was passed to codex"
+grep -q 'Do not spawn subagents' "$prompt24" && ok "the prompt forbids subagents in words" || bad "no subagent ban in the prompt"
+grep -q 'security-analysis/SKILL.md' "$prompt24" && ok "and names the skill file by path" || bad "the prompt does not name the skill file"
+grep -q 'Agent. tool' "$prompt24" && bad "the prompt still speaks of the Agent tool" || ok "and never speaks of the Agent tool"
+grep -q 'ALREADY RAN for this analysis' "$prompt24" && ! grep -q 'YOUR FIRST COMMAND' "$prompt24" \
+  && ok "the prompt says the deterministic phase already ran" || bad "the prompt still asks the agent to run prepare, or never says the engine did"
+[ "$(lastrun | jq -r .id)" = "security-sandbox-oa" ] && [ "$(lastrun | jq -r .platform)" = "openai" ] && [ "$(lastrun | jq -r .cost_basis)" = "estimated" ] \
+  && ok "the journal has the derived job's run on openai, priced by estimate" || bad "$(lastrun | jq -c '{id,platform,cost_basis}')"
+sleep 1
 
 echo
 printf '\n  %s passed, %s failed\n' "$pass" "$fail"

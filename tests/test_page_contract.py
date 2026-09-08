@@ -6,6 +6,7 @@ cheap guards: it parses, the elements the new code reaches for exist, and the
 arithmetic it duplicates from the engine still agrees with the engine.
 """
 
+import ast
 import json
 import re
 import shutil
@@ -597,7 +598,8 @@ def _run_save(srv, tmp_path, *, multi, name="save.js"):
     const effortGet = (id) => ALApp.effortFromIndex($(id).value);
     const sent = [];
     const vals = {"pj-name":"Web","pj-desc":"","pj-cwd":"%s","pj-ccd":"","pj-base":"develop",
-                  "pj-wt":"auto","pj-up":"","pj-down":"already here",
+                  "pj-wt":"auto","pj-platform":"anthropic","sec-platform":"",
+                  "pj-up":"","pj-down":"already here",
                   "sec-enabled":false,"sec-model":"","sec-effort":"0","sec-perm":"bypassPermissions","sec-cfgdir":"",
                   "sec-profile-default":"standard","sec-max-budget":"","sec-daily-budget":"",
                   "sec-min-severity":"medium","sec-ignore":""};
@@ -714,8 +716,8 @@ def test_security_model_and_effort_use_the_job_editors_controls(srv):
     assert 'id="sec-effort" class="effslider"' in page
     assert 'id="sec-effort-label"' in page
     # the combo is created and kept in step with /api/models like the job's
-    assert 'createCombo({id:"sec-model"' in page
-    assert "secModelCombo.set(secModelCombo.get(), MODELS)" in page
+    assert 'const secModelCfg={id:"sec-model"' in page and 'createCombo(secModelCfg)' in page
+    assert "applyPlatformToSecurity(secEffectivePlatform(), true)" in page
     # and the permission mode is the job editor's combo too, with the headless
     # default that actually lets a fresh worktree run tools
     assert 'createCombo({id:"sec-perm"' in page
@@ -735,12 +737,107 @@ def test_saving_always_sends_the_whole_security_block_with_a_real_boolean(srv, t
     proj = next(e["project"] for op, e in sent if op == "project_set")
     sec = proj["security"]
     assert sec["enabled"] is False, f"enabled must be a real boolean, got {sec['enabled']!r}"
-    assert set(sec) == {"enabled", "model", "effort", "permission_mode", "claude_config_dir",
+    assert set(sec) == {"enabled", "platform", "model", "effort", "permission_mode", "claude_config_dir",
                          "default_profile", "max_budget_usd", "daily_budget_usd",
                          "min_severity", "ignore_paths"}, f"security block: {sec}"
+    assert sec["platform"] == "", "an empty platform must be SENT: it is how the block goes back to inheriting"
+    assert proj["platform"] == "anthropic", "the project's platform is always sent, like claude_config_dir"
     assert sec["max_budget_usd"] == "", "an empty budget must clear, not vanish from the payload"
     assert sec["default_profile"] == "standard"
     assert sec["min_severity"] == "medium"
+
+
+def test_the_project_editor_chooses_a_platform_for_the_project_and_for_its_analyses(srv):
+    page = srv.render_page("boot-authed")
+    for part in ("pj-platform-combo", "pj-platform-trigger", "pj-platform-val", "pj-platform-pop",
+                 "pj-platform-search", "pj-platform-opts", "sec-platform-combo", "sec-platform-trigger",
+                 "sec-platform-val", "sec-platform-pop", "sec-platform-search", "sec-platform-opts",
+                 "sec-model-help", "sec-perm-help"):
+        assert f'id="{part}"' in page, f"missing {part}"
+    assert '<input type="hidden" id="pj-platform">' in page
+    assert '<input type="hidden" id="sec-platform">' in page
+    assert 'createCombo({id:"pj-platform"' in page
+    assert 'createCombo({id:"sec-platform"' in page
+    assert "noneLabel:\"— Inherit the project's —\"" in page, "the security block's empty platform reads as inheritance"
+    js = _fn(_js(srv), "saveProject")
+    assert 'proj.platform=$("pj-platform").value||"anthropic"' in js
+    assert 'platform: $("sec-platform").value' in js
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
+    """applyPlatformToSecurity over a stub DOM: the block's own platform, else
+    the project's, decides the model list, the ladder (the MODEL's, on
+    OpenAI), the modes and the default label -- and a re-apply after
+    /api/models answers (keep=true) throws nothing the operator chose away."""
+    page = _js(srv)
+    app = _app_js(srv)
+    deps = "\n".join(_plainfn(page, n) for n in
+                     ("applyPlatformToSecurity", "secEffectivePlatform", "effortSet", "effortGet",
+                      "ladderOf", "modelOptions"))
+    vocab = "\n".join(_plainfn(app, n) for n in
+                      ("effortsFor", "effortIndex", "effortFromIndex", "permissionsFor",
+                       "defaultPermissionFor", "defaultModelFor", "modelOptionsFor")) \
+        + "\n" + _const(app, "FALLBACK_EFFORTS") + _const(app, "FALLBACK_PERMISSIONS")
+    script = tmp_path / "sec-platform.js"
+    script.write_text(vocab + """
+    const ALApp = {effortsFor, effortIndex, effortFromIndex, permissionsFor, defaultPermissionFor,
+                   defaultModelFor, modelOptionsFor, FALLBACK_EFFORTS};
+    const nodes = {"pj-platform": {value: "openai"}, "sec-platform": {value: ""},
+                   "sec-model": {value: "gpt-5.5"}, "sec-effort": {value: "2", max: "5"},
+                   "sec-perm": {value: "bypassPermissions"}};
+    const $ = (id) => nodes[id] || (nodes[id] = {value: "", max: "", textContent: ""});
+    const effortLabel = (v) => v;
+    const groupModels = (ids) => ids.map(v => ({v, label: v}));
+    const PLATFORMS = """ + json.dumps(_PLATFORMS_PAYLOAD) + """;
+    let edEfforts = FALLBACK_EFFORTS.slice(), secEfforts = FALLBACK_EFFORTS.slice();
+    let edPlatApplied = "", secPlatApplied = "";
+    const secModelCfg = {id: "sec-model", allowNone: true, noneLabel: "— Default (opus) —", allowCustom: true};
+    let modelOpts = null, permOpts = null;
+    const secModelCombo = {set(v, o){ nodes["sec-model"].value = v; if(o) modelOpts = o; }, get: () => nodes["sec-model"].value};
+    const secPermCombo = {set(v, o){ nodes["sec-perm"].value = v; if(o) permOpts = o; }, get: () => nodes["sec-perm"].value};
+    """ + deps + """
+    applyPlatformToSecurity(secEffectivePlatform(), true);
+    const afterKeep = {model: $("sec-model").value, max: $("sec-effort").max, eff: $("sec-effort").value,
+      perm: $("sec-perm").value, custom: secModelCfg.allowCustom, none: secModelCfg.noneLabel,
+      labels: modelOpts.map(o => o.label), perms: permOpts.map(o => o.v),
+      help: $("sec-model-help").textContent};
+    applyPlatformToSecurity("anthropic", false);
+    const afterReset = {model: $("sec-model").value, max: $("sec-effort").max, eff: $("sec-effort").value,
+      perm: $("sec-perm").value, custom: secModelCfg.allowCustom, none: secModelCfg.noneLabel,
+      secPlatApplied};
+    console.log(JSON.stringify({afterKeep, afterReset}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    k = out["afterKeep"]
+    assert k["model"] == "gpt-5.5", "a model the platform knows is kept on a re-apply"
+    assert k["max"] == "4" and k["eff"] == "2", "gpt-5.5's four levels; medium stays medium on the new ladder"
+    assert k["perm"] == "full-access", "an Anthropic mode is replaced by the OpenAI security default"
+    assert k["custom"] is False and k["none"] == "— Default (gpt-5.6-sol) —"
+    assert "GPT-5.5 · no price" in k["labels"] and k["perms"] == ["read-only", "workspace-write", "full-access"]
+    assert "falls back to the platform's default" in k["help"]
+    r = out["afterReset"]
+    assert r == {"model": "", "max": "5", "eff": "0", "perm": "bypassPermissions", "custom": True,
+                 "none": "— Default (opus) —", "secPlatApplied": "anthropic"}, \
+        "the pane records the platform it was built for on its way out"
+
+
+def test_re_picking_the_platform_a_pane_already_shows_changes_nothing(srv):
+    """The three platform combos apply a platform only when the pick MOVES the
+    effective platform: the job editor's against edPlatApplied, the project's
+    and the security block's against secPlatApplied (the project's only while
+    the block inherits). Without a guard, a click that chose what was already
+    there resets the model, effort and mode on screen -- so the three guards
+    are pinned as written, inside initCombos."""
+    combos = _plainfn(_js(srv), "initCombos")
+    assert 'onPick:(v)=>{ if(v!==edPlatApplied) applyPlatformToJobEditor(v,false); }' in combos, \
+        "the job editor's platform combo lost its re-pick guard"
+    assert ('onPick:()=>{ if(!$("sec-platform").value && secEffectivePlatform()!==secPlatApplied) '
+            'applyPlatformToSecurity(secEffectivePlatform(), false); }') in combos, \
+        "the project's platform combo must reach the Security pane only while the block inherits, and only on a move"
+    assert ('onPick:()=>{ if(secEffectivePlatform()!==secPlatApplied) '
+            'applyPlatformToSecurity(secEffectivePlatform(), false); }') in combos, \
+        "the security block's platform combo lost its re-pick guard"
 
 
 # ---- the job card's kept-session notice, and the guard it must share with
@@ -1821,6 +1918,157 @@ def test_the_page_has_no_effort_vocabulary_of_its_own(srv):
     )
 
 
+def test_the_job_editor_saves_platform_before_the_fields_it_governs(srv):
+    """The engine rewrites model, effort and permission_mode to the new
+    platform's defaults when platform changes (set-field platform), so the page
+    must send platform FIRST and only then the three it governs -- sent after,
+    the rewrite would overwrite what the page had just saved."""
+    js = _fn(_js(srv), "saveEditor")
+    first = js.index('field:"platform"')
+    assert first < js.index('setF("model"'), "platform must be saved before model"
+    assert first < js.index('setF("effort"'), "platform must be saved before effort"
+    assert first < js.index('setF("permission_mode"'), "platform must be saved before permission_mode"
+    assert first < js.index('api("set_prompt"'), "platform is the first field after the rename"
+    assert "platform:f.platform" in js, "create sends the platform in the job object"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_job_editor_makes_the_platform_explicit_when_a_project_would_move_it(srv, tmp_path):
+    """A job with no platform of its own runs on its project's. Moved to a
+    project on the OTHER platform, it used to save only `set_field project`:
+    the page compared the platform on screen against the job's effective
+    platform under its CURRENT project, found them equal, and sent nothing --
+    and the engine's set-field project rewrites nothing, so the job landed on
+    the new CLI with the old platform's model and permission mode, refused at
+    launch. saveEditor now also asks what the job would resolve to under the
+    project about to be saved, and makes the platform explicit when either
+    answer differs from what the operator saw -- before the project, like
+    every platform write."""
+    page = _js(srv)
+    app = _app_js(srv)
+
+    def run(new_project):
+        script = tmp_path / f"save-editor-{new_project}.js"
+        script.write_text(_plainfn(app, "platformOf") + """
+        const ALApp = {platformOf};
+        const sent = [];
+        const vals = {"ed-id": "j", "ed-prompt": "", "ed-precheck": "", "ed-project": %s,
+                      "ed-desc": "", "ed-cwd": "", "ed-perm": "dontAsk"};
+        const $ = (id) => ({ get value(){ return vals[id] ?? ""; }, set value(v){ vals[id] = v; },
+                             disabled: false, close(){} });
+        async function api(op, extra){ sent.push([op, extra]); return true; }
+        // pa has no platform of its own (anthropic, the engine's rule); po runs on OpenAI
+        const DATA = {jobs: [{id: "j", model: "claude-opus-5", permission_mode: "dontAsk", project: "pa"}],
+                      projects: [{name: "pa"}, {name: "po", platform: "openai"}]};
+        const projById = (name) => DATA.projects.find(p => p.name === name) || null;
+        // What the screen showed: the job's effective platform under pa. Every
+        // other field matches the job, so only what platform/project decide is sent.
+        const readForm = () => ({platform: "anthropic", secs: 300, model: "claude-opus-5", effort: "",
+                                 interactive: false, hours: "", days: [], budget: null, maxPar: null,
+                                 daily: null, timeoutSecs: null, stallSecs: null});
+        const ED_STEPS = [], validateStep = () => "";
+        const edWiz = {markClean(){}}, toast = () => {}, refresh = () => {};
+        let creating = false, editingId = "j", editingPrecheck = "";
+        """ % json.dumps(new_project) + _fn(page, "saveEditor")
+                          + "\nsaveEditor().then(() => console.log(JSON.stringify(sent)));\n")
+        out = subprocess.run(["node", str(script)], capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)
+
+    moved = run("po")
+    assert ["set_field", {"id": "j", "field": "platform", "value": "anthropic"}] in moved, \
+        f"the platform the operator saw was not made explicit: {moved}"
+    fields = [e["field"] for op, e in moved if op == "set_field"]
+    assert fields.index("platform") < fields.index("project"), \
+        f"platform must be saved before the project that would move it: {fields}"
+    stays = run("pa")
+    assert not [e for op, e in stays if op == "set_field" and e["field"] == "platform"], \
+        f"a job whose project and platform did not change sends no platform: {stays}"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_job_editor_re_sends_what_a_platform_change_governs(srv, tmp_path):
+    """`set_field platform` makes the engine rewrite or clear the model, effort
+    and permission mode the new platform does not know -- and the saves that
+    follow compared the screen against the PRE-save job, so a value equal to
+    the old one was skipped although the engine had just changed it on disk:
+    an Anthropic job at effort `xhigh` moved to an OpenAI model that also has
+    `xhigh` ended without an effort while the screen kept showing it. After a
+    platform write the governed fields are sent unconditionally; without one,
+    the comparison still keeps an unchanged job from sending anything."""
+    page = _js(srv)
+    app = _app_js(srv)
+
+    def run(form):
+        script = tmp_path / f"save-editor-governed-{form['platform']}.js"
+        script.write_text(_plainfn(app, "platformOf") + """
+        const ALApp = {platformOf};
+        const sent = [];
+        const vals = {"ed-id": "j", "ed-prompt": "", "ed-precheck": "", "ed-project": "",
+                      "ed-desc": "", "ed-cwd": "", "ed-perm": "dontAsk"};
+        const $ = (id) => ({ get value(){ return vals[id] ?? ""; }, set value(v){ vals[id] = v; },
+                             disabled: false, close(){} });
+        async function api(op, extra){ sent.push([op, extra]); return true; }
+        const DATA = {jobs: [{id: "j", platform: "anthropic", model: "claude-opus-5", effort: "xhigh",
+                              permission_mode: "dontAsk"}],
+                      projects: []};
+        const projById = (name) => DATA.projects.find(p => p.name === name) || null;
+        const readForm = () => (%s);
+        const ED_STEPS = [], validateStep = () => "";
+        const edWiz = {markClean(){}}, toast = () => {}, refresh = () => {};
+        let creating = false, editingId = "j", editingPrecheck = "";
+        """ % json.dumps(form) + _fn(page, "saveEditor")
+                          + "\nsaveEditor().then(() => console.log(JSON.stringify(sent)));\n")
+        out = subprocess.run(["node", str(script)], capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)
+
+    # Everything the job already has, except what the platform change brings.
+    base = {"secs": 300, "effort": "xhigh", "interactive": False, "hours": "", "days": [],
+            "budget": None, "maxPar": None, "daily": None, "timeoutSecs": None, "stallSecs": None}
+    moved = run({**base, "platform": "openai", "model": "gpt-5.6-sol"})
+    fields = {e["field"]: e["value"] for op, e in moved if op == "set_field"}
+    assert fields.get("platform") == "openai", f"the platform change was not sent: {moved}"
+    for field, value in (("effort", "xhigh"), ("permission_mode", "dontAsk"),
+                         ("interactive", "false"), ("model", "gpt-5.6-sol")):
+        assert fields.get(field) == value, \
+            f"{field} was not re-sent after the platform change, though the engine rewrote it: {moved}"
+    same = run({**base, "platform": "anthropic", "model": "claude-opus-5"})
+    assert not [e for op, e in same if op == "set_field"], \
+        f"a job saved unchanged sends no set_field at all: {same}"
+
+
+def test_the_job_editors_model_default_is_the_platforms(srv):
+    """createCombo reads cfg.def on every set(): with the catalog empty or not
+    yet fetched, an empty model falls back to it. "opus" is Anthropic's and a
+    lie on OpenAI (the engine would refuse it), so the job editor's model
+    combo keeps its cfg by name and applyPlatformToJobEditor rewrites the
+    default to the platform's before every set -- "" on OpenAI with no
+    catalog, which the engine refuses honestly."""
+    js = _js(srv)
+    assert 'const edModelCfg={id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelPicked};' in js
+    assert "modelCombo=createCombo(edModelCfg)" in js
+    fn = _plainfn(js, "applyPlatformToJobEditor")
+    assert 'edModelCfg.def=ALApp.defaultModelFor(p,PLATFORMS)||(p==="openai"?"":"opus");' in fn
+    assert fn.index("edModelCfg.def=") < fn.index("modelCombo.set("), "the default is set before the combo is"
+
+
+def test_the_page_has_no_permission_vocabulary_of_its_own(srv):
+    """Same rule as the effort ladder: the permission modes are the engine's
+    (platform_permissions), mirrored by /api/models; the page keeps no copy."""
+    page = srv.render_page()
+    assert "const PERMS" not in page
+
+
+def test_the_job_editor_has_a_platform_combo_before_the_model(srv):
+    page = srv.render_page("boot-authed")
+    for part in ("ed-platform-combo", "ed-platform-trigger", "ed-platform-val",
+                 "ed-platform-pop", "ed-platform-search", "ed-platform-opts",
+                 "ed-platform-note", "ed-interactive-help", "ed-limits-note"):
+        assert f'id="{part}"' in page, f"missing {part}"
+    assert '<input type="hidden" id="ed-platform">' in page
+    assert page.index('id="ed-platform-combo"') < page.index('id="ed-model-combo"')
+    assert 'createCombo({id:"ed-platform"' in page
+
+
 def test_the_cells_icon_rule_cannot_repaint_the_favourite_star(srv):
     """The identity cell (.jobcell) holds two icons: its own, a direct child,
     and the favourite star's, nested inside the .favstar button. The star
@@ -2522,6 +2770,67 @@ def test_the_spent_today_card_carries_the_week_in_its_sublabel(srv, tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_spent_today_card_names_the_estimated_share_only_when_there_is_one(srv, tmp_path):
+    block = _app_js(srv)
+    deps = _index_screen_deps(block, "pulseKpis")
+    script = tmp_path / "week-est.js"
+    script.write_text(_INDEX_DOM_HARNESS + deps + """
+    const a = pulseKpis({checks: 96, per: {woke: 23}, warn: 3, err: 1, spentToday: 9.34, spentWeek: 41.02, estToday: 2.5});
+    const b = pulseKpis({checks: 96, per: {woke: 23}, warn: 3, err: 1, spentToday: 9.34, spentWeek: 41.02, estToday: 0});
+    const sub = (cards) => cards.find(c => c.label === "Spent today").sub;
+    console.log(JSON.stringify([sub(a), sub(b)]));
+    """)
+    got = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert got == ["$41.02 over 7 days · includes ~$2.50 estimated", "$41.02 over 7 days"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_cost_says_what_kind_of_number_it_is(srv, tmp_path):
+    """reported: the CLI's figure. estimated: ours, marked ~ with the tooltip
+    saying so. none: a dash -- never $0.00, which reads as free."""
+    block = _app_js(srv)
+    deps = _plainfn(block, "costParts") + "\n" + _plainfn(block, "tokensText")
+    script = tmp_path / "cost-parts.js"
+    script.write_text(deps + """
+    const fmt = (n) => "$" + Number(n).toFixed(2);
+    console.log(JSON.stringify({
+      rep: costParts({cost: 0.5, cost_basis: "reported"}, fmt),
+      old: costParts({cost: 0.5}, fmt),
+      est: costParts({cost: 0.031784, cost_basis: "estimated"}, fmt),
+      none: costParts({cost: 0, cost_basis: "none"}, fmt),
+      toks: tokensText({input: 32675, cached: 28160, cache_write: 0, output: 123, reasoning: 0}),
+      toksAll: tokensText({input: 32675, cached: 28160, cache_write: 10, output: 123, reasoning: 50}),
+      toksNone: tokensText(null),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["rep"] == {"text": "$0.50", "cls": "", "tip": ""}
+    assert out["old"] == out["rep"], "a record from before cost_basis existed is a reported one"
+    assert out["est"]["text"] == "~$0.03" and out["est"]["cls"] == "cost-est" and "pricing.json" in out["est"]["tip"]
+    assert out["none"]["text"] == "—" and out["none"]["cls"] == "cost-none" and "no price" in out["none"]["tip"]
+    assert out["toks"] == "32,675 in (28,160 cached) · 123 out"
+    assert out["toksAll"] == "32,675 in (28,160 cached, 10 cache write) · 123 out (50 reasoning)"
+    assert out["toksNone"] == "—"
+
+
+def test_the_runs_table_the_log_and_the_security_meta_name_the_platform(srv):
+    app = _app_js(srv)
+    assert 'el("span", "platbadge", platformLabel(r.platform))' in app, "the Runs table badges an OpenAI run"
+    # The badge is drawn for OpenAI runs only -- every run was an Anthropic run
+    # until it existed, and a badge on all of them would say nothing -- so the
+    # guard is pinned as source, and pinned AHEAD of the badge it guards.
+    assert 'if(r.platform === "openai"){' in app, "the Runs badge has no OpenAI-only guard"
+    assert app.index('if(r.platform === "openai"){') < app.index('el("span", "platbadge"'), \
+        "the OpenAI guard must come before the badge it guards"
+    assert "costParts(r, money)" in app, "the Runs table's cost cell goes through costParts"
+    log = _plainfn(_js(srv), "renderLog")
+    assert '["Platform", esc(ALApp.platformLabel(rec.platform))]' in log
+    assert '["Tokens", esc(ALApp.tokensText(a.tokens))]' in log
+    assert '["Cost", costHtml(rec)]' in log
+    assert 'cell("Runs on"' in _security_js(srv), "the analysis meta grid says which CLI ran it"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 @pytest.mark.parametrize("jobs,expected", [
     ([], "There are no jobs yet."),
     ([{"enabled": False}], "All 1 jobs are disabled."),
@@ -2701,8 +3010,9 @@ def test_no_window_and_switched_off_are_different_answers(srv, tmp_path, job,
 # SCRIPT'S OWN STDOUT, so this is also where that content stops reaching the
 # HTML parser at all: the sink-scan above holds the RULE (no ui/ module may
 # reach innerHTML/outerHTML/etc.), these two hold the CONTENT. jobCard calls
-# jobFacts (jobs-domain.js), fmtDays, sessionNotices, probeVerdict,
-# nextRunNote, spendTone, checkList and el, all by their bare names -- safe
+# jobFacts (jobs-domain.js), platformOf (editor-domain.js), fmtDays,
+# sessionNotices, probeVerdict, nextRunNote, spendTone, checkList and el, all
+# by their bare names -- safe
 # here because, unlike the pinned functions above, nothing extracts jobCard
 # alone and runs it standing apart from its module (see overview.js's own
 # banner comment on the isolation rule those pinned functions keep and this
@@ -2717,19 +3027,9 @@ def test_the_job_card_is_built_from_nodes_and_shows_what_it_always_showed(
     probeVerdict/nextRunNote/spendTone's own wording, so this pins the one
     fact that is jobCard's alone to get right: the card names its own job."""
     block = _app_js(srv)
-    deps = (_const(block, "DOW")
-            + _index_screen_deps(block, "fmtDays", "el", "jobFacts",
-                                  "nextCheckAt", "inWindow", "probeVerdict",
-                                  "nextRunNote", "spendTone", "checkList",
-                                  "sessionNotices", "jobCard"))
     script = tmp_path / "card.js"
-    script.write_text(_INDEX_DOM_HARNESS + _JOBS_DOMAIN_HARNESS + """
-    // jobCard's remaining reads off the page -- a formatter each, stood up
-    // the same honest, minimal way _JOBS_DOMAIN_HARNESS stands up eff above.
-    function money(n){ return "$" + n; }
-    function effortLabel(v){ return v || "default"; }
-    function projById(_name){ return null; }
-    """ + deps + """
+    script.write_text(_INDEX_DOM_HARNESS + _JOBS_DOMAIN_HARNESS + _JOB_CARD_PAGE_STUBS
+                      + _job_card_deps(block) + """
     const n = jobCard({id: "qg-dev-agent", project: "Quality Gate",
                        enabled: true, interval_minutes: 15});
     console.log(JSON.stringify(collectAll(n, [])));
@@ -2738,6 +3038,54 @@ def test_the_job_card_is_built_from_nodes_and_shows_what_it_always_showed(
                                     text=True, check=True).stdout)
     txt = " ".join(r["text"] for r in got)
     assert "qg-dev-agent" in txt, "the card did not name its own job"
+
+
+# jobCard's remaining reads off the page -- a formatter each, stood up the
+# same honest, minimal way _JOBS_DOMAIN_HARNESS stands up eff above. projById
+# answers null: the cards below stand on their own, with no project behind
+# them, so what they show is the job's own.
+_JOB_CARD_PAGE_STUBS = """
+    function money(n){ return "$" + n; }
+    function effortLabel(v){ return v || "default"; }
+    function projById(_name){ return null; }
+    """
+
+
+def _job_card_deps(block):
+    """jobCard and everything it reaches in the bundle, plus the DOW table."""
+    return (_const(block, "DOW")
+            + _index_screen_deps(block, "fmtDays", "el", "jobFacts",
+                                 "nextCheckAt", "inWindow", "probeVerdict",
+                                 "nextRunNote", "spendTone", "checkList",
+                                 "sessionNotices", "platformOf", "jobCard"))
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_job_card_names_the_platform_only_when_it_is_openai(srv, tmp_path):
+    """The settings line names the platform only when it is not the default:
+    "Anthropic · opus" on every card would say nothing, "OpenAI · gpt-5.6-sol"
+    says the one thing that changed. Both cards are built with no project
+    behind them (projById is null here), so the platform read is the job's
+    own -- the engine's rule, via platformOf."""
+    block = _app_js(srv)
+    script = tmp_path / "card-platform.js"
+    script.write_text(_INDEX_DOM_HARNESS + _JOBS_DOMAIN_HARNESS + _JOB_CARD_PAGE_STUBS
+                      + _job_card_deps(block) + """
+    const cfgOf = (j) => collectAll(jobCard(j), []).filter(r => r.cls === "cfgline").map(r => r.text);
+    console.log(JSON.stringify({
+      openai: cfgOf({id: "codex-agent", project: "Quality Gate", enabled: true,
+                     interval_minutes: 15, platform: "openai", model: "gpt-5.6-sol"}),
+      anthropic: cfgOf({id: "claude-agent", project: "Quality Gate", enabled: true,
+                        interval_minutes: 15, platform: "anthropic", model: "opus"}),
+    }));
+    """)
+    got = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert len(got["openai"]) == 1, f"one settings line per card, got {got['openai']}"
+    assert "OpenAI · gpt-5.6-sol" in got["openai"][0], got["openai"]
+    assert len(got["anthropic"]) == 1, f"one settings line per card, got {got['anthropic']}"
+    assert "Anthropic ·" not in got["anthropic"][0], got["anthropic"]
+    assert "opus" in got["anthropic"][0], "the Anthropic card still names its model, bare"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -7510,8 +7858,11 @@ def test_days_and_effort_map_form_and_job_without_loss(srv, tmp_path):
     then agree on the very same shuffled table; only checking a known value
     against its known position catches a level quietly renamed."""
     block = _app_js(srv)
+    # EFFORTS is an alias of FALLBACK_EFFORTS -- the built-in ladder the two
+    # functions default to when no list is passed -- so the extracted alias
+    # only resolves with the ladder it names standing beside it.
     deps = ("\n".join(_plainfn(block, n) for n in ("effortIndex", "effortFromIndex", "dayNumbers"))
-            + "\n" + _const(block, "EFFORTS"))
+            + "\n" + _const(block, "FALLBACK_EFFORTS") + _const(block, "EFFORTS"))
     script = tmp_path / "days-effort.js"
     script.write_text(deps + """
     const levels = ["", "low", "medium", "high", "xhigh", "max"];
@@ -7539,6 +7890,123 @@ def test_days_and_effort_map_form_and_job_without_loss(srv, tmp_path):
     assert out["days"]["none"] == []
     assert out["days"]["some"] == [1, 4, 7]
     assert out["days"]["allSeven"] == [1, 2, 3, 4, 5, 6, 7]
+
+
+_PLATFORMS_PAYLOAD = {
+    "anthropic": {"available": True, "models": ["claude-opus-5", "claude-sonnet-5"],
+                  "efforts": ["low", "medium", "high", "xhigh", "max"],
+                  "permissions": [{"v": "dontAsk", "label": "dontAsk — run tools without prompting"},
+                                  {"v": "bypassPermissions", "label": "bypassPermissions — full autonomy"}],
+                  "default_model": "opus"},
+    "openai": {"available": True, "reason": "", "catalog_at": 1,
+               "models": [{"v": "gpt-5.6-sol", "label": "GPT-5.6-Sol", "desc": "Reliable agentic workhorse for everyday tasks.",
+                           "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_effort": "low",
+                           "deprecated_by": "", "retires_at": "", "priced": True},
+                          {"v": "gpt-5.5", "label": "GPT-5.5", "desc": "", "efforts": ["low", "medium", "high", "xhigh"],
+                           "default_effort": "medium", "deprecated_by": "", "retires_at": "", "priced": False},
+                          {"v": "gpt-5.4-mini", "label": "GPT-5.4 Mini", "desc": "Old.", "efforts": ["low", "medium", "high", "xhigh"],
+                           "default_effort": "medium", "deprecated_by": "gpt-5.6-luna", "retires_at": "2026-08-31T19:00:00Z", "priced": True}],
+               "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+               "permissions": [{"v": "read-only", "label": "read-only — sandbox"}, {"v": "workspace-write", "label": "workspace-write"},
+                               {"v": "full-access", "label": "full-access"}],
+               "default_model": "gpt-5.6-sol"},
+}
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_effort_ladder_follows_the_platform_and_the_model(srv, tmp_path):
+    """effortsFor is the ONE source of the slider's stops: the platform's levels
+    from /api/models, and on OpenAI the chosen model's own. Index 0 is always
+    the unset stop. Pinned against literal payloads, as the days/effort test
+    above pins the old constant."""
+    block = _app_js(srv)
+    deps = "\n".join(_plainfn(block, n) for n in ("effortsFor", "effortIndex", "effortFromIndex")) \
+        + "\n" + _const(block, "FALLBACK_EFFORTS")
+    script = tmp_path / "efforts-for.js"
+    script.write_text(deps + "\nconst P = " + json.dumps(_PLATFORMS_PAYLOAD) + ";\n" + """
+    const sol = effortsFor("openai", "gpt-5.6-sol", P);
+    console.log(JSON.stringify({
+      sol, five: effortsFor("openai", "gpt-5.5", P), unknown: effortsFor("openai", "gpt-nope", P),
+      anth: effortsFor("anthropic", "claude-opus-5", P), noPayload: effortsFor("anthropic", "x", null),
+      ultraIndex: effortIndex("ultra", sol), ultraBack: effortFromIndex("6", sol),
+      ultraWithoutList: effortIndex("ultra"), oldIndex: effortIndex("max"),
+      empty: effortsFor("openai", "x", {openai: {available: false, models: [], efforts: []}}),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["sol"] == ["", "low", "medium", "high", "xhigh", "max", "ultra"]
+    assert out["five"] == ["", "low", "medium", "high", "xhigh"]
+    assert out["unknown"] == ["", "low", "medium", "high", "xhigh", "max", "ultra"], "an unlisted slug gets the platform's union"
+    assert out["anth"] == ["", "low", "medium", "high", "xhigh", "max"]
+    assert out["noPayload"] == ["", "low", "medium", "high", "xhigh", "max"], "before /api/models answers, the built-in ladder"
+    assert out["ultraIndex"] == 6 and out["ultraBack"] == "ultra"
+    assert out["ultraWithoutList"] == 0, "the default ladder has no ultra: it settles on unset"
+    assert out["oldIndex"] == 5, "the old callers (no list) still read the built-in ladder"
+    assert out["empty"] == [""], "an unavailable platform offers only the unset stop"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_permissions_models_and_platform_come_from_the_payload(srv, tmp_path):
+    block = _app_js(srv)
+    deps = "\n".join(_plainfn(block, n) for n in
+                     ("permissionsFor", "defaultPermissionFor", "defaultModelFor", "modelOptionsFor",
+                      "platformOf", "platformLabel")) + "\n" + _const(block, "FALLBACK_PERMISSIONS")
+    script = tmp_path / "vocab-for.js"
+    script.write_text(deps + "\nconst P = " + json.dumps(_PLATFORMS_PAYLOAD) + ";\n" + """
+    const groupFn = (ids) => [{sec: "G"}].concat(ids.map(v => ({v, label: v})));
+    console.log(JSON.stringify({
+      oaPerms: permissionsFor("openai", P).map(o => o.v),
+      anPermsNoPayload: permissionsFor("anthropic", null).map(o => o.v),
+      defs: [defaultPermissionFor("anthropic", "job"), defaultPermissionFor("anthropic", "security"),
+             defaultPermissionFor("openai", "job"), defaultPermissionFor("openai", "security")],
+      defModels: [defaultModelFor("anthropic", P), defaultModelFor("openai", P), defaultModelFor("openai", null)],
+      oaModels: modelOptionsFor("openai", P, groupFn).map(o => o.label),
+      anModels: modelOptionsFor("anthropic", P, groupFn),
+      plat: [platformOf({platform: "openai"}, {platform: "anthropic"}), platformOf({}, {platform: "openai"}),
+             platformOf({}, null), platformOf({platform: "weird"}, {platform: "openai"})],
+      labels: [platformLabel("openai"), platformLabel("anthropic"), platformLabel("")],
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["oaPerms"] == ["read-only", "workspace-write", "full-access"]
+    # The server's own order (PLATFORM_PERMISSIONS, bin/agentloop-server): the
+    # fallback is that list verbatim, so the combo does not reorder when
+    # /api/models answers. The labels are pinned against the server below.
+    assert out["anPermsNoPayload"] == ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"]
+    assert out["defs"] == ["dontAsk", "bypassPermissions", "workspace-write", "full-access"]
+    assert out["defModels"] == ["opus", "gpt-5.6-sol", ""]
+    assert out["oaModels"] == ["GPT-5.6-Sol — Reliable agentic workhorse for everyday tasks.",
+                               "GPT-5.5 · no price",
+                               "GPT-5.4 Mini — → gpt-5.6-luna, retires 2026-08-31"]
+    assert out["anModels"][0] == {"sec": "G"} and out["anModels"][1]["v"] == "claude-opus-5"
+    # The 4th: a job's OWN unknown platform reads as anthropic, not as its
+    # project's -- job_platform() normalises what resolve() picked, and
+    # resolve() picks the job's own word whenever it is non-empty.
+    assert out["plat"] == ["openai", "openai", "anthropic", "anthropic"]
+    assert out["labels"] == ["OpenAI", "Anthropic", "Anthropic"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_anthropic_fallback_permissions_say_what_the_server_says(srv, tmp_path):
+    """The page opens on the fallback and swaps to the server's list on the
+    first fetch; if the two differed, the labels would flip on screen. So
+    FALLBACK_PERMISSIONS is PLATFORM_PERMISSIONS (bin/agentloop-server)
+    verbatim -- v AND label, in the server's order -- for both platforms, not
+    only the Anthropic one that drifted. The JS object is read by node,
+    exactly as the page reads it (turning its source into JSON by string
+    replacement would trip on the trailing commas); the server's is the
+    literal in its source."""
+    script = tmp_path / "fallback-perms.js"
+    script.write_text(_const(_app_js(srv), "FALLBACK_PERMISSIONS")
+                      + "console.log(JSON.stringify(FALLBACK_PERMISSIONS));\n")
+    fallback = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    server = (REPO / "bin" / "agentloop-server").read_text()
+    brace = server.index("{", server.index("\nPLATFORM_PERMISSIONS = "))
+    table = ast.literal_eval(server[brace:_scan_balanced(server, brace)])
+    assert set(fallback) == set(table) == {"anthropic", "openai"}
+    for platform in ("anthropic", "openai"):
+        assert [(o["v"], o["label"]) for o in fallback[platform]] \
+            == [(o["v"], o["label"]) for o in table[platform]], platform
 
 
 # ---- Artboard parity: closing four divergences between the shipped editor

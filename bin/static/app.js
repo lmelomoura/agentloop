@@ -373,6 +373,139 @@
     return have.concat(none);
   }
 
+  // ui/app/editor-domain.js
+  function changedKeys(now, clean) {
+    return Object.keys(now).filter((k) => now[k] !== clean[k]);
+  }
+  var FALLBACK_EFFORTS = ["", "low", "medium", "high", "xhigh", "max"];
+  var EFFORTS = FALLBACK_EFFORTS;
+  function effortsFor(platform, model, platforms) {
+    const p = (platforms || {})[platform || "anthropic"];
+    if (!p) return FALLBACK_EFFORTS.slice();
+    let levels = null;
+    if ((platform || "anthropic") === "openai" && model) {
+      const m = (p.models || []).find((x) => x && x.v === model);
+      if (m && Array.isArray(m.efforts) && m.efforts.length) levels = m.efforts;
+    }
+    if (!levels && Array.isArray(p.efforts) && p.efforts.length) levels = p.efforts;
+    if (!levels) return [""];
+    return [""].concat(levels.filter((l) => typeof l === "string" && l));
+  }
+  function effortIndex(v, list) {
+    return Math.max(0, (list || FALLBACK_EFFORTS).indexOf(v || ""));
+  }
+  function effortFromIndex(raw, list) {
+    return (list || FALLBACK_EFFORTS)[+raw || 0] || "";
+  }
+  var FALLBACK_PERMISSIONS = {
+    anthropic: [
+      { v: "acceptEdits", label: "acceptEdits \u2014 edits allowed, commands ask" },
+      { v: "auto", label: "auto \u2014 the CLI decides per tool" },
+      { v: "bypassPermissions", label: "bypassPermissions \u2014 nothing asks" },
+      { v: "manual", label: "manual \u2014 everything asks (headless: everything denied)" },
+      { v: "dontAsk", label: "dontAsk \u2014 allowlisted tools only, no prompts" },
+      { v: "plan", label: "plan \u2014 read-only planning" }
+    ],
+    openai: [
+      { v: "read-only", label: "read-only \u2014 sandbox: no writes, no network" },
+      { v: "workspace-write", label: "workspace-write \u2014 sandbox: writes inside the workspace" },
+      { v: "full-access", label: "full-access \u2014 no sandbox, no approvals" }
+    ]
+  };
+  function permissionsFor(platform, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    const list = p && Array.isArray(p.permissions) && p.permissions.length ? p.permissions : FALLBACK_PERMISSIONS[key];
+    return list.map((o) => ({ v: o.v, label: o.label || o.v }));
+  }
+  function defaultPermissionFor(platform, kind) {
+    if (platform === "openai") return kind === "security" ? "full-access" : "workspace-write";
+    return kind === "security" ? "bypassPermissions" : "dontAsk";
+  }
+  function defaultModelFor(platform, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    if (p && p.default_model) return p.default_model;
+    return key === "anthropic" ? "opus" : "";
+  }
+  function modelOptionsFor(platform, platforms, groupFn) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    if (key === "anthropic") {
+      const ids = p && Array.isArray(p.models) ? p.models : [];
+      return groupFn ? groupFn(ids) : ids.map((v) => ({ v, label: v }));
+    }
+    const list = p && Array.isArray(p.models) ? p.models : [];
+    const noPrice = (m) => m.priced === false ? " \xB7 no price" : "";
+    const live = list.filter((m) => !m.deprecated_by).map((m) => ({
+      v: m.v,
+      label: (m.label || m.v) + (m.desc ? " \u2014 " + m.desc : "") + noPrice(m)
+    }));
+    const old = list.filter((m) => m.deprecated_by).map((m) => ({
+      v: m.v,
+      label: (m.label || m.v) + " \u2014 \u2192 " + m.deprecated_by + (m.retires_at ? ", retires " + String(m.retires_at).slice(0, 10) : "") + noPrice(m)
+    }));
+    return live.concat(old);
+  }
+  function platformOf(job, project) {
+    const own = job && job.platform;
+    if (own) return own === "openai" ? "openai" : "anthropic";
+    const pp = project && project.platform;
+    if (pp === "anthropic" || pp === "openai") return pp;
+    return "anthropic";
+  }
+  function platformLabel(p) {
+    return p === "openai" ? "OpenAI" : "Anthropic";
+  }
+  function dayNumbers(rawValues) {
+    return rawValues.map((v) => +v);
+  }
+  function shapeRepoRows(rawRows) {
+    return rawRows.map((r) => ({ name: r.name.trim(), path: r.path.trim(), base: r.base.trim() })).filter((r) => r.name && r.path);
+  }
+  function projectStepError(k, values) {
+    if (k === "project") {
+      const n = values.name;
+      if (!n) return { ok: false, message: "A project name is required." };
+      if (!values.editingProject && values.projects.some((p) => p.name === n))
+        return { ok: false, message: "A project with that name already exists." };
+      if (!values.cwd)
+        return { ok: false, message: "Pick a working directory \u2014 the folder its runs work in." };
+    }
+    if (k === "repos" && values.multi) {
+      const rows = values.repos;
+      if (!rows.length)
+        return { ok: false, message: "Add a repository, or go back to a single repository." };
+      if (!rows.some((r) => r.path === values.cwd))
+        return { ok: false, message: "One repo's path must be exactly the working directory from step 1 \u2014 that is the repo the agent starts in. None of these match it." };
+    }
+    return { ok: true };
+  }
+  function costParts(r, fmt) {
+    const basis = r && r.cost_basis || "reported";
+    if (basis === "none") return {
+      text: "\u2014",
+      cls: "cost-none",
+      tip: "No cost recorded: the model has no price in config/pricing.json, or the run ended without a final event"
+    };
+    if (basis === "estimated") return {
+      text: "~" + fmt(r && r.cost || 0),
+      cls: "cost-est",
+      tip: "Estimated from the run's tokens with config/pricing.json \u2014 the Codex CLI reports tokens, not dollars"
+    };
+    return { text: fmt(r && r.cost || 0), cls: "", tip: "" };
+  }
+  function tokensText(t) {
+    if (!t || typeof t !== "object") return "\u2014";
+    const n = (v) => Number(v || 0).toLocaleString("en-US");
+    const extra = [];
+    if (t.cached) extra.push(n(t.cached) + " cached");
+    if (t.cache_write) extra.push(n(t.cache_write) + " cache write");
+    let s = n(t.input) + " in" + (extra.length ? " (" + extra.join(", ") + ")" : "") + " \xB7 " + n(t.output) + " out";
+    if (t.reasoning) s += " (" + n(t.reasoning) + " reasoning)";
+    return s;
+  }
+
   // ui/app/overview.js
   function pulseKpis(k) {
     const checks = k.checks || 0;
@@ -381,6 +514,7 @@
     const err = k.err || 0;
     const spentToday = k.spentToday || 0;
     const spentWeek = k.spentWeek || 0;
+    const estToday = k.estToday || 0;
     const pct = (n) => checks ? Math.round(n / checks * 100) + "%" : "\u2014";
     const money2 = (n) => new Intl.NumberFormat("en-US", {
       style: "currency",
@@ -462,10 +596,12 @@
       // original brief. runsToday already surfaces, unreliably, through the
       // greeting sentence above this row; both counts stay one click away on
       // the Runs page regardless.
+      // The estimated share is named only when there is one: a fleet with no
+      // OpenAI run today reads exactly as it always did (pinned by test).
       {
         label: "Spent today",
         value: money2(spentToday),
-        sub: money2(spentWeek) + " over 7 days",
+        sub: money2(spentWeek) + " over 7 days" + (estToday > 0 ? " \xB7 includes ~" + money2(estToday) + " estimated" : ""),
         tone: "",
         filter: "",
         door: false
@@ -793,7 +929,8 @@
     const cfg = el("div", "cfgline");
     cfg.appendChild(marked("timer", bit("every " + fmtDur(j.interval_seconds || 300), own("interval_seconds"))));
     cfg.appendChild(marked("clock", bit((j.active_hours || "24h") + " " + fmtDays(j.active_days || [1, 2, 3, 4, 5, 6, 7]), own("active_hours") || own("active_days"))));
-    cfg.appendChild(bit(model, own("model")));
+    const plat = platformOf(j, p);
+    cfg.appendChild(bit(plat === "openai" ? "OpenAI \xB7 " + model : model, own("model") || own("platform")));
     if (effortLabel(eff(j, "effort", "")) !== "default") {
       cfg.appendChild(bit(effortLabel(eff(j, "effort", "")), own("effort")));
     }
@@ -1987,6 +2124,11 @@
     tr.appendChild(tdWhen);
     const tdJob = el("td");
     tdJob.appendChild(el("code", null, r.id));
+    if (r.platform === "openai") {
+      const b = el("span", "platbadge", platformLabel(r.platform));
+      b.title = "Ran on the Codex CLI" + (r.model_id ? " \xB7 " + r.model_id : "");
+      tdJob.appendChild(b);
+    }
     tr.appendChild(tdJob);
     const tdProject = el("td");
     if (r.project) {
@@ -2034,7 +2176,12 @@
     tr.appendChild(tdDuration);
     const tdCost = el("td", "num");
     if (r.live) tdCost.appendChild(el("span", "muted", "\u2014"));
-    else tdCost.appendChild(document.createTextNode(money(r.cost)));
+    else {
+      const c = costParts(r, money);
+      const s2 = el("span", c.cls || null, c.text);
+      if (c.tip) s2.title = c.tip;
+      tdCost.appendChild(s2);
+    }
     tr.appendChild(tdCost);
     const tdSession = el("td");
     tdSession.appendChild(el("code", null, (r.session || "").slice(0, 8) || "\u2014"));
@@ -2189,42 +2336,6 @@
     renderRunsTable();
   }
 
-  // ui/app/editor-domain.js
-  function changedKeys(now, clean) {
-    return Object.keys(now).filter((k) => now[k] !== clean[k]);
-  }
-  var EFFORTS = ["", "low", "medium", "high", "xhigh", "max"];
-  function effortIndex(v) {
-    return Math.max(0, EFFORTS.indexOf(v || ""));
-  }
-  function effortFromIndex(raw) {
-    return EFFORTS[+raw || 0] || "";
-  }
-  function dayNumbers(rawValues) {
-    return rawValues.map((v) => +v);
-  }
-  function shapeRepoRows(rawRows) {
-    return rawRows.map((r) => ({ name: r.name.trim(), path: r.path.trim(), base: r.base.trim() })).filter((r) => r.name && r.path);
-  }
-  function projectStepError(k, values) {
-    if (k === "project") {
-      const n = values.name;
-      if (!n) return { ok: false, message: "A project name is required." };
-      if (!values.editingProject && values.projects.some((p) => p.name === n))
-        return { ok: false, message: "A project with that name already exists." };
-      if (!values.cwd)
-        return { ok: false, message: "Pick a working directory \u2014 the folder its runs work in." };
-    }
-    if (k === "repos" && values.multi) {
-      const rows = values.repos;
-      if (!rows.length)
-        return { ok: false, message: "Add a repository, or go back to a single repository." };
-      if (!rows.some((r) => r.path === values.cwd))
-        return { ok: false, message: "One repo's path must be exactly the working directory from step 1 \u2014 that is the repo the agent starts in. None of these match it." };
-    }
-    return { ok: true };
-  }
-
   // ui/app/index.js
   function init(cc) {
     bindPage(cc);
@@ -2374,21 +2485,49 @@
     // code, pulled out of bin/dashboard.html ahead of their
     // restyle so each can be pinned under Node. makeWizard's own
     // W.changed calls changedKeys; effortSet/effortGet call
-    // effortIndex/effortFromIndex and read EFFORTS for the
-    // "unset" check; getDays calls dayNumbers; collectRepos
+    // effortIndex/effortFromIndex against the ladder their pane
+    // was last built with (effortsFor's, seeded from
+    // FALLBACK_EFFORTS -- the page no longer reads EFFORTS
+    // itself; that alias survives for the round-trip test);
+    // getDays calls dayNumbers; collectRepos
     // calls shapeRepoRows; validateProjectStep calls
     // projectStepError. Every one of them is plain values in,
     // plain values out -- none reaches $, document or AL.DATA,
     // so none needed a page.js entry the way jobs-domain.js's
     // exports do.
+    //
+    // FALLBACK_EFFORTS, effortsFor, FALLBACK_PERMISSIONS,
+    // permissionsFor, defaultPermissionFor, defaultModelFor,
+    // modelOptionsFor, platformOf and platformLabel are B2's
+    // (the platforms UI plan): pure functions over the
+    // `platforms` payload of /api/models -- plain values in,
+    // plain values out, no $, document or AL.DATA -- that the
+    // page reads through ALApp to build its Platform -> Model
+    // combos, effort ladders and permission lists instead of
+    // keeping copies of those vocabularies itself.
     changedKeys,
     EFFORTS,
+    FALLBACK_EFFORTS,
     effortIndex,
     effortFromIndex,
+    effortsFor,
+    FALLBACK_PERMISSIONS,
+    permissionsFor,
+    defaultPermissionFor,
+    defaultModelFor,
+    modelOptionsFor,
+    platformOf,
+    platformLabel,
+    // costParts and tokensText are the same plan's Task 4: what a
+    // run's cost cell and Tokens row say, shared by the Runs table
+    // (runs.js, by import) and the run dialog's renderLog/costHtml
+    // in bin/dashboard.html, which reaches them through here.
+    costParts,
+    tokensText,
     dayNumbers,
     shapeRepoRows,
     projectStepError
   };
 })();
-/* ui-bundle: da8781c275af1a436776b37166d48894dcb8096a3ac563ddacf0b3d566fd3330 */
-/* ui-sources: 55b58d6008704a6a9af84c7b5c09f3ae37c5b7565c3bdee3cd039a3aa57bc4e0 */
+/* ui-bundle: 6fe97e02b9abcfac2def21c338c5996c810f4f4b8940817cd4b46359f94110e9 */
+/* ui-sources: d23edc78a056ecdce2e354450025d21da04d4e84676c16c2529cb511b4d99728 */
