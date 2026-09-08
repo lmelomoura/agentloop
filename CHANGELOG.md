@@ -243,6 +243,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it: the trash button appeared to hang, and the Runs list stopped updating
   every time anyone used it.
 
+- **A row being deleted hands back its buttons and says what is happening to
+  it.** Clicking the trash on a failed run left View, Stop and Resume live on a
+  row that was already being erased — Resume on a run mid-delete is a race with
+  no good outcome — while the only button that did go down went grey, which is
+  what this page shows for "this action does not apply here". The row now shows
+  a pulsing **Deleting…** in place of its actions for as long as the request is
+  in flight, and the Sessions dialog's Discard does the same (**Discarding…**),
+  where the wait is a `down` hook that can run for minutes. Both repaint the
+  moment the action is released, including when the confirm is cancelled. What
+  it cost to not have it: a delete looked like a click that had not registered,
+  and the way to find out was to click something else on a row that was going.
+
 - **A busy index no longer paints "No runs recorded yet" over an intact
   journal.** A read that could not get the index — because a compaction or a
   large ingest was holding it — raised `database is locked` after `timeout=5`

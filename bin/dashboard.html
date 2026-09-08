@@ -2162,7 +2162,7 @@ ALApp.init({ $, fmtAgo, fmtDur, money,
              icon: AL.icon,
              projById, eff,
              backoffMultiplier, activeRunsOf, renderJobs: renderJobsArea,
-             effortLabel, fmtExpiresIn, resumeInFlight, markIfPending,
+             effortLabel, fmtExpiresIn, resumeInFlight, markIfPending, isPending,
              fmtWhen, fmtIn, isFav, TOKEN, toast, refresh, paintJobPickers,
              normStatus,
              openLog, resumeTarget, resumeTip, continuedRun, resumedBadgeTip,
@@ -2689,9 +2689,15 @@ function renderRetained(){
       +'<td class="muted nowrap">'+(w.expires_in==null
           ? '<span class="muted">—</span>'
           : esc(fmtExpiresIn(w.expires_in)))+'</td>'
-      +'<td class="rowacts"><button class="btn ghost sm" data-wtdrop="'
-        +esc(w.job)+'" data-wtstamp="'+esc(w.stamp)+'"'
-        +pendingAttr("worktree_drop", w.job, w.stamp)+'>Discard</button></td></tr>';
+      // Discarding runs the project's `down` hook -- seconds to minutes. A
+      // button that only goes grey for all that time is indistinguishable from
+      // a click that never registered, which is how the same discard gets asked
+      // for twice. It says what it is doing instead.
+      +'<td class="rowacts">'+(isPending("worktree_drop", w.job, w.stamp)
+        ? '<span class="goingbadge"><span class="pulse"></span>Discarding…</span>'
+        : '<button class="btn ghost sm" data-wtdrop="'
+          +esc(w.job)+'" data-wtstamp="'+esc(w.stamp)+'">Discard</button>')
+      +'</td></tr>';
   }).join("");
 }
 
@@ -2863,7 +2869,10 @@ function btnExtra(b){
 // Every element the click listener can act on, for clearPending's sweep.
 const ACTION_SELECTOR = "button[data-op],button[data-del-id],button[data-wtdrop]"
                       + ",button[data-delproj],button[data-bulk]";
-// For the two builders that still compose their button as an HTML string.
+// For the group bulk switch, the one builder left that composes its button
+// as an HTML string. The Sessions dialog's Discard used to be the other; it
+// shows a "Discarding…" badge in the button's place now instead of a disabled
+// button, since its wait is long enough that grey alone reads as a dead click.
 function pendingAttr(op, id, extra){ return isPending(op, id, extra) ? " disabled" : ""; }
 function pendKey(op, id, extra){ return op+"|"+(id||"")+"|"+(extra||""); }
 function markPending(op, id, extra){
@@ -5131,7 +5140,7 @@ document.addEventListener("click", async (e)=>{
       const freed=(j.removed&&j.removed.bytes)||0;
       toast("Run deleted"+(freed>0?" — "+fmtBytes(freed)+" reclaimed":""), false, "trash");
       refresh();
-     }finally{ clearPending(...dk); }
+     }finally{ clearPending(...dk); refresh(); }
     })();
     return;
   }
@@ -5185,7 +5194,7 @@ document.addEventListener("click", async (e)=>{
     const j=await r.json().catch(()=>({}));
     if(!r.ok){ toast(j.error||"could not discard", true); wtd.disabled=false; return; }
     toast("Discarded "+job+" / "+stamp); refresh(); return;
-    }finally{ clearPending(...wk); }
+    }finally{ clearPending(...wk); refresh(); }
   }
   // sorting the runs table -- the sort state itself, and the fork on the key
   // that decides the opening direction, now live in ui/app/runs.js.

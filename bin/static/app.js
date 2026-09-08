@@ -14,6 +14,7 @@
   var fmtExpiresIn;
   var resumeInFlight;
   var markIfPending;
+  var isPending;
   var fmtWhen;
   var fmtIn;
   var isFav;
@@ -50,6 +51,7 @@
       fmtExpiresIn,
       resumeInFlight,
       markIfPending,
+      isPending,
       fmtWhen,
       fmtIn,
       isFav,
@@ -1881,11 +1883,14 @@
     return rows;
   }
   function runsHeaderSubtitle(runs, liveCount) {
+    const stale = !!(AL.DATA && AL.DATA.runs_stale);
     const total = runs.length + liveCount;
-    if (!total) return "Nothing recorded yet \u2014 a run appears here the moment a job wakes.";
+    if (!total) {
+      return stale ? "The run index is busy \u2014 nothing can be listed until it answers." : "Nothing recorded yet \u2014 a run appears here the moment a job wakes.";
+    }
     const t0 = Math.floor((/* @__PURE__ */ new Date()).setHours(0, 0, 0, 0) / 1e3);
     const today = runs.filter((r) => r.start >= t0).length + liveCount;
-    return total + " run" + (total === 1 ? "" : "s") + " on record, " + today + " today.";
+    return total + " run" + (total === 1 ? "" : "s") + " on record, " + today + " today." + (stale ? " The index is busy \u2014 this list is the last one it gave, and may be behind." : "");
   }
   function runsKpis(runs, liveCount) {
     const t0 = Math.floor((/* @__PURE__ */ new Date()).setHours(0, 0, 0, 0) / 1e3);
@@ -2186,6 +2191,15 @@
     tdSession.appendChild(el("code", null, (r.session || "").slice(0, 8) || "\u2014"));
     tr.appendChild(tdSession);
     const tdActs = el("td", "rowacts");
+    if (isPending("run_delete", r.id, String(r.start))) {
+      tr.classList.add("row-going");
+      const going = el("span", "goingbadge");
+      going.appendChild(el("span", "pulse"));
+      going.appendChild(document.createTextNode("Deleting\u2026"));
+      tdActs.appendChild(going);
+      tr.appendChild(tdActs);
+      return tr;
+    }
     const view = el("button", "iconbtn" + (r.live ? " live" : ""));
     view.title = r.live ? "Follow this run live" : "View log";
     view.appendChild(icon("eye"));
@@ -2528,5 +2542,5 @@
     projectStepError
   };
 })();
-/* ui-bundle: f0f2898f6c4030ba7665b7632e4bca3cd2a665e0fb8fa47ebcff6010701da5e8 */
-/* ui-sources: ea07ded1b0d1d804c23b09e35ca69c05ecfbe4496d78c9d6bff1953a08686302 */
+/* ui-bundle: 6e77393fef21833ad896bc74737735379e2825530936c70a626bb0f1a065ca5b */
+/* ui-sources: 134b851fbcb498cab658c010ab60be13d9f3103555f575a9d140a3c3eccfbfdb */
