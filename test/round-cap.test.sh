@@ -32,6 +32,26 @@ rc_rounds_used T-ERR >/dev/null 2>&1 && bad "unreadable changelog returns error"
                                      || ok  "unreadable changelog returns error"
 
 echo
+echo "== a human release restarts the budget =="
+# The cap parks an exhausted ticket and waits for a human, whose only interface is
+# the board. When the count was for the ticket's LIFETIME that answer was
+# unusable: the released card came back with its rounds already spent, so the very
+# next change-requested verdict re-parked it instantly and the loop never got a
+# round to act on the decision. Rounds are therefore counted from the last entry
+# into the ready column.
+eq "a release zeroes the round count"     "$(rc_rounds_used T-RELEASED)"      "0"
+eq "one round since the release"          "$(rc_rounds_used T-RELEASED-1)"    "1"
+eq "the cap can be spent again"           "$(rc_rounds_used T-RELEASED-2)"    "2"
+eq "a release past page 1 still counts"   "$(rc_rounds_used T-RELEASED-PAGE)" "0"
+eq "the lifetime count ignores releases"  "$(rc_rounds_total T-RELEASED-2)"   "4"
+rc_gate_rework T-RELEASED 2>/dev/null   && ok "a released ticket is allowed to rework" \
+                                        || bad "a released ticket is allowed to rework" "refused — the human's board move did nothing"
+rc_gate_rework T-RELEASED-1 2>/dev/null && ok "and gets its second round too" \
+                                        || bad "and gets its second round too" "refused"
+rc_gate_rework T-RELEASED-2 2>/dev/null && bad "the cap bites again after a release" "allowed — the cap is now unenforceable" \
+                                        || ok "the cap bites again after a release"
+
+echo
 echo "== the gate (cap=2) =="
 rc_gate_rework T-0 2>/dev/null && ok "round 1 allowed"  || bad "round 1 allowed" "refused"
 rc_gate_rework T-1 2>/dev/null && ok "round 2 allowed"  || bad "round 2 allowed" "refused"
