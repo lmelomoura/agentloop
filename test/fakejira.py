@@ -3,6 +3,8 @@
 
 Scenario per issue key, set in SCEN:
   rounds        how many "Change Requested" entries the changelog holds
+  pre_reset     rounds spent BEFORE a "Selected for Development" entry, i.e. before
+                a human released the parked card; `rounds` then follow that entry
   noise         extra non-matching changelog entries (to force pagination)
   routes        transitions offered from the *current* status
   changelog_500 serve an error instead of the changelog
@@ -28,21 +30,53 @@ SCEN = {
     "T-NOPARK": dict(rounds=2, noise=0, routes=[]),
     # capped, used only to prove a dry run refuses without writing
     "T-DRY": dict(rounds=2, noise=0, routes=["In Progress", "Blocked"]),
+    # spent its rounds, then a human moved it back into the ready column: the
+    # budget restarts, so the loop gets the full cap again
+    "T-RELEASED": dict(rounds=0, pre_reset=2, noise=0, routes=["In Progress", "Blocked"]),
+    # released, then one round spent since -> still under the cap
+    "T-RELEASED-1": dict(rounds=1, pre_reset=2, noise=0, routes=["In Progress", "Blocked"]),
+    # released, then the cap spent AGAIN -> the cap must bite a second time
+    "T-RELEASED-2": dict(rounds=2, pre_reset=2, noise=0, routes=["In Progress", "Blocked"]),
+    # the release sits past the first changelog page: paginating must not lose it
+    "T-RELEASED-PAGE": dict(rounds=0, pre_reset=2, noise=250,
+                            routes=["In Progress", "Blocked"]),
 }
 
 STATE = {k: {"status": "Change Requested", "comments": [], "moves": []} for k in SCEN}
 
 
+def _at(n):
+    """A plausible ascending timestamp. The changelog is served oldest-first and
+    round-cap.sh reads it positionally, but real entries carry `created` and a
+    fixture that omits it would not catch a reader that started using it."""
+    return "2026-09-%02dT%02d:00:00.000+0100" % (1 + n // 24, n % 24)
+
+
+def _round(n):
+    return [
+        {"created": _at(n), "items": [{"field": "status", "fromString": "In Review - DEV",
+                                       "toString": "Change Requested"}]},
+        {"created": _at(n + 1), "items": [{"field": "status", "fromString": "Change Requested",
+                                           "toString": "In Progress"}]},
+    ]
+
+
 def changelog(key):
     s = SCEN[key]
     vals = []
+    n = 0
     for i in range(s["noise"]):
-        vals.append({"items": [{"field": "assignee", "toString": f"n{i}"}]})
-    for i in range(s["rounds"]):
-        vals.append({"items": [{"field": "status", "fromString": "In Review - DEV",
-                                "toString": "Change Requested"}]})
-        vals.append({"items": [{"field": "status", "fromString": "Change Requested",
-                                "toString": "In Progress"}]})
+        vals.append({"created": _at(n), "items": [{"field": "assignee", "toString": f"n{i}"}]})
+        n += 1
+    for _ in range(s.get("pre_reset", 0)):
+        vals.extend(_round(n)); n += 2
+    if s.get("pre_reset"):
+        vals.append({"created": _at(n),
+                     "items": [{"field": "status", "fromString": "Blocked",
+                                "toString": "Selected for Development"}]})
+        n += 1
+    for _ in range(s["rounds"]):
+        vals.extend(_round(n)); n += 2
     return vals
 
 

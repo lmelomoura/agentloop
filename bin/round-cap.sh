@@ -35,29 +35,76 @@ RC_CAP="${AL_ROUND_CAP:-${CC_ROUND_CAP:-2}}"
 # change-requested verdict, so counting entries counts rounds.
 RC_ROUND_STATUS="${AL_ROUND_STATUS:-${CC_ROUND_STATUS:-Change Requested}}"
 
-# rc_rounds_used <KEY> -> prints the number of rework rounds already spent.
-# Returns non-zero if the changelog could not be read, so callers can fail OPEN
-# (see rc_gate_rework): a network blip must never park a healthy ticket.
+# The status that RESETS the round count. Entering it is the human saying "go
+# again": the cap parks an exhausted ticket and the only interface for answering
+# that is the board, so a card moved back into the ready column has been answered
+# and starts a fresh budget.
+#
+# WHY THE COUNT IS NOT LIFETIME. It used to be, and that made the human's answer
+# unusable: the card came back into the ready column with its rounds already
+# spent, so the very first change-requested verdict after the release parked it
+# again — instantly, without the loop being given a single round to act on the
+# decision. The human moved it, nothing happened, and the only escape was an
+# env var that raises the cap for the whole fleet. Counting from the last reset
+# makes the move mean what it looks like it means.
+#
+# It does not weaken the cap. In the normal life of a ticket the ready column is
+# entered once, before the first In Progress, so every round still counts and the
+# numbers are identical. The count only moves when something puts the card back,
+# and both things that can are decisions: a human dragging it, or the precheck
+# releasing a claim whose run died before it spent the round.
+RC_RESET_STATUS="${AL_ROUND_RESET_STATUS:-${CC_ROUND_RESET_STATUS:-Selected for Development}}"
+
+# rc_status_trail <KEY> -> one "<created>\t<toString>" line per status change,
+# oldest first. Returns non-zero if the changelog could not be read, so callers
+# can fail OPEN (see rc_gate_rework): a network blip must never park a healthy
+# ticket.
 #
 # Paginated deliberately. `?expand=changelog` on the issue endpoint truncates at
 # 100 entries with no warning, and these tickets are exactly the ones with long
 # histories — the truncation would silently under-count the tickets that need the
 # cap most, which is the one failure mode that matters here.
-rc_rounds_used() {
-  local k="$1" start=0 total=1 n=0 page got cnt
+rc_status_trail() {
+  local k="$1" start=0 total=1 page got
   while [ "$start" -lt "$total" ]; do
     page="$(curl -sf -u "$AUTH" \
       "$JIRA/rest/api/3/issue/$k/changelog?startAt=$start&maxResults=100" 2>/dev/null)" || return 1
     total="$(printf '%s' "$page" | "$JQ" -r '.total // empty' 2>/dev/null)"
     [ -n "${total:-}" ] || return 1
-    cnt="$(printf '%s' "$page" | "$JQ" --arg s "$RC_ROUND_STATUS" \
-      '[.values[]?.items[]? | select(.field=="status" and .toString==$s)] | length' 2>/dev/null)"
-    n=$(( n + ${cnt:-0} ))
+    printf '%s' "$page" | "$JQ" -r \
+      '.values[]? | .created as $c | .items[]? | select(.field=="status") | "\($c)\t\(.toString)"' 2>/dev/null
     got="$(printf '%s' "$page" | "$JQ" '.values | length' 2>/dev/null)"
     [ "${got:-0}" -gt 0 ] || break
     start=$(( start + got ))
   done
-  echo "$n"
+}
+
+# rc_rounds_used <KEY> -> rework rounds spent SINCE THE LAST RESET (see
+# RC_RESET_STATUS). This is the number the cap is enforced on.
+#
+# Counted by position in the trail, not by comparing timestamps: the changelog
+# arrives oldest-first, so "after the last reset" is "everything following the
+# last reset line". Timestamps here carry a UTC offset that shifts across a
+# daylight-saving boundary, and a lexical compare of two differently-offset
+# stamps is wrong for exactly the tickets that straddle one.
+rc_rounds_used() {
+  local trail
+  trail="$(rc_status_trail "$1")" || return 1
+  printf '%s\n' "$trail" | awk -F'\t' -v round="$RC_ROUND_STATUS" -v reset="$RC_RESET_STATUS" '
+    $2 == reset { n = 0; next }
+    $2 == round { n++ }
+    END { print n + 0 }'
+}
+
+# rc_rounds_total <KEY> -> rework rounds over the ticket's whole life, ignoring
+# resets. Never gates anything; it is what tells rc_develop_note that a card in
+# the ready queue is one a human released, which rc_rounds_used can no longer say
+# now that a release zeroes it.
+rc_rounds_total() {
+  local trail
+  trail="$(rc_status_trail "$1")" || return 1
+  printf '%s\n' "$trail" | awk -F'\t' -v round="$RC_ROUND_STATUS" \
+    '$2 == round { n++ } END { print n + 0 }'
 }
 
 # rc_transition_to <KEY> <STATUS NAME> -> 0 when the card is now in that status.
@@ -128,10 +175,10 @@ Why a cap exists: the reviewer blocks on any behavioural finding of any severity
 
 What a human decides now, on the pull request as it stands:
 - ACCEPT — the acceptance criteria are met and the open findings are new surfaces rather than regressions. Move it back to Review - DEV and record the findings as their own tickets.
-- FIX — one of the open findings is a genuine regression. Say which one in a comment and return the card to In Progress; the cap counts rounds, so state that this round is authorised.
+- FIX — one of the open findings is a genuine regression. Move the card back to $RC_RESET_STATUS and say in a comment which finding to close. That move resets the round budget to a full $RC_CAP, so the loop picks it straight back up; nothing else has to be set.
 - RESCOPE — the ticket is too large or its spec is wrong. Send it back to the backlog.
 
-Raise the cap for one ticket by saying so in a comment; raise it fleet-wide with AL_ROUND_CAP."
+The board move above is the whole interface for authorising more rounds. Raise the cap fleet-wide with AL_ROUND_CAP."
 
   rc_transition_to "$k" "Blocked" && return 0
 
@@ -204,10 +251,13 @@ rc_round_note() {
 # the cap has already been answered, and re-deriving it from the round count is
 # reading the question after it has been answered.
 rc_develop_note() { # rc_develop_note <KEY>
-  local k="$1" used
-  used="$(rc_rounds_used "$k" 2>/dev/null)" || used=""
-  if [ -n "$used" ] && [ "${used:-0}" -ge "$RC_CAP" ]; then
-    echo "human-released — this ticket had spent its $used/$RC_CAP rework rounds and a human has since moved it into the ready queue. THAT MOVE IS THE HUMAN DECISION the cap was waiting for: it is not a board glitch and not something to re-check. Do the work. Do NOT re-park it in Blocked over the round count — only a NEW blocker (an unanswered business question, a broken assumption) justifies blocking, exactly as it would on any other ticket."
+  local k="$1" spent
+  # The LIFETIME count, not rc_rounds_used: entering the ready queue is itself the
+  # reset, so by the time this runs rc_rounds_used is 0 for every card here and
+  # would never recognise the released ones.
+  spent="$(rc_rounds_total "$k" 2>/dev/null)" || spent=""
+  if [ -n "$spent" ] && [ "${spent:-0}" -ge "$RC_CAP" ]; then
+    echo "human-released — this ticket had spent $spent rework rounds against a cap of $RC_CAP and a human has since moved it into the ready queue. THAT MOVE IS THE HUMAN DECISION the cap was waiting for: it is not a board glitch and not something to re-check, and it has already reset the round budget, so the loop has a full $RC_CAP rounds again. Do the work. Do NOT re-park it in Blocked over the round count — only a NEW blocker (an unanswered business question, a broken assumption) justifies blocking, exactly as it would on any other ticket."
   else
     echo "from the ready queue — no rework cap applies"
   fi
