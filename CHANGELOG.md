@@ -230,6 +230,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A reviewer's trial merge is no longer reported as work that would be lost.**
+  Reviewing a change means measuring the *merged* tree, so a reviewer runs
+  `git merge --no-commit` inside its own run directory — which leaves every
+  incoming file staged with `MERGE_HEAD` set. The delivery check read that as
+  changes existing on no remote: a real run reviewed RP-216, approved it, merged
+  the pull request and moved the card, and still came back `warning` /
+  `UNDELIVERED`, with its directory retained holding nothing but a half-finished
+  merge of commits already on `develop`. The check now asks of `MERGE_HEAD` the
+  question it already asked of `HEAD` — is this already on a remote? — and skips
+  only when the tree is *exactly* what the merge produced: the index matches
+  git's own recorded `AUTO_MERGE` result, with nothing unstaged and nothing
+  untracked on top. A merge of a branch on no remote, a dirty tree with no merge
+  in progress, and anything the agent added over the merge are all reported
+  exactly as before; a git that cannot answer still gets the strict reading.
+  What it cost to not have it: a clean run reported as a warning, a directory
+  kept for nothing, and an operator learning that the warning means nothing.
+
 - **Declining "Nothing to do right now" can no longer start the run anyway.**
   Run now probes the precheck first and warns when it reports no pending work,
   because a forced idle run still costs a full agent session. That probe sits in

@@ -4830,6 +4830,87 @@ EOF
   esac
   rm -f "$tmp/cfg/provision/two.up.sh"
 
+  echo "wt_merge_probe_only() — a trial merge of what is already on a remote is not work"
+  # Reviewing a change means measuring the MERGED tree, so a reviewer runs
+  # `git merge --no-commit` inside its own run directory. That leaves every
+  # incoming file staged with MERGE_HEAD set, and the dirty-tree check read it
+  # as work that exists nowhere else: RP-216 was reviewed, approved and merged,
+  # and still came back UNDELIVERED with its directory retained. The contents
+  # came FROM a remote, so nothing there could be lost -- the same question the
+  # unpushed-commits check below already asks of HEAD, asked of MERGE_HEAD.
+  local mp="$tmp/g/mp"
+  mkdir -p "$mp"
+  git init --bare -q "$mp/origin.git"
+  git clone -q "$mp/origin.git" "$mp/work" 2>/dev/null
+  git -C "$mp/work" config user.email t@example.com
+  git -C "$mp/work" config user.name tester
+  echo base > "$mp/work/base.txt"
+  git -C "$mp/work" add -A && git -C "$mp/work" commit -qm base
+  git -C "$mp/work" push -q origin HEAD:refs/heads/main
+  git -C "$mp/work" branch -q --set-upstream-to=origin/main 2>/dev/null
+  git -C "$mp/work" checkout -q -b feat
+  echo incoming > "$mp/work/incoming.txt"
+  git -C "$mp/work" add -A && git -C "$mp/work" commit -qm feat
+  git -C "$mp/work" push -q origin feat
+  git -C "$mp/work" checkout -q -
+  git -C "$mp/work" fetch -q origin
+  git -C "$mp/work" merge --no-commit --no-ff -q origin/feat >/dev/null 2>&1
+  [ -n "$(git -C "$mp/work" status --porcelain 2>/dev/null)" ] \
+    && ok "the fixture really is dirty: the trial merge staged something" \
+    || bad "the trial merge staged nothing -- fixture invalid"
+  ( wt_merge_probe_only "$mp/work" ) >/dev/null 2>&1
+  want "a staged trial merge of a commit already on a remote is recognised" 0 $?
+  # Anything the agent put on top of the merge is still its own work.
+  echo "the agent was here" > "$mp/work/agent.txt"
+  ( wt_merge_probe_only "$mp/work" ) >/dev/null 2>&1
+  want "an untracked file on top of the merge fails the test" 1 $?
+  rm -f "$mp/work/agent.txt"
+  echo "edited" >> "$mp/work/base.txt"
+  ( wt_merge_probe_only "$mp/work" ) >/dev/null 2>&1
+  want "an unstaged edit on top of the merge fails the test" 1 $?
+  git -C "$mp/work" checkout -q -- base.txt
+  ( wt_merge_probe_only "$mp/work" ) >/dev/null 2>&1
+  want "and the untouched trial merge is recognised again" 0 $?
+  # A merge of something that exists on NO remote is exactly the case the
+  # undelivered report exists for -- it must still be caught.
+  git -C "$mp/work" merge --abort 2>/dev/null
+  git -C "$mp/work" checkout -q -b local-only
+  echo private > "$mp/work/private.txt"
+  git -C "$mp/work" add -A && git -C "$mp/work" commit -qm private
+  git -C "$mp/work" checkout -q -
+  git -C "$mp/work" merge --no-commit --no-ff -q local-only >/dev/null 2>&1
+  ( wt_merge_probe_only "$mp/work" ) >/dev/null 2>&1
+  want "a trial merge of a branch on no remote is NOT excused" 1 $?
+  git -C "$mp/work" merge --abort 2>/dev/null
+  # No merge at all: an ordinary dirty tree must never take this exit.
+  echo "plain work" > "$mp/work/plain.txt"
+  ( wt_merge_probe_only "$mp/work" ) >/dev/null 2>&1
+  want "a dirty tree with no merge in progress is NOT excused" 1 $?
+  rm -f "$mp/work/plain.txt"
+
+  echo "wt_undelivered_work() — and the classifier itself consults it"
+  local rdM="$tmp/wtroot/jMerge/stampM"
+  mkdir -p "$rdM"
+  git clone -q "$mp/origin.git" "$rdM/repo" 2>/dev/null
+  # `git init --bare` points HEAD at a branch this fixture never creates, so a
+  # plain clone lands with an unborn HEAD and wt_undelivered_work reports
+  # "cannot read commits" -- true, and nothing to do with the merge. Put the
+  # clone on a real branch so the test measures what it says it measures.
+  git -C "$rdM/repo" checkout -q -B main origin/main
+  git -C "$rdM/repo" config user.email t@example.com
+  git -C "$rdM/repo" config user.name tester
+  git -C "$rdM/repo" merge --no-commit --no-ff -q origin/feat >/dev/null 2>&1
+  ( WORKTREES_DIR="$tmp/wtroot"; wt_undelivered_work "$rdM" ) >/dev/null 2>&1
+  want "a run dir holding only a trial merge is not reported as undelivered" 1 $?
+  echo "the agent was here" > "$rdM/repo/agent.txt"
+  got="$( WORKTREES_DIR="$tmp/wtroot"; wt_undelivered_work "$rdM" )"
+  want "the agent's own file on top of the merge still IS undelivered" 0 $?
+  case "$got" in *"uncommitted changes in repo"*)
+      ok "and it names the repo it is in" ;;
+    *) bad "the description was '$got'" ;;
+  esac
+  rm -rf "$tmp/wtroot/jMerge"
+
   echo "wt_dirt_sha() / wt_undelivered_work() — git that cannot answer is reported, not read as clean"
   # `git status --porcelain` prints nothing for a clean tree AND for one it
   # cannot read at all — hashing empty stdout used to give the SAME

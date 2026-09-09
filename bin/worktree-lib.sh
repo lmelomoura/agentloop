@@ -453,6 +453,46 @@ wt_setup() { # <id> <project> <canonical_cwd> <stamp> [port_base]
 # STATUS: a run that ended with commits no remote knows about did not deliver,
 # and that is a failure the operator should see on the card, not a folder they
 # have to find. Push is the delivery channel; not pushing is a failed run.
+# Is this worktree holding a TRIAL MERGE and nothing else?
+#
+# Reviewing a change means measuring the MERGED tree, so a reviewer runs
+# `git merge --no-commit` inside its own run directory. That leaves every
+# incoming file staged with MERGE_HEAD set, and the dirty-tree check below read
+# it as work that exists on no remote: a real reviewer run reviewed RP-216,
+# approved it, merged the pull request, and still came back UNDELIVERED with a
+# warning and a retained directory holding nothing but that half-finished merge.
+# The staged contents came FROM a commit that is already published, so throwing
+# the directory away loses nothing -- which is the same question the
+# unpushed-commits check already asks of HEAD, asked here of MERGE_HEAD.
+#
+# Deliberately narrow. It answers yes only when ALL of these hold:
+#   * a merge really is in progress (MERGE_HEAD resolves), and
+#   * that MERGE_HEAD is already reachable from some remote branch, and
+#   * the tree is EXACTLY what the merge produced by itself: the index matches
+#     the AUTO_MERGE result git recorded, with nothing unstaged and nothing
+#     untracked on top of it.
+# Anything the agent added fails the third test and is reported exactly as
+# before. If git cannot answer any of the three, the answer is the strict one --
+# the same rule wt_dirt_sha follows for a status it could not read.
+wt_merge_probe_only() { # <worktree> -> 0 when it holds a trial merge and nothing else
+  local wt="${1:-}" mh am idx
+  [ -d "$wt" ] || return 1
+  mh="$(git -C "$wt" rev-parse --verify --quiet MERGE_HEAD 2>/dev/null)" || return 1
+  [ -n "$mh" ] || return 1
+  [ -n "$(git -C "$wt" branch -r --contains "$mh" 2>/dev/null)" ] || return 1
+  # AUTO_MERGE is what git itself recorded as the automatic result. Comparing
+  # against it is what separates "the merge, untouched" from "the merge plus
+  # whatever was done to it"; a git that does not write it (an older version, a
+  # strategy that does not) simply fails the test and the strict reading stands.
+  am="$(git -C "$wt" rev-parse --verify --quiet "AUTO_MERGE^{tree}" 2>/dev/null)" || return 1
+  [ -n "$am" ] || return 1
+  idx="$(git -C "$wt" write-tree 2>/dev/null)" || return 1
+  [ "$idx" = "$am" ] || return 1
+  git -C "$wt" diff --quiet 2>/dev/null || return 1
+  [ -z "$(git -C "$wt" ls-files --others --exclude-standard 2>/dev/null)" ] || return 1
+  return 0
+}
+
 wt_undelivered_work() { # <run dir> -> 0 and a description, or 1
   local run_dir="${1:-}" mf="${1:-}/.run.json" wt head fork snap live name found=""
   [ -d "$run_dir" ] || return 1
@@ -475,6 +515,8 @@ wt_undelivered_work() { # <run dir> -> 0 and a description, or 1
         '.repos[] | select(.worktree==$w) | .dirt_sha // ""' "$mf" 2>/dev/null)"
     if ! live="$(wt_dirt_sha "$wt")"; then
       found="$found, cannot read git in $name"
+    elif wt_merge_probe_only "$wt"; then
+      : # a trial merge of what is already on a remote -- see the function above
     elif [ -n "$snap" ]; then
       [ "$live" != "$snap" ] && found="$found, uncommitted changes in $name"
     else
