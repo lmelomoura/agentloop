@@ -230,6 +230,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Declining "Nothing to do right now" can no longer start the run anyway.**
+  Run now probes the precheck first and warns when it reports no pending work,
+  because a forced idle run still costs a full agent session. That probe sits in
+  a `try` whose `catch` deliberately falls through and starts the run — right
+  for a probe that could not run, since refusing there would turn a broken
+  precheck script into a lock on the job. The **confirmation was inside that
+  same `try`**, so anything thrown while the dialog was up, or on the way out of
+  it, was swallowed by the same `catch` and the run started — with the
+  operator's last click having been Cancel. The probe keeps its `catch`; it now
+  only decides *what to ask*, and the asking happens outside, where a throw is
+  an error and can never read as a yes. What it cost to not have it: a dialog
+  whose whole purpose is to stop you spending a session could fall through into
+  spending one.
+
+- **A second dialog no longer leaves the first one unanswered for ever.**
+  `showConfirm` kept its resolver in one module-level slot and simply overwrote
+  it, so a dialog opening over another orphaned the earlier promise: its `await`
+  never returned, its handler never reached its own cleanup, and its button
+  stayed held down for the life of the page. Reaching it takes no race — the
+  precheck probe runs for seconds with nothing on screen, so a second Run now on
+  another job lands in that window with no modal up to block the click. Opening
+  a dialog now answers whoever was waiting on the previous one, as **declined**:
+  an unanswered question must never read as consent.
+
 - **One failed `/api/models` no longer costs a tab its Model field for good.**
   The catalog was fetched once, at boot, and every failure was swallowed
   silently. A single miss left `PLATFORMS` empty for the life of the tab — and

@@ -1570,6 +1570,16 @@ async function api(op, extra){
 /* ------------------------------------------------------------ confirm modal */
 let _cfResolve=null;
 function showConfirm(o){
+  // Anyone still waiting on this dialog is answered NO before it is reused.
+  // There is one resolver slot, and it used to be simply overwritten: the
+  // earlier promise then never settled, so its `await` never returned, its
+  // handler never reached its own cleanup, and its button stayed down for the
+  // life of the page. Easy to reach -- Run now probes the precheck for seconds
+  // with nothing on screen, so a second click on another job lands in that
+  // window with no modal up to block it. An unanswered dialog reads as
+  // DECLINED: whatever it was guarding must never proceed on a click nobody
+  // made.
+  if(_cfResolve){ const stale=_cfResolve; _cfResolve=null; stale(false); }
   $("cf-halo").className="halo "+(o.tone==="danger"?"b-err":"b-warn");
   $("cf-halo").innerHTML=I[o.icon||"alert"]||I.alert;
   $("cf-title").textContent=o.title||"Are you sure?";
@@ -5374,6 +5384,15 @@ document.addEventListener("click", async (e)=>{
     // Guard: forcing bypasses the precheck, so probe it first and warn when
     // it reports nothing to do — a forced idle run still costs a session.
     toast("Checking precheck…", false, "radar");
+    // ONLY the probe is inside this try. Its catch falls through to the run on
+    // purpose -- a probe that could not run knows nothing, and refusing to
+    // start on it would turn a broken precheck script into a lock on the job.
+    // The ANSWER used to be awaited in here too, and that is a different thing
+    // entirely: anything thrown while the dialog was up, or on the way out of
+    // it, landed in the same catch and started the run the operator had just
+    // declined. So this block only decides WHAT TO ASK; the asking happens
+    // below, where a throw is an error and can never read as a yes.
+    let warn=null;
     try{
       const r=await fetch("/api/action",{method:"POST",
         headers:{"Content-Type":"text/plain","X-AL-Token":TOKEN},
@@ -5382,17 +5401,19 @@ document.addEventListener("click", async (e)=>{
       if(r.ok && j.broken){
         // A probe that could not run knows nothing about the board, so
         // "nothing to do" would be a lie. Say what actually happened.
-        const yes=await showConfirm({tone:"danger", icon:"alert", title:"This job's precheck is broken",
+        warn={tone:"danger", icon:"alert", title:"This job's precheck is broken",
           message:"The probe exited with an error instead of reporting on the board, so nothing is known about whether there is work. Until it is fixed this job will never start on its own. A forced run will still spend a full agent session.",
-          mono:(j.output||""), confirmLabel:"Run anyway"});
-        if(!yes){ clearPending(op, id, extra); b.disabled=false; return; }
+          mono:(j.output||""), confirmLabel:"Run anyway"};
       } else if(r.ok && j.ok && j.work===false){
-        const yes=await showConfirm({tone:"warn", icon:"alert", title:"Nothing to do right now",
+        warn={tone:"warn", icon:"alert", title:"Nothing to do right now",
           message:"The precheck reports no pending work. Run now bypasses the precheck — a forced run will still spend a full agent session.",
-          mono:(j.output||""), confirmLabel:"Run anyway"});
-        if(!yes){ clearPending(op, id, extra); b.disabled=false; return; }
+          mono:(j.output||""), confirmLabel:"Run anyway"};
       }
-    }catch(err){ /* probe failed — fall through, the run itself will tell */ }
+    }catch(err){ /* probe failed — nothing to ask about, the run itself will tell */ }
+    if(warn){
+      const confirmed=await showConfirm(warn);
+      if(!confirmed){ clearPending(op, id, extra); b.disabled=false; return; }
+    }
   }
   // "Run now" is refused with 409 while a run is in flight — report that plainly
   // instead of the old blanket "Started".

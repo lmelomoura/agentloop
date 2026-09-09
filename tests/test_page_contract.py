@@ -9565,6 +9565,89 @@ def test_every_side_effecting_button_is_held_from_the_click(srv):
         "in flight: " + ", ".join(missing))
 
 
+def test_a_cancelled_confirmation_can_never_fall_through_into_the_action(srv):
+    """Answering "no" and a broken probe must not share an exit.
+
+    Run now probes the precheck first and warns when it reports nothing to do,
+    because a forced idle run still costs a full agent session. That probe sits
+    in a try/catch whose catch deliberately FALLS THROUGH to the run — "the
+    probe failed, the run itself will tell" — which is right for a failed probe.
+
+    The confirmation was inside that same try. So anything that threw while the
+    dialog was up or on the way out of it — not just a failed probe — was
+    swallowed by that catch and the run started anyway, with the operator's last
+    click having been Cancel. A dialog that guards spending money must not be
+    able to fall through into the spending.
+
+    So the probe keeps its try/catch, and the ANSWER is read outside it: the
+    catch can only ever decide "the probe told us nothing", never "the operator
+    said yes".
+    """
+    js = _js(srv)
+    i = js.index('body:JSON.stringify({op:"precheck",id})')
+    j = js.index('body:JSON.stringify({op:"run",id})')
+    guard = js[i:j]
+    catch = guard.index("}catch(err){")
+    # Both warnings still exist -- the try may still DECIDE what to ask.
+    for what in ('title:"Nothing to do right now"', 'title:"This job\'s precheck is broken"'):
+        assert what in guard, f"the {what} warning is gone from the Run now guard"
+    # What must not happen inside it is the ASKING: no dialog is awaited before
+    # the catch closes, so nothing thrown while one is up can reach that catch.
+    assert "showConfirm" not in guard[:catch], (
+        "a confirmation is awaited inside the try whose catch falls through to the "
+        "run, so a throw while it is up starts the run the operator just declined")
+    assert "const confirmed=await showConfirm(warn);" in guard[catch:], (
+        "the warning is never actually put to the operator outside the catch")
+    assert "if(!confirmed){ clearPending(op, id, extra); b.disabled=false; return; }" in guard[catch:], (
+        "the guard does not stop on a declined confirmation outside the catch")
+
+
+def test_two_confirmations_at_once_cannot_orphan_the_first(srv, tmp_path):
+    """One global resolver slot meant the earlier dialog was never answered.
+
+    showConfirm kept `_cfResolve` in a single module-level variable, so a second
+    dialog opening over the first overwrote it: the first promise could never
+    settle, its `await` never returned, and its handler hung with its button
+    held down for the life of the page. Easy to hit — the precheck probe takes
+    seconds and shows nothing while it runs, so a second Run now on another job
+    lands in that window with no modal up to block the click.
+
+    An unanswered dialog resolves as DECLINED, never as accepted: whatever the
+    orphaned handler was guarding must not proceed on a click nobody made.
+    """
+    fn = _plainfn(_js(srv), "showConfirm")
+    script = tmp_path / "confirm.js"
+    script.write_text("""
+    const els = {};
+    const $ = (id) => (els[id] = els[id] || {
+      className:"", innerHTML:"", textContent:"", hidden:false,
+      showModal(){ this.open = true; }, close(){ this.open = false; },
+      addEventListener(){}, });
+    const I = {alert:"", trash:""};
+    let _cfResolve = null;
+    """ + fn + """
+    const out = {};
+    const first = showConfirm({title:"A"});
+    const second = showConfirm({title:"B"});
+    let firstSettled = "pending";
+    first.then(v => { firstSettled = "resolved:" + v; });
+    // Answer the one dialog that is on screen, the way cf-cancel does.
+    if(_cfResolve){ _cfResolve(false); _cfResolve = null; }
+    second.then(v => { out.second = v; }).then(() => {
+      out.first = firstSettled;
+      console.log(JSON.stringify(out));
+    });
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert out["second"] is False, "the visible dialog's own answer was lost"
+    assert out["first"] == "resolved:false", (
+        "the first dialog was orphaned by the second: its promise never settled, "
+        "so its handler waits for ever holding its button down — and an "
+        "unanswered dialog must read as declined, never as accepted, got "
+        + str(out["first"]))
+
+
 def test_the_model_catalog_is_asked_for_again_until_it_arrives(srv, tmp_path):
     """One failed fetch used to cost the tab its Model field, permanently.
 
