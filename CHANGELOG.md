@@ -20,6 +20,48 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A sweep hook, so cleaning up is no longer a run's one chance.** A project
+  can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and
+  `.down.sh`, and the tick calls it on a timer — every
+  `AGENTLOOP_SWEEP_INTERVAL` seconds, 300 by default — whether or not anything
+  is running. What it cost to not have it: `down` is a run's last act and it
+  gets exactly ONE chance. Miss it — the tick that would have called it was
+  killed, the run dir was already removed so nothing was left to enumerate, the
+  agent cut a worktree of its own that no manifest ever named — and nothing
+  calls it again for that run, ever. Whatever it started keeps holding memory,
+  ports and disk from then on, and where those services restart themselves at
+  boot, escaping teardown once is escaping it permanently. Observed: five
+  containers of a finished run still up twenty-one hours later, restarted
+  healthy by Docker Desktop the next morning, invisible to the existing orphan
+  sweep because that sweep only reclaimed a project whose working directory had
+  disappeared — and this one's worktree was still on disk.
+  - The engine's half is deliberately not about containers. It answers the one
+    question a hook cannot answer for itself — WHAT IS STILL IN USE — with the
+    two facts only it holds: `AL_LIVE_WORKTREES`, every path a live run is
+    working in, read from the run slots rather than from the state file (which
+    cannot describe several concurrent runs); and `AL_CANONICALS`, every
+    project's canonical checkouts, which is where a human's own environment
+    lives. `AL_SWEEP_GRACE_SECONDS` (`AGENTLOOP_SWEEP_GRACE`, 21600) says how
+    old a thing must be before it is fair game.
+  - It refuses to run at all while ANY run of that project is alive — not
+    merely one that holds the directory in question. An agent cuts throwaway
+    worktrees of its own mid-run (the pre-push trial merge is a
+    `git worktree add`) and brings services up in them; by every test available
+    those are indistinguishable from garbage, and they are not garbage until
+    the run ends. A live job whose project cannot be resolved — a derived
+    security job, or a job deleted from `jobs.json` while its run was still
+    going — counts as a run of every project, so an unresolvable id can never
+    silently license a sweep of all of them.
+  - Rate-limited in the tick rather than by a launchd agent of its own, the
+    same choice for the same reason as the model-resolution refresh beside it:
+    nothing lives outside the project folder, and there is only ever one thing
+    on a timer to fall out of step. `AGENTLOOP_SWEEP_INTERVAL=0` switches it
+    off. Killed if it outlives `.worktree.sweep_timeout_seconds` (300), because
+    it runs inside the tick's mutex and a hook blocked on an unresponsive
+    daemon would stop the scheduler launching anything at all.
+  - `config/provision/example-hello.sweep.sh` documents the contract and
+    reclaims nothing, so copying it and forgetting to edit it destroys nothing.
+
 - **The OpenAI platform, engine side.** A job, a project or a project's
   security block can say `"platform": "openai"` and its runs go through the
   Codex CLI (`codex exec --json`) instead of Claude Code — same journal, same
