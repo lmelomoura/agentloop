@@ -398,9 +398,10 @@ fill that gap:
 ```
 config/provision/<project>.up.sh     # after the worktrees exist, before the agent starts
 config/provision/<project>.down.sh   # when the run ends, before they are removed
+config/provision/<project>.sweep.sh  # on a timer, run or no run — see below
 ```
 
-Each runs **once per repo**, with the working directory set to that repo's
+The first two run **once per repo**, with the working directory set to that repo's
 worktree and the run described in its environment: `AL_REPO_NAME`,
 `AL_REPO_PATH` (the canonical checkout), `AL_WORKTREE`, `AL_BASE`, `AL_RUN_DIR`,
 `AL_RUN_MANIFEST`, `AL_PROJECT`, `AL_JOB_ID`, plus `AL_PORT_BASE`,
@@ -422,6 +423,54 @@ needs before it can run — so a `down` hook that reaches for it deadlocks
 against its own caller, until `worktree.provision_timeout_seconds` kills the
 hook, wedging every other job's resume and drop behind that same lock for as
 long as it takes to time out.
+
+#### The sweep: cleaning up after the project, not after a run
+
+`down` is a run's last act and it gets **one chance**. Miss it — the tick that
+would have called it was killed, the run dir was already removed so nothing was
+left to enumerate, the agent cut a worktree of its own that no manifest ever
+named — and nothing calls it again for that run, ever. Whatever it started keeps
+holding memory, ports and disk from then on. Where those services restart
+themselves at boot, escaping teardown once is escaping it permanently.
+
+`config/provision/<project>.sweep.sh` is the answer. It belongs to the
+**project** rather than to a run, and the tick calls it every
+`AGENTLOOP_SWEEP_INTERVAL` seconds (default 300) whether or not anything is
+running — so there is no single moment to miss, and whatever a `down` failed to
+clean gets a second look, and a thousandth. Ship one as soon as a run starts
+anything that outlives its own process: containers, a database, a daemon, a
+tunnel, a registered site.
+
+The engine knows nothing about what the hook reclaims. Its half is to answer the
+one question the hook cannot answer for itself — **what is still in use** — and
+it arrives as two files:
+
+| | |
+|---|---|
+| `AL_LIVE_WORKTREES` | every path a live run is working in, one per line, read from the run slots. Never reclaim anything at or under one. |
+| `AL_CANONICALS` | every project's canonical checkouts, one per line. This is where a human's own environment lives. |
+| `AL_SWEEP_GRACE_SECONDS` | how old something must be before it is fair game (`AGENTLOOP_SWEEP_GRACE`, default 21600) |
+
+Two guarantees before it is ever called. The working directory is the project's
+`.cwd`; and **no run of that project is alive** — not merely none holding the
+directory in question. An agent creates working directories of its own mid-run
+that no manifest names and no lock points at (the pre-push trial merge is a
+`git worktree add`), and those are indistinguishable from garbage until the run
+ends. A live job whose project cannot be resolved — a derived security job, or a
+job deleted from `jobs.json` while its run was still going — counts as a run of
+*every* project, so an unresolvable id can never license a sweep of all of them.
+
+A hook that outlives `worktree.sweep_timeout_seconds` (default 300) is killed:
+it runs inside the tick's own mutex, so one blocked on an unresponsive daemon
+would stop the scheduler launching anything at all. `AGENTLOOP_SWEEP_INTERVAL=0`
+switches the whole thing off. See `config/provision/example-hello.sweep.sh`,
+which documents the contract and reclaims nothing, so copying it and forgetting
+to edit it destroys nothing.
+
+> A sweep deletes things on a machine nobody is watching, on a timer, for ever.
+> Write every test in it so that being **wrong costs disk rather than data**:
+> prove a thing is yours before reclaiming it, rather than assuming it is yours
+> because nothing proved otherwise — and give the humans an opt-out.
 
 Every worktree is cut from a freshly fetched base, and that fetch is bounded by
 `worktree.fetch_timeout_seconds` (default 120). It has to be: the fetch happens
@@ -1799,6 +1848,7 @@ agentloop/
 │   ├── models.json            # cached family→model resolutions (generated)
 │   ├── prechecks/<id>.sh      # one precheck per job
 │   ├── provision/<project>.{up,down}.sh   # per-repo worktree provisioning
+│   ├── provision/<project>.sweep.sh       # periodic cleanup, run or no run
 │   └── control.token          # dashboard secret (chmod 600, generated)
 ├── data/                      # index.db (derived), app.db (profile + sessions),
 │                              #   security.db (the analysis ledger), journal, logs

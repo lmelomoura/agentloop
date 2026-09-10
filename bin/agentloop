@@ -5375,6 +5375,107 @@ NASTY
     && bad "the longer canonical (.../Jane Doe/repo-a) survived the prune" \
     || ok "the longer canonical (.../Jane Doe/repo-a) was pruned"
 
+  echo "wt_live_worktrees() — a dead slot's worktree is not in use"
+  # The sweep hooks are handed this list and refuse to touch anything in it, so
+  # a path WRONGLY present here is a stack that never gets cleaned up, and a
+  # path wrongly ABSENT is a running agent's database being torn down under it.
+  # Both directions are asserted.
+  mkdir -p "$tmp/data"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup jLive two "$tmp/g/repo" stampLive ) >/dev/null 2>&1
+  mkdir -p "$tmp/locks/jLive/1"
+  echo $$ > "$tmp/locks/jLive/1/pid"
+  echo "$tmp/wtroot/jLive/stampLive" > "$tmp/locks/jLive/1/worktree"
+  got="$( LOCK_DIR="$tmp/locks"; WORKTREES_DIR="$tmp/wtroot"; wt_live_worktrees )"
+  printf '%s\n' "$got" | grep -qx "$tmp/wtroot/jLive/stampLive" \
+    && ok "a live slot's run dir is reported in use" \
+    || bad "a live run's directory was not listed: $got"
+  printf '%s\n' "$got" | grep -q "stampLive/" \
+    && ok "and so is each repo worktree inside it" \
+    || bad "the repo worktrees inside a live run dir were not listed: $got"
+  # A slot from a process that is gone. No `boot` file, so slot_alive falls
+  # through to the pid, and this pid answers for nobody.
+  mkdir -p "$tmp/locks/jDead/1"
+  echo 2147483646 > "$tmp/locks/jDead/1/pid"
+  echo "$tmp/wtroot/jLive/stampLive-dead" > "$tmp/locks/jDead/1/worktree"
+  got="$( LOCK_DIR="$tmp/locks"; WORKTREES_DIR="$tmp/wtroot"; wt_live_worktrees )"
+  printf '%s\n' "$got" | grep -q "stampLive-dead" \
+    && bad "a dead slot's worktree was reported as still in use — it would never be cleaned up" \
+    || ok "a dead slot's worktree is not reported in use"
+
+  echo "wt_project_has_live_run() — an unresolvable job blocks every project"
+  ( LOCK_DIR="$tmp/locks"; JOBS_FILE="$tmp/cfg/jobs.json"
+    printf '%s' '{"jobs":[{"id":"jLive","project":"two"}]}' > "$tmp/cfg/jobs.json"
+    wt_project_has_live_run two ) \
+    && ok "a live run of the project is found" \
+    || bad "a live run of the project was missed — its stacks would be swept mid-run"
+  ( LOCK_DIR="$tmp/locks"; JOBS_FILE="$tmp/cfg/jobs.json"
+    wt_project_has_live_run other ) \
+    && bad "a live run of 'two' was counted as a live run of 'other'" \
+    || ok "a live run of another project does not block this one"
+  # jLive is in NO jobs file now: a derived security job, or a job deleted while
+  # its run was still going. It must count as live for EVERY project — an empty
+  # project comparing unequal to every name is what would silently license a
+  # sweep of all of them while that run is still working.
+  printf '%s' '{"jobs":[]}' > "$tmp/cfg/jobs.json"
+  ( LOCK_DIR="$tmp/locks"; JOBS_FILE="$tmp/cfg/jobs.json"
+    wt_project_has_live_run two ) \
+    && ok "a live job whose project cannot be resolved blocks the sweep" \
+    || bad "an unresolvable live job licensed a sweep — the conservative branch is gone"
+
+  echo "wt_sweep_projects() — periodic, throttled, and never while a run is live"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "swept" >> "$AL_SWEEP_LOG"' \
+    'cp "$AL_LIVE_WORKTREES" "$AL_SWEEP_LOG.live"' \
+    'cp "$AL_CANONICALS" "$AL_SWEEP_LOG.canon"' \
+    > "$tmp/cfg/provision/two.sweep.sh"
+  chmod +x "$tmp/cfg/provision/two.sweep.sh"
+  # The live slot from the block above is still standing, and `two` is its
+  # project again — so this first call must do nothing at all.
+  printf '%s' '{"jobs":[{"id":"jLive","project":"two"}]}' > "$tmp/cfg/jobs.json"
+  rm -f "$tmp/data/.sweep.stamp" "$tmp/data/sweep.log"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; JOBS_FILE="$tmp/cfg/jobs.json"
+    DATA_DIR="$tmp/data"; LOCK_DIR="$tmp/locks"; WORKTREES_DIR="$tmp/wtroot"
+    AL_SWEEP_LOG="$tmp/data/sweep.log"; export AL_SWEEP_LOG
+    wt_sweep_projects ) >/dev/null 2>&1
+  [ ! -f "$tmp/data/sweep.log" ] \
+    && ok "a project with a live run is not swept" \
+    || bad "the sweep ran while a run of that project was still live"
+  # Kill the claim and it runs.
+  rm -rf "$tmp/locks/jLive"
+  rm -f "$tmp/data/.sweep.stamp"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; JOBS_FILE="$tmp/cfg/jobs.json"
+    DATA_DIR="$tmp/data"; LOCK_DIR="$tmp/locks"; WORKTREES_DIR="$tmp/wtroot"
+    AL_SWEEP_LOG="$tmp/data/sweep.log"; export AL_SWEEP_LOG
+    wt_sweep_projects ) >/dev/null 2>&1
+  [ "$(grep -c . "$tmp/data/sweep.log" 2>/dev/null || echo 0)" = "1" ] \
+    && ok "with nothing live, the project's sweep hook runs" \
+    || bad "the sweep hook did not run for an idle project"
+  # Immediately again: the tick fires every 60s and a sweep shells out to a
+  # container daemon, so without the throttle this would run sixty times an hour
+  # more than intended.
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; JOBS_FILE="$tmp/cfg/jobs.json"
+    DATA_DIR="$tmp/data"; LOCK_DIR="$tmp/locks"; WORKTREES_DIR="$tmp/wtroot"
+    AL_SWEEP_LOG="$tmp/data/sweep.log"; export AL_SWEEP_LOG
+    wt_sweep_projects ) >/dev/null 2>&1
+  [ "$(grep -c . "$tmp/data/sweep.log" 2>/dev/null || echo 0)" = "1" ] \
+    && ok "a second call inside the interval is throttled away" \
+    || bad "the sweep ran twice inside one interval"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; JOBS_FILE="$tmp/cfg/jobs.json"
+    DATA_DIR="$tmp/data"; LOCK_DIR="$tmp/locks"; WORKTREES_DIR="$tmp/wtroot"
+    AGENTLOOP_SWEEP_INTERVAL=0
+    AL_SWEEP_LOG="$tmp/data/sweep.log"; export AL_SWEEP_LOG
+    wt_sweep_projects ) >/dev/null 2>&1
+  [ "$(grep -c . "$tmp/data/sweep.log" 2>/dev/null || echo 0)" = "1" ] \
+    && ok "an interval of 0 disables the sweep rather than running it every tick" \
+    || bad "AGENTLOOP_SWEEP_INTERVAL=0 ran the hook instead of switching it off"
+  # And the hook is handed the two facts it cannot work out for itself. The
+  # canonical list is what stops it reclaiming a developer's own environment, so
+  # an empty one is not a cosmetic defect.
+  grep -q "$tmp/g/repo" "$tmp/data/sweep.log.canon" 2>/dev/null \
+    && ok "the hook is handed the canonical checkouts to protect" \
+    || bad "AL_CANONICALS reached the hook empty — nothing would be protected"
+
   echo "toggle-many flips only the jobs it was handed"
   printf '%s' '{"jobs":[{"id":"a"},{"id":"b","enabled":false},{"id":"c"}]}' > "$tmp/tm.json"
   got="$("$JQ" -c --argjson want '["a","b"]' --argjson v false "$TOGGLE_MANY_FILTER" "$tmp/tm.json")"
@@ -9793,6 +9894,11 @@ cmd_tick() {
   # undelivered — see the .ended write in run_job).
   wt_prune_orphans
   wt_prune_canonicals
+  # Then the projects' own sweep, on its own slower timer. Everything above
+  # cleans up after a RUN and can only act while that run's directory is still
+  # here to describe it; this cleans up after the PROJECT, on a schedule, and so
+  # is the only thing that ever gets a second look at what a `down` missed.
+  wt_sweep_projects
   # Keep the family→model resolutions fresh (about once a day). It rides on the
   # tick this package already installs — deliberately NOT a second launchd job or
   # a crontab entry, so nothing lives outside the project folder and the whole

@@ -801,3 +801,156 @@ wt_is_claimed() { # <id> <run dir>
   done
   return 1
 }
+
+# -------------------------------------------------------------------- sweeping
+#
+# A provisioning hook runs at the two ends of a RUN, and that is precisely why
+# what it starts outlives it. `down` is a run's last act and it gets ONE chance:
+# miss it -- the tick that would have called it was killed, the run dir was
+# already removed so nothing is left to enumerate, the agent cut a worktree of
+# its own that no manifest ever named -- and nothing will ever call it again for
+# that run. Whatever it left holding RAM, a port block and gigabytes of disk is
+# permanent from then on. On a project whose containers carry
+# `restart: unless-stopped` it is worse than permanent: it comes back by itself
+# after every reboot, so escaping the hook ONCE is enough to escape it for ever.
+#
+# The sweep hook answers that. It belongs to the PROJECT rather than to a run,
+# and the tick calls it on a timer whether or not anything is running -- so
+# there is no single moment to miss, and whatever a `down` failed to clean gets
+# a second chance, and a thousandth. Being periodic is the entire point: it is
+# what makes the cleanup permanent rather than merely likely.
+#
+# Nothing here knows what a container is; the hook does. The engine's half is to
+# answer the one question a hook cannot answer for itself -- WHAT IS STILL IN
+# USE -- from the two facts it alone holds: the worktrees live runs are working
+# in, and the canonical checkouts a human's own environment lives in.
+
+# Every path a LIVE run is working in: each run dir, and each repo worktree
+# inside it, one per line.
+#
+# Read from the run SLOTS, because that is where "alive right now" is recorded.
+# A run dir on disk says nothing about whether anyone still wants it, and the
+# state file's single cur_worktree cannot describe several concurrent runs --
+# the same reason wt_is_claimed asks the slots rather than the state.
+wt_live_worktrees() {
+  local iddir slot run_dir
+  [ -d "$LOCK_DIR" ] || return 0
+  # The engine's own mutexes (.tick, .resume, .ports, .state.lock) are lock
+  # DIRECTORIES in this very folder. They are dot-prefixed and a glob does not
+  # match those, which is the only reason this loop may treat every entry it
+  # sees as a job.
+  for iddir in "$LOCK_DIR"/*; do
+    [ -d "$iddir" ] || continue
+    for slot in "$iddir"/*/; do
+      [ -d "${slot%/}" ] || continue
+      slot_alive "${slot%/}" || continue
+      run_dir="$(cat "${slot%/}/worktree" 2>/dev/null || true)"
+      [ -n "$run_dir" ] || continue
+      printf '%s\n' "$run_dir"
+      wt_run_worktrees "$run_dir"
+    done
+  done
+}
+
+# Is any run of <project> alive right now?
+#
+# A sweep must not touch a project with work in flight, and the live-worktree
+# list above is NOT enough to promise that. An agent cuts throwaway worktrees of
+# its OWN mid-run -- the pre-push trial merge is a `git worktree add --detach`
+# into a path no manifest names and no slot points at -- and brings a full stack
+# up inside one. By every test available here such a tree is indistinguishable
+# from garbage, and it is not garbage until the run ends. So the project as a
+# whole goes off-limits while any of its runs live: the cost of waiting is one
+# sweep interval, and the cost of not waiting is tearing down the database a
+# running agent is testing against.
+#
+# A live job whose project cannot be resolved counts as a run of EVERY project.
+# That is the conservative direction on purpose: a derived security job, or a
+# job deleted from jobs.json while its run was still going, resolves to an empty
+# project -- and an empty project comparing unequal to every name would silently
+# license a sweep of all of them.
+wt_project_has_live_run() { # <project>
+  local project="${1:-}" iddir id slot p
+  [ -d "$LOCK_DIR" ] || return 1
+  for iddir in "$LOCK_DIR"/*; do
+    [ -d "$iddir" ] || continue
+    id="$(basename "$iddir")"
+    for slot in "$iddir"/*/; do
+      [ -d "${slot%/}" ] || continue
+      slot_alive "${slot%/}" || continue
+      # Resolved only once a slot is known to be live: job_get is a jq fork, and
+      # the overwhelmingly common case is a job directory with no live slot at
+      # all -- every job that has ever run keeps its directory here.
+      p="$(job_get "$id" '.project' '')"
+      case "$p" in null) p="" ;; esac
+      [ -z "$p" ] && return 0
+      [ "$p" = "$project" ] && return 0
+    done
+  done
+  return 1
+}
+
+# Run every project's sweep hook, at most once per AGENTLOOP_SWEEP_INTERVAL.
+# A missing script means "this project has nothing to sweep" and is not an error.
+#
+# Called from the tick, which runs every 60s. Rate-limited HERE rather than by a
+# launchd agent of its own -- the same choice, for the same reason, as the
+# model-resolution refresh a few lines below its call site: nothing lives
+# outside this folder, and there is only ever one thing on a timer to get out of
+# step. A sweep shells out to whatever the project uses, so once a minute is far
+# too often; five minutes is the default.
+wt_sweep_projects() {
+  local interval grace now last stamp project cwd script t rc live canon
+  interval="$(num "${AGENTLOOP_SWEEP_INTERVAL:-}" 300)"
+  [ "$interval" -gt 0 ] || return 0
+  grace="$(num "${AGENTLOOP_SWEEP_GRACE:-}" 21600)"
+  stamp="$DATA_DIR/.sweep.stamp"
+  now="$(now_epoch)"
+  last="$(num "$(cat "$stamp" 2>/dev/null || true)" 0)"
+  [ $(( now - last )) -ge "$interval" ] || return 0
+  # Stamped BEFORE the hooks run, not after, so a hook's own duration is not
+  # charged to the interval: a sweep that takes four minutes must not mean the
+  # next one is nine minutes away.
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+  live=""; canon=""
+  while IFS= read -r project; do
+    [ -n "$project" ] || continue
+    script="$CONFIG_DIR/provision/$project.sweep.sh"
+    [ -f "$script" ] || continue
+    wt_project_has_live_run "$project" && continue
+    # Built once, lazily: a machine whose projects declare no sweep hook must
+    # not pay two jq forks and a walk of every lock directory per tick.
+    if [ -z "$live" ]; then
+      live="$(mktemp "$DATA_DIR/.sweep.live.XXXXXX")" || return 0
+      canon="$(mktemp "$DATA_DIR/.sweep.canon.XXXXXX")" || { rm -f "$live"; return 0; }
+      wt_live_worktrees > "$live" 2>/dev/null || true
+      # EVERY project's canonicals, not just this one's. A hook is handed the
+      # full list so that it can refuse to touch anything a human's own
+      # environment lives in, whoever owns it -- the projects do not each get a
+      # private view of which checkouts are off-limits.
+      projects_json | "$JQ" -r '
+        .projects[]? | ((.repos // [])[]? | objects | .path), .cwd
+        | strings | select(. != "")' > "$canon" 2>/dev/null || true
+    fi
+    cwd="$(project_get "$project" '.cwd' '')"
+    [ -d "$cwd" ] || cwd="$DATA_DIR"
+    t="$(project_get "$project" '.worktree.sweep_timeout_seconds' '300')"
+    case "$t" in ''|null|*[!0-9]*) t=300 ;; esac
+    # Killed if it outlives the timeout, like every provisioning hook: this runs
+    # inside the tick's own mutex, so a sweep that hangs on an unresponsive
+    # daemon would stop the scheduler launching anything at all.
+    _wt_sweep_hook() {
+      cd "$cwd" 2>/dev/null || return 1
+      AL_PROJECT="$project" CC_PROJECT="$project" \
+      AL_LIVE_WORKTREES="$live" AL_CANONICALS="$canon" \
+      AL_SWEEP_GRACE_SECONDS="$grace" \
+      AL_PROVISION_LIB="${AL_PROVISION_LIB:-}" CC_PROVISION_LIB="${AL_PROVISION_LIB:-}" \
+        bash "$script" >>"$DATA_DIR/exec.log" 2>&1
+    }
+    wt_run_limited "$t" _wt_sweep_hook; rc=$?
+    unset -f _wt_sweep_hook
+    [ "$rc" -eq 0 ] || log_tick "sweep: $project hook failed (rc=$rc) — see exec.log"
+  done < <(projects_json | "$JQ" -r '.projects[]?.name | strings | select(. != "")' 2>/dev/null)
+  [ -n "$live" ] && rm -f "$live" "$canon"
+  true
+}
