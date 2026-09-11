@@ -2666,7 +2666,7 @@ Em `## [Unreleased]` → `### Added`, no topo:
   most expensive OpenAI model was one click away, and a job on a CLI nobody
   had signed in to found out at its first launch, hours later.
 ```
-Em `### Removed` (criar a secção se não existir sob `[Unreleased]`):
+A secção `### Removed` sob `[Unreleased]` **já existe** desde a Task 5, com este mesmo entry — não o repetir; só mover a secção para entre `### Changed` e `### Fixed` (a ordem de Keep a Changelog) e confirmar o texto:
 
 ```markdown
 - **The per-project and per-block `claude_config_dir`.** The account a run
