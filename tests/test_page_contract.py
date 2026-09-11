@@ -3369,12 +3369,41 @@ def test_the_settings_summary_and_the_status_chip(srv, tmp_path):
     assert out["nobin"]["cls"] == "off" and out["nosession"]["cls"] == "idle" and out["planned"]["cls"] == "disabled"
 
 
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_settings_summary_ignores_a_disabled_platforms_models(srv, tmp_path):
+    """platform_disable does not clear models_enabled, so a platform switched
+    off can still carry a list -- none of it is available to a job, and the
+    summary must not count it."""
+    js = _app_js(srv)
+    script = tmp_path / "settings-summary-disabled.js"
+    script.write_text("""
+    const REGISTRY = [{id: "anthropic"}, {id: "openai"}, {id: "opencode"}];
+    """ + _plainfn(js, "settingsSummary") + """
+    const P = {anthropic: {enabled: true, models_enabled: ["a", "b"]}, openai: {enabled: false, models_enabled: ["c"]}, opencode: {enabled: false, models_enabled: []}};
+    console.log(JSON.stringify({summary: settingsSummary(P)}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["summary"] == "1 of 3 platforms enabled · 2 models available to jobs", \
+        "a disabled platform's leftover models_enabled must not be counted"
+
+
 def test_the_settings_module_speaks_the_six_actions(srv):
     src = (REPO / "ui" / "app" / "settings.js").read_text()
     for op in ("platform_check", "platform_enable", "platform_disable", "platform_set_bin", "platform_models", "platform_set_models"):
         assert f'"{op}"' in src, f"settings.js never calls {op}"
     assert "Test the session first, then load the models" in src
     assert "no longer in the catalog" in src
+    assert "delete live.checks[r.id]" in src, \
+        "a changed binary must invalidate the stale check and catalog"
+    assert "live.busy[extra.platform] = true" in src, \
+        "change() must lock the card while a save is in flight"
+    params = re.search(r"function setupBanner\(([^)]*)\)", src).group(1)
+    assert len([p for p in params.split(",") if p.strip()]) == 3, \
+        "setupBanner must take (configured, error, withButton)"
+    assert '"btn primary open-settings"' in src, \
+        "the Open Settings button must be found by class"
+    assert 'id = "open-settings"' not in src and 'id="open-settings"' not in src, \
+        "the button must carry no id -- a later task mounts this banner on two views at once"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -7675,6 +7704,11 @@ _UNSTYLED_CLASS_ALLOWLIST = {
     "secfind-stat",
     "total",
     "unique",
+    # setupBanner's Open Settings button (settings.js): a pure MARKER class
+    # -- "btn primary" already carries its whole look -- so a click on it can
+    # be delegated by class once this banner is mounted on two views at once
+    # and an id can no longer be given to both.
+    "open-settings",
 }
 
 

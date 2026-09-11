@@ -36,7 +36,9 @@ async function post(op, extra){
 export function settingsSummary(platforms){
   const entries = REGISTRY.map(r => (platforms || {})[r.id] || {});
   const enabled = entries.filter(p => p.enabled === true).length;
-  const models = entries.reduce((n, p) => n + ((p.models_enabled || []).length), 0);
+  // platform_disable does not clear models_enabled, so a disabled platform's
+  // leftover list must not count -- those models are not available to a job.
+  const models = entries.reduce((n, p) => n + (p.enabled === true ? (p.models_enabled || []).length : 0), 0);
   return enabled + " of " + REGISTRY.length + " platforms enabled · " + models + " model" + (models === 1 ? "" : "s") + " available to jobs";
 }
 
@@ -49,7 +51,7 @@ export function platformStatus(entry, check){
 }
 
 // The strip Overview and Jobs show while nothing is configured (Task 9 mounts it).
-export function setupBanner(configured, error){
+export function setupBanner(configured, error, withButton = true){
   if(configured !== false && !error) return null;
   const b = el("div", "setup-banner");
   const bic = el("div", "bic"); bic.appendChild(icon("alert")); b.appendChild(bic);
@@ -58,9 +60,13 @@ export function setupBanner(configured, error){
   t.appendChild(el("span", null, error ? error
     : "Enable one in Settings › Platforms and switch on at least one model; until then no job can be created. New job takes you there."));
   b.appendChild(t);
-  const btn = el("button", "btn primary"); btn.type = "button"; btn.id = "open-settings";
-  btn.appendChild(icon("gear")); btn.appendChild(document.createTextNode("Open Settings"));
-  b.appendChild(btn);
+  if(withButton){
+    // No id here: this banner is about to be mounted on two views at once
+    // (Task 9), so the click is delegated by class instead of a duplicated id.
+    const btn = el("button", "btn primary open-settings"); btn.type = "button";
+    btn.appendChild(icon("gear")); btn.appendChild(document.createTextNode("Open Settings"));
+    b.appendChild(btn);
+  }
   return b;
 }
 
@@ -70,9 +76,10 @@ function ago(ms){
   return s < 60 ? "checked " + s + " s ago" : "checked " + Math.round(s / 60) + " min ago";
 }
 
-function switchEl(on, disabled, title, onToggle){
+function switchEl(on, disabled, title, ariaLabel, onToggle){
   const lab = el("label", "switch"); if(title) lab.title = title;
   const inp = el("input"); inp.type = "checkbox"; inp.checked = !!on; inp.disabled = !!disabled;
+  inp.setAttribute("aria-label", ariaLabel);
   inp.addEventListener("change", () => onToggle(inp.checked));
   lab.appendChild(inp); lab.appendChild(el("span", "track")); lab.appendChild(el("span", "knob"));
   return lab;
@@ -102,9 +109,20 @@ async function loadCatalog(id){
 }
 
 async function change(op, extra){
-  const j = await post(op, extra);
-  if(j && j.output) toast(j.output.split("\n")[0], false, "check");
-  if(ctx && ctx.onChange) await ctx.onChange();   // the page re-reads /api/models and repaints this page
+  // Lock the card for the round trip -- paint() already disables its
+  // switches and buttons while live.busy[platform] is set, so a second
+  // toggle clicked before this one lands can no longer read the same stale
+  // `entry` and clobber the first save.
+  live.busy[extra.platform] = true; paint();
+  try{
+    const j = await post(op, extra);
+    if(j && j.output) toast(j.output.split("\n")[0], false, "check");
+    if(ctx && ctx.onChange) await ctx.onChange();   // the page re-reads /api/models and repaints this page
+    return j;   // truthy on success, null on a refused or failed call
+  } finally {
+    live.busy[extra.platform] = false;
+    paint();
+  }
 }
 
 function binaryBlock(r, entry, check){
@@ -118,16 +136,25 @@ function binaryBlock(r, entry, check){
   const sub = el("div", "sub");
   sub.textContent = check
     ? (check.bin_found ? [src, check.version].filter(Boolean).join(" · ") + " · this is the path launchd sees, the one scheduled runs use"
-                       : "looked at " + check.bin + " — type the path if it lives elsewhere, or install it: " + check.reason.split("install: ")[1])
-    : "checking…";
+                       : "looked at " + check.bin + " — type the path if it lives elsewhere, or install it: " + (check.reason.split("install: ")[1] || check.reason))
+    : (live.busy[r.id] ? "checking…" : "— not checked");
   box.appendChild(sub);
   const ctrl = el("div", "ctrl");
   const inp = el("input"); inp.type = "text"; inp.value = entry.bin || ""; inp.placeholder = "Use another binary… (leave empty to detect)";
   inp.disabled = !!live.busy[r.id] || entry.supported === false;
-  inp.addEventListener("change", async () => { await change("platform_set_bin", {platform: r.id, bin: inp.value.trim()}); await runCheck(r.id); });
+  inp.addEventListener("change", async () => {
+    const ok = await change("platform_set_bin", {platform: r.id, bin: inp.value.trim()});
+    if(!ok) return;
+    delete live.checks[r.id]; delete live.catalogs[r.id];   // the old check named the old binary
+    await runCheck(r.id);
+  });
   ctrl.appendChild(inp);
-  ctrl.appendChild(button("Detect", "radar", async () => { await change("platform_set_bin", {platform: r.id, bin: ""}); await runCheck(r.id); },
-                          live.busy[r.id] || entry.supported === false));
+  ctrl.appendChild(button("Detect", "radar", async () => {
+    const ok = await change("platform_set_bin", {platform: r.id, bin: ""});
+    if(!ok) return;
+    delete live.checks[r.id]; delete live.catalogs[r.id];
+    await runCheck(r.id);
+  }, live.busy[r.id] || entry.supported === false));
   box.appendChild(ctrl);
   return box;
 }
@@ -137,7 +164,13 @@ function sessionBlock(r, entry, check){
   box.appendChild(el("h3", null, "Session"));
   const val = el("div", "val" + (check ? (check.ready ? " ok" : (check.bin_found ? " err" : " mute")) : " mute"));
   if(!check){ val.textContent = live.busy[r.id] ? "checking…" : "— not checked"; }
-  else if(check.ready){ val.appendChild(icon("check")); val.appendChild(document.createTextNode("Signed in as " + (check.account || "unknown"))); }
+  else if(check.ready){
+    val.appendChild(icon("check"));
+    const account = check.account || "unknown";
+    // The engine already phrases codex's own answer as "Logged in ..." --
+    // prefixing "Signed in as " on top of that reads twice.
+    val.appendChild(document.createTextNode(account.startsWith("Logged in") ? account : "Signed in as " + account));
+  }
   else if(!check.bin_found){ val.textContent = "— waiting for a binary"; }
   else { val.appendChild(icon("xcircle")); val.appendChild(document.createTextNode(check.reason)); }
   box.appendChild(val);
@@ -158,7 +191,8 @@ function modelRow(r, entry, m, using, gone){
   const row = el("div", "mrow" + (enabledNow ? "" : " offrow"));
   const name = el("div", "mname");
   name.appendChild(el("b", null, m.label || m.v));
-  name.appendChild(el("span", null, m.v + (m.desc ? " — " + m.desc : "") + (gone ? " — no longer in the catalog" : "")
+  name.appendChild(el("span", null, m.v + (m.desc ? " — " + m.desc : "")
+    + (gone ? " — no longer in the catalog — switch it off before changing the others (the engine refuses a list with an id it cannot find)" : "")
     + (m.deprecated_by ? " — deprecated, → " + m.deprecated_by : "")));
   row.appendChild(name);
   const meta = el("div", "mmeta");
@@ -168,7 +202,7 @@ function modelRow(r, entry, m, using, gone){
   const n = using[m.v] || 0;
   if(n) meta.appendChild(el("span", "jobs", n + " job" + (n === 1 ? "" : "s")));
   row.appendChild(meta);
-  row.appendChild(switchEl(enabledNow, live.busy[r.id], n ? n + " enabled job(s) use this model" : "", async (on) => {
+  row.appendChild(switchEl(enabledNow, live.busy[r.id], n ? n + " enabled job(s) use this model" : "", "Switch on " + m.v, async (on) => {
     const cur = (entry.models_enabled || []).slice();
     const next = on ? (cur.includes(m.v) ? cur : cur.concat([m.v])) : cur.filter(v => v !== m.v);
     await change("platform_set_models", {platform: r.id, models: next});
@@ -197,7 +231,8 @@ function modelsSection(r, entry, check, catalog){
     return frag;
   }
   if(!catalog){
-    frag.appendChild(el("div", "mempty", ready ? "Loading the models…" : "Test the session first, then load the models."));
+    frag.appendChild(el("div", "mempty", live.busy[r.id] ? "Loading the models…"
+      : (ready ? "The catalog could not be loaded — Refresh to try again." : "Test the session first, then load the models.")));
     return frag;
   }
   const using = entry.jobs_using || {};
@@ -221,6 +256,7 @@ function platformCard(r, entry, check, catalog){
   const canToggle = entry.supported !== false && !live.busy[r.id] && (entry.enabled || (check && check.ready));
   row.appendChild(switchEl(!!entry.enabled, !canToggle,
     entry.supported === false ? "runs on OpenCode arrive with the next release" : (canToggle ? "" : "unlocks when the session test passes"),
+    "Enable " + r.name,
     async (on) => { await change(on ? "platform_enable" : "platform_disable", {platform: r.id}); }));
   sw.appendChild(row);
   const n = entry.jobs_on_platform || 0;
@@ -239,12 +275,32 @@ function paint(){
   head.textContent = "";
   head.appendChild(pageHeader({icon: "gear", title: "Settings",
     subtitle: "Which agent CLIs this scheduler may run, and which of their models a job may pick."}));
+  // The three checks and two catalogs this page fires on open land within
+  // the first seconds, each one repainting -- so save the focused Binary
+  // field's card, value and selection before tearing the DOM down, and
+  // restore them after, or a still-typing operator loses keystrokes to a
+  // completion that has nothing to do with what they are editing.
+  const active = document.activeElement;
+  let savedFocus = null;
+  if(active && active.tagName === "INPUT" && host.contains(active)){
+    const card = active.closest("section.platcard");
+    if(card) savedFocus = {cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd};
+  }
   host.textContent = "";
   if(ctx.error){
-    const b = setupBanner(false, ctx.error); if(b) host.appendChild(b);
+    const b = setupBanner(false, ctx.error, false); if(b) host.appendChild(b);
   }
   host.appendChild(el("div", "summary", settingsSummary(ctx.platforms)));
   REGISTRY.forEach(r => host.appendChild(platformCard(r, (ctx.platforms || {})[r.id] || {}, live.checks[r.id] || null, live.catalogs[r.id] || null)));
+  if(savedFocus){
+    const card = $(savedFocus.cardId);
+    const inp = card && card.querySelector(".ctrl input");
+    if(inp){
+      inp.value = savedFocus.value;
+      inp.setSelectionRange(savedFocus.selectionStart, savedFocus.selectionEnd);
+      inp.focus({preventScroll: true});
+    }
+  }
 }
 
 // The page calls this on entering the view and after every /api/models

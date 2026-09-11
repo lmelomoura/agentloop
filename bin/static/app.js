@@ -2434,7 +2434,7 @@
   function settingsSummary(platforms) {
     const entries = REGISTRY.map((r) => (platforms || {})[r.id] || {});
     const enabled = entries.filter((p) => p.enabled === true).length;
-    const models = entries.reduce((n, p) => n + (p.models_enabled || []).length, 0);
+    const models = entries.reduce((n, p) => n + (p.enabled === true ? (p.models_enabled || []).length : 0), 0);
     return enabled + " of " + REGISTRY.length + " platforms enabled \xB7 " + models + " model" + (models === 1 ? "" : "s") + " available to jobs";
   }
   function platformStatus(entry, check) {
@@ -2443,7 +2443,7 @@
     if (check && check.ready === false) return { cls: "idle", label: "Not signed in" };
     return entry && entry.enabled ? { cls: "on", label: "Enabled" } : { cls: "disabled", label: "Disabled" };
   }
-  function setupBanner(configured, error) {
+  function setupBanner(configured, error, withButton = true) {
     if (configured !== false && !error) return null;
     const b = el("div", "setup-banner");
     const bic = el("div", "bic");
@@ -2453,12 +2453,13 @@
     t.appendChild(el("b", null, error ? "The platform settings cannot be read." : "No platform is enabled yet."));
     t.appendChild(el("span", null, error ? error : "Enable one in Settings \u203A Platforms and switch on at least one model; until then no job can be created. New job takes you there."));
     b.appendChild(t);
-    const btn = el("button", "btn primary");
-    btn.type = "button";
-    btn.id = "open-settings";
-    btn.appendChild(icon("gear"));
-    btn.appendChild(document.createTextNode("Open Settings"));
-    b.appendChild(btn);
+    if (withButton) {
+      const btn = el("button", "btn primary open-settings");
+      btn.type = "button";
+      btn.appendChild(icon("gear"));
+      btn.appendChild(document.createTextNode("Open Settings"));
+      b.appendChild(btn);
+    }
     return b;
   }
   function ago(ms) {
@@ -2466,13 +2467,14 @@
     const s = Math.max(0, Math.round((Date.now() - ms) / 1e3));
     return s < 60 ? "checked " + s + " s ago" : "checked " + Math.round(s / 60) + " min ago";
   }
-  function switchEl(on, disabled, title, onToggle) {
+  function switchEl(on, disabled, title, ariaLabel, onToggle) {
     const lab = el("label", "switch");
     if (title) lab.title = title;
     const inp = el("input");
     inp.type = "checkbox";
     inp.checked = !!on;
     inp.disabled = !!disabled;
+    inp.setAttribute("aria-label", ariaLabel);
     inp.addEventListener("change", () => onToggle(inp.checked));
     lab.appendChild(inp);
     lab.appendChild(el("span", "track"));
@@ -2509,9 +2511,17 @@
     paint();
   }
   async function change(op, extra) {
-    const j = await post(op, extra);
-    if (j && j.output) toast(j.output.split("\n")[0], false, "check");
-    if (ctx && ctx.onChange) await ctx.onChange();
+    live.busy[extra.platform] = true;
+    paint();
+    try {
+      const j = await post(op, extra);
+      if (j && j.output) toast(j.output.split("\n")[0], false, "check");
+      if (ctx && ctx.onChange) await ctx.onChange();
+      return j;
+    } finally {
+      live.busy[extra.platform] = false;
+      paint();
+    }
   }
   function binaryBlock(r, entry, check) {
     const box = el("div");
@@ -2527,7 +2537,7 @@
     box.appendChild(val);
     const src = { env: "from AGENTLOOP_" + r.cli.toUpperCase() + "_BIN", file: "set here", auto: "found on PATH" }[(check || entry).bin_source] || "";
     const sub = el("div", "sub");
-    sub.textContent = check ? check.bin_found ? [src, check.version].filter(Boolean).join(" \xB7 ") + " \xB7 this is the path launchd sees, the one scheduled runs use" : "looked at " + check.bin + " \u2014 type the path if it lives elsewhere, or install it: " + check.reason.split("install: ")[1] : "checking\u2026";
+    sub.textContent = check ? check.bin_found ? [src, check.version].filter(Boolean).join(" \xB7 ") + " \xB7 this is the path launchd sees, the one scheduled runs use" : "looked at " + check.bin + " \u2014 type the path if it lives elsewhere, or install it: " + (check.reason.split("install: ")[1] || check.reason) : live.busy[r.id] ? "checking\u2026" : "\u2014 not checked";
     box.appendChild(sub);
     const ctrl = el("div", "ctrl");
     const inp = el("input");
@@ -2536,19 +2546,20 @@
     inp.placeholder = "Use another binary\u2026 (leave empty to detect)";
     inp.disabled = !!live.busy[r.id] || entry.supported === false;
     inp.addEventListener("change", async () => {
-      await change("platform_set_bin", { platform: r.id, bin: inp.value.trim() });
+      const ok = await change("platform_set_bin", { platform: r.id, bin: inp.value.trim() });
+      if (!ok) return;
+      delete live.checks[r.id];
+      delete live.catalogs[r.id];
       await runCheck(r.id);
     });
     ctrl.appendChild(inp);
-    ctrl.appendChild(button(
-      "Detect",
-      "radar",
-      async () => {
-        await change("platform_set_bin", { platform: r.id, bin: "" });
-        await runCheck(r.id);
-      },
-      live.busy[r.id] || entry.supported === false
-    ));
+    ctrl.appendChild(button("Detect", "radar", async () => {
+      const ok = await change("platform_set_bin", { platform: r.id, bin: "" });
+      if (!ok) return;
+      delete live.checks[r.id];
+      delete live.catalogs[r.id];
+      await runCheck(r.id);
+    }, live.busy[r.id] || entry.supported === false));
     box.appendChild(ctrl);
     return box;
   }
@@ -2560,7 +2571,8 @@
       val.textContent = live.busy[r.id] ? "checking\u2026" : "\u2014 not checked";
     } else if (check.ready) {
       val.appendChild(icon("check"));
-      val.appendChild(document.createTextNode("Signed in as " + (check.account || "unknown")));
+      const account = check.account || "unknown";
+      val.appendChild(document.createTextNode(account.startsWith("Logged in") ? account : "Signed in as " + account));
     } else if (!check.bin_found) {
       val.textContent = "\u2014 waiting for a binary";
     } else {
@@ -2582,7 +2594,7 @@
     const row = el("div", "mrow" + (enabledNow ? "" : " offrow"));
     const name = el("div", "mname");
     name.appendChild(el("b", null, m.label || m.v));
-    name.appendChild(el("span", null, m.v + (m.desc ? " \u2014 " + m.desc : "") + (gone ? " \u2014 no longer in the catalog" : "") + (m.deprecated_by ? " \u2014 deprecated, \u2192 " + m.deprecated_by : "")));
+    name.appendChild(el("span", null, m.v + (m.desc ? " \u2014 " + m.desc : "") + (gone ? " \u2014 no longer in the catalog \u2014 switch it off before changing the others (the engine refuses a list with an id it cannot find)" : "") + (m.deprecated_by ? " \u2014 deprecated, \u2192 " + m.deprecated_by : "")));
     row.appendChild(name);
     const meta = el("div", "mmeta");
     if (m.price) meta.appendChild(el("span", "price", "$" + m.price.input + " / $" + m.price.output));
@@ -2591,7 +2603,7 @@
     const n = using[m.v] || 0;
     if (n) meta.appendChild(el("span", "jobs", n + " job" + (n === 1 ? "" : "s")));
     row.appendChild(meta);
-    row.appendChild(switchEl(enabledNow, live.busy[r.id], n ? n + " enabled job(s) use this model" : "", async (on) => {
+    row.appendChild(switchEl(enabledNow, live.busy[r.id], n ? n + " enabled job(s) use this model" : "", "Switch on " + m.v, async (on) => {
       const cur = (entry.models_enabled || []).slice();
       const next = on ? cur.includes(m.v) ? cur : cur.concat([m.v]) : cur.filter((v) => v !== m.v);
       await change("platform_set_models", { platform: r.id, models: next });
@@ -2619,7 +2631,7 @@
       return frag;
     }
     if (!catalog) {
-      frag.appendChild(el("div", "mempty", ready ? "Loading the models\u2026" : "Test the session first, then load the models."));
+      frag.appendChild(el("div", "mempty", live.busy[r.id] ? "Loading the models\u2026" : ready ? "The catalog could not be loaded \u2014 Refresh to try again." : "Test the session first, then load the models."));
       return frag;
     }
     const using = entry.jobs_using || {};
@@ -2653,6 +2665,7 @@
       !!entry.enabled,
       !canToggle,
       entry.supported === false ? "runs on OpenCode arrive with the next release" : canToggle ? "" : "unlocks when the session test passes",
+      "Enable " + r.name,
       async (on) => {
         await change(on ? "platform_enable" : "platform_disable", { platform: r.id });
       }
@@ -2680,13 +2693,28 @@
       title: "Settings",
       subtitle: "Which agent CLIs this scheduler may run, and which of their models a job may pick."
     }));
+    const active = document.activeElement;
+    let savedFocus = null;
+    if (active && active.tagName === "INPUT" && host.contains(active)) {
+      const card = active.closest("section.platcard");
+      if (card) savedFocus = { cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd };
+    }
     host.textContent = "";
     if (ctx.error) {
-      const b = setupBanner(false, ctx.error);
+      const b = setupBanner(false, ctx.error, false);
       if (b) host.appendChild(b);
     }
     host.appendChild(el("div", "summary", settingsSummary(ctx.platforms)));
     REGISTRY.forEach((r) => host.appendChild(platformCard(r, (ctx.platforms || {})[r.id] || {}, live.checks[r.id] || null, live.catalogs[r.id] || null)));
+    if (savedFocus) {
+      const card = $(savedFocus.cardId);
+      const inp = card && card.querySelector(".ctrl input");
+      if (inp) {
+        inp.value = savedFocus.value;
+        inp.setSelectionRange(savedFocus.selectionStart, savedFocus.selectionEnd);
+        inp.focus({ preventScroll: true });
+      }
+    }
   }
   function renderSettingsPage(c) {
     ctx = c;
@@ -2928,5 +2956,5 @@
     setupBanner
   };
 })();
-/* ui-bundle: 9737d4cb19f47a95adcbf6a18550a19e8360609bda90d32a86e28f17dd84fac8 */
-/* ui-sources: 7040d201f8364defceccd2e13309a57969338fad7108772994df817b06aabfcd */
+/* ui-bundle: b9a999886229107cd99f9652f17c1852859733c1287137d36c3baeb781f7d5b4 */
+/* ui-sources: 370da79387a8e057a21043dced9e48dd133defb74d8463403fc1864b07711ec4 */
