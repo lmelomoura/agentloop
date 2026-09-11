@@ -1550,20 +1550,48 @@ cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-m
       local path="${3:-}" epath
       if [ -n "$path" ]; then
         epath="$(expand_home "$path")"
+        # A relative path only resolves against whoever's cwd calls it next --
+        # the tick runs from launchd, a different cwd entirely, and would not
+        # find it. Leave an already-absolute or ~-rooted path alone (expand_home
+        # resolves ~ from $HOME regardless of cwd, so it is already portable).
+        case "$path" in
+          /*|'~'*) ;;
+          *) path="$PWD/$path"; epath="$path" ;;
+        esac
         [ -f "$epath" ] && [ -x "$epath" ] || die "set-bin: not executable: $path"
       fi
       write_platforms --arg p "$p" --arg b "$path" '.platforms[$p] = ((.platforms[$p] // {enabled:false, models:[]}) + {bin:$b})'
       if [ -n "$path" ]; then echo "$p binary: $path"; else echo "$p binary: detected ($(platform_bin "$p"))"; fi ;;
     models)
-      local stale=false reason=""
+      local stale=false reason="" old tmp
       if [ "$p" = "openai" ]; then
+        # config/models.json's .openai block is a cache the launch gate reads
+        # through openai_catalog_available/_visible, not through this call's
+        # stale flag. resolve_models_openai replaces the whole block
+        # unconditionally, even on failure (an {available:false} stub) -- so
+        # a transient codex problem (missing binary, empty answer) would
+        # otherwise empty a catalog that still resolves real jobs, and refuse
+        # every openai launch until the next successful refresh. Snapshot the
+        # catalog first and put it back when the refresh left nothing usable.
+        old="$("$JQ" -c '.openai // empty' "$MODELS_FILE" 2>/dev/null)"
         out="$(resolve_models_openai 2>&1)"; rc=$?
-        if [ "$rc" -ne 0 ] || ! openai_catalog_available; then stale=true; reason="refresh failed: $(printf '%s' "$out" | tail -1)"; fi
+        if [ "$rc" -ne 0 ] || ! openai_catalog_available; then
+          stale=true; reason="refresh failed: $(printf '%s' "$out" | tail -1)"
+          if [ -n "$old" ] && printf '%s' "$old" | "$JQ" -e '.models | type == "array"' >/dev/null 2>&1; then
+            tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX" 2>/dev/null)"
+            if [ -n "$tmp" ] && ! { "$JQ" --argjson b "$old" '.openai = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
+              rm -f "$tmp"
+            fi
+          fi
+        fi
       fi
       platform_models_json "$p" "$stale" "$reason" ;;
     set-models)
-      list="$(cat | "$JQ" -c 'if type == "array" and all(.[]; type == "string") then . else error("not a list") end' 2>/dev/null)" \
+      list="$(cat | "$JQ" -ec 'if type == "array" and all(.[]; type == "string") then . else error("not a list") end' 2>/dev/null)" \
         || die "set-models: expected a JSON list of model ids on stdin"
+      # First-seen order, the same reduce platforms_seed already dedupes with,
+      # so a repeated id in the request is not written twice.
+      list="$(printf '%s' "$list" | "$JQ" -c 'reduce .[] as $m ([]; if index($m) then . else . + [$m] end)')"
       cur="$(platform_models_enabled "$p" | "$JQ" -R . | "$JQ" -sc .)"
       catalog="$(platform_catalog_ids "$p" | "$JQ" -R . | "$JQ" -sc .)"; [ -n "$catalog" ] || catalog='[]'
       # every NEW id has to be in the catalog; one already enabled may stay even when a refresh dropped it
@@ -3566,7 +3594,7 @@ JSON
   [ "$(platform_check martian | "$JQ" -r .reason)" = "unknown platform martian" ] && ok "an unlisted platform is answered, never a crash" || bad "unlisted"
 
   echo "agentloop platform … — the commands the Settings page is made of"
-  local pc="$tmp/pc"; mkdir -p "$pc/config" "$pc/data"
+  local pc="$tmp/pc" out rc _pm _pl; mkdir -p "$pc/config" "$pc/data"
   printf '{"jobs":[{"id":"u1","model":"claude-opus-5","prompt":"x"},{"id":"u2","platform":"openai","model":"gpt-a","prompt":"x"}]}\n' > "$pc/config/jobs.json"
   printf '{"projects":[]}\n' > "$pc/config/projects.json"
   "$JQ" -n '{resolved:{opus:{id:"claude-opus-5",at:1}}, openai:{at:1, source:"fixture", models:[
@@ -3583,6 +3611,11 @@ JSON
     > "$pc/catalog.json"
   pc_al() { AGENTLOOP_CONFIG="$pc/config" AGENTLOOP_DATA="$pc/data" AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" \
             AGENTLOOP_CODEX_BIN="$BASE_DIR/test/fake-codex" AGENTLOOP_CLAUDE_CONFIG_DIR="" CODEX_HOME="$pc/codex-home" \
+            FAKE_CODEX_MODELS_JSON="$pc/catalog.json" "$BIN_DIR/agentloop" "$@"; }
+  # pc_al's own twin, pointed at a codex that is not there, for the "a failed
+  # refresh must not clobber the catalog" assertion below.
+  pc_al_nocodex() { AGENTLOOP_CONFIG="$pc/config" AGENTLOOP_DATA="$pc/data" AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" \
+            AGENTLOOP_CODEX_BIN=/nonexistent/codex AGENTLOOP_CLAUDE_CONFIG_DIR="" CODEX_HOME="$pc/codex-home" \
             FAKE_CODEX_MODELS_JSON="$pc/catalog.json" "$BIN_DIR/agentloop" "$@"; }
   pc_al platform check openai | "$JQ" -e '.ready == true' >/dev/null 2>&1; want "platform check prints platform_check's JSON" 0 $?
   pc_al platform check martian >/dev/null 2>&1; want "platform check refuses an unlisted platform" 1 $?
@@ -3603,17 +3636,33 @@ JSON
   pc_al platform set-bin openai /nonexistent/codex >/dev/null 2>&1; want "set-bin refuses a path that is not executable" 1 $?
   pc_al platform set-bin openai "$BASE_DIR/test/fake-codex" >/dev/null 2>&1; want "set-bin accepts an executable" 0 $?
   [ "$("$JQ" -r '.platforms.openai.bin' "$pc/config/platforms.json")" = "$BASE_DIR/test/fake-codex" ] && ok "and writes it" || bad "bin not written"
+  pc_al platform set-bin openai "test/fake-codex" >/dev/null 2>&1; want "set-bin accepts a relative path" 0 $?
+  [ "$("$JQ" -r '.platforms.openai.bin' "$pc/config/platforms.json")" = "$BASE_DIR/test/fake-codex" ] \
+    && ok "and stores it made absolute against the cwd, not as typed" || bad "relative bin not absolutized: $("$JQ" -r '.platforms.openai.bin' "$pc/config/platforms.json")"
   pc_al platform set-bin openai "" >/dev/null 2>&1
   [ "$("$JQ" -r '.platforms.openai.bin' "$pc/config/platforms.json")" = "" ] && ok "set-bin with nothing goes back to detection" || bad "bin not cleared"
   _pm="$(pc_al platform models openai 2>/dev/null)"
   printf '%s' "$_pm" | "$JQ" -e '.platform == "openai" and .stale == false and (.models | map(.v)) == ["gpt-a","gpt-b"] and .models[0].enabled == true and .models[1].enabled == false and .models[0].price.input == 4 and .models[1].price == null and .models[0].efforts == ["low","high"]' >/dev/null 2>&1 \
     && ok "platform models: the catalog in priority order, each slug with enabled, efforts and price" || bad "models openai: $_pm"
+  # A refresh that fails (codex missing) must not empty the catalog the launch
+  # gate reads: it should keep serving the last good one, marked stale.
+  _pm="$(pc_al_nocodex platform models openai 2>/dev/null)"
+  printf '%s' "$_pm" | "$JQ" -e '.stale == true and (.reason | test("refresh failed")) and (.models | map(.v)) == ["gpt-a","gpt-b"]' >/dev/null 2>&1 \
+    && ok "platform models: a failed refresh keeps the old catalog and says stale" || bad "models openai failed refresh: $_pm"
+  "$JQ" -e '.openai.models | length == 2' "$pc/config/models.json" >/dev/null 2>&1 \
+    && ok "and config/models.json still carries the pre-refresh catalog" || bad "models.json after failed refresh: $(cat "$pc/config/models.json")"
   _pm="$(pc_al platform models anthropic 2>/dev/null)"
   printf '%s' "$_pm" | "$JQ" -e '.platform == "anthropic" and (.models | map(.v) | index("claude-opus-5")) != null and (.models[] | select(.v == "claude-opus-5") | .enabled) == true' >/dev/null 2>&1 \
     && ok "platform models anthropic: the ids in use are listed and flagged" || bad "models anthropic: $_pm"
   pc_al platform models opencode | "$JQ" -e '.models == [] and (.reason | length) > 0' >/dev/null 2>&1; want "platform models opencode: an empty list with the reason" 0 $?
   printf '["gpt-zzz"]' | pc_al platform set-models openai >/dev/null 2>&1; want "set-models refuses an id outside the catalog" 1 $?
   printf 'not json' | pc_al platform set-models openai >/dev/null 2>&1; want "set-models refuses anything but a JSON list" 1 $?
+  printf '' | pc_al platform set-models openai >/dev/null 2>&1; want "set-models refuses empty stdin" 1 $?
+  [ "$("$JQ" -c '.platforms.openai.models' "$pc/config/platforms.json")" = '["gpt-a"]' ] \
+    && ok "and leaves the file unchanged" || bad "set-models empty stdin wrote: $(cat "$pc/config/platforms.json")"
+  printf '["gpt-a","gpt-a"]' | pc_al platform set-models openai >/dev/null 2>&1
+  [ "$("$JQ" -c '.platforms.openai.models' "$pc/config/platforms.json")" = '["gpt-a"]' ] \
+    && ok "set-models dedupes a repeated id before writing" || bad "set-models dedupe wrote: $(cat "$pc/config/platforms.json")"
   out="$(printf '["gpt-b"]' | pc_al platform set-models openai 2>&1)"; rc=$?
   [ "$rc" -eq 0 ] && [ "$("$JQ" -c '.platforms.openai.models' "$pc/config/platforms.json")" = '["gpt-b"]' ] \
     && ok "set-models writes the list it was given" || bad "set-models: rc=$rc $out"

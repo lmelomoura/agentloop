@@ -60,6 +60,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     the operator actually enabled (`usable`, `bin_source`, `models_enabled`,
     which jobs run on each), with `_error` at the top when the file itself
     cannot be read.
+  - A failed catalog refresh from Settings (`agentloop platform models
+    openai` when codex is missing or its answer is empty) keeps the catalog
+    it had instead of emptying it, and says stale.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and
