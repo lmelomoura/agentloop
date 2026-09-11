@@ -1246,11 +1246,13 @@ job_platform() { # job_platform <id>
 # A job with no model, or one that names a model invalid for its own
 # platform, still runs -- on that platform's default -- so the seed has to
 # credit the default to it, not an empty string. platform_default_model is
-# the function that knows the default, but platforms_jq never calls it
-# directly: a later change makes platform_default_model read the enabled
-# models back out of THIS file, and calling it from in here would be that
-# same loop one layer down. So platforms_jq takes both platforms' defaults
-# as arguments, and each caller works out its own (see platforms_seed vs.
+# the function that knows the default, but platforms_jq never calls it (nor
+# any openai_catalog_* reader -- openai_catalog_visible already sits on the
+# seed's own path, feeding $odef) directly: a later change makes
+# platform_default_model read the enabled models back out of THIS file, and
+# calling it, or a catalog reader it comes to depend on, from in here would
+# be that same loop one layer down. So platforms_jq takes both platforms'
+# defaults as arguments, and each caller works out its own (see platforms_seed vs.
 # platform_jobs_on below: the seed can only use what it can compute without
 # this file; a live read uses the real thing).
 PLATFORMS_JQ='
@@ -1265,7 +1267,7 @@ PLATFORMS_JQ='
                          elif (($p.platform // "") != "") then $p.platform else "anthropic" end) | known;
   def sec_on($p): ((sec($p).enabled == true) or (sec($p).enabled == "true"));
   def resolved($m): (if ($m != "") and ((($resolved[$m] // {}) | .id // "") != "") then $resolved[$m].id else $m end);
-  def valid($p; $m): if $p == "openai" then ($ocat | index($m)) != null
+  def valid($p; $m): if $p == "openai" then (($ocat | length) == 0) or (($ocat | index($m)) != null)
                       else ($m == "opus" or $m == "sonnet" or $m == "haiku" or $m == "fable" or ($m | startswith("claude-"))) end;
   def effective($p; $m): if $m != "" and valid($p; $m) then $m else (if $p == "openai" then $odef else $adef end) end;
   def uses: ([ ($jobs.jobs // [])[] | select(.enabled != false) | job_platform(.) as $p
@@ -1319,6 +1321,7 @@ platforms_json() { # the file, seeded when missing; an unreadable one reads as n
 write_platforms() { # write_platforms <jq-filter> [jq-args...] -- write_jobs's guard: never replace the file with a broken document
   local tmp
   platforms_ensure
+  [ -f "$PLATFORMS_FILE" ] || die "could not seed $PLATFORMS_FILE"
   platforms_valid || die "refusing to write $PLATFORMS_FILE: it is not a valid platforms file (not JSON, or no .platforms object) — fix it by hand first"
   tmp="$(mktemp "$(dirname "$PLATFORMS_FILE")/.platforms.XXXXXX")"
   if "$JQ" "$@" "$PLATFORMS_FILE" > "$tmp" 2>/dev/null \
@@ -1353,6 +1356,11 @@ platform_model_enabled() { # platform_model_enabled <platform> <model> -> 0 when
 platform_usable() { # enabled AND at least one model enabled: what the editors and the dashboard's warning read
   platform_enabled "$1" && [ -n "$(platform_models_enabled "$1" | head -1)" ]
 }
+# A regular job whose model is invalid for its own platform is credited to
+# the platform's default here, exactly like an enabled security block always
+# was (effective(), above) -- but the run gate that actually launches a job
+# skips one like that rather than silently running it on the default. So
+# this list answers "counts as using this platform", never "runs there".
 platform_jobs_on() { # platform_jobs_on <platform> [model] -> one line per enabled job (its id) or enabled security block ("security:<project>") running there; a model may be a family
   platforms_jq "$(platform_default_model anthropic)" "$(platform_default_model openai)" \
     'uses[] | select(.p == $p) | select($m == "" or .m == $m or .m == resolved($m)) | .who' -r --arg p "$1" --arg m "${2:-}"
@@ -3270,6 +3278,21 @@ JSON
   [ "$( p4_env; platform_jobs_on openai gpt-a )" = "badmodel" ] \
     && ok "and platform_jobs_on matches it against that effective model too" || bad "jobs on openai gpt-a: $( p4_env; platform_jobs_on openai gpt-a )"
 
+  # Without ANY openai catalog ($ocat == []), the old valid() rejected every
+  # openai slug -- so effective() replaced even a job's OWN configured model
+  # with the (also empty) openai default, and it vanished from the seed. A
+  # job that today is merely skipped until `resolve-models openai` runs would
+  # be refused for good once a later task's gate reads this file. No catalog
+  # means "cannot validate", not "invalid" -- the configured slug is kept.
+  local pf6="$tmp/pf6"; mkdir -p "$pf6"
+  printf '{"jobs":[{"id":"o1","platform":"openai","model":"gpt-5.6-luna","prompt":"x"}]}\n' > "$pf6/jobs.json"
+  printf '{"resolved":{}}\n' > "$pf6/models.json"
+  p6_env() { PLATFORMS_FILE="$pf6/platforms.json"; JOBS_FILE="$pf6/jobs.json"; PROJECTS_FILE="$pf6/projects.json"; MODELS_FILE="$pf6/models.json"; }
+  got="$( p6_env; platform_models_enabled openai | tr '\n' ' ' )"
+  [ "$got" = "gpt-5.6-luna " ] \
+    && ok "no openai catalog at all: the configured slug is kept, not dropped for the empty default" \
+    || bad "no-catalog openai model: '$got'"
+
   # An empty (0-byte) models.json used to make every read of it fail (jq -c
   # on empty input prints nothing but still exits 0, so --argjson resolved
   # "" blew up) -- the seed must still work with no cache at all.
@@ -3279,6 +3302,9 @@ JSON
   ( PLATFORMS_FILE="$pf5/platforms.json"; JOBS_FILE="$pf5/jobs.json"; PROJECTS_FILE="$pf5/projects.json"; MODELS_FILE="$pf5/models.json"; platforms_ensure )
   want "an empty models.json still seeds" 0 $?
   [ -f "$pf5/platforms.json" ] && ok "and the file exists" || bad "platforms_ensure with an empty models.json wrote nothing"
+  [ "$( PLATFORMS_FILE="$pf5/platforms.json"; JOBS_FILE="$pf5/jobs.json"; PROJECTS_FILE="$pf5/projects.json"; MODELS_FILE="$pf5/models.json"; platform_models_enabled anthropic )" = "opus" ] \
+    && ok "and platform_models_enabled anthropic still prints opus (no cache: the family stays as it is)" \
+    || bad "anthropic models with no cache: '$( PLATFORMS_FILE="$pf5/platforms.json"; JOBS_FILE="$pf5/jobs.json"; PROJECTS_FILE="$pf5/projects.json"; MODELS_FILE="$pf5/models.json"; platform_models_enabled anthropic )'"
 
   # a fresh install: only the two disabled example jobs -> nothing enabled, and the file still lists the three platforms
   local pf2="$tmp/pf2"; mkdir -p "$pf2"; cp "$BASE_DIR/config/jobs.example.json" "$pf2/jobs.json"

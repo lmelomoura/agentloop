@@ -20,6 +20,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`config/platforms.json`'s seed and readers now survive the states they
+  will actually meet, before anything reads the file for a real decision.**
+  Code review on the platform-settings work found three gaps in this not
+  yet wired up plumbing:
+  - An empty (0-byte) `config/models.json` — the shape of a fresh install
+    before the first catalog resolve — made `jq -c '.resolved // {}'` print
+    nothing while still exiting 0, so `--argjson resolved ""` failed on
+    every single read of the seed. `jq -e`, which does distinguish
+    "produced nothing" from "produced `{}`", plus an explicit fallback,
+    fixes it.
+  - `platforms_error` accepted anything that merely parsed as JSON, while
+    `platforms_json` separately demanded a `.platforms` object — so a file
+    like `{"platform": {...}}` (a plausible typo by hand) silently read as
+    nothing enabled, with no reason given anywhere. One `platforms_valid`
+    predicate, shared by every reader and writer, fixes it.
+  - A job with no `model`, or one naming a model invalid on its own
+    platform (an OpenAI job left with `"model": "opus"` after a platform
+    switch, say), contributed nothing to the seed instead of the
+    platform's actual default — so an upgrade would read
+    `enabled:true, models:[]` and refuse every run it used to allow. The
+    seed now resolves each job's *effective* model (its own where valid,
+    else the platform's default) before recording it.
+
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and
   `.down.sh`, and the tick calls it on a timer — every
@@ -271,29 +294,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     goes, and emptying it is how that release starts.
 
 ### Fixed
-
-- **`config/platforms.json`'s seed and readers now survive the states they
-  will actually meet, before anything reads the file for a real decision.**
-  Code review on the platform-settings work found three gaps in this not
-  yet wired up plumbing:
-  - An empty (0-byte) `config/models.json` — the shape of a fresh install
-    before the first catalog resolve — made `jq -c '.resolved // {}'` print
-    nothing while still exiting 0, so `--argjson resolved ""` failed on
-    every single read of the seed. `jq -e`, which does distinguish
-    "produced nothing" from "produced `{}`", plus an explicit fallback,
-    fixes it.
-  - `platforms_error` accepted anything that merely parsed as JSON, while
-    `platforms_json` separately demanded a `.platforms` object — so a file
-    like `{"platform": {...}}` (a plausible typo by hand) silently read as
-    nothing enabled, with no reason given anywhere. One `platforms_valid`
-    predicate, shared by every reader and writer, fixes it.
-  - A job with no `model`, or one naming a model invalid on its own
-    platform (an OpenAI job left with `"model": "opus"` after a platform
-    switch, say), contributed nothing to the seed instead of the
-    platform's actual default — so an upgrade would read
-    `enabled:true, models:[]` and refuse every run it used to allow. The
-    seed now resolves each job's *effective* model (its own where valid,
-    else the platform's default) before recording it.
 
 - **A reviewer's trial merge is no longer reported as work that would be lost.**
   Reviewing a change means measuring the *merged* tree, so a reviewer runs
