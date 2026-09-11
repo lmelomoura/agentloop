@@ -118,6 +118,31 @@ def test_the_registry_rides_on_api_models(srv, tmp_path, monkeypatch):
     # the keys the page reads today are still there, unchanged in shape
     assert out["models"] == a["models"] and isinstance(a["models"][0], str)
     assert a["catalog_at"] == 1788585387
+    # What a family resolves to right now -- the id the engine gates a family
+    # job on at launch; the families the cache has not resolved are left out.
+    assert a["families"] == {"opus": "claude-opus-5"}
+
+
+def test_a_seed_that_leaves_no_file_reports_a_sentence_not_the_registry(srv, tmp_path, monkeypatch):
+    """`agentloop platforms` prints the registry JSON on success; a run that
+    exits 0 and still leaves no file behind must not hand that JSON to the
+    page as `error` -- only a failing engine's own output is a reason."""
+    monkeypatch.setattr(srv, "PLATFORMS_FILE", tmp_path / "never" / "platforms.json")
+    monkeypatch.setattr(srv, "al", lambda *a, **k: (True, '{"anthropic": {"enabled": true}}'))
+    cfg, err = srv.platforms_config()
+    assert cfg == {} and err.endswith("could not be seeded")
+    monkeypatch.setattr(srv, "al", lambda *a, **k: (False, "platforms: could not write the seed"))
+    assert srv.platforms_config() == ({}, "platforms: could not write the seed")
+
+
+def test_bin_found_requires_a_file_like_the_engine(srv, tmp_path, monkeypatch):
+    """The engine's check is `-f && -x`; os.access alone says a directory is
+    executable, and a path pointed at a folder would read as found."""
+    _write_models(srv, openai=_catalog_block())   # a block on disk: nothing to resolve through the engine
+    monkeypatch.setenv("AGENTLOOP_CODEX_BIN", str(tmp_path))
+    assert srv.list_models()["platforms"]["openai"]["bin_found"] is False
+    monkeypatch.setenv("AGENTLOOP_CODEX_BIN", str(FAKE_CODEX))
+    assert srv.list_models()["platforms"]["openai"]["bin_found"] is True
 
 
 def test_a_hand_edited_non_dict_platform_entry_does_not_crash(srv):

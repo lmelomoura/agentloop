@@ -30,7 +30,6 @@ set -u
 # The two probes platform_check makes BEFORE a launch. Answered here, before
 # any recording below, so a FAKE_ARGV_OUT/FAKE_ACCOUNT_OUT set for the launch
 # never captures the probe instead of the run.
-#   FAKE_CLAUDE_LOGGED_OUT  set to play a CLI with no session: `auth status` exits 1
 case "${1:-}" in
   --version) echo "2.1.258 (Claude Code)"; exit 0 ;;
   auth)

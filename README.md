@@ -846,8 +846,10 @@ jobs inherit it. `agentloop set-field <id> platform openai` rewrites a
 platform's default and prints each rewrite; `create` takes the platform's
 defaults. The OpenAI catalog comes from `codex debug models`: `agentloop
 resolve-models openai` writes it into `config/models.json`, the tick
-refreshes it daily, and a slug outside it is refused at launch — a
-deprecated slug still runs, with its successor named in `tick.log`.
+refreshes it daily — a refresh that fails keeps the catalog it had, stamped
+`stale_at`/`stale_reason`, and is retried the next day — and a slug outside
+it is refused at launch; a deprecated slug still runs, with its successor
+named in `tick.log`.
 
 **What a run needs.** The Codex CLI installed and signed in (`codex login`);
 the platform switched on in Settings, and the model switched on for it — a run

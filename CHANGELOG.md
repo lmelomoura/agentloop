@@ -70,6 +70,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     half-typed path when another card's check repaints the page.
   - A refusal, and the jobs a switch-off leaves skipped, are shown in the
     card itself, until the next change.
+  - A catalog refresh that fails — codex gone, an empty answer — keeps the
+    catalog on disk and stamps it (`stale_at`, `stale_reason`) instead of
+    replacing it with an `available: false` stub: the daily pass used to do
+    exactly that, and every OpenAI launch was refused until the next
+    successful pass a day later. `platform models openai` reads the stamp
+    back as `stale` with the reason, the next good refresh clears it, and
+    the tick retries after the usual day, as it did over the stub — not on
+    every tick. A refresh with no catalog to keep still writes the stub.
+  - `set-field platform` with an empty value (inherit the project's) is
+    refused, before anything is written, when the platform inherited has no
+    model switched on — it used to rewrite the job's model to the empty
+    string, a job no launch could resolve.
+  - `/api/models` says what each family resolves to right now
+    (`families`), so the page can gate a family value on the id the engine
+    launches it with; `bin_found` requires a file, as the engine's own check
+    does (a folder is executable to `os.access`); a seed that exits 0 and
+    still leaves no file reports a sentence, never the registry JSON.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and

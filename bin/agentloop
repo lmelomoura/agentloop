@@ -1416,7 +1416,7 @@ platform_usable() { # enabled AND at least one model enabled: what the editors a
 # was (effective(), above) -- but the run gate that actually launches a job
 # skips one like that rather than silently running it on the default. So
 # this list answers "counts as using this platform", never "runs there".
-platform_jobs_on() { # platform_jobs_on <platform> [model] -> one line per enabled job (its id) or enabled security block ("security:<project>") running there; a model may be a family
+platform_jobs_on() { # platform_jobs_on <platform> [model] -> one line per enabled job (its id) or enabled security block ("security:<project>") counted as using it; a model may be a family
   platforms_jq "$(platform_default_model anthropic)" "$(platform_default_model openai)" \
     'uses[] | select(.p == $p) | select($m == "" or .m == $m or .m == resolved($m)) | .who' -r --arg p "$1" --arg m "${2:-}"
 }
@@ -1608,26 +1608,20 @@ cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-m
       write_platforms --arg p "$p" --arg b "$path" '.platforms[$p] = ((.platforms[$p] // {enabled:false, models:[]}) + {bin:$b})'
       if [ -n "$path" ]; then echo "$p binary: $path"; else echo "$p binary: detected ($(platform_bin "$p"))"; fi ;;
     models)
-      local stale=false reason="" old tmp
+      local stale=false reason=""
       if [ "$p" = "openai" ]; then
-        # config/models.json's .openai block is a cache the launch gate reads
-        # through openai_catalog_available/_visible, not through this call's
-        # stale flag. resolve_models_openai replaces the whole block
-        # unconditionally, even on failure (an {available:false} stub) -- so
-        # a transient codex problem (missing binary, empty answer) would
-        # otherwise empty a catalog that still resolves real jobs, and refuse
-        # every openai launch until the next successful refresh. Snapshot the
-        # catalog first and put it back when the refresh left nothing usable.
-        old="$("$JQ" -c '.openai // empty' "$MODELS_FILE" 2>/dev/null)"
+        # A refresh that fails keeps the catalog the launch gate reads and
+        # stamps why (resolve_models_openai's `stale_reason`); this call
+        # reports that as `stale` over the catalog it kept. A failure with
+        # nothing to keep leaves the {available:false} stub, which
+        # platform_models_json lists as empty -- still stale, with the
+        # refresh's own last line as the reason.
         out="$(resolve_models_openai 2>&1)"; rc=$?
-        if [ "$rc" -ne 0 ] || ! openai_catalog_available; then
+        reason="$("$JQ" -r '.openai.stale_reason // empty' "$MODELS_FILE" 2>/dev/null)"
+        if [ -n "$reason" ]; then
+          stale=true; reason="refresh failed: $reason"
+        elif [ "$rc" -ne 0 ] || ! openai_catalog_available; then
           stale=true; reason="refresh failed: $(printf '%s' "$out" | tail -1)"
-          if [ -n "$old" ] && printf '%s' "$old" | "$JQ" -e '.models | type == "array"' >/dev/null 2>&1; then
-            tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX" 2>/dev/null)"
-            if [ -n "$tmp" ] && ! { "$JQ" --argjson b "$old" '.openai = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
-              rm -f "$tmp"
-            fi
-          fi
         fi
       fi
       platform_models_json "$p" "$stale" "$reason" ;;
@@ -1927,7 +1921,7 @@ openai_catalog_all_efforts() { # the union of every VISIBLE model's efforts, fir
 
 # --- the OpenAI catalog, write side ------------------------------------------
 resolve_models_openai() { # refresh config/models.json's `openai` block from `codex debug models`
-  local raw source block tmp
+  local raw source block tmp kept
   tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
   if [ ! -f "$MODELS_FILE" ]; then
     echo '{"resolved":{}}' > "$MODELS_FILE"
@@ -1957,6 +1951,27 @@ resolve_models_openai() { # refresh config/models.json's `openai` block from `co
           visibility:(.visibility // "list"), priority:(.priority // 999),
           deprecated_by:(.upgrade.model // ""), retires_at:(.upgrade.retirement_at // "")}]}')"
     fi
+  fi
+  # A refresh that failed -- no codex, an empty answer -- must not replace a
+  # catalog that still resolves real jobs: the launch gate reads
+  # .openai.models and would refuse every openai run until the next
+  # successful refresh. Keep the block it had and stamp when and why the
+  # attempt failed; `platform models` reads the stamp back as `stale`, and
+  # models_stale ages the block from that stamp, so the tick retries after
+  # MODELS_TTL exactly as it did over the stub -- not on every tick, which
+  # would spend the anthropic probing pass that rides along each time. A
+  # successful refresh writes a block that carries neither stamp. The
+  # {available:false} stub is written only when there is nothing to keep.
+  if openai_catalog_available && printf '%s' "$block" | "$JQ" -e '.available == false' >/dev/null 2>&1; then
+    kept="$(printf '%s' "$block" | "$JQ" -r .reason)"
+    if ! { "$JQ" --argjson at "$(now_epoch)" --arg r "$kept" '.openai.stale_at = $at | .openai.stale_reason = $r' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
+      rm -f "$tmp"
+      echo "openai -> could not write $MODELS_FILE"
+      return 1
+    fi
+    rm -f "$tmp"
+    echo "openai -> kept the previous catalog ($kept)"
+    return 0
   fi
   if ! { "$JQ" --argjson b "$block" '.openai = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
     rm -f "$tmp"
@@ -3164,8 +3179,11 @@ models_stale() { # 0 = either cache is missing or older than MODELS_TTL
   oldest="$("$JQ" -r '[.resolved[]?.at // 0] | min // 0' "$MODELS_FILE" 2>/dev/null)"
   case "$oldest" in ''|null|*[!0-9]*) oldest=0 ;; esac
   # The openai block ages the same way. Absent, it is stale by definition --
-  # which is what gets it written on the first tick after this upgrade.
-  oa="$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)"
+  # which is what gets it written on the first tick after this upgrade. It
+  # ages from the last ATTEMPT: a failed refresh keeps the catalog and stamps
+  # `stale_at` (resolve_models_openai) instead of moving `.at`, so the stamp
+  # is what keeps a missing codex from re-running the whole pass every tick.
+  oa="$("$JQ" -r '[.openai.at // 0, .openai.stale_at // 0] | max' "$MODELS_FILE" 2>/dev/null)"
   case "$oa" in ''|null|*[!0-9]*) oa=0 ;; esac
   [ "$oa" -lt "$oldest" ] && oldest="$oa"
   [ "$(( $(now_epoch) - oldest ))" -ge "$MODELS_TTL" ]
@@ -3701,6 +3719,17 @@ JSON
     && ok "platform models: a failed refresh keeps the old catalog and says stale" || bad "models openai failed refresh: $_pm"
   "$JQ" -e '.openai.models | length == 2' "$pc/config/models.json" >/dev/null 2>&1 \
     && ok "and config/models.json still carries the pre-refresh catalog" || bad "models.json after failed refresh: $(cat "$pc/config/models.json")"
+  # The tick's own path (`_resolve_models` -> cmd_resolve_models ->
+  # resolve_models_openai, with no `platform models` around it): a good
+  # refresh carries no stale stamp, a failed one keeps the catalog and
+  # stamps when and why.
+  pc_al resolve-models openai >/dev/null 2>&1
+  "$JQ" -e '(.openai.models | length == 2) and ((.openai | has("stale_reason")) | not) and ((.openai | has("stale_at")) | not)' "$pc/config/models.json" >/dev/null 2>&1 \
+    && ok "resolve-models openai: a successful refresh carries no stale stamp" || bad "after a good refresh: $(cat "$pc/config/models.json")"
+  out="$(pc_al_nocodex resolve-models openai 2>&1)"
+  "$JQ" -e '(.openai.models | length == 2) and (.openai.stale_reason == "codex not installed") and (.openai.stale_at | type == "number")' "$pc/config/models.json" >/dev/null 2>&1 \
+    && ok "resolve-models openai: a failed refresh keeps the catalog and stamps stale_at/stale_reason" || bad "after a failed refresh: $(cat "$pc/config/models.json")"
+  case "$out" in *"openai -> kept the previous catalog (codex not installed)"*) ok "and says it kept the previous catalog" ;; *) bad "kept line: $out" ;; esac
   _pm="$(pc_al platform models anthropic 2>/dev/null)"
   printf '%s' "$_pm" | "$JQ" -e '.platform == "anthropic" and (.models | map(.v) | index("claude-opus-5")) != null and (.models[] | select(.v == "claude-opus-5") | .enabled) == true' >/dev/null 2>&1 \
     && ok "platform models anthropic: the ids in use are listed and flagged" || bad "models anthropic: $_pm"
@@ -3859,11 +3888,20 @@ JSON
       && ok "resolve_models_openai: no codex -> .openai.reason says so" \
       || bad "reason '$("$JQ" -r '.openai.reason' "$MODELS_FILE")'"
 
+    # models_stale ages the openai block from the last ATTEMPT: a kept
+    # catalog (old .at, fresh stale_at) is not refreshed again on the next
+    # tick, which would spend the anthropic probing pass every minute.
+    MODELS_FILE="$tmp/rm/stale.json"
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{opus:{id:"x", at:$now}}, openai:{at:1, models:[]}}' > "$MODELS_FILE"
+    models_stale; want "models_stale: an openai block older than MODELS_TTL is stale" 0 $?
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{opus:{id:"x", at:$now}}, openai:{at:1, models:[], stale_at:$now, stale_reason:"codex not installed"}}' > "$MODELS_FILE"
+    models_stale; want "models_stale: a kept catalog with a fresh stale_at is not" 1 $?
+
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_rmout" | grep -v '^RESULT '
-  printf '%s\n' "$_rmout" | grep -qx 'RESULT ok=15 bad=0' \
-    && ok "resolve_models_openai over the fixture catalog: all 15 assertions reach the gate" \
+  printf '%s\n' "$_rmout" | grep -qx 'RESULT ok=17 bad=0' \
+    && ok "resolve_models_openai over the fixture catalog: all 17 assertions reach the gate" \
     || bad "resolve_models_openai over the fixture catalog did not: $(printf '%s\n' "$_rmout" | tail -1)"
 
   echo "resolve_pricing_openai() — the price table refreshes itself from the source, never inventing a number"
@@ -4374,6 +4412,22 @@ JSON
   printf '{"name":"np","platform":"openai","security":{"enabled":true,"platform":"anthropic","model":"opus"}}' | cfg_al project-set >/dev/null 2>&1; want "project-set accepts an enabled security model on the block's own platform" 0 $?
   "$JQ" '.platforms.anthropic.models = []' "$tmp/cfg/config/platforms.json" > "$tmp/cfg/pf.next"; mv "$tmp/cfg/pf.next" "$tmp/cfg/config/platforms.json"
   printf '{"name":"np2","platform":"anthropic"}' | cfg_al project-set >/dev/null 2>&1; want "project-set refuses a platform that is enabled but has no model switched on" 1 $?
+  # The inherit case of set-field platform: cj (openai, gpt-a, no project)
+  # would inherit anthropic, which has nothing switched on right now -- the
+  # rewrite has no default to land on, so it is refused before anything is
+  # written, never a job whose model is the empty string.
+  out="$(printf '' | cfg_al set-field cj platform 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    case "$out" in
+      *"no model is enabled for anthropic in Settings — switch one on there first"*)
+        [ "$(cfg_job cj .platform)" = "openai" ] && [ "$(cfg_job cj .model)" = "gpt-a" ] \
+          && ok "set-field platform '' refuses to inherit a platform with no model on, and writes nothing" \
+          || bad "refused, but the job was touched: $(cfg_job cj '{platform,model}')" ;;
+      *) bad "inherit refusal text: $out" ;;
+    esac
+  else
+    bad "inheriting a platform with no model on was accepted: $(cfg_job cj '{platform,model}')"
+  fi
   "$JQ" '.platforms.anthropic.models = ["opus"]' "$tmp/cfg/config/platforms.json" > "$tmp/cfg/pf.next"; mv "$tmp/cfg/pf.next" "$tmp/cfg/config/platforms.json"
   [ "$( PLATFORMS_FILE="$tmp/cfg/config/platforms.json"; platform_default_model openai )" = "gpt-a" ] \
     && ok "platform_default_model is the first model switched on" || bad "default: $( PLATFORMS_FILE="$tmp/cfg/config/platforms.json"; platform_default_model openai )"
@@ -11367,14 +11421,22 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
       if [ "$eff" = "openai" ] && ! openai_catalog_ensure; then
         die "no OpenAI catalog yet: install codex, sign in, and run: agentloop resolve-models openai"
       fi
+      # The model rewrite is decided BEFORE the platform is written, so a
+      # refusal leaves the job exactly as it was. Only the inherit case can
+      # find no default: anthropic/openai went through platform_usable above,
+      # and a project's platform may have nothing switched on -- writing the
+      # empty string as the model would be a job no launch could resolve.
+      cur="$(job_get "$id" '.model' '')"; dm=""
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! platform_model_ok "$eff" "$cur"; then
+        dm="$(platform_default_model "$eff")"
+        [ -n "$dm" ] || die "no model is enabled for $eff in Settings — switch one on there first"
+      fi
       if [ -n "$value" ]; then
         write_jobs --arg id "$id" --arg v "$value" '.jobs = [.jobs[] | if .id == $id then .platform = $v else . end]'
       else
         write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.platform) else . end]'
       fi
-      cur="$(job_get "$id" '.model' '')"
-      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! platform_model_ok "$eff" "$cur"; then
-        dm="$(platform_default_model "$eff")"
+      if [ -n "$dm" ]; then
         write_jobs --arg id "$id" --arg v "$dm" '.jobs = [.jobs[] | if .id == $id then .model = $v else . end]'
         echo "model '$cur' is not a $eff model — rewritten to $dm"
       fi

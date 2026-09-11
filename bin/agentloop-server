@@ -2605,7 +2605,9 @@ def platforms_config():
     if not PLATFORMS_FILE.exists():
         ok, out = al(["platforms"])
         if not ok or not PLATFORMS_FILE.exists():
-            return {}, out or f"{PLATFORMS_FILE} could not be seeded"
+            # A seed that exited 0 and still left no file printed the
+            # registry JSON, not a reason -- that must never land in `error`.
+            return {}, (out if not ok else "") or f"{PLATFORMS_FILE} could not be seeded"
     try:
         text = PLATFORMS_FILE.read_text()
     except OSError:
@@ -2706,7 +2708,9 @@ def platform_entry(p, cfg, jobs, projects, resolved, catalog_slugs):
     using, n_jobs = jobs_using(p, jobs, projects, resolved, default, catalog_slugs)
     return {"supported": p not in PLATFORMS_PLANNED, "enabled": enabled,
             "usable": enabled and bool(models), "bin": b, "bin_source": src,
-            "bin_found": os.access(b, os.X_OK), "models_enabled": models,
+            # The engine's own test (`-f && -x`): a directory is executable
+            # to os.access and is not a binary.
+            "bin_found": os.path.isfile(b) and os.access(b, os.X_OK), "models_enabled": models,
             "jobs_on_platform": n_jobs, "jobs_using": using}
 
 
@@ -2802,6 +2806,12 @@ def list_models():
                  "efforts": list(ANTHROPIC_EFFORTS),
                  "permissions": PLATFORM_PERMISSIONS["anthropic"],
                  "default_model": "",
+                 # What each family resolves to in the cache RIGHT NOW: the id
+                 # the engine's effective_model launches a family job with, and
+                 # so the id platform_model_enabled gates it on. The page's
+                 # modelEnabled reads this instead of guessing from the id's
+                 # prefix; a family the cache has not resolved is left out.
+                 "families": {f["v"]: f["id"] for f in families if f["id"]},
                  "catalog_at": max([int(r.get("at") or 0) for r in resolved.values() if isinstance(r, dict)] or [0])}
     anthropic.update(platform_entry("anthropic", cfg, jobs, projects, resolved, catalog_slugs))
     # By construction the first id of the filtered models_enabled list, like the engine.
