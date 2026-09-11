@@ -1,5 +1,6 @@
 """Things that are wrong about the repository itself, not about its code."""
 
+import subprocess
 from pathlib import Path
 
 from . import ignores
@@ -128,6 +129,37 @@ def _is_key_material(path, name):
     return stem.endswith(_KEY_BINARY_SUFFIXES)
 
 
+def _tracked_files(root):
+    """The repo-relative paths git tracks under `root`, or None when git cannot say.
+
+    The two `committed_*` rules are about what a CLONE carries, so the index is
+    the only honest source: the working tree also holds what a build or a
+    provisioning step wrote after checkout. Measured on the Minerva analyses,
+    that was `.env` and `docker/.env` -- both gitignored, never committed,
+    written into the worktree by the harness's compose-project seal a few
+    seconds after checkout -- reported as "committed" on every single run, with
+    nothing in the repository for the operator to remove.
+
+    `ls-files` is the tracked set as git defines it: staged files included,
+    gitignored files excluded, and the `-z` form so a path with a space or a
+    newline in it comes back whole. None -- not an empty set -- when `root` is
+    not a checkout or git is absent: an empty set would silence both rules over
+    every directory that is not a repository, which `scan()` is also pointed
+    at (the tests do it, and so does a plain directory an operator analyses).
+    There the rules keep their old reading of the tree, which is the only one
+    available.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return {p for p in proc.stdout.split("\0") if p}
+
+
 def scan(root, ignore=()):
     """Every hygiene finding in the tree, minus what `ignore_paths` excludes.
 
@@ -136,8 +168,14 @@ def scan(root, ignore=()):
     `tests/fixtures/**` from the secret scan and still be told, every single
     analysis, that `tests/fixtures/id_rsa` "looks like a key file" -- the
     setting said what it meant and one phase of three ignored it.
+
+    The two `committed_*` rules report only files git TRACKS when `root` is a
+    checkout (`_tracked_files`); the world-writable rule deliberately keeps
+    reading the tree, because what a provisioning step leaves behind is
+    exactly what it exists to catch.
     """
     root = Path(root)
+    tracked = _tracked_files(root)
     out = []
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.is_symlink():
@@ -148,8 +186,9 @@ def scan(root, ignore=()):
         rel, name = str(rel_path), path.name
         if ignored(rel, ignore):
             continue
+        committed = tracked is None or rel in tracked
 
-        if (name.startswith(".env") and name not in _ENV_EXCLUDED_NAMES
+        if (committed and name.startswith(".env") and name not in _ENV_EXCLUDED_NAMES
                 and not ignores.sample_suffix(name)):
             out.append(_finding(
                 "committed_env_file", "high", f"{rel} is committed",
@@ -158,7 +197,7 @@ def scan(root, ignore=()):
                 "Remove it from the repository, add it to .gitignore, and rotate "
                 "anything it contained.", rel))
 
-        if _is_key_material(path, name):
+        if committed and _is_key_material(path, name):
             out.append(_finding(
                 "committed_key_file", "critical", f"{rel} looks like a key file",
                 "Key material in a repository is readable by everyone with a clone.",

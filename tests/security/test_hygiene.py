@@ -190,3 +190,88 @@ def test_a_plain_directory_gets_no_gitignore_advisory(tmp_path):
     one."""
     (tmp_path / "app.py").write_text("x = 1\n")
     assert [f for f in scan(tmp_path) if f["rule"] == "missing_gitignore"] == []
+
+
+# --- the committed_* rules read the INDEX inside a checkout ------------------------
+# The Minerva analyses reported `.env` and `docker/.env` as "committed" on every run:
+# both gitignored, never in any commit, written into the worktree by the harness's
+# compose-project seal a few seconds after checkout. A rule named "committed" that
+# never asked git what is committed was reporting the harness's own provisioning.
+import subprocess
+
+
+def _git(root, *args):
+    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True,
+                   env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+                        "GIT_COMMITTER_EMAIL": "t@x", "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+                        "HOME": str(root)})
+
+
+def _checkout(root):
+    _git(root, "init", "-q")
+    (root / ".gitignore").write_text(".env\ndocker/.env\n*.key\n")
+    (root / "README.md").write_text("x\n")
+    _git(root, "add", ".gitignore", "README.md")
+    _git(root, "commit", "-q", "-m", "init")
+
+
+def test_an_untracked_env_file_in_a_checkout_is_not_a_finding(tmp_path):
+    _checkout(tmp_path)
+    (tmp_path / ".env").write_text("COMPOSE_PROJECT_NAME=dkp-x\n")
+    (tmp_path / "docker").mkdir()
+    (tmp_path / "docker" / ".env").write_text("COMPOSE_PROJECT_NAME=dkp-x\n")
+    rules = [f["rule"] for f in scan(tmp_path)]
+    assert "committed_env_file" not in rules
+
+
+def test_a_tracked_env_file_in_a_checkout_is_still_a_finding(tmp_path):
+    # The nearest case on the other side: the same name, this time in a commit.
+    _checkout(tmp_path)
+    (tmp_path / ".env.production").write_text("DB_PASSWORD=hunter2\n")
+    _git(tmp_path, "add", "-f", ".env.production")
+    _git(tmp_path, "commit", "-q", "-m", "oops")
+    found = [f for f in scan(tmp_path) if f["rule"] == "committed_env_file"]
+    assert [f["occurrences"][0]["file"] for f in found] == [".env.production"]
+
+
+def test_a_staged_but_uncommitted_env_file_counts_as_committed(tmp_path):
+    # `git ls-files` is the index: what the NEXT commit would carry is already in
+    # it, and refusing to report it would let the analysis pass the commit that
+    # lands it.
+    _checkout(tmp_path)
+    (tmp_path / ".env.staging").write_text("DB_PASSWORD=hunter2\n")
+    _git(tmp_path, "add", "-f", ".env.staging")
+    rules = [f["rule"] for f in scan(tmp_path)]
+    assert "committed_env_file" in rules
+
+
+def test_an_untracked_key_file_in_a_checkout_is_not_a_finding(tmp_path):
+    # The sibling rule reads the same index: a dev cert generated into a gitignored
+    # directory after checkout is not "readable by everyone with a clone".
+    _checkout(tmp_path)
+    (tmp_path / "server.key").write_text(
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----\n")
+    rules = [f["rule"] for f in scan(tmp_path)]
+    assert "committed_key_file" not in rules
+
+
+def test_a_world_writable_untracked_file_is_still_a_finding(tmp_path):
+    # Containment: that rule exists for what provisioning leaves behind, so it must
+    # NOT start consulting the index.
+    _checkout(tmp_path)
+    p = tmp_path / "leftover.sh"
+    p.write_text("echo\n")
+    p.chmod(0o666)
+    rules = [f["rule"] for f in scan(tmp_path)]
+    assert "world_writable_file" in rules
+
+
+def test_a_plain_directory_keeps_the_old_reading(tmp_path):
+    # Not a checkout: git cannot say what is tracked, so the rules read the tree
+    # exactly as they did -- None from the index lookup, never an empty set that
+    # would silence them.
+    from security.hygiene import _tracked_files
+
+    assert _tracked_files(tmp_path) is None
+    (tmp_path / ".env").write_text("DB_HOST=localhost\n")
+    assert "committed_env_file" in [f["rule"] for f in scan(tmp_path)]
