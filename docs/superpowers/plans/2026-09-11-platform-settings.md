@@ -22,7 +22,7 @@
   - `claude is not signed in (run: claude auth login)` — com pin: `claude is not signed in in <dir> (run: CLAUDE_CONFIG_DIR=<dir> claude auth login)`;
   - `codex is not signed in (run: codex login)` (inalterada);
   - `runs on OpenCode arrive with the OpenCode engine`;
-  - lançamento: `<id>: <p> is disabled in Settings (agentloop platform enable <p>), skipped` · `<id>: model '<m>' is not enabled in Settings — <p> enables: <lista>, skipped` · `<id>: opencode is not supported yet — it arrives with the OpenCode engine, skipped`;
+  - lançamento, por esta ordem (decidida na revisão da Task 4): planned (`<id>: opencode is not supported yet — it arrives with the OpenCode engine, skipped`) → desconhecida → desligada (`<id>: <p> is disabled in Settings (agentloop platform enable <p>), skipped`) → **nenhum modelo activado** (`<id>: no model is enabled for <p> in Settings, skipped`, antes de qualquer sonda ao CLI) → não pronta → (openai: interactive, catálogo, permissão) → modelo não activado (`<id>: model '<m>' is not enabled in Settings — <p> enables: <lista>, skipped`);
   - `<p> is not enabled in Settings — enable it there, or: agentloop platform enable <p>` (escrita);
   - `<file> is not a valid platforms file (not JSON, or no .platforms object) — no platform is enabled until it is fixed`.
 - **`platform_default_model <p>`** passa a ser o primeiro id da lista `models` do ficheiro (vazio sem nenhum). O `opus` fixo de hoje desaparece.
@@ -1197,6 +1197,8 @@ found out at its first launch.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
+
+> **Tasks 2–4 entregues** (006c03f..c99a90c, 47a5655..0d176de, a46c4e3..7a41f6b). O que as revisões mudaram e as tarefas seguintes herdam: `run_job` lança `"$cli_bin"` resolvido depois da porta de prontidão; `platform_check` exige `-f && -x`; `cmd_platform models openai` repõe o catálogo anterior quando o refresh falha (`stale:true`); `set-models` deduplica, recusa stdin vazio e guarda caminhos absolutos; `test/fake-codex` aceita `FAKE_CODEX_MODELS_JSON`; a porta "no model enabled" corre antes das sondas ao CLI; `cmd_create` verifica `platform_usable` antes de `openai_catalog_ensure`. Selftest 712, e2e 99.
 
 ### Task 5: Sai o `claude_config_dir` por projecto e por bloco de segurança
 
