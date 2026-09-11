@@ -124,6 +124,15 @@ signed in. To stop everything, `./uninstall.sh`.
 
 ### Try it in one minute
 
+Nothing runs until a platform and at least one of its models are switched on.
+Enable Anthropic and one of its models in **Settings › Platforms** — or from the
+terminal:
+
+```bash
+agentloop platform enable anthropic
+printf '["claude-haiku-4-5-20251001"]' | agentloop platform set-models anthropic
+```
+
 The shipped `example-hello` job is disabled. Enable it in the dashboard (or
 `agentloop enable example-hello`), then:
 
@@ -841,10 +850,15 @@ refreshes it daily, and a slug outside it is refused at launch — a
 deprecated slug still runs, with its successor named in `tick.log`.
 
 **What a run needs.** The Codex CLI installed and signed in (`codex login`);
-a job whose platform is not ready is skipped before it costs a slot, with the
-reason in `tick.log` (`codex is not signed in`, `codex not found at …`).
-`AGENTLOOP_CODEX_BIN` overrides the binary; `CODEX_HOME` is the CLI's own
-variable and picks the account and where its rollouts live.
+the platform switched on in Settings, and the model switched on for it — a run
+on either that is off is skipped before it costs a slot, with the reason in
+`tick.log` (`openai is disabled in Settings`, `model 'gpt-6-astra' is not
+enabled in Settings — openai enables: gpt-5.6-luna`), the treatment a job
+whose platform is not ready already gets (`codex is not signed in`, `codex not
+found at …`). See [Settings](#settings) for the switches. `AGENTLOOP_CODEX_BIN`
+overrides the binary, ahead of the path set in Settings and of detection;
+`CODEX_HOME` is the CLI's own variable and picks the account and where its
+rollouts live.
 
 **How a Codex run is read.** `bin/platforms/openai_stream.py` translates the
 Codex event stream into the stream-json every reader here already speaks, so
@@ -955,13 +969,9 @@ CLAUDE_CONFIG_DIR=~/.claude-personal claude    # personal account
 ```
 
 Shell aliases for that never reach agentloop: `launchd` inherits nothing from
-your shell, so by default every run signs in as the CLI's own `~/.claude`. There
-are two levels:
-
-| Level | Where | Applies to |
-|---|---|---|
-| default | `AGENTLOOP_CLAUDE_CONFIG_DIR` at install time | every run, and the model probes |
-| per project | `claude_config_dir` in `config/projects.json` (**Edit project** in the dashboard) | that project's runs and their prechecks |
+your shell, so by default every run signs in as the CLI's own `~/.claude`. The
+account is the install's — one pin, set at install time, for every run and every
+model probe:
 
 ```bash
 AGENTLOOP_CLAUDE_CONFIG_DIR=~/.claude-work bash install.sh
@@ -970,8 +980,13 @@ AGENTLOOP_CLAUDE_CONFIG_DIR=~/.claude-work bash install.sh
 The value is written into both `launchd` plists — under `AGENTLOOP_CLAUDE_CONFIG_DIR`,
 the name the engine reads, and under `CLAUDE_CONFIG_DIR` beside it for everything
 else those agents start — so it survives logout and reboot; re-running the
-installer without the variable keeps whatever is already pinned. A project's own
-setting wins over it, and an empty one inherits it.
+installer without the variable keeps whatever is already pinned. There is no
+account per project: a `claude_config_dir` still sitting in `config/projects.json`
+is ignored, `agentloop status` and `install` say so, and the next save of that
+project drops it. **Settings › Platforms** shows whom the pin is signed in as —
+the Anthropic card's Session line is `claude auth status` run in that directory,
+and a directory with no session says so with the `claude auth login` to run —
+and `agentloop status` prints the same account, with the directory in brackets.
 
 The pin reaches everything `launchd` starts: the tick, and therefore every
 scheduled run, a **Run now** from the dashboard, and the model probes. A run you
@@ -980,19 +995,6 @@ only the explicit variable, and never the `CLAUDE_CONFIG_DIR` your shell happens
 to export, so a run typed inside a Claude Code session cannot silently bill that
 session's account. Put the variable in front of the command when you want the
 pinned account by hand: `AGENTLOOP_CLAUDE_CONFIG_DIR=~/.claude-work agentloop run <id>`.
-
-Three things to know before splitting jobs across accounts:
-
-- **Keep a job's account stable.** Sessions are stored per config directory, so
-  a resumed run is looked up inside the account that created it — moving a
-  project to another account strands anything still open.
-- **The account brings its whole environment.** Its `settings.json`, plugins,
-  MCP servers and any managed policy come with it, so the same prompt can behave
-  differently on the other account. An MCP server authenticated interactively in
-  one directory is *not* authenticated in the other.
-- **A missing directory is refused, not created.** The run is skipped with
-  `claude_config_dir missing` in `data/tick.log` rather than launching a session
-  that would stop at a login prompt. Sign that account in once, interactively.
 
 ---
 
@@ -1331,7 +1333,6 @@ presenting a partial read as coverage.
   "model": "opus",
   "effort": "",
   "permission_mode": "bypassPermissions",
-  "claude_config_dir": "",
   "default_profile": "standard",
   "max_budget_usd": 5,
   "daily_budget_usd": 20,
@@ -1344,7 +1345,7 @@ The **Security** tab of the project editor writes all of it. A project with no
 block gets no analysis, and no derived job either.
 
 The engine reads `enabled`, `platform`, `model`, `effort`, `permission_mode`,
-`claude_config_dir`, `max_budget_usd`, `daily_budget_usd` and `ignore_paths` —
+`max_budget_usd`, `daily_budget_usd` and `ignore_paths` —
 `permission_mode` defaults to `bypassPermissions` when absent (an unrecognised
 value falls back to it too, with a warning) and is carried onto the derived
 job the same way. `default_profile` and `min_severity` belong to the
@@ -1356,13 +1357,12 @@ which CLI runs the analysis; with it, `model`, `effort` and `permission_mode`
 take that platform's vocabulary and defaults (`full-access` on OpenAI, where the
 sandbox modes cannot write the ledger). See [Platforms](#platforms).
 
-`model` left empty means the `opus` family; `effort` left empty leaves the
-decision to the CLI, as in a job. `claude_config_dir` is carried on the derived
-job — the only place an analysis has to carry it, there being no jobs.json row
-to edit — and the job's own value is what a run resolves first; left empty it
-inherits the project's, which inherits the install's — see [Which Claude account
-a run signs in as](#which-claude-account-a-run-signs-in-as). Set it here only
-when the analysis itself should sign in as somebody else.
+`model` left empty means the first model switched on for that platform in
+[Settings](#settings), and a model switched off there falls back to the same
+one, with a warning; `effort` left empty leaves the decision to the CLI, as in
+a job. The analysis signs in as the platform's account — the install's pin, see
+[Which Claude account a run signs in as](#which-claude-account-a-run-signs-in-as);
+there is no account of its own to set here.
 
 **Some noise is filtered before you configure anything.** A `fixtures`,
 `__fixtures__` or `testdata` directory — at any depth, and whatever its case —
@@ -1608,6 +1608,102 @@ fastest way to teach everybody to ignore a selftest.
 
 ---
 
+## Settings
+
+A job may only pick a platform somebody switched on, and a model switched on
+for it. **Settings › Platforms** is where that happens: one card per platform —
+Anthropic (Claude Code), OpenAI (Codex CLI), OpenCode — read top to bottom, in
+the order the steps have to be taken.
+
+- **Binary** — the path the engine will launch, with where it came from
+  (`found on PATH`, `set here`, `from AGENTLOOP_CODEX_BIN`) and the version it
+  answered. This is the path `launchd` sees, which is the one scheduled runs
+  use: a `claude` that only exists on your interactive shell's `PATH` shows as
+  *Not found on the launchd PATH*, and the field under it is the fix — type
+  another path and it is saved when you leave the field, **Detect** goes back
+  to detection. A binary that is not there shows the install command instead.
+- **Session** — the live answer of `claude auth status --json` or `codex login
+  status`: *Signed in as me@example.com · max plan*, *Logged in using ChatGPT*,
+  or *Not signed in* with the command to run, and how long ago it was checked.
+  All three cards are checked when the page opens; **Test** asks again. Nothing
+  from this zone is stored — the engine asks the same question before every run.
+- **Models** — **Load models** (then **Refresh**) reads the platform's catalog:
+  on OpenAI that is `codex debug models`, with the price per million tokens
+  beside each slug (or *no price*), its effort range and a deprecated slug's
+  successor; on Anthropic it is the ids the installed CLI knows. Every model
+  has a switch, and only the ones switched on reach the job editor. A model in
+  use says how many enabled jobs run on it; one you switched on that a refresh
+  no longer lists stays at the end as *no longer in the catalog* until you
+  switch it off. Until the session test passes the list says so and stays
+  empty.
+- **The switch** in the card's header enables the platform. It is locked until
+  the session test passes, and switching a platform off never refuses: the
+  reply names the enabled jobs that will be skipped until it is on again.
+
+Every change saves at once — there is no Save button — and a refusal from the
+engine appears in the card, in the engine's words. Above the cards one line
+sums it up: *2 of 3 platforms enabled · 4 models available to jobs*. While
+nothing is usable, Overview and Jobs carry a strip saying so, **New job** lands
+on this page instead of the editor, the Settings item in the sidebar carries a
+dot, and a fresh install opens here right after the operator profile.
+
+**The file.** The choices live in `config/platforms.json`, personal to the
+install and git-ignored like your jobs:
+
+```json
+{
+  "platforms": {
+    "anthropic": {"enabled": true,  "bin": "", "models": ["claude-opus-5", "claude-sonnet-5"]},
+    "openai":    {"enabled": true,  "bin": "", "models": ["gpt-5.6-luna"]},
+    "opencode":  {"enabled": false, "bin": "", "models": []}
+  }
+}
+```
+
+`bin` empty means detection (the CLI on `launchd`'s `PATH`, else its usual
+install path); `AGENTLOOP_CLAUDE_BIN` and `AGENTLOOP_CODEX_BIN` still win over
+both, which is what the tests and a stand-in CLI use. `models` are exact ids,
+in the order they were switched on, and the first one is the platform's
+default — what `create` gives a job with no `model`, and what a `security`
+block with none runs on. The file is written on first use: an install that
+upgrades gets every platform an enabled job or an enabled security block runs
+on, with the models they use, so nothing that ran yesterday stops today; a
+fresh install gets nothing enabled, because switching a platform on is a
+decision, not an inference. `config/models.json` stays what it was, a cache
+the daily refresh rewrites — the catalog is read from it, the choice is read
+from here, and a refresh never touches it. A `platforms.json` that is not
+JSON, or has no `platforms` object, reads as nothing enabled: `agentloop
+status` says so, the tick logs it once per tick, the dashboard's strip names
+the file, and the engine never writes over it.
+
+**From the terminal.** Each button on the page is one of these:
+
+```bash
+agentloop platform check openai            # {ready, bin, bin_found, bin_source, version, account, reason}, live
+agentloop platform enable openai           # runs the check first; refused with the reason while it fails
+agentloop platform disable openai          # never refused; names the enabled jobs that will be skipped
+agentloop platform set-bin openai ~/.local/bin/codex    # must be executable; no path = back to detection
+agentloop platform models openai           # refreshes the catalog and prints it with `enabled` per model
+printf '["gpt-5.6-luna"]' | agentloop platform set-models openai   # a new id must be in the catalog
+```
+
+`agentloop platforms` reports it all in one object — `supported`, `enabled`,
+`usable` (enabled with at least one model on), `bin`, `bin_source`,
+`bin_found`, `models_enabled`, `jobs_on_platform` and `jobs_using` per
+platform — and a catalog refresh that fails keeps the catalog it had and
+answers `stale: true` with the reason. A job that names a platform or a model
+that has since been switched off is not rewritten: the editor flags the value
+*(disabled in Settings)*, the card and the row carry a chip, and the run is
+skipped at launch with the reason in `tick.log`.
+
+**OpenCode, in this version,** is listed and found — the card shows the binary
+and its version, or `brew install opencode` — and nothing else: the session
+test, the model list and the runs arrive with the OpenCode engine, a later
+release. A job edited by hand onto `opencode` is refused at launch with
+`opencode is not supported yet`.
+
+---
+
 ## Dashboard
 
 - **Jobs** — one card each: schedule, last check (with the precheck's output),
@@ -1617,9 +1713,12 @@ fastest way to teach everybody to ignore a selftest.
   The editor chooses the **platform first, then the model** — Anthropic
   (Claude Code) or OpenAI (Codex CLI) — and every list it offers (models,
   effort levels, permission modes) is that platform's, read from
-  `/api/models`; on OpenAI a model without a price is marked, Interactive is
-  off and the Limits pane says the cost is estimated. A card names the
-  platform only when it is OpenAI.
+  `/api/models`; the editor offers only the platforms and models switched on
+  in Settings, and a job whose own value was switched off since sees it
+  flagged *(disabled in Settings)* rather than rewritten. On OpenAI a model
+  without a price is marked, Interactive is off and the Limits pane says the
+  cost is estimated. A card names the platform only when it is OpenAI, and
+  carries a *platform disabled* / *model disabled* chip when its value is off.
   A job holding a session from a run that was cut short says so right on the
   card — when it expires, and a **Resume** button when there is a session id
   to continue — rather than only a count on the Sessions tab below.
@@ -1641,6 +1740,11 @@ fastest way to teach everybody to ignore a selftest.
   the activity log. It needs no jobs, and nothing here appears until a project
   turns it on. The project editor's Security pane picks the analysis's platform
   (empty inherits the project's); the analysis meta grid says which CLI ran it.
+- **Settings** — the [Platforms](#settings) page: one card per platform, with
+  its binary, its live session test, its catalog and a switch per model.
+  While nothing is switched on, Overview and Jobs carry a strip that says so
+  and **New job** lands here; a fresh install opens here right after the
+  operator profile. The Profile tab is not built yet.
 - **Theme** — light/dark toggle in the header.
 
 ### Signing in
@@ -1670,7 +1774,7 @@ can already run commands as you can read `data/app.db` and mint their own sessio
 
 ```bash
 agentloop dashboard          # open the control UI
-agentloop status             # jobs + last run + cost, and both platforms' readiness
+agentloop status             # jobs + last run + cost, and one line per platform: enabled, signed in as whom, models on
 agentloop run <id>           # force a run now (ignores precheck + daily cap)
 agentloop check <id>         # run only the precheck, report what it saw
 agentloop enable|disable <id>
@@ -1694,7 +1798,11 @@ agentloop security analyze [--detach] <project> <repo> <branch> [profile]
 agentloop security-branches <project> <repo>   # branches that checkout has
 agentloop resolve-models [anthropic|openai]  # refresh the model catalogs (both, without an argument)
 agentloop resolve-pricing    # refresh config/pricing.json from the price source (daily on its own)
-agentloop platforms          # what each platform offers, and whether it is ready
+agentloop platforms          # what each platform offers, whether it is ready, and what Settings switched on
+agentloop platform check|enable|disable|set-bin|models|set-models <platform> [path]
+                               #   what Settings › Platforms does: probe a CLI, switch a platform
+                               #   on or off, point at its binary, refresh its catalog, choose
+                               #   its models (JSON list on stdin) — see Settings
 agentloop skills             # show / link the skills the agent prompts require
 agentloop selftest           # offline checks of the logic that can kill a run
 agentloop install | uninstall
@@ -1702,7 +1810,8 @@ agentloop install | uninstall
 
 Environment overrides: `AGENTLOOP_PORT`, `AGENTLOOP_CONFIG`,
 `AGENTLOOP_DATA`, `AGENTLOOP_CLAUDE_BIN`, `AGENTLOOP_CLAUDE_CONFIG_DIR`,
-`AGENTLOOP_CODEX_BIN`, `CODEX_HOME` (this one is the Codex CLI's own),
+`AGENTLOOP_CODEX_BIN`, `AGENTLOOP_OPENCODE_BIN` (the three `_BIN` variables
+win over the path set in Settings), `CODEX_HOME` (this one is the Codex CLI's own),
 `AGENTLOOP_PRICING_URL` (where the price table refreshes from),
 `AGENTLOOP_PYTHON`, `AGENTLOOP_JQ`, `AGENTLOOP_LOG_MAX` (log rotation
 threshold, default 4 MiB), `AGENTLOOP_HOOK_TIMEOUT`, `AGENTLOOP_LOCK_GRACE`,
@@ -1845,6 +1954,7 @@ agentloop/
 │   ├── jobs.json              # your jobs (created from the example on install)
 │   ├── jobs.example.json      # a disabled demo job
 │   ├── projects.json          # your projects (generated)
+│   ├── platforms.json         # which platforms and models are switched on (seeded on first use)
 │   ├── models.json            # cached family→model resolutions (generated)
 │   ├── prechecks/<id>.sh      # one precheck per job
 │   ├── provision/<project>.{up,down}.sh   # per-repo worktree provisioning
@@ -1860,8 +1970,9 @@ agentloop/
 └── README.md
 ```
 
-Everything generated or personal (`data/`, `dist/`, your jobs, projects, model
-cache and token) is git-ignored, so a clone starts clean.
+Everything generated or personal (`data/`, `dist/`, your jobs, projects,
+platform settings, model cache and token) is git-ignored, so a clone starts
+clean.
 
 The two `launchd` agents are the only thing outside this folder — macOS loads
 them from `~/Library/LaunchAgents/com.agentloop.*.plist`. The scripts resolve

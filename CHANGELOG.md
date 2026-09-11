@@ -20,104 +20,51 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **`config/platforms.json`'s seed and readers now survive the states they
-  will actually meet, before anything reads the file for a real decision.**
-  Code review on the platform-settings work found three gaps in this not
-  yet wired up plumbing:
-  - An empty (0-byte) `config/models.json` — the shape of a fresh install
-    before the first catalog resolve — made `jq -c '.resolved // {}'` print
-    nothing while still exiting 0, so `--argjson resolved ""` failed on
-    every single read of the seed. `jq -e`, which does distinguish
-    "produced nothing" from "produced `{}`", plus an explicit fallback,
-    fixes it.
-  - `platforms_error` accepted anything that merely parsed as JSON, while
-    `platforms_json` separately demanded a `.platforms` object — so a file
-    like `{"platform": {...}}` (a plausible typo by hand) silently read as
-    nothing enabled, with no reason given anywhere. One `platforms_valid`
-    predicate, shared by every reader and writer, fixes it.
-  - A job with no `model`, or one naming a model invalid on its own
-    platform (an OpenAI job left with `"model": "opus"` after a platform
-    switch, say), contributed nothing to the seed instead of the
-    platform's actual default — so an upgrade would read
-    `enabled:true, models:[]` and refuse every run it used to allow. The
-    seed now resolves each job's *effective* model (its own where valid,
-    else the platform's default) before recording it.
-  - `platform_check` now answers binary, version, session and account
-    live for a platform (`claude auth status --json`, `codex login
-    status`), and `platform_bin` resolves the CLI's path through the new
-    three-tier precedence — an `AGENTLOOP_*_BIN` environment override,
-    else the file's own `bin`, else the detected default — with a missing
-    binary naming the path, the Settings field and the install command.
-  - A run launches the binary the readiness check looked at — the file's
-    own `bin` when one is set.
-  - The Settings page's own commands landed: `agentloop platform
-    check|enable|disable|set-bin|models|set-models <platform>` probe a CLI,
-    flip a platform on or off, point at its binary, list its catalog with
-    `enabled`/price/efforts per model, and choose which ids are enabled —
-    `enable` refuses while the check fails, and `disable`/`set-models` name
-    the enabled jobs a change would leave skipped. `agentloop platforms`
-    now lists the planned OpenCode alongside both engines and carries what
-    the operator actually enabled (`usable`, `bin_source`, `models_enabled`,
-    which jobs run on each), with `_error` at the top when the file itself
-    cannot be read.
-  - A failed catalog refresh from Settings (`agentloop platform models
-    openai` when codex is missing or its answer is empty) keeps the catalog
-    it had instead of emptying it, and says stale.
-  - The gates: a run, a job and a project may only use what Settings
-    switched on. Launch refuses a platform switched off or planned, and a
-    model nobody enabled, one line each in `tick.log` before a slot is
-    spent; `set-field`, `create` and `project-set` refuse the same at write
-    time, naming what is enabled; a security block's switched-off model
-    falls back to the first one switched on, with a warning. `agentloop
-    status` names enabled/disabled, version, account and model counts per
-    platform (and warns when the file cannot be read, as the tick now logs
-    once); `install.sh` says when nothing is enabled yet. What it cost: a
-    job on the most expensive model in the catalog was one click away, and
-    a job on a CLI nobody signed in to found out at its first launch.
-  - A security block with no model enabled at all is told exactly that, not
-    sent to refresh a catalog: the derivation warning used to say "no OpenAI
-    catalog is resolved yet" for any platform whenever nothing was enabled —
-    anthropic included, and even with the catalog already resolved.
-  - `/api/models` now carries the same registry Settings will read: each
-    platform's `supported`/`enabled`/`usable`, where its binary is and by
-    which rule, the models switched on and the jobs using them, behind
-    `configured`/`error` at the top — no probe runs inside the endpoint, the
-    file is read and the engine seeds it when missing. The six Settings ops
-    (`platform_check`/`enable`/`disable`/`set_bin`/`models`/`set_models`)
-    shape into `agentloop platform <verb>` calls and relay the engine's
-    refusal verbatim.
-  - The page's job counts credit a job with no model, or one invalid on its
-    platform, to the platform's default model, as the engine does — instead
-    of dropping it or counting it under its own invalid raw id.
-  - The Platform/Model editors and the job card/row now read that registry
-    too: `platformOptions`/`modelOptionsFor` offer only what Settings
-    switched on, flagging the job's own value instead of rewriting it, while
-    `platformState`/`platformChip` put the same verdict on the card and the
-    table row.
-  - One rule (`modelEnabled`) decides whether a job's model is switched on —
-    for the combo, the chip and the editor alike; a family value counts when
-    an id of it is on.
-  - The Settings item comes out of hiding, with the Platforms page behind it:
-    one card per platform that finds the CLI, tests the session live, loads
-    the catalog once the test passes and switches models on one by one — every
-    change saves at once and the page re-reads what the engine now allows.
-    OpenCode is listed and detected, otherwise waiting for its engine.
-  - The Settings page locks a card while it saves, keeps what you are typing
-    across a repaint, and forgets a stale check when the binary changes.
-  - A toggle no longer writes "on" into the Binary field: the repaint's focus
-    guard mistook a switch's own checkbox -- also an `<input>` -- for the
-    field being typed into.
-  - The job and project editors offer only what Settings switched on: the
-    Platform and Model combos read the registry (the fixed two-platform list
-    is gone, and the Security pane takes no typed-in model any more), a job's
-    own switched-off value is shown flagged instead of rewritten, and the
-    editor's Agent step refuses a platform not enabled or a model switched
-    off -- when creating or changing it, never when editing another field.
-    While nothing is configured, Overview and Jobs carry a strip, New job
-    lands on Settings, the sidebar item carries a dot, and a fresh install
-    lands on Settings right after the operator profile.
-  - Opening a job whose model was switched off shows it flagged in the Model
-    list, not only after a re-read.
+- **Settings › Platforms, and `config/platforms.json`: a job may only pick a
+  platform and a model somebody switched on.** The Settings item comes out of
+  hiding with one card per platform — find the binary (or point at it), test
+  the session live (`claude auth status`, `codex login status`), load the
+  catalog, switch models on one by one. The engine keeps the file
+  (`agentloop platform …`), seeds it from the jobs already in use on an
+  upgrade, and refuses at launch — one line in `tick.log`, before a slot is
+  spent — a run on a platform or a model that is off; `set-field`, `create`
+  and `project-set` refuse the same at write time. Overview and Jobs carry a
+  strip while nothing is configured, and *New job* opens Settings. OpenCode
+  is listed and detected; its engine is a later release. What it cost to
+  not have it: the model picker offered the whole catalog, so a job on the
+  most expensive OpenAI model was one click away, and a job on a CLI nobody
+  had signed in to found out at its first launch, hours later.
+  - The seed: a missing file is written on first use with every platform an
+    enabled job or an enabled security block runs on, and the models they
+    use — a job with no model, or one invalid on its platform, is credited to
+    the platform's default, as the engine runs it — so an install that
+    upgrades keeps every job running without a visit to Settings; a fresh
+    install gets nothing enabled. A refresh of the catalog never touches the
+    file; a file that is not JSON, or has no `platforms` object, reads as
+    nothing enabled, is named by `status`, the tick and the dashboard's strip,
+    and is never written over.
+  - The launch refusals, in this order and one line each: a planned platform
+    (`opencode is not supported yet`), one switched off in Settings, a
+    platform with no model switched on, the CLI's own readiness, and — after
+    the catalog check — a model the CLI knows but Settings did not enable,
+    naming the ones it did. A security analysis passes the same gates; a
+    security block whose model was switched off falls back to the first one
+    switched on, with a warning.
+  - `disable` and `set-models` never refuse — switching off is the operator's
+    decision — and answer with the enabled jobs and security blocks that will
+    be skipped until it is on again; the page shows the same sentence.
+    `enable` refuses while the live check fails, with the reason; a `set-bin`
+    path must be executable and is stored absolute; a catalog refresh that
+    fails keeps the catalog it had and says `stale`.
+  - `/api/models` carries the registry (`configured`, `error`, and per
+    platform `supported`, `enabled`, `usable`, `bin`, `bin_source`,
+    `bin_found`, `models_enabled`, `jobs_on_platform`, `jobs_using`) with no
+    probe inside the endpoint; the editors offer only what is usable and
+    enabled, flag a job's switched-off value *(disabled in Settings)* instead
+    of rewriting it, and the card and the row carry a `platform disabled` /
+    `model disabled` / `platform not supported yet` chip. `agentloop status`
+    prints one line per platform — enabled, version, account, models on —
+    and `install.sh` ends by saying so when nothing is usable.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and
@@ -327,13 +274,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   have it: an OpenAI job refused in `tick.log` for a signed-out Codex had no
   place in the terminal that said so.
 
-### Removed
-
-- **The per-project and per-block `claude_config_dir`.** The account a run signs
-  in as is the platform's — the install's pin — and Settings › Platforms shows
-  whom it is signed in as. A `projects.json` still carrying the field is warned
-  about by `status` and `install`, and cleaned by the next save.
-
 ### Changed
 
 - **claude-cron is now agentloop.** The scheduler runs more than one agent from
@@ -375,6 +315,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Every shortcut above is deleted in the release after this one; the
     `ALLOWED` list in `tests/test_no_old_name_survives.py` is the list of what
     goes, and emptying it is how that release starts.
+
+### Removed
+
+- **The per-project and per-block `claude_config_dir`.** The account a run signs
+  in as is the platform's — the install's pin — and Settings › Platforms shows
+  whom it is signed in as. A `projects.json` still carrying the field is warned
+  about by `status` and `install`, and cleaned by the next save.
 
 ### Fixed
 
