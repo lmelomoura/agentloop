@@ -495,6 +495,32 @@ que o código, entrada por comportamento — "a job can no longer be created on
 a platform nobody enabled; what it cost: a job on `gpt-6-astra` at $10/50
 per 1M was one click away in a picker that showed the whole catalog".
 
+## Ecrãs
+
+Os cinco artboards aprovados vivem em
+[`../mockups/2026-09-11-platform-settings/`](../mockups/2026-09-11-platform-settings/)
+(`Main.dc.html`, `OverviewBanner.dc.html`, `CardStates.dc.html`,
+`JobEditorAgent.dc.html`, `JobEditorFlag.dc.html`, e o `canvas.json` que os
+dispõe) e no canvas
+<https://claude.ai/code/artifact/b259a209-09bb-447d-9010-3e5a736aac48>. Foram
+desenhados com os valores da própria aplicação (`ui/css/tokens.css`,
+`components.css`, `pages.css`, a barra lateral e os ícones de
+`bin/dashboard.html`), por isso o plano pode citar deles medidas e classes:
+
+1. **Settings › Platforms** (`Main`): a página como esta instalação a abre
+   depois do upgrade — Anthropic e OpenAI ligadas pela semente, Anthropic com
+   quatro modelos em cinco, OpenAI só com Luna, OpenCode como *planned*.
+2. **Overview sem nada configurado** (`OverviewBanner`): a faixa, o *New
+   job* a apontar para os Settings e o ponto de atenção na barra lateral.
+3. **Estados de falha do cartão** (`CardStates`): binário encontrado sem
+   sessão, com o interruptor trancado; e binário ausente, com o campo do
+   caminho.
+4. **Editor de jobs, passo *The agent*** (`JobEditorAgent`): Platform só com
+   as ligadas, Model só com os activados e a contagem dos que o catálogo
+   ainda esconde.
+5. **Editor de jobs com um modelo desligado** (`JobEditorFlag`): o valor
+   marcado "(disabled in Settings)" e a caixa que diz o que acontece.
+
 ## Fora desta versão
 
 - Runs em OpenCode (entrega 2) e a listagem real dos seus modelos.
