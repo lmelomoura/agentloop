@@ -3420,6 +3420,29 @@ def test_the_settings_module_speaks_the_six_actions(srv):
         "the button must carry no id -- a later task mounts this banner on two views at once"
 
 
+def test_the_binary_field_saves_on_blur_not_on_a_repaints_change(srv):
+    """A repaint (the three open-page checks, any Test/Refresh/toggle on any
+    card, the 5 s config_sig re-read) can land while the operator is
+    mid-typing in the Binary field; Chrome fires "change" on the <input>
+    being torn out of the DOM by paint()'s `host.textContent = ""`, so a
+    listener on "change" posts whatever partial path happened to be typed so
+    far -- refused if it is not executable, saved and checked if it happens
+    to be. binaryBlock must save on blur (and Enter, which just blurs)
+    instead, and skip the save both for the blur a repaint's own teardown
+    causes and for one that lands after the element was already detached."""
+    fn = _plainfn(_app_js(srv), "binaryBlock")
+    assert 'inp.addEventListener("blur"' in fn, "the Binary field must save on blur"
+    assert 'inp.addEventListener("change"' not in fn, \
+        "a repaint tearing this input out must not save through \"change\" -- the switches' own " \
+        "checkboxes still use \"change\", but that listener lives outside binaryBlock"
+    assert "inp.isConnected" in fn, \
+        "a save must not fire for a blur reaching an input a repaint already detached"
+    assert "repainting" in fn, \
+        "a save must not fire for the blur a repaint's own host.textContent teardown causes"
+    assert "Chrome fires" in fn and "removed from the DOM" in fn, \
+        "the source must explain why: Chrome fires \"change\" on an input the repaint removes"
+
+
 # Settings › Platforms (Task 9): the editors offer only what Settings switched
 # on, the strip Overview and Jobs carry while nothing is configured, New job
 # diverted to Settings, the sidebar dot, and the landing after the profile.

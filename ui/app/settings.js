@@ -23,6 +23,10 @@ export const REGISTRY = [
 const live = {checks: {}, checkedAt: {}, catalogs: {}, busy: {}};
 let ctx = null;   // {platforms, configured, error, onChange}
 let probed = false;   // the three live checks have been fired once, on the first paint with a real payload
+// True while paint() tears #st-platforms down and rebuilds it. The Binary
+// field's blur/keydown handlers (binaryBlock) no-op while this is set -- see
+// the comment there for why.
+let repainting = false;
 
 async function post(op, extra){
   const r = await fetch("/api/action", {method: "POST",
@@ -142,11 +146,31 @@ function binaryBlock(r, entry, check){
   const ctrl = el("div", "ctrl");
   const inp = el("input"); inp.type = "text"; inp.value = entry.bin || ""; inp.placeholder = "Use another binary… (leave empty to detect)";
   inp.disabled = !!live.busy[r.id] || entry.supported === false;
-  inp.addEventListener("change", async () => {
-    const ok = await change("platform_set_bin", {platform: r.id, bin: inp.value.trim()});
+  // Save on blur (and Enter, which just blurs) instead of "change": a
+  // repaint can land while the operator is mid-typing (the three open-page
+  // checks, any Test/Refresh/toggle on any card, the 5 s config_sig
+  // re-read), and Chrome fires "change" -- and "blur" -- on an <input>
+  // being removed from the DOM, with whatever partial path is typed so
+  // far. `repainting` (set around the host rebuild in paint()) and
+  // `inp.isConnected` both catch that and skip the save; paint()'s focus
+  // preservation restores the typed text onto the new input, so the next
+  // real blur/Enter still saves what the operator actually finished
+  // typing. The value check also keeps a no-op blur (tab through without
+  // editing) from re-posting the same path.
+  const saveBin = async () => {
+    if(repainting || !inp.isConnected) return;
+    const v = inp.value.trim();
+    if(v === (entry.bin || "")) return;
+    const ok = await change("platform_set_bin", {platform: r.id, bin: v});
     if(!ok) return;
     delete live.checks[r.id]; delete live.catalogs[r.id];   // the old check named the old binary
     await runCheck(r.id);
+  };
+  inp.addEventListener("blur", saveBin);
+  inp.addEventListener("keydown", (e) => {
+    if(e.key !== "Enter") return;
+    if(repainting || !inp.isConnected) return;
+    inp.blur();   // triggers saveBin above
   });
   ctrl.appendChild(inp);
   ctrl.appendChild(button("Detect", "radar", async () => {
@@ -294,12 +318,14 @@ function paint(){
     const card = active.closest("section.platcard");
     if(card) savedFocus = {cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd};
   }
+  repainting = true;   // see binaryBlock: an input torn out below must not save on the blur this causes
   host.textContent = "";
   if(ctx.error){
     const b = setupBanner(false, ctx.error, false); if(b) host.appendChild(b);
   }
   host.appendChild(el("div", "summary", settingsSummary(ctx.platforms)));
   REGISTRY.forEach(r => host.appendChild(platformCard(r, (ctx.platforms || {})[r.id] || {}, live.checks[r.id] || null, live.catalogs[r.id] || null)));
+  repainting = false;
   if(savedFocus){
     const card = $(savedFocus.cardId);
     const inp = card && card.querySelector(".ctrl input");

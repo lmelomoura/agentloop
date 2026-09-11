@@ -65,6 +65,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `model disabled` / `platform not supported yet` chip. `agentloop status`
     prints one line per platform — enabled, version, account, models on —
     and `install.sh` ends by saying so when nothing is usable.
+  - The Binary field saves what you typed when you leave it, never a
+    half-typed path when another card's check repaints the page.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and

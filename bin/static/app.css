@@ -2874,4 +2874,4 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 .navitem .attn{width:8px;height:8px;border-radius:50%;background:var(--warn);flex:none;margin-right:4px}
 @media (max-width: 900px){ .platcard-g{grid-template-columns:1fr} .platcard-g > div + div{border-left:0;border-top:1px solid var(--line2)} }
 /* ui-bundle: c0e8765f50895e0c23cde5650a94dccf0193db274f539940a61c9d987b0df068 */
-/* ui-sources: a577cc396a8762ecdca500ca369e0005f8db681df34a6ae619f9023814889104 */
+/* ui-sources: 6995955f9f455bebd1e5dfb019589327c5c8d5a3b9e49e321eddc659d103db80 */

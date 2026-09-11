@@ -2418,6 +2418,7 @@
   var live = { checks: {}, checkedAt: {}, catalogs: {}, busy: {} };
   var ctx = null;
   var probed = false;
+  var repainting = false;
   async function post(op, extra) {
     const r = await fetch("/api/action", {
       method: "POST",
@@ -2545,12 +2546,21 @@
     inp.value = entry.bin || "";
     inp.placeholder = "Use another binary\u2026 (leave empty to detect)";
     inp.disabled = !!live.busy[r.id] || entry.supported === false;
-    inp.addEventListener("change", async () => {
-      const ok = await change("platform_set_bin", { platform: r.id, bin: inp.value.trim() });
+    const saveBin = async () => {
+      if (repainting || !inp.isConnected) return;
+      const v = inp.value.trim();
+      if (v === (entry.bin || "")) return;
+      const ok = await change("platform_set_bin", { platform: r.id, bin: v });
       if (!ok) return;
       delete live.checks[r.id];
       delete live.catalogs[r.id];
       await runCheck(r.id);
+    };
+    inp.addEventListener("blur", saveBin);
+    inp.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      if (repainting || !inp.isConnected) return;
+      inp.blur();
     });
     ctrl.appendChild(inp);
     ctrl.appendChild(button("Detect", "radar", async () => {
@@ -2700,6 +2710,7 @@
       const card = active.closest("section.platcard");
       if (card) savedFocus = { cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd };
     }
+    repainting = true;
     host.textContent = "";
     if (ctx.error) {
       const b = setupBanner(false, ctx.error, false);
@@ -2707,6 +2718,7 @@
     }
     host.appendChild(el("div", "summary", settingsSummary(ctx.platforms)));
     REGISTRY.forEach((r) => host.appendChild(platformCard(r, (ctx.platforms || {})[r.id] || {}, live.checks[r.id] || null, live.catalogs[r.id] || null)));
+    repainting = false;
     if (savedFocus) {
       const card = $(savedFocus.cardId);
       const inp = card && card.querySelector(".ctrl input");
@@ -2957,5 +2969,5 @@
     setupBanner
   };
 })();
-/* ui-bundle: 15bd20b1420b25ef667bdd55f0ce6bcd20ee87ef0ca2652a08561a7d1f332337 */
-/* ui-sources: a577cc396a8762ecdca500ca369e0005f8db681df34a6ae619f9023814889104 */
+/* ui-bundle: cb493255820d703db53d9b2aba601c78b38017909f3946950135c772fb81b4c3 */
+/* ui-sources: 6995955f9f455bebd1e5dfb019589327c5c8d5a3b9e49e321eddc659d103db80 */
