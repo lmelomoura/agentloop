@@ -50,6 +50,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     binary naming the path, the Settings field and the install command.
   - A run launches the binary the readiness check looked at — the file's
     own `bin` when one is set.
+  - The Settings page's own commands landed: `agentloop platform
+    check|enable|disable|set-bin|models|set-models <platform>` probe a CLI,
+    flip a platform on or off, point at its binary, list its catalog with
+    `enabled`/price/efforts per model, and choose which ids are enabled —
+    `enable` refuses while the check fails, and `disable`/`set-models` name
+    the enabled jobs a change would leave skipped. `agentloop platforms`
+    now lists the planned OpenCode alongside both engines and carries what
+    the operator actually enabled (`usable`, `bin_source`, `models_enabled`,
+    which jobs run on each), with `_error` at the top when the file itself
+    cannot be read.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and
