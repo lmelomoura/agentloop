@@ -10,6 +10,7 @@ config/*.bak*
 config/projects.json
 config/models.json
 config/pricing.json
+config/platforms.json
 
 # Personal precheck scripts (keep only the shipped examples)
 config/prechecks/*.sh

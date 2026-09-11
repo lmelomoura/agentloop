@@ -83,6 +83,7 @@ JOBS_FILE="$CONFIG_DIR/jobs.json"
 PROJECTS_FILE="$CONFIG_DIR/projects.json"
 MODELS_FILE="$CONFIG_DIR/models.json"
 PRICING_FILE="$CONFIG_DIR/pricing.json"   # USD per 1M tokens, per OpenAI slug (install.sh seeds it)
+PLATFORMS_FILE="$CONFIG_DIR/platforms.json"   # what the operator enabled: platforms, their binary, their models (seeded by the engine)
 INTERACTIVE_GRACE=20        # seconds to wait for a human reply before ending
                             # an interactive run that has finished its turn
 MODELS_TTL=86400            # 24h — how long a family→id resolution is trusted,
@@ -1211,9 +1212,12 @@ is_due_vals() { # is_due_vals <interval> <last-start> <fail-streak> ; 0 = due
 # docs/superpowers/specs/2026-09-06-codex-measurements/README.md -- and where
 # the measurement contradicted the design, the measurement won (its
 # "Correcções por medição" section).
-PLATFORMS="anthropic openai"
+PLATFORMS="anthropic openai"          # the platforms that run
+PLATFORMS_PLANNED="opencode"          # listed and checked for a binary, never run: the engine for it is a later release
 
 platform_known() { case "${1:-}" in anthropic|openai) return 0 ;; *) return 1 ;; esac; }
+platform_planned() { case "${1:-}" in opencode) return 0 ;; *) return 1 ;; esac; }
+platform_listed() { platform_known "${1:-}" || platform_planned "${1:-}"; }
 
 # job_platform <id> -> the job's effective platform: resolve(), then
 # normalised. A hand-edited project can carry a platform this engine does not
@@ -1226,6 +1230,106 @@ job_platform() { # job_platform <id>
   local p; p="$(resolve "$1" platform 'anthropic')"
   platform_known "$p" || p="anthropic"
   printf '%s\n' "$p"
+}
+
+# --- config/platforms.json: what the operator enabled ---------------------------
+# One object per listed platform: `enabled`, `bin` ("" = detect) and `models`,
+# the exact ids a job may pick, in the order they were switched on. The
+# catalog in config/models.json is a CACHE the daily refresh rewrites; this
+# file is the operator's intent, and a refresh never touches it. Missing, it
+# is seeded from what is already in use, so an install that upgrades keeps
+# every enabled job running; on a fresh install nothing is enabled until
+# someone decides so in Settings. Read the two config files RAW here, never
+# through jobs_json: that one derives the security jobs, which ask this file
+# for their default model -- a loop.
+PLATFORMS_JQ='
+  def known: if . == "openai" then "openai" else "anthropic" end;
+  def project($name): ([ ($projects.projects // [])[] | select(.name == $name) ] | first // {});
+  def sec($p): (($p.security | objects) // {});
+  def job_platform($j): (if (($j.platform // "") != "") then $j.platform
+                         elif ((project($j.project // "") | .platform // "") != "") then (project($j.project // "") | .platform)
+                         else "anthropic" end) | known;
+  def job_model($j): (if (($j.model // "") != "") then $j.model else (project($j.project // "") | .model // "") end);
+  def sec_platform($p): (if ((sec($p).platform // "") != "") then sec($p).platform
+                         elif (($p.platform // "") != "") then $p.platform else "anthropic" end) | known;
+  def sec_on($p): ((sec($p).enabled == true) or (sec($p).enabled == "true"));
+  def resolved($m): (if ($m != "") and ((($resolved[$m] // {}) | .id // "") != "") then $resolved[$m].id else $m end);
+  def uses: ([ ($jobs.jobs // [])[] | select(.enabled != false) | {who: .id, p: job_platform(.), m: resolved(job_model(.))} ]
+           + [ ($projects.projects // [])[] | select(sec_on(.)) | {who: ("security:" + .name), p: sec_platform(.), m: resolved((sec(.).model // ""))} ]);
+'
+
+platforms_jq() { # platforms_jq <jq-filter> [jq options…] -- runs the filter with $jobs, $projects, $resolved bound and PLATFORMS_JQ's defs in scope
+  local filter="$1"; shift
+  local jobs='{"jobs":[]}' projects='{"projects":[]}' resolved='{}'
+  if [ -f "$JOBS_FILE" ] && "$JQ" -e . "$JOBS_FILE" >/dev/null 2>&1; then jobs="$(cat "$JOBS_FILE")"; fi
+  if [ -f "$PROJECTS_FILE" ] && "$JQ" -e . "$PROJECTS_FILE" >/dev/null 2>&1; then projects="$(cat "$PROJECTS_FILE")"; fi
+  if [ -f "$MODELS_FILE" ]; then resolved="$("$JQ" -c '.resolved // {}' "$MODELS_FILE" 2>/dev/null || echo '{}')"; fi
+  "$JQ" -n "$@" --argjson jobs "$jobs" --argjson projects "$projects" --argjson resolved "$resolved" "${PLATFORMS_JQ}${filter}"
+}
+
+platforms_seed() { # the file's first contents: a platform is enabled when an enabled job or an enabled security block runs on it, with the models they use
+  platforms_jq '
+    def entry($p): {enabled: ([uses[] | select(.p == $p)] | length > 0), bin: "",
+                    models: ([uses[] | select(.p == $p) | .m | select(. != "")] | reduce .[] as $m ([]; if index($m) then . else . + [$m] end))};
+    {platforms: {anthropic: entry("anthropic"), openai: entry("openai"), opencode: {enabled: false, bin: "", models: []}}}' -c
+}
+
+platforms_ensure() { # write the seed when the file does not exist; an existing file, valid or not, is left alone
+  [ -f "$PLATFORMS_FILE" ] && return 0
+  local seed; seed="$(platforms_seed)" || return 1
+  mkdir -p "$(dirname "$PLATFORMS_FILE")"
+  printf '%s\n' "$seed" > "$PLATFORMS_FILE"
+}
+
+platforms_error() { # one sentence when the file exists and is not JSON, else nothing
+  [ -f "$PLATFORMS_FILE" ] || return 0
+  "$JQ" -e . "$PLATFORMS_FILE" >/dev/null 2>&1 || printf '%s is not valid JSON — no platform is enabled until it is fixed' "$PLATFORMS_FILE"
+}
+
+platforms_json() { # the file, seeded when missing; an unreadable one reads as nothing enabled (platforms_error says why)
+  platforms_ensure
+  if "$JQ" -e '.platforms | type == "object"' "$PLATFORMS_FILE" >/dev/null 2>&1; then cat "$PLATFORMS_FILE"; else echo '{"platforms":{}}'; fi
+}
+
+write_platforms() { # write_platforms <jq-filter> [jq-args...] -- write_jobs's guard: never replace the file with a broken document
+  local tmp
+  platforms_ensure
+  "$JQ" -e . "$PLATFORMS_FILE" >/dev/null 2>&1 || die "refusing to write $PLATFORMS_FILE: it is not valid JSON — fix it by hand first"
+  tmp="$(mktemp "$(dirname "$PLATFORMS_FILE")/.platforms.XXXXXX")"
+  if "$JQ" "$@" "$PLATFORMS_FILE" > "$tmp" 2>/dev/null \
+     && "$JQ" -e 'type == "object" and (.platforms | type) == "object"' "$tmp" >/dev/null 2>&1; then
+    mv "$tmp" "$PLATFORMS_FILE"
+  else
+    rm -f "$tmp"; die "refusing to write a malformed platforms file (change discarded)"
+  fi
+}
+
+platforms_field() { # platforms_field <platform> <key> -> the value as text ("" when absent; a list joined by commas)
+  platforms_json | "$JQ" -r --arg p "$1" --arg k "$2" \
+    '.platforms[$p][$k] // "" | if type == "array" then join(",") else tostring end'
+}
+platform_enabled() { [ "$(platforms_field "$1" enabled)" = "true" ]; }
+platform_models_enabled() { # the enabled ids, one per line, in the file's own order
+  platforms_json | "$JQ" -r --arg p "$1" '.platforms[$p].models // [] | .[] | select(type == "string" and . != "")'
+}
+family_cached_id() { # family_cached_id <family> -> the id the cache holds for it, TTL ignored; nothing for an id or an unknown family. Never a probe.
+  case "${1:-}" in opus|sonnet|haiku|fable) ;; *) return 0 ;; esac
+  [ -f "$MODELS_FILE" ] || return 0
+  "$JQ" -r --arg f "$1" '.resolved[$f].id // empty' "$MODELS_FILE" 2>/dev/null
+}
+platform_model_enabled() { # platform_model_enabled <platform> <model> -> 0 when the list carries the value itself, or the id a family resolves to
+  local list id
+  list="$(platform_models_enabled "$1")"
+  [ -n "$list" ] || return 1
+  printf '%s\n' "$list" | grep -qxF -- "$2" && return 0
+  id="$(family_cached_id "$2")"
+  [ -n "$id" ] && printf '%s\n' "$list" | grep -qxF -- "$id"
+}
+platform_usable() { # enabled AND at least one model enabled: what the editors and the dashboard's warning read
+  platform_enabled "$1" && [ -n "$(platform_models_enabled "$1" | head -1)" ]
+}
+platform_jobs_on() { # platform_jobs_on <platform> [model] -> one line per enabled job (its id) or enabled security block ("security:<project>") running there
+  platforms_jq 'uses[] | select(.p == $p) | select($m == "" or .m == $m) | .who' -r --arg p "$1" --arg m "${2:-}"
 }
 
 platform_bin() { # platform_bin <platform> -> the CLI's path
@@ -2968,6 +3072,21 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   local TICK_LOG="$DATA_DIR/tick.log"
   local LOG_DIR="$DATA_DIR/logs" LOCK_DIR="$DATA_DIR/locks"
   local WORKTREES_DIR="$DATA_DIR/worktrees" RUNS_FILE="$DATA_DIR/runs.ndjson"
+  # The platforms file is read by every gate below through PLATFORMS_FILE,
+  # which was computed from the REAL config dir at load time. Shadowed here
+  # so a scenario that redirects JOBS_FILE alone can never seed or read the
+  # operator's own config/platforms.json; the guard at the end proves it.
+  local _real_pf="$PLATFORMS_FILE" _pf0
+  _pf0="$(stat -f %m "$PLATFORMS_FILE" 2>/dev/null || echo none)"
+  local PLATFORMS_FILE="$tmp/platforms.json"
+  # Permissive on purpose: the scenarios below launch runs on every model
+  # their fixtures name, and Settings is not what any of them is testing. A
+  # block that IS testing Settings writes a file of its own (pf_env, pc_al,
+  # dplat, sec_env below).
+  "$JQ" -n '{platforms:{
+    anthropic:{enabled:true, bin:"", models:["opus","sonnet","haiku","fable","claude-opus-5","claude-sonnet-5","claude-opus-4-8","claude-fable-5-1","claude-haiku-4-5-20251001"]},
+    openai:{enabled:true, bin:"", models:["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-a","gpt-b"]},
+    opencode:{enabled:false, bin:"", models:[]}}}' > "$PLATFORMS_FILE"
   mkdir -p "$DATA_DIR" "$LOG_DIR" "$LOCK_DIR" "$WORKTREES_DIR"
 
   echo "num() — a number from a command is always an integer"
@@ -3058,6 +3177,56 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     && ok "and never fires for a mode it does not describe" || bad "the inert warning fired for the wrong mode"
   platform_effort_ok anthropic opus ultra;   want "ultra is not an anthropic effort"          1 $?
   platform_effort_ok anthropic opus "";      want "an empty effort is always fine"            0 $?
+
+  echo "config/platforms.json — seeded from what is in use, read by every gate"
+  local pf="$tmp/pf"; mkdir -p "$pf"
+  pf_env() { PLATFORMS_FILE="$pf/platforms.json"; JOBS_FILE="$pf/jobs.json"; PROJECTS_FILE="$pf/projects.json"; MODELS_FILE="$pf/models.json"; }
+  cat > "$pf/jobs.json" <<'JSON'
+{"jobs":[{"id":"a1","model":"claude-opus-5","prompt":"x"},
+         {"id":"a2","model":"opus","prompt":"x"},
+         {"id":"off","enabled":false,"model":"claude-sonnet-5","prompt":"x"},
+         {"id":"o1","platform":"openai","model":"gpt-5.6-luna","prompt":"x"},
+         {"id":"p1","project":"P","prompt":"x"}]}
+JSON
+  cat > "$pf/projects.json" <<'JSON'
+{"projects":[{"name":"P","platform":"openai","model":"gpt-5.6-sol",
+              "security":{"enabled":true,"platform":"anthropic","model":"claude-fable-5-1"}}]}
+JSON
+  printf '{"resolved":{"opus":{"id":"claude-opus-5","at":1}}}\n' > "$pf/models.json"
+  type platforms_ensure >/dev/null 2>&1 && ok "the platforms file reader is defined" || bad "platforms_ensure does not exist"
+  ( pf_env; platforms_ensure )
+  [ -f "$pf/platforms.json" ] && ok "a missing platforms file is written on first use" || bad "platforms_ensure wrote nothing"
+  ( pf_env; platform_enabled anthropic ); want "anthropic is enabled: enabled jobs run on it" 0 $?
+  ( pf_env; platform_enabled openai );    want "openai is enabled: an enabled job and a project's jobs run on it" 0 $?
+  ( pf_env; platform_enabled opencode );  want "opencode is never enabled by the seed" 1 $?
+  got="$( pf_env; platform_models_enabled anthropic | tr '\n' ' ' )"
+  [ "$got" = "claude-opus-5 claude-fable-5-1 " ] \
+    && ok "anthropic's models: the ids in use, a family resolved through the cache, the disabled job's model left out, no repeats" \
+    || bad "anthropic models: '$got'"
+  got="$( pf_env; platform_models_enabled openai | tr '\n' ' ' )"
+  [ "$got" = "gpt-5.6-luna gpt-5.6-sol " ] && ok "openai's models: the job's own and the one inherited from the project" || bad "openai models: '$got'"
+  ( pf_env; platform_model_enabled anthropic opus );            want "a family counts as enabled when its cached id is" 0 $?
+  ( pf_env; platform_model_enabled anthropic claude-sonnet-5 ); want "a model no enabled job uses is not enabled" 1 $?
+  ( pf_env; platform_usable anthropic ); want "usable: enabled with a model" 0 $?
+  [ "$( pf_env; platform_jobs_on openai | tr '\n' ' ' )" = "o1 p1 " ] \
+    && ok "platform_jobs_on lists the enabled jobs of a platform" || bad "jobs on openai: $( pf_env; platform_jobs_on openai | tr '\n' ' ' )"
+  [ "$( pf_env; platform_jobs_on anthropic claude-fable-5-1 )" = "security:P" ] \
+    && ok "and an enabled security block, by its project" || bad "block: $( pf_env; platform_jobs_on anthropic claude-fable-5-1 )"
+  # a fresh install: only the two disabled example jobs -> nothing enabled, and the file still lists the three platforms
+  local pf2="$tmp/pf2"; mkdir -p "$pf2"; cp "$BASE_DIR/config/jobs.example.json" "$pf2/jobs.json"
+  ( PLATFORMS_FILE="$pf2/platforms.json"; JOBS_FILE="$pf2/jobs.json"; PROJECTS_FILE="$pf2/projects.json"; MODELS_FILE="$pf2/models.json"
+    platforms_ensure; platform_usable anthropic ); want "a fresh install enables nothing" 1 $?
+  "$JQ" -e '.platforms | keys == ["anthropic","openai","opencode"]' "$pf2/platforms.json" >/dev/null 2>&1 \
+    && ok "and still lists the three platforms" || bad "seed keys: $("$JQ" -c '.platforms | keys' "$pf2/platforms.json" 2>/dev/null)"
+  # an invalid file: nothing enabled, a reason, and never rewritten
+  printf '{oops' > "$pf2/platforms.json"
+  ( PLATFORMS_FILE="$pf2/platforms.json"; platform_enabled anthropic ); want "an invalid file enables nothing" 1 $?
+  [ -n "$( PLATFORMS_FILE="$pf2/platforms.json"; platforms_error )" ] && ok "and platforms_error names it" || bad "no error for an invalid file"
+  ( PLATFORMS_FILE="$pf2/platforms.json"; write_platforms '.platforms.anthropic.enabled = true' ) >/dev/null 2>&1; want "write_platforms refuses to write over an invalid file" 1 $?
+  [ "$(cat "$pf2/platforms.json")" = "{oops" ] && ok "and left it exactly as it was" || bad "the invalid file was rewritten"
+  ( pf_env; write_platforms '.platforms = "nope"' ) >/dev/null 2>&1; want "a filter that drops .platforms is discarded" 1 $?
+  ( pf_env; write_platforms '.platforms.openai.enabled = false' ) >/dev/null 2>&1; want "a good filter writes" 0 $?
+  ( pf_env; platform_enabled openai ); want "and the write is read back" 1 $?
 
   # The catalog readers, over a models.json of this test's own.
   mkdir -p "$tmp/cat"
@@ -5494,6 +5663,9 @@ NASTY
   [ "$(size_of "$_real_exec")" = "$_exec0" ] \
     && ok "the real exec.log is byte-identical after the suite" \
     || bad "the suite appended to the real exec.log ($_exec0 -> $(size_of "$_real_exec") bytes)"
+  [ "$(stat -f %m "$_real_pf" 2>/dev/null || echo none)" = "$_pf0" ] \
+    && ok "the suite never touched the real config/platforms.json" \
+    || bad "the suite created or rewrote $_real_pf"
 
   echo "log_rotate() — a log that grows without bound is capped, never lost"
   printf 'old line\n' > "$tmp/r.log"
