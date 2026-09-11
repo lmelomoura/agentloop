@@ -983,13 +983,6 @@ document.documentElement.dataset.theme =
     at run time — a detached or stray-branch checkout included, which every run
     then inherits — and a trailing <code>*</code> (<code>release/*</code>) takes that family's newest.</p>
   </div>
-  <label>Claude account — the config directory this project's runs sign in as</label>
-  <input id="pj-ccd" type="text" placeholder="default — the account the scheduler itself runs as"
-         autocomplete="off" spellcheck="false">
-  <p class="fieldhelp">Exported to runs as <code>CLAUDE_CONFIG_DIR</code> (e.g. <code>~/.claude-work</code>).
-    Empty inherits the scheduler's own account; once runs exist, keep it stable —
-    a resumed session is looked up inside the account that created it. Anthropic runs only — a run
-    on OpenAI signs in as the Codex CLI's own account (<code>codex login</code>).</p>
   </div><!-- /pane project -->
 
   <div class="tabpane" data-pjpane="repos">
@@ -1098,11 +1091,6 @@ document.documentElement.dataset.theme =
   </div>
   <p class="fieldhelp" id="sec-perm-help">How the analysis agent may use tools — dontAsk without an allowlist denies
     everything headless, but the ledger stays protected by the CLI's validating door either way.</p>
-  <label>Claude account — which account signs the analysis</label>
-  <input id="sec-cfgdir" type="text" placeholder="inherits the project's" autocomplete="off" spellcheck="false">
-  <p class="fieldhelp">Empty inherits this project's own Claude account above; set it only when the
-    analysis itself should sign in as someone else. Anthropic runs only — a run on OpenAI signs in
-    as the Codex CLI's own account (<code>codex login</code>).</p>
   <label>Default profile — offered first when you open Analyse for this project</label>
   <div class="combo" id="sec-profile-default-combo">
     <button type="button" class="combo-trigger" id="sec-profile-default-trigger" aria-haspopup="listbox" aria-expanded="false">
@@ -2458,7 +2446,6 @@ function openProjectEditor(name){
   $("pj-name").value=p?p.name:""; $("pj-name").disabled=false;
   $("pj-desc").value=(p&&p.description)||"";
   $("pj-cwd").value=(p&&p.cwd)||"";
-  $("pj-ccd").value=(p&&p.claude_config_dir)||"";
   // The stored value is "auto" | true | false; the select speaks strings.
   const wt=(p&&p.worktree&&p.worktree.enabled);
   wtCombo.set((wt===true||wt==="true") ? "true" : (wt===false||wt==="false") ? "false" : "auto");
@@ -2519,7 +2506,6 @@ function openProjectEditor(name){
   if(splat==="openai") secEfforts=ALApp.effortsFor("openai", $("sec-model").value, PLATFORMS);
   effortSet("sec-effort","sec-effort-label", sec.effort||"");
   secPermCombo.set(sec.permission_mode||ALApp.defaultPermissionFor(splat,"security"));
-  $("sec-cfgdir").value = sec.claude_config_dir||"";
   $("sec-profile-default").value = ALSecurity.SEC_PROFILES.includes(sec.default_profile) ? sec.default_profile : "standard";
   // The hidden input above is the value saveProject reads; the combo also
   // needs telling, or the trigger keeps showing whatever it last rendered
@@ -2577,12 +2563,8 @@ async function saveProject(){
     const proj={name};
     const d=$("pj-desc").value.trim(); if(d) proj.description=d;
     const c=$("pj-cwd").value.trim(); if(c) proj.cwd=c;
-    // Sent even when empty, unlike the fields above: emptying this one is how you
-    // put a project back on the default account, and project-set merges, so a key
-    // that is simply omitted would keep the old account forever.
-    proj.claude_config_dir=$("pj-ccd").value.trim();
-    // Always sent, like claude_config_dir: project-set merges, and a project
-    // going back to Anthropic has to be able to say so.
+    // Always sent: project-set merges, and a project going back to Anthropic
+    // has to be able to say so.
     proj.platform=$("pj-platform").value||"anthropic";
     // Send only .worktree.enabled: project-set merges (jq `. * $p`), so any
     // venv/env the project declares alongside it survives the save.
@@ -2600,8 +2582,8 @@ async function saveProject(){
     // that merge runs recursively even inside `security` itself, so a field
     // this pane leaves untouched (there is no control for it here) survives.
     // What a merge cannot do is drop a key that is simply missing from what
-    // is sent -- so every field this pane owns is always present, with "" the
-    // way each of them says "unset" (matching claude_config_dir above).
+    // is sent -- so every field this pane owns is always present, with ""
+    // the way each of them says "unset".
     // `enabled` is always a real boolean: security_enabled() and
     // security_derived_jobs' own fast path both also accept the string
     // "true", for a hand-edited config, but this pane has no reason to ever
@@ -2623,7 +2605,6 @@ async function saveProject(){
       // the config -- silently, since project_set accepts any string.
       effort: effortGet("sec-effort"),
       permission_mode: $("sec-perm").value||"bypassPermissions",
-      claude_config_dir: $("sec-cfgdir").value.trim(),
       default_profile: ALSecurity.SEC_PROFILES.includes(profDef) ? profDef : "standard",
       max_budget_usd: (mb===""||isNaN(mbNum)) ? "" : mbNum,
       daily_budget_usd: (db===""||isNaN(dbNum)) ? "" : dbNum,

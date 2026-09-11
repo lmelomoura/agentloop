@@ -597,10 +597,10 @@ def _run_save(srv, tmp_path, *, multi, name="save.js"):
                     effortFromIndex: (i) => ALApp.EFFORTS[+i||0] || "" };
     const effortGet = (id) => ALApp.effortFromIndex($(id).value);
     const sent = [];
-    const vals = {"pj-name":"Web","pj-desc":"","pj-cwd":"%s","pj-ccd":"","pj-base":"develop",
+    const vals = {"pj-name":"Web","pj-desc":"","pj-cwd":"%s","pj-base":"develop",
                   "pj-wt":"auto","pj-platform":"anthropic","sec-platform":"",
                   "pj-up":"","pj-down":"already here",
-                  "sec-enabled":false,"sec-model":"","sec-effort":"0","sec-perm":"bypassPermissions","sec-cfgdir":"",
+                  "sec-enabled":false,"sec-model":"","sec-effort":"0","sec-perm":"bypassPermissions",
                   "sec-profile-default":"standard","sec-max-budget":"","sec-daily-budget":"",
                   "sec-min-severity":"medium","sec-ignore":""};
     const $ = (id) => ({ get value(){ return vals[id]; }, set value(v){ vals[id]=v; },
@@ -664,10 +664,19 @@ def test_a_multi_repo_project_keeps_its_rows_and_leaves_the_project_base_alone(s
 def test_the_project_editor_has_a_security_pane(srv):
     page = srv.render_page("boot-authed")
     assert 'data-pjpane="security"' in page
-    for field in ("sec-enabled", "sec-model", "sec-effort", "sec-perm", "sec-cfgdir",
+    for field in ("sec-enabled", "sec-model", "sec-effort", "sec-perm",
                   "sec-profile-default", "sec-max-budget", "sec-daily-budget",
                   "sec-min-severity", "sec-ignore"):
         assert f'id="{field}"' in page, f"the security pane has no {field} field"
+
+
+def test_the_project_editor_no_longer_offers_an_account_of_its_own(srv):
+    """The account is the platform's, shown in Settings › Platforms; a per-project
+    or per-block claude_config_dir was removed with the Settings page."""
+    page = srv.render_page("boot-authed")
+    assert 'id="pj-ccd"' not in page
+    assert 'id="sec-cfgdir"' not in page
+    assert "claude_config_dir" not in _js(srv)
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -737,11 +746,11 @@ def test_saving_always_sends_the_whole_security_block_with_a_real_boolean(srv, t
     proj = next(e["project"] for op, e in sent if op == "project_set")
     sec = proj["security"]
     assert sec["enabled"] is False, f"enabled must be a real boolean, got {sec['enabled']!r}"
-    assert set(sec) == {"enabled", "platform", "model", "effort", "permission_mode", "claude_config_dir",
+    assert set(sec) == {"enabled", "platform", "model", "effort", "permission_mode",
                          "default_profile", "max_budget_usd", "daily_budget_usd",
                          "min_severity", "ignore_paths"}, f"security block: {sec}"
     assert sec["platform"] == "", "an empty platform must be SENT: it is how the block goes back to inheriting"
-    assert proj["platform"] == "anthropic", "the project's platform is always sent, like claude_config_dir"
+    assert proj["platform"] == "anthropic", "the project's platform is always sent"
     assert sec["max_budget_usd"] == "", "an empty budget must clear, not vanish from the payload"
     assert sec["default_profile"] == "standard"
     assert sec["min_severity"] == "medium"

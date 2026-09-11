@@ -287,6 +287,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   have it: an OpenAI job refused in `tick.log` for a signed-out Codex had no
   place in the terminal that said so.
 
+### Removed
+
+- **The per-project and per-block `claude_config_dir`.** The account a run signs
+  in as is the platform's — the install's pin — and Settings › Platforms shows
+  whom it is signed in as. A `projects.json` still carrying the field is warned
+  about by `status` and `install`, and cleaned by the next save.
+
 ### Changed
 
 - **claude-cron is now agentloop.** The scheduler runs more than one agent from

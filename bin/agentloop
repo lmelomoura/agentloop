@@ -77,6 +77,17 @@ legacy_scripts_warnings() { # one line per personal script under config/ still r
     done
 }
 
+legacy_config_dir_warning() { # one line per project or security block still naming an account: the field is ignored since this version
+  [ -f "$PROJECTS_FILE" ] || return 0
+  "$JQ" -r '
+    .projects[]? | select(type == "object")
+    | (.claude_config_dir // "") as $a | (((.security | objects) // {}).claude_config_dir // "") as $b
+    | select($a != "" or $b != "") | .name' "$PROJECTS_FILE" 2>/dev/null \
+  | while IFS= read -r n; do
+      printf "WARNING: projects.json: claude_config_dir on %s is ignored since this version — the account is the platform's, see Settings\n" "$n"
+    done
+}
+
 CONFIG_DIR="${AGENTLOOP_CONFIG:-$BASE_DIR/config}"
 DATA_DIR="${AGENTLOOP_DATA:-$BASE_DIR/data}"
 JOBS_FILE="$CONFIG_DIR/jobs.json"
@@ -138,9 +149,10 @@ OPENCODE_BIN="${AGENTLOOP_OPENCODE_BIN:-$_opencode_default}"
 # settings, plugins, MCP servers and past sessions per config directory — one
 # signed-in account each — so this variable is the only thing that chooses
 # between two accounts on the same Mac. Set here it is the default for
-# everything, model probes included; a project may pin its own (see
-# `claude_config_dir` in projects.json). Empty leaves the CLI's own default
-# (~/.claude), which is what this tool used before the setting existed.
+# everything, model probes included -- a project or a security block has no
+# pin of its own any more; the Anthropic card in Settings shows whom it is
+# signed in as. Empty leaves the CLI's own default (~/.claude), which is
+# what this tool used before the setting existed.
 #
 # Taken ONLY from the explicit variable — an ambient CLAUDE_CONFIG_DIR is
 # deliberately not a fallback. cmd_install already refuses it, and the runtime
@@ -392,7 +404,6 @@ security_derived_jobs() {
       --arg effort "$seffort" \
       --arg budget "$budget" \
       --arg daily "$daily" \
-      --arg cfgdir "$(security_get "$project" '.claude_config_dir' '')" \
       --arg perm "$perm" \
       --arg notools "$SECURITY_DISALLOWED_TOOLS" \
       '{id:$id, project:$project, prompt:$prompt, model:$model, platform:$platform,
@@ -406,7 +417,7 @@ security_derived_jobs() {
        # drop the job rather than the field. Collect first, then decide.
        + ([$budget | tonumber?] | if length == 0 then {} else {max_budget_usd: .[0]} end)
        + ([$daily  | tonumber?] | if length == 0 then {} else {daily_budget_usd: .[0]} end)
-       + (if $cfgdir == "" then {} else {claude_config_dir:$cfgdir} end)' 2>/dev/null)" || elem=""
+       ' 2>/dev/null)" || elem=""
     [ -n "$elem" ] || continue
     [ $first -eq 1 ] || printf ','
     first=0
@@ -8838,42 +8849,40 @@ JSON
     && ok "a success-close of an analysis whose deterministic phases never ran lands capped, and says so" \
     || bad "engine close of an unprepared analysis -> $secnoprep (want capped,true)"
 
-  echo "claude_config_dir — an analysis signs in as the account its security block names"
-  # The derived job is the ONLY place an analysis can carry a config dir: there
-  # is no jobs.json row to edit, so security_derived_jobs puts the security
-  # block's value on the job it builds. run_job read only the PROJECT's, so the
-  # setting was inert -- an operator who pointed the analysis at a different
-  # Claude account (a client login for client code) got no error and no effect,
-  # and the analysis quietly signed in as the project's account instead.
+  echo "claude_config_dir — no longer a project's or a block's to set: ignored, and said"
   local ccd="$tmp/ccd" ccdjid ccdbody
   mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/proj-account" "$ccd/sec-account"
   cat > "$ccd/cfg/projects.json" <<JSON
 {"projects":[{"name":"Ccd App","cwd":"$ccd","claude_config_dir":"$ccd/proj-account",
-              "security":{"enabled":true,"claude_config_dir":"$ccd/sec-account"}}]}
+              "security":{"enabled":true,"model":"claude-opus-5","claude_config_dir":"$ccd/sec-account"}}]}
 JSON
   cat > "$ccd/cfg/jobs.json" <<JSON
 {"jobs":[{"id":"ccd-plain","project":"Ccd App","prompt":"x","enabled":false}]}
 JSON
+  printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]}}}\n' > "$ccd/cfg/platforms.json"
   ccd_env() {
-    PROJECTS_FILE="$ccd/cfg/projects.json"; JOBS_FILE="$ccd/cfg/jobs.json"
+    PROJECTS_FILE="$ccd/cfg/projects.json"; JOBS_FILE="$ccd/cfg/jobs.json"; PLATFORMS_FILE="$ccd/cfg/platforms.json"
     DATA_DIR="$ccd/data"
   }
   ccdjid="$(security_job_id "Ccd App")"
-  [ "$( ( ccd_env; resolve "$ccdjid" claude_config_dir '' ) )" = "$ccd/sec-account" ] \
-    && ok "the derived job resolves the config dir its security block names" \
-    || bad "derived cfgdir -> '$( ( ccd_env; resolve "$ccdjid" claude_config_dir '' ) )' (want $ccd/sec-account)"
-  [ "$( ( ccd_env; resolve ccd-plain claude_config_dir '' ) )" = "$ccd/proj-account" ] \
-    && ok "and a plain job of the same project still inherits the project's" \
-    || bad "plain cfgdir -> '$( ( ccd_env; resolve ccd-plain claude_config_dir '' ) )' (want $ccd/proj-account)"
-  # Structural, because the two assertions above exercise `resolve` and run_job
-  # is what has to CALL it: reverting that one line would leave both green.
+  [ -z "$( ( ccd_env; job_get "$ccdjid" '.claude_config_dir' '' ) )" ] \
+    && ok "the derived security job no longer carries the block's claude_config_dir" \
+    || bad "derived job carries '$( ( ccd_env; job_get "$ccdjid" '.claude_config_dir' '' ) )'"
   ccdbody="$(sed -n '/^run_job() { # run_job <id>/,/^}/p' "$BIN_DIR/agentloop")"
   case "$ccdbody" in
-    *'run_cfgdir="$(resolve "$id" claude_config_dir'*)
-      ok "run_job reads the config dir through resolve, so the job's own value wins" ;;
-    *)
-      bad "run_job no longer resolves claude_config_dir through resolve() — a derived job's value is inert again" ;;
+    *'resolve "$id" claude_config_dir'*) bad "run_job still resolves claude_config_dir from the job or the project" ;;
+    *) ok "run_job no longer reads a per-project account: the install's pin is the only one" ;;
   esac
+  got="$( ( ccd_env; legacy_config_dir_warning ) )"
+  case "$got" in
+    *"WARNING: projects.json: claude_config_dir on Ccd App is ignored since this version — the account is the platform's, see Settings"*)
+      ok "status and install warn about a projects.json that still carries the field" ;;
+    *) bad "warning: '$got'" ;;
+  esac
+  got="$( printf '{"name":"Ccd App","claude_config_dir":"/x","security":{"enabled":true,"claude_config_dir":"/y"}}' | ( ccd_env; cmd_project_set ) 2>&1 )"
+  case "$got" in *"note: claude_config_dir is ignored since this version"*) ok "project-set drops the field and says so" ;; *) bad "project-set: $got" ;; esac
+  "$JQ" -e '.projects[0] | (has("claude_config_dir") | not) and ((.security | has("claude_config_dir")) | not)' "$ccd/cfg/projects.json" >/dev/null 2>&1 \
+    && ok "and the saved project carries the field at neither level" || bad "saved: $("$JQ" -c '.projects[0]' "$ccd/cfg/projects.json")"
 
   # The close used to overwrite the row unconditionally, which turned the one
   # honest thing an agent can say about its own run -- "I ran out of room" --
@@ -9438,29 +9447,12 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   local platform
   platform="$(resolve "$id" platform 'anthropic')"
   case "$platform" in ''|null) platform="anthropic" ;; esac
-  # Which account this run signs in as. A project pins one when its work belongs
-  # to a different Claude login than the scheduler's default — a company account
-  # for client work, a personal one for your own repos. It carries far more than
-  # billing: the config dir holds that account's settings, plugins, MCP servers
-  # AND its past sessions, so it must stay stable for a job or `--resume` below
-  # would go looking for the session in the other account's directory.
-  #
-  # THE JOB'S OWN VALUE FIRST, through the same `resolve` every other inherited
-  # field uses. Only the PROJECT's was read, which made the security block's
-  # `claude_config_dir` inert: `security_derived_jobs` puts it on the derived
-  # job (the job is the only place a derived analysis has to carry it — there
-  # is no jobs.json row to edit), and run_job then read straight past it and
-  # signed the analysis in as the project's account. An operator who set it
-  # precisely so the analysis would sign in as somebody else got no error and
-  # no effect.
-  #
-  # Nothing changes for a real job: `claude_config_dir` is not a field one can
-  # have. It is absent from config/jobs.example.json, it is not in
-  # `cmd_set_field`'s allowlist, and the dashboard's job editor never writes it
-  # — only the project editor and the project's security block do.
-  run_cfgdir="$(resolve "$id" claude_config_dir '')"
-  case "$run_cfgdir" in null) run_cfgdir="" ;; esac
-  run_cfgdir="$(expand_home "$run_cfgdir")"
+  # Which account this run signs in as: the install's pin, exported as
+  # CLAUDE_CONFIG_DIR at load time, and nothing else -- a project's or a
+  # security block's own claude_config_dir was removed in this version; the
+  # account is the platform's, shown in Settings. Empty here: the two readers
+  # below (the precheck's env, run_env) then leave the exported variable alone.
+  run_cfgdir=""
   # cwd, model, permission, budget and timeout inherit from the project when the
   # job doesn't set them (see resolve()).
   cwd="$(resolve "$id" cwd "$HOME")"
@@ -9519,11 +9511,6 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   [ -d "$cwd" ] || { log_tick "$id: cwd missing ($cwd), skipped"; return 1; }
   local _inert; _inert="$(permission_inert_warning "$platform" "$permission" "$allowed")"
   [ -z "$_inert" ] || log_tick "$id: $_inert"
-  # Refuse rather than let the CLI create the directory and find no credentials
-  # in it: that spends a launch to fail at the login prompt, and every later run
-  # would fail the same way with nothing saying why.
-  [ -z "$run_cfgdir" ] || [ -d "$run_cfgdir" ] || {
-    log_tick "$id: claude_config_dir missing ($run_cfgdir), skipped"; return 1; }
 
   # A run that cannot start is refused HERE, before a slot, a precheck or a
   # turn is spent, with the reason in tick.log -- the treatment `cwd missing`
@@ -10979,6 +10966,7 @@ PLIST
   legacy_env_warnings
   legacy_scripts_warnings
   statusline_path_warning
+  legacy_config_dir_warning
 }
 
 cmd_uninstall() {
@@ -11081,6 +11069,7 @@ cmd_status() {
   legacy_env_warnings
   legacy_scripts_warnings
   statusline_path_warning
+  legacy_config_dir_warning
 }
 
 cmd_dashboard() {
@@ -11647,9 +11636,15 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
     platform_model_enabled "$eff_sp" "$sm" \
       || die "project-set: security.model '$sm' is not enabled in Settings — $eff_sp enables: $(platform_models_enabled_line "$eff_sp")"
   fi
+  # The account is the platform's now (see Settings): a claude_config_dir sent
+  # at either level is dropped from the partial AND from the stored project, and said.
+  if echo "$partial" | "$JQ" -e '((.claude_config_dir // "") != "") or ((((.security | objects) // {}).claude_config_dir // "") != "")' >/dev/null 2>&1; then
+    echo "note: claude_config_dir is ignored since this version — the account is the platform's, see Settings"
+  fi
+  partial="$(echo "$partial" | "$JQ" -c 'del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end')"
   if projects_json | "$JQ" -e --arg n "$name" 'any(.projects[]; .name==$n)' >/dev/null 2>&1; then
     write_projects --arg n "$name" --argjson p "$partial" \
-      '.projects = [.projects[] | if .name==$n then (. * $p) else . end]'
+      '.projects = [.projects[] | if .name==$n then ((. * $p) | del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end) else . end]'
   else
     write_projects --argjson p "$partial" '.projects += [$p]'
   fi
