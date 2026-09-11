@@ -3443,6 +3443,43 @@ def test_the_binary_field_saves_on_blur_not_on_a_repaints_change(srv):
         "the source must explain why: Chrome fires \"change\" on an input the repaint removes"
 
 
+def test_the_platform_card_shows_the_engines_own_note(srv):
+    """The spec's promise: a refusal from the engine appears in the card, in
+    the engine's own words, and switching a platform or a model off shows
+    what the command answers (the enabled jobs it leaves skipped). change()
+    keeps that per platform in live.notes; platformCard paints it right
+    after the header row. A refused set-bin must not lose what was typed,
+    and a throw mid-repaint must not leave the Binary field unable to save."""
+    src = (REPO / "ui" / "app" / "settings.js").read_text()
+    assert "live.notes[" in src, "change() must keep the engine's note per platform"
+    assert '"platnote' in src, "platformCard must paint the note with the platnote class"
+    fn = _plainfn(_app_js(srv), "binaryBlock")
+    assert "live.typedBin" in fn, \
+        "a refused set-bin must keep the typed path in the field, not snap back to entry.bin"
+    fn = _plainfn(_app_js(srv), "paint")
+    assert "finally" in fn, \
+        "repainting must be cleared in a finally -- a throw mid-rebuild must not leave it stuck true"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_note_from_output_keeps_only_the_lines_after_the_first(srv, tmp_path):
+    """platform_affected_note's sentences (the enabled jobs a disable or a
+    model switch-off leaves skipped) are every line the engine prints after
+    its own first line -- joined by a space for the card; nothing when
+    there is only the one line."""
+    js = _app_js(srv)
+    script = tmp_path / "note-from-output.js"
+    script.write_text(_plainfn(js, "noteFromOutput") + """
+    console.log(JSON.stringify({
+      skipped: noteFromOutput("openai disabled\\n1 enabled job (u2) runs on openai and will be skipped until it is enabled again"),
+      plain: noteFromOutput("openai enabled"),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["skipped"] == "1 enabled job (u2) runs on openai and will be skipped until it is enabled again"
+    assert out["plain"] == ""
+
+
 # Settings › Platforms (Task 9): the editors offer only what Settings switched
 # on, the strip Overview and Jobs carry while nothing is configured, New job
 # diverted to Settings, the sidebar dot, and the landing after the profile.

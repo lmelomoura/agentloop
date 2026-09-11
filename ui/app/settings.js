@@ -20,7 +20,7 @@ export const REGISTRY = [
   {id: "opencode", name: "OpenCode", cli: "opencode", sub: "opencode run — arrives with the next release", mark: "OC"},
 ];
 
-const live = {checks: {}, checkedAt: {}, catalogs: {}, busy: {}};
+const live = {checks: {}, checkedAt: {}, catalogs: {}, busy: {}, notes: {}, typedBin: {}};
 let ctx = null;   // {platforms, configured, error, onChange}
 let probed = false;   // the three live checks have been fired once, on the first paint with a real payload
 // True while paint() tears #st-platforms down and rebuilds it. The Binary
@@ -33,8 +33,24 @@ async function post(op, extra){
     headers: {"Content-Type": "text/plain", "X-AL-Token": TOKEN},
     body: JSON.stringify(Object.assign({op}, extra))});
   const j = await r.json().catch(() => ({}));
-  if(!r.ok || j.ok === false){ toast(j.output || j.error || ("HTTP " + r.status), true); return null; }
+  if(!r.ok || j.ok === false){
+    const output = j.output || j.error || ("HTTP " + r.status);
+    toast(output, true);
+    // {ok:false, output}, not null: change() reads the engine's own refusal
+    // sentence back out of this for the card note. The other two callers
+    // (runCheck, loadCatalog) only ever act on j.check/j.catalog off a
+    // successful call, so a falsy `ok` still reads as failure for them.
+    return {ok: false, output};
+  }
   return j;
+}
+
+// The `platform_affected_note` sentences (the enabled jobs a disable or a
+// model switch-off leaves skipped) arrive as extra lines after the op's own
+// first line -- pulled out on its own so change() and a node test both
+// reach the same extraction.
+export function noteFromOutput(output){
+  return (output || "").split("\n").slice(1).join(" ");
 }
 
 export function settingsSummary(platforms){
@@ -120,9 +136,22 @@ async function change(op, extra){
   live.busy[extra.platform] = true; paint();
   try{
     const j = await post(op, extra);
-    if(j && j.output) toast(j.output.split("\n")[0], false, "check");
+    if(j && j.ok){
+      toast(j.output.split("\n")[0], false, "check");
+      // The spec's promise: switching a platform or a model off shows what
+      // the command answers. Any lines after the first are
+      // platform_affected_note's sentences -- cleared by a later successful
+      // change that carries none of its own.
+      const note = noteFromOutput(j.output);
+      if(note) live.notes[extra.platform] = {text: note, err: false};
+      else delete live.notes[extra.platform];
+    } else if(j){
+      // Refused -- post() already toasted j.output. The card keeps that same
+      // sentence, in the engine's own words, until the next successful change.
+      live.notes[extra.platform] = {text: j.output, err: true};
+    }
     if(ctx && ctx.onChange) await ctx.onChange();   // the page re-reads /api/models and repaints this page
-    return j;   // truthy on success, null on a refused or failed call
+    return (j && j.ok) ? j : null;   // truthy on success, null on a refused or failed call
   } finally {
     live.busy[extra.platform] = false;
     paint();
@@ -144,7 +173,12 @@ function binaryBlock(r, entry, check){
     : (live.busy[r.id] ? "checking…" : "— not checked");
   box.appendChild(sub);
   const ctrl = el("div", "ctrl");
-  const inp = el("input"); inp.type = "text"; inp.value = entry.bin || ""; inp.placeholder = "Use another binary… (leave empty to detect)";
+  const inp = el("input"); inp.type = "text";
+  // A refused save keeps what was typed on screen (live.typedBin) instead of
+  // snapping back to the last saved entry.bin -- a bad path should not have
+  // to be retyped from scratch.
+  inp.value = live.typedBin[r.id] !== undefined ? live.typedBin[r.id] : (entry.bin || "");
+  inp.placeholder = "Use another binary… (leave empty to detect)";
   inp.disabled = !!live.busy[r.id] || entry.supported === false;
   // Save on blur (and Enter, which just blurs) instead of "change": a
   // repaint can land while the operator is mid-typing (the three open-page
@@ -161,8 +195,10 @@ function binaryBlock(r, entry, check){
     if(repainting || !inp.isConnected) return;
     const v = inp.value.trim();
     if(v === (entry.bin || "")) return;
+    live.typedBin[r.id] = v;   // shown back on a refusal -- see the input's value above
     const ok = await change("platform_set_bin", {platform: r.id, bin: v});
     if(!ok) return;
+    delete live.typedBin[r.id];
     delete live.checks[r.id]; delete live.catalogs[r.id];   // the old check named the old binary
     await runCheck(r.id);
   };
@@ -176,6 +212,7 @@ function binaryBlock(r, entry, check){
   ctrl.appendChild(button("Detect", "radar", async () => {
     const ok = await change("platform_set_bin", {platform: r.id, bin: ""});
     if(!ok) return;
+    delete live.typedBin[r.id];
     delete live.checks[r.id]; delete live.catalogs[r.id];
     await runCheck(r.id);
   }, live.busy[r.id] || entry.supported === false));
@@ -290,6 +327,16 @@ function platformCard(r, entry, check, catalog){
   sw.appendChild(el("span", null, entry.supported === false ? "runs on OpenCode are not supported yet"
     : (n ? n + " enabled job" + (n === 1 ? "" : "s") + " run" + (n === 1 ? "s" : "") + " here" : (entry.enabled ? "jobs may pick this platform" : "unlocks when the session test passes"))));
   right.appendChild(sw); h.appendChild(right); card.appendChild(h);
+  // The engine's own answer, in its own words: a refusal (red, alert icon)
+  // or -- a switch-off's sentence about the enabled jobs it leaves skipped --
+  // a plain note (check icon). See change() for how live.notes is kept.
+  const note = live.notes[r.id];
+  if(note){
+    const nd = el("div", "platnote" + (note.err ? " err" : ""));
+    nd.appendChild(icon(note.err ? "alert" : "check"));
+    nd.appendChild(document.createTextNode(note.text));
+    card.appendChild(nd);
+  }
   const g = el("div", "platcard-g"); g.appendChild(binaryBlock(r, entry, check)); g.appendChild(sessionBlock(r, entry, check)); card.appendChild(g);
   card.appendChild(modelsSection(r, entry, check, catalog));
   return card;
@@ -319,13 +366,19 @@ function paint(){
     if(card) savedFocus = {cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd};
   }
   repainting = true;   // see binaryBlock: an input torn out below must not save on the blur this causes
-  host.textContent = "";
-  if(ctx.error){
-    const b = setupBanner(false, ctx.error, false); if(b) host.appendChild(b);
+  try{
+    host.textContent = "";
+    if(ctx.error){
+      const b = setupBanner(false, ctx.error, false); if(b) host.appendChild(b);
+    }
+    host.appendChild(el("div", "summary", settingsSummary(ctx.platforms)));
+    REGISTRY.forEach(r => host.appendChild(platformCard(r, (ctx.platforms || {})[r.id] || {}, live.checks[r.id] || null, live.catalogs[r.id] || null)));
+  } finally {
+    // A throw mid-rebuild (a bad payload, a bug in one card) must not leave
+    // this stuck true -- that would silently disable the Binary field's
+    // save for every card, not just the one that failed to draw.
+    repainting = false;
   }
-  host.appendChild(el("div", "summary", settingsSummary(ctx.platforms)));
-  REGISTRY.forEach(r => host.appendChild(platformCard(r, (ctx.platforms || {})[r.id] || {}, live.checks[r.id] || null, live.catalogs[r.id] || null)));
-  repainting = false;
   if(savedFocus){
     const card = $(savedFocus.cardId);
     const inp = card && card.querySelector(".ctrl input");

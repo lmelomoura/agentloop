@@ -2415,7 +2415,7 @@
     { id: "openai", name: "OpenAI", cli: "codex", sub: "Codex CLI \u2014 codex exec --json", mark: "O" },
     { id: "opencode", name: "OpenCode", cli: "opencode", sub: "opencode run \u2014 arrives with the next release", mark: "OC" }
   ];
-  var live = { checks: {}, checkedAt: {}, catalogs: {}, busy: {} };
+  var live = { checks: {}, checkedAt: {}, catalogs: {}, busy: {}, notes: {}, typedBin: {} };
   var ctx = null;
   var probed = false;
   var repainting = false;
@@ -2427,10 +2427,14 @@
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.ok === false) {
-      toast(j.output || j.error || "HTTP " + r.status, true);
-      return null;
+      const output = j.output || j.error || "HTTP " + r.status;
+      toast(output, true);
+      return { ok: false, output };
     }
     return j;
+  }
+  function noteFromOutput(output) {
+    return (output || "").split("\n").slice(1).join(" ");
   }
   function settingsSummary(platforms) {
     const entries = REGISTRY.map((r) => (platforms || {})[r.id] || {});
@@ -2516,9 +2520,16 @@
     paint();
     try {
       const j = await post(op, extra);
-      if (j && j.output) toast(j.output.split("\n")[0], false, "check");
+      if (j && j.ok) {
+        toast(j.output.split("\n")[0], false, "check");
+        const note = noteFromOutput(j.output);
+        if (note) live.notes[extra.platform] = { text: note, err: false };
+        else delete live.notes[extra.platform];
+      } else if (j) {
+        live.notes[extra.platform] = { text: j.output, err: true };
+      }
       if (ctx && ctx.onChange) await ctx.onChange();
-      return j;
+      return j && j.ok ? j : null;
     } finally {
       live.busy[extra.platform] = false;
       paint();
@@ -2543,15 +2554,17 @@
     const ctrl = el("div", "ctrl");
     const inp = el("input");
     inp.type = "text";
-    inp.value = entry.bin || "";
+    inp.value = live.typedBin[r.id] !== void 0 ? live.typedBin[r.id] : entry.bin || "";
     inp.placeholder = "Use another binary\u2026 (leave empty to detect)";
     inp.disabled = !!live.busy[r.id] || entry.supported === false;
     const saveBin = async () => {
       if (repainting || !inp.isConnected) return;
       const v = inp.value.trim();
       if (v === (entry.bin || "")) return;
+      live.typedBin[r.id] = v;
       const ok = await change("platform_set_bin", { platform: r.id, bin: v });
       if (!ok) return;
+      delete live.typedBin[r.id];
       delete live.checks[r.id];
       delete live.catalogs[r.id];
       await runCheck(r.id);
@@ -2566,6 +2579,7 @@
     ctrl.appendChild(button("Detect", "radar", async () => {
       const ok = await change("platform_set_bin", { platform: r.id, bin: "" });
       if (!ok) return;
+      delete live.typedBin[r.id];
       delete live.checks[r.id];
       delete live.catalogs[r.id];
       await runCheck(r.id);
@@ -2687,6 +2701,13 @@
     right.appendChild(sw);
     h.appendChild(right);
     card.appendChild(h);
+    const note = live.notes[r.id];
+    if (note) {
+      const nd = el("div", "platnote" + (note.err ? " err" : ""));
+      nd.appendChild(icon(note.err ? "alert" : "check"));
+      nd.appendChild(document.createTextNode(note.text));
+      card.appendChild(nd);
+    }
     const g = el("div", "platcard-g");
     g.appendChild(binaryBlock(r, entry, check));
     g.appendChild(sessionBlock(r, entry, check));
@@ -2711,14 +2732,17 @@
       if (card) savedFocus = { cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd };
     }
     repainting = true;
-    host.textContent = "";
-    if (ctx.error) {
-      const b = setupBanner(false, ctx.error, false);
-      if (b) host.appendChild(b);
+    try {
+      host.textContent = "";
+      if (ctx.error) {
+        const b = setupBanner(false, ctx.error, false);
+        if (b) host.appendChild(b);
+      }
+      host.appendChild(el("div", "summary", settingsSummary(ctx.platforms)));
+      REGISTRY.forEach((r) => host.appendChild(platformCard(r, (ctx.platforms || {})[r.id] || {}, live.checks[r.id] || null, live.catalogs[r.id] || null)));
+    } finally {
+      repainting = false;
     }
-    host.appendChild(el("div", "summary", settingsSummary(ctx.platforms)));
-    REGISTRY.forEach((r) => host.appendChild(platformCard(r, (ctx.platforms || {})[r.id] || {}, live.checks[r.id] || null, live.catalogs[r.id] || null)));
-    repainting = false;
     if (savedFocus) {
       const card = $(savedFocus.cardId);
       const inp = card && card.querySelector(".ctrl input");
@@ -2969,5 +2993,5 @@
     setupBanner
   };
 })();
-/* ui-bundle: cb493255820d703db53d9b2aba601c78b38017909f3946950135c772fb81b4c3 */
-/* ui-sources: 6995955f9f455bebd1e5dfb019589327c5c8d5a3b9e49e321eddc659d103db80 */
+/* ui-bundle: bb0d9e7d45d8d25c65247f77f43b1be5dff53faf8758024af5e79a5fce76e809 */
+/* ui-sources: 3ebd1e2fc558a713b6d0b32e1196a324043a5c697ff124cd7e24375ba91e1a27 */

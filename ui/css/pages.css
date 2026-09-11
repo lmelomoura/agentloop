@@ -2291,6 +2291,7 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 .platcard-r{display:flex;align-items:center;gap:14px;flex:none}
 .swlabel{display:flex;flex-direction:column;align-items:flex-end;gap:3px;font-size:11.5px;color:var(--muted);text-align:right}
 .swrow{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--ink)}
+.platnote{display:flex;align-items:flex-start;gap:8px;padding:10px 20px;font-size:12.5px;color:var(--muted);border-bottom:1px solid var(--line2)} .platnote .ic{width:14px;height:14px;margin-top:2px;flex:none} .platnote.err{color:var(--err);background:var(--err-soft)}
 .platcard-g{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:0}
 .platcard-g > div{padding:14px 20px 16px}
 .platcard-g > div + div{border-left:1px solid var(--line2)}

@@ -1627,15 +1627,16 @@ the order the steps have to be taken.
   or *Not signed in* with the command to run, and how long ago it was checked.
   All three cards are checked when the page opens; **Test** asks again. Nothing
   from this zone is stored — the engine asks the same question before every run.
-- **Models** — **Load models** (then **Refresh**) reads the platform's catalog:
+- **Models** — the catalog loads on its own once the session test passes:
   on OpenAI that is `codex debug models`, with the price per million tokens
   beside each slug (or *no price*), its effort range and a deprecated slug's
-  successor; on Anthropic it is the ids the installed CLI knows. Every model
-  has a switch, and only the ones switched on reach the job editor. A model in
-  use says how many enabled jobs run on it; one you switched on that a refresh
-  no longer lists stays at the end as *no longer in the catalog* until you
-  switch it off. Until the session test passes the list says so and stays
-  empty.
+  successor; on Anthropic it is the ids the installed CLI knows. **Refresh**
+  reads it again, and **Load models** takes its place when the first load
+  failed. Every model has a switch, and only the ones switched on reach the
+  job editor. A model in use says how many enabled jobs run on it; one you
+  switched on that a refresh no longer lists stays at the end as *no longer
+  in the catalog* until you switch it off. Until the session test passes the
+  list says so and stays empty.
 - **The switch** in the card's header enables the platform. It is locked until
   the session test passes, and switching a platform off never refuses: the
   reply names the enabled jobs that will be skipped until it is on again.
@@ -1660,10 +1661,11 @@ install and git-ignored like your jobs:
 }
 ```
 
-`bin` empty means detection (the CLI on `launchd`'s `PATH`, else its usual
-install path); `AGENTLOOP_CLAUDE_BIN` and `AGENTLOOP_CODEX_BIN` still win over
-both, which is what the tests and a stand-in CLI use. `models` are exact ids,
-in the order they were switched on, and the first one is the platform's
+`bin` empty means detection — for `claude`, `~/.local/bin/claude` first, then
+`launchd`'s `PATH`; for `codex` and `opencode`, the `PATH` first, then the
+usual install path. `AGENTLOOP_CLAUDE_BIN` and `AGENTLOOP_CODEX_BIN` still win
+over both, which is what the tests and a stand-in CLI use. `models` are exact
+ids, in the order they were switched on, and the first one is the platform's
 default — what `create` gives a job with no `model`, and what a `security`
 block with none runs on. The file is written on first use: an install that
 upgrades gets every platform an enabled job or an enabled security block runs
@@ -1679,7 +1681,7 @@ the file, and the engine never writes over it.
 **From the terminal.** Each button on the page is one of these:
 
 ```bash
-agentloop platform check openai            # {ready, bin, bin_found, bin_source, version, account, reason}, live
+agentloop platform check openai            # {platform, supported, ready, bin, bin_found, bin_source, version, account, reason}, live
 agentloop platform enable openai           # runs the check first; refused with the reason while it fails
 agentloop platform disable openai          # never refused; names the enabled jobs that will be skipped
 agentloop platform set-bin openai ~/.local/bin/codex    # must be executable; no path = back to detection

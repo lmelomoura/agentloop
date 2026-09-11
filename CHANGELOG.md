@@ -54,8 +54,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     decision — and answer with the enabled jobs and security blocks that will
     be skipped until it is on again; the page shows the same sentence.
     `enable` refuses while the live check fails, with the reason; a `set-bin`
-    path must be executable and is stored absolute; a catalog refresh that
-    fails keeps the catalog it had and says `stale`.
+    path must be executable — a relative path is stored absolute, `~` is
+    kept; a catalog refresh that fails keeps the catalog it had and says
+    `stale`.
   - `/api/models` carries the registry (`configured`, `error`, and per
     platform `supported`, `enabled`, `usable`, `bin`, `bin_source`,
     `bin_found`, `models_enabled`, `jobs_on_platform`, `jobs_using`) with no
@@ -67,6 +68,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     and `install.sh` ends by saying so when nothing is usable.
   - The Binary field saves what you typed when you leave it, never a
     half-typed path when another card's check repaints the page.
+  - A refusal, and the jobs a switch-off leaves skipped, are shown in the
+    card itself.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and
