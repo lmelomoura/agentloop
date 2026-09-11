@@ -2521,7 +2521,9 @@ function openProjectEditor(name){
   secPlatformCombo.set(sp, ALApp.platformOptions(PLATFORMS, sp));
   const splat=secEffectivePlatform();
   applyPlatformToSecurity(splat, false);
-  secModelCombo.set(sec.model||"");
+  // Same reason as fill()'s modelCombo.set just above: the option list, so a
+  // switched-off model shows flagged the moment the project opens.
+  secModelCombo.set(sec.model||"", modelOptions(splat, sec.model||""));
   if(splat==="openai") secEfforts=ALApp.effortsFor("openai", $("sec-model").value, PLATFORMS);
   effortSet("sec-effort","sec-effort-label", sec.effort||"");
   secPermCombo.set(sec.permission_mode||ALApp.defaultPermissionFor(splat,"security"));
@@ -3405,6 +3407,11 @@ async function loadModels(){
     MODELS_CONFIGURED=d.configured; MODELS_ERROR=d.error||"";
     refillPlatformBound();
     paintSetupBanners();
+    // The sidebar dot must track MODELS_CONFIGURED as soon as it changes, not
+    // wait for the next five-second poll's render() -- DATA already carries
+    // its page-level defaults by the time this can run, but the guard keeps
+    // this safe regardless.
+    if(DATA && DATA.jobs) paintNav();
     if(currentView==="settings") paintSettings();
   }catch(e){ /* keep the built-in fallback lists */ }
 }
@@ -3499,7 +3506,11 @@ function applyPlatformToJobEditor(p, keep){
   edModelCfg.def=ALApp.defaultModelFor(p,PLATFORMS)||(p==="openai"?"":"opus");
   const opts=modelOptions(p, keep ? $("ed-model").value : "");
   const curModel=$("ed-model").value;
-  const known=opts.some(o=>!o.sec && o.v===curModel);
+  // A value the shared rule (ALApp.modelEnabled) says is ON but the grouped
+  // list does not literally carry -- a family value like "opus" -- must still
+  // count as known, or a keep-reapply would silently swap it for the
+  // platform's own default and the combo would show a value nobody chose.
+  const known=opts.some(o=>!o.sec && o.v===curModel) || (!!curModel && ALApp.modelEnabled(p, curModel, PLATFORMS));
   modelCombo.set((keep&&known)?curModel:ALApp.defaultModelFor(p,PLATFORMS), opts);
   const effVal=keep?effortGet("ed-effort"):"";                  // read against the OLD ladder
   edEfforts=ALApp.effortsFor(p, $("ed-model").value, PLATFORMS);
@@ -3548,7 +3559,12 @@ function secEffectivePlatform(){ return $("sec-platform").value || $("pj-platfor
 function applyPlatformToSecurity(p, keep){
   const opts=modelOptions(p, keep ? $("sec-model").value : "");
   const curModel=$("sec-model").value;
-  const keepModel=keep && (!curModel || opts.some(o=>!o.sec && o.v===curModel) || p!=="openai");
+  // The job editor's `known` (applyPlatformToJobEditor, above), applied here
+  // too: a family value the shared rule says is ON but the grouped list does
+  // not literally carry must still be kept -- not just any non-OpenAI value,
+  // which is the blanket allowance this replaces and hid the same gap
+  // fill()/openProjectEditor's own initial set() had.
+  const keepModel=keep && (!curModel || opts.some(o=>!o.sec && o.v===curModel) || (!!curModel && ALApp.modelEnabled(p, curModel, PLATFORMS)));
   // Never a typed-in id, on either platform: the list Settings switched on is
   // the authority, and an id outside it is exactly what the Agent step and
   // the launch refuse.
@@ -3718,7 +3734,10 @@ function fill(j){
   const plat=ALApp.platformOf(j, j.project?projById(j.project):null);
   platformCombo.set(plat, ALApp.platformOptions(PLATFORMS, plat));
   applyPlatformToJobEditor(plat, false);
-  modelCombo.set(j.model||ALApp.defaultModelFor(plat,PLATFORMS));
+  // The full option list, not just a bare id -- opening a job must show a
+  // switched-off model flagged right away, not only after the next
+  // /api/models re-apply (applyPlatformToJobEditor's own `keep` path, below).
+  modelCombo.set(j.model||ALApp.defaultModelFor(plat,PLATFORMS), modelOptions(plat, j.model||""));
   if(plat==="openai") edEfforts=ALApp.effortsFor("openai", $("ed-model").value, PLATFORMS);
   setEffort(j.effort||"");
   $("ed-interactive").checked = (plat!=="openai") && j.interactive===true;
@@ -4592,7 +4611,12 @@ function validateStep(k){
   if(k==="agent"){
     const p=$("ed-platform").value||"anthropic", m=$("ed-model").value;
     const was=editingJob&&editingJob.id ? {p: ALApp.platformOf(editingJob, projById(editingJob.project||"")), m: editingJob.model||""} : null;
-    const changed=creating || !was || p!==was.p || m!==was.m;
+    // A job with no model of its own shows the platform's default on screen
+    // (was.m is ""), so comparing the raw strings read every such job as
+    // "changed" the instant its Agent step opened -- resolve both sides the
+    // same way `eff` below resolves the screen's.
+    const wasModel=was ? (was.m || ALApp.defaultModelFor(was.p, PLATFORMS) || "") : "";
+    const changed=creating || !was || p!==was.p || m!==wasModel;
     const entry=(PLATFORMS||{})[p];
     if(changed && entry && entry.enabled!==undefined){
       if(!entry.usable) return "This platform is not enabled in Settings › Platforms — enable it there, or pick another.";
@@ -5133,11 +5157,14 @@ async function submitSetup(e){
     const j = await r.json().catch(()=>({}));
     if(!r.ok || j.ok === false) return fail(j.error || j.output || ("HTTP " + r.status));
     $("su-pw").value = $("su-pw2").value = "";
+    // enterDashboard's own loadModels() is what this awaits -- see its
+    // comment; a second call here would fire a redundant /api/models GET for
+    // the same answer.
     await enterDashboard(j.user);
     // A fresh install lands on Settings: the profile is the first step and
     // enabling a platform is the second, so the page goes there itself
     // instead of showing an Overview with nothing to do on it.
-    await loadModels(); if(MODELS_CONFIGURED===false) setView("settings");
+    if(MODELS_CONFIGURED===false) setView("settings");
     toast("Profile created", false, "check");
   }catch(ex){
     fail("Could not reach the control server — " + ex.message);
@@ -5152,8 +5179,12 @@ async function enterDashboard(user){
   CFG.sig = null;              // force the config re-read that carries the profile
   applyGates();
   await refresh();
-  loadModels();
+  // Returned, not just fired: a caller that awaits enterDashboard() (submitSetup,
+  // right below) needs MODELS_CONFIGURED settled when it comes back, instead of
+  // firing a second /api/models GET of its own to get the same answer.
+  const modelsLoaded = loadModels();
   startPolling();
+  return modelsLoaded;
 }
 
 function initViews(){

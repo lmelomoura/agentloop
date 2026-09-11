@@ -116,6 +116,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     While nothing is configured, Overview and Jobs carry a strip, New job
     lands on Settings, the sidebar item carries a dot, and a fresh install
     lands on Settings right after the operator profile.
+  - Opening a job whose model was switched off shows it flagged in the Model
+    list, not only after a re-read.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and

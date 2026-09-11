@@ -3450,10 +3450,18 @@ def test_the_agent_step_refuses_what_settings_switched_off(srv, tmp_path):
     """Creating, or changing platform/model: a platform that is not usable or a
     model not switched on is refused with the sentence that says where to fix
     it; editing another field of a job whose model was switched off later is
-    still allowed (the refusal is the launch's)."""
+    still allowed (the refusal is the launch's). A job with no model of its
+    own -- the combo shows the platform's default -- compares against that
+    resolved default, not the empty string was.m literally is, so leaving it
+    untouched is never misread as a change."""
     js = _js(srv)
+    app = _app_js(srv)
+    # The real rule, not a hand copy: modelOptionsFor and the Agent step both
+    # call ALApp.modelEnabled, and a hand-copied stub can silently drift from
+    # what the page actually ships.
+    deps = _plainfn(app, "modelEnabled")
     script = tmp_path / "validate-agent.js"
-    script.write_text("""
+    script.write_text(deps + """
     const vals = {"ed-id": "j", "ed-cwd": "/x", "ed-prompt": "p", "ed-hours-start": "", "ed-hours-end": "",
                   "ed-platform": "openai", "ed-model": "gpt-a"};
     const $ = (id) => ({ get value(){ return vals[id] || ""; } });
@@ -3461,10 +3469,8 @@ def test_the_agent_step_refuses_what_settings_switched_off(srv, tmp_path):
     const DATA = {jobs: []};
     const projById = () => null;
     const ALApp = { platformOf: (j) => (j && j.platform) || "anthropic",
-                    modelEnabled: (p, m, P) => { const e = (P || {})[p === "openai" ? "openai" : "anthropic"];
-                      if(!e || !Array.isArray(e.models_enabled)) return true; if(!m) return true;
-                      if(e.models_enabled.includes(m)) return true;
-                      return /^(opus|sonnet|haiku|fable)$/.test(m) && e.models_enabled.some(id => id.startsWith("claude-" + m + "-")); } };
+                    modelEnabled,
+                    defaultModelFor: (p, P) => ((P||{})[p]||{}).default_model || "" };
     let PLATFORMS = {anthropic: {enabled: true, usable: true, models_enabled: ["claude-opus-5"]},
                      openai: {enabled: true, usable: false, models_enabled: []}};
     let creating = true, editingJob = null;
@@ -3479,6 +3485,12 @@ def test_the_agent_step_refuses_what_settings_switched_off(srv, tmp_path):
     out.unchangedEdit = validateStep("agent");
     vals["ed-model"] = "gpt-zzz";
     out.changedEdit = validateStep("agent");
+    // No model of its own: the combo shows the platform's default (fill's own
+    // fix, this same wave), so leaving it there is unchanged, not a switch
+    // away from the empty string was.m literally is.
+    PLATFORMS.openai = {enabled: true, usable: true, models_enabled: ["gpt-b"], default_model: "gpt-b"};
+    editingJob = {id: "j", platform: "openai", model: ""}; vals["ed-model"] = "gpt-b";
+    out.unchangedNoModel = validateStep("agent");
     PLATFORMS = {};
     out.blind = validateStep("agent");
     console.log(JSON.stringify(out));
@@ -3488,6 +3500,21 @@ def test_the_agent_step_refuses_what_settings_switched_off(srv, tmp_path):
     assert out["modelOff"] == "This model is switched off in Settings › Platforms — switch it on there, or pick another."
     assert out["ok"] is None and out["unchangedEdit"] is None and out["blind"] is None
     assert out["changedEdit"].startswith("This model is switched off")
+    assert out["unchangedNoModel"] is None, \
+        "an unset model must compare against the resolved default, not against the literal empty string"
+
+
+def test_opening_a_job_or_project_shows_a_switched_off_model_flagged(srv):
+    """fill() and openProjectEditor() used to hand the model combo a bare id
+    with no option list, so an existing job or project security block whose
+    model Settings had since switched off showed the raw id with no flagged
+    row, and the help text under it contradicted what was on screen -- only
+    the NEXT re-apply (applyPlatformToJobEditor/applyPlatformToSecurity's own
+    `keep` path, which does pass the option list) caught up. Opening must show
+    the truth immediately, the same as a re-apply does."""
+    js = _js(srv)
+    assert 'modelCombo.set(j.model||ALApp.defaultModelFor(plat,PLATFORMS), modelOptions(plat, j.model||""));' in js
+    assert 'secModelCombo.set(sec.model||"", modelOptions(splat, sec.model||""));' in js
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
