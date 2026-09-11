@@ -42,6 +42,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `enabled:true, models:[]` and refuse every run it used to allow. The
     seed now resolves each job's *effective* model (its own where valid,
     else the platform's default) before recording it.
+  - `platform_check` now answers binary, version, session and account
+    live for a platform (`claude auth status --json`, `codex login
+    status`), and `platform_bin` resolves the CLI's path through the new
+    three-tier precedence — an `AGENTLOOP_*_BIN` environment override,
+    else the file's own `bin`, else the detected default — with a missing
+    binary naming the path, the Settings field and the install command.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and

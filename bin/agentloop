@@ -116,14 +116,24 @@ LEGACY_CLI_NAME="claude-cron"
 SERVER_BIN="$BIN_DIR/agentloop-server"
 PORT="${AGENTLOOP_PORT:-8787}"
 
-CLAUDE_BIN="${AGENTLOOP_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+# Where each CLI is, before config/platforms.json has a say: the AGENTLOOP_*_BIN
+# variable (tests, stand-ins, a second install), else detection. platform_bin
+# below puts the file's own `bin` between the two.
+if [ -x "$HOME/.local/bin/claude" ]; then _claude_default="$HOME/.local/bin/claude"
+else _claude_default="$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")"; fi
+CLAUDE_BIN="${AGENTLOOP_CLAUDE_BIN:-$_claude_default}"
 # The Codex CLI, for runs on the openai platform. On PATH from Homebrew
-# (/opt/homebrew/bin, which the launchd plists already carry); override for a
-# test stand-in or a second install. Its account and its rollouts live under
-# CODEX_HOME (the CLI's own variable, honoured as-is: `--help` says auth still
-# uses it); platform_finish reads the rollout from there after every run.
+# (/opt/homebrew/bin, which the launchd plists already carry). Its account and
+# its rollouts live under CODEX_HOME (the CLI's own variable, honoured as-is:
+# `--help` says auth still uses it); platform_finish reads the rollout from
+# there after every run.
 CODEX_BIN="${AGENTLOOP_CODEX_BIN:-$(command -v codex 2>/dev/null || echo /opt/homebrew/bin/codex)}"
 CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+# OpenCode: listed and detected, never launched in this release (PLATFORMS_PLANNED).
+if command -v opencode >/dev/null 2>&1; then _opencode_default="$(command -v opencode)"
+elif [ -x "$HOME/.opencode/bin/opencode" ]; then _opencode_default="$HOME/.opencode/bin/opencode"
+else _opencode_default="/opt/homebrew/bin/opencode"; fi
+OPENCODE_BIN="${AGENTLOOP_OPENCODE_BIN:-$_opencode_default}"
 # Which Claude account every run signs in as. Claude Code keeps credentials,
 # settings, plugins, MCP servers and past sessions per config directory — one
 # signed-in account each — so this variable is the only thing that chooses
@@ -1366,26 +1376,87 @@ platform_jobs_on() { # platform_jobs_on <platform> [model] -> one line per enabl
     'uses[] | select(.p == $p) | select($m == "" or .m == $m or .m == resolved($m)) | .who' -r --arg p "$1" --arg m "${2:-}"
 }
 
-platform_bin() { # platform_bin <platform> -> the CLI's path
-  case "$1" in anthropic) printf '%s' "$CLAUDE_BIN" ;; openai) printf '%s' "$CODEX_BIN" ;; esac
+platform_cli_name() { case "$1" in anthropic) printf 'claude' ;; openai) printf 'codex' ;; opencode) printf 'opencode' ;; esac; }
+platform_install_hint() {
+  case "$1" in
+    anthropic) printf 'npm i -g @anthropic-ai/claude-code' ;;
+    openai)    printf 'npm i -g @openai/codex, then codex login' ;;
+    opencode)  printf 'brew install opencode' ;;
+  esac
+}
+platform_bin_env() { # the AGENTLOOP_*_BIN override for a platform, or nothing
+  case "$1" in
+    anthropic) printf '%s' "${AGENTLOOP_CLAUDE_BIN:-}" ;;
+    openai)    printf '%s' "${AGENTLOOP_CODEX_BIN:-}" ;;
+    opencode)  printf '%s' "${AGENTLOOP_OPENCODE_BIN:-}" ;;
+  esac
+}
+platform_bin_source() { # env | file | auto -- which layer platform_bin's answer came from
+  if [ -n "$(platform_bin_env "$1")" ]; then printf 'env'
+  elif [ -n "$(platforms_field "$1" bin)" ]; then printf 'file'
+  else printf 'auto'; fi
+}
+platform_bin() { # platform_bin <platform> -> the CLI's path: the environment override, else config/platforms.json's bin, else the detected default
+  local v
+  v="$(platform_bin_env "$1")"
+  if [ -n "$v" ]; then printf '%s' "$v"; return; fi
+  v="$(platforms_field "$1" bin)"
+  if [ -n "$v" ]; then expand_home "$v"; return; fi
+  case "$1" in anthropic) printf '%s' "$CLAUDE_BIN" ;; openai) printf '%s' "$CODEX_BIN" ;; opencode) printf '%s' "$OPENCODE_BIN" ;; esac
 }
 
-platform_ready() { # platform_ready <platform> -> 0; or 1 with the reason on stdout
-  local bin; bin="$(platform_bin "$1")"
-  case "$1" in
-    anthropic)
-      [ -x "$bin" ] || { printf 'claude not found at %s (set AGENTLOOP_CLAUDE_BIN)' "$bin"; return 1; } ;;
-    openai)
-      [ -x "$bin" ] || { printf 'codex not found at %s (set AGENTLOOP_CODEX_BIN)' "$bin"; return 1; }
-      # Any non-zero is "not signed in". The CLI's exit code when it is not was
-      # left unmeasured on purpose (measuring it meant logging the working
-      # account out); a 0 without a login fails on the first turn as api_error,
-      # which is an honest line in tick.log either way.
-      "$bin" login status >/dev/null 2>&1 \
-        || { printf 'codex is not signed in (run: codex login)'; return 1; } ;;
-    *) printf 'unknown platform %s' "$1"; return 1 ;;
-  esac
-  return 0
+# The live check behind every readiness answer: is the binary there, which
+# version, is there a session, as whom. Never stored -- it costs 0.04-0.14 s
+# (`codex login status`, `claude auth status --json`, `--version`), so the
+# Settings page, `status` and every launch simply ask again.
+platform_check() { # platform_check <platform> -> one JSON object; always exits 0
+  local p="$1" bin src found=false ver="" acct="" reason="" ready=false supported=true
+  if ! platform_listed "$p"; then
+    "$JQ" -nc --arg p "$p" '{platform:$p, supported:false, ready:false, bin:"", bin_found:false, bin_source:"", version:"", account:"", reason:("unknown platform " + $p)}'
+    return 0
+  fi
+  platform_planned "$p" && supported=false
+  bin="$(platform_bin "$p")"; src="$(platform_bin_source "$p")"
+  if [ -x "$bin" ]; then found=true; ver="$("$bin" --version 2>/dev/null | head -1)"; fi
+  if [ "$found" = false ]; then
+    reason="$(platform_cli_name "$p") not found at $bin — set the path in Settings (or AGENTLOOP_$(platform_cli_name "$p" | tr '[:lower:]' '[:upper:]')_BIN); install: $(platform_install_hint "$p")"
+  elif [ "$supported" = false ]; then
+    reason="runs on OpenCode arrive with the OpenCode engine"
+  else
+    case "$p" in
+      anthropic)
+        local out cfgdir rc; cfgdir="$(installed_config_dir)"
+        if [ -n "$cfgdir" ]; then out="$(CLAUDE_CONFIG_DIR="$cfgdir" "$bin" auth status --json 2>/dev/null)"; rc=$?
+        else out="$("$bin" auth status --json 2>/dev/null)"; rc=$?; fi
+        if [ "$rc" -eq 0 ] && printf '%s' "$out" | "$JQ" -e '.loggedIn == true' >/dev/null 2>&1; then
+          ready=true
+          acct="$(printf '%s' "$out" | "$JQ" -r '[(.email // ""), ((.subscriptionType // "") | if . == "" then "" else . + " plan" end)] | map(select(. != "")) | join(" · ")' 2>/dev/null)"
+          [ -n "$acct" ] || acct="signed in"
+        else
+          case "$out" in
+            *loggedIn*)
+              if [ -n "$cfgdir" ]; then reason="claude is not signed in in $cfgdir (run: CLAUDE_CONFIG_DIR=$cfgdir claude auth login)"
+              else reason="claude is not signed in (run: claude auth login)"; fi ;;
+            *) # no `auth status` on this CLI (pre-2.1): the binary counts as ready, as it always did
+               ready=true; acct="unknown — claude auth status needs Claude Code 2.1+" ;;
+          esac
+        fi ;;
+      openai)
+        local line
+        if line="$("$bin" login status 2>&1)"; then ready=true; acct="$(printf '%s\n' "$line" | head -1)"
+        else reason="codex is not signed in (run: codex login)"; fi ;;
+    esac
+  fi
+  "$JQ" -nc --arg p "$p" --argjson supported "$supported" --argjson ready "$ready" --arg bin "$bin" \
+    --argjson found "$found" --arg src "$src" --arg ver "$ver" --arg acct "$acct" --arg reason "$reason" \
+    '{platform:$p, supported:$supported, ready:$ready, bin:$bin, bin_found:$found, bin_source:$src, version:$ver, account:$acct, reason:$reason}'
+}
+
+platform_ready() { # platform_ready <platform> -> 0; or 1 with the reason on stdout (platform_check decides)
+  local j; j="$(platform_check "$1")"
+  [ "$(printf '%s' "$j" | "$JQ" -r '.ready')" = "true" ] && return 0
+  printf '%s' "$(printf '%s' "$j" | "$JQ" -r '.reason')"
+  return 1
 }
 
 platform_caps() { # platform_caps <platform> <capability> -> 0 when the platform HAS it
@@ -1671,14 +1742,14 @@ resolve_models_openai() { # refresh config/models.json's `openai` block from `co
     echo "models.json was not valid JSON — reseeded"
     echo '{"resolved":{}}' > "$MODELS_FILE"
   fi
-  if [ ! -x "$CODEX_BIN" ]; then
+  if [ ! -x "$(platform_bin openai)" ]; then
     block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"codex not installed"}')"
   else
     source="codex debug models"
-    raw="$("$CODEX_BIN" debug models 2>/dev/null)"
+    raw="$("$(platform_bin openai)" debug models 2>/dev/null)"
     if ! printf '%s' "$raw" | "$JQ" -e '.models | type == "array"' >/dev/null 2>&1; then
       source="bundled"
-      raw="$("$CODEX_BIN" debug models --bundled 2>/dev/null)"
+      raw="$("$(platform_bin openai)" debug models --bundled 2>/dev/null)"
     fi
     if ! printf '%s' "$raw" | "$JQ" -e '.models | type == "array"' >/dev/null 2>&1; then
       block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"codex debug models returned no catalog"}')"
@@ -1709,7 +1780,7 @@ resolve_models_openai() { # refresh config/models.json's `openai` block from `co
 
 openai_catalog_ensure() { # resolve once, synchronously, when the block is missing and codex exists (0 s measured)
   openai_catalog_available && return 0
-  [ -x "$CODEX_BIN" ] || return 1
+  [ -x "$(platform_bin openai)" ] || return 1
   resolve_models_openai >/dev/null 2>&1
   openai_catalog_available
 }
@@ -2830,7 +2901,7 @@ global_daily_cap() { # -> dollars, or empty for "no cap"
 
 model_probe_ok() { # model_probe_ok <id> -> 0 when the API accepts it
   local out
-  out="$("$CLAUDE_BIN" -p --output-format json --model "$1" "ok" 2>&1)" || return 1
+  out="$("$(platform_bin anthropic)" -p --output-format json --model "$1" "ok" 2>&1)" || return 1
   printf '%s' "$out" | "$JQ" -e '
     (.is_error != true) and (((.result // "") | test("issue with the selected model"; "i")) | not)
   ' >/dev/null 2>&1
@@ -2839,7 +2910,7 @@ model_probe_ok() { # model_probe_ok <id> -> 0 when the API accepts it
 model_alias_baseline() { # what the CLI's own alias points at (no API call)
   # The init event is selected, not assumed first: with any hook configured
   # the CLI emits hook_started/hook_response system events ahead of it.
-  "$CLAUDE_BIN" -p --output-format stream-json --verbose --model "$1" "hi" 2>/dev/null \
+  "$(platform_bin anthropic)" -p --output-format stream-json --verbose --model "$1" "hi" 2>/dev/null \
     | "$JQ" -r 'select(.type=="system" and .subtype=="init") | .model // empty' 2>/dev/null \
     | head -1
 }
@@ -3322,6 +3393,52 @@ JSON
   ( pf_env; write_platforms '.platforms.openai.enabled = false' ) >/dev/null 2>&1; want "a good filter writes" 0 $?
   ( pf_env; platform_enabled openai ); want "and the write is read back" 1 $?
 
+  echo "platform_bin() / platform_check() — where the CLI is, and whether it is signed in"
+  local pb="$tmp/pb"; mkdir -p "$pb/bin"
+  printf '#!/bin/sh\necho "codex-cli 9.9.9"\n' > "$pb/bin/codex"; chmod +x "$pb/bin/codex"
+  printf '{"platforms":{"openai":{"enabled":true,"bin":"%s","models":[]}}}\n' "$pb/bin/codex" > "$pb/platforms.json"
+  type platform_check >/dev/null 2>&1 && ok "platform_check is defined" || bad "platform_check does not exist"
+  [ "$( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=/env/codex; platform_bin openai )" = "/env/codex" ] \
+    && ok "platform_bin: the environment override wins" || bad "env: $( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=/env/codex; platform_bin openai )"
+  [ "$( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=""; platform_bin openai )" = "$pb/bin/codex" ] \
+    && ok "platform_bin: then the file's bin" || bad "file: $( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=""; platform_bin openai )"
+  [ "$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; CODEX_BIN=/detected/codex; platform_bin openai )" = "/detected/codex" ] \
+    && ok "platform_bin: then the detected default" || bad "auto: $( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; CODEX_BIN=/detected/codex; platform_bin openai )"
+  [ "$( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=""; platform_bin_source openai )" = "file" ] \
+    && [ "$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; platform_bin_source openai )" = "auto" ] \
+    && [ "$( AGENTLOOP_CODEX_BIN=/env/codex; platform_bin_source openai )" = "env" ] \
+    && ok "platform_bin_source names the layer that answered" || bad "bin_source"
+  _pc="$( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=""; platform_check openai )"
+  printf '%s' "$_pc" | "$JQ" -e --arg b "$pb/bin/codex" \
+    '.platform == "openai" and .supported == true and .ready == true and .bin == $b and .bin_found == true and .bin_source == "file" and .version == "codex-cli 9.9.9"' >/dev/null 2>&1 \
+    && ok "platform_check openai: found, version read, signed in through the stand-in" || bad "check openai: $_pc"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; CODEX_BIN="$BASE_DIR/test/fake-codex"; FAKE_CODEX_LOGGED_OUT=1 platform_check openai )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .reason' | tr '\n' '|')" = "false|codex is not signed in (run: codex login)|" ] \
+    && ok "platform_check openai: signed out, with today's sentence" || bad "signed out: $_pc"
+  [ "$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; CODEX_BIN=/nonexistent; platform_ready openai )" = "codex not found at /nonexistent — set the path in Settings (or AGENTLOOP_CODEX_BIN); install: npm i -g @openai/codex, then codex login" ] \
+    && ok "platform_ready: a missing binary names the path, the setting and the install command" || bad "not found: $( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; CODEX_BIN=/nonexistent; platform_ready openai )"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CLAUDE_BIN=""; CLAUDE_BIN="$BASE_DIR/test/fake-claude"; AGENTLOOP_CLAUDE_CONFIG_DIR=""; PLIST_PATH=/nonexistent; platform_check anthropic )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .account, .version' | tr '\n' '|')" = "true|fake@example.org · max plan|2.1.258 (Claude Code)|" ] \
+    && ok "platform_check anthropic: the account and plan come from claude auth status" || bad "check anthropic: $_pc"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CLAUDE_BIN=""; CLAUDE_BIN="$BASE_DIR/test/fake-claude"; AGENTLOOP_CLAUDE_CONFIG_DIR=""; PLIST_PATH=/nonexistent; FAKE_CLAUDE_LOGGED_OUT=1 platform_check anthropic )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .reason' | tr '\n' '|')" = "false|claude is not signed in (run: claude auth login)|" ] \
+    && ok "platform_check anthropic: signed out says how to sign in" || bad "anthropic signed out: $_pc"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CLAUDE_BIN=""; CLAUDE_BIN="$BASE_DIR/test/fake-claude"; AGENTLOOP_CLAUDE_CONFIG_DIR=/pinned/home; PLIST_PATH=/nonexistent; FAKE_CLAUDE_LOGGED_OUT=1 platform_check anthropic )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.reason')" = "claude is not signed in in /pinned/home (run: CLAUDE_CONFIG_DIR=/pinned/home claude auth login)" ] \
+    && ok "and names the pinned account directory when there is one" || bad "pinned signed out: $_pc"
+  printf '#!/bin/sh\necho "2.0.0 (Claude Code)"\n' > "$pb/bin/oldclaude"; chmod +x "$pb/bin/oldclaude"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CLAUDE_BIN=""; CLAUDE_BIN="$pb/bin/oldclaude"; AGENTLOOP_CLAUDE_CONFIG_DIR=""; PLIST_PATH=/nonexistent; platform_check anthropic )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .account' | tr '\n' '|')" = "true|unknown — claude auth status needs Claude Code 2.1+|" ] \
+    && ok "a CLI without \`auth status\` counts as ready, and says the account is unknown" || bad "old cli: $_pc"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN=""; OPENCODE_BIN=/nonexistent; platform_check opencode )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.supported, .ready, .bin_found, .reason' | tr '\n' '|')" = "false|false|false|opencode not found at /nonexistent — set the path in Settings (or AGENTLOOP_OPENCODE_BIN); install: brew install opencode|" ] \
+    && ok "platform_check opencode: planned, and not found says how to install it" || bad "opencode missing: $_pc"
+  printf '#!/bin/sh\necho "1.18.30"\n' > "$pb/bin/opencode"; chmod +x "$pb/bin/opencode"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN=""; OPENCODE_BIN="$pb/bin/opencode"; platform_check opencode )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .bin_found, .version, .reason' | tr '\n' '|')" = "false|true|1.18.30|runs on OpenCode arrive with the OpenCode engine|" ] \
+    && ok "platform_check opencode: found and versioned, still not ready, with the reason" || bad "opencode found: $_pc"
+  [ "$(platform_check martian | "$JQ" -r .reason)" = "unknown platform martian" ] && ok "an unlisted platform is answered, never a crash" || bad "unlisted"
+
   # The catalog readers, over a models.json of this test's own.
   mkdir -p "$tmp/cat"
   "$JQ" -n '{resolved:{}, openai:{at:1, source:"fixture", models:[
@@ -3675,7 +3792,7 @@ JSON
       || bad "signed-out line: $(printf '%s\n' "$_b" | tail -1)"
     CODEX_BIN=/nonexistent
     _b="$(status_platforms_block)"
-    printf '%s\n' "$_b" | grep -q '^openai    : codex not found at /nonexistent (set AGENTLOOP_CODEX_BIN)$' \
+    printf '%s\n' "$_b" | grep -q '^openai    : codex not found at /nonexistent — set the path in Settings (or AGENTLOOP_CODEX_BIN); install: npm i -g @openai/codex, then codex login$' \
       && ok "status_platforms_block: no codex reads as not found, never a crash" \
       || bad "no-codex line: $(printf '%s\n' "$_b" | tail -1)"
     echo "RESULT ok=$_upass bad=$_ufail"
