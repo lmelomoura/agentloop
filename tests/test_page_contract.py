@@ -784,10 +784,14 @@ def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
     deps = "\n".join(_plainfn(page, n) for n in
                      ("applyPlatformToSecurity", "secEffectivePlatform", "effortSet", "effortGet",
                       "ladderOf", "modelOptions"))
+    # modelEnabled and DISABLED_SUFFIX: modelOptionsFor reads both for the
+    # `current` value the pane now hands it on a re-apply (Task 9), so a model
+    # Settings switched off is shown flagged instead of silently dropped.
     vocab = "\n".join(_plainfn(app, n) for n in
                       ("effortsFor", "effortIndex", "effortFromIndex", "permissionsFor",
-                       "defaultPermissionFor", "defaultModelFor", "modelOptionsFor")) \
-        + "\n" + _const(app, "FALLBACK_EFFORTS") + _const(app, "FALLBACK_PERMISSIONS")
+                       "defaultPermissionFor", "defaultModelFor", "modelEnabled", "modelOptionsFor")) \
+        + "\n" + _const(app, "FALLBACK_EFFORTS") + _const(app, "FALLBACK_PERMISSIONS") \
+        + _const(app, "DISABLED_SUFFIX")
     script = tmp_path / "sec-platform.js"
     script.write_text(vocab + """
     const ALApp = {effortsFor, effortIndex, effortFromIndex, permissionsFor, defaultPermissionFor,
@@ -826,7 +830,10 @@ def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
     assert "GPT-5.5 · no price" in k["labels"] and k["perms"] == ["read-only", "workspace-write", "full-access"]
     assert "falls back to the platform's default" in k["help"]
     r = out["afterReset"]
-    assert r == {"model": "", "max": "5", "eff": "0", "perm": "bypassPermissions", "custom": True,
+    # custom is False on BOTH platforms now (Task 9): the list Settings
+    # switched on is the authority, so there is no typed-in id on Anthropic
+    # either -- the stub above starts it True to prove the apply turns it off.
+    assert r == {"model": "", "max": "5", "eff": "0", "perm": "bypassPermissions", "custom": False,
                  "none": "— Default (opus) —", "secPlatApplied": "anthropic"}, \
         "the pane records the platform it was built for on its way out"
 
@@ -3411,6 +3418,76 @@ def test_the_settings_module_speaks_the_six_actions(srv):
         "the Open Settings button must be found by class"
     assert 'id = "open-settings"' not in src and 'id="open-settings"' not in src, \
         "the button must carry no id -- a later task mounts this banner on two views at once"
+
+
+# Settings › Platforms (Task 9): the editors offer only what Settings switched
+# on, the strip Overview and Jobs carry while nothing is configured, New job
+# diverted to Settings, the sidebar dot, and the landing after the profile.
+def test_the_editors_read_the_platform_list_from_the_registry(srv):
+    js = _js(srv)
+    assert "PLATFORM_OPTS" not in js, "the fixed two-platform list is gone: the registry decides"
+    assert js.count("ALApp.platformOptions(PLATFORMS") >= 7
+    assert "function modelOptions(p, current){ return ALApp.modelOptionsFor(p, PLATFORMS, groupModels, current); }" in js
+    assert "allowCustom:false" in js.split("const secModelCfg=", 1)[1].split("\n", 1)[0], "the enabled list is the authority: no typed-in model"
+    page = srv.render_page("boot-authed")
+    for part in ("ov-setup", "jobs-setup", "ed-model-help"):
+        assert f'id="{part}"' in page, f"missing {part}"
+    assert "Only platforms enabled in Settings › Platforms are offered" in page
+
+
+def test_new_job_is_diverted_to_settings_while_nothing_is_configured(srv):
+    js = _js(srv)
+    for hook in ("#new-job", "#ov-new-job"):
+        assert f'if(e.target.closest("{hook}")){{ if(MODELS_CONFIGURED===false){{ setView("settings");' in js, hook
+    assert 'if(e.target.closest(".open-settings")){ setView("settings"); return; }' in js
+    assert 'MODELS_CONFIGURED===false ? \'<span class="attn" title="No platform is enabled yet"></span>\' : ""' in _plainfn(js, "paintNav")
+    assert 'if(MODELS_CONFIGURED===false) setView("settings");' in _plainfn(js, "submitSetup")
+    assert "paintSetupBanners();" in _plainfn(js, "render")
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_agent_step_refuses_what_settings_switched_off(srv, tmp_path):
+    """Creating, or changing platform/model: a platform that is not usable or a
+    model not switched on is refused with the sentence that says where to fix
+    it; editing another field of a job whose model was switched off later is
+    still allowed (the refusal is the launch's)."""
+    js = _js(srv)
+    script = tmp_path / "validate-agent.js"
+    script.write_text("""
+    const vals = {"ed-id": "j", "ed-cwd": "/x", "ed-prompt": "p", "ed-hours-start": "", "ed-hours-end": "",
+                  "ed-platform": "openai", "ed-model": "gpt-a"};
+    const $ = (id) => ({ get value(){ return vals[id] || ""; } });
+    const getDays = () => [1];
+    const DATA = {jobs: []};
+    const projById = () => null;
+    const ALApp = { platformOf: (j) => (j && j.platform) || "anthropic",
+                    modelEnabled: (p, m, P) => { const e = (P || {})[p === "openai" ? "openai" : "anthropic"];
+                      if(!e || !Array.isArray(e.models_enabled)) return true; if(!m) return true;
+                      if(e.models_enabled.includes(m)) return true;
+                      return /^(opus|sonnet|haiku|fable)$/.test(m) && e.models_enabled.some(id => id.startsWith("claude-" + m + "-")); } };
+    let PLATFORMS = {anthropic: {enabled: true, usable: true, models_enabled: ["claude-opus-5"]},
+                     openai: {enabled: true, usable: false, models_enabled: []}};
+    let creating = true, editingJob = null;
+    """ + _plainfn(js, "validateStep") + """
+    const out = {};
+    out.platformOff = validateStep("agent");
+    PLATFORMS.openai = {enabled: true, usable: true, models_enabled: ["gpt-b"]};
+    out.modelOff = validateStep("agent");
+    vals["ed-model"] = "gpt-b";
+    out.ok = validateStep("agent");
+    creating = false; editingJob = {id: "j", platform: "openai", model: "gpt-a"}; vals["ed-model"] = "gpt-a";
+    out.unchangedEdit = validateStep("agent");
+    vals["ed-model"] = "gpt-zzz";
+    out.changedEdit = validateStep("agent");
+    PLATFORMS = {};
+    out.blind = validateStep("agent");
+    console.log(JSON.stringify(out));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["platformOff"] == "This platform is not enabled in Settings › Platforms — enable it there, or pick another."
+    assert out["modelOff"] == "This model is switched off in Settings › Platforms — switch it on there, or pick another."
+    assert out["ok"] is None and out["unchangedEdit"] is None and out["blind"] is None
+    assert out["changedEdit"].startswith("This model is switched off")
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")

@@ -107,6 +107,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - A toggle no longer writes "on" into the Binary field: the repaint's focus
     guard mistook a switch's own checkbox -- also an `<input>` -- for the
     field being typed into.
+  - The job and project editors offer only what Settings switched on: the
+    Platform and Model combos read the registry (the fixed two-platform list
+    is gone, and the Security pane takes no typed-in model any more), a job's
+    own switched-off value is shown flagged instead of rewritten, and the
+    editor's Agent step refuses a platform not enabled or a model switched
+    off -- when creating or changing it, never when editing another field.
+    While nothing is configured, Overview and Jobs carry a strip, New job
+    lands on Settings, the sidebar item carries a dot, and a fresh install
+    lands on Settings right after the operator profile.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and
