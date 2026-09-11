@@ -117,26 +117,37 @@ export function defaultModelFor(platform, platforms){
   return key === "anthropic" ? "opus" : "";
 }
 
-// The model combo's option list for one platform. Anthropic keeps the
-// family/generation grouping the page already draws (groupFn is the page's
-// groupModels); OpenAI is flat, in the catalog's own order, each slug with
-// its description, a deprecated slug at the end pointing at its successor,
-// and " · no price" on a slug config/pricing.json does not price.
-export function modelOptionsFor(platform, platforms, groupFn){
+// The model combo's option list for one platform, filtered by what Settings
+// switched on (`models_enabled`; a payload without it filters nothing).
+// Anthropic keeps the family/generation grouping the page already draws
+// (groupFn is the page's groupModels); OpenAI is flat, in the catalog's own
+// order, each slug with its description, a deprecated slug at the end
+// pointing at its successor, and " · no price" on a slug config/pricing.json
+// does not price. `current` -- the job's own value -- joins the end, flagged,
+// when it is no longer on the list: the editor shows the truth, never rewrites.
+export function modelOptionsFor(platform, platforms, groupFn, current){
   const key = platform === "openai" ? "openai" : "anthropic";
   const p = (platforms || {})[key];
+  const enabledList = (p && Array.isArray(p.models_enabled)) ? p.models_enabled : null;
+  const keep = (v) => !enabledList || enabledList.includes(v);
+  let opts;
   if(key === "anthropic"){
-    const ids = (p && Array.isArray(p.models)) ? p.models : [];
-    return groupFn ? groupFn(ids) : ids.map(v => ({v, label: v}));
+    const ids = ((p && Array.isArray(p.models)) ? p.models : []).filter(keep);
+    opts = groupFn ? groupFn(ids) : ids.map(v => ({v, label: v}));
+  }else{
+    const list = ((p && Array.isArray(p.models)) ? p.models : []).filter(m => keep(m.v));
+    const noPrice = (m) => m.priced === false ? " · no price" : "";
+    const live = list.filter(m => !m.deprecated_by).map(m => ({
+      v: m.v, label: (m.label || m.v) + (m.desc ? " — " + m.desc : "") + noPrice(m)}));
+    const old = list.filter(m => m.deprecated_by).map(m => ({
+      v: m.v, label: (m.label || m.v) + " — → " + m.deprecated_by
+        + (m.retires_at ? ", retires " + String(m.retires_at).slice(0, 10) : "") + noPrice(m)}));
+    opts = live.concat(old);
   }
-  const list = (p && Array.isArray(p.models)) ? p.models : [];
-  const noPrice = (m) => m.priced === false ? " · no price" : "";
-  const live = list.filter(m => !m.deprecated_by).map(m => ({
-    v: m.v, label: (m.label || m.v) + (m.desc ? " — " + m.desc : "") + noPrice(m)}));
-  const old = list.filter(m => m.deprecated_by).map(m => ({
-    v: m.v, label: (m.label || m.v) + " — → " + m.deprecated_by
-      + (m.retires_at ? ", retires " + String(m.retires_at).slice(0, 10) : "") + noPrice(m)}));
-  return live.concat(old);
+  if(current && !opts.some(o => !o.sec && o.v === current)){
+    opts.push({v: current, label: current + " (disabled in Settings)", flagged: true});
+  }
+  return opts;
 }
 
 // A job's effective platform, the engine's way: resolve() hands back the
@@ -153,6 +164,39 @@ export function platformOf(job, project){
 }
 
 export function platformLabel(p){ return p === "openai" ? "OpenAI" : "Anthropic"; }
+
+export const PLATFORM_LABELS = {anthropic: "Anthropic", openai: "OpenAI", opencode: "OpenCode"};
+
+// Whether /api/models has told this page what Settings switched on: the
+// registry rides on every platform entry as `enabled`. A payload without it
+// (or none yet) leaves every editor as it was before Settings existed.
+export function registryKnown(platforms){
+  const a = platforms && platforms.anthropic;
+  return !!(a && a.enabled !== undefined);
+}
+
+// The Platform combo's options: the platforms switched on in Settings (both,
+// until the registry arrives), plus the job's current one flagged when it is
+// not among them -- the editor never rewrites a job on its own.
+export function platformOptions(platforms, current){
+  const known = ["anthropic", "openai"];
+  const have = registryKnown(platforms);
+  const out = known.filter(p => !have || ((platforms[p] || {}).usable === true))
+                   .map(p => ({v: p, label: PLATFORM_LABELS[p]}));
+  if(current && !out.some(o => o.v === current)){
+    out.push({v: current, label: (PLATFORM_LABELS[current] || current) + " (disabled in Settings)", flagged: true});
+  }
+  return out;
+}
+
+// How many models the catalog carries that Settings keeps off the list.
+export function hiddenModelCount(platform, platforms){
+  const key = platform === "openai" ? "openai" : "anthropic";
+  const p = (platforms || {})[key];
+  if(!p || !Array.isArray(p.models_enabled) || !Array.isArray(p.models)) return 0;
+  const ids = p.models.map(m => typeof m === "string" ? m : m.v);
+  return ids.filter(v => !p.models_enabled.includes(v)).length;
+}
 
 // The "on" day buttons' own dataset.day strings (already read off the DOM by
 // getDays, bin/dashboard.html) -> the numbers a job's active_days is stored

@@ -235,6 +235,168 @@
     return foot;
   }
 
+  // ui/app/editor-domain.js
+  function changedKeys(now, clean) {
+    return Object.keys(now).filter((k) => now[k] !== clean[k]);
+  }
+  var FALLBACK_EFFORTS = ["", "low", "medium", "high", "xhigh", "max"];
+  var EFFORTS = FALLBACK_EFFORTS;
+  function effortsFor(platform, model, platforms) {
+    const p = (platforms || {})[platform || "anthropic"];
+    if (!p) return FALLBACK_EFFORTS.slice();
+    let levels = null;
+    if ((platform || "anthropic") === "openai" && model) {
+      const m = (p.models || []).find((x) => x && x.v === model);
+      if (m && Array.isArray(m.efforts) && m.efforts.length) levels = m.efforts;
+    }
+    if (!levels && Array.isArray(p.efforts) && p.efforts.length) levels = p.efforts;
+    if (!levels) return [""];
+    return [""].concat(levels.filter((l) => typeof l === "string" && l));
+  }
+  function effortIndex(v, list) {
+    return Math.max(0, (list || FALLBACK_EFFORTS).indexOf(v || ""));
+  }
+  function effortFromIndex(raw, list) {
+    return (list || FALLBACK_EFFORTS)[+raw || 0] || "";
+  }
+  var FALLBACK_PERMISSIONS = {
+    anthropic: [
+      { v: "acceptEdits", label: "acceptEdits \u2014 edits allowed, commands ask" },
+      { v: "auto", label: "auto \u2014 the CLI decides per tool" },
+      { v: "bypassPermissions", label: "bypassPermissions \u2014 nothing asks" },
+      { v: "manual", label: "manual \u2014 everything asks (headless: everything denied)" },
+      { v: "dontAsk", label: "dontAsk \u2014 allowlisted tools only, no prompts" },
+      { v: "plan", label: "plan \u2014 read-only planning" }
+    ],
+    openai: [
+      { v: "read-only", label: "read-only \u2014 sandbox: no writes, no network" },
+      { v: "workspace-write", label: "workspace-write \u2014 sandbox: writes inside the workspace" },
+      { v: "full-access", label: "full-access \u2014 no sandbox, no approvals" }
+    ]
+  };
+  function permissionsFor(platform, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    const list = p && Array.isArray(p.permissions) && p.permissions.length ? p.permissions : FALLBACK_PERMISSIONS[key];
+    return list.map((o) => ({ v: o.v, label: o.label || o.v }));
+  }
+  function defaultPermissionFor(platform, kind) {
+    if (platform === "openai") return kind === "security" ? "full-access" : "workspace-write";
+    return "bypassPermissions";
+  }
+  function defaultModelFor(platform, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    if (p && p.default_model) return p.default_model;
+    return key === "anthropic" ? "opus" : "";
+  }
+  function modelOptionsFor(platform, platforms, groupFn, current) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    const enabledList = p && Array.isArray(p.models_enabled) ? p.models_enabled : null;
+    const keep = (v) => !enabledList || enabledList.includes(v);
+    let opts;
+    if (key === "anthropic") {
+      const ids = (p && Array.isArray(p.models) ? p.models : []).filter(keep);
+      opts = groupFn ? groupFn(ids) : ids.map((v) => ({ v, label: v }));
+    } else {
+      const list = (p && Array.isArray(p.models) ? p.models : []).filter((m) => keep(m.v));
+      const noPrice = (m) => m.priced === false ? " \xB7 no price" : "";
+      const live = list.filter((m) => !m.deprecated_by).map((m) => ({
+        v: m.v,
+        label: (m.label || m.v) + (m.desc ? " \u2014 " + m.desc : "") + noPrice(m)
+      }));
+      const old = list.filter((m) => m.deprecated_by).map((m) => ({
+        v: m.v,
+        label: (m.label || m.v) + " \u2014 \u2192 " + m.deprecated_by + (m.retires_at ? ", retires " + String(m.retires_at).slice(0, 10) : "") + noPrice(m)
+      }));
+      opts = live.concat(old);
+    }
+    if (current && !opts.some((o) => !o.sec && o.v === current)) {
+      opts.push({ v: current, label: current + " (disabled in Settings)", flagged: true });
+    }
+    return opts;
+  }
+  function platformOf(job, project) {
+    const own = job && job.platform;
+    if (own) return own === "openai" ? "openai" : "anthropic";
+    const pp = project && project.platform;
+    if (pp === "anthropic" || pp === "openai") return pp;
+    return "anthropic";
+  }
+  function platformLabel(p) {
+    return p === "openai" ? "OpenAI" : "Anthropic";
+  }
+  var PLATFORM_LABELS = { anthropic: "Anthropic", openai: "OpenAI", opencode: "OpenCode" };
+  function registryKnown(platforms) {
+    const a = platforms && platforms.anthropic;
+    return !!(a && a.enabled !== void 0);
+  }
+  function platformOptions(platforms, current) {
+    const known = ["anthropic", "openai"];
+    const have = registryKnown(platforms);
+    const out = known.filter((p) => !have || (platforms[p] || {}).usable === true).map((p) => ({ v: p, label: PLATFORM_LABELS[p] }));
+    if (current && !out.some((o) => o.v === current)) {
+      out.push({ v: current, label: (PLATFORM_LABELS[current] || current) + " (disabled in Settings)", flagged: true });
+    }
+    return out;
+  }
+  function hiddenModelCount(platform, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    if (!p || !Array.isArray(p.models_enabled) || !Array.isArray(p.models)) return 0;
+    const ids = p.models.map((m) => typeof m === "string" ? m : m.v);
+    return ids.filter((v) => !p.models_enabled.includes(v)).length;
+  }
+  function dayNumbers(rawValues) {
+    return rawValues.map((v) => +v);
+  }
+  function shapeRepoRows(rawRows) {
+    return rawRows.map((r) => ({ name: r.name.trim(), path: r.path.trim(), base: r.base.trim() })).filter((r) => r.name && r.path);
+  }
+  function projectStepError(k, values) {
+    if (k === "project") {
+      const n = values.name;
+      if (!n) return { ok: false, message: "A project name is required." };
+      if (!values.editingProject && values.projects.some((p) => p.name === n))
+        return { ok: false, message: "A project with that name already exists." };
+      if (!values.cwd)
+        return { ok: false, message: "Pick a working directory \u2014 the folder its runs work in." };
+    }
+    if (k === "repos" && values.multi) {
+      const rows = values.repos;
+      if (!rows.length)
+        return { ok: false, message: "Add a repository, or go back to a single repository." };
+      if (!rows.some((r) => r.path === values.cwd))
+        return { ok: false, message: "One repo's path must be exactly the working directory from step 1 \u2014 that is the repo the agent starts in. None of these match it." };
+    }
+    return { ok: true };
+  }
+  function costParts(r, fmt) {
+    const basis = r && r.cost_basis || "reported";
+    if (basis === "none") return {
+      text: "\u2014",
+      cls: "cost-none",
+      tip: "No cost recorded: the model has no price in config/pricing.json, or the run ended without a final event"
+    };
+    if (basis === "estimated") return {
+      text: "~" + fmt(r && r.cost || 0),
+      cls: "cost-est",
+      tip: "Estimated from the run's tokens with config/pricing.json \u2014 the Codex CLI reports tokens, not dollars"
+    };
+    return { text: fmt(r && r.cost || 0), cls: "", tip: "" };
+  }
+  function tokensText(t) {
+    if (!t || typeof t !== "object") return "\u2014";
+    const n = (v) => Number(v || 0).toLocaleString("en-US");
+    const extra = [];
+    if (t.cached) extra.push(n(t.cached) + " cached");
+    if (t.cache_write) extra.push(n(t.cache_write) + " cache write");
+    let s = n(t.input) + " in" + (extra.length ? " (" + extra.join(", ") + ")" : "") + " \xB7 " + n(t.output) + " out";
+    if (t.reasoning) s += " (" + n(t.reasoning) + " reasoning)";
+    return s;
+  }
+
   // ui/app/jobs-domain.js
   var jobFilters = { project: "", status: "", query: "" };
   function inWindow(j, when) {
@@ -374,138 +536,24 @@
     none.sort((a, b) => String(a.j.id).localeCompare(String(b.j.id)));
     return have.concat(none);
   }
-
-  // ui/app/editor-domain.js
-  function changedKeys(now, clean) {
-    return Object.keys(now).filter((k) => now[k] !== clean[k]);
+  function platformState(j, project, platforms) {
+    if (j && j.platform === "opencode") return "planned";
+    const p = platformOf(j, project);
+    const entry = (platforms || {})[p];
+    if (!entry || entry.enabled === void 0) return "ok";
+    if (!entry.usable) return "platform_disabled";
+    const model = eff(j, "model", "") || entry.default_model || "";
+    const enabled = entry.models_enabled || [];
+    const famOk = /^(opus|sonnet|haiku|fable)$/.test(model) && enabled.some((id) => id.startsWith("claude-" + model + "-"));
+    if (model && !enabled.includes(model) && !famOk) return "model_disabled";
+    return "ok";
   }
-  var FALLBACK_EFFORTS = ["", "low", "medium", "high", "xhigh", "max"];
-  var EFFORTS = FALLBACK_EFFORTS;
-  function effortsFor(platform, model, platforms) {
-    const p = (platforms || {})[platform || "anthropic"];
-    if (!p) return FALLBACK_EFFORTS.slice();
-    let levels = null;
-    if ((platform || "anthropic") === "openai" && model) {
-      const m = (p.models || []).find((x) => x && x.v === model);
-      if (m && Array.isArray(m.efforts) && m.efforts.length) levels = m.efforts;
-    }
-    if (!levels && Array.isArray(p.efforts) && p.efforts.length) levels = p.efforts;
-    if (!levels) return [""];
-    return [""].concat(levels.filter((l) => typeof l === "string" && l));
-  }
-  function effortIndex(v, list) {
-    return Math.max(0, (list || FALLBACK_EFFORTS).indexOf(v || ""));
-  }
-  function effortFromIndex(raw, list) {
-    return (list || FALLBACK_EFFORTS)[+raw || 0] || "";
-  }
-  var FALLBACK_PERMISSIONS = {
-    anthropic: [
-      { v: "acceptEdits", label: "acceptEdits \u2014 edits allowed, commands ask" },
-      { v: "auto", label: "auto \u2014 the CLI decides per tool" },
-      { v: "bypassPermissions", label: "bypassPermissions \u2014 nothing asks" },
-      { v: "manual", label: "manual \u2014 everything asks (headless: everything denied)" },
-      { v: "dontAsk", label: "dontAsk \u2014 allowlisted tools only, no prompts" },
-      { v: "plan", label: "plan \u2014 read-only planning" }
-    ],
-    openai: [
-      { v: "read-only", label: "read-only \u2014 sandbox: no writes, no network" },
-      { v: "workspace-write", label: "workspace-write \u2014 sandbox: writes inside the workspace" },
-      { v: "full-access", label: "full-access \u2014 no sandbox, no approvals" }
-    ]
-  };
-  function permissionsFor(platform, platforms) {
-    const key = platform === "openai" ? "openai" : "anthropic";
-    const p = (platforms || {})[key];
-    const list = p && Array.isArray(p.permissions) && p.permissions.length ? p.permissions : FALLBACK_PERMISSIONS[key];
-    return list.map((o) => ({ v: o.v, label: o.label || o.v }));
-  }
-  function defaultPermissionFor(platform, kind) {
-    if (platform === "openai") return kind === "security" ? "full-access" : "workspace-write";
-    return "bypassPermissions";
-  }
-  function defaultModelFor(platform, platforms) {
-    const key = platform === "openai" ? "openai" : "anthropic";
-    const p = (platforms || {})[key];
-    if (p && p.default_model) return p.default_model;
-    return key === "anthropic" ? "opus" : "";
-  }
-  function modelOptionsFor(platform, platforms, groupFn) {
-    const key = platform === "openai" ? "openai" : "anthropic";
-    const p = (platforms || {})[key];
-    if (key === "anthropic") {
-      const ids = p && Array.isArray(p.models) ? p.models : [];
-      return groupFn ? groupFn(ids) : ids.map((v) => ({ v, label: v }));
-    }
-    const list = p && Array.isArray(p.models) ? p.models : [];
-    const noPrice = (m) => m.priced === false ? " \xB7 no price" : "";
-    const live = list.filter((m) => !m.deprecated_by).map((m) => ({
-      v: m.v,
-      label: (m.label || m.v) + (m.desc ? " \u2014 " + m.desc : "") + noPrice(m)
-    }));
-    const old = list.filter((m) => m.deprecated_by).map((m) => ({
-      v: m.v,
-      label: (m.label || m.v) + " \u2014 \u2192 " + m.deprecated_by + (m.retires_at ? ", retires " + String(m.retires_at).slice(0, 10) : "") + noPrice(m)
-    }));
-    return live.concat(old);
-  }
-  function platformOf(job, project) {
-    const own = job && job.platform;
-    if (own) return own === "openai" ? "openai" : "anthropic";
-    const pp = project && project.platform;
-    if (pp === "anthropic" || pp === "openai") return pp;
-    return "anthropic";
-  }
-  function platformLabel(p) {
-    return p === "openai" ? "OpenAI" : "Anthropic";
-  }
-  function dayNumbers(rawValues) {
-    return rawValues.map((v) => +v);
-  }
-  function shapeRepoRows(rawRows) {
-    return rawRows.map((r) => ({ name: r.name.trim(), path: r.path.trim(), base: r.base.trim() })).filter((r) => r.name && r.path);
-  }
-  function projectStepError(k, values) {
-    if (k === "project") {
-      const n = values.name;
-      if (!n) return { ok: false, message: "A project name is required." };
-      if (!values.editingProject && values.projects.some((p) => p.name === n))
-        return { ok: false, message: "A project with that name already exists." };
-      if (!values.cwd)
-        return { ok: false, message: "Pick a working directory \u2014 the folder its runs work in." };
-    }
-    if (k === "repos" && values.multi) {
-      const rows = values.repos;
-      if (!rows.length)
-        return { ok: false, message: "Add a repository, or go back to a single repository." };
-      if (!rows.some((r) => r.path === values.cwd))
-        return { ok: false, message: "One repo's path must be exactly the working directory from step 1 \u2014 that is the repo the agent starts in. None of these match it." };
-    }
-    return { ok: true };
-  }
-  function costParts(r, fmt) {
-    const basis = r && r.cost_basis || "reported";
-    if (basis === "none") return {
-      text: "\u2014",
-      cls: "cost-none",
-      tip: "No cost recorded: the model has no price in config/pricing.json, or the run ended without a final event"
-    };
-    if (basis === "estimated") return {
-      text: "~" + fmt(r && r.cost || 0),
-      cls: "cost-est",
-      tip: "Estimated from the run's tokens with config/pricing.json \u2014 the Codex CLI reports tokens, not dollars"
-    };
-    return { text: fmt(r && r.cost || 0), cls: "", tip: "" };
-  }
-  function tokensText(t) {
-    if (!t || typeof t !== "object") return "\u2014";
-    const n = (v) => Number(v || 0).toLocaleString("en-US");
-    const extra = [];
-    if (t.cached) extra.push(n(t.cached) + " cached");
-    if (t.cache_write) extra.push(n(t.cache_write) + " cache write");
-    let s = n(t.input) + " in" + (extra.length ? " (" + extra.join(", ") + ")" : "") + " \xB7 " + n(t.output) + " out";
-    if (t.reasoning) s += " (" + n(t.reasoning) + " reasoning)";
-    return s;
+  function platformChip(st) {
+    if (st === "ok") return null;
+    const c = el("span", "pill idle");
+    c.textContent = st === "planned" ? "platform not supported yet" : st === "platform_disabled" ? "platform disabled" : "model disabled";
+    c.title = st === "planned" ? "This platform arrives with a later release \u2014 runs are refused until then" : "Switched off in Settings \u203A Platforms \u2014 runs are refused until it is switched on again, or the job picks another";
+    return c;
   }
 
   // ui/app/overview.js
@@ -804,6 +852,8 @@
     const pill = el("span", "pill " + pillCls, disabled ? "disabled" : idle ? "idle" : "enabled");
     if (idle) pill.title = "Outside its active window \u2014 no runs until the window reopens";
     h2.appendChild(pill);
+    const pchip = platformChip(platformState(j, projById(j.project || ""), AL.PLATFORMS));
+    if (pchip) h2.appendChild(pchip);
     card.appendChild(h2);
     if (disabled && nLive) {
       const w = el("div", "warnline");
@@ -1354,6 +1404,8 @@
       if (F.idle) pill.title = "Outside its active window \u2014 no runs until the window reopens";
       tdState.appendChild(pill);
     }
+    const pchip = platformChip(platformState(j, projById(j.project || ""), AL.PLATFORMS));
+    if (pchip) tdState.appendChild(pchip);
     tr.appendChild(tdState);
     const tdSched = el("td", "nowrap");
     tdSched.appendChild(el("span", "muted", "every"));
@@ -2531,6 +2583,19 @@
     modelOptionsFor,
     platformOf,
     platformLabel,
+    // PLATFORM_LABELS, registryKnown, platformOptions and
+    // hiddenModelCount are Task 7's: the Platform/Model combos'
+    // own read of what Settings switched on, alongside
+    // modelOptionsFor's now-optional fourth argument above.
+    // platformState and platformChip are jobs-domain.js's own
+    // half of the same task -- the verdict jobCard and jobRow
+    // both put on screen as a chip next to the status pill.
+    PLATFORM_LABELS,
+    registryKnown,
+    platformOptions,
+    hiddenModelCount,
+    platformState,
+    platformChip,
     // costParts and tokensText are the same plan's Task 4: what a
     // run's cost cell and Tokens row say, shared by the Runs table
     // (runs.js, by import) and the run dialog's renderLog/costHtml
@@ -2542,5 +2607,5 @@
     projectStepError
   };
 })();
-/* ui-bundle: 6e77393fef21833ad896bc74737735379e2825530936c70a626bb0f1a065ca5b */
-/* ui-sources: 134b851fbcb498cab658c010ab60be13d9f3103555f575a9d140a3c3eccfbfdb */
+/* ui-bundle: f52c89f17203f7e54118d1a7cb15b6d3d0f2a745410472b657b7ca818eec71cc */
+/* ui-sources: d36b1b8d8435b5c102d4f4b53fb65d526cb92dc543f67083c858c12509fed9d1 */

@@ -1493,7 +1493,7 @@ def _jobs_table_deps(block):
               + _const(block, "JOB_COLS") + _const(block, "KPI_ICONS"))
     fns = ("el", "kpiCard", "filterBar", "tableCard", "tableFooter",
            "inWindow", "nextCheckAt", "jobFacts", "visibleJobs", "sortJobs",
-           "bulkOn", "bulkLabel", "jobsEmptyNote",
+           "bulkOn", "bulkLabel", "jobsEmptyNote", "platformOf", "platformState", "platformChip",
            "jobsHeaderSubtitle", "jobsKpis", "mountJobsToolbar",
            "paintJobFilterBar", "jobRow", "renderJobsTable", "renderJobsPage")
     return consts + "\n".join(_plainfn(block, n) for n in fns)
@@ -1534,6 +1534,7 @@ def _jobs_page_harness(deps):
     function fmtWhen(t){ return "when" + t; }
     function fmtIn(t){ return "in" + t; }
     function isFav(_name){ return false; }
+    function projById(_name){ return null; }
     function paintJobPickers(){}
     // Stubbed rather than extracted -- see _jobs_table_deps's own comment on
     // why pageHeader in particular cannot go through _plainfn.
@@ -3144,7 +3145,8 @@ def _job_card_deps(block):
             + _index_screen_deps(block, "fmtDays", "el", "jobFacts",
                                  "nextCheckAt", "inWindow", "probeVerdict",
                                  "nextRunNote", "spendTone", "checkList",
-                                 "sessionNotices", "platformOf", "jobCard"))
+                                 "sessionNotices", "platformOf", "platformState",
+                                 "platformChip", "jobCard"))
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -3173,6 +3175,79 @@ def test_the_job_card_names_the_platform_only_when_it_is_openai(srv, tmp_path):
     assert len(got["anthropic"]) == 1, f"one settings line per card, got {got['anthropic']}"
     assert "Anthropic ·" not in got["anthropic"][0], got["anthropic"]
     assert "opus" in got["anthropic"][0], "the Anthropic card still names its model, bare"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_platform_options_offer_only_what_settings_switched_on(srv, tmp_path):
+    """Until /api/models answers with the registry, both platforms (the page as
+    it was); once it does, only the usable ones -- and the job's current one
+    flagged rather than silently swapped."""
+    js = _app_js(srv)
+    deps = "\n".join(_plainfn(js, n) for n in ("registryKnown", "platformOptions"))
+    script = tmp_path / "platform-options.js"
+    script.write_text("""
+    const PLATFORM_LABELS = {anthropic: "Anthropic", openai: "OpenAI", opencode: "OpenCode"};
+    """ + deps + """
+    const before = platformOptions({}, "anthropic");
+    const p = {anthropic: {enabled: true, usable: true}, openai: {enabled: true, usable: false}};
+    const after = platformOptions(p, "anthropic");
+    const flagged = platformOptions(p, "openai");
+    console.log(JSON.stringify({before, after, flagged}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert [o["v"] for o in out["before"]] == ["anthropic", "openai"]
+    assert [o["v"] for o in out["after"]] == ["anthropic"]
+    assert out["flagged"][-1] == {"v": "openai", "label": "OpenAI (disabled in Settings)", "flagged": True}
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_model_options_are_filtered_by_the_enabled_list_and_flag_the_current(srv, tmp_path):
+    js = _app_js(srv)
+    script = tmp_path / "model-options.js"
+    script.write_text(_plainfn(js, "modelOptionsFor") + """
+    const P = {anthropic: {models: ["claude-opus-5", "claude-sonnet-5"], models_enabled: ["claude-opus-5"]},
+               openai: {models: [{v: "gpt-a", label: "A", desc: "da"}, {v: "gpt-b", label: "B"}], models_enabled: ["gpt-b"]}};
+    const a = modelOptionsFor("anthropic", P, null, "claude-sonnet-5");
+    const o = modelOptionsFor("openai", P, null, "gpt-b");
+    const legacy = modelOptionsFor("anthropic", {anthropic: {models: ["claude-opus-5", "claude-sonnet-5"]}}, null, "");
+    console.log(JSON.stringify({a, o, legacy}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["a"] == [{"v": "claude-opus-5", "label": "claude-opus-5"},
+                        {"v": "claude-sonnet-5", "label": "claude-sonnet-5 (disabled in Settings)", "flagged": True}]
+    assert out["o"] == [{"v": "gpt-b", "label": "B"}]
+    assert [x["v"] for x in out["legacy"]] == ["claude-opus-5", "claude-sonnet-5"], "no models_enabled: nothing is filtered"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_platform_state_names_a_platform_or_model_switched_off(srv, tmp_path):
+    js = _app_js(srv)
+    script = tmp_path / "platform-state.js"
+    script.write_text("\n".join(_plainfn(js, n) for n in ("platformOf", "platformState")) + """
+    function eff(j, f, d){ return (j && j[f] != null && j[f] !== "") ? j[f] : d; }
+    const P = {anthropic: {enabled: true, usable: true, models_enabled: ["claude-opus-5"], default_model: "claude-opus-5"},
+               openai: {enabled: false, usable: false, models_enabled: []}};
+    console.log(JSON.stringify({
+      ok: platformState({model: "claude-opus-5"}, null, P),
+      fam: platformState({model: "opus"}, null, P),
+      model: platformState({model: "claude-sonnet-5"}, null, P),
+      plat: platformState({platform: "openai", model: "gpt-a"}, null, P),
+      planned: platformState({platform: "opencode"}, null, P),
+      blind: platformState({model: "claude-sonnet-5"}, null, {}),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out == {"ok": "ok", "fam": "ok", "model": "model_disabled", "plat": "platform_disabled",
+                   "planned": "planned", "blind": "ok"}
+
+
+def test_the_card_and_the_row_show_the_platform_chip(srv):
+    js = _app_js(srv)
+    assert "platformChip(platformState(j, projById(j.project || \"\"), AL.PLATFORMS))" in _plainfn(js, "jobCard")
+    assert "platformChip(platformState(j, projById(j.project || \"\"), AL.PLATFORMS))" in _plainfn(js, "jobRow")
+    for name in ("platformOptions", "registryKnown", "hiddenModelCount", "platformState", "platformChip", "PLATFORM_LABELS"):
+        assert name in js.split("window.ALApp = {", 1)[1], f"{name} is not on window.ALApp"
+    assert "get PLATFORMS(){ return PLATFORMS; }" in _js(srv)
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")

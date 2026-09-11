@@ -47,11 +47,11 @@
    bin/dashboard.html's one delegated listener rather than a listener built
    here. */
 import { jobFacts, visibleJobs, jobFilters, sortJobs, JOB_COLS,
-         bulkOn, bulkLabel } from "./jobs-domain.js";
+         bulkOn, bulkLabel, platformState, platformChip } from "./jobs-domain.js";
 import { jobsEmptyNote } from "./overview.js";
 import { el, pageHeader, kpiCard, filterBar, tableCard, tableFooter } from "./chrome.js";
 import { $, AL, icon, money, fmtAgo, fmtDur, fmtWhen, fmtIn, isFav,
-         TOKEN, toast, refresh, paintJobPickers, markIfPending } from "./page.js";
+         TOKEN, toast, refresh, paintJobPickers, markIfPending, projById } from "./page.js";
 
 /* ------------------------------------------------------------ the header
    One sentence, built from what is actually configured -- not a static
@@ -276,6 +276,8 @@ function jobRow(j, F){
     if(F.idle) pill.title = "Outside its active window — no runs until the window reopens";
     tdState.appendChild(pill);
   }
+  const pchip = platformChip(platformState(j, projById(j.project || ""), AL.PLATFORMS));
+  if(pchip) tdState.appendChild(pchip);
   tr.appendChild(tdState);
 
   const tdSched = el("td", "nowrap");

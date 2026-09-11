@@ -89,6 +89,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - The page's job counts credit a job with no model, or one invalid on its
     platform, to the platform's default model, as the engine does — instead
     of dropping it or counting it under its own invalid raw id.
+  - The Platform/Model editors and the job card/row now read that registry
+    too: `platformOptions`/`modelOptionsFor` offer only what Settings
+    switched on, flagging the job's own value instead of rewriting it, while
+    `platformState`/`platformChip` put the same verdict on the card and the
+    table row.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and

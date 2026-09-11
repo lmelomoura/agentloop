@@ -7,6 +7,8 @@
    table followed in a later phase -- so it moves whole, here, and the table
    becomes its second consumer later. */
 import { AL, $, eff, backoffMultiplier, activeRunsOf, renderJobs } from "./page.js";
+import { platformOf } from "./editor-domain.js";
+import { el } from "./chrome.js";
 
 /* One object rather than three module-level `let`s. Three bindings can only
    be read across a module boundary by exporting three getters and three
@@ -173,4 +175,31 @@ export function sortJobs(rows, key, dir){
   have.sort((a,b)=>(S.cmp(a,b)*dir) || (S.tie ? S.tie(a,b) : 0));
   none.sort((a,b)=>String(a.j.id).localeCompare(String(b.j.id)));
   return have.concat(none);
+}
+
+// What Settings says about a job's platform and model, for the chip on its
+// card and its row: ok, a planned platform (never runs yet), a platform
+// switched off, a model switched off. No verdict until the registry arrives.
+export function platformState(j, project, platforms){
+  if(j && j.platform === "opencode") return "planned";
+  const p = platformOf(j, project);
+  const entry = (platforms || {})[p];
+  if(!entry || entry.enabled === undefined) return "ok";
+  if(!entry.usable) return "platform_disabled";
+  const model = eff(j, "model", "") || entry.default_model || "";
+  const enabled = entry.models_enabled || [];
+  // A family value (opus) is fine when an id of that family is switched on.
+  const famOk = /^(opus|sonnet|haiku|fable)$/.test(model) && enabled.some(id => id.startsWith("claude-" + model + "-"));
+  if(model && !enabled.includes(model) && !famOk) return "model_disabled";
+  return "ok";
+}
+
+export function platformChip(st){
+  if(st === "ok") return null;
+  const c = el("span", "pill idle");
+  c.textContent = st === "planned" ? "platform not supported yet"
+                : st === "platform_disabled" ? "platform disabled" : "model disabled";
+  c.title = st === "planned" ? "This platform arrives with a later release — runs are refused until then"
+          : "Switched off in Settings › Platforms — runs are refused until it is switched on again, or the job picks another";
+  return c;
 }

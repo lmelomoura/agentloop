@@ -29,7 +29,8 @@
 import { bindPage } from "./page.js";
 import { pageHeader, kpiCard, tableFooter } from "./chrome.js";
 import { visibleJobs, jobFilters, bulkOn, bulkLabel,
-         clearJobFilters, jobProjectNames, sortJobs, JOB_COLS } from "./jobs-domain.js";
+         clearJobFilters, jobProjectNames, sortJobs, JOB_COLS,
+         platformState, platformChip } from "./jobs-domain.js";
 import { groupJobs, jobsEmptyNote, worktreesCard,
          renderOverviewHead, jobCard } from "./overview.js";
 import { renderJobsPage, jobsSort, jobsSetPage, initJobDrag } from "./jobs-table.js";
@@ -40,7 +41,8 @@ import { RF, renderRunsPage, runsSort, runsSetPage,
          clearRunFilters, runSearch, runProjectNames } from "./runs.js";
 import { changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, effortsFor,
          FALLBACK_PERMISSIONS, permissionsFor, defaultPermissionFor, defaultModelFor,
-         modelOptionsFor, platformOf, platformLabel, costParts, tokensText,
+         modelOptionsFor, platformOf, platformLabel, PLATFORM_LABELS, registryKnown,
+         platformOptions, hiddenModelCount, costParts, tokensText,
          dayNumbers, shapeRepoRows, projectStepError } from "./editor-domain.js";
 
 function init(cc){
@@ -202,6 +204,15 @@ window.ALApp = { init, visibleJobs, jobFilters, bulkOn,
                  changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, effortsFor,
                  FALLBACK_PERMISSIONS, permissionsFor, defaultPermissionFor, defaultModelFor,
                  modelOptionsFor, platformOf, platformLabel,
+                 // PLATFORM_LABELS, registryKnown, platformOptions and
+                 // hiddenModelCount are Task 7's: the Platform/Model combos'
+                 // own read of what Settings switched on, alongside
+                 // modelOptionsFor's now-optional fourth argument above.
+                 // platformState and platformChip are jobs-domain.js's own
+                 // half of the same task -- the verdict jobCard and jobRow
+                 // both put on screen as a chip next to the status pill.
+                 PLATFORM_LABELS, registryKnown, platformOptions, hiddenModelCount,
+                 platformState, platformChip,
                  // costParts and tokensText are the same plan's Task 4: what a
                  // run's cost cell and Tokens row say, shared by the Runs table
                  // (runs.js, by import) and the run dialog's renderLog/costHtml
