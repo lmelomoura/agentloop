@@ -102,7 +102,7 @@ Ficheiro novo, pessoal (entra no `.gitignore` ao lado de `jobs.json` e
   **launchd** vê, que é o que conta para os runs agendados — um `claude` que
   só existe no PATH da shell interactiva aparece como não encontrado, e o
   campo `bin` é a correcção.
-- **`models`** são ids exactos activados, na ordem do catálogo. A semente
+- **`models`** são ids exactos activados, na ordem em que foram ligados. A semente
   guarda o id em que o valor do job resolve (uma família como `opus` fica
   como está se a cache ainda não a conhece); `platform_model_enabled` aceita
   um valor quando a lista contém o próprio valor ou o id em que ele resolve.
@@ -125,7 +125,8 @@ Ficheiro ausente → `platforms_ensure` cria-o na primeira leitura:
 - `enabled` = `in_use` não vazio; `models` = os modelos desses jobs e blocos,
   resolvidos pela cache de famílias, sem repetições, na ordem em que aparecem
   (jobs primeiro, blocos de segurança depois) — a ordem do catálogo não
-  precisa de ser conhecida para semear, e o operador reordena na página.
+  precisa de ser conhecida para semear; a página lista-os na ordem do
+  catálogo seja qual for a do ficheiro.
 
 Numa instalação em uso os jobs continuam a correr sem uma visita aos
 Settings (nesta: anthropic com `claude-opus-5`, `claude-opus-4-8`,
