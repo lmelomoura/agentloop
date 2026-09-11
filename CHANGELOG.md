@@ -63,6 +63,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - A failed catalog refresh from Settings (`agentloop platform models
     openai` when codex is missing or its answer is empty) keeps the catalog
     it had instead of emptying it, and says stale.
+  - The gates: a run, a job and a project may only use what Settings
+    switched on. Launch refuses a platform switched off or planned, and a
+    model nobody enabled, one line each in `tick.log` before a slot is
+    spent; `set-field`, `create` and `project-set` refuse the same at write
+    time, naming what is enabled; a security block's switched-off model
+    falls back to the first one switched on, with a warning. `agentloop
+    status` names enabled/disabled, version, account and model counts per
+    platform (and warns when the file cannot be read, as the tick now logs
+    once); `install.sh` says when nothing is enabled yet. What it cost: a
+    job on the most expensive model in the catalog was one click away, and
+    a job on a CLI nobody signed in to found out at its first launch.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and

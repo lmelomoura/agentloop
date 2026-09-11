@@ -55,6 +55,14 @@ cat > "$ROOT/config/projects.json" <<JSON
               "security":{"enabled":true,"model":"claude-opus-5","max_budget_usd":5}}]}
 JSON
 
+# What the operator would have switched on in Settings. Explicit rather than
+# seeded: the seed is scenario 28's own subject.
+cat > "$ROOT/config/platforms.json" <<'JSON'
+{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},
+              "openai":{"enabled":true,"bin":"","models":["gpt-5.6-sol"]},
+              "opencode":{"enabled":false,"bin":"","models":[]}}}
+JSON
+
 mkjob() { # mkjob <id> <mode>
   printf '{"jobs":[{"id":"%s","project":"sandbox","enabled":false,"prompt":"do the thing",
     "interval_seconds":3600,"permission_mode":"bypassPermissions","max_parallel":1}]}\n' "$1" \
@@ -463,7 +471,10 @@ echo "22. a session is resumed on the platform it ran on, or not at all"
 mkjob_openai j22
 FAKE_MODE=undeclared FAKE_SESSION=thr-moved "$AL" run j22 >/dev/null 2>&1
 sleep 2
-sed -i '' 's/"platform":"openai"/"platform":"anthropic"/; s/"gpt-5.6-sol"/"opus"/; s/"workspace-write"/"dontAsk"/; s/"effort":"high"/"effort":"low"/' "$ROOT/config/jobs.json"
+# Moved onto a model Settings switched on (the fixture at the top): the
+# stand-in cannot resolve a family, so a bare `opus` would be refused by the
+# model gate first, and never reach the resume refusal this scenario is about.
+sed -i '' 's/"platform":"openai"/"platform":"anthropic"/; s/"gpt-5.6-sol"/"claude-opus-5"/; s/"workspace-write"/"dontAsk"/; s/"effort":"high"/"effort":"low"/' "$ROOT/config/jobs.json"
 "$AL" resume j22 thr-moved >/dev/null 2>&1
 grep -q 'j22: refusing to resume thr-moved — this session belongs to openai; the job now runs on anthropic' "$ROOT/data/tick.log" \
   && ok "the resume is refused, naming both platforms" || bad "no refusal line for the moved job"
@@ -549,6 +560,39 @@ FAKE_ACCOUNT_OUT="$acct25" CLAUDE_CONFIG_DIR="$ROOT/someones-session" \
 [ -z "$(cat "$acct25" 2>/dev/null)" ] \
   && ok "and an ambient one is not borrowed" || bad "the agent inherited '$(cat "$acct25" 2>/dev/null)'"
 sleep 1
+
+echo
+echo "26. a job on a platform switched off in Settings is skipped before it costs a slot"
+mkjob j26
+"$AL" platform disable anthropic >/dev/null 2>&1
+FAKE_MODE=complete FAKE_SESSION=sess-26 "$AL" run j26 >/dev/null 2>&1
+grep -q "j26: anthropic is disabled in Settings (agentloop platform enable anthropic), skipped" "$ROOT/data/tick.log" \
+  && ok "the refusal is one line in tick.log" || bad "no refusal line: $(tail -3 "$ROOT/data/tick.log")"
+[ -z "$(dirs j26)" ] && ok "and no run directory was cut" || bad "a worktree was cut for a refused run"
+"$AL" platform enable anthropic >/dev/null 2>&1 || bad "platform enable anthropic failed over the stand-in"
+FAKE_MODE=complete FAKE_SESSION=sess-26b "$AL" run j26 >/dev/null 2>&1
+sleep 2
+[ "$(lastrun | jq -r .session)" = "sess-26b" ] && ok "enabled again, the same job runs" || bad "no run after enable: $(lastrun)"
+
+echo
+echo "27. a model switched off in Settings is refused, and the line names what is enabled"
+mkjob_openai j27
+printf '["gpt-5.6-luna"]' | "$AL" platform set-models openai >/dev/null 2>&1
+FAKE_MODE=complete FAKE_SESSION=thr-27 "$AL" run j27 >/dev/null 2>&1
+grep -q "j27: model 'gpt-5.6-sol' is not enabled in Settings — openai enables: gpt-5.6-luna, skipped" "$ROOT/data/tick.log" \
+  && ok "the refusal names the model and the enabled list" || bad "no model refusal: $(tail -3 "$ROOT/data/tick.log")"
+printf '["gpt-5.6-sol"]' | "$AL" platform set-models openai >/dev/null 2>&1
+
+echo
+echo "28. upgrade path: no platforms file and an enabled job -> seeded from it, and the run is unchanged"
+mkjob j28
+jq '.jobs[0].enabled = true | .jobs[0].model = "claude-opus-5"' "$ROOT/config/jobs.json" > "$ROOT/config/jobs.next" && mv "$ROOT/config/jobs.next" "$ROOT/config/jobs.json"
+rm -f "$ROOT/config/platforms.json"
+FAKE_MODE=complete FAKE_SESSION=sess-28 "$AL" run j28 >/dev/null 2>&1
+sleep 2
+jq -e '.platforms.anthropic.enabled == true and (.platforms.anthropic.models | index("claude-opus-5")) != null' "$ROOT/config/platforms.json" >/dev/null 2>&1 \
+  && ok "the file was seeded with the enabled job's platform and model" || bad "seed: $(cat "$ROOT/config/platforms.json" 2>/dev/null)"
+[ "$(lastrun | jq -r .session)" = "sess-28" ] && ok "and the job ran as before" || bad "no run: $(lastrun)"
 
 echo
 printf '\n  %s passed, %s failed\n' "$pass" "$fail"
