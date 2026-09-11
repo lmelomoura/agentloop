@@ -194,7 +194,15 @@ function binaryBlock(r, entry, check){
   const saveBin = async () => {
     if(repainting || !inp.isConnected) return;
     const v = inp.value.trim();
-    if(v === (entry.bin || "")) return;
+    if(v === (entry.bin || "")){
+      // The operator retyped the stored path by hand, undoing an earlier
+      // refused edit -- drop the stale typed value and its note so the
+      // field and the card both go back to describing the saved state
+      // right away, rather than on the next unrelated repaint.
+      delete live.typedBin[r.id]; delete live.notes[r.id];
+      paint();
+      return;
+    }
     live.typedBin[r.id] = v;   // shown back on a refusal -- see the input's value above
     const ok = await change("platform_set_bin", {platform: r.id, bin: v});
     if(!ok) return;

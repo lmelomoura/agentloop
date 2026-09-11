@@ -3454,8 +3454,10 @@ def test_the_platform_card_shows_the_engines_own_note(srv):
     assert "live.notes[" in src, "change() must keep the engine's note per platform"
     assert '"platnote' in src, "platformCard must paint the note with the platnote class"
     fn = _plainfn(_app_js(srv), "binaryBlock")
-    assert "live.typedBin" in fn, \
-        "a refused set-bin must keep the typed path in the field, not snap back to entry.bin"
+    assert fn.count("delete live.typedBin[r.id]") >= 2, \
+        "the typed path must be cleared both on a later successful save and on a revert to the stored value"
+    assert "delete live.notes[r.id]" in fn, \
+        "retyping the stored path by hand must clear the refusal note right away, not just the typed value"
     fn = _plainfn(_app_js(srv), "paint")
     assert "finally" in fn, \
         "repainting must be cleared in a finally -- a throw mid-rebuild must not leave it stuck true"

@@ -2560,7 +2560,12 @@
     const saveBin = async () => {
       if (repainting || !inp.isConnected) return;
       const v = inp.value.trim();
-      if (v === (entry.bin || "")) return;
+      if (v === (entry.bin || "")) {
+        delete live.typedBin[r.id];
+        delete live.notes[r.id];
+        paint();
+        return;
+      }
       live.typedBin[r.id] = v;
       const ok = await change("platform_set_bin", { platform: r.id, bin: v });
       if (!ok) return;
@@ -2993,5 +2998,5 @@
     setupBanner
   };
 })();
-/* ui-bundle: bb0d9e7d45d8d25c65247f77f43b1be5dff53faf8758024af5e79a5fce76e809 */
-/* ui-sources: 3ebd1e2fc558a713b6d0b32e1196a324043a5c697ff124cd7e24375ba91e1a27 */
+/* ui-bundle: e7b9b2277fab83c3655579bdc9bcc20c428d35a1acc934f929fdcac05e970f1e */
+/* ui-sources: 86177c2f4fe3feb8aa451a06018a7602693c82420aec68d7e49fff838550e7a9 */
