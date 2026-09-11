@@ -3246,11 +3246,30 @@ def test_model_options_are_filtered_by_the_enabled_list_and_flag_the_current(srv
 def test_model_enabled_is_one_rule_for_the_combo_the_chip_and_the_editor(srv, tmp_path):
     """modelEnabled on its own, not only through its three callers -- the one
     rule modelOptionsFor, platformState and the editor's Agent step all read
-    for whether Settings left a model switched on."""
+    for whether Settings left a model switched on.
+
+    A family value is gated the engine's way: effective_model resolves it to
+    the id the cache holds NOW and platform_model_enabled checks THAT id, so
+    the page reads the same resolution off /api/models (`families`) -- a
+    family whose resolved id is off is off, even while another id of the
+    family is on (the day the daily pass moves opus to a new id, every family
+    job is refused at launch; the page must show the chip that day). A
+    payload without `families` (an older server) keeps the by-prefix guess."""
     js = _app_js(srv)
     script = tmp_path / "model-enabled.js"
     script.write_text(_plainfn(js, "modelEnabled") + """
     const P = {anthropic: {models_enabled: ["claude-opus-5"]}, openai: {models_enabled: ["gpt-a"]}};
+    // The registry with the cache's own resolutions: opus -> claude-opus-5.
+    const R = {anthropic: {models_enabled: ["claude-opus-5"], families: {opus: "claude-opus-5", sonnet: "claude-sonnet-5"}}};
+    // The daily pass moved opus to claude-opus-6 while Settings still lists
+    // claude-opus-5: the engine gates on claude-opus-6, which is off.
+    const M = {anthropic: {models_enabled: ["claude-opus-5"], families: {opus: "claude-opus-6"}}};
+    // The list names the family itself (the seed writes a bare `opus` when
+    // the cache had not resolved it yet): on, whatever it resolves to.
+    const F = {anthropic: {models_enabled: ["opus"], families: {opus: "claude-opus-6"}}};
+    // A family the cache has not resolved at all: the engine finds no id to
+    // check and refuses -- so does the page.
+    const U = {anthropic: {models_enabled: ["claude-haiku-4"], families: {opus: "claude-opus-5"}}};
     console.log(JSON.stringify({
       no_registry: modelEnabled("anthropic", "claude-sonnet-5", {}),
       on_list: modelEnabled("anthropic", "claude-opus-5", P),
@@ -3258,11 +3277,20 @@ def test_model_enabled_is_one_rule_for_the_combo_the_chip_and_the_editor(srv, tm
       family_off: modelEnabled("anthropic", "sonnet", P),
       empty_model: modelEnabled("anthropic", "", P),
       openai_off: modelEnabled("openai", "gpt-b", P),
+      resolved_on: modelEnabled("anthropic", "opus", R),
+      resolved_off: modelEnabled("anthropic", "sonnet", R),
+      moved: modelEnabled("anthropic", "opus", M),
+      listed_family: modelEnabled("anthropic", "opus", F),
+      unresolved: modelEnabled("anthropic", "haiku", U),
     }));
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
     assert out == {"no_registry": True, "on_list": True, "family_on": True,
-                   "family_off": False, "empty_model": True, "openai_off": False}
+                   "family_off": False, "empty_model": True, "openai_off": False,
+                   "resolved_on": True, "resolved_off": False,
+                   "moved": False, "listed_family": True, "unresolved": False}, out
+    assert out["family_on"] is True and out["moved"] is False, \
+        "the by-prefix guess is only for a payload without `families`; with them, the resolved id decides"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -3577,6 +3605,55 @@ def test_opening_a_job_or_project_shows_a_switched_off_model_flagged(srv):
     js = _js(srv)
     assert 'modelCombo.set(j.model||ALApp.defaultModelFor(plat,PLATFORMS), modelOptions(plat, j.model||""));' in js
     assert 'secModelCombo.set(sec.model||"", modelOptions(splat, sec.model||""));' in js
+
+
+def test_a_config_change_re_reads_the_model_registry(srv):
+    """The config signature covers config/platforms.json since Settings
+    exists, so a switch flipped by the CLI or another tab moves it -- and the
+    editors, the strip and the chips all read /api/models, which the poll
+    never re-fetched: an open page kept offering a platform the CLI had just
+    disabled until a reload. The re-read rides on the sig branch, the first
+    read included -- that IS the boot's /api/models GET now, so neither boot
+    path fires a second one (list_models reads and scans the CLI binary), and
+    retryModelsIfMissing stands down while that first request is in flight
+    instead of asking again beside it. enterDashboard still hands submitSetup
+    the round trip, so a fresh install lands on Settings with
+    MODELS_CONFIGURED settled."""
+    js = _js(srv)
+    assert "await loadConfig(); loadModels();" in _fn(js, "refresh"), \
+        "a moved config_sig must re-read /api/models along with /api/config"
+    for name in ("enterDashboard", "boot"):
+        assert "loadModels()" not in _anyfn(js, name), \
+            f"{name} fires its own /api/models GET beside the one refresh() already fired"
+    assert "return modelsLoad;" in _anyfn(js, "enterDashboard")
+    assert "modelsPending" in _plainfn(js, "retryModelsIfMissing"), \
+        "the retry must stand down while a request is already in flight"
+    body = _fn(js, "loadModels")
+    assert "modelsPending=true;" in body and "finally{ modelsPending=false; }" in body
+
+
+def test_the_settings_modules_own_posts_answer_a_lost_session_like_the_poll(srv):
+    """The Settings page's calls go through settings.js's own post(), not the
+    page's api(): a session that ran out, or was signed out from another tab,
+    used to come back as an "HTTP 401" toast over a page refresh() was about
+    to replace with the login screen, and change() then kept "HTTP 401" as
+    the card's note. post() now answers 401/428 the way refresh() does --
+    sessionLost(), no toast, an empty output change() keeps no note for --
+    through the page's one sessionLost, bound like toast is."""
+    js = _js(srv)
+    app = _app_js(srv)
+    assert "sessionLost" in _plainfn(app, "bindPage"), "page.js must bind sessionLost"
+    a, b = _init_call_object(js, "ALApp.init")
+    assert "sessionLost" in js[a:b], "the page must hand sessionLost to ALApp.init"
+    post = _plainfn(app, "post")
+    assert "sessionLost" in post and "r.status === 401 || r.status === 428" in post
+    code = _strip_comments(post)   # the source's own comment names the toast it avoids
+    assert "toast" not in code.split("sessionLost", 1)[0], \
+        "a lost session must not toast before it puts the login screen back"
+    src = (REPO / "ui" / "app" / "settings.js").read_text()
+    assert re.search(r'import\s*\{[^}]*sessionLost[^}]*\}\s*from\s*"\./page\.js"', src, re.S), \
+        "settings.js must import sessionLost from page.js"
+    assert "else if(j && j.output)" in src, "an empty output (a lost session) must leave no note on the card"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -10091,13 +10168,19 @@ def test_the_model_catalog_is_asked_for_again_until_it_arrives(srv, tmp_path):
         "permanent for this tab")
     script = tmp_path / "models-retry.js"
     script.write_text(
-        "let PLATFORMS={}, modelTries=0, nextModelTry=0, calls=0;\n"
+        "let PLATFORMS={}, modelTries=0, nextModelTry=0, calls=0, modelsPending=false;\n"
         "function loadModels(){ calls++; }\n"
         "let NOW=1000; Date.now=()=>NOW;\n"
         + _plainfn(js, "modelCatalogMissing") + "\n"
         + _plainfn(js, "retryModelsIfMissing") + """
     const out = {};
     out.missing_empty = modelCatalogMissing();
+    // A request already in flight (the first refresh()'s own, at boot) IS
+    // the retry: nothing is asked beside it.
+    modelsPending = true;
+    for(let i=0;i<3;i++){ retryModelsIfMissing(); NOW += 5000; }
+    out.tries_while_pending = calls;
+    modelsPending = false;
     // Ten polls, five seconds apart, with the catalog never arriving.
     for(let i=0;i<10;i++){ retryModelsIfMissing(); NOW += 5000; }
     out.tries_first_50s = calls;
@@ -10115,6 +10198,9 @@ def test_the_model_catalog_is_asked_for_again_until_it_arrives(srv, tmp_path):
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
                                     text=True, check=True).stdout)
     assert out["missing_empty"] is True, "an empty PLATFORMS is not recognised as missing"
+    assert out["tries_while_pending"] == 0, (
+        "a request already in flight is the retry -- asking again beside it is the "
+        "double GET at boot this guard exists to avoid")
     assert out["missing_after"] is False, "the arrived catalog is still read as missing"
     assert out["tries_first_50s"] >= 5, (
         "the first polls after a miss do not re-ask, so a server that restarted "

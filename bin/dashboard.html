@@ -1627,7 +1627,9 @@ async function refresh(){
     if(d.build && d.build!==BUILD && sessionStorage.ccReloadedFor!==d.build){
       sessionStorage.ccReloadedFor=d.build; location.reload(); return;
     }
-    if(CFG.sig!==d.config_sig) await loadConfig();
+    // The signature covers config/platforms.json too, so a switch flipped by
+    // the CLI or another tab must reach the editors, the strip and the chips.
+    if(CFG.sig!==d.config_sig){ await loadConfig(); loadModels(); }
     // The catalog heals itself the same way the config does -- see
     // retryModelsIfMissing on why it is not simply fetched on every tick.
     retryModelsIfMissing();
@@ -2182,6 +2184,11 @@ ALApp.init({ $, fmtAgo, fmtDur, money,
              effortLabel, fmtExpiresIn, resumeInFlight, markIfPending, isPending,
              fmtWhen, fmtIn, isFav, TOKEN, toast, refresh, paintJobPickers,
              normStatus,
+             // sessionLost (the same hoisted function the Security interface
+             // above already hands over): ui/app/settings.js's own POSTs
+             // answer a lost session the way refresh() does -- back to the
+             // login screen, no error toast.
+             sessionLost,
              openLog, resumeTarget, resumeTip, continuedRun, resumedBadgeTip,
              runKey, isStopping, unjournaledLive, paintRunPickers, runDateLabel,
              get DATA(){ return DATA; },
@@ -3398,22 +3405,35 @@ function groupModels(ids){
   }
   return out;
 }
+// The most recent /api/models round trip, and whether it is still in flight.
+// refresh() fires one on every config_sig change -- the first read included,
+// so boot() and enterDashboard() fire none of their own, and
+// retryModelsIfMissing() stands down while one is pending (list_models reads
+// and scans the CLI binary: not a GET to make twice for one answer).
+// enterDashboard hands the promise to submitSetup, which has to see
+// MODELS_CONFIGURED settled before it decides where a fresh install lands.
+let modelsLoad=Promise.resolve(), modelsPending=false;
 async function loadModels(){
-  try{
-    const r=await fetch("/api/models",{headers:{"X-AL-Token":TOKEN}});
-    if(!r.ok) return;
-    const d=await r.json();
-    PLATFORMS=d.platforms||{};
-    MODELS_CONFIGURED=d.configured; MODELS_ERROR=d.error||"";
-    refillPlatformBound();
-    paintSetupBanners();
-    // The sidebar dot must track MODELS_CONFIGURED as soon as it changes, not
-    // wait for the next five-second poll's render() -- DATA already carries
-    // its page-level defaults by the time this can run, but the guard keeps
-    // this safe regardless.
-    if(DATA && DATA.jobs) paintNav();
-    if(currentView==="settings") paintSettings();
-  }catch(e){ /* keep the built-in fallback lists */ }
+  modelsLoad=(async()=>{
+    modelsPending=true;
+    try{
+      const r=await fetch("/api/models",{headers:{"X-AL-Token":TOKEN}});
+      if(!r.ok) return;
+      const d=await r.json();
+      PLATFORMS=d.platforms||{};
+      MODELS_CONFIGURED=d.configured; MODELS_ERROR=d.error||"";
+      refillPlatformBound();
+      paintSetupBanners();
+      // The sidebar dot must track MODELS_CONFIGURED as soon as it changes, not
+      // wait for the next five-second poll's render() -- DATA already carries
+      // its page-level defaults by the time this can run, but the guard keeps
+      // this safe regardless.
+      if(DATA && DATA.jobs) paintNav();
+      if(currentView==="settings") paintSettings();
+    }catch(e){ /* keep the built-in fallback lists */ }
+    finally{ modelsPending=false; }
+  })();
+  return modelsLoad;
 }
 // Whether this page still has to be told what the platforms offer. The server
 // always names `anthropic` in the payload, so its absence means the payload
@@ -3435,7 +3455,9 @@ function modelCatalogMissing(){ return !(PLATFORMS && PLATFORMS.anthropic); }
 // the poll's own cadence and anything after that drops to once a minute.
 let modelTries=0, nextModelTry=0;
 function retryModelsIfMissing(){
-  if(!modelCatalogMissing()) return;
+  // A request already in flight (the first refresh()'s own, at boot) is the
+  // retry -- asking again beside it is the double GET this exists to avoid.
+  if(!modelCatalogMissing() || modelsPending) return;
   const now=Date.now();
   if(now<nextModelTry) return;
   nextModelTry=now+(modelTries<6?4000:60000);
@@ -5176,15 +5198,15 @@ async function submitSetup(e){
 async function enterDashboard(user){
   SESSION = {configured:true, authenticated:true, user:user||null};
   if(user) CFG.user = user;
-  CFG.sig = null;              // force the config re-read that carries the profile
+  CFG.sig = null;              // force the config re-read that carries the profile (and the /api/models read that rides on it)
   applyGates();
   await refresh();
-  // Returned, not just fired: a caller that awaits enterDashboard() (submitSetup,
-  // right below) needs MODELS_CONFIGURED settled when it comes back, instead of
-  // firing a second /api/models GET of its own to get the same answer.
-  const modelsLoaded = loadModels();
   startPolling();
-  return modelsLoaded;
+  // The /api/models round trip refresh() just fired, returned rather than a
+  // second GET for the same answer: a caller that awaits enterDashboard()
+  // (submitSetup, right below) needs MODELS_CONFIGURED settled when it comes
+  // back.
+  return modelsLoad;
 }
 
 function initViews(){
@@ -5826,7 +5848,8 @@ $("jobsearchbox").insertAdjacentHTML("afterbegin", I.search);
     return;
   }
   applyGates();
-  if(SESSION.authenticated){ await refresh(); loadModels(); startPolling(); }
+  // The first refresh() reads the config AND fires /api/models (see loadModels).
+  if(SESSION.authenticated){ await refresh(); startPolling(); }
 })();
 </script>
 </body></html>

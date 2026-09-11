@@ -23,6 +23,7 @@
   var refresh;
   var paintJobPickers;
   var normStatus;
+  var sessionLost;
   var openLog;
   var resumeTarget;
   var resumeTip;
@@ -60,6 +61,7 @@
       refresh,
       paintJobPickers,
       normStatus,
+      sessionLost,
       openLog,
       resumeTarget,
       resumeTip,
@@ -297,7 +299,12 @@
     if (!p || !Array.isArray(p.models_enabled)) return true;
     if (!model) return true;
     if (p.models_enabled.includes(model)) return true;
-    return /^(opus|sonnet|haiku|fable)$/.test(model) && p.models_enabled.some((id) => id.startsWith("claude-" + model + "-"));
+    if (!/^(opus|sonnet|haiku|fable)$/.test(model)) return false;
+    if (p.families && typeof p.families === "object") {
+      const id = p.families[model];
+      return typeof id === "string" && id !== "" && p.models_enabled.includes(id);
+    }
+    return p.models_enabled.some((id) => id.startsWith("claude-" + model + "-"));
   }
   function modelOptionsFor(platform, platforms, groupFn, current) {
     const key = platform === "openai" ? "openai" : "anthropic";
@@ -2425,6 +2432,10 @@
       headers: { "Content-Type": "text/plain", "X-AL-Token": TOKEN },
       body: JSON.stringify(Object.assign({ op }, extra))
     });
+    if (r.status === 401 || r.status === 428) {
+      sessionLost();
+      return { ok: false, output: "" };
+    }
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.ok === false) {
       const output = j.output || j.error || "HTTP " + r.status;
@@ -2525,7 +2536,7 @@
         const note = noteFromOutput(j.output);
         if (note) live.notes[extra.platform] = { text: note, err: false };
         else delete live.notes[extra.platform];
-      } else if (j) {
+      } else if (j && j.output) {
         live.notes[extra.platform] = { text: j.output, err: true };
       }
       if (ctx && ctx.onChange) await ctx.onChange();
@@ -2998,5 +3009,5 @@
     setupBanner
   };
 })();
-/* ui-bundle: e7b9b2277fab83c3655579bdc9bcc20c428d35a1acc934f929fdcac05e970f1e */
-/* ui-sources: 86177c2f4fe3feb8aa451a06018a7602693c82420aec68d7e49fff838550e7a9 */
+/* ui-bundle: 73ae5963c2c377e479dc661b07b2198b2e5031d70982d0feb1f7539f8405a325 */
+/* ui-sources: 9a3007535b87e04c5ad8d4c9831b24be13878fdb707d4a90221dcda3c5022345 */

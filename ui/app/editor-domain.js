@@ -124,15 +124,26 @@ export const DISABLED_SUFFIX = " (disabled in Settings)";
 
 // Whether Settings lets a job keep this model: no verdict until the registry
 // arrives (models_enabled absent → true), the id itself on the list, or a
-// family value (opus…) with an id of that family on the list. The one rule
-// modelOptionsFor, platformState and the editor's Agent step all read.
+// family value (opus…) that the engine would launch. The engine resolves a
+// family to the id its cache holds NOW (effective_model) and gates on THAT
+// id -- /api/models carries the same resolutions as `families` -- so a
+// family is on when the list names the family itself or the id it resolves
+// to today; any other id of the family on the list does not count, since on
+// the day the daily pass moves the family to a new id the launch is refused
+// (a payload without `families` falls back to the by-prefix guess). The one
+// rule modelOptionsFor, platformState and the editor's Agent step all read.
 export function modelEnabled(platform, model, platforms){
   const key = platform === "openai" ? "openai" : "anthropic";
   const p = (platforms || {})[key];
   if(!p || !Array.isArray(p.models_enabled)) return true;
   if(!model) return true;
   if(p.models_enabled.includes(model)) return true;
-  return /^(opus|sonnet|haiku|fable)$/.test(model) && p.models_enabled.some(id => id.startsWith("claude-" + model + "-"));
+  if(!/^(opus|sonnet|haiku|fable)$/.test(model)) return false;
+  if(p.families && typeof p.families === "object"){
+    const id = p.families[model];
+    return typeof id === "string" && id !== "" && p.models_enabled.includes(id);
+  }
+  return p.models_enabled.some(id => id.startsWith("claude-" + model + "-"));
 }
 
 // The model combo's option list for one platform, filtered by what Settings

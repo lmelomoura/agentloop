@@ -12,7 +12,7 @@
    CLI in the meantime shows up too. Live results stay at module level
    across repaints -- they are this page's, not the payload's. */
 import { el, pageHeader } from "./chrome.js";
-import { $, icon, toast, TOKEN } from "./page.js";
+import { $, icon, sessionLost, toast, TOKEN } from "./page.js";
 
 export const REGISTRY = [
   {id: "anthropic", name: "Anthropic", cli: "claude", sub: "Claude Code — claude -p", mark: "A"},
@@ -32,6 +32,11 @@ async function post(op, extra){
   const r = await fetch("/api/action", {method: "POST",
     headers: {"Content-Type": "text/plain", "X-AL-Token": TOKEN},
     body: JSON.stringify(Object.assign({op}, extra))});
+  // The session ran out, or was signed out from another tab: the page's
+  // refresh() answers this by putting the login screen back, and so does
+  // this -- no "HTTP 401" toast over a page about to be replaced, and no
+  // sentence for the card (change() keeps none for an empty output).
+  if(r.status === 401 || r.status === 428){ sessionLost(); return {ok: false, output: ""}; }
   const j = await r.json().catch(() => ({}));
   if(!r.ok || j.ok === false){
     const output = j.output || j.error || ("HTTP " + r.status);
@@ -145,9 +150,10 @@ async function change(op, extra){
       const note = noteFromOutput(j.output);
       if(note) live.notes[extra.platform] = {text: note, err: false};
       else delete live.notes[extra.platform];
-    } else if(j){
+    } else if(j && j.output){
       // Refused -- post() already toasted j.output. The card keeps that same
       // sentence, in the engine's own words, until the next successful change.
+      // (A lost session answers with no output at all: nothing to keep.)
       live.notes[extra.platform] = {text: j.output, err: true};
     }
     if(ctx && ctx.onChange) await ctx.onChange();   // the page re-reads /api/models and repaints this page

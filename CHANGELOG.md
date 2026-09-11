@@ -87,6 +87,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     launches it with; `bin_found` requires a file, as the engine's own check
     does (a folder is executable to `os.access`); a seed that exits 0 and
     still leaves no file reports a sentence, never the registry JSON.
+  - A switch flipped by the CLI, or in another tab, reaches an open page:
+    the poll re-reads `/api/models` whenever the config signature moves, so
+    the editors, the strip and the chips follow it — they used to keep
+    offering a platform the CLI had just disabled until a reload. The first
+    read is the boot's own `/api/models` call now, and the retry stands
+    down while one is in flight, so a boot makes one such call, not two.
+  - A family value (`opus`) is flagged *(disabled in Settings)* exactly when
+    the launch would refuse it: when the id the family resolves to right now
+    is off the list — not while any id of that family is on. On the day the
+    daily pass moves a family to a new id, the page and `tick.log` agree.
+  - The Settings page's own calls answer a session that ran out the way the
+    poll does — back to the login screen, no `HTTP 401` toast, no note left
+    on the card.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and

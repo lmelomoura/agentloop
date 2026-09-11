@@ -84,6 +84,13 @@
      them alongside the two Jobs ones), and this module only ever reaches
      their `.paint()`/`.label()` through these two small bridges.
 
+   sessionLost joins for ui/app/settings.js (Settings › Platforms): its own
+   POSTs answer a 401/428 the way the page's refresh() does -- the login
+   screen comes back and the poll stops -- instead of toasting "HTTP 401"
+   over a page that is about to be replaced. The page's one implementation
+   is what the Security interface already hands over, bound here the same
+   way toast is.
+
    esc, iconLabel, openEditor and setView still are not exported: nothing
    under ui/app/ calls any of them. api is not either -- the module's own
    network calls (initJobDrag's reorder) go through a plain `fetch` the
@@ -95,7 +102,7 @@ export let $, fmtAgo, fmtDur, money,
            backoffMultiplier, activeRunsOf, renderJobs,
            effortLabel, fmtExpiresIn, resumeInFlight, markIfPending, isPending,
            fmtWhen, fmtIn, isFav, TOKEN, toast, refresh, paintJobPickers,
-           normStatus,
+           normStatus, sessionLost,
            openLog, resumeTarget, resumeTip, continuedRun, resumedBadgeTip,
            runKey, isStopping, unjournaledLive, paintRunPickers, runDateLabel;
 
@@ -112,7 +119,7 @@ export function bindPage(cc){
      backoffMultiplier, activeRunsOf, renderJobs,
      effortLabel, fmtExpiresIn, resumeInFlight, markIfPending, isPending,
      fmtWhen, fmtIn, isFav, TOKEN, toast, refresh, paintJobPickers,
-     normStatus,
+     normStatus, sessionLost,
      openLog, resumeTarget, resumeTip, continuedRun, resumedBadgeTip,
      runKey, isStopping, unjournaledLive, paintRunPickers, runDateLabel } = cc);
 }
