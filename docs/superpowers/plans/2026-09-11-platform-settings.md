@@ -301,6 +301,8 @@ upgrade keeps everything running; nothing reads it for a decision yet.
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
+> **Task 8 entregue** (e6ecd18, fe37651, 2e25046): `setupBanner(configured, error, withButton = true)` — o botão *Open Settings* leva a classe `open-settings` e **nenhum id** (a faixa vai ser montada em duas vistas ao mesmo tempo; a Task 9 delega o clique por classe); a página Settings passa `false`. Os três `platform_check` disparam no primeiro paint com um payload real (`configured !== undefined`), nunca antes da sessão. O módulo tranca o cartão enquanto grava (`live.busy`), preserva só o campo de texto do Binary através de um repaint, e esquece `live.checks`/`live.catalogs` depois de um `set-bin` aceite.
+
 > **Task 7 entregue** (8193f81, 90153ac): `editor-domain.js` exporta também `modelEnabled(platform, model, platforms)` — a única regra de "este modelo está ligado" (sem veredicto até o registo chegar; o id na lista; uma família com um id dela na lista) — e `DISABLED_SUFFIX`; ambos em `window.ALApp`. `platformState` lê-a; a Task 9 lê `ALApp.modelEnabled` no `validateStep`, resolvendo antes o modelo por omissão. No combo, um `opencode` actual lê "OpenCode (not supported yet)".
 
 > **Task 1 entregue** (09e42dc, 338287c, 8c39421). A revisão mudou três coisas que as tarefas seguintes herdam: `platforms_jq` tem agora dois argumentos posicionais à cabeça — `platforms_jq <default-anthropic> <default-openai> <filtro> [opções jq]` — e o `uses` regista o modelo **efectivo** de cada job (`resolved(effective(p; m))`: o próprio quando é válido na plataforma, senão o default recebido); `platforms_seed` passa os defaults legados (`opus`, primeiro slug visível) e `platform_jobs_on` passa `platform_default_model`; o predicado `platforms_valid` é partilhado por `platforms_error`, `platforms_json` e `write_platforms`, e a frase de erro é a das *Global Constraints*. Sem catálogo OpenAI a semente mantém o slug configurado. O selftest ficou em 647 asserções.
@@ -2469,7 +2471,7 @@ def test_new_job_is_diverted_to_settings_while_nothing_is_configured(srv):
     js = _js(srv)
     for hook in ("#new-job", "#ov-new-job"):
         assert f'if(e.target.closest("{hook}")){{ if(MODELS_CONFIGURED===false){{ setView("settings");' in js, hook
-    assert 'if(e.target.closest("#open-settings")){ setView("settings"); return; }' in js
+    assert 'if(e.target.closest(".open-settings")){ setView("settings"); return; }' in js
     assert 'MODELS_CONFIGURED===false ? \'<span class="attn" title="No platform is enabled yet"></span>\' : ""' in _plainfn(js, "paintNav")
     assert 'if(MODELS_CONFIGURED===false) setView("settings");' in _plainfn(js, "submitSetup")
     assert "paintSetupBanners();" in _plainfn(js, "render")
@@ -2612,7 +2614,7 @@ e
 ```js
   if(e.target.closest("#ov-new-job")){ if(MODELS_CONFIGURED===false){ setView("settings"); toast("Enable a platform and at least one model first", true, "alert"); return; } openCreator(); return; }
 ```
-mais, ao lado, `if(e.target.closest("#open-settings")){ setView("settings"); return; }`.
+mais, ao lado, `if(e.target.closest(".open-settings")){ setView("settings"); return; }`.
 
 (h) `paintNav`: `item("nav-settings", I.gear, "Settings", null);` → `item("nav-settings", I.gear, "Settings", null, MODELS_CONFIGURED===false ? '<span class="attn" title="No platform is enabled yet"></span>' : "");`.
 
