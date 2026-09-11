@@ -301,6 +301,8 @@ upgrade keeps everything running; nothing reads it for a decision yet.
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
+> **Task 7 entregue** (8193f81, 90153ac): `editor-domain.js` exporta também `modelEnabled(platform, model, platforms)` — a única regra de "este modelo está ligado" (sem veredicto até o registo chegar; o id na lista; uma família com um id dela na lista) — e `DISABLED_SUFFIX`; ambos em `window.ALApp`. `platformState` lê-a; a Task 9 lê `ALApp.modelEnabled` no `validateStep`, resolvendo antes o modelo por omissão. No combo, um `opencode` actual lê "OpenCode (not supported yet)".
+
 > **Task 1 entregue** (09e42dc, 338287c, 8c39421). A revisão mudou três coisas que as tarefas seguintes herdam: `platforms_jq` tem agora dois argumentos posicionais à cabeça — `platforms_jq <default-anthropic> <default-openai> <filtro> [opções jq]` — e o `uses` regista o modelo **efectivo** de cada job (`resolved(effective(p; m))`: o próprio quando é válido na plataforma, senão o default recebido); `platforms_seed` passa os defaults legados (`opus`, primeiro slug visível) e `platform_jobs_on` passa `platform_default_model`; o predicado `platforms_valid` é partilhado por `platforms_error`, `platforms_json` e `write_platforms`, e a frase de erro é a das *Global Constraints*. Sem catálogo OpenAI a semente mantém o slug configurado. O selftest ficou em 647 asserções.
 
 ### Task 2: O binário com override e a verificação ao vivo (`platform_bin`, `platform_check`, `platform_ready`)
@@ -1730,7 +1732,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `platformOf`, `eff`, `projById`, `AL`, `el`, `icon`; o `PLATFORMS` da página (o `platforms` de `/api/models`, com as chaves da Task 6).
-- Produces (exportadas em `window.ALApp`): `PLATFORM_LABELS`; `registryKnown(platforms)`; `platformOptions(platforms, current)` → `[{v,label[,flagged]}]`; `modelOptionsFor(platform, platforms, groupFn, current)` (filtrado por `models_enabled`; o valor actual fora da lista entra no fim marcado `(disabled in Settings)`); `hiddenModelCount(platform, platforms)`; `platformState(job, project, platforms)` → `"ok"|"planned"|"platform_disabled"|"model_disabled"`; `platformChip(state)` → elemento `.pill.idle` ou `null`. O cartão (`jobCard`) e a linha (`jobRow`) mostram o chip a seguir ao pill de estado.
+- Produces (exportadas em `window.ALApp`): `PLATFORM_LABELS`; `registryKnown(platforms)`; `platformOptions(platforms, current)` → `[{v,label[,flagged]}]`; `modelOptionsFor(platform, platforms, groupFn, current)` (filtrado por `models_enabled`; o valor actual entra no fim marcado `(disabled in Settings)` só quando a regra partilhada `modelEnabled` diz que Settings o desligou — nunca antes de o registo chegar, nunca para uma família com um id dela activado); `hiddenModelCount(platform, platforms)`; `platformState(job, project, platforms)` → `"ok"|"planned"|"platform_disabled"|"model_disabled"`; `platformChip(state)` → elemento `.pill.idle` ou `null`. O cartão (`jobCard`) e a linha (`jobRow`) mostram o chip a seguir ao pill de estado.
 
 - [ ] **Step 1: Escrever os testes de contrato (falham)**
 
@@ -2488,7 +2490,11 @@ def test_the_agent_step_refuses_what_settings_switched_off(srv, tmp_path):
     const getDays = () => [1];
     const DATA = {jobs: []};
     const projById = () => null;
-    const ALApp = { platformOf: (j) => (j && j.platform) || "anthropic" };
+    const ALApp = { platformOf: (j) => (j && j.platform) || "anthropic",
+                    modelEnabled: (p, m, P) => { const e = (P || {})[p === "openai" ? "openai" : "anthropic"];
+                      if(!e || !Array.isArray(e.models_enabled)) return true; if(!m) return true;
+                      if(e.models_enabled.includes(m)) return true;
+                      return /^(opus|sonnet|haiku|fable)$/.test(m) && e.models_enabled.some(id => id.startsWith("claude-" + m + "-")); } };
     let PLATFORMS = {anthropic: {enabled: true, usable: true, models_enabled: ["claude-opus-5"]},
                      openai: {enabled: true, usable: false, models_enabled: []}};
     let creating = true, editingJob = null;
@@ -2572,7 +2578,11 @@ function refillPlatformBound(){
     const entry=(PLATFORMS||{})[p];
     if(changed && entry && entry.enabled!==undefined){
       if(!entry.usable) return "This platform is not enabled in Settings › Platforms — enable it there, or pick another.";
-      if(m && !(entry.models_enabled||[]).includes(m)) return "This model is switched off in Settings › Platforms — switch it on there, or pick another.";
+      // The one rule the combo and the chip read (ALApp.modelEnabled, Task 7):
+      // a family value counts when an id of it is on; an empty model means the
+      // platform's default, which has to be resolved BEFORE asking.
+      const eff=m||entry.default_model||"";
+      if(eff && !ALApp.modelEnabled(p, eff, PLATFORMS)) return "This model is switched off in Settings › Platforms — switch it on there, or pick another.";
     }
   }
 ```
