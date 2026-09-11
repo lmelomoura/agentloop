@@ -94,6 +94,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     switched on, flagging the job's own value instead of rewriting it, while
     `platformState`/`platformChip` put the same verdict on the card and the
     table row.
+  - One rule (`modelEnabled`) decides whether a job's model is switched on —
+    for the combo, the chip and the editor alike; a family value counts when
+    an id of it is on.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and

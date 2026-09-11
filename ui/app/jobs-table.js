@@ -276,6 +276,8 @@ function jobRow(j, F){
     if(F.idle) pill.title = "Outside its active window — no runs until the window reopens";
     tdState.appendChild(pill);
   }
+  // A job whose platform or model was switched off in Settings says so on
+  // the row too, so the refusal in tick.log is not the only place it shows.
   const pchip = platformChip(platformState(j, projById(j.project || ""), AL.PLATFORMS));
   if(pchip) tdState.appendChild(pchip);
   tr.appendChild(tdState);

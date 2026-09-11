@@ -42,7 +42,8 @@ import { RF, renderRunsPage, runsSort, runsSetPage,
 import { changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, effortsFor,
          FALLBACK_PERMISSIONS, permissionsFor, defaultPermissionFor, defaultModelFor,
          modelOptionsFor, platformOf, platformLabel, PLATFORM_LABELS, registryKnown,
-         platformOptions, hiddenModelCount, costParts, tokensText,
+         platformOptions, hiddenModelCount, modelEnabled, DISABLED_SUFFIX,
+         costParts, tokensText,
          dayNumbers, shapeRepoRows, projectStepError } from "./editor-domain.js";
 
 function init(cc){
@@ -213,6 +214,15 @@ window.ALApp = { init, visibleJobs, jobFilters, bulkOn,
                  // both put on screen as a chip next to the status pill.
                  PLATFORM_LABELS, registryKnown, platformOptions, hiddenModelCount,
                  platformState, platformChip,
+                 // modelEnabled and DISABLED_SUFFIX are Task 7's fix wave 1:
+                 // the one rule modelOptionsFor and platformState both read
+                 // for whether Settings left a model switched on (a family
+                 // value like "opus" counts once an id of that family is on
+                 // the list), and the label suffix modelOptionsFor and
+                 // platformOptions both flag a switched-off value with.
+                 // Exported because a later task's validateStep reads
+                 // ALApp.modelEnabled for the editor's own Agent step.
+                 modelEnabled, DISABLED_SUFFIX,
                  // costParts and tokensText are the same plan's Task 4: what a
                  // run's cost cell and Tokens row say, shared by the Runs table
                  // (runs.js, by import) and the run dialog's renderLog/costHtml

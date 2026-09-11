@@ -117,6 +117,24 @@ export function defaultModelFor(platform, platforms){
   return key === "anthropic" ? "opus" : "";
 }
 
+// The suffix a flagged value's label ends with -- one spelling shared by
+// modelOptionsFor and platformOptions, so a value Settings switched off
+// never reads two different ways depending on which combo it showed up in.
+export const DISABLED_SUFFIX = " (disabled in Settings)";
+
+// Whether Settings lets a job keep this model: no verdict until the registry
+// arrives (models_enabled absent → true), the id itself on the list, or a
+// family value (opus…) with an id of that family on the list. The one rule
+// modelOptionsFor, platformState and the editor's Agent step all read.
+export function modelEnabled(platform, model, platforms){
+  const key = platform === "openai" ? "openai" : "anthropic";
+  const p = (platforms || {})[key];
+  if(!p || !Array.isArray(p.models_enabled)) return true;
+  if(!model) return true;
+  if(p.models_enabled.includes(model)) return true;
+  return /^(opus|sonnet|haiku|fable)$/.test(model) && p.models_enabled.some(id => id.startsWith("claude-" + model + "-"));
+}
+
 // The model combo's option list for one platform, filtered by what Settings
 // switched on (`models_enabled`; a payload without it filters nothing).
 // Anthropic keeps the family/generation grouping the page already draws
@@ -124,7 +142,9 @@ export function defaultModelFor(platform, platforms){
 // order, each slug with its description, a deprecated slug at the end
 // pointing at its successor, and " · no price" on a slug config/pricing.json
 // does not price. `current` -- the job's own value -- joins the end, flagged,
-// when it is no longer on the list: the editor shows the truth, never rewrites.
+// when modelEnabled says Settings really switched it off (never while the
+// registry is still unknown, and never for a family value some concrete id
+// of it keeps enabled): the editor shows the truth, never rewrites.
 export function modelOptionsFor(platform, platforms, groupFn, current){
   const key = platform === "openai" ? "openai" : "anthropic";
   const p = (platforms || {})[key];
@@ -144,8 +164,8 @@ export function modelOptionsFor(platform, platforms, groupFn, current){
         + (m.retires_at ? ", retires " + String(m.retires_at).slice(0, 10) : "") + noPrice(m)}));
     opts = live.concat(old);
   }
-  if(current && !opts.some(o => !o.sec && o.v === current)){
-    opts.push({v: current, label: current + " (disabled in Settings)", flagged: true});
+  if(current && !modelEnabled(platform, current, platforms)){
+    opts.push({v: current, label: current + DISABLED_SUFFIX, flagged: true});
   }
   return opts;
 }
@@ -184,7 +204,13 @@ export function platformOptions(platforms, current){
   const out = known.filter(p => !have || ((platforms[p] || {}).usable === true))
                    .map(p => ({v: p, label: PLATFORM_LABELS[p]}));
   if(current && !out.some(o => o.v === current)){
-    out.push({v: current, label: (PLATFORM_LABELS[current] || current) + " (disabled in Settings)", flagged: true});
+    // opencode has no Settings switch to have been turned off -- it is a
+    // platform that does not exist here yet, the same fact platformChip's
+    // "planned" state names on the job's own card/row. The generic disabled
+    // suffix would send an operator looking for a toggle that is not there.
+    const label = current === "opencode" ? PLATFORM_LABELS.opencode + " (not supported yet)"
+                : (PLATFORM_LABELS[current] || current) + DISABLED_SUFFIX;
+    out.push({v: current, label, flagged: true});
   }
   return out;
 }

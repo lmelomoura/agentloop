@@ -7,7 +7,7 @@
    table followed in a later phase -- so it moves whole, here, and the table
    becomes its second consumer later. */
 import { AL, $, eff, backoffMultiplier, activeRunsOf, renderJobs } from "./page.js";
-import { platformOf } from "./editor-domain.js";
+import { platformOf, modelEnabled } from "./editor-domain.js";
 import { el } from "./chrome.js";
 
 /* One object rather than three module-level `let`s. Three bindings can only
@@ -187,15 +187,18 @@ export function platformState(j, project, platforms){
   if(!entry || entry.enabled === undefined) return "ok";
   if(!entry.usable) return "platform_disabled";
   const model = eff(j, "model", "") || entry.default_model || "";
-  const enabled = entry.models_enabled || [];
-  // A family value (opus) is fine when an id of that family is switched on.
-  const famOk = /^(opus|sonnet|haiku|fable)$/.test(model) && enabled.some(id => id.startsWith("claude-" + model + "-"));
-  if(model && !enabled.includes(model) && !famOk) return "model_disabled";
+  // One rule for "is this model switched on" -- modelEnabled (editor-domain.js)
+  // -- so a family value (opus) reads the same way here as it does in the
+  // model combo: fine once an id of that family is switched on.
+  if(model && !modelEnabled(p, model, platforms)) return "model_disabled";
   return "ok";
 }
 
 export function platformChip(st){
   if(st === "ok") return null;
+  // .pill.idle (amber): not running, by the operator's own setting -- not a
+  // fault (.pill.off, red, is the launchd service itself being down) and not
+  // the grey of a job nobody enabled (.pill.disabled) either.
   const c = el("span", "pill idle");
   c.textContent = st === "planned" ? "platform not supported yet"
                 : st === "platform_disabled" ? "platform disabled" : "model disabled";

@@ -290,6 +290,15 @@
     if (p && p.default_model) return p.default_model;
     return key === "anthropic" ? "opus" : "";
   }
+  var DISABLED_SUFFIX = " (disabled in Settings)";
+  function modelEnabled(platform, model, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    if (!p || !Array.isArray(p.models_enabled)) return true;
+    if (!model) return true;
+    if (p.models_enabled.includes(model)) return true;
+    return /^(opus|sonnet|haiku|fable)$/.test(model) && p.models_enabled.some((id) => id.startsWith("claude-" + model + "-"));
+  }
   function modelOptionsFor(platform, platforms, groupFn, current) {
     const key = platform === "openai" ? "openai" : "anthropic";
     const p = (platforms || {})[key];
@@ -312,8 +321,8 @@
       }));
       opts = live.concat(old);
     }
-    if (current && !opts.some((o) => !o.sec && o.v === current)) {
-      opts.push({ v: current, label: current + " (disabled in Settings)", flagged: true });
+    if (current && !modelEnabled(platform, current, platforms)) {
+      opts.push({ v: current, label: current + DISABLED_SUFFIX, flagged: true });
     }
     return opts;
   }
@@ -337,7 +346,8 @@
     const have = registryKnown(platforms);
     const out = known.filter((p) => !have || (platforms[p] || {}).usable === true).map((p) => ({ v: p, label: PLATFORM_LABELS[p] }));
     if (current && !out.some((o) => o.v === current)) {
-      out.push({ v: current, label: (PLATFORM_LABELS[current] || current) + " (disabled in Settings)", flagged: true });
+      const label = current === "opencode" ? PLATFORM_LABELS.opencode + " (not supported yet)" : (PLATFORM_LABELS[current] || current) + DISABLED_SUFFIX;
+      out.push({ v: current, label, flagged: true });
     }
     return out;
   }
@@ -543,9 +553,7 @@
     if (!entry || entry.enabled === void 0) return "ok";
     if (!entry.usable) return "platform_disabled";
     const model = eff(j, "model", "") || entry.default_model || "";
-    const enabled = entry.models_enabled || [];
-    const famOk = /^(opus|sonnet|haiku|fable)$/.test(model) && enabled.some((id) => id.startsWith("claude-" + model + "-"));
-    if (model && !enabled.includes(model) && !famOk) return "model_disabled";
+    if (model && !modelEnabled(p, model, platforms)) return "model_disabled";
     return "ok";
   }
   function platformChip(st) {
@@ -2596,6 +2604,16 @@
     hiddenModelCount,
     platformState,
     platformChip,
+    // modelEnabled and DISABLED_SUFFIX are Task 7's fix wave 1:
+    // the one rule modelOptionsFor and platformState both read
+    // for whether Settings left a model switched on (a family
+    // value like "opus" counts once an id of that family is on
+    // the list), and the label suffix modelOptionsFor and
+    // platformOptions both flag a switched-off value with.
+    // Exported because a later task's validateStep reads
+    // ALApp.modelEnabled for the editor's own Agent step.
+    modelEnabled,
+    DISABLED_SUFFIX,
     // costParts and tokensText are the same plan's Task 4: what a
     // run's cost cell and Tokens row say, shared by the Runs table
     // (runs.js, by import) and the run dialog's renderLog/costHtml
@@ -2607,5 +2625,5 @@
     projectStepError
   };
 })();
-/* ui-bundle: f52c89f17203f7e54118d1a7cb15b6d3d0f2a745410472b657b7ca818eec71cc */
-/* ui-sources: d36b1b8d8435b5c102d4f4b53fb65d526cb92dc543f67083c858c12509fed9d1 */
+/* ui-bundle: 24b130aa2571dbce93c144c0852836ce3f0881d538c5f9bc393527c2f741ad66 */
+/* ui-sources: baff89a7ac1f9e01a6ab68962ae9d9e1adcc668331074dd98085d3ddd678ee47 */

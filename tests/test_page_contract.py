@@ -1493,7 +1493,7 @@ def _jobs_table_deps(block):
               + _const(block, "JOB_COLS") + _const(block, "KPI_ICONS"))
     fns = ("el", "kpiCard", "filterBar", "tableCard", "tableFooter",
            "inWindow", "nextCheckAt", "jobFacts", "visibleJobs", "sortJobs",
-           "bulkOn", "bulkLabel", "jobsEmptyNote", "platformOf", "platformState", "platformChip",
+           "bulkOn", "bulkLabel", "jobsEmptyNote", "platformOf", "modelEnabled", "platformState", "platformChip",
            "jobsHeaderSubtitle", "jobsKpis", "mountJobsToolbar",
            "paintJobFilterBar", "jobRow", "renderJobsTable", "renderJobsPage")
     return consts + "\n".join(_plainfn(block, n) for n in fns)
@@ -3145,7 +3145,7 @@ def _job_card_deps(block):
             + _index_screen_deps(block, "fmtDays", "el", "jobFacts",
                                  "nextCheckAt", "inWindow", "probeVerdict",
                                  "nextRunNote", "spendTone", "checkList",
-                                 "sessionNotices", "platformOf", "platformState",
+                                 "sessionNotices", "platformOf", "modelEnabled", "platformState",
                                  "platformChip", "jobCard"))
 
 
@@ -3183,7 +3183,7 @@ def test_platform_options_offer_only_what_settings_switched_on(srv, tmp_path):
     it was); once it does, only the usable ones -- and the job's current one
     flagged rather than silently swapped."""
     js = _app_js(srv)
-    deps = "\n".join(_plainfn(js, n) for n in ("registryKnown", "platformOptions"))
+    deps = _const(js, "DISABLED_SUFFIX") + "\n".join(_plainfn(js, n) for n in ("registryKnown", "platformOptions"))
     script = tmp_path / "platform-options.js"
     script.write_text("""
     const PLATFORM_LABELS = {anthropic: "Anthropic", openai: "OpenAI", opencode: "OpenCode"};
@@ -3192,38 +3192,77 @@ def test_platform_options_offer_only_what_settings_switched_on(srv, tmp_path):
     const p = {anthropic: {enabled: true, usable: true}, openai: {enabled: true, usable: false}};
     const after = platformOptions(p, "anthropic");
     const flagged = platformOptions(p, "openai");
-    console.log(JSON.stringify({before, after, flagged}));
+    // A planned platform (never wired up yet) is not something Settings
+    // switched off -- it must read that way, not as a stray disabled toggle.
+    const planned = platformOptions(p, "opencode");
+    console.log(JSON.stringify({before, after, flagged, planned}));
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
     assert [o["v"] for o in out["before"]] == ["anthropic", "openai"]
     assert [o["v"] for o in out["after"]] == ["anthropic"]
     assert out["flagged"][-1] == {"v": "openai", "label": "OpenAI (disabled in Settings)", "flagged": True}
+    assert out["planned"][-1] == {"v": "opencode", "label": "OpenCode (not supported yet)", "flagged": True}
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_model_options_are_filtered_by_the_enabled_list_and_flag_the_current(srv, tmp_path):
     js = _app_js(srv)
+    deps = _const(js, "DISABLED_SUFFIX") + "\n".join(_plainfn(js, n) for n in ("modelEnabled", "modelOptionsFor"))
     script = tmp_path / "model-options.js"
-    script.write_text(_plainfn(js, "modelOptionsFor") + """
+    script.write_text(deps + """
     const P = {anthropic: {models: ["claude-opus-5", "claude-sonnet-5"], models_enabled: ["claude-opus-5"]},
                openai: {models: [{v: "gpt-a", label: "A", desc: "da"}, {v: "gpt-b", label: "B"}], models_enabled: ["gpt-b"]}};
     const a = modelOptionsFor("anthropic", P, null, "claude-sonnet-5");
     const o = modelOptionsFor("openai", P, null, "gpt-b");
     const legacy = modelOptionsFor("anthropic", {anthropic: {models: ["claude-opus-5", "claude-sonnet-5"]}}, null, "");
-    console.log(JSON.stringify({a, o, legacy}));
+    // A family value (opus) is not "off": claude-opus-5, a model of that
+    // family, is switched on -- it must not gain a flagged twin beside it.
+    const fam = modelOptionsFor("anthropic", P, null, "opus");
+    // No models_enabled at all (the registry has not answered yet): the
+    // job's own current model gets no verdict either, same as platformState.
+    const noRegistry = modelOptionsFor("anthropic", {anthropic: {models: ["claude-opus-5", "claude-sonnet-5"]}}, null, "claude-opus-5");
+    console.log(JSON.stringify({a, o, legacy, fam, noRegistry}));
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
     assert out["a"] == [{"v": "claude-opus-5", "label": "claude-opus-5"},
                         {"v": "claude-sonnet-5", "label": "claude-sonnet-5 (disabled in Settings)", "flagged": True}]
     assert out["o"] == [{"v": "gpt-b", "label": "B"}]
     assert [x["v"] for x in out["legacy"]] == ["claude-opus-5", "claude-sonnet-5"], "no models_enabled: nothing is filtered"
+    assert out["fam"] == [{"v": "claude-opus-5", "label": "claude-opus-5"}], \
+        "opus must not be flagged: claude-opus-5, a model of that family, is enabled"
+    assert out["noRegistry"] == [{"v": "claude-opus-5", "label": "claude-opus-5"},
+                                 {"v": "claude-sonnet-5", "label": "claude-sonnet-5"}], \
+        "no models_enabled: the job's own current model is not flagged either"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_model_enabled_is_one_rule_for_the_combo_the_chip_and_the_editor(srv, tmp_path):
+    """modelEnabled on its own, not only through its three callers -- the one
+    rule modelOptionsFor, platformState and the editor's Agent step all read
+    for whether Settings left a model switched on."""
+    js = _app_js(srv)
+    script = tmp_path / "model-enabled.js"
+    script.write_text(_plainfn(js, "modelEnabled") + """
+    const P = {anthropic: {models_enabled: ["claude-opus-5"]}, openai: {models_enabled: ["gpt-a"]}};
+    console.log(JSON.stringify({
+      no_registry: modelEnabled("anthropic", "claude-sonnet-5", {}),
+      on_list: modelEnabled("anthropic", "claude-opus-5", P),
+      family_on: modelEnabled("anthropic", "opus", P),
+      family_off: modelEnabled("anthropic", "sonnet", P),
+      empty_model: modelEnabled("anthropic", "", P),
+      openai_off: modelEnabled("openai", "gpt-b", P),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out == {"no_registry": True, "on_list": True, "family_on": True,
+                   "family_off": False, "empty_model": True, "openai_off": False}
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_platform_state_names_a_platform_or_model_switched_off(srv, tmp_path):
     js = _app_js(srv)
     script = tmp_path / "platform-state.js"
-    script.write_text("\n".join(_plainfn(js, n) for n in ("platformOf", "platformState")) + """
+    script.write_text("\n".join(_plainfn(js, n) for n in ("platformOf", "modelEnabled", "platformState")) + """
     function eff(j, f, d){ return (j && j[f] != null && j[f] !== "") ? j[f] : d; }
     const P = {anthropic: {enabled: true, usable: true, models_enabled: ["claude-opus-5"], default_model: "claude-opus-5"},
                openai: {enabled: false, usable: false, models_enabled: []}};
@@ -3245,9 +3284,46 @@ def test_the_card_and_the_row_show_the_platform_chip(srv):
     js = _app_js(srv)
     assert "platformChip(platformState(j, projById(j.project || \"\"), AL.PLATFORMS))" in _plainfn(js, "jobCard")
     assert "platformChip(platformState(j, projById(j.project || \"\"), AL.PLATFORMS))" in _plainfn(js, "jobRow")
-    for name in ("platformOptions", "registryKnown", "hiddenModelCount", "platformState", "platformChip", "PLATFORM_LABELS"):
+    for name in ("platformOptions", "registryKnown", "hiddenModelCount", "platformState", "platformChip",
+                 "PLATFORM_LABELS", "modelEnabled", "DISABLED_SUFFIX"):
         assert name in js.split("window.ALApp = {", 1)[1], f"{name} is not on window.ALApp"
     assert "get PLATFORMS(){ return PLATFORMS; }" in _js(srv)
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_platform_chip_renders_each_state_the_pill_and_the_why(srv, tmp_path):
+    """platformChip's three non-ok states, run standing alone: the pill class
+    every one of them shares, what each says, and -- for the two Settings
+    actually switched off, not the planned platform that is not built yet --
+    that the title points at where to fix it."""
+    js = _app_js(srv)
+    deps = "\n".join(_plainfn(js, n) for n in ("el", "platformChip"))
+    script = tmp_path / "platform-chip.js"
+    # A minimal document.createElement stub -- just enough for el() to build
+    # the span platformChip fills in, with no real DOM behind it.
+    script.write_text("""
+    const document = {
+      createElement: (_tag) => ({className: "", textContent: "", title: ""}),
+    };
+    """ + deps + """
+    console.log(JSON.stringify({
+      ok: platformChip("ok"),
+      planned: platformChip("planned"),
+      platform_disabled: platformChip("platform_disabled"),
+      model_disabled: platformChip("model_disabled"),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["ok"] is None, "the ok state renders no chip at all"
+    for key, text in (("planned", "platform not supported yet"),
+                       ("platform_disabled", "platform disabled"),
+                       ("model_disabled", "model disabled")):
+        assert out[key]["className"] == "pill idle"
+        assert out[key]["textContent"] == text
+    assert "Settings › Platforms" not in out["planned"]["title"], \
+        "a planned platform was never switched off in Settings -- nothing to point at there"
+    assert "Settings › Platforms" in out["platform_disabled"]["title"]
+    assert "Settings › Platforms" in out["model_disabled"]["title"]
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
