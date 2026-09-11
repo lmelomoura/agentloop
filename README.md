@@ -1158,7 +1158,9 @@ Secrets across the whole tree, and across the branch's whole git history on
 **every** analysis. A dependency inventory read from the lockfiles it knows
 (`package-lock.json`, `requirements.txt`, `poetry.lock`, `composer.lock`,
 `go.sum`), a CycloneDX SBOM built from that, repository hygiene (a committed
-`.env`, a file whose first bytes are a private key, a world-writable file),
+`.env`, a committed file whose first bytes are a private key — both read off
+`git ls-files`, so what a build wrote into the worktree after checkout is not
+"committed" — and a world-writable file, which IS about the working tree),
 and infrastructure-as-code misconfigurations in any Dockerfile, Terraform
 module, Kubernetes manifest, Helm chart or CloudFormation template committed
 to the repository. All of it runs by pattern, so it takes seconds and costs

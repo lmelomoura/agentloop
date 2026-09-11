@@ -272,6 +272,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The `committed_env_file` and `committed_key_file` hygiene rules ask git what
+  is committed.** They read the working tree, and the working tree of an analysis
+  is not only the clone: a build or a provisioning step writes into it after
+  checkout. Measured on the Minerva analyses, that was `.env` and `docker/.env` —
+  gitignored, never in any commit, written into the worktree by the harness's
+  compose-project seal a few seconds after checkout — reported as "committed" on
+  every single run, with nothing in the repository for the operator to remove,
+  and the same two false positives to re-triage each time. Inside a checkout the
+  two rules now report only what `git ls-files` returns: the index, so a staged
+  `.env` still fails the analysis before the commit that lands it, and a
+  gitignored one written by tooling never does. A directory that is not a
+  checkout keeps the old reading of the tree — the lookup yields None there, not
+  an empty set that would have silenced both rules. `world_writable_file` is
+  deliberately untouched: what provisioning leaves behind is exactly what that
+  rule exists to catch.
+
 - **A reviewer's trial merge is no longer reported as work that would be lost.**
   Reviewing a change means measuring the *merged* tree, so a reviewer runs
   `git merge --no-commit` inside its own run directory — which leaves every
