@@ -48,6 +48,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     three-tier precedence — an `AGENTLOOP_*_BIN` environment override,
     else the file's own `bin`, else the detected default — with a missing
     binary naming the path, the Settings field and the install command.
+  - A run launches the binary the readiness check looked at — the file's
+    own `bin` when one is set.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and

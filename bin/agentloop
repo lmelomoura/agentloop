@@ -1417,7 +1417,7 @@ platform_check() { # platform_check <platform> -> one JSON object; always exits 
   fi
   platform_planned "$p" && supported=false
   bin="$(platform_bin "$p")"; src="$(platform_bin_source "$p")"
-  if [ -x "$bin" ]; then found=true; ver="$("$bin" --version 2>/dev/null | head -1)"; fi
+  if [ -f "$bin" ] && [ -x "$bin" ]; then found=true; ver="$("$bin" --version 2>/dev/null | head -1)"; fi
   if [ "$found" = false ]; then
     reason="$(platform_cli_name "$p") not found at $bin — set the path in Settings (or AGENTLOOP_$(platform_cli_name "$p" | tr '[:lower:]' '[:upper:]')_BIN); install: $(platform_install_hint "$p")"
   elif [ "$supported" = false ]; then
@@ -3156,6 +3156,12 @@ check_ui_artifacts() {
 cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   local pass=0 fail=0 tmp
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/alselftest.XXXXXX")"
+  # CODEX_BIN/CLAUDE_BIN/OPENCODE_BIN (the globals platform_bin() falls back
+  # to) were computed from these at load time; the suite below points at its
+  # own stand-ins by assigning those globals directly, or by prefixing a
+  # subprocess explicitly (cfg_al). An AGENTLOOP_*_BIN exported by the
+  # invoking shell must not reach platform_bin() here.
+  AGENTLOOP_CLAUDE_BIN=""; AGENTLOOP_CODEX_BIN=""; AGENTLOOP_OPENCODE_BIN=""
   ok()   { pass=$(( pass + 1 )); printf '  ok    %s\n' "$1"; }
   bad()  { fail=$(( fail + 1 )); printf '  FAIL  %s\n' "$1"; }
   want() { # want <label> <expected 0|1> <actual-rc>
@@ -3394,7 +3400,7 @@ JSON
   ( pf_env; platform_enabled openai ); want "and the write is read back" 1 $?
 
   echo "platform_bin() / platform_check() — where the CLI is, and whether it is signed in"
-  local pb="$tmp/pb"; mkdir -p "$pb/bin"
+  local pb="$tmp/pb" _pc; mkdir -p "$pb/bin"
   printf '#!/bin/sh\necho "codex-cli 9.9.9"\n' > "$pb/bin/codex"; chmod +x "$pb/bin/codex"
   printf '{"platforms":{"openai":{"enabled":true,"bin":"%s","models":[]}}}\n' "$pb/bin/codex" > "$pb/platforms.json"
   type platform_check >/dev/null 2>&1 && ok "platform_check is defined" || bad "platform_check does not exist"
@@ -7523,7 +7529,7 @@ JSON
   st_argv_idx() { printf '%s\n' "$1" | awk -F'\t' -v w="$2" '$2==w {print $1; exit}'; }
   st_argv_at()  { printf '%s\n' "$1" | awk -F'\t' -v i="$2" '$1==i {print $2; exit}'; }
   st_argv_argc() { printf '%s\n' "$1" | awk -F'\t' '$1=="ARGC" {print $2; exit}'; }
-  local av_deny av_both av_plain di ai mi
+  local av_deny av_both av_plain av_filebin di ai mi
   av_deny="$(st_argv_run argv-deny)"
   di="$(st_argv_idx "$av_deny" '--disallowedTools')"
   ( [ -n "$di" ] && [ "$(st_argv_at "$av_deny" "$((di + 1))")" = "Agent" ] ) \
@@ -7568,6 +7574,24 @@ JSON
   ( [ -n "$mi" ] && [ "$((mi + 1))" = "$(st_argv_argc "$av_plain")" ] ) \
     && ok "and -- is there regardless, so the prompt is guarded with or without a tool flag" \
     || bad "-- is emitted only alongside a tool flag — the guard is conditional, and one day it will be missing"
+
+  # The gate and the launch must agree on the binary. Same recording
+  # stand-in, but no AGENTLOOP_CLAUDE_BIN this time: config/platforms.json's
+  # own `bin` is the only route to it, so a recorded PROMPT-SENTINEL argument
+  # can only have come from the real launch -- platform_check's own
+  # --version/auth-status probes write the same file, but never the prompt.
+  printf '{"platforms":{"anthropic":{"enabled":true,"bin":"%s","models":["opus"]}}}\n' \
+    "$argvdir/claude" > "$argvdir/config/platforms.json"
+  rm -f "$argvdir/out"
+  AGENTLOOP_CONFIG="$argvdir/config" AGENTLOOP_DATA="$argvdir/data" \
+    AGENTLOOP_CLAUDE_BIN="" AL_ARGV_OUT="$argvdir/out" \
+    "$BIN_DIR/agentloop" run argv-plain >/dev/null 2>&1
+  av_filebin="$(cat "$argvdir/out" 2>/dev/null)"
+  mi="$(st_argv_idx "$av_filebin" '--')"
+  ( [ -n "$mi" ] && [ "$((mi + 1))" = "$(st_argv_argc "$av_filebin")" ] \
+    && case "$(st_argv_at "$av_filebin" "$((mi + 1))")" in PROMPT-SENTINEL*) true ;; *) false ;; esac ) \
+    && ok "run_job launches config/platforms.json's own bin, the same one platform_ready checked" \
+    || bad "the launch never reached the file's bin — no launch argv reached the recorder: $av_filebin"
 
   # The prompt explains the absence. It does not enforce it (the flag does),
   # but an agent that finds a tool missing with no reason given wastes turns
@@ -9102,6 +9126,10 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   if ! not_ready="$(platform_ready "$platform")"; then
     log_tick "$id: $platform is not ready ($not_ready), skipped"; return 1
   fi
+  # Resolved once, after the gate, so the binary that was checked is the
+  # binary that launches -- the file's own bin, the env override, or
+  # detection, in that order.
+  local cli_bin; cli_bin="$(platform_bin "$platform")"
   if [ "$platform" = "openai" ]; then
     [ "$interactive" != "true" ] \
       || { log_tick "$id: interactive is not available on openai (codex exec has no stdin protocol), skipped"; return 1; }
@@ -9664,7 +9692,7 @@ If the work turns out to be already finished, or it can no longer be done at all
       "$(openai_writable_roots "$run_cwd" "$run_dir")"
     (
       cd "$run_cwd" || exit 1
-      exec env ${run_env[@]+"${run_env[@]}"} "$CODEX_BIN" ${PLATFORM_ARGV[@]+"${PLATFORM_ARGV[@]}"} \
+      exec env ${run_env[@]+"${run_env[@]}"} "$cli_bin" ${PLATFORM_ARGV[@]+"${PLATFORM_ARGV[@]}"} \
         > "$rawfifo" 2> "$logfile.err" < /dev/null
     ) &
     cli_pid=$!
@@ -9688,7 +9716,7 @@ If the work turns out to be already finished, or it can no longer be done at all
       # day someone hands this one a positional argument the guard is already
       # there. Confirmed harmless on CLI 2.1.258: a `--` with nothing after it
       # parses to no operands at all, and the run starts normally.
-      env ${run_env[@]+"${run_env[@]}"} "$CLAUDE_BIN" $args \
+      env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
         ${toolargs[@]+"${toolargs[@]}"} -- < "$fifo" > "$streamfile" 2> "$logfile.err"
     ) &
   else
@@ -9698,7 +9726,7 @@ If the work turns out to be already finished, or it can no longer be done at all
       # costs nothing when there is no option to terminate, and it is what
       # keeps the prompt a positional of its own rather than the tail of a
       # variadic option's value list. See the toolargs note above.
-      env ${run_env[@]+"${run_env[@]}"} "$CLAUDE_BIN" $args \
+      env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
         ${toolargs[@]+"${toolargs[@]}"} -- "$prompt" > "$streamfile" 2> "$logfile.err"
     ) &
   fi
