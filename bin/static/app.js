@@ -311,7 +311,7 @@
     } else {
       const list = (p && Array.isArray(p.models) ? p.models : []).filter((m) => keep(m.v));
       const noPrice = (m) => m.priced === false ? " \xB7 no price" : "";
-      const live = list.filter((m) => !m.deprecated_by).map((m) => ({
+      const live2 = list.filter((m) => !m.deprecated_by).map((m) => ({
         v: m.v,
         label: (m.label || m.v) + (m.desc ? " \u2014 " + m.desc : "") + noPrice(m)
       }));
@@ -319,7 +319,7 @@
         v: m.v,
         label: (m.label || m.v) + " \u2014 \u2192 " + m.deprecated_by + (m.retires_at ? ", retires " + String(m.retires_at).slice(0, 10) : "") + noPrice(m)
       }));
-      opts = live.concat(old);
+      opts = live2.concat(old);
     }
     if (current && !modelEnabled(platform, current, platforms)) {
       opts.push({ v: current, label: current + DISABLED_SUFFIX, flagged: true });
@@ -1913,8 +1913,8 @@
   };
   function filteredRuns(rf, liveRows, searchKeys2, sortKey4, sortDir4) {
     const fromT = rf.from ? Date.parse(rf.from) : null, toT = rf.to ? Date.parse(rf.to) : null;
-    const live = searchKeys2 ? [] : liveRows;
-    const rows = live.concat(AL.DATA.runs).filter((r) => {
+    const live2 = searchKeys2 ? [] : liveRows;
+    const rows = live2.concat(AL.DATA.runs).filter((r) => {
       if (r.live) {
         if (rf.project) {
           const rp = r.project || "";
@@ -2409,6 +2409,295 @@
     renderRunsTable();
   }
 
+  // ui/app/settings.js
+  var REGISTRY = [
+    { id: "anthropic", name: "Anthropic", cli: "claude", sub: "Claude Code \u2014 claude -p", mark: "A" },
+    { id: "openai", name: "OpenAI", cli: "codex", sub: "Codex CLI \u2014 codex exec --json", mark: "O" },
+    { id: "opencode", name: "OpenCode", cli: "opencode", sub: "opencode run \u2014 arrives with the next release", mark: "OC" }
+  ];
+  var live = { checks: {}, checkedAt: {}, catalogs: {}, busy: {} };
+  var ctx = null;
+  var probed = false;
+  async function post(op, extra) {
+    const r = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain", "X-AL-Token": TOKEN },
+      body: JSON.stringify(Object.assign({ op }, extra))
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) {
+      toast(j.output || j.error || "HTTP " + r.status, true);
+      return null;
+    }
+    return j;
+  }
+  function settingsSummary(platforms) {
+    const entries = REGISTRY.map((r) => (platforms || {})[r.id] || {});
+    const enabled = entries.filter((p) => p.enabled === true).length;
+    const models = entries.reduce((n, p) => n + (p.models_enabled || []).length, 0);
+    return enabled + " of " + REGISTRY.length + " platforms enabled \xB7 " + models + " model" + (models === 1 ? "" : "s") + " available to jobs";
+  }
+  function platformStatus(entry, check) {
+    if (entry && entry.supported === false) return { cls: "disabled", label: "Coming soon" };
+    if (check && check.bin_found === false) return { cls: "off", label: "Not installed" };
+    if (check && check.ready === false) return { cls: "idle", label: "Not signed in" };
+    return entry && entry.enabled ? { cls: "on", label: "Enabled" } : { cls: "disabled", label: "Disabled" };
+  }
+  function setupBanner(configured, error) {
+    if (configured !== false && !error) return null;
+    const b = el("div", "setup-banner");
+    const bic = el("div", "bic");
+    bic.appendChild(icon("alert"));
+    b.appendChild(bic);
+    const t = el("div", "btxt");
+    t.appendChild(el("b", null, error ? "The platform settings cannot be read." : "No platform is enabled yet."));
+    t.appendChild(el("span", null, error ? error : "Enable one in Settings \u203A Platforms and switch on at least one model; until then no job can be created. New job takes you there."));
+    b.appendChild(t);
+    const btn = el("button", "btn primary");
+    btn.type = "button";
+    btn.id = "open-settings";
+    btn.appendChild(icon("gear"));
+    btn.appendChild(document.createTextNode("Open Settings"));
+    b.appendChild(btn);
+    return b;
+  }
+  function ago(ms) {
+    if (!ms) return "";
+    const s = Math.max(0, Math.round((Date.now() - ms) / 1e3));
+    return s < 60 ? "checked " + s + " s ago" : "checked " + Math.round(s / 60) + " min ago";
+  }
+  function switchEl(on, disabled, title, onToggle) {
+    const lab = el("label", "switch");
+    if (title) lab.title = title;
+    const inp = el("input");
+    inp.type = "checkbox";
+    inp.checked = !!on;
+    inp.disabled = !!disabled;
+    inp.addEventListener("change", () => onToggle(inp.checked));
+    lab.appendChild(inp);
+    lab.appendChild(el("span", "track"));
+    lab.appendChild(el("span", "knob"));
+    return lab;
+  }
+  function button(label, iconName, onClick, disabled) {
+    const b = el("button", "btn");
+    b.type = "button";
+    b.disabled = !!disabled;
+    if (iconName) b.appendChild(icon(iconName));
+    b.appendChild(document.createTextNode(label));
+    b.addEventListener("click", onClick);
+    return b;
+  }
+  async function runCheck(id) {
+    live.busy[id] = true;
+    paint();
+    const j = await post("platform_check", { platform: id });
+    if (j && j.check) {
+      live.checks[id] = j.check;
+      live.checkedAt[id] = Date.now();
+    }
+    live.busy[id] = false;
+    paint();
+    if (j && j.check && j.check.ready && !live.catalogs[id]) await loadCatalog(id);
+  }
+  async function loadCatalog(id) {
+    live.busy[id] = true;
+    paint();
+    const j = await post("platform_models", { platform: id });
+    if (j && j.catalog) live.catalogs[id] = j.catalog;
+    live.busy[id] = false;
+    paint();
+  }
+  async function change(op, extra) {
+    const j = await post(op, extra);
+    if (j && j.output) toast(j.output.split("\n")[0], false, "check");
+    if (ctx && ctx.onChange) await ctx.onChange();
+  }
+  function binaryBlock(r, entry, check) {
+    const box = el("div");
+    box.appendChild(el("h3", null, "Binary"));
+    const val = el("div", "val" + (check ? check.bin_found ? "" : " err" : " mute"));
+    if (check && !check.bin_found) {
+      val.appendChild(icon("xcircle"));
+      val.appendChild(document.createTextNode("Not found on the launchd PATH"));
+    } else {
+      const c = el("code", null, check && check.bin || entry.bin || "\u2026");
+      val.appendChild(c);
+    }
+    box.appendChild(val);
+    const src = { env: "from AGENTLOOP_" + r.cli.toUpperCase() + "_BIN", file: "set here", auto: "found on PATH" }[(check || entry).bin_source] || "";
+    const sub = el("div", "sub");
+    sub.textContent = check ? check.bin_found ? [src, check.version].filter(Boolean).join(" \xB7 ") + " \xB7 this is the path launchd sees, the one scheduled runs use" : "looked at " + check.bin + " \u2014 type the path if it lives elsewhere, or install it: " + check.reason.split("install: ")[1] : "checking\u2026";
+    box.appendChild(sub);
+    const ctrl = el("div", "ctrl");
+    const inp = el("input");
+    inp.type = "text";
+    inp.value = entry.bin || "";
+    inp.placeholder = "Use another binary\u2026 (leave empty to detect)";
+    inp.disabled = !!live.busy[r.id] || entry.supported === false;
+    inp.addEventListener("change", async () => {
+      await change("platform_set_bin", { platform: r.id, bin: inp.value.trim() });
+      await runCheck(r.id);
+    });
+    ctrl.appendChild(inp);
+    ctrl.appendChild(button(
+      "Detect",
+      "radar",
+      async () => {
+        await change("platform_set_bin", { platform: r.id, bin: "" });
+        await runCheck(r.id);
+      },
+      live.busy[r.id] || entry.supported === false
+    ));
+    box.appendChild(ctrl);
+    return box;
+  }
+  function sessionBlock(r, entry, check) {
+    const box = el("div");
+    box.appendChild(el("h3", null, "Session"));
+    const val = el("div", "val" + (check ? check.ready ? " ok" : check.bin_found ? " err" : " mute" : " mute"));
+    if (!check) {
+      val.textContent = live.busy[r.id] ? "checking\u2026" : "\u2014 not checked";
+    } else if (check.ready) {
+      val.appendChild(icon("check"));
+      val.appendChild(document.createTextNode("Signed in as " + (check.account || "unknown")));
+    } else if (!check.bin_found) {
+      val.textContent = "\u2014 waiting for a binary";
+    } else {
+      val.appendChild(icon("xcircle"));
+      val.appendChild(document.createTextNode(check.reason));
+    }
+    box.appendChild(val);
+    const sub = el("div", "sub");
+    sub.textContent = entry.supported === false ? "the session test and the model list arrive with the OpenCode engine" : check ? ago(live.checkedAt[r.id]) + " with " + (r.id === "anthropic" ? "claude auth status" : "codex login status") : "";
+    box.appendChild(sub);
+    const ctrl = el("div", "ctrl");
+    ctrl.appendChild(button("Test", "refresh", () => runCheck(r.id), live.busy[r.id] || entry.supported === false || check && !check.bin_found));
+    ctrl.appendChild(el("span", "muted", "re-runs the sign-in check and the version probe"));
+    box.appendChild(ctrl);
+    return box;
+  }
+  function modelRow(r, entry, m, using, gone) {
+    const enabledNow = (entry.models_enabled || []).includes(m.v);
+    const row = el("div", "mrow" + (enabledNow ? "" : " offrow"));
+    const name = el("div", "mname");
+    name.appendChild(el("b", null, m.label || m.v));
+    name.appendChild(el("span", null, m.v + (m.desc ? " \u2014 " + m.desc : "") + (gone ? " \u2014 no longer in the catalog" : "") + (m.deprecated_by ? " \u2014 deprecated, \u2192 " + m.deprecated_by : "")));
+    row.appendChild(name);
+    const meta = el("div", "mmeta");
+    if (m.price) meta.appendChild(el("span", "price", "$" + m.price.input + " / $" + m.price.output));
+    else if (r.id === "openai" && !gone) meta.appendChild(el("span", null, "no price"));
+    if (m.efforts && m.efforts.length) meta.appendChild(el("span", null, m.efforts[0] + " \u2192 " + m.efforts[m.efforts.length - 1]));
+    const n = using[m.v] || 0;
+    if (n) meta.appendChild(el("span", "jobs", n + " job" + (n === 1 ? "" : "s")));
+    row.appendChild(meta);
+    row.appendChild(switchEl(enabledNow, live.busy[r.id], n ? n + " enabled job(s) use this model" : "", async (on) => {
+      const cur = (entry.models_enabled || []).slice();
+      const next = on ? cur.includes(m.v) ? cur : cur.concat([m.v]) : cur.filter((v) => v !== m.v);
+      await change("platform_set_models", { platform: r.id, models: next });
+    }));
+    return row;
+  }
+  function modelsSection(r, entry, check, catalog) {
+    const frag = document.createDocumentFragment();
+    const head = el("div", "models-h");
+    head.appendChild(el("h3", null, "Models"));
+    const age = el("span", "age");
+    if (catalog) {
+      const from = r.id === "openai" ? "from codex debug models" : "from the installed CLI";
+      age.textContent = from + (catalog.stale ? " \u2014 " + catalog.reason : "") + (r.id === "anthropic" ? " \xB7 every Claude model takes effort low \u2192 max" : "");
+    } else if (entry.supported === false) {
+      age.textContent = "the providers you sign in to, listed by opencode models";
+    }
+    head.appendChild(age);
+    head.appendChild(el("span", "sp"));
+    const ready = !!(check && check.ready);
+    head.appendChild(button(catalog ? "Refresh" : "Load models", "refresh", () => loadCatalog(r.id), !ready || live.busy[r.id]));
+    frag.appendChild(head);
+    if (entry.supported === false) {
+      frag.appendChild(el("div", "mempty", "Nothing to switch on yet \u2014 OpenCode jobs, and this list, come with the next release. The card is here so the binary is found and named before that day."));
+      return frag;
+    }
+    if (!catalog) {
+      frag.appendChild(el("div", "mempty", ready ? "Loading the models\u2026" : "Test the session first, then load the models."));
+      return frag;
+    }
+    const using = entry.jobs_using || {};
+    const seen = /* @__PURE__ */ new Set();
+    catalog.models.forEach((m) => {
+      seen.add(m.v);
+      frag.appendChild(modelRow(r, entry, m, using, false));
+    });
+    (entry.models_enabled || []).filter((v) => !seen.has(v)).forEach((v) => frag.appendChild(modelRow(r, entry, { v, label: v }, using, true)));
+    if (!catalog.models.length && !(entry.models_enabled || []).length) frag.appendChild(el("div", "mempty", "The catalog came back empty" + (catalog.reason ? " \u2014 " + catalog.reason : "") + "."));
+    return frag;
+  }
+  function platformCard(r, entry, check, catalog) {
+    const card = el("section", "platcard");
+    card.id = "platcard-" + r.id;
+    const h = el("div", "platcard-h");
+    h.appendChild(el("div", "platcard-ic" + (entry.supported === false ? " off" : ""), r.mark));
+    const t = el("div", "platcard-t");
+    t.appendChild(el("b", null, r.name));
+    t.appendChild(el("span", null, r.sub));
+    h.appendChild(t);
+    const right = el("div", "platcard-r");
+    const st = platformStatus(entry, check);
+    const pill = el("span", "pill " + st.cls, st.label);
+    right.appendChild(pill);
+    const sw = el("div", "swlabel");
+    const row = el("div", "swrow");
+    row.appendChild(document.createTextNode(entry.enabled ? "Enabled " : "Disabled "));
+    const canToggle = entry.supported !== false && !live.busy[r.id] && (entry.enabled || check && check.ready);
+    row.appendChild(switchEl(
+      !!entry.enabled,
+      !canToggle,
+      entry.supported === false ? "runs on OpenCode arrive with the next release" : canToggle ? "" : "unlocks when the session test passes",
+      async (on) => {
+        await change(on ? "platform_enable" : "platform_disable", { platform: r.id });
+      }
+    ));
+    sw.appendChild(row);
+    const n = entry.jobs_on_platform || 0;
+    sw.appendChild(el("span", null, entry.supported === false ? "runs on OpenCode are not supported yet" : n ? n + " enabled job" + (n === 1 ? "" : "s") + " run" + (n === 1 ? "s" : "") + " here" : entry.enabled ? "jobs may pick this platform" : "unlocks when the session test passes"));
+    right.appendChild(sw);
+    h.appendChild(right);
+    card.appendChild(h);
+    const g = el("div", "platcard-g");
+    g.appendChild(binaryBlock(r, entry, check));
+    g.appendChild(sessionBlock(r, entry, check));
+    card.appendChild(g);
+    card.appendChild(modelsSection(r, entry, check, catalog));
+    return card;
+  }
+  function paint() {
+    if (!ctx) return;
+    const head = $("st-head"), host = $("st-platforms");
+    if (!head || !host) return;
+    head.textContent = "";
+    head.appendChild(pageHeader({
+      icon: "gear",
+      title: "Settings",
+      subtitle: "Which agent CLIs this scheduler may run, and which of their models a job may pick."
+    }));
+    host.textContent = "";
+    if (ctx.error) {
+      const b = setupBanner(false, ctx.error);
+      if (b) host.appendChild(b);
+    }
+    host.appendChild(el("div", "summary", settingsSummary(ctx.platforms)));
+    REGISTRY.forEach((r) => host.appendChild(platformCard(r, (ctx.platforms || {})[r.id] || {}, live.checks[r.id] || null, live.catalogs[r.id] || null)));
+  }
+  function renderSettingsPage(c) {
+    ctx = c;
+    paint();
+    if (probed || c.configured === void 0) return;
+    probed = true;
+    REGISTRY.forEach((r) => {
+      if (!live.checks[r.id] && !live.busy[r.id]) runCheck(r.id);
+    });
+  }
+
   // ui/app/index.js
   function init(cc) {
     bindPage(cc);
@@ -2622,8 +2911,22 @@
     tokensText,
     dayNumbers,
     shapeRepoRows,
-    projectStepError
+    projectStepError,
+    // renderSettingsPage, settingsSummary, platformStatus and
+    // setupBanner are Task 8's (the platforms UI plan):
+    // Settings › Platforms, drawn whole by ui/app/settings.js.
+    // The page's own paintSettings() calls
+    // ALApp.renderSettingsPage() on entering the view and after
+    // every /api/models re-read; settingsSummary and
+    // platformStatus are the two pure helpers the contract
+    // tests pin standing alone; setupBanner is the strip a
+    // later task mounts on Overview and Jobs while nothing is
+    // configured, reached from the page the same way.
+    renderSettingsPage,
+    settingsSummary,
+    platformStatus,
+    setupBanner
   };
 })();
-/* ui-bundle: 24b130aa2571dbce93c144c0852836ce3f0881d538c5f9bc393527c2f741ad66 */
-/* ui-sources: baff89a7ac1f9e01a6ab68962ae9d9e1adcc668331074dd98085d3ddd678ee47 */
+/* ui-bundle: 9737d4cb19f47a95adcbf6a18550a19e8360609bda90d32a86e28f17dd84fac8 */
+/* ui-sources: 7040d201f8364defceccd2e13309a57969338fad7108772994df817b06aabfcd */

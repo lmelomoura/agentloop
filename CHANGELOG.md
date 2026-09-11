@@ -97,6 +97,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - One rule (`modelEnabled`) decides whether a job's model is switched on —
     for the combo, the chip and the editor alike; a family value counts when
     an id of it is on.
+  - The Settings item comes out of hiding, with the Platforms page behind it:
+    one card per platform that finds the CLI, tests the session live, loads
+    the catalog once the test passes and switches models on one by one — every
+    change saves at once and the page re-reads what the engine now allows.
+    OpenCode is listed and detected, otherwise waiting for its engine.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and

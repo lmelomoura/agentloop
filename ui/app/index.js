@@ -45,6 +45,7 @@ import { changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, e
          platformOptions, hiddenModelCount, modelEnabled, DISABLED_SUFFIX,
          costParts, tokensText,
          dayNumbers, shapeRepoRows, projectStepError } from "./editor-domain.js";
+import { renderSettingsPage, settingsSummary, platformStatus, setupBanner } from "./settings.js";
 
 function init(cc){
   bindPage(cc);
@@ -228,4 +229,15 @@ window.ALApp = { init, visibleJobs, jobFilters, bulkOn,
                  // (runs.js, by import) and the run dialog's renderLog/costHtml
                  // in bin/dashboard.html, which reaches them through here.
                  costParts, tokensText,
-                 dayNumbers, shapeRepoRows, projectStepError };
+                 dayNumbers, shapeRepoRows, projectStepError,
+                 // renderSettingsPage, settingsSummary, platformStatus and
+                 // setupBanner are Task 8's (the platforms UI plan):
+                 // Settings › Platforms, drawn whole by ui/app/settings.js.
+                 // The page's own paintSettings() calls
+                 // ALApp.renderSettingsPage() on entering the view and after
+                 // every /api/models re-read; settingsSummary and
+                 // platformStatus are the two pure helpers the contract
+                 // tests pin standing alone; setupBanner is the strip a
+                 // later task mounts on Overview and Jobs while nothing is
+                 // configured, reached from the page the same way.
+                 renderSettingsPage, settingsSummary, platformStatus, setupBanner };

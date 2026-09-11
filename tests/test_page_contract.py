@@ -3326,6 +3326,57 @@ def test_platform_chip_renders_each_state_the_pill_and_the_why(srv, tmp_path):
     assert "Settings › Platforms" in out["model_disabled"]["title"]
 
 
+# Settings › Platforms (Task 8): the page's own hosts and wiring, and the two
+# pure helpers ui/app/settings.js exports -- the one-line summary above the
+# cards and the status chip's word -- run standing alone under Node.
+def test_the_settings_page_is_reachable_and_has_its_two_panes(srv):
+    page = srv.render_page("boot-authed")
+    assert '<button class="navitem" data-view="settings" id="nav-settings"></button>' in page, "the Settings item is hidden"
+    for part in ("st-head", "st-tabs", "sttab-platforms", "sttab-profile", "st-platforms", "st-profile", "soon-settings"):
+        assert f'id="{part}"' in page, f"missing {part}"
+    js = _js(srv)
+    assert 'const VIEWS = ["overview","jobs","runs","projects","security","settings"];' in js
+    assert 'if(currentView === "settings") paintSettings();' in _plainfn(js, "setView")
+    assert "MODELS_CONFIGURED=" in _fn(js, "loadModels") and "MODELS_ERROR=" in _fn(js, "loadModels")
+    assert "ALApp.renderSettingsPage(" in _plainfn(js, "paintSettings")
+    assert "renderSettingsPage" in _app_js(srv).split("window.ALApp = {", 1)[1]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_settings_summary_and_the_status_chip(srv, tmp_path):
+    js = _app_js(srv)
+    script = tmp_path / "settings-words.js"
+    script.write_text("""
+    const REGISTRY = [{id: "anthropic"}, {id: "openai"}, {id: "opencode"}];
+    """ + "\n".join(_plainfn(js, n) for n in ("settingsSummary", "platformStatus")) + """
+    const P = {anthropic: {enabled: true, models_enabled: ["a", "b"]}, openai: {enabled: true, models_enabled: ["c"]}, opencode: {enabled: false, models_enabled: []}};
+    console.log(JSON.stringify({
+      summary: settingsSummary(P),
+      one: settingsSummary({anthropic: {enabled: true, models_enabled: ["a"]}}),
+      on: platformStatus({supported: true, enabled: true}, {ready: true, bin_found: true}),
+      off: platformStatus({supported: true, enabled: false}, {ready: true, bin_found: true}),
+      nobin: platformStatus({supported: true, enabled: false}, {ready: false, bin_found: false}),
+      nosession: platformStatus({supported: true, enabled: false}, {ready: false, bin_found: true}),
+      planned: platformStatus({supported: false, enabled: false}, {ready: false, bin_found: false}),
+      unchecked: platformStatus({supported: true, enabled: true}, null),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["summary"] == "2 of 3 platforms enabled · 3 models available to jobs"
+    assert out["one"] == "1 of 3 platforms enabled · 1 model available to jobs"
+    assert [out[k]["label"] for k in ("on", "off", "nobin", "nosession", "planned", "unchecked")] == \
+        ["Enabled", "Disabled", "Not installed", "Not signed in", "Coming soon", "Enabled"]
+    assert out["nobin"]["cls"] == "off" and out["nosession"]["cls"] == "idle" and out["planned"]["cls"] == "disabled"
+
+
+def test_the_settings_module_speaks_the_six_actions(srv):
+    src = (REPO / "ui" / "app" / "settings.js").read_text()
+    for op in ("platform_check", "platform_enable", "platform_disable", "platform_set_bin", "platform_models", "platform_set_models"):
+        assert f'"{op}"' in src, f"settings.js never calls {op}"
+    assert "Test the session first, then load the models" in src
+    assert "no longer in the catalog" in src
+
+
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_a_probe_line_containing_markup_stays_text(srv, tmp_path):
     """The first line of a probe script's stdout, rendered. `esc()` held

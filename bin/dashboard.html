@@ -154,9 +154,7 @@ document.documentElement.dataset.theme =
     <button class="navitem" data-view="runs" id="nav-runs"></button>
     <button class="navitem" data-view="projects" id="nav-projects"></button>
     <button class="navitem" data-view="security" id="nav-security"></button>
-    <!-- Hidden until the Settings page is built: the markup and the view stay
-         so bringing it back is this attribute and the VIEWS entry. -->
-    <button class="navitem" data-view="settings" id="nav-settings" hidden></button>
+    <button class="navitem" data-view="settings" id="nav-settings"></button>
   </nav>
   <div class="side-user unset" id="side-user"></div>
 </aside>
@@ -680,8 +678,15 @@ document.documentElement.dataset.theme =
   </div><!-- /view-security -->
 
   <div class="view" id="view-settings" hidden>
-  <div class="secthead"><h3 id="h-settings"></h3></div>
-  <div class="soon" id="soon-settings"></div>
+  <!-- Settings › Platforms is drawn by ALApp.renderSettingsPage() (ui/app/settings.js)
+       into the two hosts below; the Profile tab keeps the "not built yet" note. -->
+  <div id="st-head"></div>
+  <nav class="viewtabs" id="st-tabs">
+    <button class="viewtab active" data-sttab="platforms" id="sttab-platforms"></button>
+    <button class="viewtab" data-sttab="profile" id="sttab-profile"></button>
+  </nav>
+  <div class="pane" id="st-platforms"></div>
+  <div class="pane" id="st-profile" hidden><div class="soon" id="soon-settings"></div></div>
   </div><!-- /view-settings -->
 
   <footer id="foot"></footer>
@@ -1450,6 +1455,11 @@ const I={
   // a rotated-square outline distinct from every icon above it -- nothing
   // here already drew a diamond.
   diamond:ic('<path d="M2.7 10.3a2.41 2.41 0 0 0 0 3.4l7.6 7.6a2.41 2.41 0 0 0 3.4 0l7.6-7.6a2.41 2.41 0 0 0 0-3.4l-7.6-7.6a2.41 2.41 0 0 0-3.4 0Z"/>'),
+  // Settings › Platforms' own Test / Load models / Refresh buttons
+  // (ui/app/settings.js): a circular arrow, the mockup's own glyph for
+  // "run this probe again" -- nothing above already drew one, and `radar`
+  // beside it means "detect", a different action.
+  refresh:ic('<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>'),
 };
 const STATUS_ICON={success:I.check, warning:I.alert, error:I.xcircle, idle:I.clock,
                    running:I.timer, stopped:I.power};
@@ -3380,7 +3390,9 @@ async function loadModels(){
     if(!r.ok) return;
     const d=await r.json();
     PLATFORMS=d.platforms||{};
+    MODELS_CONFIGURED=d.configured; MODELS_ERROR=d.error||"";
     refillPlatformBound();
+    if(currentView==="settings") paintSettings();
   }catch(e){ /* keep the built-in fallback lists */ }
 }
 // Whether this page still has to be told what the platforms offer. The server
@@ -3418,6 +3430,13 @@ function modelOptions(p){ return ALApp.modelOptionsFor(p, PLATFORMS, groupModels
 function refillPlatformBound(){
   if(platformCombo) applyPlatformToJobEditor($("ed-platform").value||"anthropic", true);
   if(secPlatformCombo) applyPlatformToSecurity(secEffectivePlatform(), true);
+}
+// The Settings page repaints only on entering the view and when /api/models
+// answers -- never on the five-second poll, which would reset what the
+// operator is typing into a card.
+function paintSettings(){
+  ALApp.renderSettingsPage({platforms: PLATFORMS, configured: MODELS_CONFIGURED, error: MODELS_ERROR,
+    onChange: loadModels});
 }
 
 // Effort: slider position ↔ CLI value. 0 leaves it unset (the CLI decides);
@@ -3537,6 +3556,7 @@ const WT_MODES=[
 ];
 const PLATFORM_OPTS=[{v:"anthropic",label:"Anthropic"},{v:"openai",label:"OpenAI"}];
 let PLATFORMS={};                                          // /api/models.platforms, as served
+let MODELS_CONFIGURED, MODELS_ERROR="";   // /api/models' configured and error, undefined until it answers
 // The job editor's model combo, configured by name: createCombo keeps `cfg` by
 // reference and reads cfg.def inside set(), so applyPlatformToJobEditor can
 // make the fallback the PLATFORM's -- "opus" is Anthropic's, and a lie on
@@ -4648,10 +4668,7 @@ function initModalScrollLock(){
    counters are refreshed with the data so switching pages is never needed just
    to see numbers. Overview owns the 24h band, which used to sit above every
    page — Jobs and Runs are now the whole page they are named for. */
-// "settings" is deliberately absent while the page is unbuilt: dropping it here
-// is what sends anyone whose last view WAS settings back to the overview,
-// instead of restoring them onto a blank pane with no nav item to leave by.
-const VIEWS = ["overview","jobs","runs","projects","security"];
+const VIEWS = ["overview","jobs","runs","projects","security","settings"];
 let currentView = VIEWS.includes(localStorage.ccView) ? localStorage.ccView : "overview";
 
 /* ------------------------------------------------------------ browser history
@@ -4746,6 +4763,7 @@ function setView(v, fromHistory){
   // arriving somewhere has to repaint. Without this the Jobs page opened empty:
   // the last render had drawn cards into a container this view does not show.
   render();
+  if(currentView === "settings") paintSettings();
   // Security reads its own endpoints, one subprocess per project on the server,
   // so it fetches on arrival rather than on the five-second poll — and stops
   // watching a running analysis the moment the page is left.
@@ -5649,10 +5667,19 @@ initSidebar();
 initPickers();
 initViews();
 paintUser();
-$("h-settings").innerHTML=I.gear+"Settings";
 const soon=(what)=>I.hammer+"<b>Not built yet</b><p>"+what+"</p>";
 $("soon-settings").innerHTML=soon("Your profile — photo, name, email and password — plus the "
   +"scheduler's own settings will live here. Nothing is editable yet.");
+// The Settings header itself is drawn by ALApp.renderSettingsPage() (ui/app/
+// settings.js) on entering the view; only the two tabs are labelled here.
+$("sttab-platforms").innerHTML=I.layers+"Platforms";
+$("sttab-profile").innerHTML=I.user+"Profile";
+$("st-tabs").addEventListener("click",(e)=>{
+  const b=e.target.closest(".viewtab"); if(!b) return;
+  document.querySelectorAll("#st-tabs .viewtab").forEach(x=>x.classList.toggle("active", x===b));
+  $("st-platforms").hidden=(b.dataset.sttab!=="platforms");
+  $("st-profile").hidden=(b.dataset.sttab!=="profile");
+});
 // "New job" and "New project" are no longer static markup here -- each is
 // built into its own page's header by ALApp.renderJobsPage()/
 // ALApp.renderProjectsPage() (ui/app/jobs-table.js, ui/app/projects.js), the
