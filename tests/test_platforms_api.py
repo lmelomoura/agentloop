@@ -63,11 +63,15 @@ def _write_platforms(srv, platforms):
 
 @pytest.fixture(autouse=True)
 def _isolated_registry(srv, tmp_path, monkeypatch):
-    """Every test in this file reads a platforms file of its own (missing until
-    the test writes one: list_models then reads nothing enabled), and the
-    engine behind al() -- the seed, `platform check` -- only ever sees the
-    stand-in CLIs, never the operator's."""
-    monkeypatch.setattr(srv, "PLATFORMS_FILE", tmp_path / "platforms.json")
+    """Every test in this file reads a platforms file of its own -- {"platforms":
+    {}} (empty until the test writes one: list_models then reads nothing
+    enabled) written straight to disk, so list_models() never launches the
+    engine for a seed it then throws away -- and the engine behind al() -- the
+    seed, `platform check` -- only ever sees the stand-in CLIs, never the
+    operator's."""
+    platforms_file = tmp_path / "platforms.json"
+    platforms_file.write_text(json.dumps({"platforms": {}}))
+    monkeypatch.setattr(srv, "PLATFORMS_FILE", platforms_file)
     monkeypatch.setenv("AGENTLOOP_CLAUDE_BIN", str(REPO / "test" / "fake-claude"))
     monkeypatch.setenv("AGENTLOOP_CODEX_BIN", str(FAKE_CODEX))
     monkeypatch.setenv("AGENTLOOP_OPENCODE_BIN", "/nonexistent/opencode")
@@ -83,12 +87,15 @@ def test_the_registry_rides_on_api_models(srv, tmp_path, monkeypatch):
         {"id": "a", "model": "claude-opus-5"},
         {"id": "b", "model": "claude-opus-5"},
         {"id": "off", "enabled": False, "model": "claude-sonnet-5"},
-        {"id": "o", "platform": "openai", "model": "gpt-5.6-luna"}]}))
+        {"id": "o", "platform": "openai", "model": "gpt-5.6-luna"},
+        {"id": "nomodel"},
+        {"id": "bad", "platform": "openai", "model": "opus"}]}))
     srv.PROJECTS_FILE.write_text(json.dumps({"projects": [
-        {"name": "P", "security": {"enabled": True, "model": "claude-fable-5-1"}}]}))
+        {"name": "P", "security": {"enabled": True, "model": "claude-fable-5-1"}},
+        {"name": "Q", "security": {"enabled": True}}]}))
     _write_platforms(srv, {
         "anthropic": {"enabled": True, "bin": "", "models": ["claude-opus-5", "claude-fable-5-1"]},
-        "openai": {"enabled": True, "bin": "", "models": []},
+        "openai": {"enabled": True, "bin": "", "models": ["gpt-5.6-luna"]},
         "opencode": {"enabled": False, "bin": "", "models": []}})
     out = srv.list_models()
     p = out["platforms"]
@@ -96,9 +103,14 @@ def test_the_registry_rides_on_api_models(srv, tmp_path, monkeypatch):
     a, o, c = p["anthropic"], p["openai"], p["opencode"]
     assert a["supported"] is True and a["enabled"] is True and a["usable"] is True
     assert a["models_enabled"] == ["claude-opus-5", "claude-fable-5-1"]
-    assert a["jobs_using"] == {"claude-opus-5": 2, "claude-fable-5-1": 1} and a["jobs_on_platform"] == 3
-    assert o["enabled"] is True and o["usable"] is False, "enabled with no model is not usable"
-    assert o["jobs_using"] == {"gpt-5.6-luna": 1}
+    # "nomodel" (no model) and Q's security block (no model) both fall back to
+    # the platform's default -- the first enabled model, claude-opus-5 -- and
+    # still count on the platform even though neither adds a new model key.
+    assert a["jobs_using"] == {"claude-opus-5": 4, "claude-fable-5-1": 1} and a["jobs_on_platform"] == 5
+    assert o["enabled"] is True and o["usable"] is True
+    # "bad"'s model ("opus") is not a valid openai slug, so it falls back to
+    # openai's default too and lands under the same key as "o".
+    assert o["jobs_using"] == {"gpt-5.6-luna": 2} and o["jobs_on_platform"] == 2
     assert c["supported"] is False and c["usable"] is False and c["available"] is False
     assert c["reason"] == "runs on OpenCode arrive with the OpenCode engine"
     assert out["configured"] is True and out["error"] == ""
@@ -106,6 +118,22 @@ def test_the_registry_rides_on_api_models(srv, tmp_path, monkeypatch):
     # the keys the page reads today are still there, unchanged in shape
     assert out["models"] == a["models"] and isinstance(a["models"][0], str)
     assert a["catalog_at"] == 1788585387
+
+
+def test_a_hand_edited_non_dict_platform_entry_does_not_crash(srv):
+    """A hand edit can leave .platforms.anthropic as a bare string. platform_entry
+    already falls back to {} for a non-dict entry; default_model must be read
+    from that same fallback's models_enabled, not re-derived from cfg[p] a
+    second time (which used to crash on a string: ("x" or {}).get(...))."""
+    _write_platforms(srv, {"anthropic": "x"})
+    a = srv.list_models()["platforms"]["anthropic"]
+    assert a["default_model"] == "" and a["models_enabled"] == []
+
+
+def test_a_null_jobs_list_does_not_crash_list_models(srv, tmp_path, monkeypatch):
+    monkeypatch.setattr(srv, "JOBS_FILE", tmp_path / "jobs.json")
+    srv.JOBS_FILE.write_text(json.dumps({"jobs": None}))
+    srv.list_models()          # must not raise
 
 
 def test_nothing_usable_reads_as_not_configured_and_an_unreadable_file_says_why(srv):
@@ -274,10 +302,6 @@ def test_an_unavailable_catalog_says_why(srv):
 
 
 def test_a_missing_block_is_resolved_once_when_codex_exists(srv, monkeypatch):
-    # A platforms file already on disk keeps list_models from seeding one
-    # through al() itself -- this test's own al mock is about the openai
-    # catalog resolution, not the registry, and records every call it sees.
-    _write_platforms(srv, {})
     _write_models(srv, openai=None)
     calls = []
 
@@ -293,10 +317,6 @@ def test_a_missing_block_is_resolved_once_when_codex_exists(srv, monkeypatch):
 
 
 def test_a_missing_block_without_codex_is_reported_not_resolved(srv, monkeypatch):
-    # Same reason as the sibling test above: a platforms file already on disk
-    # means list_models never calls al() itself to seed one, so the poison
-    # below only ever catches a call _openai_platform makes on its own.
-    _write_platforms(srv, {})
     _write_models(srv, openai=None)
     monkeypatch.setattr(srv, "al", lambda *a, **k: (_ for _ in ()).throw(AssertionError("al called")))
     monkeypatch.setattr(srv.shutil, "which", lambda name: None)

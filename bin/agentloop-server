@@ -2596,11 +2596,16 @@ def platforms_config():
     """config/platforms.json as (platforms dict, error sentence).
 
     The server never invents the seed: a missing file is written by the engine
-    (`agentloop platforms` runs platforms_ensure) and read back. An unreadable
-    file reads as nothing enabled, with the engine's own sentence as `error`.
+    (`agentloop platforms` runs platforms_ensure) and read back; a seed that
+    fails, or still leaves the file missing, reports the engine's own output
+    as `error`. An unreadable file (a transient OSError on one that does
+    exist) reads as nothing enabled with no error. An invalid file reads as
+    nothing enabled too, with the engine's own sentence as `error`.
     """
     if not PLATFORMS_FILE.exists():
-        al(["platforms"])
+        ok, out = al(["platforms"])
+        if not ok or not PLATFORMS_FILE.exists():
+            return {}, out or f"{PLATFORMS_FILE} could not be seeded"
     try:
         text = PLATFORMS_FILE.read_text()
     except OSError:
@@ -2638,35 +2643,45 @@ def platform_bin(p, entry):
     exactly platform_bin/platform_bin_source in the engine."""
     env = _env(PLATFORM_BIN_ENV[p]) or ""
     if env:
-        return os.path.expanduser(env), "env"
+        return env, "env"                   # the engine prints the override raw, no ~ expansion
     file_bin = (entry or {}).get("bin")
     if isinstance(file_bin, str) and file_bin:
         return os.path.expanduser(file_bin), "file"
     return _bin_detect(p), "auto"
 
 
-def jobs_using(p, jobs, projects):
-    """{model id: n} over the enabled jobs and enabled security blocks whose
-    effective platform is `p` -- the engine's `uses` (PLATFORMS_JQ), in python."""
-    try:
-        resolved = (json.loads((CONFIG_DIR / "models.json").read_text()) or {}).get("resolved") or {}
-    except Exception:  # noqa: BLE001
-        resolved = {}
-    if not isinstance(resolved, dict):
-        resolved = {}
+def jobs_using(p, jobs, projects, resolved, default, catalog_slugs):
+    """(model id -> n, n jobs) over the enabled jobs and enabled security blocks
+    whose effective platform is `p` -- the engine's `uses` (PLATFORMS_JQ), in
+    python. A job or block with no model, or one invalid on this platform, is
+    credited to the platform's default model instead (the engine's
+    `effective`) and still counts on the platform either way: `n_jobs` counts
+    jobs/blocks, `out` only the ones that land on a real (non-empty) model id.
+    """
 
     def rid(m):
         r = resolved.get(m)
         return (r.get("id") or m) if isinstance(r, dict) else m
+
+    def valid(m):
+        if p == "openai":
+            return not catalog_slugs or m in catalog_slugs   # an empty catalog validates nothing
+        return m in ("opus", "sonnet", "haiku", "fable") or m.startswith("claude-")
+
+    def effective(m):
+        return rid(m if (m and valid(m)) else default)
+
     by_name = {e.get("name"): e for e in projects if isinstance(e, dict)}
     out = {}
+    n_jobs = 0
     for j in jobs:
         if not isinstance(j, dict) or j.get("enabled") is False or _job_platform(j, projects) != p:
             continue
         proj = by_name.get(j.get("project") or "") or {}
-        m = j.get("model") or proj.get("model") or ""
+        m = effective(j.get("model") or proj.get("model") or "")
+        n_jobs += 1
         if m:
-            out[rid(m)] = out.get(rid(m), 0) + 1
+            out[m] = out.get(m, 0) + 1
     for e in projects:
         sec = e.get("security") if isinstance(e, dict) else None
         if not isinstance(sec, dict) or sec.get("enabled") not in (True, "true"):
@@ -2674,30 +2689,25 @@ def jobs_using(p, jobs, projects):
         sp = sec.get("platform") or e.get("platform") or "anthropic"
         if (sp if sp in PLATFORM_PERMISSIONS else "anthropic") != p:
             continue
-        m = sec.get("model") or ""
+        m = effective(sec.get("model") or "")
+        n_jobs += 1
         if m:
-            out[rid(m)] = out.get(rid(m), 0) + 1
-    return out
+            out[m] = out.get(m, 0) + 1
+    return out, n_jobs
 
 
-def _first_enabled(cfg, p):
-    """The first id of cfg[p]['models'], or '' -- platform_entry's default_model,
-    used for both anthropic and openai so the two never drift apart."""
-    models = (cfg.get(p) or {}).get("models")
-    return models[0] if models else ""
-
-
-def platform_entry(p, cfg, jobs, projects):
+def platform_entry(p, cfg, jobs, projects, resolved, catalog_slugs):
     """What Settings switched on for one platform, as /api/models carries it."""
     entry = cfg.get(p) if isinstance(cfg.get(p), dict) else {}
-    enabled = entry.get("enabled") is True
+    enabled = entry.get("enabled") in (True, "true")        # the engine's tostring == "true", mirrored
     models = [m for m in (entry.get("models") or []) if isinstance(m, str) and m]
     b, src = platform_bin(p, entry)
-    using = jobs_using(p, jobs, projects)
+    default = models[0] if models else ""
+    using, n_jobs = jobs_using(p, jobs, projects, resolved, default, catalog_slugs)
     return {"supported": p not in PLATFORMS_PLANNED, "enabled": enabled,
             "usable": enabled and bool(models), "bin": b, "bin_source": src,
             "bin_found": os.access(b, os.X_OK), "models_enabled": models,
-            "jobs_on_platform": sum(using.values()), "jobs_using": using}
+            "jobs_on_platform": n_jobs, "jobs_using": using}
 
 
 def list_models():
@@ -2718,11 +2728,17 @@ def list_models():
     500. `platforms.openai.models` is where those slugs belong.
     """
     cfg, err = platforms_config()
-    resolved = {}
+    resolved, catalog_slugs = {}, set()
     try:
         data = json.loads((CONFIG_DIR / "models.json").read_text())
         resolved = data.get("resolved") or {}
+        odata = data.get("openai")
+        if isinstance(odata, dict):
+            catalog_slugs = {m["slug"] for m in (odata.get("models") or [])
+                              if isinstance(m, dict) and isinstance(m.get("slug"), str)}
     except Exception:  # noqa: BLE001
+        resolved = {}
+    if not isinstance(resolved, dict):
         resolved = {}
     families = []
     for fam, desc in MODEL_FAMILIES:
@@ -2767,6 +2783,12 @@ def list_models():
             conn.close()
     except Exception:  # noqa: BLE001
         pass
+    # A hand edit can leave either file as e.g. {"jobs": null}: the try above
+    # then leaves jobs/projects as None, and jobs_using below has no try of
+    # its own around its "for j in jobs" -- normalise here so that a malformed
+    # file never takes /api/models down with it.
+    jobs = jobs if isinstance(jobs, list) else []
+    projects = projects if isinstance(projects, list) else []
     ids -= {f[0] for f in MODEL_FAMILIES}
 
     fam_order = [f[0] for f in MODEL_FAMILIES]
@@ -2779,15 +2801,17 @@ def list_models():
     anthropic = {"available": True, "reason": "", "models": models,
                  "efforts": list(ANTHROPIC_EFFORTS),
                  "permissions": PLATFORM_PERMISSIONS["anthropic"],
-                 "default_model": _first_enabled(cfg, "anthropic"),
+                 "default_model": "",
                  "catalog_at": max([int(r.get("at") or 0) for r in resolved.values() if isinstance(r, dict)] or [0])}
-    anthropic.update(platform_entry("anthropic", cfg, jobs, projects))
+    anthropic.update(platform_entry("anthropic", cfg, jobs, projects, resolved, catalog_slugs))
+    # By construction the first id of the filtered models_enabled list, like the engine.
+    anthropic["default_model"] = (anthropic["models_enabled"] or [""])[0]
     openai = _openai_platform()
-    openai.update(platform_entry("openai", cfg, jobs, projects))
-    openai["default_model"] = _first_enabled(cfg, "openai")
+    openai.update(platform_entry("openai", cfg, jobs, projects, resolved, catalog_slugs))
+    openai["default_model"] = (openai["models_enabled"] or [""])[0]
     opencode = {"available": False, "reason": "runs on OpenCode arrive with the OpenCode engine",
                 "models": [], "efforts": [], "permissions": [], "default_model": "", "catalog_at": 0}
-    opencode.update(platform_entry("opencode", cfg, jobs, projects))
+    opencode.update(platform_entry("opencode", cfg, jobs, projects, resolved, catalog_slugs))
     platforms = {"anthropic": anthropic, "openai": openai, "opencode": opencode}
     return {"models": models, "efforts": list(ANTHROPIC_EFFORTS), "platforms": platforms,
             "configured": any(v["usable"] for v in platforms.values()), "error": err}

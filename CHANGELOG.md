@@ -86,6 +86,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     (`platform_check`/`enable`/`disable`/`set_bin`/`models`/`set_models`)
     shape into `agentloop platform <verb>` calls and relay the engine's
     refusal verbatim.
+  - The page's job counts credit a job with no model, or one invalid on its
+    platform, to the platform's default model, as the engine does — instead
+    of dropping it or counting it under its own invalid raw id.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and
