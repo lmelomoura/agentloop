@@ -93,9 +93,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     offering a platform the CLI had just disabled until a reload. The first
     read is the boot's own `/api/models` call now, and the retry stands
     down while one is in flight, so a boot makes one such call, not two.
-  - A family value (`opus`) is flagged *(disabled in Settings)* exactly when
-    the launch would refuse it: when the id the family resolves to right now
-    is off the list — not while any id of that family is on. On the day the
+  - A family value (`opus`), or an explicit id reached only through a bare
+    family name on the list — what the seed writes before the cache ever
+    resolves it — is flagged *(disabled in Settings)* exactly when the
+    launch would refuse it: when the id the family resolves to right now is
+    off the list — not while any id of that family is on. On the day the
     daily pass moves a family to a new id, the page and `tick.log` agree.
   - The Settings page's own calls answer a session that ran out the way the
     poll does — back to the login screen, no `HTTP 401` toast, no note left

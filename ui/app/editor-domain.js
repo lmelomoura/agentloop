@@ -130,15 +130,23 @@ export const DISABLED_SUFFIX = " (disabled in Settings)";
 // family is on when the list names the family itself or the id it resolves
 // to today; any other id of the family on the list does not count, since on
 // the day the daily pass moves the family to a new id the launch is refused
-// (a payload without `families` falls back to the by-prefix guess). The one
-// rule modelOptionsFor, platformState and the editor's Agent step all read.
+// (a payload without `families` falls back to the by-prefix guess). The
+// reverse also holds: an explicit id counts as on when its bare family name
+// -- what the seed writes before the cache ever resolved anything -- sits on
+// the enabled list and `families` maps that family to this same id; any
+// OTHER id of that family still stays off. The one rule modelOptionsFor,
+// platformState and the editor's Agent step all read.
 export function modelEnabled(platform, model, platforms){
   const key = platform === "openai" ? "openai" : "anthropic";
   const p = (platforms || {})[key];
   if(!p || !Array.isArray(p.models_enabled)) return true;
   if(!model) return true;
   if(p.models_enabled.includes(model)) return true;
-  if(!/^(opus|sonnet|haiku|fable)$/.test(model)) return false;
+  if(!/^(opus|sonnet|haiku|fable)$/.test(model)){
+    // Not a bare family value either -- the only other way in is a family
+    // whose name sits unresolved on the list and resolves to THIS id.
+    return Object.entries(p.families || {}).some(([f, id]) => id === model && p.models_enabled.includes(f));
+  }
   if(p.families && typeof p.families === "object"){
     const id = p.families[model];
     return typeof id === "string" && id !== "" && p.models_enabled.includes(id);

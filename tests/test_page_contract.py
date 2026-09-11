@@ -3254,7 +3254,12 @@ def test_model_enabled_is_one_rule_for_the_combo_the_chip_and_the_editor(srv, tm
     family whose resolved id is off is off, even while another id of the
     family is on (the day the daily pass moves opus to a new id, every family
     job is refused at launch; the page must show the chip that day). A
-    payload without `families` (an older server) keeps the by-prefix guess."""
+    payload without `families` (an older server) keeps the by-prefix guess.
+
+    The reverse also holds: an explicit id counts as on when its bare family
+    name -- what the seed writes before the cache ever resolved anything --
+    sits on the enabled list and `families` maps that family to this same
+    id; any OTHER id of that family still stays off."""
     js = _app_js(srv)
     script = tmp_path / "model-enabled.js"
     script.write_text(_plainfn(js, "modelEnabled") + """
@@ -3281,6 +3286,13 @@ def test_model_enabled_is_one_rule_for_the_combo_the_chip_and_the_editor(srv, tm
       resolved_off: modelEnabled("anthropic", "sonnet", R),
       moved: modelEnabled("anthropic", "opus", M),
       listed_family: modelEnabled("anthropic", "opus", F),
+      // The inverse of listed_family: asking with the id "opus" resolves to,
+      // not with "opus" itself -- still on, through the same bare entry.
+      listed_family_resolved_id: modelEnabled("anthropic", "claude-opus-6", F),
+      // The containment case: F's family resolves to claude-opus-6, so a
+      // DIFFERENT id of that family must not ride along just because the
+      // family itself is on the list.
+      listed_family_other_id: modelEnabled("anthropic", "claude-opus-5", F),
       unresolved: modelEnabled("anthropic", "haiku", U),
     }));
     """)
@@ -3288,9 +3300,13 @@ def test_model_enabled_is_one_rule_for_the_combo_the_chip_and_the_editor(srv, tm
     assert out == {"no_registry": True, "on_list": True, "family_on": True,
                    "family_off": False, "empty_model": True, "openai_off": False,
                    "resolved_on": True, "resolved_off": False,
-                   "moved": False, "listed_family": True, "unresolved": False}, out
+                   "moved": False, "listed_family": True,
+                   "listed_family_resolved_id": True, "listed_family_other_id": False,
+                   "unresolved": False}, out
     assert out["family_on"] is True and out["moved"] is False, \
         "the by-prefix guess is only for a payload without `families`; with them, the resolved id decides"
+    assert out["listed_family_resolved_id"] is True and out["listed_family_other_id"] is False, \
+        "a bare family name on the list enables only the id it currently resolves to, not every id of it"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -3630,6 +3646,19 @@ def test_a_config_change_re_reads_the_model_registry(srv):
         "the retry must stand down while a request is already in flight"
     body = _fn(js, "loadModels")
     assert "modelsPending=true;" in body and "finally{ modelsPending=false; }" in body
+
+
+def test_a_stuck_models_fetch_does_not_silence_the_retry_forever(srv):
+    """modelsPending has no age cap of its own: a fetch that never settles --
+    a backgrounded tab, a connection dropped with no error -- leaves it true
+    forever, and retryModelsIfMissing stands down for good instead of ever
+    trying again. loadModels must stamp when a load started (modelsPendingSince),
+    and the retry must stop trusting a "pending" flag once it is 60s stale."""
+    js = _js(srv)
+    assert "modelsPendingSince" in _fn(js, "loadModels"), \
+        "loadModels must record when it started, or the retry has no way to tell a stuck load from a fresh one"
+    assert "60000" in _plainfn(js, "retryModelsIfMissing"), \
+        "the retry must age out a pending load past 60s, or a hung fetch silences every retry for the rest of the session"
 
 
 def test_the_settings_modules_own_posts_answer_a_lost_session_like_the_poll(srv):
@@ -10168,7 +10197,8 @@ def test_the_model_catalog_is_asked_for_again_until_it_arrives(srv, tmp_path):
         "permanent for this tab")
     script = tmp_path / "models-retry.js"
     script.write_text(
-        "let PLATFORMS={}, modelTries=0, nextModelTry=0, calls=0, modelsPending=false;\n"
+        "let PLATFORMS={}, modelTries=0, nextModelTry=0, calls=0,"
+        " modelsPending=false, modelsPendingSince=0;\n"
         "function loadModels(){ calls++; }\n"
         "let NOW=1000; Date.now=()=>NOW;\n"
         + _plainfn(js, "modelCatalogMissing") + "\n"
@@ -10176,8 +10206,8 @@ def test_the_model_catalog_is_asked_for_again_until_it_arrives(srv, tmp_path):
     const out = {};
     out.missing_empty = modelCatalogMissing();
     // A request already in flight (the first refresh()'s own, at boot) IS
-    // the retry: nothing is asked beside it.
-    modelsPending = true;
+    // the retry: nothing is asked beside it, while it is still fresh.
+    modelsPending = true; modelsPendingSince = NOW;
     for(let i=0;i<3;i++){ retryModelsIfMissing(); NOW += 5000; }
     out.tries_while_pending = calls;
     modelsPending = false;
@@ -10193,6 +10223,17 @@ def test_the_model_catalog_is_asked_for_again_until_it_arrives(srv, tmp_path):
     const before = calls;
     for(let i=0;i<10;i++){ retryModelsIfMissing(); NOW += 5000; }
     out.tries_once_loaded = calls - before;
+    // A fetch that never settles: modelsPending stays true forever on its
+    // own, but a load "pending" for more than 60s must stop blocking the
+    // retry, or a hung fetch silences it for the rest of the session.
+    PLATFORMS = {}; modelTries = 0; nextModelTry = 0;
+    modelsPending = true; modelsPendingSince = NOW;
+    const beforeStale = calls;
+    retryModelsIfMissing();
+    out.tries_freshly_pending = calls - beforeStale;
+    NOW += 65000;
+    retryModelsIfMissing();
+    out.tries_once_stale = calls - beforeStale;
     console.log(JSON.stringify(out));
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
@@ -10212,6 +10253,13 @@ def test_the_model_catalog_is_asked_for_again_until_it_arrives(srv, tmp_path):
         "it gives up completely instead of slowing down, so a server that comes "
         "back late is never noticed")
     assert out["tries_once_loaded"] == 0, "it keeps fetching a catalog it already has"
+    assert out["tries_freshly_pending"] == 0, (
+        "a load pending for well under 60s is still the retry in flight -- asking "
+        "again beside it is the double GET this guard exists to avoid")
+    assert out["tries_once_stale"] == 1, (
+        "a load stuck 'pending' past 60s must no longer count as one, or a fetch "
+        "that never settles -- a dropped connection, a backgrounded tab -- "
+        "silences every retry for the rest of the session")
 
 
 def test_an_empty_combo_says_which_kind_of_empty_it_is(srv):

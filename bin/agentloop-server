@@ -2035,10 +2035,13 @@ def server_supervised():
 
 
 def config_sig():
-    """Fingerprint of the three config files, so the page can tell when the parts
+    """Fingerprint of the four config files, so the page can tell when the parts
     of the payload that almost never change actually did."""
     parts = []
-    for p in (JOBS_FILE, PROJECTS_FILE, PLATFORMS_FILE):
+    # models.json carries the `families` map /api/models resolves ids from --
+    # the day the daily pass moves a family to a new id, an open tab must
+    # re-read, so its stamp rides here too.
+    for p in (JOBS_FILE, PROJECTS_FILE, PLATFORMS_FILE, CONFIG_DIR / "models.json"):
         try:
             st = p.stat()
             parts.append(f"{st.st_mtime_ns}:{st.st_size}")

@@ -250,6 +250,16 @@ def test_config_sig_moves_when_platforms_json_does(srv, tmp_path, monkeypatch):
     assert srv.config_sig() != before
 
 
+def test_config_sig_moves_when_models_json_does(srv, tmp_path, monkeypatch):
+    """The `families` map /api/models carries comes from models.json, not from
+    platforms.json -- so the day the daily pass moves a family to a new id, an
+    open tab has to notice too, and it only ever notices through this sig."""
+    monkeypatch.setattr(srv, "CONFIG_DIR", tmp_path)
+    before = srv.config_sig()
+    _write_models(srv)
+    assert srv.config_sig() != before
+
+
 def test_the_old_keys_are_still_there_for_the_current_page(srv):
     _write_models(srv, openai=_catalog_block())
     out = srv.list_models()

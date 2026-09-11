@@ -3412,10 +3412,10 @@ function groupModels(ids){
 // and scans the CLI binary: not a GET to make twice for one answer).
 // enterDashboard hands the promise to submitSetup, which has to see
 // MODELS_CONFIGURED settled before it decides where a fresh install lands.
-let modelsLoad=Promise.resolve(), modelsPending=false;
+let modelsLoad=Promise.resolve(), modelsPending=false, modelsPendingSince=0;
 async function loadModels(){
   modelsLoad=(async()=>{
-    modelsPending=true;
+    modelsPending=true; modelsPendingSince=Date.now();
     try{
       const r=await fetch("/api/models",{headers:{"X-AL-Token":TOKEN}});
       if(!r.ok) return;
@@ -3457,7 +3457,11 @@ let modelTries=0, nextModelTry=0;
 function retryModelsIfMissing(){
   // A request already in flight (the first refresh()'s own, at boot) is the
   // retry -- asking again beside it is the double GET this exists to avoid.
-  if(!modelCatalogMissing() || modelsPending) return;
+  // But a fetch that never settles -- a backgrounded tab, a connection
+  // dropped with no error -- would then silence every retry after it for
+  // good, so a load still "pending" past 60s no longer counts as one.
+  const pendingAndFresh = modelsPending && (Date.now() - modelsPendingSince) < 60000;
+  if(!modelCatalogMissing() || pendingAndFresh) return;
   const now=Date.now();
   if(now<nextModelTry) return;
   nextModelTry=now+(modelTries<6?4000:60000);

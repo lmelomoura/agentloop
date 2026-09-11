@@ -299,7 +299,9 @@
     if (!p || !Array.isArray(p.models_enabled)) return true;
     if (!model) return true;
     if (p.models_enabled.includes(model)) return true;
-    if (!/^(opus|sonnet|haiku|fable)$/.test(model)) return false;
+    if (!/^(opus|sonnet|haiku|fable)$/.test(model)) {
+      return Object.entries(p.families || {}).some(([f, id]) => id === model && p.models_enabled.includes(f));
+    }
     if (p.families && typeof p.families === "object") {
       const id = p.families[model];
       return typeof id === "string" && id !== "" && p.models_enabled.includes(id);
@@ -3009,5 +3011,5 @@
     setupBanner
   };
 })();
-/* ui-bundle: 73ae5963c2c377e479dc661b07b2198b2e5031d70982d0feb1f7539f8405a325 */
-/* ui-sources: 9a3007535b87e04c5ad8d4c9831b24be13878fdb707d4a90221dcda3c5022345 */
+/* ui-bundle: 56ae655b096afaae6fb047d1fcc12e8eb12dc34dd9c62cce503c582b9b898e4c */
+/* ui-sources: 12e71db424ecfc150aca58a3d2e36181e73d219156cbf5587f725f9b000562a9 */
