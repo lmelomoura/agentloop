@@ -189,10 +189,13 @@ function sessionBlock(r, entry, check){
 function modelRow(r, entry, m, using, gone){
   const enabledNow = (entry.models_enabled || []).includes(m.v);
   const row = el("div", "mrow" + (enabledNow ? "" : " offrow"));
+  // The long reason lives in the row's tooltip, not the line itself -- the
+  // span stays a short read, the hover is for whoever wants the why.
+  if(gone) row.title = "the engine refuses a list with an id it cannot find";
   const name = el("div", "mname");
   name.appendChild(el("b", null, m.label || m.v));
   name.appendChild(el("span", null, m.v + (m.desc ? " — " + m.desc : "")
-    + (gone ? " — no longer in the catalog — switch it off before changing the others (the engine refuses a list with an id it cannot find)" : "")
+    + (gone ? " — no longer in the catalog — switch it off before changing the others" : "")
     + (m.deprecated_by ? " — deprecated, → " + m.deprecated_by : "")));
   row.appendChild(name);
   const meta = el("div", "mmeta");
@@ -232,7 +235,7 @@ function modelsSection(r, entry, check, catalog){
   }
   if(!catalog){
     frag.appendChild(el("div", "mempty", live.busy[r.id] ? "Loading the models…"
-      : (ready ? "The catalog could not be loaded — Refresh to try again." : "Test the session first, then load the models.")));
+      : (ready ? "The catalog could not be loaded — Load models to try again." : "Test the session first, then load the models.")));
     return frag;
   }
   const using = entry.jobs_using || {};
@@ -279,10 +282,15 @@ function paint(){
   // the first seconds, each one repainting -- so save the focused Binary
   // field's card, value and selection before tearing the DOM down, and
   // restore them after, or a still-typing operator loses keystrokes to a
-  // completion that has nothing to do with what they are editing.
+  // completion that has nothing to do with what they are editing. Every
+  // switch is an <input> too (components.css covers the whole label with an
+  // invisible checkbox, which is the real click target and keeps focus
+  // after a toggle) -- type === "text" is what tells the Binary field apart
+  // from one of those, or a toggle would overwrite it with the checkbox's
+  // own value ("on").
   const active = document.activeElement;
   let savedFocus = null;
-  if(active && active.tagName === "INPUT" && host.contains(active)){
+  if(active && active.tagName === "INPUT" && active.type === "text" && host.contains(active)){
     const card = active.closest("section.platcard");
     if(card) savedFocus = {cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd};
   }

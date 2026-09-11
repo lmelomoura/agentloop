@@ -2592,9 +2592,10 @@
   function modelRow(r, entry, m, using, gone) {
     const enabledNow = (entry.models_enabled || []).includes(m.v);
     const row = el("div", "mrow" + (enabledNow ? "" : " offrow"));
+    if (gone) row.title = "the engine refuses a list with an id it cannot find";
     const name = el("div", "mname");
     name.appendChild(el("b", null, m.label || m.v));
-    name.appendChild(el("span", null, m.v + (m.desc ? " \u2014 " + m.desc : "") + (gone ? " \u2014 no longer in the catalog \u2014 switch it off before changing the others (the engine refuses a list with an id it cannot find)" : "") + (m.deprecated_by ? " \u2014 deprecated, \u2192 " + m.deprecated_by : "")));
+    name.appendChild(el("span", null, m.v + (m.desc ? " \u2014 " + m.desc : "") + (gone ? " \u2014 no longer in the catalog \u2014 switch it off before changing the others" : "") + (m.deprecated_by ? " \u2014 deprecated, \u2192 " + m.deprecated_by : "")));
     row.appendChild(name);
     const meta = el("div", "mmeta");
     if (m.price) meta.appendChild(el("span", "price", "$" + m.price.input + " / $" + m.price.output));
@@ -2631,7 +2632,7 @@
       return frag;
     }
     if (!catalog) {
-      frag.appendChild(el("div", "mempty", live.busy[r.id] ? "Loading the models\u2026" : ready ? "The catalog could not be loaded \u2014 Refresh to try again." : "Test the session first, then load the models."));
+      frag.appendChild(el("div", "mempty", live.busy[r.id] ? "Loading the models\u2026" : ready ? "The catalog could not be loaded \u2014 Load models to try again." : "Test the session first, then load the models."));
       return frag;
     }
     const using = entry.jobs_using || {};
@@ -2695,7 +2696,7 @@
     }));
     const active = document.activeElement;
     let savedFocus = null;
-    if (active && active.tagName === "INPUT" && host.contains(active)) {
+    if (active && active.tagName === "INPUT" && active.type === "text" && host.contains(active)) {
       const card = active.closest("section.platcard");
       if (card) savedFocus = { cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd };
     }
@@ -2956,5 +2957,5 @@
     setupBanner
   };
 })();
-/* ui-bundle: b9a999886229107cd99f9652f17c1852859733c1287137d36c3baeb781f7d5b4 */
-/* ui-sources: 370da79387a8e057a21043dced9e48dd133defb74d8463403fc1864b07711ec4 */
+/* ui-bundle: 15bd20b1420b25ef667bdd55f0ce6bcd20ee87ef0ca2652a08561a7d1f332337 */
+/* ui-sources: a577cc396a8762ecdca500ca369e0005f8db681df34a6ae619f9023814889104 */

@@ -3397,6 +3397,13 @@ def test_the_settings_module_speaks_the_six_actions(srv):
         "a changed binary must invalidate the stale check and catalog"
     assert "live.busy[extra.platform] = true" in src, \
         "change() must lock the card while a save is in flight"
+    # A switch's own checkbox is an <input> too (it covers the whole label
+    # and is the real click target, per components.css), so the repaint's
+    # focus guard must check the type as well as the tag -- otherwise a
+    # toggle leaves its checkbox focused and paint() mistakes it for the
+    # Binary field, overwriting it with the checkbox's own value ("on").
+    assert 'active.type === "text"' in src, \
+        "the focus guard must exclude a switch's checkbox, which is an INPUT too"
     params = re.search(r"function setupBanner\(([^)]*)\)", src).group(1)
     assert len([p for p in params.split(",") if p.strip()]) == 3, \
         "setupBanner must take (configured, error, withButton)"

@@ -104,6 +104,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     OpenCode is listed and detected, otherwise waiting for its engine.
   - The Settings page locks a card while it saves, keeps what you are typing
     across a repaint, and forgets a stale check when the binary changes.
+  - A toggle no longer writes "on" into the Binary field: the repaint's focus
+    guard mistook a switch's own checkbox -- also an `<input>` -- for the
+    field being typed into.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and
