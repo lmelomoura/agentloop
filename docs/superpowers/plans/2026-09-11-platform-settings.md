@@ -24,12 +24,12 @@
   - `runs on OpenCode arrive with the OpenCode engine`;
   - lançamento: `<id>: <p> is disabled in Settings (agentloop platform enable <p>), skipped` · `<id>: model '<m>' is not enabled in Settings — <p> enables: <lista>, skipped` · `<id>: opencode is not supported yet — it arrives with the OpenCode engine, skipped`;
   - `<p> is not enabled in Settings — enable it there, or: agentloop platform enable <p>` (escrita);
-  - `<file> is not valid JSON — no platform is enabled until it is fixed`.
+  - `<file> is not a valid platforms file (not JSON, or no .platforms object) — no platform is enabled until it is fixed`.
 - **`platform_default_model <p>`** passa a ser o primeiro id da lista `models` do ficheiro (vazio sem nenhum). O `opus` fixo de hoje desaparece.
 - **Testes:** `bash bin/agentloop selftest` (no worktree, copiar antes `config/jobs.example.json` para `config/jobs.json` — git-ignored — ou um teste falha por falta do ficheiro); `python3.13 -m pytest tests/<file> -p no:cacheprovider -q`; `bash test/e2e.test.sh`. O selftest embute o e2e e ambos usam `test/sandbox`: **nunca correr os dois em paralelo**. Testes sempre em primeiro plano, `timeout` 600000.
 - **Isolamento:** todo o teste que lança runs aponta `PLATFORMS_FILE`, `AGENTLOOP_CLAUDE_BIN=test/fake-claude`, `AGENTLOOP_CODEX_BIN=test/fake-codex`, `CODEX_HOME`, `AGENTLOOP_CONFIG`/`AGENTLOOP_DATA` para pastas de rascunho; nunca o `config/`, `data/` ou `~/.codex` reais.
 - **UI:** qualquer edição em `ui/` obriga a `bash build/build-ui.sh` no mesmo commit (o selftest recusa a árvore sem isso). Ícones só do conjunto `I` da página; nada de emoji.
-- **CHANGELOG:** entrada em `## [Unreleased]` no mesmo commit que o código (o selftest falha quando `main` mexeu e o ficheiro não). Formato: "o que mudou e o que custava não ter".
+- **CHANGELOG:** o selftest exige que `CHANGELOG.md` seja pelo menos tão recente como o último commit de código, por isso **cada commit de código toca o CHANGELOG**: até à Task 10, cada tarefa acrescenta um ponto ao entry interino que a Task 1 abriu em `## [Unreleased]` → `### Added` ("**`config/platforms.json`'s seed and readers…**"), dizendo o que essa tarefa entregou; a Task 10 substitui o entry interino pelo entry final da funcionalidade. Formato: "o que mudou e o que custava não ter".
 - **Commits:** frequentes, uma tarefa por commit no mínimo; terminar a mensagem com `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
 
 ## Mapa de ficheiros
@@ -300,6 +300,8 @@ upgrade keeps everything running; nothing reads it for a decision yet.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
+
+> **Task 1 entregue** (09e42dc, 338287c, 8c39421). A revisão mudou três coisas que as tarefas seguintes herdam: `platforms_jq` tem agora dois argumentos posicionais à cabeça — `platforms_jq <default-anthropic> <default-openai> <filtro> [opções jq]` — e o `uses` regista o modelo **efectivo** de cada job (`resolved(effective(p; m))`: o próprio quando é válido na plataforma, senão o default recebido); `platforms_seed` passa os defaults legados (`opus`, primeiro slug visível) e `platform_jobs_on` passa `platform_default_model`; o predicado `platforms_valid` é partilhado por `platforms_error`, `platforms_json` e `write_platforms`, e a frase de erro é a das *Global Constraints*. Sem catálogo OpenAI a semente mantém o slug configurado. O selftest ficou em 647 asserções.
 
 ### Task 2: O binário com override e a verificação ao vivo (`platform_bin`, `platform_check`, `platform_ready`)
 
@@ -602,7 +604,7 @@ Em `cmd_selftest`, a seguir ao bloco da Task 2, inserir:
       and .opencode.usable == false and (.opencode.models_enabled == [])' >/dev/null 2>&1 \
     && ok "platforms: the three platforms, each with enabled, usable, bin_source, models_enabled and the jobs using them" || bad "platforms: $_pl"
   printf '{oops' > "$pc/config/platforms.json"
-  pc_al platforms 2>/dev/null | "$JQ" -e '._error | test("not valid JSON")' >/dev/null 2>&1; want "platforms carries _error when the file is unreadable" 0 $?
+  pc_al platforms 2>/dev/null | "$JQ" -e '._error | test("not a valid platforms file")' >/dev/null 2>&1; want "platforms carries _error when the file is unreadable" 0 $?
   pc_al platform enable openai >/dev/null 2>&1; want "and enable refuses to write over it" 1 $?
 ```
 
@@ -748,7 +750,8 @@ cmd_platforms() { # one JSON object: what each listed platform offers, whether i
     if platform_usable "$p"; then usable=true; else usable=false; fi
     men="$(platform_models_enabled "$p" | "$JQ" -R . | "$JQ" -sc .)"
     jon="$(num "$(platform_jobs_on "$p" | grep -c . 2>/dev/null)")"
-    jus="$(platforms_jq '[uses[] | select(.p == $p) | select(.m != "")] | group_by(.m) | map({key: .[0].m, value: length}) | from_entries' -c --arg p "$p")"
+    jus="$(platforms_jq "$(platform_default_model anthropic)" "$(platform_default_model openai)" \
+             '[uses[] | select(.p == $p) | select(.m != "")] | group_by(.m) | map({key: .[0].m, value: length}) | from_entries' -c --arg p "$p")"
     cat_at=0; cat_ok=false; pr_at=0; pr_ck=0; pr_src=""; unpriced="[]"
     if [ "$p" = "openai" ]; then
       cat_at="$(num "$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)")"
@@ -988,6 +991,16 @@ bash bin/agentloop selftest 2>&1 | grep -E "FAIL|passed"
 Esperado: as asserções novas de (a)–(c) a falhar (as recusas ainda não existem; `platform_default_model` ainda responde `opus`).
 
 - [ ] **Step 4: Implementar**
+
+(a0) `platform_model_enabled` — a revisão da Task 1 notou a assimetria: a semente pode escrever uma família nua (`opus`) quando a cache ainda não a resolveu, e um job que depois nomeie o id explícito (`claude-opus-5`) não contaria como activado. Acrescentar, ao lado de `family_cached_id`:
+
+```bash
+family_of_cached_id() { # family_of_cached_id <id> -> the family whose cached resolution is this id, or nothing
+  [ -f "$MODELS_FILE" ] || return 0
+  "$JQ" -r --arg id "$1" '.resolved | to_entries[] | select(.value.id == $id) | .key' "$MODELS_FILE" 2>/dev/null | head -1
+}
+```
+e em `platform_model_enabled`, depois da comparação pelo id resolvido, a comparação inversa: `fam="$(family_of_cached_id "$2")"; [ -n "$fam" ] && printf '%s\n' "$list" | grep -qxF -- "$fam"`. Uma asserção no bloco `pf` da Task 1 (junto às de `platform_model_enabled`): com a lista `["opus"]` e a cache a resolver `opus` para `claude-opus-5`, `platform_model_enabled anthropic claude-opus-5` responde 0.
 
 (a) `platform_default_model` — substituir por:
 
@@ -1413,7 +1426,9 @@ def test_nothing_usable_reads_as_not_configured_and_an_unreadable_file_says_why(
     srv.PLATFORMS_FILE.write_text("{oops")
     out = srv.list_models()
     assert out["configured"] is False
-    assert out["error"].endswith("is not valid JSON — no platform is enabled until it is fixed")
+    assert out["error"].endswith("is not a valid platforms file (not JSON, or no .platforms object) — no platform is enabled until it is fixed")
+    srv.PLATFORMS_FILE.write_text(json.dumps({"platform": {"anthropic": {"enabled": True}}}))   # a typo by hand: no .platforms object
+    assert srv.list_models()["error"].endswith("no platform is enabled until it is fixed")
     assert out["platforms"]["anthropic"]["enabled"] is False
 
 
@@ -1533,12 +1548,15 @@ def platforms_config():
         text = PLATFORMS_FILE.read_text()
     except OSError:
         return {}, ""
+    bad = f"{PLATFORMS_FILE} is not a valid platforms file (not JSON, or no .platforms object) — no platform is enabled until it is fixed"
     try:
         data = json.loads(text)
     except ValueError:
-        return {}, f"{PLATFORMS_FILE} is not valid JSON — no platform is enabled until it is fixed"
+        return {}, bad
     p = data.get("platforms") if isinstance(data, dict) else None
-    return (p if isinstance(p, dict) else {}), ""
+    if not isinstance(p, dict):
+        return {}, bad                     # the engine's platforms_valid, mirrored
+    return p, ""
 
 
 def _bin_detect(p):
