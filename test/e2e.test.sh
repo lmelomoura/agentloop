@@ -587,11 +587,25 @@ echo
 echo "28. upgrade path: no platforms file and an enabled job -> seeded from it, and the run is unchanged"
 mkjob j28
 jq '.jobs[0].enabled = true | .jobs[0].model = "claude-opus-5"' "$ROOT/config/jobs.json" > "$ROOT/config/jobs.next" && mv "$ROOT/config/jobs.next" "$ROOT/config/jobs.json"
+# Scenario 24 left "sandbox-oa" behind with its security block still enabled
+# on openai, and platforms_seed's own comment says a platform is seeded
+# enabled by EITHER an enabled job or an enabled security block -- left as
+# is, that block alone would seed openai as enabled, and the assertion below
+# would pass for the wrong reason (a leftover, not a fresh read of j28 alone).
+jq '(.projects[] | select(.name == "sandbox-oa") | .security.enabled) = false' \
+  "$ROOT/config/projects.json" > "$ROOT/projects.next" && mv "$ROOT/projects.next" "$ROOT/config/projects.json"
 rm -f "$ROOT/config/platforms.json"
 FAKE_MODE=complete FAKE_SESSION=sess-28 "$AL" run j28 >/dev/null 2>&1
 sleep 2
 jq -e '.platforms.anthropic.enabled == true and (.platforms.anthropic.models | index("claude-opus-5")) != null' "$ROOT/config/platforms.json" >/dev/null 2>&1 \
   && ok "the file was seeded with the enabled job's platform and model" || bad "seed: $(cat "$ROOT/config/platforms.json" 2>/dev/null)"
+# The fixture at the top of this file enables openai; the seed, with no
+# enabled openai job or project anywhere in this run, must not. This is the
+# one observable that tells "seeded fresh" apart from "the fixture survived
+# the rm -f above" -- both would pass the anthropic assertion just above.
+jq -e '.platforms.openai.enabled == false' "$ROOT/config/platforms.json" >/dev/null 2>&1 \
+  && ok "and openai came out disabled — this is the seed, not the fixture surviving the rm" \
+  || bad "openai after reseed: $(cat "$ROOT/config/platforms.json" 2>/dev/null)"
 [ "$(lastrun | jq -r .session)" = "sess-28" ] && ok "and the job ran as before" || bad "no run: $(lastrun)"
 
 echo

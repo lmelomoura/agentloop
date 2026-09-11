@@ -319,7 +319,7 @@ security_derived_jobs() {
     # Containment does not come from the permission mode: the worktree is
     # disposable, the ledger only accepts writes through the CLI's validating
     # door, and AL_SECURITY_AGENT keeps the human-authority verbs shut.
-    local splat smodel seffort perm
+    local splat smodel seffort perm nomodel_warn
     splat="$(security_get "$project" '.platform' '')"
     [ -n "$splat" ] || splat="$(project_get "$project" '.platform' 'anthropic')"
     case "$splat" in
@@ -327,14 +327,26 @@ security_derived_jobs() {
       *) security_warn "security: project '$project' names a platform the engine does not know ('$splat') -- using anthropic"
          splat="anthropic" ;;
     esac
+    # Shared by both "nothing is enabled" branches below, so the sentence is
+    # written once: a project on a platform with no model switched on in
+    # Settings at all, whether its own chosen model is unknown to the CLI or
+    # known but switched off.
+    nomodel_warn="security: project '$project' runs on $splat but no model is enabled for it in Settings -- the analysis will be refused at launch"
     smodel="$(security_get "$project" '.model' "$(platform_default_model "$splat")")"
     if ! platform_model_ok "$splat" "$smodel"; then
       local sdefault; sdefault="$(platform_default_model "$splat")"
-      # openai with no catalog resolved yet: platform_default_model answers
-      # NOTHING, so the generic message below would read "using " with the
-      # default missing off the end. Name the actual cause instead.
+      # sdefault empty means nothing is enabled for $splat in Settings -- not
+      # necessarily an unresolved OpenAI catalog, which is only ONE of the
+      # ways it can happen and the only one with a remedy of its own. Naming
+      # the wrong cause here sent an operator to refresh a catalog that had
+      # nothing to do with it whenever the real problem was simply nothing
+      # switched on.
       if [ -z "$sdefault" ]; then
-        security_warn "security: project '$project' runs on openai but no OpenAI catalog is resolved yet (run: agentloop resolve-models openai) -- the analysis will be refused at launch"
+        if [ "$splat" = openai ] && ! openai_catalog_available; then
+          security_warn "security: project '$project' runs on openai but no OpenAI catalog is resolved yet (run: agentloop resolve-models openai) -- the analysis will be refused at launch"
+        else
+          security_warn "$nomodel_warn"
+        fi
       else
         security_warn "security: project '$project' has a model $splat does not know ('$smodel') -- using $sdefault"
       fi
@@ -349,7 +361,7 @@ security_derived_jobs() {
         security_warn "security: project '$project' names a model that is not enabled in Settings ('$smodel' on $splat) -- using $sfirst"
         smodel="$sfirst"
       else
-        security_warn "security: project '$project' runs on $splat but no model is enabled for it in Settings -- the analysis will be refused at launch"
+        security_warn "$nomodel_warn"
       fi
     fi
     seffort="$(security_get "$project" '.effort' '')"
@@ -4334,6 +4346,19 @@ JSON
   printf '["gpt-a"]' | cfg_al platform set-models openai >/dev/null 2>&1
   printf '{"id":"ej2","platform":"openai","model":"gpt-b","prompt":"p"}' | cfg_al create >/dev/null 2>&1; want "create refuses a model switched off in Settings" 1 $?
   printf '["gpt-a","gpt-b"]' | cfg_al platform set-models openai >/dev/null 2>&1
+  # The launch-time twin of the create-time gate above: with nothing enabled
+  # for openai, `dj` (model gpt-b, still on openai from the round trip above)
+  # is skipped naming Settings as the cause. cfg_al's AGENTLOOP_CODEX_BIN
+  # points nowhere, so a gate that failed to fire here would fall through to
+  # the CLI readiness check instead and log "not ready" -- proving this gate
+  # runs before that one, not just that SOME refusal happened.
+  printf '[]' | cfg_al platform set-models openai >/dev/null 2>&1
+  : > "$tmp/cfg/data/tick.log"
+  cfg_al run dj >/dev/null 2>&1
+  grep -q "dj: no model is enabled for openai in Settings, skipped" "$tmp/cfg/data/tick.log" \
+    && ok "run: no model enabled on openai is skipped naming Settings, not codex readiness" \
+    || bad "tick.log: $(cat "$tmp/cfg/data/tick.log" 2>/dev/null)"
+  printf '["gpt-a","gpt-b"]' | cfg_al platform set-models openai >/dev/null 2>&1
   printf '{"name":"np","platform":"openai","security":{"enabled":true,"model":"gpt-zzz"}}' | cfg_al project-set >/dev/null 2>&1; want "project-set refuses a security model that is not enabled" 1 $?
   printf '{"name":"np","platform":"openai","security":{"enabled":true,"platform":"anthropic","model":"opus"}}' | cfg_al project-set >/dev/null 2>&1; want "project-set accepts an enabled security model on the block's own platform" 0 $?
   "$JQ" '.platforms.anthropic.models = []' "$tmp/cfg/config/platforms.json" > "$tmp/cfg/pf.next"; mv "$tmp/cfg/pf.next" "$tmp/cfg/config/platforms.json"
@@ -4452,6 +4477,32 @@ JSON
   case "$warn" in
     *"no OpenAI catalog is resolved yet"*"resolve-models openai"*)
       ok "and the warning names the missing catalog and the refresh command" ;;
+    *) bad "warning: $warn" ;;
+  esac
+
+  # A project with no model at all on anthropic -- sdefault comes out empty
+  # here too, but there is no catalog to blame it on (only openai has one):
+  # the warning must name anthropic and "no model is enabled", never send the
+  # operator to refresh a catalog that was never the problem. A separate
+  # scratch dir/fixture, like dnocat's own, so dplat and dnocat keep their
+  # values.
+  mkdir -p "$tmp/dnomodel/data"
+  cat > "$tmp/dnomodel/projects.json" <<'JSON'
+{"projects":[{"name":"Of","cwd":"/tmp/of","security":{"enabled":true}}]}
+JSON
+  printf '{"jobs":[]}\n' > "$tmp/dnomodel/jobs.json"
+  printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":[]}}}\n' > "$tmp/dnomodel/platforms.json"
+  dnomodel() { ( JOBS_FILE="$tmp/dnomodel/jobs.json"; PROJECTS_FILE="$tmp/dnomodel/projects.json"; DATA_DIR="$tmp/dnomodel/data"
+                 PLATFORMS_FILE="$tmp/dnomodel/platforms.json"
+                 MODELS_FILE="$tmp/dnomodel/no-such-models.json"; job_get "$1" "$2" '' ); }
+  [ -z "$(dnomodel security-of .model)" ] \
+    && ok "anthropic with no model enabled: the derived job's model is empty too" \
+    || bad "model '$(dnomodel security-of .model)'"
+  warn="$(cat "$tmp/dnomodel/data/security/derivation-warnings.txt" 2>/dev/null)"
+  case "$warn" in
+    *"resolve-models"*) bad "warning sent anthropic to refresh an OpenAI catalog: $warn" ;;
+    *"project 'Of' runs on anthropic but no model is enabled for it in Settings"*)
+      ok "and the warning names anthropic and the real cause, not a catalog" ;;
     *) bad "warning: $warn" ;;
   esac
 
@@ -9479,13 +9530,21 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   # gets. Each of these would otherwise fail at launch with nothing saying why.
   local not_ready
   # The operator's own gates, before the CLI's: a planned platform, a
-  # platform switched off in Settings. Each is one line before a slot is
-  # spent, the treatment `cwd missing` gets.
+  # platform switched off in Settings, nothing switched on to run it with.
+  # Each is one line before a slot is spent, the treatment `cwd missing` gets.
   if platform_planned "$platform"; then
     log_tick "$id: $platform is not supported yet — it arrives with the OpenCode engine, skipped"; return 1
   fi
   platform_known "$platform" || { log_tick "$id: unknown platform '$platform', skipped"; return 1; }
   platform_enabled "$platform" || { log_tick "$id: $platform is disabled in Settings (agentloop platform enable $platform), skipped"; return 1; }
+  # Still an operator gate, ahead of the CLI's own readiness check right below
+  # and the OpenAI block's catalog check further down: with nothing enabled,
+  # $model is empty, and the catalog check would otherwise refuse it with a
+  # misleading "not in the OpenAI catalog" message instead of naming the real
+  # cause.
+  if [ -z "$(platform_models_enabled "$platform" | head -1)" ]; then
+    log_tick "$id: no model is enabled for $platform in Settings, skipped"; return 1
+  fi
   if ! not_ready="$(platform_ready "$platform")"; then
     log_tick "$id: $platform is not ready ($not_ready), skipped"; return 1
   fi
@@ -9510,10 +9569,9 @@ run_job() { # run_job <id> [--force] [resume-session-id]
     [ -z "$disallowed" ] || [ "$disallowed" = "null" ] \
       || log_tick "$id: disallowed_tools is ignored on openai (codex cannot close a tool by flag)"
   fi
-  # After the catalog: a model the CLI knows but nobody switched on in Settings.
-  if [ -z "$model" ]; then
-    log_tick "$id: no model is enabled for $platform in Settings, skipped"; return 1
-  fi
+  # After the catalog: a model the CLI knows, but not the one Settings
+  # enabled (the enabled list is never empty here -- the gate above already
+  # refused that case).
   if ! platform_model_enabled "$platform" "$model"; then
     log_tick "$id: model '$model' is not enabled in Settings — $platform enables: $(platform_models_enabled_line "$platform"), skipped"; return 1
   fi
@@ -10951,7 +11009,7 @@ age_label() { # age_label <epoch> [zero-label]
 # printed where people already look (`agentloop status`, the end of
 # `agentloop install`).
 status_platforms_block() { # one line per listed platform: enabled or not, version, account, models switched on; the Codex facts a refused run needs
-  local p j ready ver acct reason state n_on n_all cfg
+  local p j ready ver acct reason state n_on n_all cfg mid fcid
   for p in $PLATFORMS $PLATFORMS_PLANNED; do
     j="$(platform_check "$p")"
     ready="$(printf '%s' "$j" | "$JQ" -r .ready)"; ver="$(printf '%s' "$j" | "$JQ" -r .version)"
@@ -10960,7 +11018,15 @@ status_platforms_block() { # one line per listed platform: enabled or not, versi
     if platform_enabled "$p"; then state=enabled; else state=disabled; fi
     if [ "$ready" != "true" ]; then printf '%-9s : %s — %s\n' "$p" "$state" "$reason"; continue; fi
     n_on="$(num "$(platform_models_enabled "$p" | grep -c . 2>/dev/null)")"
-    n_all="$(num "$({ platform_catalog_ids "$p"; platform_models_enabled "$p"; } | sort -u | grep -c . 2>/dev/null)")"
+    # A listed family (platforms.json can still carry a bare "opus", not yet
+    # resolved to an id) is folded to the id the cache holds for it before the
+    # union with the catalog -- unfolded, the family and the id the catalog
+    # already lists count as two, one more than the catalog actually has.
+    n_all="$(num "$({ platform_catalog_ids "$p"
+                       platform_models_enabled "$p" | while IFS= read -r mid; do
+                         fcid="$(family_cached_id "$mid")"
+                         printf '%s\n' "${fcid:-$mid}"
+                       done; } | sort -u | grep -c . 2>/dev/null)")"
     # The pin the INSTALL carries (the variable, then the plist), not this
     # process's CLAUDE_CONFIG_DIR: `agentloop status` typed in a plain shell
     # has none, and would call a pinned install the CLI default.
@@ -11507,10 +11573,13 @@ cmd_create() { # reads a partial job object (JSON) from stdin
     opencode) die "create: opencode is not supported yet — it arrives with the OpenCode engine" ;;
     *) die "create: platform must be anthropic or openai" ;;
   esac
+  # The operator's own gate, before the CLI's: refuse a platform Settings has
+  # not switched on before spending a `codex debug models` round trip on it,
+  # the same order run_job's launch gates use.
+  platform_usable "$cplat" || die "create: $cplat is not enabled in Settings — enable it there, or: agentloop platform enable $cplat"
   if [ "$cplat" = "openai" ] && ! openai_catalog_ensure; then
     die "create: no OpenAI catalog yet: install codex, sign in, and run: agentloop resolve-models openai"
   fi
-  platform_usable "$cplat" || die "create: $cplat is not enabled in Settings — enable it there, or: agentloop platform enable $cplat"
   defaults="$("$JQ" -n --arg id "$id" --arg pc "bash $path" \
       --arg model "$(platform_default_model "$cplat")" --arg perm "$(platform_default_permission "$cplat" job)" '{
     id: $id, description: "", enabled: true,

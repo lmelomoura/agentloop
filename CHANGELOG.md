@@ -74,6 +74,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     once); `install.sh` says when nothing is enabled yet. What it cost: a
     job on the most expensive model in the catalog was one click away, and
     a job on a CLI nobody signed in to found out at its first launch.
+  - A security block with no model enabled at all is told exactly that, not
+    sent to refresh a catalog: the derivation warning used to say "no OpenAI
+    catalog is resolved yet" for any platform whenever nothing was enabled —
+    anthropic included, and even with the catalog already resolved.
 
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and
