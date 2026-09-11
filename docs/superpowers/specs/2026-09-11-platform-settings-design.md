@@ -123,8 +123,9 @@ Ficheiro ausente → `platforms_ensure` cria-o na primeira leitura:
   cuja `job_platform` é essa plataforma, mais projectos com
   `security.enabled == true` cuja plataforma efectiva de segurança é essa;
 - `enabled` = `in_use` não vazio; `models` = os modelos desses jobs e blocos,
-  resolvidos, sem repetições, na ordem do catálogo (o que o catálogo não
-  conhece vai para o fim, na ordem em que apareceu).
+  resolvidos pela cache de famílias, sem repetições, na ordem em que aparecem
+  (jobs primeiro, blocos de segurança depois) — a ordem do catálogo não
+  precisa de ser conhecida para semear, e o operador reordena na página.
 
 Numa instalação em uso os jobs continuam a correr sem uma visita aos
 Settings (nesta: anthropic com `claude-opus-5`, `claude-opus-4-8`,
