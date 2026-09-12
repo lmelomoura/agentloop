@@ -63,6 +63,7 @@ secção "OpenCode: o ponto de extensão"), a medição manda.
 | por omissão, em `run`: `bash`, `read` e `write` correm sem perguntar (`edit` não foi exercido); `external_directory` (ferramentas de ficheiro fora do `--dir`) é `ask`; `question`, `plan_enter` e `plan_exit` são `deny` (o agente não pode ficar à espera de uma pergunta ao humano) | 02, 17, 18, 14 (`info.permission`) |
 | **não há sandbox ao nível do SO**: `bash` escreve fora do directório e faz `git commit` num worktree (cujo `.git` real fica fora do directório) sem `--auto` e sem pedir nada | 19, 20 |
 | `--pure` desliga os plugins externos do operador; sem ele o plugin `rtk.ts` de `~/.config/opencode/plugins/` **reescreveu `ls` para `rtk ls`** e o plugin `superpowers` acrescentou ~3k tokens de instruções a cada passo | 02, 03 |
+| `--pure` **não tira as skills**: as corridas 26 e 27 levaram `--pure` e o agente continuou a ver `~/.claude/skills/` e `.opencode/skills/` do run; o que sai são só os plugins (`plugin` da configuração e `~/.config/opencode/plugins/`) | 26, 27 |
 | `--title` evita a chamada extra a um modelo pequeno que gera o título de cada sessão nova (0 streams `agent=title` contra 1 sem a flag) | 30, 21b, 16 |
 | `opencode export <id>`, do directório da sessão: `{info, messages}` com `info.model{id, providerID, variant}` (o modelo que correu), `info.directory`, `info.version`, `info.cost`, `info.tokens`, `info.permission`, e por mensagem `modelID`, `providerID`, `cost`, `tokens`, `finish`, `path.cwd`; é o análogo do rollout do Codex, com a diferença de o modelo e o custo lá estarem | 14 |
 | `opencode models`: uma linha `provider/model`; `--verbose`: cada linha seguida de um JSON com `cost{input, output, cache{read, write}}` por milhão, `limit{context, output}`, `capabilities{toolcall, reasoning, …}`, `variants{…}`, `status`; nesta máquina `pdm_ai/deepseek-v4-flash` e `pdm_ai/qwen3.5-vision` têm `toolcall: false` | `models.txt`, `models-verbose.txt` |
@@ -71,6 +72,8 @@ secção "OpenCode: o ponto de extensão"), a medição manda.
 | `XDG_CONFIG_HOME` move `~/.config/opencode` de facto (os providers do operador desaparecem; `~/.opencode/opencode.json(c)` continua a ser lido) e `XDG_DATA_HOME` move `auth.json` e a base de dados de sessões: é este o par que isola conta e configuração por run | 15c, 15d |
 | skills: o agente vê `~/.claude/skills/*/SKILL.md` (as 35 desta máquina, pelo `name` do frontmatter) mais a interna `customize-opencode`, e `.opencode/skills/<nome>/SKILL.md` no directório do run; invoca-as com a ferramenta `skill` por nome (`input: {name}`) | 26, 27 |
 | `opencode session list` é uma tabela humana, não JSON; o motor não precisa dela | 25 |
+| `--agent plan`, o agente embutido "read-only", **não é read-only a sério**: pelas regras nega `edit` (fora das pastas de planos) e `task general`, mas `bash` fica `allow`; o que travou o modelo foi o prompt de sistema ("I'm in Plan Mode (read-only)"), sem tocar em ferramentas | 31, 31b, 32 |
+| `opencode agent list` imprime cada agente com as suas regras de permissão: os defaults de `build` são `*: allow`, `doom_loop: ask`, `external_directory: ask` (com `allow` para a pasta de tool-output, o tmp e cada directório de skill), `read *.env: ask`, `read *.env.example: allow`, `question`/`plan_enter`/`plan_exit: deny`; `general` (subagente) acrescenta `todowrite: deny`; `explore` é uma lista de leitura (`grep`, `glob`, `list`, `bash`, `webfetch`, `websearch`, `read`) sobre `*: deny` | 32 |
 
 ## Ficheiro a ficheiro
 
@@ -123,6 +126,9 @@ secção "OpenCode: o ponto de extensão"), a medição manda.
 | `27-project-skill-visible` | `.opencode/skills/probe-skill/SKILL.md` no directório do run, pedir para a invocar | `tool: "skill"` com `input{name: "probe-skill"}` e a resposta ditada pela skill |
 | `29-dir-missing` | `--dir /tmp/probe/does-not-exist` | exit 1 em 0 s, `Error: Failed to change directory to …`, sem stdout, sem chamada ao modelo |
 | `30-title-flag-skips-title-call` | `--title 'agentloop probe 30' --print-logs --log-level INFO` | zero streams `agent=title` (o 21b, sem `--title`, tem um) |
+| `31-agent-plan-auto` | `--agent plan --auto`, pedir `ls`, um `write` e um `echo >` | o modelo recusou tudo em texto ("Plan Mode (read-only)") sem chamar uma ferramenta; exit 0 |
+| `31b-export-plan-session.json` | `opencode export <sessão do 31>` | `info.agent: "plan"`; `info.permission` traz só os três `deny` do modo `run`: as regras do agente não vêm no export |
+| `32-agent-list.txt` | `opencode agent list` | as regras de permissão de cada agente (`build`, `plan`, `general`, `explore`, `compaction`, `summary`, `title`, e o `image-analyzer` do operador): a fonte dos defaults; o `plan` mantém `bash: allow` |
 
 ## O que não ficou medido, e porquê
 
