@@ -37,7 +37,8 @@ não há janelas de utilização, sandbox do SO nem protocolo de stdin.
 | headless: `opencode run --format json --pure --auto -m provider/model [--variant v] --dir d [-s id] [--title t] -- PROMPT`, **sempre com `</dev/null`**: com stdin aberto o CLI lê-o até ao EOF antes de arrancar e fica pendurado sem um byte (13a); texto no stdin é anexado ao prompt (13b); `--` antes do prompt é aceite (33) | a linha de lançamento; o prompt vai no argv, como nas outras duas plataformas |
 | eventos, um por linha, todos com `sessionID`: `step_start`, `text`, `tool_use` (sai **uma vez, já concluído**, com `state{status, input, output, error}`), `step_finish{reason, tokens{input, output, reasoning, cache{read, write}}, cost}`, `error{name, data}`; sem modelo no stream; stderr vazio num run são (01, 02, 03) | o normalizador tem o que precisa; o modelo que correu vem do `export` |
 | um passo por chamada ao modelo: `step_finish.reason` é `tool-calls` entre ferramentas e `stop` no último; tokens e custo são **por passo**; o fim do run é o fim do processo, exit 0 (02, 05) | o `result` sai no `stop`; o run somado é a soma dos passos |
-| o primeiro byte só sai quando o modelo começa a responder; um provider lento leva dezenas de segundos sem output (21, 21b), e um provider que aceita a ligação e nunca responde deixa o CLI pendurado **sem timeout, sem erro e sem um byte** (34b) | o watchdog de stall do motor (sem output nem CPU durante `stall_timeout_seconds`) é a única defesa e chega; o motor não inventa timeouts |
+| o primeiro byte só sai quando o modelo começa a responder; um provider lento leva dezenas de segundos sem output (21, 21b), e um provider que aceita a ligação e nunca responde deixa o CLI pendurado **sem timeout, sem erro e sem um byte** (34b) | o watchdog de stall do motor é a única defesa; ver a linha seguinte |
+| **um run pendurado não está parado para o `ps`**: o processo pendurado do 08c, sem um byte de output e sem filhos, soma ~1 s de CPU a cada 75 s (35). O watchdog de hoje dá um run por vivo sempre que o inteiro de CPU da árvore muda entre dois polls de 30 s, por isso esse ralenti mantém-no vivo para sempre, e `timeout_seconds` não tem omissão | o sinal de CPU do watchdog ganha um chão: só conta como actividade quando cresce pelo menos `AGENTLOOP_WATCHDOG_CPU_FLOOR` segundos (omissão 2) num poll de 30 s; o ralenti medido (0 ou 1 por poll) fica abaixo, trabalho real (compilações, suites, instalações) fica ordens de grandeza acima |
 | `-s <id>` retoma a mesma sessão, com o mesmo id em todos os eventos, **só com `--dir` no directório em que ela nasceu**; noutro directório o CLI corre o turno numa segunda instância que o `run` não ouve, gasta-o, e pendura-se para sempre (08, 08b, 08c, 08d) | um resume leva `--dir` = o directório retido do run; o motor já recusa resumir sem ele |
 | SIGTERM: sai em 1 s com exit 143, a ferramenta em curso morre com ele, nada fica órfão; a sessão sobrevive e retoma (12, 12b) | `stop` e o watchdog funcionam como hoje |
 | permissões vivem na configuração, por ferramenta e por padrão de `bash` (`{"bash": {"*": "allow", "git push*": "deny"}}`), entregues por `OPENCODE_CONFIG_CONTENT`; `--auto` aprova o que é `ask` (04, 05, 06, 23) | o vocabulário de `permission_mode` é um bloco gerado pelo motor; `allowed_tools`/`disallowed_tools` traduzem-se para ele |
@@ -107,7 +108,7 @@ Um ramo `opencode` em cada função da tabela:
 | `platform_catalog_ids` | os ids `status: active`, na ordem do catálogo |
 | `platform_models_json` | o catálogo com `enabled` por modelo, mais `priced`, `price`, `tools`, `variants`, `context` |
 | `platform_default_model` | o primeiro activado nos Settings, como as outras |
-| `platform_stderr_filter` | no-op: um run são não escreve nada em stderr, e o que lá aparecer é real (uma negação auto-rejeitada, um erro do provider repetido, a razão de um `UnknownError`) |
+| `platform_stderr_filter` | no-op, por decisão: com `--print-logs --log-level ERROR` um run que não precisou de repetir nenhum pedido não escreve nada (01–03, 11, 30, 34), e um que precisou escreve a linha do erro repetido (24c) e fica `warning`, que é o que se quer de um run que correu bem mas teve o provider a falhar a meio: uma negação auto-rejeitada, um erro repetido e a razão de um `UnknownError` são todos reais, e nenhum é a linha fixa de ruído que o Codex tinha |
 | `platform_argv_opencode` | a linha abaixo |
 | `platform_finish` | `cd <run_cwd> && opencode export <sid>` (limitado a 30 s) → `PF_MODEL_ID` = `info.model.providerID + "/" + info.model.id`; sem export (falhou, expirou, sessão sem directório), `model_id` fica o pedido e o `tick.log` di-lo. Nada de rate limits |
 | `platform_normalizer` (nova) | o caminho do normalizador da plataforma, ou nada: `bin/platforms/openai_stream.py`, `bin/platforms/opencode_stream.py`; é isto que o `run_job` passa a perguntar em vez de `[ "$platform" = "openai" ]` |
@@ -273,10 +274,31 @@ run cortado (a worktree reatada, ou o `cwd` do job num run sem isolamento): é
 o directório em que a sessão nasceu, a única condição em que o CLI a retoma
 (08b). O motor já recusa um resume cujo directório retido desapareceu ("no
 open session directory holds it"), por isso o caso do pendurar (08c) não tem
-por onde entrar. Se entrar na mesma (um directório movido à mão, um provider
-que não responde: 34b), o watchdog de stall mata o run ao fim de
-`stall_timeout_seconds` sem output nem CPU, e o run explica-se com a nota
-"stalled". Um resume não leva `--title`: a sessão já tem um.
+por onde entrar. Um resume não leva `--title`: a sessão já tem um.
+
+### O watchdog, e o chão de CPU
+
+A defesa de trás para tudo o que pendure na mesma (um directório movido à
+mão, um provider que aceita a ligação e nunca responde: 34b) é o watchdog de
+stall que já existe, e a medição 35 mostrou que hoje ele **não** apanha um
+processo OpenCode pendurado: esse processo, sem output e sem filhos, soma
+cerca de 1 s de CPU a cada 75 s de ralenti, e o watchdog dá o run por vivo
+sempre que o inteiro de CPU da árvore muda entre dois polls de 30 s. Sem
+`timeout_seconds`, que não tem omissão, o run seguraria a ranhura para
+sempre.
+
+A correcção é no watchdog, para as três plataformas, e é pequena: o sinal de
+CPU só conta como actividade quando **cresceu pelo menos
+`WATCHDOG_CPU_FLOOR` segundos num poll** (omissão 2 s por poll de 30 s, ou
+seja 6,7% de um núcleo; `AGENTLOOP_WATCHDOG_CPU_FLOOR` sobrepõe). O ralenti
+medido dá 0 ou 1 por poll e fica abaixo; uma compilação, uma suite de testes,
+um `npm install`, um `git clone` grande ficam ordens de grandeza acima; o que
+muda de destino é só uma ferramenta que passe `stall_timeout_seconds`
+inteiros sem emitir um evento e a queimar menos de 6,7% de CPU, que é, com
+esse nome, uma ferramenta parada. O `selftest` fixa-o com uma tabela de
+processos fixa, como `cpu_tree_sum` já é testado. A regra "um run longo não
+é um run pendurado" continua de pé: o stream a crescer, ou CPU a sério,
+mantêm-no vivo as horas que precisar.
 
 ## Configuração
 
@@ -370,7 +392,13 @@ três) a partir de `opencode models --verbose --pure`, cujo formato é uma linha
   sem preço no catálogo nem na tabela.
 - Os tectos diário e global somam `reported` e `estimated` como sempre.
 - Tecto por run: sem flag no CLI; verificado no fim, "BUDGET LIMITED" quando
-  `cost ≥ 0.9 × cap`; o editor diz "advisory on OpenCode".
+  `cost ≥ 0.9 × cap`; o editor diz "advisory on OpenCode". Com
+  `cost_basis: none` a comparação de hoje (`${cost:-0} >= cap × 0.9`) é
+  **inerte em silêncio**: custo desconhecido vale zero e zero nunca chega a
+  90% de nada. A entrega fecha esse silêncio para as três plataformas: um
+  run com `max_budget_usd` definido e custo desconhecido leva na nota
+  "max_budget_usd $X not applied: the cost of this run is unknown (no price
+  for <model>)" e a mesma frase no `tick.log`; o estado não muda.
 
 ## Janelas de utilização
 
@@ -470,13 +498,13 @@ continua a ler `init.model` como fallback do que o `export` deu.
 | quota / 429 (não medido) | `APIError` com `statusCode: 429` → `rate_limited`, fora do backoff; sem janela para marcar, o run seguinte vem no intervalo do job |
 | ferramenta negada por regra (lista do job ou configuração do operador) | evento no stream, `permission_denials` preenchido, o turno continua; o run é `error` com causa `tools_denied`, como no Claude |
 | auto-rejeição de um `ask` (só possível num run lançado sem `--auto`, o que o motor nunca faz) | o turno acaba aí; o `result` de EOF nomeia a ferramenta e o run é `error` com causa `tools_denied`, em vez de um sucesso vazio |
-| provider que não responde (34b) | nem output nem CPU; o watchdog mata ao fim de `stall_timeout_seconds`; nota "stalled", causa `killed` |
-| resume fora do directório da sessão (08c) | não tem por onde entrar: o motor passa `--dir` = o directório retido e recusa resumir sem ele; se acontecer na mesma, o watchdog |
+| provider que não responde (34b) | sem output e com o ralenti de CPU abaixo do chão (35): o watchdog mata ao fim de `stall_timeout_seconds`; nota "stalled", causa `killed` |
+| resume fora do directório da sessão (08c) | não tem por onde entrar: o motor passa `--dir` = o directório retido e recusa resumir sem ele; se acontecer na mesma, o watchdog com o chão de CPU |
 | `export` falha ou expira no fim do run | `model_id` fica o pedido; uma linha no `tick.log` |
 | normalizador termina com erro | o CLI morre com SIGPIPE, o run cai no salvamento, a nota diz "normalizer exited N" |
 | linha malformada no stream | copiada para `.raw`, ignorada |
-| stderr | um run são não escreve nada; qualquer byte é real e o run fica `warning` como hoje (um erro transitório repetido pelo CLI, 24c, é exactamente isso: correu bem, quer um olhar) |
-| sem preço para o modelo | `cost_basis: none`, "—" com tooltip na tabela, nota no editor, `unpriced` em `status` |
+| stderr | um run que não repetiu pedidos não escreve nada; qualquer byte é real e o run fica `warning` como hoje (um erro transitório repetido pelo CLI, 24c, é exactamente isso: correu bem, quer um olhar) |
+| sem preço para o modelo | `cost_basis: none`, "—" com tooltip na tabela, nota no editor, `unpriced` em `status`; com `max_budget_usd` definido, a nota do run e o `tick.log` dizem que o tecto não foi aplicado |
 | stop | TERM ao CLI, que sai em 1 s (12); sem `result`; o marcador `stopped` do slot decide, como hoje |
 | `say` a um run OpenCode | "this run is not interactive" |
 | resume de um run cuja plataforma difere da actual do job | recusado, como hoje |
@@ -526,7 +554,9 @@ continua a ler `init.model` como fallback do que o `export` deu.
   plataforma incluindo a reescrita; `create`; as recusas de lançamento; a
   recusa do resume com plataforma diferente; `security_derived_jobs` com
   `tools: false`; `rl_gate opencode`; o `turn_is_over` sobre um stream
-  normalizado.
+  normalizado; o chão de CPU do watchdog sobre uma tabela de processos fixa
+  (um ralenti de 1 s por poll não conta, 2 s contam); a nota "cap not
+  applied" num run com custo desconhecido e tecto definido.
 - **pytest do servidor**: a forma de `/api/models.platforms.opencode`; a
   lista de permissões igual à do engine; `set_field platform opencode`;
   `unpriced`; contrato da página: os elementos existem, o vocabulário vem do
@@ -553,8 +583,8 @@ continua a ler `init.model` como fallback do que o `export` deu.
    com as listas, esforços, `model_ok`, `check`/`ready`, `argv`, `finish`
    (`export`), `platform_normalizer`; selftest.
 4. Catálogo: `resolve_models_opencode`, `models.json`, `/api/models`.
-5. Lançamento: o ramo genérico do `run_job`, as recusas, `run_env`; e2e de
-   run, resume e stop.
+5. Lançamento: o ramo genérico do `run_job`, as recusas, `run_env`; o chão de
+   CPU do watchdog e a nota do tecto inerte; e2e de run, resume e stop.
 6. Esquema de configuração: `set-field`, `create`, `resolve`, `project-set`,
    validações; selftest e pytest.
 7. Custos: `pricing.example.json`, `unpriced`, `status`/`platforms`.
