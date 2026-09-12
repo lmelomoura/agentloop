@@ -3398,6 +3398,11 @@ rl_gate() { # rl_gate [platform] -> 0 = hold this run back (reason on stdout); a
 STALL_HOURS="${AGENTLOOP_STALL_HOURS:-4}"
 STALL_MARK_FILE="$DATA_DIR/.stalled"
 
+# How often the run watchdog looks at a run (seconds). Overridable for the
+# tests only: the e2e drives a 4-second stall with a 2-second poll.
+WATCHDOG_POLL="${AGENTLOOP_WATCHDOG_POLL:-30}"
+case "$WATCHDOG_POLL" in ''|*[!0-9]*|0) WATCHDOG_POLL=30 ;; esac
+
 # Why is nothing running? Prints one sentence when the answer is a fault or a
 # ceiling; stays silent when the fleet is merely idle, asleep, or busy.
 #
@@ -11071,7 +11076,7 @@ If the work turns out to be already finished, or it can no longer be done at all
   local wdfile="$logfile.watchdog"
   : > "$wdfile"
   (
-    local last_size=-1 last_cpu=-1 last_change now size cpu began poll=30
+    local last_size=-1 last_cpu=-1 last_change now size cpu began poll="$WATCHDOG_POLL"
     began="$(now_epoch)"; last_change="$began"
     while kill -0 "$child" 2>/dev/null; do
       # Bind this run dir to its session the moment the transcript names one,
@@ -11084,6 +11089,23 @@ If the work turns out to be already finished, or it can no longer be done at all
       cpu="$(num "$(tree_cpu_seconds "$child")")"
       if [ "$size" != "$last_size" ] || [ "$cpu" != "$last_cpu" ]; then
         last_size="$size"; last_cpu="$cpu"; last_change="$now"
+      fi
+      # A stream still EMPTY this long after the launch is a dead run,
+      # whatever the CPU says. Measured on OpenCode (evidence 35): a CLI
+      # whose provider never answers, or a resume the CLI took to another
+      # directory, hangs with no output for ever and still gains a CPU
+      # second every minute or so of idling -- which the test below reads as
+      # life, so the stall never fired and timeout_seconds has no default.
+      # Every healthy run of every platform writes its first event within
+      # seconds (Claude's init, Codex's thread.started, OpenCode's
+      # step_start when the model starts answering), so this rule changes
+      # the fate of no run that ever wrote a byte. A CPU floor was weighed
+      # and rejected: the slowest legitimate work here (docker builds, trivy
+      # pulling its policies, a clone on a bad link) burns its CPU outside
+      # the run's process tree and survives today by the same tick.
+      if [ "$stall" -gt 0 ] && [ "${size:-0}" -eq 0 ] && [ "$((now - began))" -ge "$stall" ]; then
+        printf 'stalled: no output at all for %ss (the CLI never started answering; killed by watchdog)\n' "$stall" > "$wdfile"
+        kill -TERM "$child" 2>/dev/null; break
       fi
       if [ "$stall" -gt 0 ] && [ "$((now - last_change))" -ge "$stall" ]; then
         printf 'stalled: no output and no CPU for %ss (killed by watchdog)\n' "$stall" > "$wdfile"

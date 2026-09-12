@@ -98,6 +98,7 @@ case "$mode" in
     ev tool_use '{"type":"tool","tool":"bash","callID":"call_fake_reject","state":{"status":"error","input":{"command":"ls"},"error":"The user rejected permission to use this specific tool call.","time":{"start":1789223581861,"end":1789223581881}},"id":"prt_fake_tool","sessionID":"'"$sid"'","messageID":"msg_fake"}'
     step_finish tool-calls 5 44 0 13696
     exit 0 ;;
+  silent) exec sleep 600 ;;   # like `hang`, but before the first event -- the provider itself never answered
 esac
 
 step_start

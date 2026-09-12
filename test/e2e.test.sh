@@ -834,5 +834,39 @@ lastrun | jq -r .note | grep -q 'max_budget_usd \$1 not applied' && ok "and so d
 [ "$(lastrun | jq -r .status)" = "success" ] && ok "without changing the status" || bad "status $(lastrun | jq -r .status)"
 
 echo
+echo "41. a run that never writes a byte is killed at the stall timeout, whatever its CPU does"
+# Measured on OpenCode (evidence 35): a hung CLI process burns ~1 CPU second
+# every 75 s of idling, which the watchdog's "CPU changed" test reads as
+# life for ever. A stream still EMPTY after stall_timeout_seconds is the one
+# shape both measured hangs share, and no healthy run of any platform has:
+# the first event is written in seconds.
+mkjob j41
+sed -i '' 's/"max_parallel":1/"max_parallel":1,"stall_timeout_seconds":4/' "$ROOT/config/jobs.json"
+AGENTLOOP_WATCHDOG_POLL=2 FAKE_MODE=silent FAKE_SESSION=sess-silent "$AL" run j41 >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .status)" = "error" ] && [ "$(lastrun | jq -r .cause)" = "killed" ] \
+  && ok "error / killed" || bad "$(lastrun | jq -c '{status,cause}')"
+lastrun | jq -r .note | grep -q 'no output at all for 4s' && ok "the note names the rule: no output at all" || bad "note: $(lastrun | jq -r .note)"
+
+echo
+echo "41b. a run that wrote its first event and then went quiet is still judged by the old rule"
+mkjob j41b
+sed -i '' 's/"max_parallel":1/"max_parallel":1,"stall_timeout_seconds":4/' "$ROOT/config/jobs.json"
+AGENTLOOP_WATCHDOG_POLL=2 FAKE_MODE=hang FAKE_SESSION=sess-quiet "$AL" run j41b >/dev/null 2>&1
+sleep 1
+lastrun | jq -r .note | grep -q 'no output and no CPU for 4s' && ok "killed by the CPU-and-output rule, not the empty-stream one" || bad "note: $(lastrun | jq -r .note)"
+lastrun | jq -r .note | grep -q 'no output at all' && bad "the empty-stream rule fired on a run that had written" || ok "the empty-stream rule never touches a run that wrote a byte"
+
+echo
+echo "41c. the case that motivated the rule: an OpenCode run whose provider never answers"
+mkjob_opencode j41c
+sed -i '' 's/"max_parallel":1/"max_parallel":1,"stall_timeout_seconds":4/' "$ROOT/config/jobs.json"
+AGENTLOOP_WATCHDOG_POLL=2 FAKE_MODE=silent FAKE_SESSION=ses_silent "$AL" run j41c >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .status)" = "error" ] && [ "$(lastrun | jq -r .cause)" = "killed" ] && ok "error / killed" || bad "$(lastrun | jq -c '{status,cause}')"
+lastrun | jq -r .note | grep -q 'no output at all for 4s' && ok "the empty-stream rule ended it (measured 34b: the CLI itself never would)" || bad "note: $(lastrun | jq -r .note)"
+[ ! -e "$ROOT"/data/logs/j41c/*.raw.fifo ] && ok "and the FIFO was removed" || bad "FIFO left behind"
+
+echo
 printf '\n  %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

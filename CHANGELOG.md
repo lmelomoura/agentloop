@@ -376,6 +376,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   have it: an OpenAI job refused in `tick.log` for a signed-out Codex had no
   place in the terminal that said so.
 
+### Fixed
+
+- **A run that never wrote a byte is killed at the stall timeout, whatever
+  its CPU does.** The watchdog read any change of the run's CPU seconds as
+  life, and a hung CLI is not still: measured on OpenCode, a process whose
+  provider never answered gains about one CPU second every 75 seconds of
+  idling, so the stall never fired and, with no default `timeout_seconds`,
+  the run held its slot for ever. A stream still empty after
+  `stall_timeout_seconds` is now a dead run, with its own note ("no output
+  at all"); every healthy run of every platform writes its first event
+  within seconds, so no run that ever wrote a byte is judged differently.
+  A hang AFTER the first byte still rides on the CPU signal, and
+  `timeout_seconds` remains the tool for it; `AGENTLOOP_WATCHDOG_POLL`
+  lets the tests drive the rule in seconds.
+
 ### Changed
 
 - The dashboard brand now includes an outlined `agentloop` wordmark at both
