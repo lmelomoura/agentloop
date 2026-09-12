@@ -38,7 +38,7 @@ não há janelas de utilização, sandbox do SO nem protocolo de stdin.
 | eventos, um por linha, todos com `sessionID`: `step_start`, `text`, `tool_use` (sai **uma vez, já concluído**, com `state{status, input, output, error}`), `step_finish{reason, tokens{input, output, reasoning, cache{read, write}}, cost}`, `error{name, data}`; sem modelo no stream; stderr vazio num run são (01, 02, 03) | o normalizador tem o que precisa; o modelo que correu vem do `export` |
 | um passo por chamada ao modelo: `step_finish.reason` é `tool-calls` entre ferramentas e `stop` no último; tokens e custo são **por passo**; o fim do run é o fim do processo, exit 0 (02, 05) | o `result` sai no `stop`; o run somado é a soma dos passos |
 | o primeiro byte só sai quando o modelo começa a responder; um provider lento leva dezenas de segundos sem output (21, 21b), e um provider que aceita a ligação e nunca responde deixa o CLI pendurado **sem timeout, sem erro e sem um byte** (34b) | o watchdog de stall do motor é a única defesa; ver a linha seguinte |
-| **um run pendurado não está parado para o `ps`**: o processo pendurado do 08c, sem um byte de output e sem filhos, soma ~1 s de CPU a cada 75 s (35). O watchdog de hoje dá um run por vivo sempre que o inteiro de CPU da árvore muda entre dois polls de 30 s, por isso esse ralenti mantém-no vivo para sempre, e `timeout_seconds` não tem omissão | o sinal de CPU do watchdog ganha um chão: só conta como actividade quando cresce pelo menos `AGENTLOOP_WATCHDOG_CPU_FLOOR` segundos (omissão 2) num poll de 30 s; o ralenti medido (0 ou 1 por poll) fica abaixo, trabalho real (compilações, suites, instalações) fica ordens de grandeza acima |
+| **um run pendurado não está parado para o `ps`**: o processo pendurado do 08c, sem um byte de output e sem filhos, soma ~1 s de CPU a cada 75 s (35). O watchdog de hoje dá um run por vivo sempre que o inteiro de CPU da árvore muda entre dois polls de 30 s, por isso esse ralenti mantém-no vivo para sempre, e `timeout_seconds` não tem omissão | o watchdog ganha uma regra estreita: um stream **ainda vazio** ao fim de `stall_timeout_seconds` é um run morto, diga o CPU o que disser; um chão de CPU foi ponderado e rejeitado (mataria `docker build`, `trivy` a puxar políticas, um `clone` numa ligação má: trabalho cujo CPU vive fora da árvore do run) |
 | `-s <id>` retoma a mesma sessão, com o mesmo id em todos os eventos, **só com `--dir` no directório em que ela nasceu**; noutro directório o CLI corre o turno numa segunda instância que o `run` não ouve, gasta-o, e pendura-se para sempre (08, 08b, 08c, 08d) | um resume leva `--dir` = o directório retido do run; o motor já recusa resumir sem ele |
 | SIGTERM: sai em 1 s com exit 143, a ferramenta em curso morre com ele, nada fica órfão; a sessão sobrevive e retoma (12, 12b) | `stop` e o watchdog funcionam como hoje |
 | permissões vivem na configuração, por ferramenta e por padrão de `bash` (`{"bash": {"*": "allow", "git push*": "deny"}}`), entregues por `OPENCODE_CONFIG_CONTENT`; `--auto` aprova o que é `ask` (04, 05, 06, 23) | o vocabulário de `permission_mode` é um bloco gerado pelo motor; `allowed_tools`/`disallowed_tools` traduzem-se para ele |
@@ -276,7 +276,7 @@ o directório em que a sessão nasceu, a única condição em que o CLI a retoma
 open session directory holds it"), por isso o caso do pendurar (08c) não tem
 por onde entrar. Um resume não leva `--title`: a sessão já tem um.
 
-### O watchdog, e o chão de CPU
+### O watchdog, e o run que nunca escreveu
 
 A defesa de trás para tudo o que pendure na mesma (um directório movido à
 mão, um provider que aceita a ligação e nunca responde: 34b) é o watchdog de
@@ -287,18 +287,35 @@ sempre que o inteiro de CPU da árvore muda entre dois polls de 30 s. Sem
 `timeout_seconds`, que não tem omissão, o run seguraria a ranhura para
 sempre.
 
-A correcção é no watchdog, para as três plataformas, e é pequena: o sinal de
-CPU só conta como actividade quando **cresceu pelo menos
-`WATCHDOG_CPU_FLOOR` segundos num poll** (omissão 2 s por poll de 30 s, ou
-seja 6,7% de um núcleo; `AGENTLOOP_WATCHDOG_CPU_FLOOR` sobrepõe). O ralenti
-medido dá 0 ou 1 por poll e fica abaixo; uma compilação, uma suite de testes,
-um `npm install`, um `git clone` grande ficam ordens de grandeza acima; o que
-muda de destino é só uma ferramenta que passe `stall_timeout_seconds`
-inteiros sem emitir um evento e a queimar menos de 6,7% de CPU, que é, com
-esse nome, uma ferramenta parada. O `selftest` fixa-o com uma tabela de
-processos fixa, como `cpu_tree_sum` já é testado. A regra "um run longo não
-é um run pendurado" continua de pé: o stream a crescer, ou CPU a sério,
-mantêm-no vivo as horas que precisar.
+Um chão de CPU ("só conta como vida quando cresce N s por poll") foi
+ponderado e **rejeitado**: `tree_cpu_seconds` fecha sobre `pid`/`ppid` e só vê
+a árvore do run, e o trabalho legítimo mais lento que este scheduler corre
+vive fora dela: um `docker build` (o CPU está no daemon), um `trivy` a puxar
+o bundle de políticas pela rede (já pendurou mais de dez minutos neste
+repositório), um `git clone` numa ligação má, um `npm install` num registry
+lento. Tudo isso sobrevive hoje pelo mesmo tique que mantém o run pendurado
+vivo, e um chão trocaria um buraco por outro.
+
+A regra que entra é estreita e não muda o destino de nenhum run que tenha
+escrito um byte: **um stream ainda vazio ao fim de `stall_timeout_seconds` é
+um run morto, diga o CPU o que diga**. Os dois pendurares medidos (08c, 34b)
+têm zero bytes desde o arranque; um run são das três plataformas escreve o
+primeiro evento muito antes de vinte minutos (o `init` do Claude e o
+`thread.started` do Codex de imediato, o `step_start` do OpenCode quando o
+modelo começa a responder, dezenas de segundos medidas). A nota do run diz
+qual foi a regra: "stalled: no output at all for Ns (the CLI never started
+answering; killed by watchdog)", causa `killed`. O intervalo do poll passa a
+ler `AGENTLOOP_WATCHDOG_POLL` (omissão 30 s) só para o e2e conseguir
+exercer a regra em segundos, com um stand-in que nunca escreve.
+
+Fica como **limitação declarada**: um provider que morre depois do primeiro
+byte deixa um processo OpenCode em ralenti que o sinal de CPU de hoje lê como
+vivo; a ferramenta do operador para esse caso é `timeout_seconds`, e o
+follow-up é medir o ralenti dos três CLIs (o `claude` e o `codex` parados
+podem tiquetaquear da mesma forma) antes de tocar no sinal de CPU para as
+três plataformas. Esta regra entra em **commit próprio, com os seus testes**,
+separado do resto do motor: é a única parte da entrega que toca um run de
+qualquer plataforma, e tem de poder ser revertida sozinha.
 
 ## Configuração
 
@@ -498,8 +515,9 @@ continua a ler `init.model` como fallback do que o `export` deu.
 | quota / 429 (não medido) | `APIError` com `statusCode: 429` → `rate_limited`, fora do backoff; sem janela para marcar, o run seguinte vem no intervalo do job |
 | ferramenta negada por regra (lista do job ou configuração do operador) | evento no stream, `permission_denials` preenchido, o turno continua; o run é `error` com causa `tools_denied`, como no Claude |
 | auto-rejeição de um `ask` (só possível num run lançado sem `--auto`, o que o motor nunca faz) | o turno acaba aí; o `result` de EOF nomeia a ferramenta e o run é `error` com causa `tools_denied`, em vez de um sucesso vazio |
-| provider que não responde (34b) | sem output e com o ralenti de CPU abaixo do chão (35): o watchdog mata ao fim de `stall_timeout_seconds`; nota "stalled", causa `killed` |
-| resume fora do directório da sessão (08c) | não tem por onde entrar: o motor passa `--dir` = o directório retido e recusa resumir sem ele; se acontecer na mesma, o watchdog com o chão de CPU |
+| provider que não responde (34b) | zero bytes desde o arranque: o watchdog mata ao fim de `stall_timeout_seconds` pela regra do stream vazio, diga o CPU o que diga (35); nota "stalled: no output at all…", causa `killed` |
+| resume fora do directório da sessão (08c) | não tem por onde entrar: o motor passa `--dir` = o directório retido e recusa resumir sem ele; se acontecer na mesma, zero bytes: a regra do stream vazio |
+| provider que morre depois do primeiro byte | limitação declarada: o ralenti do processo (35) mantém o sinal de CPU vivo; `timeout_seconds` é a ferramenta do operador; follow-up com medição dos três CLIs |
 | `export` falha ou expira no fim do run | `model_id` fica o pedido; uma linha no `tick.log` |
 | normalizador termina com erro | o CLI morre com SIGPIPE, o run cai no salvamento, a nota diz "normalizer exited N" |
 | linha malformada no stream | copiada para `.raw`, ignorada |
@@ -554,14 +572,19 @@ continua a ler `init.model` como fallback do que o `export` deu.
   plataforma incluindo a reescrita; `create`; as recusas de lançamento; a
   recusa do resume com plataforma diferente; `security_derived_jobs` com
   `tools: false`; `rl_gate opencode`; o `turn_is_over` sobre um stream
-  normalizado; o chão de CPU do watchdog sobre uma tabela de processos fixa
-  (um ralenti de 1 s por poll não conta, 2 s contam); a nota "cap not
-  applied" num run com custo desconhecido e tecto definido.
+  normalizado; a nota "cap not applied" num run com custo desconhecido e
+  tecto definido.
 - **pytest do servidor**: a forma de `/api/models.platforms.opencode`; a
   lista de permissões igual à do engine; `set_field platform opencode`;
   `unpriced`; contrato da página: os elementos existem, o vocabulário vem do
   servidor, *Interactive* desligado em OpenCode, o badge, a nota de custo, o
   cartão sem *Coming soon*.
+- **e2e, a regra do stream vazio** (commit próprio): `test/fake-claude` ganha
+  `FAKE_MODE=silent` (nunca escreve um byte, dorme); um job com
+  `stall_timeout_seconds: 4` e `AGENTLOOP_WATCHDOG_POLL=2` acaba `error`,
+  causa `killed`, nota "no output at all", em segundos; o cenário `hang` de
+  hoje (escreve o `init` e dorme) continua a durar até ao `stop`, provando que
+  a regra não toca num run que escreveu.
 - **e2e** (`test/e2e.test.sh` com `test/fake-opencode`, um stand-in que emite
   as formas medidas, guiado por `FAKE_MODE` complete · tool · deny · reject ·
   error · quota · hang · undeclared · dirty, `FAKE_SESSION` como id, e que
@@ -583,8 +606,9 @@ continua a ler `init.model` como fallback do que o `export` deu.
    com as listas, esforços, `model_ok`, `check`/`ready`, `argv`, `finish`
    (`export`), `platform_normalizer`; selftest.
 4. Catálogo: `resolve_models_opencode`, `models.json`, `/api/models`.
-5. Lançamento: o ramo genérico do `run_job`, as recusas, `run_env`; o chão de
-   CPU do watchdog e a nota do tecto inerte; e2e de run, resume e stop.
+5. Lançamento: o ramo genérico do `run_job`, as recusas, `run_env`; a nota
+   do tecto inerte; e2e de run, resume e stop.
+5b. A regra do stream vazio no watchdog, em commit próprio, com o seu e2e.
 6. Esquema de configuração: `set-field`, `create`, `resolve`, `project-set`,
    validações; selftest e pytest.
 7. Custos: `pricing.example.json`, `unpriced`, `status`/`platforms`.
