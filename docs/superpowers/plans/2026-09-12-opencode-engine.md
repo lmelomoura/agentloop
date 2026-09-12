@@ -2397,6 +2397,22 @@ lastrun | jq -r .note | grep -q 'no output at all' && bad "the empty-stream rule
 
 `mkjob` (o helper Anthropic do topo do ficheiro) escreve `"max_parallel":1}` como último campo; o `sed` acrescenta o stall a seguir.
 
+E o caso que motivou a regra, na plataforma em que foi medido (08c, 34b): o `test/fake-opencode` ganha o modo `silent` (nunca escreve um byte, `exec sleep 600`, como o `hang` mas antes do primeiro evento), e um cenário a seguir ao 41b:
+
+```bash
+echo
+echo "41c. the case that motivated the rule: an OpenCode run whose provider never answers"
+mkjob_opencode j41c
+sed -i '' 's/"max_parallel":1/"max_parallel":1,"stall_timeout_seconds":4/' "$ROOT/config/jobs.json"
+AGENTLOOP_WATCHDOG_POLL=2 FAKE_MODE=silent FAKE_SESSION=ses_silent "$AL" run j41c >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .status)" = "error" ] && [ "$(lastrun | jq -r .cause)" = "killed" ] && ok "error / killed" || bad "$(lastrun | jq -c '{status,cause}')"
+lastrun | jq -r .note | grep -q 'no output at all for 4s' && ok "the empty-stream rule ended it (measured 34b: the CLI itself never would)" || bad "note: $(lastrun | jq -r .note)"
+[ ! -e "$ROOT"/data/logs/j41c/*.raw.fifo ] && ok "and the FIFO was removed" || bad "FIFO left behind"
+```
+
+(`mkjob_opencode` existe desde T5, que corre antes desta tarefa. No `test/fake-opencode`, o modo entra no `case "$mode" in` que trata `error`/`quota`/`reject`, antes do primeiro `step_start`: `silent) exec sleep 600 ;;`, e a lista de modos do cabeçalho e o teste `tests/test_fake_opencode.py` não mudam: um modo que nunca escreve não tem forma a fixar.)
+
 No `test/fake-claude`, antes do bloco do `init` (o `{ printf '{"type":"system","subtype":"init"…`), o modo `silent`:
 
 ```bash
@@ -2468,7 +2484,7 @@ Sob `## [Unreleased]`, numa secção `### Fixed` (criar a seguir a `### Added` s
 ```
 
 ```bash
-/usr/bin/git add bin/agentloop test/fake-claude test/e2e.test.sh CHANGELOG.md
+/usr/bin/git add bin/agentloop test/fake-claude test/fake-opencode test/e2e.test.sh CHANGELOG.md
 /usr/bin/git commit -m "fix(watchdog): a run that never wrote a byte dies at the stall timeout
 
 The watchdog read any change of the run's tree CPU as life, and a hung CLI
