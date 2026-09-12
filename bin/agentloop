@@ -2069,10 +2069,13 @@ platform_normalizer() { # platform_normalizer <platform> -> a script path, or no
 # (measured 14: info.model.providerID + "/" + info.model.id). The export
 # needs the session's own directory (the run's cwd, still there at the end
 # of the run) and a deadline: a CLI that hangs must not hang the close.
-opencode_export_model() { # opencode_export_model <run_cwd> <session-id> -> provider/model, or nothing
-  local cwd="$1" sid="$2" doc got
+# run_bounded's own rc is passed back on failure (124 past the deadline, so
+# the close can say timed out rather than the more general gave no model).
+opencode_export_model() { # opencode_export_model <run_cwd> <session-id> -> provider/model on stdout; rc is run_bounded's (124 = timed out)
+  local cwd="$1" sid="$2" doc got rc=0
   [ -n "$sid" ] && [ -d "$cwd" ] || return 0
-  doc="$(cd "$cwd" && run_bounded "$OPENCODE_DEADLINE" "$(platform_bin opencode)" export "$sid" 2>/dev/null)" || return 0
+  doc="$(cd "$cwd" && run_bounded "$OPENCODE_DEADLINE" "$(platform_bin opencode)" export "$sid" 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
   got="$(printf '%s' "$doc" | "$JQ" -r '.info.model | select(type == "object") | select((.providerID // "") != "" and (.id // "") != "") | .providerID + "/" + .id' 2>/dev/null)"
   [ -n "$got" ] && printf '%s' "$got"
   return 0
@@ -2091,8 +2094,15 @@ platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-
     openai) ;;
     opencode)
       [ -n "$tid" ] || return 0
-      PF_MODEL_ID="$(opencode_export_model "${5:-}" "$tid")"
-      [ -n "$PF_MODEL_ID" ] || log_tick "$id: opencode export gave no model for session $tid — model_id stays the requested id"
+      local _oc_rc=0
+      PF_MODEL_ID="$(opencode_export_model "${5:-}" "$tid")"; _oc_rc=$?
+      if [ -z "$PF_MODEL_ID" ]; then
+        if [ "$_oc_rc" -eq 124 ]; then
+          log_tick "$id: opencode export timed out after ${OPENCODE_DEADLINE} s — model_id stays the requested id"
+        else
+          log_tick "$id: opencode export gave no model for session $tid — model_id stays the requested id"
+        fi
+      fi
       return 0 ;;
     *) return 0 ;;
   esac
@@ -4269,6 +4279,22 @@ JSON
   printf '%s\n' "$_cc" | tail -n +2 | grep -q "Nonesuch" && ok "an unknown tool name is named in a note, not translated" || bad "no note for Nonesuch"
   printf '%s\n' "$_cc" | head -1 | "$JQ" -e '.permission | has("nonesuch") | not' >/dev/null 2>&1 && ok "and never reaches the block" || bad "Nonesuch reached the block"
 
+  # run_env's own guard (in run_job, right after AL_PLATFORM=$platform) refuses
+  # the launch when this comes back with an empty first line, rather than set
+  # OPENCODE_CONFIG_CONTENT to nothing and let the CLI fall back to its own
+  # defaults (sharing ON, nothing read-only). The heredoc above always prints
+  # a JSON first line for any permission/allowed/disallowed input -- the only
+  # way it comes back empty is the interpreter itself failing -- so that is
+  # exercised here directly. Not through run_job: platform_ready's own probe
+  # (run_bounded, same $PYTHON) would fail first on a broken interpreter and
+  # refuse the run for the unrelated reason "not ready", never reaching this
+  # guard at all.
+  local _ccbroken
+  _ccbroken="$(PYTHON=/no/such/python-interpreter opencode_config_content full-access "" "" 2>/dev/null)"
+  [ -z "$_ccbroken" ] \
+    && ok "a broken interpreter leaves opencode_config_content answering nothing — what run_env's guard refuses the launch on" \
+    || bad "opencode_config_content still answered over a broken PYTHON: $_ccbroken"
+
   echo "platform_argv_opencode() — the measured launch line, for a fresh run and a resume"
   local _av _flag
   platform_argv_opencode "" /tmp/w pdm_ai/glm-5.3-flash high "PROMPT" "agentloop j1 20260912-120000"
@@ -4315,6 +4341,14 @@ JSON
     && ok "no directory, no answer (never a hang: the CLI needs the session's directory)" || bad "export answered without a directory"
   ( AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode"; FAKE_RAN_MODEL=opencode/big-pickle-real; export FAKE_RAN_MODEL
     platform_finish opencode "$tmp/ocx/none.ndjson" ses_x2 j1 "$tmp/ocx"; [ "$PF_MODEL_ID" = "opencode/big-pickle-real" ] ); want "platform_finish opencode sets PF_MODEL_ID from the export" 0 $?
+  # opencode-hang (above: --version answers, anything else hangs) times the
+  # export out through the same run_bounded a genuinely wedged CLI would hit;
+  # the close has to say WHICH kind of nothing this is, not the same "gave no
+  # model" a malformed export or a missing rollout would print.
+  ( AGENTLOOP_OPENCODE_BIN="$pb/bin/opencode-hang"; OPENCODE_DEADLINE=1
+    platform_finish opencode "$tmp/ocx/none.ndjson" ses_hang j1 "$tmp/ocx"
+    [ -z "$PF_MODEL_ID" ] && grep -q 'j1: opencode export timed out after 1 s' "$TICK_LOG" ); \
+    want "an export past its deadline says timed out, not gave no model" 0 $?
 
   echo "platform_check opencode — ready when the CLI lists a model, and who the account is"
   _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode"; platform_check opencode )"
@@ -10318,6 +10352,27 @@ run_job() { # run_job <id> [--force] [resume-session-id]
     [ -z "$disallowed" ] || [ "$disallowed" = "null" ] \
       || log_tick "$id: disallowed_tools is ignored on openai (codex cannot close a tool by flag)"
   fi
+  if [ "$platform" = "opencode" ]; then
+    # The CLI reads stdin as part of the PROMPT (measured 13b): there is no
+    # protocol for a human to talk to a live run.
+    [ "$interactive" != "true" ] \
+      || { log_tick "$id: interactive is not available on opencode (opencode run has no stdin protocol: it reads stdin as part of the prompt), skipped"; return 1; }
+    platform_model_ok opencode "$model" \
+      || { log_tick "$id: model '$model' is not in the OpenCode catalog (run: agentloop resolve-models opencode), skipped"; return 1; }
+    platform_permission_ok opencode "$permission" \
+      || { log_tick "$id: permission_mode '$permission' is not an OpenCode mode (full-access, read-only), skipped"; return 1; }
+    # The CLI accepts any --variant in silence (measured 11b): an effort the
+    # catalog does not list for this model is dropped here, and said to be,
+    # rather than passed to change nothing.
+    if [ -n "$effort" ] && ! platform_effort_ok opencode "$model" "$effort"; then
+      log_tick "$id: effort '$effort' is not a variant of $model — launched without an effort"
+      effort=""
+    fi
+    # A model that makes no tool calls (the catalog says so) still runs -- a
+    # prompt that needs no tool is legitimate -- but the operator is told.
+    opencode_catalog_tools "$model" \
+      || log_tick "$id: model '$model' makes no tool calls (catalog) — the agent can only answer in text"
+  fi
   # After the catalog: a model the CLI knows, but not the one Settings
   # enabled (the enabled list is never empty here -- the gate above already
   # refused that case).
@@ -10513,6 +10568,33 @@ ${prompt}"
   # before run_env existed) and not a provisioning hook (those run before this
   # array is finished and read exported AL_* variables).
   run_env+=("AL_PLATFORM=$platform")
+  # OpenCode takes its permission block from the environment (measured
+  # 04-06, 23, 33): the job's mode and its tool lists, translated by
+  # opencode_config_content. Every note the translation makes -- a tool
+  # name the table does not know, a pattern widened or dropped -- goes to
+  # tick.log now, before the launch, so a job that asked for something the
+  # CLI cannot do learns it here rather than at its first tool call.
+  if [ "$platform" = "opencode" ]; then
+    local _occ _occ1 _ocnote
+    _occ="$(opencode_config_content "$permission" "$allowed" "$disallowed")"
+    _occ1="$(printf '%s\n' "$_occ" | head -1)"
+    if [ -z "$_occ1" ]; then
+      # opencode_config_content always prints a JSON first line for any
+      # input; an empty one means the translation itself failed (a broken
+      # $PYTHON, most likely) rather than that the job asked for something
+      # odd. Launching anyway would leave OPENCODE_CONFIG_CONTENT unset and
+      # the CLI would fall back to its own defaults -- sharing ON, nothing
+      # read-only -- silently wider than whatever this job's permission_mode
+      # promised. Refuse instead of guessing.
+      log_tick "$id: could not build the OpenCode permission block, skipped"
+      run_cleanup "$id" "$slot"; trap - EXIT
+      return 1
+    fi
+    run_env+=("OPENCODE_CONFIG_CONTENT=$_occ1")
+    printf '%s\n' "$_occ" | tail -n +2 | while IFS= read -r _ocnote; do
+      [ -n "$_ocnote" ] && log_tick "$id: $_ocnote"
+    done
+  fi
   if wt_isolation_enabled "$project" "$cwd"; then
     local reattached=""
     [ -n "$resume_sid" ] && reattached="$(wt_find_by_session "$id" "$resume_sid")"
@@ -10831,13 +10913,16 @@ If the work turns out to be already finished, or it can no longer be done at all
   # own worktree, before the CLI is launched, and security_prompt tells the
   # agent the phase already ran. Never on a resume: that session already had
   # its prepare, and a second one only rewrites the coverage record.
+  # OpenCode also runs it here: its bash tool waits for a command (measured
+  # 19), but that tool's own timeout was not measured and `prepare` can take
+  # minutes.
   #
   # A failure does not abort the run. The close is what tells the truth --
   # `finish` lowers `done` to `capped` while `prepared` is 0 -- and tick.log
   # says what happened and how long it took. The output goes to its own
   # sidecar, never to $logfile.err: a byte on that file turns a clean run
   # into `warning` (errbytes, below), and this is not the agent's stderr.
-  if [ "$platform" = "openai" ] && [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ] && [ -z "$resume_sid" ]; then
+  if ! platform_caps "$platform" prepare_inline && [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ] && [ -z "$resume_sid" ]; then
     local _prep_ignore _prep_t0 _prep_t1 _prep_secs _prep_rc=0
     _prep_ignore="$("$JQ" -r '.ignore // ""' "$(security_request_path "$id")" 2>/dev/null)"
     _prep_t0="$(now_epoch)"
@@ -10847,7 +10932,7 @@ If the work turns out to be already finished, or it can no longer be done at all
     _prep_t1="$(now_epoch)"
     _prep_secs=$((_prep_t1 - _prep_t0))
     if [ "$_prep_rc" -eq 0 ]; then
-      log_tick "$id: deterministic phase ran before the agent (prepare, ${_prep_secs}s) — the Codex shell tool cannot be trusted to wait for it"
+      log_tick "$id: deterministic phase ran before the agent (prepare, ${_prep_secs}s) — $platform does not run it inside the agent (prepare_inline)"
     else
       log_tick "$id: prepare failed before the agent (rc $_prep_rc, ${_prep_secs}s) — the close will cap the analysis — output in ${logfile##*/}.prepare"
     fi
@@ -10855,27 +10940,36 @@ If the work turns out to be already finished, or it can no longer be done at all
 
   fifo=""
   local cli_pid="" normalizer="" rawfifo="" nrc=0
-  if [ "$platform" = "openai" ]; then
-    # The Codex CLI writes its own JSONL; every reader here wants stream-json.
-    # The CLI's stdout goes down a FIFO into the normalizer, which writes the
-    # canonical stream to $streamfile and a verbatim copy to $streamfile.raw.
-    # `exec` makes the subshell BECOME the CLI, so $child below is the CLI's
-    # own pid: stop (TERM), the watchdog's tree_cpu_seconds and wait all keep
-    # working unchanged. `< /dev/null` is what keeps `codex exec` from waiting
-    # on stdin for ever (measured).
+  local normalizer_py; normalizer_py="$(platform_normalizer "$platform")"
+  if [ -n "$normalizer_py" ]; then
+    # A platform with a normalizer: the CLI writes its own dialect; every
+    # reader here wants stream-json. The CLI's stdout goes down a FIFO into
+    # the normalizer, which writes the canonical stream to $streamfile and a
+    # verbatim copy to $streamfile.raw. `exec` makes the subshell BECOME the
+    # CLI, so $child below is the CLI's own pid: stop (TERM), the watchdog's
+    # tree_cpu_seconds and wait all keep working unchanged. `< /dev/null` is
+    # what keeps both CLIs from waiting on stdin for ever (measured on each).
     rawfifo="$logfile.raw.fifo"
     rm -f "$rawfifo"; mkfifo "$rawfifo" 2>/dev/null
-    platform_argv_openai "$resume_sid" "$run_cwd" "$model" "$effort" "$permission" "$prompt" \
-      "$(openai_writable_roots "$run_cwd" "$run_dir")"
+    local -a normargs=()
+    case "$platform" in
+      openai)
+        platform_argv_openai "$resume_sid" "$run_cwd" "$model" "$effort" "$permission" "$prompt" \
+          "$(openai_writable_roots "$run_cwd" "$run_dir")"
+        normargs=(--model "$model" --permission "$permission" --cwd "$run_cwd" \
+                  --pricing "$PRICING_FILE" --raw-out "$streamfile.raw") ;;
+      opencode)
+        platform_argv_opencode "$resume_sid" "$run_cwd" "$model" "$effort" "$prompt" "agentloop $id $stamp"
+        normargs=(--model "$model" --permission "$permission" --cwd "$run_cwd" \
+                  --catalog "$MODELS_FILE" --pricing "$PRICING_FILE" --raw-out "$streamfile.raw") ;;
+    esac
     (
       cd "$run_cwd" || exit 1
       exec env ${run_env[@]+"${run_env[@]}"} "$cli_bin" ${PLATFORM_ARGV[@]+"${PLATFORM_ARGV[@]}"} \
         > "$rawfifo" 2> "$logfile.err" < /dev/null
     ) &
     cli_pid=$!
-    "$PYTHON" -u "$BIN_DIR/platforms/openai_stream.py" --model "$model" --permission "$permission" \
-      --cwd "$run_cwd" --pricing "$PRICING_FILE" --raw-out "$streamfile.raw" \
-      < "$rawfifo" > "$streamfile" 2>> "$logfile.err" &
+    "$PYTHON" -u "$normalizer_py" "${normargs[@]}" < "$rawfifo" > "$streamfile" 2>> "$logfile.err" &
     normalizer=$!
   elif [ "$interactive" = "true" ]; then
     # `--input-format stream-json` accepts further user messages on stdin while
@@ -11111,7 +11205,7 @@ If the work turns out to be already finished, or it can no longer be done at all
   [ -n "$model_id" ] && [ "$model_id" != "null" ] || model_id=""
   # On openai the init event carries the slug that was ASKED for; the model
   # that ran is in the rollout. platform_finish also feeds the usage gate.
-  platform_finish "$platform" "$streamfile" "$session" "$id"
+  platform_finish "$platform" "$streamfile" "$session" "$id" "$run_cwd"
   [ -z "$PF_MODEL_ID" ] || model_id="$PF_MODEL_ID"
 
   # Classify the run: error / warning / success.
@@ -11236,7 +11330,15 @@ If the work turns out to be already finished, or it can no longer be done at all
   local cap
   cap="$(job_get "$id" '.max_budget_usd' '')"
   case "$cap" in ''|null|0) cap="" ;; esac
-  if [ -n "$cap" ] && [ "$status" = "success" ] \
+  if [ -n "$cap" ] && [ "$cost_basis" = "none" ]; then
+    # Unknown is not zero. The comparison below reads ${cost:-0}, so a run
+    # whose cost nobody knows (no price for its model, on any platform)
+    # would never reach 90% of anything and the cap would stay silent -- the
+    # worst shape a cap can take. Say it, on the run and in tick.log, and
+    # leave the status alone: the run itself did nothing wrong.
+    log_tick "$id: max_budget_usd $cap not applied: the cost of this run is unknown (no price for ${model_id:-$model})"
+    wdreason="${wdreason:+$wdreason; }max_budget_usd \$$cap not applied: the cost of this run is unknown (no price for ${model_id:-$model})"
+  elif [ -n "$cap" ] && [ "$status" = "success" ] \
      && awk "BEGIN{exit !(${cost:-0} >= $cap * 0.9)}" 2>/dev/null; then
     wdreason="BUDGET LIMITED: spent \$${cost:-0} of a \$$cap cap — the agent wrapped up early, so the task may be unfinished. Check the ticket and the branch before assuming it is done; resume this run to continue with its context."
     status="warning"

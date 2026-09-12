@@ -69,6 +69,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `platform_normalizer` is what the launch now asks for, and
     `prepare_inline` the capability that says which platform lets the
     security agent run `prepare` itself.
+  - The launch: `run_job` asks `platform_normalizer` whether a platform's
+    stream is translated and goes down the FIFO for either, refuses an
+    OpenCode run that cannot start (no usable provider, an id outside the
+    catalog, a Codex mode, `interactive`) before a slot is spent, drops an
+    effort the model's catalog entry does not list (the CLI would accept it
+    in silence), hands the permission block to the CLI in its environment,
+    and reads the model that ran from `opencode export` at the close.
+  - A per-run cap over an unknown cost now says so. `max_budget_usd`
+    compared `${cost:-0}` with 90% of the cap, so a run whose cost nobody
+    knows (an unpriced model, on any platform) never fired the BUDGET
+    LIMITED warning and never said why; the run's note and `tick.log` now
+    carry "max_budget_usd $X not applied: the cost of this run is unknown".
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of
