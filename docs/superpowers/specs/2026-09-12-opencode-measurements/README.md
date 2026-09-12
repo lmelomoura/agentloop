@@ -23,6 +23,12 @@ secção "OpenCode: o ponto de extensão"), a medição manda.
 - Modelos usados: `opencode/big-pickle` e `opencode/ling-3.0-flash-fin-free`
   (Zen, gratuitos; o segundo tem `variants`). Prompts triviais, um directório
   de rascunho, nunca um repositório a sério.
+- A meio das medições (entre a 33 e a 34) o operador trocou a chave e o
+  catálogo do provider `pdm_ai`: os oito modelos sem preço deram lugar a seis
+  **com preço** (`models-after-provider-change.txt`,
+  `models-verbose-after-provider-change.txt`). Tudo até à 33 foi medido contra
+  o catálogo antigo (`models.txt`, `models-verbose.txt`); a 34 é a única
+  corrida num modelo pago.
 - Cada `NN-nome.jsonl` é o stdout verbatim, `NN-nome.stderr.txt` o stderr,
   `NN-nome.meta.txt` o comando, o modo do stdin, o cwd, o código de saída e a
   duração. Dois nomes foram substituídos em todos os ficheiros, e só esses: o
@@ -46,6 +52,10 @@ secção "OpenCode: o ponto de extensão"), a medição manda.
 | o primeiro byte no stdout só sai quando o modelo começa a responder; um provider lento pode levar dezenas de segundos sem output (o 21 não respondeu em 120 s, o 21b levou 28 s ao mesmo pedido) | 21, 21b |
 | `total = input + output + reasoning + cache.read + cache.write`; `input` **exclui** o que veio da cache; `reasoning` é separado do `output` (ao contrário do Codex) | 11, 24b, 24c |
 | `cost` é calculado pelo CLI a partir do preço do catálogo: `(input×in + output×out + reasoning×out + cache.read×cr + cache.write×cw) / 10⁶`; com preço 0 no catálogo (Zen gratuito, provider custom sem `cost`) vem `0`, indistinguível de "sem preço" | 24b, 24c, `models-verbose.txt` |
+| **num provider pago a sério** o CLI reporta o custo do catálogo: `cost: 0.000426176016` = (12800×0.033011 + (3+23)×0.139816)/10⁶ em `pdm_ai/glm-5.3-flash`; a mesma fórmula, o raciocínio ao preço do output | 34, `models-verbose-after-provider-change.txt` |
+| um provider que **não responde** (o router aceitou a ligação e nunca respondeu para `Nemotron-3.5-Lightning`, confirmado por um POST directo que expirou aos 25 s) deixa o CLI pendurado depois de `llm runtime selected`, sem timeout, sem erro e sem um byte: só um watchdog exterior o termina | 34b |
+| um id de modelo pode ter barra dentro (`pdm_ai/openai/gpt-oss-120b`): `provider/model` divide-se na **primeira** barra | `models-after-provider-change.txt` |
+| `--` antes do prompt é aceite; `share: "disabled"` em `OPENCODE_CONFIG_CONTENT` também (a par de `permission`) | 33 |
 | sobrepor por configuração um modelo de um provider embutido (`provider.opencode.models.big-pickle.cost`) parte a resolução do modelo ("Model not found: opencode/big-pickle. Did you mean: big-pickle?"); um provider custom com o mesmo endpoint funciona | 24, 24b |
 | `--variant` é o esforço: os valores válidos são as chaves de `variants` de cada modelo no catálogo (`low`/`medium`/`high`, `minimal`…`xhigh`, `max`, `non-think`, consoante o modelo); `--variant high` fez `reasoning > 0`; **um valor inválido é aceite em silêncio** (exit 0) | 11, 11b, `models-verbose.txt` |
 | `--dir <d>` é o cwd do run (processo em `p`, ferramentas em `q`) | 07 |
@@ -129,6 +139,10 @@ secção "OpenCode: o ponto de extensão"), a medição manda.
 | `31-agent-plan-auto` | `--agent plan --auto`, pedir `ls`, um `write` e um `echo >` | o modelo recusou tudo em texto ("Plan Mode (read-only)") sem chamar uma ferramenta; exit 0 |
 | `31b-export-plan-session.json` | `opencode export <sessão do 31>` | `info.agent: "plan"`; `info.permission` traz só os três `deny` do modo `run`: as regras do agente não vêm no export |
 | `32-agent-list.txt` | `opencode agent list` | as regras de permissão de cada agente (`build`, `plan`, `general`, `explore`, `compaction`, `summary`, `title`, e o `image-analyzer` do operador): a fonte dos defaults; o `plan` mantém `bash: allow` |
+| `33-dashdash-and-share-disabled` | `OPENCODE_CONFIG_CONTENT='{"share":"disabled","permission":{"task":"deny"}}'`, `-- 'Reply with exactly: dashdash'` | respondeu `dashdash`; exit 0; stderr vazio: o `--` e a chave `share` são aceites |
+| `34-paid-provider-cost` | `-m pdm_ai/glm-5.3-flash` (pago, 0.033011 / 0.139816 por 1M), `Reply with exactly: ok` | `cost: 0.000426176016`, `tokens{input:12800, output:3, reasoning:23}`: o custo reportado bate com a fórmula num preço real |
+| `34b-paid-provider-cost-logs` | `-m pdm_ai/Nemotron-3.5-Lightning --print-logs --log-level DEBUG`, 40 s | o log pára em `llm runtime selected` e nada mais acontece: o router não responde para este modelo e o CLI espera para sempre; a primeira tentativa (150 s) também não escreveu um byte |
+| `models-after-provider-change.txt`, `models-verbose-after-provider-change.txt` | `opencode models` / `--verbose`, depois da troca de chave | 7 `opencode/*-free` mais 6 `pdm_ai/*` com `cost` real, `limit`, `variants` e `toolcall: true` em todos |
 
 ## O que não ficou medido, e porquê
 
@@ -136,9 +150,6 @@ secção "OpenCode: o ponto de extensão"), a medição manda.
   devolveram durante as medições e não há como a forçar. Pela forma do 16, um
   429 chegaria como `error{name: "APIError", data{statusCode: 429}}`; a spec
   trata-o como inferência da forma, não como facto.
-- **Um custo real do CLI para um provider pago.** Todos os modelos desta
-  máquina têm custo 0 no catálogo; a fórmula foi provada com um preço dado por
-  configuração (24b, 24c).
 - **`step_finish.reason` além de `stop` e `tool-calls`.** Só esses dois foram
   vistos.
 - **Modelos com `toolcall: false`** (`pdm_ai/deepseek-v4-flash`,
