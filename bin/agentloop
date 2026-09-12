@@ -4279,16 +4279,18 @@ JSON
   printf '%s\n' "$_cc" | tail -n +2 | grep -q "Nonesuch" && ok "an unknown tool name is named in a note, not translated" || bad "no note for Nonesuch"
   printf '%s\n' "$_cc" | head -1 | "$JQ" -e '.permission | has("nonesuch") | not' >/dev/null 2>&1 && ok "and never reaches the block" || bad "Nonesuch reached the block"
 
-  # run_env's own guard (in run_job, right after AL_PLATFORM=$platform) refuses
-  # the launch when this comes back with an empty first line, rather than set
-  # OPENCODE_CONFIG_CONTENT to nothing and let the CLI fall back to its own
-  # defaults (sharing ON, nothing read-only). The heredoc above always prints
-  # a JSON first line for any permission/allowed/disallowed input -- the only
-  # way it comes back empty is the interpreter itself failing -- so that is
-  # exercised here directly. Not through run_job: platform_ready's own probe
-  # (run_bounded, same $PYTHON) would fail first on a broken interpreter and
-  # refuse the run for the unrelated reason "not ready", never reaching this
-  # guard at all.
+  # The opencode refusal block's own guard (in run_job, before acquire_slot)
+  # refuses the launch when this comes back with an empty first line, rather
+  # than set OPENCODE_CONFIG_CONTENT to nothing and let the CLI fall back to
+  # its own defaults (sharing ON, nothing read-only). The heredoc above
+  # always prints a JSON first line for any permission/allowed/disallowed
+  # input -- the only way it comes back empty is the interpreter itself
+  # failing -- so that is exercised here directly. Not through run_job with a
+  # GLOBALLY broken interpreter: platform_ready's own probe (run_bounded,
+  # same $PYTHON) runs first and would fail there instead, on the unrelated
+  # reason "not ready", never reaching this guard at all -- the e2e suite
+  # drives the guard itself with a $PYTHON that only fails the one call
+  # shape opencode_config_content uses (see test/e2e.test.sh, scenario 37).
   local _ccbroken
   _ccbroken="$(PYTHON=/no/such/python-interpreter opencode_config_content full-access "" "" 2>/dev/null)"
   [ -z "$_ccbroken" ] \
@@ -10372,6 +10374,23 @@ run_job() { # run_job <id> [--force] [resume-session-id]
     # prompt that needs no tool is legitimate -- but the operator is told.
     opencode_catalog_tools "$model" \
       || log_tick "$id: model '$model' makes no tool calls (catalog) — the agent can only answer in text"
+    # The permission block this run launches with, built and validated HERE --
+    # before a slot, a precheck or a log dir is spent -- so the one way this
+    # ever fails (a broken $PYTHON: opencode_config_content always prints a
+    # JSON first line otherwise) costs the run nothing to refuse. `_occ1`
+    # (its first line, the JSON) is kept in a `local` that outlives this
+    # block, for the run_env section further down to read; every note on the
+    # later lines goes to tick.log now.
+    local _occ _oc_rc _occ1 _ocnote
+    _occ="$(opencode_config_content "$permission" "$allowed" "$disallowed")"; _oc_rc=$?
+    _occ1="$(printf '%s\n' "$_occ" | head -1)"
+    if [ "$_oc_rc" -ne 0 ] || [ -z "$_occ1" ]; then
+      log_tick "$id: could not build the OpenCode permission block, skipped"
+      return 1
+    fi
+    printf '%s\n' "$_occ" | tail -n +2 | while IFS= read -r _ocnote; do
+      [ -n "$_ocnote" ] && log_tick "$id: $_ocnote"
+    done
   fi
   # After the catalog: a model the CLI knows, but not the one Settings
   # enabled (the enabled list is never empty here -- the gate above already
@@ -10573,27 +10592,11 @@ ${prompt}"
   # opencode_config_content. Every note the translation makes -- a tool
   # name the table does not know, a pattern widened or dropped -- goes to
   # tick.log now, before the launch, so a job that asked for something the
-  # CLI cannot do learns it here rather than at its first tool call.
+  # CLI cannot do learns it here rather than at its first tool call. Built
+  # and validated in the opencode refusal block above, before a slot was
+  # ever spent; here it is just read into the run's environment.
   if [ "$platform" = "opencode" ]; then
-    local _occ _occ1 _ocnote
-    _occ="$(opencode_config_content "$permission" "$allowed" "$disallowed")"
-    _occ1="$(printf '%s\n' "$_occ" | head -1)"
-    if [ -z "$_occ1" ]; then
-      # opencode_config_content always prints a JSON first line for any
-      # input; an empty one means the translation itself failed (a broken
-      # $PYTHON, most likely) rather than that the job asked for something
-      # odd. Launching anyway would leave OPENCODE_CONFIG_CONTENT unset and
-      # the CLI would fall back to its own defaults -- sharing ON, nothing
-      # read-only -- silently wider than whatever this job's permission_mode
-      # promised. Refuse instead of guessing.
-      log_tick "$id: could not build the OpenCode permission block, skipped"
-      run_cleanup "$id" "$slot"; trap - EXIT
-      return 1
-    fi
     run_env+=("OPENCODE_CONFIG_CONTENT=$_occ1")
-    printf '%s\n' "$_occ" | tail -n +2 | while IFS= read -r _ocnote; do
-      [ -n "$_ocnote" ] && log_tick "$id: $_ocnote"
-    done
   fi
   if wt_isolation_enabled "$project" "$cwd"; then
     local reattached=""
@@ -10899,7 +10902,8 @@ ${prompt}"
 If the work turns out to be already finished, or it can no longer be done at all (the ticket is gone, the card moved on, another run took it), then do NOT invent new work: stop and answer with one line starting exactly with 'NOTHING TO DO: ' followed by the reason."
   fi
 
-  # THE DETERMINISTIC PHASE, ENGINE-SIDE, ON CODEX ONLY. `security prepare`
+  # THE DETERMINISTIC PHASE, ENGINE-SIDE, ON THE PLATFORMS WITHOUT prepare_inline
+  # (Codex, OpenCode). `security prepare`
   # (secrets, dependency CVEs, SBOM, hygiene, IaC) is the analysis prompt's
   # first command on Claude Code, and there the agent's Bash tool waits for
   # it however long it takes -- that flow works and is not touched here. On
@@ -10962,6 +10966,10 @@ If the work turns out to be already finished, or it can no longer be done at all
         platform_argv_opencode "$resume_sid" "$run_cwd" "$model" "$effort" "$prompt" "agentloop $id $stamp"
         normargs=(--model "$model" --permission "$permission" --cwd "$run_cwd" \
                   --catalog "$MODELS_FILE" --pricing "$PRICING_FILE" --raw-out "$streamfile.raw") ;;
+      *)
+        log_tick "$id: no launch line for platform $platform"
+        run_cleanup "$id" "$slot"; trap - EXIT
+        return 1 ;;
     esac
     (
       cd "$run_cwd" || exit 1
@@ -10969,7 +10977,7 @@ If the work turns out to be already finished, or it can no longer be done at all
         > "$rawfifo" 2> "$logfile.err" < /dev/null
     ) &
     cli_pid=$!
-    "$PYTHON" -u "$normalizer_py" "${normargs[@]}" < "$rawfifo" > "$streamfile" 2>> "$logfile.err" &
+    "$PYTHON" -u "$normalizer_py" ${normargs[@]+"${normargs[@]}"} < "$rawfifo" > "$streamfile" 2>> "$logfile.err" &
     normalizer=$!
   elif [ "$interactive" = "true" ]; then
     # `--input-format stream-json` accepts further user messages on stdin while
@@ -11002,7 +11010,7 @@ If the work turns out to be already finished, or it can no longer be done at all
     ) &
   fi
   local child=$!
-  [ -z "$normalizer" ] || child="$cli_pid"   # openai: $! was the normalizer
+  [ -z "$normalizer" ] || child="$cli_pid"   # a platform with a normalizer: $! was the normalizer
 
   if [ "$interactive" = "true" ]; then
     exec 9> "$fifo"                       # hold it open: EOF would end the turn loop
@@ -11176,9 +11184,10 @@ If the work turns out to be already finished, or it can no longer be done at all
   # says it cannot (`none`); a run that died without a final event knows
   # neither, and records null tokens rather than a zero that reads as free.
   local cost_basis tokens_json
+  local _no_result=false
   cost_basis="$("$JQ" -r '.cost_basis // empty' "$logfile" 2>/dev/null)"
   if [ -z "$cost_basis" ]; then
-    if [ "$("$JQ" -r '.subtype // ""' "$logfile" 2>/dev/null)" = "no_result_event" ]; then cost_basis="none"
+    if [ "$("$JQ" -r '.subtype // ""' "$logfile" 2>/dev/null)" = "no_result_event" ]; then cost_basis="none"; _no_result=true
     elif [ "$platform" = "anthropic" ]; then cost_basis="reported"
     else cost_basis="none"; fi
   fi
@@ -11203,8 +11212,9 @@ If the work turns out to be already finished, or it can no longer be done at all
   local model_id
   model_id="$("$JQ" -r 'select(.type=="system" and .subtype=="init") | .model' "$streamfile" 2>/dev/null | head -1)"
   [ -n "$model_id" ] && [ "$model_id" != "null" ] || model_id=""
-  # On openai the init event carries the slug that was ASKED for; the model
-  # that ran is in the rollout. platform_finish also feeds the usage gate.
+  # On openai and opencode the init event carries the slug that was ASKED
+  # for; the model that ran is in the rollout (openai) or the export
+  # (opencode). platform_finish also feeds the usage gate on openai.
   platform_finish "$platform" "$streamfile" "$session" "$id" "$run_cwd"
   [ -z "$PF_MODEL_ID" ] || model_id="$PF_MODEL_ID"
 
@@ -11330,12 +11340,17 @@ If the work turns out to be already finished, or it can no longer be done at all
   local cap
   cap="$(job_get "$id" '.max_budget_usd' '')"
   case "$cap" in ''|null|0) cap="" ;; esac
-  if [ -n "$cap" ] && [ "$cost_basis" = "none" ]; then
+  if [ -n "$cap" ] && [ "$cost_basis" = "none" ] && [ "$_no_result" = false ]; then
     # Unknown is not zero. The comparison below reads ${cost:-0}, so a run
     # whose cost nobody knows (no price for its model, on any platform)
     # would never reach 90% of anything and the cap would stay silent -- the
     # worst shape a cap can take. Say it, on the run and in tick.log, and
     # leave the status alone: the run itself did nothing wrong.
+    # `_no_result` guards this: a run that ended without a final event
+    # (killed, stopped, crashed at launch) also has cost_basis "none", but
+    # its cost is unknown because it died, not because the model has no
+    # price -- telling it "not applied" there is false on every platform,
+    # anthropic included, where the cap IS applied via --max-budget-usd.
     log_tick "$id: max_budget_usd $cap not applied: the cost of this run is unknown (no price for ${model_id:-$model})"
     wdreason="${wdreason:+$wdreason; }max_budget_usd \$$cap not applied: the cost of this run is unknown (no price for ${model_id:-$model})"
   elif [ -n "$cap" ] && [ "$status" = "success" ] \

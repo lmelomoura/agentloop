@@ -81,6 +81,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     knows (an unpriced model, on any platform) never fired the BUDGET
     LIMITED warning and never said why; the run's note and `tick.log` now
     carry "max_budget_usd $X not applied: the cost of this run is unknown".
+    A run that ended without a final event (stopped, killed) is not told
+    its cap was not applied: its cost is unknown because it died, not
+    because the model has no price.
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of

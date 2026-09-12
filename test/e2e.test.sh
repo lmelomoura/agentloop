@@ -717,7 +717,7 @@ dd="$(idx_in "$argv33" --)"; [ -n "$dd" ] && [ "$((dd + 1))" = "$argc33" ] && ok
 [ "$(jq -r .share "$cfg33")" = "disabled" ] && ok "OPENCODE_CONFIG_CONTENT disables sharing" || bad "config: $(cat "$cfg33")"
 [ "$(jq -c .permission "$cfg33")" = '{"task":"deny","bash":{"*":"allow","git push *":"deny"}}' ] \
   && ok "and carries the job's denylist: Agent closed task, Bash(git push *) became a bash rule" || bad "permission: $(jq -c .permission "$cfg33")"
-grep -q "j33: disallowed_tools is ignored on opencode" "$ROOT/data/tick.log" && bad "the lists were called ignored on opencode" || ok "nothing calls the tool lists ignored: they are translated"
+grep -q "j33: disallowed_tools is ignored" "$ROOT/data/tick.log" && bad "the lists were called ignored on opencode" || ok "nothing calls the tool lists ignored: they are translated"
 [ "$(lastrun | jq -r .status)" = "success" ] && ok "and the run went on to finish" || bad "status $(lastrun | jq -r .status)"
 
 echo
@@ -759,7 +759,7 @@ sleep 2
 
 echo
 echo "36. a stop ends an OpenCode run that will not end by itself"
-mkjob_opencode j36
+mkjob_opencode j36 full-access pdm_ai/glm-5.3-flash ',"max_budget_usd":1'
 FAKE_MODE=hang FAKE_SESSION=ses_hang "$AL" run j36 >/dev/null 2>&1 &
 w=0; while [ "$w" -lt 20 ] && ! ls "$ROOT"/data/locks/j36/*/child >/dev/null 2>&1; do sleep 1; w=$((w + 1)); done
 sleep 1
@@ -767,6 +767,7 @@ sleep 1
 wait
 [ "$(lastrun | jq -r .status)" = "stopped" ] && ok "status stopped (waited ${w}s for the slot)" || bad "status $(lastrun | jq -r .status)"
 [ ! -e "$ROOT"/data/logs/j36/*.raw.fifo ] && ok "the FIFO was removed" || bad "FIFO left behind"
+lastrun | jq -r .note | grep -q 'not applied' && bad "a stopped run got the cap note" || ok "a stopped run gets no cap note: its cost is unknown because it died, not because the model has no price"
 
 echo
 echo "37. a run that cannot start is refused in tick.log before it costs a slot"
@@ -783,6 +784,14 @@ grep -q "j37: interactive is not available on opencode" "$ROOT/data/tick.log" &&
 mkjob_opencode j37 workspace-write
 "$AL" run j37 >/dev/null 2>&1
 grep -q "j37: permission_mode 'workspace-write' is not an OpenCode mode" "$ROOT/data/tick.log" && ok "a Codex mode → refused (there is no sandbox to promise)" || bad "no permission refusal"
+argv37x="$ROOT/argv-37x"; rm -f "$argv37x"
+printf '#!/bin/bash\nif [ "$1" = "-" ] && { [ "$2" = "full-access" ] || [ "$2" = "read-only" ]; }; then exit 1; fi\nexec python3 "$@"\n' > "$ROOT/pybroken"
+chmod +x "$ROOT/pybroken"
+mkjob_opencode j37
+AGENTLOOP_PYTHON="$ROOT/pybroken" FAKE_ARGV_OUT="$argv37x" "$AL" run j37 >/dev/null 2>&1
+grep -q "j37: could not build the OpenCode permission block, skipped" "$ROOT/data/tick.log" && ok "a broken permission block is refused before a slot is spent" || bad "no permission-block refusal line"
+[ ! -e "$argv37x" ] && ok "and no argv was ever written" || bad "the CLI launched anyway"
+[ ! -d "$ROOT/data/locks/j37" ] && ok "and no lock directory was left" || bad "a lock directory was left"
 argv37="$ROOT/argv-37"; rm -f "$argv37"
 mkjob_opencode j37
 sed -i '' 's/"effort":"high"/"effort":"ultra"/' "$ROOT/config/jobs.json"
