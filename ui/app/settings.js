@@ -277,10 +277,14 @@ function platformJobsLine(entry){
 }
 
 // A model row's badge counts everything; the tooltip is where the switched-on
-// half is spelled out, so the badge stays a short read.
+// half is spelled out, so the badge stays a short read. `on` is undefined when
+// the payload predates jobs_using_enabled -- the same rule platformJobsLine
+// follows: an absent number is not zero, so the clause is left off entirely
+// rather than telling every row that nothing uses it.
 function modelJobsTitle(n, on){
   if(!n) return "";
-  return n + " job" + (n === 1 ? "" : "s") + " use" + (n === 1 ? "s" : "") + " this model (" + (on || 0) + " switched on)";
+  return n + " job" + (n === 1 ? "" : "s") + " use" + (n === 1 ? "s" : "") + " this model"
+    + (typeof on === "number" ? " (" + on + " switched on)" : "");
 }
 
 function modelRow(r, entry, m, using, gone){
@@ -302,7 +306,8 @@ function modelRow(r, entry, m, using, gone){
   const n = using[m.v] || 0;
   if(n) meta.appendChild(el("span", "jobs", n + " job" + (n === 1 ? "" : "s")));
   row.appendChild(meta);
-  row.appendChild(switchEl(enabledNow, live.busy[r.id], modelJobsTitle(n, (entry.jobs_using_enabled || {})[m.v] || 0), "Switch on " + m.v, async (on) => {
+  const onHere = entry.jobs_using_enabled ? (entry.jobs_using_enabled[m.v] || 0) : undefined;
+  row.appendChild(switchEl(enabledNow, live.busy[r.id], modelJobsTitle(n, onHere), "Switch on " + m.v, async (on) => {
     const cur = (entry.models_enabled || []).slice();
     const next = on ? (cur.includes(m.v) ? cur : cur.concat([m.v])) : cur.filter(v => v !== m.v);
     await change("platform_set_models", {platform: r.id, models: next});

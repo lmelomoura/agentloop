@@ -3527,6 +3527,8 @@ def test_the_card_line_counts_every_job_not_only_the_enabled_ones(srv, tmp_path)
       title:     modelJobsTitle(2, 0),
       titleOne:  modelJobsTitle(1, 1),
       titleNone: modelJobsTitle(0, 0),
+      titleUnknown: modelJobsTitle(2, undefined),
+      lineUnknown:  platformJobsLine({enabled: true, jobs_on_platform: 2}),
     }));
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
@@ -3537,6 +3539,12 @@ def test_the_card_line_counts_every_job_not_only_the_enabled_ones(srv, tmp_path)
     assert out["planned"] == "runs on OpenCode are not supported yet"
     assert out["title"] == "2 jobs use this model (0 switched on)", out
     assert out["titleOne"] == "1 job uses this model (1 switched on)" and out["titleNone"] == ""
+    # A payload without the enabled halves (an older server, a cached response)
+    # must lose the clause, not read it as zero -- the line already did this,
+    # and a tooltip saying "(0 switched on)" about every model would be the
+    # same wrong-number-under-a-confident-name the whole fix is about.
+    assert out["titleUnknown"] == "2 jobs use this model", out
+    assert out["lineUnknown"] == "2 jobs run here", out
     assert "enabled job" not in _plainfn(js, "platformJobsLine"), \
         "the card line must stop calling every configured job an enabled one"
 

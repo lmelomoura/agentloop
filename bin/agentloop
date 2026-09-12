@@ -1433,10 +1433,18 @@ platform_usable() { # enabled AND at least one model enabled: what the editors a
 # was (effective(), above) -- but the run gate that actually launches a job
 # skips one like that rather than silently running it on the default. So
 # this list answers "counts as using this platform", never "runs there".
-platform_jobs_on() { # platform_jobs_on <platform> [model] [only-enabled] -> one line per job (its id) or security block ("security:<project>") counted as using it, switched on or not; a model may be a family; pass `on` as the third argument for only the ones switched on
+# The third argument is a FLAG with exactly one accepted spelling, `on`, and
+# the filter is handed a real boolean rather than that word: comparing the
+# string inside jq made every other value -- a typo, a `true`, a `yes` -- mean
+# "everything", silently, which is the wrong answer in the direction nobody
+# notices (more jobs listed, so a switch-off warning that over-warns rather
+# than fails).
+platform_jobs_on() { # platform_jobs_on <platform> [model] [only-enabled] -> one line per job (its id) or security block ("security:<project>") counted as using it, switched on or not; a model may be a family; the literal `on` as the third argument narrows it to the ones switched on
+  local only=false
+  [ "${3:-}" = "on" ] && only=true
   platforms_jq "$(platform_default_model anthropic)" "$(platform_default_model openai)" \
-    'uses[] | select(.p == $p) | select($m == "" or .m == $m or .m == resolved($m)) | select($only != "on" or .on) | .who' \
-    -r --arg p "$1" --arg m "${2:-}" --arg only "${3:-}"
+    'uses[] | select(.p == $p) | select($m == "" or .m == $m or .m == resolved($m)) | select(($only | not) or .on) | .who' \
+    -r --arg p "$1" --arg m "${2:-}" --argjson only "$only"
 }
 
 platform_cli_name() { case "$1" in anthropic) printf 'claude' ;; openai) printf 'codex' ;; opencode) printf 'opencode' ;; esac; }
@@ -3818,8 +3826,20 @@ JSON
   printf '%s' "$_pl" | "$JQ" -e '(keys | sort) == ["anthropic","openai","opencode"] and .opencode.supported == false and .openai.supported == true
       and .openai.enabled == true and .openai.usable == true and .openai.models_enabled == ["gpt-gone","gpt-a"] and .openai.bin_source == "env"
       and .openai.jobs_on_platform == 1 and .openai.jobs_using == {"gpt-a": 1} and .anthropic.jobs_using == {"claude-opus-5": 1}
+      and .openai.jobs_on_platform_enabled == 1 and .openai.jobs_using_enabled == {"gpt-a": 1}
+      and .anthropic.jobs_on_platform_enabled == 1 and .anthropic.jobs_using_enabled == {"claude-opus-5": 1}
       and .opencode.usable == false and (.opencode.models_enabled == [])' >/dev/null 2>&1 \
-    && ok "platforms: the three platforms, each with enabled, usable, bin_source, models_enabled and the jobs using them" || bad "platforms: $_pl"
+    && ok "platforms: the three platforms, each with enabled, usable, bin_source, models_enabled and both counts of the jobs using them" || bad "platforms: $_pl"
+  # Every job in the fixture above is switched on, so the two maps come out
+  # identical there and a filter that had lost its `select(.on)` would read
+  # exactly like one that kept it. Park a job and the pair has to disagree.
+  cp "$pc/config/jobs.json" "$pc/jobs.orig"
+  "$JQ" '.jobs += [{"id":"u3","platform":"openai","model":"gpt-a","enabled":false,"prompt":"x"}]' "$pc/jobs.orig" > "$pc/config/jobs.json"
+  _pl="$(pc_al platforms 2>/dev/null)"
+  printf '%s' "$_pl" | "$JQ" -e '.openai.jobs_on_platform == 2 and .openai.jobs_using == {"gpt-a": 2}
+      and .openai.jobs_on_platform_enabled == 1 and .openai.jobs_using_enabled == {"gpt-a": 1}' >/dev/null 2>&1 \
+    && ok "and a parked job counts in jobs_using but never in jobs_using_enabled" || bad "platforms with a parked job: $_pl"
+  cp "$pc/jobs.orig" "$pc/config/jobs.json"
   printf '{oops' > "$pc/config/platforms.json"
   pc_al platforms 2>/dev/null | "$JQ" -e '._error | test("not a valid platforms file")' >/dev/null 2>&1; want "platforms carries _error when the file is unreadable" 0 $?
   pc_al platform enable openai >/dev/null 2>&1; want "and enable refuses to write over it" 1 $?

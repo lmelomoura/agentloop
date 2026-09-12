@@ -111,11 +111,15 @@ def test_the_registry_rides_on_api_models(srv, tmp_path, monkeypatch):
     # configuration the operator means to switch back on.
     assert a["jobs_using"] == {"claude-opus-5": 4, "claude-fable-5-1": 1, "claude-sonnet-5": 1}
     assert a["jobs_on_platform"] == 6 and a["jobs_on_platform_enabled"] == 5
+    # the same map with "off" taken back out -- this is what the model rows'
+    # tooltips count, so a filter that drifts here mislabels every row
+    assert a["jobs_using_enabled"] == {"claude-opus-5": 4, "claude-fable-5-1": 1}
     assert o["enabled"] is True and o["usable"] is True
     # "bad"'s model ("opus") is not a valid openai slug, so it falls back to
     # openai's default too and lands under the same key as "o".
     assert o["jobs_using"] == {"gpt-5.6-luna": 2}
     assert o["jobs_on_platform"] == 2 and o["jobs_on_platform_enabled"] == 2
+    assert o["jobs_using_enabled"] == {"gpt-5.6-luna": 2}     # nothing parked on openai here
     assert c["supported"] is False and c["usable"] is False and c["available"] is False
     assert c["reason"] == "runs on OpenCode arrive with the OpenCode engine"
     assert out["configured"] is True and out["error"] == ""
@@ -152,6 +156,9 @@ def test_a_parked_jobs_model_still_counts_as_using_the_platform(srv, tmp_path, m
     assert a["jobs_on_platform"] == 2 and a["jobs_on_platform_enabled"] == 0
     assert o["jobs_using"] == {"gpt-5.6-luna": 1}
     assert o["jobs_on_platform"] == 1 and o["jobs_on_platform_enabled"] == 0
+    # the discriminating half: a parked job is in jobs_using and in NEITHER
+    # of the enabled twins, so the model rows read "(0 switched on)"
+    assert a["jobs_using_enabled"] == {} and o["jobs_using_enabled"] == {}
 
 
 def test_a_seed_that_leaves_no_file_reports_a_sentence_not_the_registry(srv, tmp_path, monkeypatch):

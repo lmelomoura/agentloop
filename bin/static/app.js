@@ -2640,7 +2640,7 @@
   }
   function modelJobsTitle(n, on) {
     if (!n) return "";
-    return n + " job" + (n === 1 ? "" : "s") + " use" + (n === 1 ? "s" : "") + " this model (" + (on || 0) + " switched on)";
+    return n + " job" + (n === 1 ? "" : "s") + " use" + (n === 1 ? "s" : "") + " this model" + (typeof on === "number" ? " (" + on + " switched on)" : "");
   }
   function modelRow(r, entry, m, using, gone) {
     const enabledNow = (entry.models_enabled || []).includes(m.v);
@@ -2657,7 +2657,8 @@
     const n = using[m.v] || 0;
     if (n) meta.appendChild(el("span", "jobs", n + " job" + (n === 1 ? "" : "s")));
     row.appendChild(meta);
-    row.appendChild(switchEl(enabledNow, live.busy[r.id], modelJobsTitle(n, (entry.jobs_using_enabled || {})[m.v] || 0), "Switch on " + m.v, async (on) => {
+    const onHere = entry.jobs_using_enabled ? entry.jobs_using_enabled[m.v] || 0 : void 0;
+    row.appendChild(switchEl(enabledNow, live.busy[r.id], modelJobsTitle(n, onHere), "Switch on " + m.v, async (on) => {
       const cur = (entry.models_enabled || []).slice();
       const next = on ? cur.includes(m.v) ? cur : cur.concat([m.v]) : cur.filter((v) => v !== m.v);
       await change("platform_set_models", { platform: r.id, models: next });
@@ -3021,5 +3022,5 @@
     setupBanner
   };
 })();
-/* ui-bundle: f84b23ce958417c841e36bd44063dd281ec7ddfd3187ca2f76442a5085dcb641 */
-/* ui-sources: ec9db5cd92dbd661bceb4bc16866f5ef0daec1d9fd298cae1602aa71df7ea97b */
+/* ui-bundle: 4f8b73dbc5f355fa23ffc3297e72a86f303b73f97b3db6682333f0ee957fddb8 */
+/* ui-sources: 1519753038c0b70d9e479f60b3fc77b17c383243b2ff5a9630e2f23272c5bf81 */

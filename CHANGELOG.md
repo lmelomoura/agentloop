@@ -386,9 +386,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   model those jobs would run on read as used by nobody, so switching it off, or
   switching the whole platform off, looked free. Both counts now cover every
   configured job and every security block a project carries, switched on or not,
-  and the card says which is which: *8 jobs run here (0 enabled)* when the two
-  numbers differ, plain *3 jobs run here* when they do not, and a model row's
-  tooltip spells out how many of its jobs are switched on. The two sentences that
+  and both places say which is which: the card reads *8 jobs run here (0
+  enabled)* when the two numbers differ and plain *3 jobs run here* when they do
+  not, and hovering a model's switch names how many of that model's jobs are
+  switched on — *2 jobs use this model (0 switched on)*. The two sentences that
   really are about running are unchanged: a platform is still only *enabled* by
   the seed when something would actually run on it, and the warning a switch-off
   prints still counts only the enabled jobs it leaves skipped. The seed's model
