@@ -53,7 +53,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     nothing; `platform check opencode` is ready when the CLI lists a model
     and names the credentials and the providers. `run_bounded` puts a
     deadline under the two CLI calls a hung OpenCode could otherwise turn
-    into a hung Settings page.
+    into a hung Settings page; a CLI that hangs past its deadline is reported
+    as a timeout, not as a missing provider.
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of

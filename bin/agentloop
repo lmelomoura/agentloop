@@ -145,6 +145,11 @@ if command -v opencode >/dev/null 2>&1; then _opencode_default="$(command -v ope
 elif [ -x "$HOME/.opencode/bin/opencode" ]; then _opencode_default="$HOME/.opencode/bin/opencode"
 else _opencode_default="/opt/homebrew/bin/opencode"; fi
 OPENCODE_BIN="${AGENTLOOP_OPENCODE_BIN:-$_opencode_default}"
+# How long a `opencode` call may run before it counts as hung (measured 34b: a
+# provider that never answers hangs the CLI for ever, silently). `models
+# --verbose` gets double this; the selftest shortens it to keep the two hang
+# cases fast.
+OPENCODE_DEADLINE="${AGENTLOOP_OPENCODE_DEADLINE:-30}"
 # Which Claude account every run signs in as. Claude Code keeps credentials,
 # settings, plugins, MCP servers and past sessions per config directory — one
 # signed-in account each — so this variable is the only thing that chooses
@@ -1519,14 +1524,20 @@ platform_check() { # platform_check <platform> -> one JSON object; always exits 
         # to run (the providers with a key, plus the free Zen models that need
         # none -- measured, 01), and the account line says how many
         # credentials auth.json holds and which providers the catalog shows.
-        local list nmod ncred provs esc
-        list="$(run_bounded 30 "$bin" models --pure 2>/dev/null | grep -E '^[A-Za-z0-9_.-]+/' || true)"
+        local list nmod ncred provs esc raw rc
+        raw="$(run_bounded "$OPENCODE_DEADLINE" "$bin" models --pure 2>/dev/null)"; rc=$?
+        list="$(printf '%s\n' "$raw" | grep -E '^[A-Za-z0-9_.-]+/' || true)"
         nmod="$(num "$(printf '%s\n' "$list" | grep -c . 2>/dev/null)")"
-        if [ "$nmod" -gt 0 ]; then
+        if [ "$rc" -eq 124 ]; then
+          # A deadline that hits is not the same fact as "no usable provider"
+          # -- it must never read as one (measured 34b: a hung CLI answers
+          # nothing at all, for ever).
+          reason="opencode models timed out after ${OPENCODE_DEADLINE} s (the CLI hung; measured: a provider that never answers hangs it for ever)"
+        elif [ "$nmod" -gt 0 ]; then
           ready=true
           esc="$(printf '\033')"
           # `auth list` draws a box with ANSI colours even off a TTY (measured); strip them before reading the count
-          ncred="$(run_bounded 30 "$bin" auth list 2>/dev/null | sed "s/${esc}\[[0-9;]*m//g" | grep -oE '[0-9]+ credentials' | head -1)"
+          ncred="$(run_bounded "$OPENCODE_DEADLINE" "$bin" auth list 2>/dev/null | sed "s/${esc}\[[0-9;]*m//g" | grep -oE '[0-9]+ credentials?' | head -1)"
           provs="$(printf '%s\n' "$list" | cut -d/ -f1 | sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
           acct="${ncred:-0 credentials} · providers: $provs"
         else
@@ -2111,7 +2122,7 @@ opencode_catalog_tools() { # opencode_catalog_tools <id> -> 0 unless the catalog
 }
 
 resolve_models_opencode() { # refresh config/models.json's `opencode` block from `opencode models --verbose`
-  local raw block tmp kept version
+  local raw block tmp kept version rc
   tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
   if [ ! -f "$MODELS_FILE" ]; then
     echo '{"resolved":{}}' > "$MODELS_FILE"
@@ -2125,8 +2136,24 @@ resolve_models_opencode() { # refresh config/models.json's `opencode` block from
     # --pure: the operator's plugins have no business in a catalog read, and
     # one of them rewrote a command in a run (measured 02). Bounded: a CLI
     # that hangs must not hang the daily pass.
-    version="$(run_bounded 30 "$(platform_bin opencode)" --version 2>/dev/null | head -1)"
-    raw="$(run_bounded 60 "$(platform_bin opencode)" models --verbose --pure 2>/dev/null)"
+    #
+    # No --refresh: the catalog mirrors what a run can actually use, which is
+    # what the CLI itself resolves at launch (its own models.dev cache plus
+    # the providers in its config). A provider added to the OpenCode config
+    # appears without --refresh (measured 2026-09-12: the new pdm_ai models
+    # were listed right after the config changed). Refreshing the models.dev
+    # metadata of the built-in providers is the CLI's own business
+    # (`opencode models --refresh` by hand), not something the daily pass
+    # should do on the operator's behalf.
+    version="$(run_bounded "$OPENCODE_DEADLINE" "$(platform_bin opencode)" --version 2>/dev/null | head -1)"
+    raw="$(run_bounded "$((OPENCODE_DEADLINE * 2))" "$(platform_bin opencode)" models --verbose --pure 2>/dev/null)"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+      # Past its deadline, the CLI hung (measured 34b): report a timeout, not
+      # the "no provider" wording -- a hung process answered nothing, it did
+      # not answer with an empty catalog.
+      block="$("$JQ" -nc --argjson at "$(now_epoch)" --arg reason "opencode models --verbose timed out after $((OPENCODE_DEADLINE * 2)) s" \
+        '{at:$at, available:false, reason:$reason}')"
+    else
     # The format is a header line `provider/model` followed by one pretty
     # JSON document per model; jq cannot read the two interleaved, python can.
     # raw rides in through a process substitution, not a pipe: this
@@ -2171,6 +2198,7 @@ else:
                       "reason": "opencode models listed no model: no provider is usable"}))
 PY
 )"
+    fi
   fi
   # A refresh that failed -- no opencode, an empty list -- must not replace a
   # catalog that still resolves real jobs: keep the block it had, stamped
@@ -3944,6 +3972,13 @@ JSON
   _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN=""; OPENCODE_BIN="$pb/bin/opencode"; platform_check opencode )"
   [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .bin_found, .version, .reason' | tr '\n' '|')" = "false|true|1.18.30|no usable provider: run opencode auth login, or configure one in ~/.config/opencode/opencode.json|" ] \
     && ok "platform_check opencode: found and versioned, not ready while no model is listed, with the reason" || bad "opencode found: $_pc"
+  # A CLI that never answers (--version is quick; anything else hangs for ever,
+  # the shape of the measured 34b hang) must read as a timeout, never as "no
+  # usable provider" -- OPENCODE_DEADLINE=1 keeps this assertion fast.
+  printf '#!/bin/sh\ncase "$1" in --version) echo 1.18.30;; *) exec sleep 600;; esac\n' > "$pb/bin/opencode-hang"; chmod +x "$pb/bin/opencode-hang"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN="$pb/bin/opencode-hang"; OPENCODE_DEADLINE=1; platform_check opencode )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .reason' | tr '\n' '|')" = "false|opencode models timed out after 1 s (the CLI hung; measured: a provider that never answers hangs it for ever)|" ] \
+    && ok "platform_check opencode: a CLI past its deadline reads as a timeout, never as no usable provider" || bad "opencode hang: $_pc"
   [ "$(platform_check martian | "$JQ" -r .reason)" = "unknown platform martian" ] && ok "an unlisted platform is answered, never a crash" || bad "unlisted"
 
   echo "the OpenCode catalog — resolve_models_opencode over the stand-in, and the readers"
@@ -3978,6 +4013,14 @@ JSON
     resolve_models_opencode >/dev/null 2>&1 )
   "$JQ" -e '.opencode | has("stale_reason") | not' "$_oc/config/models.json" >/dev/null 2>&1 \
     && ok "and the next good refresh clears the stamp" || bad "stamp survived a good refresh"
+  # Same hang stand-in as platform_check above: a CLI that never answers
+  # "models --verbose --pure" must keep the catalog it had, stamped as a
+  # timeout rather than as an empty list -- OPENCODE_DEADLINE=1 doubles to 2 s.
+  ( CONFIG_DIR="$_oc/config"; MODELS_FILE="$_oc/config/models.json"; AGENTLOOP_OPENCODE_BIN="$pb/bin/opencode-hang"; OPENCODE_DEADLINE=1
+    resolve_models_opencode >/dev/null 2>&1 )
+  "$JQ" -e '(.opencode.models | length) == 13 and .opencode.stale_reason == "opencode models --verbose timed out after 2 s"' "$_oc/config/models.json" >/dev/null 2>&1 \
+    && ok "resolve_models_opencode: a CLI past its deadline keeps the catalog, stamped as a timeout" \
+    || bad "after a hung refresh: $("$JQ" -c '.opencode | {n: (.models | length), stale_reason}' "$_oc/config/models.json")"
   ( CONFIG_DIR="$_oc/config"; MODELS_FILE="$_oc/config/none.json"; AGENTLOOP_OPENCODE_BIN=""; OPENCODE_BIN=/nonexistent
     resolve_models_opencode >/dev/null 2>&1 )
   [ "$("$JQ" -r '.opencode.available, .opencode.reason' "$_oc/config/none.json" | tr '\n' '|')" = "false|opencode not installed|" ] \
@@ -4259,6 +4302,9 @@ JSON
   _prout="$(
     mkdir -p "$tmp/pr"
     CODEX_BIN="$BASE_DIR/test/fake-codex"
+    # opencode pinned off: cmd_platforms below walks every platform, opencode
+    # included, and must never reach the real CLI on this machine.
+    AGENTLOOP_OPENCODE_BIN=""; OPENCODE_BIN=/nonexistent
     CONFIG_DIR="$tmp/pr"
     MODELS_FILE="$tmp/pr/models.json"
     PRICING_FILE="$tmp/pr/pricing.json"
@@ -4381,11 +4427,15 @@ JSON
       && ok "cmd_platforms: openai.pricing_at is the table's refresh time" || bad "pricing_at '$(printf '%s' "$_pl" | "$JQ" -c '.openai.pricing_at')'"
     [ "$(printf '%s' "$_pl" | "$JQ" -c '.openai.unpriced')" = '["gpt-5.4-mini"]' ] \
       && ok "cmd_platforms: openai.unpriced names the visible slug without a price" || bad "unpriced '$(printf '%s' "$_pl" | "$JQ" -c '.openai.unpriced')'"
+    # opencode pinned off above: prove it held, so the leak this guards
+    # against cannot come back silently.
+    [ "$(printf '%s' "$_pl" | "$JQ" -r '.opencode.bin_found')" = "false" ] \
+      && ok "cmd_platforms: opencode.bin_found is false, the pin held" || bad "opencode.bin_found '$(printf '%s' "$_pl" | "$JQ" -c '.opencode.bin_found')'"
     printf 'RESULT ok=%s bad=%s\n' "$_upass" "$_ufail"
   )"
   printf '%s\n' "$_prout" | grep -v '^RESULT '
-  printf '%s\n' "$_prout" | grep -qx 'RESULT ok=27 bad=0' \
-    && ok "resolve_pricing_openai: all 27 refresh assertions passed" \
+  printf '%s\n' "$_prout" | grep -qx 'RESULT ok=28 bad=0' \
+    && ok "resolve_pricing_openai: all 28 refresh assertions passed" \
     || bad "resolve_pricing_openai over the sample source did not: $(printf '%s\n' "$_prout" | tail -1)"
 
   echo "cmd_skills() — links into the Claude skills root, and into the Codex home only when that home exists"
