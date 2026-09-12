@@ -85,6 +85,13 @@ echo
 # 5) launchd agents ------------------------------------------------------
 echo "Installing the launchd agents (tick + control server)…"
 "$HERE/bin/agentloop" install
+# Nothing runs until a platform and at least one of its models are switched
+# on -- a fresh install has none, an upgraded one keeps what its jobs use.
+if ! "$HERE/bin/agentloop" platforms 2>/dev/null | jq -e '[.[] | objects | select(.usable == true)] | length > 0' >/dev/null 2>&1; then
+  echo
+  say "No platform is enabled yet. Open the dashboard and enable one in Settings › Platforms"
+  say "(and switch on at least one model) before creating jobs."
+fi
 echo
 echo "Done. Open the dashboard with:"
 echo "    agentloop dashboard"

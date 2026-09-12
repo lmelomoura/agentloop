@@ -154,9 +154,7 @@ document.documentElement.dataset.theme =
     <button class="navitem" data-view="runs" id="nav-runs"></button>
     <button class="navitem" data-view="projects" id="nav-projects"></button>
     <button class="navitem" data-view="security" id="nav-security"></button>
-    <!-- Hidden until the Settings page is built: the markup and the view stay
-         so bringing it back is this attribute and the VIEWS entry. -->
-    <button class="navitem" data-view="settings" id="nav-settings" hidden></button>
+    <button class="navitem" data-view="settings" id="nav-settings"></button>
   </nav>
   <div class="side-user unset" id="side-user"></div>
 </aside>
@@ -175,6 +173,10 @@ document.documentElement.dataset.theme =
        actually produced, with Refresh and New job trailing on the right.
        Built whole by ALApp.renderOverviewHead() -- see ui/app/overview.js. -->
   <div id="ov-head"></div>
+  <!-- The strip shown while no platform is enabled (or the settings cannot be
+       read): ALApp.setupBanner(), mounted here and on the Jobs page by
+       paintSetupBanners(); empty once something is configured. -->
+  <div id="ov-setup"></div>
   <!-- Checks, Woke a run, Warnings, Errors, Spent today. Warnings and Errors
        are doors into Runs -- see initStatFilters() below. -->
   <div class="kpi-grid" id="ov-kpis"></div>
@@ -215,6 +217,8 @@ document.documentElement.dataset.theme =
        mountJobsToolbar() and paintJobFilterBar(). -->
   <div class="view" id="view-jobs" hidden>
     <div id="jobs-head"></div>
+    <!-- The same strip the Overview carries above -- see #ov-setup. -->
+    <div id="jobs-setup"></div>
     <div class="kpi-grid" id="jobs-kpis"></div>
     <div id="jobstoolbar">
       <div class="searchbox" id="jobsearchbox">
@@ -680,8 +684,15 @@ document.documentElement.dataset.theme =
   </div><!-- /view-security -->
 
   <div class="view" id="view-settings" hidden>
-  <div class="secthead"><h3 id="h-settings"></h3></div>
-  <div class="soon" id="soon-settings"></div>
+  <!-- Settings › Platforms is drawn by ALApp.renderSettingsPage() (ui/app/settings.js)
+       into the two hosts below; the Profile tab keeps the "not built yet" note. -->
+  <div id="st-head"></div>
+  <nav class="viewtabs" id="st-tabs">
+    <button class="viewtab active" data-sttab="platforms" id="sttab-platforms"></button>
+    <button class="viewtab" data-sttab="profile" id="sttab-profile"></button>
+  </nav>
+  <div class="pane" id="st-platforms"></div>
+  <div class="pane" id="st-profile" hidden><div class="soon" id="soon-settings"></div></div>
   </div><!-- /view-settings -->
 
   <footer id="foot"></footer>
@@ -829,7 +840,7 @@ document.documentElement.dataset.theme =
     </div>
     <input type="hidden" id="ed-platform">
   </div>
-  <p class="fieldhelp" id="ed-platform-note">Which CLI runs this job: Claude Code (Anthropic) or the Codex CLI (OpenAI). Changing it resets the model, effort and permission mode to that platform's defaults. Moving the job to a project on the other platform keeps this choice and sets it on the job. A job being created takes its project's.</p>
+  <p class="fieldhelp" id="ed-platform-note">Which CLI runs this job. Only platforms enabled in Settings › Platforms are offered; changing it resets the model, effort and permission mode to that platform's defaults. Moving the job to a project on the other platform keeps this choice and sets it on the job. A job being created takes its project's.</p>
   <div class="row2">
     <div><label>Model</label>
       <div class="combo" id="ed-model-combo">
@@ -843,7 +854,7 @@ document.documentElement.dataset.theme =
         </div>
         <input type="hidden" id="ed-model">
       </div>
-      <p class="fieldhelp">The model the agent uses to execute this job.</p></div>
+      <p class="fieldhelp" id="ed-model-help">The model the agent uses to execute this job.</p></div>
     <div><label>Effort <span class="efflabel" id="ed-effort-label">—</span></label>
       <input type="range" id="ed-effort" class="effslider" min="0" max="5" step="1" value="0">
       <div class="effends"><span>Faster</span><span>Smarter</span></div>
@@ -983,13 +994,6 @@ document.documentElement.dataset.theme =
     at run time — a detached or stray-branch checkout included, which every run
     then inherits — and a trailing <code>*</code> (<code>release/*</code>) takes that family's newest.</p>
   </div>
-  <label>Claude account — the config directory this project's runs sign in as</label>
-  <input id="pj-ccd" type="text" placeholder="default — the account the scheduler itself runs as"
-         autocomplete="off" spellcheck="false">
-  <p class="fieldhelp">Exported to runs as <code>CLAUDE_CONFIG_DIR</code> (e.g. <code>~/.claude-work</code>).
-    Empty inherits the scheduler's own account; once runs exist, keep it stable —
-    a resumed session is looked up inside the account that created it. Anthropic runs only — a run
-    on OpenAI signs in as the Codex CLI's own account (<code>codex login</code>).</p>
   </div><!-- /pane project -->
 
   <div class="tabpane" data-pjpane="repos">
@@ -1098,11 +1102,6 @@ document.documentElement.dataset.theme =
   </div>
   <p class="fieldhelp" id="sec-perm-help">How the analysis agent may use tools — dontAsk without an allowlist denies
     everything headless, but the ledger stays protected by the CLI's validating door either way.</p>
-  <label>Claude account — which account signs the analysis</label>
-  <input id="sec-cfgdir" type="text" placeholder="inherits the project's" autocomplete="off" spellcheck="false">
-  <p class="fieldhelp">Empty inherits this project's own Claude account above; set it only when the
-    analysis itself should sign in as someone else. Anthropic runs only — a run on OpenAI signs in
-    as the Codex CLI's own account (<code>codex login</code>).</p>
   <label>Default profile — offered first when you open Analyse for this project</label>
   <div class="combo" id="sec-profile-default-combo">
     <button type="button" class="combo-trigger" id="sec-profile-default-trigger" aria-haspopup="listbox" aria-expanded="false">
@@ -1462,6 +1461,11 @@ const I={
   // a rotated-square outline distinct from every icon above it -- nothing
   // here already drew a diamond.
   diamond:ic('<path d="M2.7 10.3a2.41 2.41 0 0 0 0 3.4l7.6 7.6a2.41 2.41 0 0 0 3.4 0l7.6-7.6a2.41 2.41 0 0 0 0-3.4l-7.6-7.6a2.41 2.41 0 0 0-3.4 0Z"/>'),
+  // Settings › Platforms' own Test / Load models / Refresh buttons
+  // (ui/app/settings.js): a circular arrow, the mockup's own glyph for
+  // "run this probe again" -- nothing above already drew one, and `radar`
+  // beside it means "detect", a different action.
+  refresh:ic('<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>'),
 };
 const STATUS_ICON={success:I.check, warning:I.alert, error:I.xcircle, idle:I.clock,
                    running:I.timer, stopped:I.power};
@@ -1623,7 +1627,9 @@ async function refresh(){
     if(d.build && d.build!==BUILD && sessionStorage.ccReloadedFor!==d.build){
       sessionStorage.ccReloadedFor=d.build; location.reload(); return;
     }
-    if(CFG.sig!==d.config_sig) await loadConfig();
+    // The signature covers config/platforms.json too, so a switch flipped by
+    // the CLI or another tab must reach the editors, the strip and the chips.
+    if(CFG.sig!==d.config_sig){ await loadConfig(); loadModels(); }
     // The catalog heals itself the same way the config does -- see
     // retryModelsIfMissing on why it is not simply fetched on every tick.
     retryModelsIfMissing();
@@ -2178,10 +2184,16 @@ ALApp.init({ $, fmtAgo, fmtDur, money,
              effortLabel, fmtExpiresIn, resumeInFlight, markIfPending, isPending,
              fmtWhen, fmtIn, isFav, TOKEN, toast, refresh, paintJobPickers,
              normStatus,
+             // sessionLost (the same hoisted function the Security interface
+             // above already hands over): ui/app/settings.js's own POSTs
+             // answer a lost session the way refresh() does -- back to the
+             // login screen, no error toast.
+             sessionLost,
              openLog, resumeTarget, resumeTip, continuedRun, resumedBadgeTip,
              runKey, isStopping, unjournaledLive, paintRunPickers, runDateLabel,
              get DATA(){ return DATA; },
-             get currentView(){ return currentView; } });
+             get currentView(){ return currentView; },
+             get PLATFORMS(){ return PLATFORMS; } });
 /* ================================================================ end app */
 
 // paintJobFilters (the toolbar's own repaint: the two pickers, the active-
@@ -2458,7 +2470,6 @@ function openProjectEditor(name){
   $("pj-name").value=p?p.name:""; $("pj-name").disabled=false;
   $("pj-desc").value=(p&&p.description)||"";
   $("pj-cwd").value=(p&&p.cwd)||"";
-  $("pj-ccd").value=(p&&p.claude_config_dir)||"";
   // The stored value is "auto" | true | false; the select speaks strings.
   const wt=(p&&p.worktree&&p.worktree.enabled);
   wtCombo.set((wt===true||wt==="true") ? "true" : (wt===false||wt==="false") ? "false" : "auto");
@@ -2511,15 +2522,18 @@ function openProjectEditor(name){
   // Platform first, on both combos -- the project's own (anthropic when it has
   // none), then the block's override (empty = inherit) -- because everything
   // below is read against the platform that results.
-  pjPlatformCombo.set((p&&p.platform==="openai")?"openai":"anthropic", PLATFORM_OPTS);
-  secPlatformCombo.set((sec.platform==="openai"||sec.platform==="anthropic")?sec.platform:"", PLATFORM_OPTS);
+  const pjp=(p&&p.platform==="openai")?"openai":"anthropic";
+  pjPlatformCombo.set(pjp, ALApp.platformOptions(PLATFORMS, pjp));
+  const sp=(sec.platform==="openai"||sec.platform==="anthropic")?sec.platform:"";
+  secPlatformCombo.set(sp, ALApp.platformOptions(PLATFORMS, sp));
   const splat=secEffectivePlatform();
   applyPlatformToSecurity(splat, false);
-  secModelCombo.set(sec.model||"");
+  // Same reason as fill()'s modelCombo.set just above: the option list, so a
+  // switched-off model shows flagged the moment the project opens.
+  secModelCombo.set(sec.model||"", modelOptions(splat, sec.model||""));
   if(splat==="openai") secEfforts=ALApp.effortsFor("openai", $("sec-model").value, PLATFORMS);
   effortSet("sec-effort","sec-effort-label", sec.effort||"");
   secPermCombo.set(sec.permission_mode||ALApp.defaultPermissionFor(splat,"security"));
-  $("sec-cfgdir").value = sec.claude_config_dir||"";
   $("sec-profile-default").value = ALSecurity.SEC_PROFILES.includes(sec.default_profile) ? sec.default_profile : "standard";
   // The hidden input above is the value saveProject reads; the combo also
   // needs telling, or the trigger keeps showing whatever it last rendered
@@ -2577,12 +2591,8 @@ async function saveProject(){
     const proj={name};
     const d=$("pj-desc").value.trim(); if(d) proj.description=d;
     const c=$("pj-cwd").value.trim(); if(c) proj.cwd=c;
-    // Sent even when empty, unlike the fields above: emptying this one is how you
-    // put a project back on the default account, and project-set merges, so a key
-    // that is simply omitted would keep the old account forever.
-    proj.claude_config_dir=$("pj-ccd").value.trim();
-    // Always sent, like claude_config_dir: project-set merges, and a project
-    // going back to Anthropic has to be able to say so.
+    // Always sent: project-set merges, and a project going back to Anthropic
+    // has to be able to say so.
     proj.platform=$("pj-platform").value||"anthropic";
     // Send only .worktree.enabled: project-set merges (jq `. * $p`), so any
     // venv/env the project declares alongside it survives the save.
@@ -2600,8 +2610,8 @@ async function saveProject(){
     // that merge runs recursively even inside `security` itself, so a field
     // this pane leaves untouched (there is no control for it here) survives.
     // What a merge cannot do is drop a key that is simply missing from what
-    // is sent -- so every field this pane owns is always present, with "" the
-    // way each of them says "unset" (matching claude_config_dir above).
+    // is sent -- so every field this pane owns is always present, with ""
+    // the way each of them says "unset".
     // `enabled` is always a real boolean: security_enabled() and
     // security_derived_jobs' own fast path both also accept the string
     // "true", for a hand-edited config, but this pane has no reason to ever
@@ -2623,7 +2633,6 @@ async function saveProject(){
       // the config -- silently, since project_set accepts any string.
       effort: effortGet("sec-effort"),
       permission_mode: $("sec-perm").value||"bypassPermissions",
-      claude_config_dir: $("sec-cfgdir").value.trim(),
       default_profile: ALSecurity.SEC_PROFILES.includes(profDef) ? profDef : "standard",
       max_budget_usd: (mb===""||isNaN(mbNum)) ? "" : mbNum,
       daily_budget_usd: (db===""||isNaN(dbNum)) ? "" : dbNum,
@@ -2783,6 +2792,10 @@ function render(){
   ALApp.renderOverviewHead(kpis, (CFG.user||{}).name||"");
 
   paintNav();
+  // Painted on every render as well as when /api/models answers, so the
+  // strip and the sidebar dot paintNav() just drew always read the same
+  // MODELS_CONFIGURED -- whichever of the two fetches landed first.
+  paintSetupBanners();
   paintUser();
   ALApp.renderProjectsPage();
   ALSecurity.render();
@@ -3214,7 +3227,7 @@ function syncCwdField(projectName){
   // A new job takes its project's platform the moment the project is picked
   // (the engine's create does the same); an existing job keeps its own.
   if(creating){ const plat=ALApp.platformOf({}, p);
-    if(plat!==$("ed-platform").value){ platformCombo.set(plat, PLATFORM_OPTS); applyPlatformToJobEditor(plat,false); } }
+    if(plat!==$("ed-platform").value){ platformCombo.set(plat, ALApp.platformOptions(PLATFORMS, plat)); applyPlatformToJobEditor(plat,false); } }
 }
 
 function initPromptEditor(){
@@ -3392,14 +3405,35 @@ function groupModels(ids){
   }
   return out;
 }
+// The most recent /api/models round trip, and whether it is still in flight.
+// refresh() fires one on every config_sig change -- the first read included,
+// so boot() and enterDashboard() fire none of their own, and
+// retryModelsIfMissing() stands down while one is pending (list_models reads
+// and scans the CLI binary: not a GET to make twice for one answer).
+// enterDashboard hands the promise to submitSetup, which has to see
+// MODELS_CONFIGURED settled before it decides where a fresh install lands.
+let modelsLoad=Promise.resolve(), modelsPending=false, modelsPendingSince=0;
 async function loadModels(){
-  try{
-    const r=await fetch("/api/models",{headers:{"X-AL-Token":TOKEN}});
-    if(!r.ok) return;
-    const d=await r.json();
-    PLATFORMS=d.platforms||{};
-    refillPlatformBound();
-  }catch(e){ /* keep the built-in fallback lists */ }
+  modelsLoad=(async()=>{
+    modelsPending=true; modelsPendingSince=Date.now();
+    try{
+      const r=await fetch("/api/models",{headers:{"X-AL-Token":TOKEN}});
+      if(!r.ok) return;
+      const d=await r.json();
+      PLATFORMS=d.platforms||{};
+      MODELS_CONFIGURED=d.configured; MODELS_ERROR=d.error||"";
+      refillPlatformBound();
+      paintSetupBanners();
+      // The sidebar dot must track MODELS_CONFIGURED as soon as it changes, not
+      // wait for the next five-second poll's render() -- DATA already carries
+      // its page-level defaults by the time this can run, but the guard keeps
+      // this safe regardless.
+      if(DATA && DATA.jobs) paintNav();
+      if(currentView==="settings") paintSettings();
+    }catch(e){ /* keep the built-in fallback lists */ }
+    finally{ modelsPending=false; }
+  })();
+  return modelsLoad;
 }
 // Whether this page still has to be told what the platforms offer. The server
 // always names `anthropic` in the payload, so its absence means the payload
@@ -3421,7 +3455,13 @@ function modelCatalogMissing(){ return !(PLATFORMS && PLATFORMS.anthropic); }
 // the poll's own cadence and anything after that drops to once a minute.
 let modelTries=0, nextModelTry=0;
 function retryModelsIfMissing(){
-  if(!modelCatalogMissing()) return;
+  // A request already in flight (the first refresh()'s own, at boot) is the
+  // retry -- asking again beside it is the double GET this exists to avoid.
+  // But a fetch that never settles -- a backgrounded tab, a connection
+  // dropped with no error -- would then silence every retry after it for
+  // good, so a load still "pending" past 60s no longer counts as one.
+  const pendingAndFresh = modelsPending && (Date.now() - modelsPendingSince) < 60000;
+  if(!modelCatalogMissing() || pendingAndFresh) return;
   const now=Date.now();
   if(now<nextModelTry) return;
   nextModelTry=now+(modelTries<6?4000:60000);
@@ -3429,13 +3469,38 @@ function retryModelsIfMissing(){
   loadModels();
 }
 // The option list of the model combo for one platform (editor-domain.js does
-// the shaping; groupModels is the page's own Anthropic grouping).
-function modelOptions(p){ return ALApp.modelOptionsFor(p, PLATFORMS, groupModels); }
+// the shaping; groupModels is the page's own Anthropic grouping). `current`
+// is the value already on screen: when Settings switched it off it joins the
+// list flagged, so the editor shows the truth instead of rewriting the job.
+function modelOptions(p, current){ return ALApp.modelOptionsFor(p, PLATFORMS, groupModels, current); }
 // Everything a platform governs, re-derived from the payload just fetched
-// without losing what the operator already has on screen.
+// without losing what the operator already has on screen. The three Platform
+// combos are refilled first: the registry decides which platforms they offer,
+// and the payload that just landed may have switched one on or off.
 function refillPlatformBound(){
-  if(platformCombo) applyPlatformToJobEditor($("ed-platform").value||"anthropic", true);
+  const edp=$("ed-platform").value||"anthropic", pjp=$("pj-platform").value||"anthropic", sp=$("sec-platform").value||"";
+  if(platformCombo) platformCombo.set(edp, ALApp.platformOptions(PLATFORMS, edp));
+  if(pjPlatformCombo) pjPlatformCombo.set(pjp, ALApp.platformOptions(PLATFORMS, pjp));
+  if(secPlatformCombo) secPlatformCombo.set(sp, ALApp.platformOptions(PLATFORMS, sp));
+  if(platformCombo) applyPlatformToJobEditor(edp, true);
   if(secPlatformCombo) applyPlatformToSecurity(secEffectivePlatform(), true);
+}
+// The Settings page repaints only on entering the view and when /api/models
+// answers -- never on the five-second poll, which would reset what the
+// operator is typing into a card.
+function paintSettings(){
+  ALApp.renderSettingsPage({platforms: PLATFORMS, configured: MODELS_CONFIGURED, error: MODELS_ERROR,
+    onChange: loadModels});
+}
+// Overview and Jobs carry the same strip while nothing is configured; the
+// Settings page itself says it in its own summary.
+function paintSetupBanners(){
+  ["ov-setup","jobs-setup"].forEach(id=>{
+    const h=$(id); if(!h) return;
+    h.textContent="";
+    const b=ALApp.setupBanner(MODELS_CONFIGURED, MODELS_ERROR);
+    if(b) h.appendChild(b);
+  });
 }
 
 // Effort: slider position ↔ CLI value. 0 leaves it unset (the CLI decides);
@@ -3465,9 +3530,13 @@ function applyPlatformToJobEditor(p, keep){
   // "" on OpenAI with no catalog is honest (the engine refuses and says why),
   // where "opus" would be a Codex slug that does not exist.
   edModelCfg.def=ALApp.defaultModelFor(p,PLATFORMS)||(p==="openai"?"":"opus");
-  const opts=modelOptions(p);
+  const opts=modelOptions(p, keep ? $("ed-model").value : "");
   const curModel=$("ed-model").value;
-  const known=opts.some(o=>!o.sec && o.v===curModel);
+  // A value the shared rule (ALApp.modelEnabled) says is ON but the grouped
+  // list does not literally carry -- a family value like "opus" -- must still
+  // count as known, or a keep-reapply would silently swap it for the
+  // platform's own default and the combo would show a value nobody chose.
+  const known=opts.some(o=>!o.sec && o.v===curModel) || (!!curModel && ALApp.modelEnabled(p, curModel, PLATFORMS));
   modelCombo.set((keep&&known)?curModel:ALApp.defaultModelFor(p,PLATFORMS), opts);
   const effVal=keep?effortGet("ed-effort"):"";                  // read against the OLD ladder
   edEfforts=ALApp.effortsFor(p, $("ed-model").value, PLATFORMS);
@@ -3481,6 +3550,12 @@ function applyPlatformToJobEditor(p, keep){
     ? "Codex exec has no stdin protocol; runs on OpenAI end by themselves"
     : "You can interact with the agent while the job is running.";
   paintLimitsNote(p, $("ed-model").value);
+  // The help line says where the list comes from, and how much of the catalog
+  // Settings keeps off it -- so a model the operator remembers but cannot find
+  // here is explained, not a mystery.
+  const hid=ALApp.hiddenModelCount(p, PLATFORMS);
+  $("ed-model-help").textContent="The model the agent uses to execute this job — one of the models switched on in Settings."
+    +(hid ? " "+hid+" more in the catalog "+(hid===1?"is":"are")+" switched off there." : "");
   edPlatApplied=p;
 }
 // On OpenAI the effort ladder is the MODEL's; a new model means a new ladder.
@@ -3508,10 +3583,18 @@ function secEffectivePlatform(){ return $("sec-platform").value || $("pj-platfor
 // label, the ladder (the model's on OpenAI), the modes and the two help lines.
 // `keep` is the re-apply after /api/models answers: nothing chosen is lost.
 function applyPlatformToSecurity(p, keep){
-  const opts=modelOptions(p);
+  const opts=modelOptions(p, keep ? $("sec-model").value : "");
   const curModel=$("sec-model").value;
-  const keepModel=keep && (!curModel || opts.some(o=>!o.sec && o.v===curModel) || p!=="openai");
-  secModelCfg.allowCustom=(p!=="openai");
+  // The job editor's `known` (applyPlatformToJobEditor, above), applied here
+  // too: a family value the shared rule says is ON but the grouped list does
+  // not literally carry must still be kept -- not just any non-OpenAI value,
+  // which is the blanket allowance this replaces and hid the same gap
+  // fill()/openProjectEditor's own initial set() had.
+  const keepModel=keep && (!curModel || opts.some(o=>!o.sec && o.v===curModel) || (!!curModel && ALApp.modelEnabled(p, curModel, PLATFORMS)));
+  // Never a typed-in id, on either platform: the list Settings switched on is
+  // the authority, and an id outside it is exactly what the Agent step and
+  // the launch refuse.
+  secModelCfg.allowCustom=false;
   const dm=ALApp.defaultModelFor(p,PLATFORMS);
   secModelCfg.noneLabel="— Default ("+(dm||"the catalog's first")+") —";
   secModelCombo.set(keepModel?curModel:"", opts);
@@ -3553,8 +3636,11 @@ const WT_MODES=[
   {v:"true", label:"Always — never run in the cwd"},
   {v:"false",label:"Off — every run works directly in the cwd"},
 ];
-const PLATFORM_OPTS=[{v:"anthropic",label:"Anthropic"},{v:"openai",label:"OpenAI"}];
+// No fixed platform list here any more: every Platform combo asks
+// ALApp.platformOptions(PLATFORMS, current) -- the platforms Settings switched
+// on, plus the job's own one flagged when it is not among them.
 let PLATFORMS={};                                          // /api/models.platforms, as served
+let MODELS_CONFIGURED, MODELS_ERROR="";   // /api/models' configured and error, undefined until it answers
 // The job editor's model combo, configured by name: createCombo keeps `cfg` by
 // reference and reads cfg.def inside set(), so applyPlatformToJobEditor can
 // make the fallback the PLATFORM's -- "opus" is Anthropic's, and a lie on
@@ -3562,10 +3648,10 @@ let PLATFORMS={};                                          // /api/models.platfo
 const edModelCfg={id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelPicked,
   emptyLabel:"The model list has not arrived yet — the page is asking again."};
 // The Security pane's model combo, configured by name so applyPlatformToSecurity
-// can flip what the widget offers: a typed-in id ("Use …") is an Anthropic
-// affordance -- the engine swaps a Codex slug outside the catalog for the
-// platform's default -- and the empty row's label names that default.
-const secModelCfg={id:"sec-model", allowNone:true, noneLabel:"— Default (opus) —", allowCustom:true,
+// can relabel the empty row with the platform's default. No typed-in id
+// ("Use …") on either platform: the list of models switched on in Settings
+// is the authority, and the combo offers exactly that list.
+const secModelCfg={id:"sec-model", allowNone:true, noneLabel:"— Default (opus) —", allowCustom:false,
   onPick:(v)=>onSecModelPicked(v)};
 let pjPlatformCombo=null;
 let edEfforts=ALApp.FALLBACK_EFFORTS.slice(), secEfforts=ALApp.FALLBACK_EFFORTS.slice();
@@ -3588,7 +3674,7 @@ function initCombos(){
     onPick:(v)=>syncCwdField(v)});
   platformCombo=createCombo({id:"ed-platform", allowNone:false, def:"anthropic",
     onPick:(v)=>{ if(v!==edPlatApplied) applyPlatformToJobEditor(v,false); }});
-  platformCombo.set("anthropic", PLATFORM_OPTS);
+  platformCombo.set("anthropic", ALApp.platformOptions(PLATFORMS, "anthropic"));
   modelCombo=createCombo(edModelCfg);
   modelCombo.set("opus", modelOptions("anthropic"));
   // The two security-side combos apply only when the EFFECTIVE platform moved:
@@ -3596,13 +3682,14 @@ function initCombos(){
   // neither pick is a change when it names what the pane already shows.
   pjPlatformCombo=createCombo({id:"pj-platform", allowNone:false, def:"anthropic",
     onPick:()=>{ if(!$("sec-platform").value && secEffectivePlatform()!==secPlatApplied) applyPlatformToSecurity(secEffectivePlatform(), false); }});
-  pjPlatformCombo.set("anthropic", PLATFORM_OPTS);
+  pjPlatformCombo.set("anthropic", ALApp.platformOptions(PLATFORMS, "anthropic"));
   secPlatformCombo=createCombo({id:"sec-platform", allowNone:true, noneLabel:"— Inherit the project's —",
     onPick:()=>{ if(secEffectivePlatform()!==secPlatApplied) applyPlatformToSecurity(secEffectivePlatform(), false); }});
-  secPlatformCombo.set("", PLATFORM_OPTS);
+  secPlatformCombo.set("", ALApp.platformOptions(PLATFORMS, ""));
   // Same list, same widget, one difference: empty is a real choice here — it
-  // means "the engine's own default" — so the none row stays. allowCustom keeps
-  // what the old free-text field could do: an exact id the CLI does not list yet.
+  // means "the engine's own default" — so the none row stays. No typed-in id:
+  // the old free-text field could name one the CLI did not list yet, but the
+  // list is Settings' now, and an id outside it is refused at launch.
   secModelCombo=createCombo(secModelCfg);
   secModelCombo.set("", modelOptions("anthropic"));
   secPermCombo=createCombo({id:"sec-perm", allowNone:false, def:"bypassPermissions"});
@@ -3671,9 +3758,12 @@ function fill(j){
   // fields below are read against. The job's own value, else its project's,
   // else anthropic -- the engine's own resolution.
   const plat=ALApp.platformOf(j, j.project?projById(j.project):null);
-  platformCombo.set(plat, PLATFORM_OPTS);
+  platformCombo.set(plat, ALApp.platformOptions(PLATFORMS, plat));
   applyPlatformToJobEditor(plat, false);
-  modelCombo.set(j.model||ALApp.defaultModelFor(plat,PLATFORMS));
+  // The full option list, not just a bare id -- opening a job must show a
+  // switched-off model flagged right away, not only after the next
+  // /api/models re-apply (applyPlatformToJobEditor's own `keep` path, below).
+  modelCombo.set(j.model||ALApp.defaultModelFor(plat,PLATFORMS), modelOptions(plat, j.model||""));
   if(plat==="openai") edEfforts=ALApp.effortsFor("openai", $("ed-model").value, PLATFORMS);
   setEffort(j.effort||"");
   $("ed-interactive").checked = (plat!=="openai") && j.interactive===true;
@@ -3764,9 +3854,15 @@ function openCreator(){
   $("ed-delete").style.display="none";
   $("ed-id-row").style.display="";
   $("ed-id").value="";
-  fill({_precheck:DEFAULT_PRECHECK, interval_seconds:300, platform:"anthropic", model:"opus",
+  // A new job starts on the first platform Settings switched on and that
+  // platform's default model -- "anthropic"/"opus" was a guess that could
+  // name a platform the operator had turned off.
+  const firstPlat=(ALApp.platformOptions(PLATFORMS, "")[0]||{}).v||"anthropic";
+  fill({_precheck:DEFAULT_PRECHECK, interval_seconds:300, platform:firstPlat,
+        model:ALApp.defaultModelFor(firstPlat, PLATFORMS)||"",
         active_hours:"08:00-20:00", active_days:[1,2,3,4,5],
-        max_budget_usd:2, stall_timeout_seconds:1200, permission_mode:"bypassPermissions"});
+        max_budget_usd:2, stall_timeout_seconds:1200,
+        permission_mode:ALApp.defaultPermissionFor(firstPlat, "job")});
   paintEditorNav();
   // No id yet, so no state and no runs — only the prompt/precheck flags can fire
   editingJob={id:""};
@@ -4533,6 +4629,30 @@ function validateStep(k){
     if((hs&&!he)||(!hs&&he)) return "Active hours: fill both times, or neither for 24h.";
     if(!getDays().length) return "Pick at least one active day.";
   }
+  // The Agent step refuses a platform Settings did not switch on, or a model
+  // it switched off -- but only when creating, or when platform/model CHANGED:
+  // editing another field of a job whose model was turned off later is still
+  // allowed (the refusal is the launch's), and a registry that has not
+  // arrived yet (no `enabled` on the entry) has no verdict to give.
+  if(k==="agent"){
+    const p=$("ed-platform").value||"anthropic", m=$("ed-model").value;
+    const was=editingJob&&editingJob.id ? {p: ALApp.platformOf(editingJob, projById(editingJob.project||"")), m: editingJob.model||""} : null;
+    // A job with no model of its own shows the platform's default on screen
+    // (was.m is ""), so comparing the raw strings read every such job as
+    // "changed" the instant its Agent step opened -- resolve both sides the
+    // same way `eff` below resolves the screen's.
+    const wasModel=was ? (was.m || ALApp.defaultModelFor(was.p, PLATFORMS) || "") : "";
+    const changed=creating || !was || p!==was.p || m!==wasModel;
+    const entry=(PLATFORMS||{})[p];
+    if(changed && entry && entry.enabled!==undefined){
+      if(!entry.usable) return "This platform is not enabled in Settings › Platforms — enable it there, or pick another.";
+      // The one rule the combo and the chip read (ALApp.modelEnabled, Task 7):
+      // a family value counts when an id of it is on; an empty model means the
+      // platform's default, which has to be resolved BEFORE asking.
+      const eff=m||entry.default_model||"";
+      if(eff && !ALApp.modelEnabled(p, eff, PLATFORMS)) return "This model is switched off in Settings › Platforms — switch it on there, or pick another.";
+    }
+  }
   return null;
 }
 
@@ -4666,10 +4786,7 @@ function initModalScrollLock(){
    counters are refreshed with the data so switching pages is never needed just
    to see numbers. Overview owns the 24h band, which used to sit above every
    page — Jobs and Runs are now the whole page they are named for. */
-// "settings" is deliberately absent while the page is unbuilt: dropping it here
-// is what sends anyone whose last view WAS settings back to the overview,
-// instead of restoring them onto a blank pane with no nav item to leave by.
-const VIEWS = ["overview","jobs","runs","projects","security"];
+const VIEWS = ["overview","jobs","runs","projects","security","settings"];
 let currentView = VIEWS.includes(localStorage.ccView) ? localStorage.ccView : "overview";
 
 /* ------------------------------------------------------------ browser history
@@ -4764,6 +4881,7 @@ function setView(v, fromHistory){
   // arriving somewhere has to repaint. Without this the Jobs page opened empty:
   // the last render had drawn cards into a container this view does not show.
   render();
+  if(currentView === "settings") paintSettings();
   // Security reads its own endpoints, one subprocess per project on the server,
   // so it fetches on arrival rather than on the five-second poll — and stops
   // watching a running analysis the moment the page is left.
@@ -4808,7 +4926,9 @@ function paintNav(){
   // and that costs a round trip per project to know. It is on the page itself,
   // beside the project it belongs to.
   item("nav-security", I.shield, "Security", null);
-  item("nav-settings", I.gear, "Settings", null);
+  // The dot says there is something to do in Settings before any job can be
+  // created -- gone the moment a platform and a model are switched on.
+  item("nav-settings", I.gear, "Settings", null, MODELS_CONFIGURED===false ? '<span class="attn" title="No platform is enabled yet"></span>' : "");
   // The rail hides labels, so the label has to survive as the tooltip.
   document.querySelectorAll(".navitem").forEach(b =>
     b.title = b.querySelector(".navlabel").textContent);
@@ -5063,7 +5183,14 @@ async function submitSetup(e){
     const j = await r.json().catch(()=>({}));
     if(!r.ok || j.ok === false) return fail(j.error || j.output || ("HTTP " + r.status));
     $("su-pw").value = $("su-pw2").value = "";
+    // enterDashboard's own loadModels() is what this awaits -- see its
+    // comment; a second call here would fire a redundant /api/models GET for
+    // the same answer.
     await enterDashboard(j.user);
+    // A fresh install lands on Settings: the profile is the first step and
+    // enabling a platform is the second, so the page goes there itself
+    // instead of showing an Overview with nothing to do on it.
+    if(MODELS_CONFIGURED===false) setView("settings");
     toast("Profile created", false, "check");
   }catch(ex){
     fail("Could not reach the control server — " + ex.message);
@@ -5075,11 +5202,15 @@ async function submitSetup(e){
 async function enterDashboard(user){
   SESSION = {configured:true, authenticated:true, user:user||null};
   if(user) CFG.user = user;
-  CFG.sig = null;              // force the config re-read that carries the profile
+  CFG.sig = null;              // force the config re-read that carries the profile (and the /api/models read that rides on it)
   applyGates();
   await refresh();
-  loadModels();
   startPolling();
+  // The /api/models round trip refresh() just fired, returned rather than a
+  // second GET for the same answer: a caller that awaits enterDashboard()
+  // (submitSetup, right below) needs MODELS_CONFIGURED settled when it comes
+  // back.
+  return modelsLoad;
 }
 
 function initViews(){
@@ -5314,13 +5445,19 @@ document.addEventListener("click", async (e)=>{
   // button any more, but the same single id: there is exactly one of it in
   // the DOM at a time (the toolbar's own copy is gone), so nothing here
   // needed to change to keep answering it.
-  if(e.target.closest("#new-job")){ openCreator(); return; }
+  // While nothing is configured, New job (both copies) lands on Settings
+  // instead of opening an editor whose Platform combo would be empty: the
+  // strip says so, and the toast says it again where the click was.
+  if(e.target.closest("#new-job")){ if(MODELS_CONFIGURED===false){ setView("settings"); toast("Enable a platform and at least one model first", true, "alert"); return; } openCreator(); return; }
   // The Overview's own page header actions -- built once by
   // ALApp.renderOverviewHead() and living in a different DOM subtree than
   // the Jobs page's header, so the two cannot share an id the way "New job"
   // above does with itself.
   if(e.target.closest("#ov-refresh")){ refresh(); return; }
-  if(e.target.closest("#ov-new-job")){ openCreator(); return; }
+  if(e.target.closest("#ov-new-job")){ if(MODELS_CONFIGURED===false){ setView("settings"); toast("Enable a platform and at least one model first", true, "alert"); return; } openCreator(); return; }
+  // The strip's own "Open Settings" -- by class, not id: ALApp.setupBanner()
+  // is mounted on the Overview and on Jobs at once (paintSetupBanners).
+  if(e.target.closest(".open-settings")){ setView("settings"); return; }
   // The Jobs page's own "Refresh", and its footer pager -- both built by
   // ALApp.renderJobsPage(). jobsSetPage(delta) clamps and redraws; there is
   // no explicit page=1 to reset elsewhere, because every filter/sort change
@@ -5667,10 +5804,19 @@ initSidebar();
 initPickers();
 initViews();
 paintUser();
-$("h-settings").innerHTML=I.gear+"Settings";
 const soon=(what)=>I.hammer+"<b>Not built yet</b><p>"+what+"</p>";
 $("soon-settings").innerHTML=soon("Your profile — photo, name, email and password — plus the "
   +"scheduler's own settings will live here. Nothing is editable yet.");
+// The Settings header itself is drawn by ALApp.renderSettingsPage() (ui/app/
+// settings.js) on entering the view; only the two tabs are labelled here.
+$("sttab-platforms").innerHTML=I.layers+"Platforms";
+$("sttab-profile").innerHTML=I.user+"Profile";
+$("st-tabs").addEventListener("click",(e)=>{
+  const b=e.target.closest(".viewtab"); if(!b) return;
+  document.querySelectorAll("#st-tabs .viewtab").forEach(x=>x.classList.toggle("active", x===b));
+  $("st-platforms").hidden=(b.dataset.sttab!=="platforms");
+  $("st-profile").hidden=(b.dataset.sttab!=="profile");
+});
 // "New job" and "New project" are no longer static markup here -- each is
 // built into its own page's header by ALApp.renderJobsPage()/
 // ALApp.renderProjectsPage() (ui/app/jobs-table.js, ui/app/projects.js), the
@@ -5706,7 +5852,8 @@ $("jobsearchbox").insertAdjacentHTML("afterbegin", I.search);
     return;
   }
   applyGates();
-  if(SESSION.authenticated){ await refresh(); loadModels(); startPolling(); }
+  // The first refresh() reads the config AND fires /api/models (see loadModels).
+  if(SESSION.authenticated){ await refresh(); startPolling(); }
 })();
 </script>
 </body></html>

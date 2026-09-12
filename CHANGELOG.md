@@ -20,6 +20,89 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Settings › Platforms, and `config/platforms.json`: a job may only pick a
+  platform and a model somebody switched on.** The Settings item comes out of
+  hiding with one card per platform — find the binary (or point at it), test
+  the session live (`claude auth status`, `codex login status`), load the
+  catalog, switch models on one by one. The engine keeps the file
+  (`agentloop platform …`), seeds it from the jobs already in use on an
+  upgrade, and refuses at launch — one line in `tick.log`, before a slot is
+  spent — a run on a platform or a model that is off; `set-field`, `create`
+  and `project-set` refuse the same at write time. Overview and Jobs carry a
+  strip while nothing is configured, and *New job* opens Settings. OpenCode
+  is listed and detected; its engine is a later release. What it cost to
+  not have it: the model picker offered the whole catalog, so a job on the
+  most expensive OpenAI model was one click away, and a job on a CLI nobody
+  had signed in to found out at its first launch, hours later.
+  - The seed: a missing file is written on first use with every platform an
+    enabled job or an enabled security block runs on, and the models they
+    use — a job with no model, or one invalid on its platform, is credited to
+    the platform's default, as the engine runs it — so an install that
+    upgrades keeps every job running without a visit to Settings; a fresh
+    install gets nothing enabled. A refresh of the catalog never touches the
+    file; a file that is not JSON, or has no `platforms` object, reads as
+    nothing enabled, is named by `status`, the tick and the dashboard's strip,
+    and is never written over.
+  - The launch refusals, in this order and one line each: a planned platform
+    (`opencode is not supported yet`), one switched off in Settings, a
+    platform with no model switched on, the CLI's own readiness, and — after
+    the catalog check — a model the CLI knows but Settings did not enable,
+    naming the ones it did. A security analysis passes the same gates; a
+    security block whose model was switched off falls back to the first one
+    switched on, with a warning.
+  - `disable` and `set-models` never refuse — switching off is the operator's
+    decision — and answer with the enabled jobs and security blocks that will
+    be skipped until it is on again; the page shows the same sentence.
+    `enable` refuses while the live check fails, with the reason; a `set-bin`
+    path must be executable — a relative path is stored absolute, `~` is
+    kept; a catalog refresh that fails keeps the catalog it had and says
+    `stale`.
+  - `/api/models` carries the registry (`configured`, `error`, and per
+    platform `supported`, `enabled`, `usable`, `bin`, `bin_source`,
+    `bin_found`, `models_enabled`, `jobs_on_platform`, `jobs_using`) with no
+    probe inside the endpoint; the editors offer only what is usable and
+    enabled, flag a job's switched-off value *(disabled in Settings)* instead
+    of rewriting it, and the card and the row carry a `platform disabled` /
+    `model disabled` / `platform not supported yet` chip. `agentloop status`
+    prints one line per platform — enabled, version, account, models on —
+    and `install.sh` ends by saying so when nothing is usable.
+  - The Binary field saves what you typed when you leave it, never a
+    half-typed path when another card's check repaints the page.
+  - A refusal, and the jobs a switch-off leaves skipped, are shown in the
+    card itself, until the next change.
+  - A catalog refresh that fails — codex gone, an empty answer — keeps the
+    catalog on disk and stamps it (`stale_at`, `stale_reason`) instead of
+    replacing it with an `available: false` stub: the daily pass used to do
+    exactly that, and every OpenAI launch was refused until the next
+    successful pass a day later. `platform models openai` reads the stamp
+    back as `stale` with the reason, the next good refresh clears it, and
+    the tick retries after the usual day, as it did over the stub — not on
+    every tick. A refresh with no catalog to keep still writes the stub.
+  - `set-field platform` with an empty value (inherit the project's) is
+    refused, before anything is written, when the platform inherited has no
+    model switched on — it used to rewrite the job's model to the empty
+    string, a job no launch could resolve.
+  - `/api/models` says what each family resolves to right now
+    (`families`), so the page can gate a family value on the id the engine
+    launches it with; `bin_found` requires a file, as the engine's own check
+    does (a folder is executable to `os.access`); a seed that exits 0 and
+    still leaves no file reports a sentence, never the registry JSON.
+  - A switch flipped by the CLI, or in another tab, reaches an open page:
+    the poll re-reads `/api/models` whenever the config signature moves, so
+    the editors, the strip and the chips follow it — they used to keep
+    offering a platform the CLI had just disabled until a reload. The first
+    read is the boot's own `/api/models` call now, and the retry stands
+    down while one is in flight, so a boot makes one such call, not two.
+  - A family value (`opus`), or an explicit id reached only through a bare
+    family name on the list — what the seed writes before the cache ever
+    resolves it — is flagged *(disabled in Settings)* exactly when the
+    launch would refuse it: when the id the family resolves to right now is
+    off the list — not while any id of that family is on. On the day the
+    daily pass moves a family to a new id, the page and `tick.log` agree.
+  - The Settings page's own calls answer a session that ran out the way the
+    poll does — back to the login screen, no `HTTP 401` toast, no note left
+    on the card.
+
 - **A sweep hook, so cleaning up is no longer a run's one chance.** A project
   can ship `config/provision/<Project>.sweep.sh` beside its `.up.sh` and
   `.down.sh`, and the tick calls it on a timer — every
@@ -269,6 +352,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Every shortcut above is deleted in the release after this one; the
     `ALLOWED` list in `tests/test_no_old_name_survives.py` is the list of what
     goes, and emptying it is how that release starts.
+
+### Removed
+
+- **The per-project and per-block `claude_config_dir`.** The account a run signs
+  in as is the platform's — the install's pin — and Settings › Platforms shows
+  whom it is signed in as. A `projects.json` still carrying the field is warned
+  about by `status` and `install`, and cleaned by the next save.
 
 ### Fixed
 

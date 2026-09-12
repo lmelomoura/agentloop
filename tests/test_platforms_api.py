@@ -13,6 +13,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 ENGINE = REPO / "bin" / "agentloop"
 FAKE_CODEX = REPO / "test" / "fake-codex"
@@ -53,6 +55,209 @@ def _run_platforms(tmp_path, seed_catalog=False):
     out = subprocess.run(["/bin/bash", str(ENGINE), "platforms"],
                          capture_output=True, text=True, env=env, check=True).stdout
     return json.loads(out)
+
+
+def _write_platforms(srv, platforms):
+    srv.PLATFORMS_FILE.write_text(json.dumps({"platforms": platforms}))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_registry(srv, tmp_path, monkeypatch):
+    """Every test in this file reads a platforms file of its own -- {"platforms":
+    {}} (empty until the test writes one: list_models then reads nothing
+    enabled) written straight to disk, so list_models() never launches the
+    engine for a seed it then throws away -- and the engine behind al() -- the
+    seed, `platform check` -- only ever sees the stand-in CLIs, never the
+    operator's."""
+    platforms_file = tmp_path / "platforms.json"
+    platforms_file.write_text(json.dumps({"platforms": {}}))
+    monkeypatch.setattr(srv, "PLATFORMS_FILE", platforms_file)
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_BIN", str(REPO / "test" / "fake-claude"))
+    monkeypatch.setenv("AGENTLOOP_CODEX_BIN", str(FAKE_CODEX))
+    monkeypatch.setenv("AGENTLOOP_OPENCODE_BIN", "/nonexistent/opencode")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_CONFIG_DIR", "")
+
+
+def test_the_registry_rides_on_api_models(srv, tmp_path, monkeypatch):
+    monkeypatch.setattr(srv, "JOBS_FILE", tmp_path / "jobs.json")
+    monkeypatch.setattr(srv, "PROJECTS_FILE", tmp_path / "projects.json")
+    _write_models(srv, openai=_catalog_block())
+    srv.JOBS_FILE.write_text(json.dumps({"jobs": [
+        {"id": "a", "model": "claude-opus-5"},
+        {"id": "b", "model": "claude-opus-5"},
+        {"id": "off", "enabled": False, "model": "claude-sonnet-5"},
+        {"id": "o", "platform": "openai", "model": "gpt-5.6-luna"},
+        {"id": "nomodel"},
+        {"id": "bad", "platform": "openai", "model": "opus"}]}))
+    srv.PROJECTS_FILE.write_text(json.dumps({"projects": [
+        {"name": "P", "security": {"enabled": True, "model": "claude-fable-5-1"}},
+        {"name": "Q", "security": {"enabled": True}}]}))
+    _write_platforms(srv, {
+        "anthropic": {"enabled": True, "bin": "", "models": ["claude-opus-5", "claude-fable-5-1"]},
+        "openai": {"enabled": True, "bin": "", "models": ["gpt-5.6-luna"]},
+        "opencode": {"enabled": False, "bin": "", "models": []}})
+    out = srv.list_models()
+    p = out["platforms"]
+    assert set(p) == {"anthropic", "openai", "opencode"}
+    a, o, c = p["anthropic"], p["openai"], p["opencode"]
+    assert a["supported"] is True and a["enabled"] is True and a["usable"] is True
+    assert a["models_enabled"] == ["claude-opus-5", "claude-fable-5-1"]
+    # "nomodel" (no model) and Q's security block (no model) both fall back to
+    # the platform's default -- the first enabled model, claude-opus-5 -- and
+    # still count on the platform even though neither adds a new model key.
+    assert a["jobs_using"] == {"claude-opus-5": 4, "claude-fable-5-1": 1} and a["jobs_on_platform"] == 5
+    assert o["enabled"] is True and o["usable"] is True
+    # "bad"'s model ("opus") is not a valid openai slug, so it falls back to
+    # openai's default too and lands under the same key as "o".
+    assert o["jobs_using"] == {"gpt-5.6-luna": 2} and o["jobs_on_platform"] == 2
+    assert c["supported"] is False and c["usable"] is False and c["available"] is False
+    assert c["reason"] == "runs on OpenCode arrive with the OpenCode engine"
+    assert out["configured"] is True and out["error"] == ""
+    assert a["bin_source"] == "env" and a["bin"].endswith("test/fake-claude")
+    # the keys the page reads today are still there, unchanged in shape
+    assert out["models"] == a["models"] and isinstance(a["models"][0], str)
+    assert a["catalog_at"] == 1788585387
+    # What a family resolves to right now -- the id the engine gates a family
+    # job on at launch; the families the cache has not resolved are left out.
+    assert a["families"] == {"opus": "claude-opus-5"}
+
+
+def test_a_seed_that_leaves_no_file_reports_a_sentence_not_the_registry(srv, tmp_path, monkeypatch):
+    """`agentloop platforms` prints the registry JSON on success; a run that
+    exits 0 and still leaves no file behind must not hand that JSON to the
+    page as `error` -- only a failing engine's own output is a reason."""
+    monkeypatch.setattr(srv, "PLATFORMS_FILE", tmp_path / "never" / "platforms.json")
+    monkeypatch.setattr(srv, "al", lambda *a, **k: (True, '{"anthropic": {"enabled": true}}'))
+    cfg, err = srv.platforms_config()
+    assert cfg == {} and err.endswith("could not be seeded")
+    monkeypatch.setattr(srv, "al", lambda *a, **k: (False, "platforms: could not write the seed"))
+    assert srv.platforms_config() == ({}, "platforms: could not write the seed")
+
+
+def test_bin_found_requires_a_file_like_the_engine(srv, tmp_path, monkeypatch):
+    """The engine's check is `-f && -x`; os.access alone says a directory is
+    executable, and a path pointed at a folder would read as found."""
+    _write_models(srv, openai=_catalog_block())   # a block on disk: nothing to resolve through the engine
+    monkeypatch.setenv("AGENTLOOP_CODEX_BIN", str(tmp_path))
+    assert srv.list_models()["platforms"]["openai"]["bin_found"] is False
+    monkeypatch.setenv("AGENTLOOP_CODEX_BIN", str(FAKE_CODEX))
+    assert srv.list_models()["platforms"]["openai"]["bin_found"] is True
+
+
+def test_a_hand_edited_non_dict_platform_entry_does_not_crash(srv):
+    """A hand edit can leave .platforms.anthropic as a bare string. platform_entry
+    already falls back to {} for a non-dict entry; default_model must be read
+    from that same fallback's models_enabled, not re-derived from cfg[p] a
+    second time (which used to crash on a string: ("x" or {}).get(...))."""
+    _write_platforms(srv, {"anthropic": "x"})
+    a = srv.list_models()["platforms"]["anthropic"]
+    assert a["default_model"] == "" and a["models_enabled"] == []
+
+
+def test_a_null_jobs_list_does_not_crash_list_models(srv, tmp_path, monkeypatch):
+    monkeypatch.setattr(srv, "JOBS_FILE", tmp_path / "jobs.json")
+    srv.JOBS_FILE.write_text(json.dumps({"jobs": None}))
+    srv.list_models()          # must not raise
+
+
+def test_nothing_usable_reads_as_not_configured_and_an_unreadable_file_says_why(srv):
+    _write_platforms(srv, {"anthropic": {"enabled": False, "bin": "", "models": []}})
+    assert srv.list_models()["configured"] is False
+    srv.PLATFORMS_FILE.write_text("{oops")
+    out = srv.list_models()
+    assert out["configured"] is False
+    assert out["error"].endswith("is not a valid platforms file (not JSON, or no .platforms object) — no platform is enabled until it is fixed")
+    srv.PLATFORMS_FILE.write_text(json.dumps({"platform": {"anthropic": {"enabled": True}}}))   # a typo by hand: no .platforms object
+    assert srv.list_models()["error"].endswith("no platform is enabled until it is fixed")
+    assert out["platforms"]["anthropic"]["enabled"] is False
+
+
+def test_a_missing_platforms_file_is_seeded_by_the_engine(srv, tmp_path, monkeypatch):
+    """The server never invents the seed: it asks the engine once (`agentloop
+    platforms` runs platforms_ensure) and reads what it wrote."""
+    cfg = tmp_path / "config"; cfg.mkdir()
+    monkeypatch.setattr(srv, "PLATFORMS_FILE", cfg / "platforms.json")
+    monkeypatch.setenv("AGENTLOOP_CONFIG", str(cfg))
+    (cfg / "jobs.json").write_text(json.dumps({"jobs": [{"id": "a", "model": "claude-opus-5"}]}))
+    cfg_, err = srv.platforms_config()
+    assert err == "" and (cfg / "platforms.json").exists()
+    assert cfg_["anthropic"]["enabled"] is True and cfg_["anthropic"]["models"] == ["claude-opus-5"]
+
+
+def test_the_bin_precedence_matches_the_engine(srv, tmp_path, monkeypatch):
+    """env override, then the file's bin, then detection -- pinned to
+    `agentloop platform check`, which is what a launch actually obeys."""
+    cfg = tmp_path / "config"; cfg.mkdir()
+    fake = tmp_path / "mycodex"; fake.write_text("#!/bin/sh\necho codex-cli 1.0\n"); fake.chmod(0o755)
+    env = dict(os.environ, AGENTLOOP_CONFIG=str(cfg), AGENTLOOP_DATA=str(tmp_path / "data"),
+               AGENTLOOP_CLAUDE_BIN=str(REPO / "test" / "fake-claude"), AGENTLOOP_CLAUDE_CONFIG_DIR="",
+               CODEX_HOME=str(tmp_path / "codex-home"))
+    env.pop("AGENTLOOP_CODEX_BIN", None)
+
+    def engine_bin():
+        out = subprocess.run(["/bin/bash", str(ENGINE), "platform", "check", "openai"],
+                             capture_output=True, text=True, env=env, check=True).stdout
+        j = json.loads(out)
+        return j["bin"], j["bin_source"]
+
+    monkeypatch.setattr(srv, "PLATFORMS_FILE", cfg / "platforms.json")
+    monkeypatch.delenv("AGENTLOOP_CODEX_BIN", raising=False)
+    (cfg / "platforms.json").write_text(json.dumps({"platforms": {"openai": {"enabled": True, "bin": str(fake), "models": []}}}))
+    assert srv.platform_bin("openai", {"bin": str(fake)}) == (str(fake), "file") == engine_bin()
+    (cfg / "platforms.json").write_text(json.dumps({"platforms": {"openai": {"enabled": True, "bin": "", "models": []}}}))
+    assert srv.platform_bin("openai", {"bin": ""}) == engine_bin()
+    assert srv.platform_bin("openai", {"bin": ""})[1] == "auto"
+    env["AGENTLOOP_CODEX_BIN"] = str(fake)
+    monkeypatch.setenv("AGENTLOOP_CODEX_BIN", str(fake))
+    assert srv.platform_bin("openai", {"bin": "/elsewhere"}) == (str(fake), "env") == engine_bin()
+
+
+def test_platform_actions_call_the_engine_and_relay_what_it_says(srv, monkeypatch):
+    seen = []
+
+    def fake(args, stdin=None):
+        seen.append((args, stdin))
+        if args[1] == "check":
+            return True, '{"platform":"openai","ready":true}'
+        if args[1] == "models":
+            return True, '{"platform":"openai","stale":false,"models":[]}'
+        if args[1] == "enable":
+            return False, "cannot enable openai: codex is not signed in (run: codex login)"
+        return True, "openai disabled\n1 enabled job (o) runs on openai and will be skipped until it is enabled again"
+    monkeypatch.setattr(srv, "al", fake)
+    assert srv.platform_action("platform_check", {"platform": "openai"}) == (200, {"ok": True, "check": {"platform": "openai", "ready": True}})
+    assert srv.platform_action("platform_models", {"platform": "openai"})[1]["catalog"]["models"] == []
+    code, payload = srv.platform_action("platform_enable", {"platform": "openai"})
+    assert code == 500 and payload["ok"] is False and "codex is not signed in" in payload["output"]
+    code, payload = srv.platform_action("platform_disable", {"platform": "openai"})
+    assert code == 200 and "will be skipped" in payload["output"]
+    srv.platform_action("platform_set_bin", {"platform": "openai", "bin": "/opt/x/codex"})
+    srv.platform_action("platform_set_models", {"platform": "openai", "models": ["gpt-5.6-luna"]})
+    assert [a for a, _ in seen] == [["platform", "check", "openai"], ["platform", "models", "openai"],
+                                    ["platform", "enable", "openai"], ["platform", "disable", "openai"],
+                                    ["platform", "set-bin", "openai", "/opt/x/codex"],
+                                    ["platform", "set-models", "openai"]]
+    assert json.loads(seen[-1][1]) == ["gpt-5.6-luna"]
+    assert srv.platform_action("platform_check", {"platform": "martian"})[0] == 400
+    assert srv.platform_action("platform_set_models", {"platform": "openai", "models": "gpt"})[0] == 400
+
+
+def test_config_sig_moves_when_platforms_json_does(srv, tmp_path, monkeypatch):
+    monkeypatch.setattr(srv, "PLATFORMS_FILE", tmp_path / "platforms.json")
+    before = srv.config_sig()
+    _write_platforms(srv, {"anthropic": {"enabled": True, "bin": "", "models": ["claude-opus-5"]}})
+    assert srv.config_sig() != before
+
+
+def test_config_sig_moves_when_models_json_does(srv, tmp_path, monkeypatch):
+    """The `families` map /api/models carries comes from models.json, not from
+    platforms.json -- so the day the daily pass moves a family to a new id, an
+    open tab has to notice too, and it only ever notices through this sig."""
+    monkeypatch.setattr(srv, "CONFIG_DIR", tmp_path)
+    before = srv.config_sig()
+    _write_models(srv)
+    assert srv.config_sig() != before
 
 
 def test_the_old_keys_are_still_there_for_the_current_page(srv):
@@ -100,10 +305,12 @@ def test_platforms_carry_the_catalog_visible_models_in_priority_order(srv):
     _write_models(srv, openai=_catalog_block())
     (srv.CONFIG_DIR / "pricing.json").write_text(
         json.dumps({"openai": {"gpt-5.6-sol": {"input": 4, "cached_input": 0.4, "output": 20}}}))
+    _write_platforms(srv, {"anthropic": {"enabled": True, "bin": "", "models": ["claude-opus-5"]},
+                           "openai": {"enabled": True, "bin": "", "models": ["gpt-5.6-sol"]}})
     p = srv.list_models()["platforms"]
-    assert set(p) == {"anthropic", "openai"}
+    assert set(p) == {"anthropic", "openai", "opencode"}
     a, o = p["anthropic"], p["openai"]
-    assert a["available"] is True and a["default_model"] == "opus"
+    assert a["available"] is True and a["default_model"] == "claude-opus-5"
     assert a["models"] == srv.list_models()["models"]
     assert [m["v"] for m in a["permissions"]] == \
         ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"]

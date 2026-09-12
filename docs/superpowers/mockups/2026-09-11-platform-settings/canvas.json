@@ -1,0 +1,84 @@
+{
+  "artboards": [
+    {
+      "file": "Main.dc.html",
+      "x": 0,
+      "y": 0,
+      "w": 1440,
+      "h": 1800,
+      "title": "Settings › Platforms"
+    },
+    {
+      "file": "OverviewBanner.dc.html",
+      "x": 1540,
+      "y": 0,
+      "w": 1440,
+      "h": 820,
+      "title": "Overview — nothing configured yet"
+    },
+    {
+      "file": "CardStates.dc.html",
+      "x": 1540,
+      "y": 960,
+      "w": 1300,
+      "h": 560,
+      "title": "Card states — not signed in · not installed"
+    },
+    {
+      "file": "JobEditorAgent.dc.html",
+      "x": 0,
+      "y": 1940,
+      "w": 960,
+      "h": 720,
+      "title": "Job editor — only enabled models"
+    },
+    {
+      "file": "JobEditorFlag.dc.html",
+      "x": 1060,
+      "y": 1940,
+      "w": 960,
+      "h": 720,
+      "title": "Job editor — a model switched off"
+    }
+  ],
+  "annotations": [
+    {
+      "id": "note-main",
+      "x": 0,
+      "y": -118,
+      "w": 620,
+      "text": "1 · Settings › Platforms, as this install opens after the upgrade: the two platforms in use came up enabled with the models the jobs already use. Anthropic: 4 of 5 on. OpenAI: only Luna on (the $10/$50 Astra stays off). OpenCode: found or not, nothing else until its engine ships."
+    },
+    {
+      "id": "note-overview",
+      "x": 1540,
+      "y": -118,
+      "w": 620,
+      "text": "2 · Overview on a fresh install: nothing is enabled, so the banner says so, New job takes you to Settings, and the Settings item carries the attention dot."
+    },
+    {
+      "id": "note-states",
+      "x": 1540,
+      "y": 850,
+      "w": 620,
+      "text": "3 · The two ways a card can fail the check. Left: binary found, no session — the switch stays locked until Test passes. Right: no binary — the path field is where you point at it; it is saved when you leave the field."
+    },
+    {
+      "id": "note-editor",
+      "x": 0,
+      "y": 1830,
+      "w": 620,
+      "text": "4 · The job editor's Agent step: Platform lists only enabled platforms, Model lists only the models switched on in Settings, and says how many the catalog still hides."
+    },
+    {
+      "id": "note-flag",
+      "x": 1060,
+      "y": 1830,
+      "w": 620,
+      "text": "5 · A job whose model was switched off later: the editor keeps the value, flags it, and says what happens — it never rewrites the job on its own."
+    }
+  ],
+  "launch": {
+    "view": "canvas"
+  }
+}

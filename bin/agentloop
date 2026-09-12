@@ -77,12 +77,24 @@ legacy_scripts_warnings() { # one line per personal script under config/ still r
     done
 }
 
+legacy_config_dir_warning() { # one line per project or security block still naming an account: the field is ignored since this version
+  [ -f "$PROJECTS_FILE" ] || return 0
+  "$JQ" -r '
+    .projects[]? | select(type == "object")
+    | (.claude_config_dir // "") as $a | (((.security | objects) // {}).claude_config_dir // "") as $b
+    | select($a != "" or $b != "") | .name' "$PROJECTS_FILE" 2>/dev/null \
+  | while IFS= read -r n; do
+      printf "WARNING: projects.json: claude_config_dir on %s is ignored since this version — the account is the platform's, see Settings\n" "$n"
+    done
+}
+
 CONFIG_DIR="${AGENTLOOP_CONFIG:-$BASE_DIR/config}"
 DATA_DIR="${AGENTLOOP_DATA:-$BASE_DIR/data}"
 JOBS_FILE="$CONFIG_DIR/jobs.json"
 PROJECTS_FILE="$CONFIG_DIR/projects.json"
 MODELS_FILE="$CONFIG_DIR/models.json"
 PRICING_FILE="$CONFIG_DIR/pricing.json"   # USD per 1M tokens, per OpenAI slug (install.sh seeds it)
+PLATFORMS_FILE="$CONFIG_DIR/platforms.json"   # what the operator enabled: platforms, their binary, their models (seeded by the engine)
 INTERACTIVE_GRACE=20        # seconds to wait for a human reply before ending
                             # an interactive run that has finished its turn
 MODELS_TTL=86400            # 24h — how long a family→id resolution is trusted,
@@ -115,21 +127,32 @@ LEGACY_CLI_NAME="claude-cron"
 SERVER_BIN="$BIN_DIR/agentloop-server"
 PORT="${AGENTLOOP_PORT:-8787}"
 
-CLAUDE_BIN="${AGENTLOOP_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+# Where each CLI is, before config/platforms.json has a say: the AGENTLOOP_*_BIN
+# variable (tests, stand-ins, a second install), else detection. platform_bin
+# below puts the file's own `bin` between the two.
+if [ -x "$HOME/.local/bin/claude" ]; then _claude_default="$HOME/.local/bin/claude"
+else _claude_default="$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")"; fi
+CLAUDE_BIN="${AGENTLOOP_CLAUDE_BIN:-$_claude_default}"
 # The Codex CLI, for runs on the openai platform. On PATH from Homebrew
-# (/opt/homebrew/bin, which the launchd plists already carry); override for a
-# test stand-in or a second install. Its account and its rollouts live under
-# CODEX_HOME (the CLI's own variable, honoured as-is: `--help` says auth still
-# uses it); platform_finish reads the rollout from there after every run.
+# (/opt/homebrew/bin, which the launchd plists already carry). Its account and
+# its rollouts live under CODEX_HOME (the CLI's own variable, honoured as-is:
+# `--help` says auth still uses it); platform_finish reads the rollout from
+# there after every run.
 CODEX_BIN="${AGENTLOOP_CODEX_BIN:-$(command -v codex 2>/dev/null || echo /opt/homebrew/bin/codex)}"
 CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+# OpenCode: listed and detected, never launched in this release (PLATFORMS_PLANNED).
+if command -v opencode >/dev/null 2>&1; then _opencode_default="$(command -v opencode)"
+elif [ -x "$HOME/.opencode/bin/opencode" ]; then _opencode_default="$HOME/.opencode/bin/opencode"
+else _opencode_default="/opt/homebrew/bin/opencode"; fi
+OPENCODE_BIN="${AGENTLOOP_OPENCODE_BIN:-$_opencode_default}"
 # Which Claude account every run signs in as. Claude Code keeps credentials,
 # settings, plugins, MCP servers and past sessions per config directory — one
 # signed-in account each — so this variable is the only thing that chooses
 # between two accounts on the same Mac. Set here it is the default for
-# everything, model probes included; a project may pin its own (see
-# `claude_config_dir` in projects.json). Empty leaves the CLI's own default
-# (~/.claude), which is what this tool used before the setting existed.
+# everything, model probes included -- a project or a security block has no
+# pin of its own any more; the Anthropic card in Settings shows whom it is
+# signed in as. Empty leaves the CLI's own default (~/.claude), which is
+# what this tool used before the setting existed.
 #
 # Taken ONLY from the explicit variable — an ambient CLAUDE_CONFIG_DIR is
 # deliberately not a fallback. cmd_install already refuses it, and the runtime
@@ -308,7 +331,7 @@ security_derived_jobs() {
     # Containment does not come from the permission mode: the worktree is
     # disposable, the ledger only accepts writes through the CLI's validating
     # door, and AL_SECURITY_AGENT keeps the human-authority verbs shut.
-    local splat smodel seffort perm
+    local splat smodel seffort perm nomodel_warn
     splat="$(security_get "$project" '.platform' '')"
     [ -n "$splat" ] || splat="$(project_get "$project" '.platform' 'anthropic')"
     case "$splat" in
@@ -316,18 +339,42 @@ security_derived_jobs() {
       *) security_warn "security: project '$project' names a platform the engine does not know ('$splat') -- using anthropic"
          splat="anthropic" ;;
     esac
+    # Shared by both "nothing is enabled" branches below, so the sentence is
+    # written once: a project on a platform with no model switched on in
+    # Settings at all, whether its own chosen model is unknown to the CLI or
+    # known but switched off.
+    nomodel_warn="security: project '$project' runs on $splat but no model is enabled for it in Settings -- the analysis will be refused at launch"
     smodel="$(security_get "$project" '.model' "$(platform_default_model "$splat")")"
     if ! platform_model_ok "$splat" "$smodel"; then
       local sdefault; sdefault="$(platform_default_model "$splat")"
-      # openai with no catalog resolved yet: platform_default_model answers
-      # NOTHING, so the generic message below would read "using " with the
-      # default missing off the end. Name the actual cause instead.
+      # sdefault empty means nothing is enabled for $splat in Settings -- not
+      # necessarily an unresolved OpenAI catalog, which is only ONE of the
+      # ways it can happen and the only one with a remedy of its own. Naming
+      # the wrong cause here sent an operator to refresh a catalog that had
+      # nothing to do with it whenever the real problem was simply nothing
+      # switched on.
       if [ -z "$sdefault" ]; then
-        security_warn "security: project '$project' runs on openai but no OpenAI catalog is resolved yet (run: agentloop resolve-models openai) -- the analysis will be refused at launch"
+        if [ "$splat" = openai ] && ! openai_catalog_available; then
+          security_warn "security: project '$project' runs on openai but no OpenAI catalog is resolved yet (run: agentloop resolve-models openai) -- the analysis will be refused at launch"
+        else
+          security_warn "$nomodel_warn"
+        fi
       else
         security_warn "security: project '$project' has a model $splat does not know ('$smodel') -- using $sdefault"
       fi
       smodel="$sdefault"
+    fi
+    # The operator's own choice, on top of the CLI's: a model switched off in
+    # Settings falls back to the first one switched on, with a warning; with
+    # none switched on, the launch refuses and the warning says so now.
+    if [ -n "$smodel" ] && platform_model_ok "$splat" "$smodel" && ! platform_model_enabled "$splat" "$smodel"; then
+      local sfirst; sfirst="$(platform_default_model "$splat")"
+      if [ -n "$sfirst" ]; then
+        security_warn "security: project '$project' names a model that is not enabled in Settings ('$smodel' on $splat) -- using $sfirst"
+        smodel="$sfirst"
+      else
+        security_warn "$nomodel_warn"
+      fi
     fi
     seffort="$(security_get "$project" '.effort' '')"
     if ! platform_effort_ok "$splat" "$smodel" "$seffort"; then
@@ -357,7 +404,6 @@ security_derived_jobs() {
       --arg effort "$seffort" \
       --arg budget "$budget" \
       --arg daily "$daily" \
-      --arg cfgdir "$(security_get "$project" '.claude_config_dir' '')" \
       --arg perm "$perm" \
       --arg notools "$SECURITY_DISALLOWED_TOOLS" \
       '{id:$id, project:$project, prompt:$prompt, model:$model, platform:$platform,
@@ -371,7 +417,7 @@ security_derived_jobs() {
        # drop the job rather than the field. Collect first, then decide.
        + ([$budget | tonumber?] | if length == 0 then {} else {max_budget_usd: .[0]} end)
        + ([$daily  | tonumber?] | if length == 0 then {} else {daily_budget_usd: .[0]} end)
-       + (if $cfgdir == "" then {} else {claude_config_dir:$cfgdir} end)' 2>/dev/null)" || elem=""
+       ' 2>/dev/null)" || elem=""
     [ -n "$elem" ] || continue
     [ $first -eq 1 ] || printf ','
     first=0
@@ -1211,9 +1257,12 @@ is_due_vals() { # is_due_vals <interval> <last-start> <fail-streak> ; 0 = due
 # docs/superpowers/specs/2026-09-06-codex-measurements/README.md -- and where
 # the measurement contradicted the design, the measurement won (its
 # "Correcções por medição" section).
-PLATFORMS="anthropic openai"
+PLATFORMS="anthropic openai"          # the platforms that run
+PLATFORMS_PLANNED="opencode"          # listed and checked for a binary, never run: the engine for it is a later release
 
 platform_known() { case "${1:-}" in anthropic|openai) return 0 ;; *) return 1 ;; esac; }
+platform_planned() { case "${1:-}" in opencode) return 0 ;; *) return 1 ;; esac; }
+platform_listed() { platform_known "${1:-}" || platform_planned "${1:-}"; }
 
 # job_platform <id> -> the job's effective platform: resolve(), then
 # normalised. A hand-edited project can carry a platform this engine does not
@@ -1228,26 +1277,373 @@ job_platform() { # job_platform <id>
   printf '%s\n' "$p"
 }
 
-platform_bin() { # platform_bin <platform> -> the CLI's path
-  case "$1" in anthropic) printf '%s' "$CLAUDE_BIN" ;; openai) printf '%s' "$CODEX_BIN" ;; esac
+# --- config/platforms.json: what the operator enabled ---------------------------
+# One object per listed platform: `enabled`, `bin` ("" = detect) and `models`,
+# the exact ids a job may pick, in the order they were switched on. The
+# catalog in config/models.json is a CACHE the daily refresh rewrites; this
+# file is the operator's intent, and a refresh never touches it. Missing, it
+# is seeded from what is already in use, so an install that upgrades keeps
+# every enabled job running; on a fresh install nothing is enabled until
+# someone decides so in Settings. Read the two config files RAW here, never
+# through jobs_json: that one derives the security jobs, which ask this file
+# for their default model -- a loop.
+#
+# A job with no model, or one that names a model invalid for its own
+# platform, still runs -- on that platform's default -- so the seed has to
+# credit the default to it, not an empty string. platform_default_model is
+# the function that knows the default, but platforms_jq never calls it (nor
+# any openai_catalog_* reader -- openai_catalog_visible already sits on the
+# seed's own path, feeding $odef) directly: platform_default_model reads the
+# enabled models back out of THIS file, and calling it, or a catalog reader
+# it comes to depend on, from in here would be that same loop one layer
+# down. So platforms_jq takes both platforms'
+# defaults as arguments, and each caller works out its own (see platforms_seed vs.
+# platform_jobs_on below: the seed can only use what it can compute without
+# this file; a live read uses the real thing).
+PLATFORMS_JQ='
+  def known: if . == "openai" then "openai" else "anthropic" end;
+  def project($name): ([ ($projects.projects // [])[] | select(.name == $name) ] | first // {});
+  def sec($p): (($p.security | objects) // {});
+  def job_platform($j): (if (($j.platform // "") != "") then $j.platform
+                         elif ((project($j.project // "") | .platform // "") != "") then (project($j.project // "") | .platform)
+                         else "anthropic" end) | known;
+  def job_model($j): (if (($j.model // "") != "") then $j.model else (project($j.project // "") | .model // "") end);
+  def sec_platform($p): (if ((sec($p).platform // "") != "") then sec($p).platform
+                         elif (($p.platform // "") != "") then $p.platform else "anthropic" end) | known;
+  def sec_on($p): ((sec($p).enabled == true) or (sec($p).enabled == "true"));
+  def resolved($m): (if ($m != "") and ((($resolved[$m] // {}) | .id // "") != "") then $resolved[$m].id else $m end);
+  def valid($p; $m): if $p == "openai" then (($ocat | length) == 0) or (($ocat | index($m)) != null)
+                      else ($m == "opus" or $m == "sonnet" or $m == "haiku" or $m == "fable" or ($m | startswith("claude-"))) end;
+  def effective($p; $m): if $m != "" and valid($p; $m) then $m else (if $p == "openai" then $odef else $adef end) end;
+  def uses: ([ ($jobs.jobs // [])[] | select(.enabled != false) | job_platform(.) as $p
+             | {who: .id, p: $p, m: resolved(effective($p; job_model(.)))} ]
+           + [ ($projects.projects // [])[] | select(sec_on(.)) | sec_platform(.) as $p
+             | {who: ("security:" + .name), p: $p, m: resolved(effective($p; (sec(.).model // "")))} ]);
+'
+
+platforms_jq() { # platforms_jq <anthropic-default> <openai-default> <jq-filter> [jq options…] -- runs the filter with $jobs, $projects, $resolved, $adef, $odef, $ocat bound and PLATFORMS_JQ's defs in scope
+  local adef="$1" odef="$2" filter="$3"; shift 3
+  local jobs='{"jobs":[]}' projects='{"projects":[]}' resolved='{}' ocat='[]'
+  if [ -f "$JOBS_FILE" ] && "$JQ" -e . "$JOBS_FILE" >/dev/null 2>&1; then jobs="$(cat "$JOBS_FILE")"; fi
+  if [ -f "$PROJECTS_FILE" ] && "$JQ" -e . "$PROJECTS_FILE" >/dev/null 2>&1; then projects="$(cat "$PROJECTS_FILE")"; fi
+  if [ -f "$MODELS_FILE" ]; then
+    resolved="$("$JQ" -ec '.resolved // {}' "$MODELS_FILE" 2>/dev/null)" || resolved='{}'
+    ocat="$("$JQ" -ec '[.openai.models[]?.slug]' "$MODELS_FILE" 2>/dev/null)" || ocat='[]'
+  fi
+  "$JQ" -n "$@" --argjson jobs "$jobs" --argjson projects "$projects" --argjson resolved "$resolved" \
+    --arg adef "$adef" --arg odef "$odef" --argjson ocat "$ocat" "${PLATFORMS_JQ}${filter}"
 }
 
-platform_ready() { # platform_ready <platform> -> 0; or 1 with the reason on stdout
-  local bin; bin="$(platform_bin "$1")"
+platforms_seed() { # the file's first contents: a platform is enabled when an enabled job or an enabled security block runs on it, with the models they use
+  platforms_jq opus "$(openai_catalog_visible | head -1)" '
+    def entry($p): {enabled: ([uses[] | select(.p == $p)] | length > 0), bin: "",
+                    models: ([uses[] | select(.p == $p) | .m | select(. != "")] | reduce .[] as $m ([]; if index($m) then . else . + [$m] end))};
+    {platforms: {anthropic: entry("anthropic"), openai: entry("openai"), opencode: {enabled: false, bin: "", models: []}}}' -c
+}
+
+platforms_ensure() { # write the seed when the file does not exist; an existing file, valid or not, is left alone
+  [ -f "$PLATFORMS_FILE" ] && return 0
+  local seed tmp; seed="$(platforms_seed)" || return 1
+  mkdir -p "$(dirname "$PLATFORMS_FILE")"
+  tmp="$(mktemp "$(dirname "$PLATFORMS_FILE")/.platforms.XXXXXX")" || return 1
+  if printf '%s\n' "$seed" > "$tmp"; then mv "$tmp" "$PLATFORMS_FILE"; else rm -f "$tmp"; return 1; fi
+}
+
+platforms_valid() { # 0 when the file is JSON with a .platforms object -- the one rule platforms_error, platforms_json and write_platforms all share
+  "$JQ" -e '.platforms | type == "object"' "$PLATFORMS_FILE" >/dev/null 2>&1
+}
+
+platforms_error() { # one sentence when the file exists and is not a valid platforms file, else nothing
+  [ -f "$PLATFORMS_FILE" ] || return 0
+  platforms_valid || printf '%s is not a valid platforms file (not JSON, or no .platforms object) — no platform is enabled until it is fixed' "$PLATFORMS_FILE"
+}
+
+platforms_json() { # the file, seeded when missing; an unreadable one reads as nothing enabled (platforms_error says why)
+  platforms_ensure
+  if platforms_valid; then cat "$PLATFORMS_FILE"; else echo '{"platforms":{}}'; fi
+}
+
+write_platforms() { # write_platforms <jq-filter> [jq-args...] -- write_jobs's guard: never replace the file with a broken document
+  local tmp
+  platforms_ensure
+  [ -f "$PLATFORMS_FILE" ] || die "could not seed $PLATFORMS_FILE"
+  platforms_valid || die "refusing to write $PLATFORMS_FILE: it is not a valid platforms file (not JSON, or no .platforms object) — fix it by hand first"
+  tmp="$(mktemp "$(dirname "$PLATFORMS_FILE")/.platforms.XXXXXX")"
+  if "$JQ" "$@" "$PLATFORMS_FILE" > "$tmp" 2>/dev/null \
+     && "$JQ" -e 'type == "object" and (.platforms | type) == "object"' "$tmp" >/dev/null 2>&1; then
+    mv "$tmp" "$PLATFORMS_FILE"
+  else
+    rm -f "$tmp"; die "refusing to write a malformed platforms file (change discarded)"
+  fi
+}
+
+platforms_field() { # platforms_field <platform> <key> -> the value as text ("" when absent; a list joined by commas; a real false stays "false")
+  platforms_json | "$JQ" -r --arg p "$1" --arg k "$2" \
+    '.platforms[$p][$k] as $v | (if $v == null then "" else $v end) | if type == "array" then join(",") else tostring end'
+}
+platform_enabled() { [ "$(platforms_field "$1" enabled)" = "true" ]; }
+platform_models_enabled() { # the enabled ids, one per line, in the file's own order
+  platforms_json | "$JQ" -r --arg p "$1" '.platforms[$p].models // [] | .[] | select(type == "string" and . != "")'
+}
+family_cached_id() { # family_cached_id <family> -> the id the cache holds for it, TTL ignored; nothing for an id or an unknown family. Never a probe.
+  case "${1:-}" in opus|sonnet|haiku|fable) ;; *) return 0 ;; esac
+  [ -f "$MODELS_FILE" ] || return 0
+  "$JQ" -r --arg f "$1" '.resolved[$f].id // empty' "$MODELS_FILE" 2>/dev/null
+}
+family_of_cached_id() { # family_of_cached_id <id> -> the family whose cached resolution is this id, or nothing
+  [ -f "$MODELS_FILE" ] || return 0
+  "$JQ" -r --arg id "$1" '.resolved | to_entries[] | select(.value.id == $id) | .key' "$MODELS_FILE" 2>/dev/null | head -1
+}
+# The list may carry a family (the seed writes a bare `opus` when the cache
+# had not resolved it yet) or an id (what Settings writes), and a job may name
+# either -- so both directions are compared through the cache: the id a listed
+# family resolves to, and the family a named id resolves from.
+platform_model_enabled() { # platform_model_enabled <platform> <model> -> 0 when the list carries the value itself, the id a family resolves to, or the family an id resolves from
+  local list id fam
+  list="$(platform_models_enabled "$1")"
+  [ -n "$list" ] || return 1
+  printf '%s\n' "$list" | grep -qxF -- "$2" && return 0
+  id="$(family_cached_id "$2")"
+  [ -n "$id" ] && printf '%s\n' "$list" | grep -qxF -- "$id" && return 0
+  fam="$(family_of_cached_id "$2")"
+  [ -n "$fam" ] && printf '%s\n' "$list" | grep -qxF -- "$fam"
+}
+platform_usable() { # enabled AND at least one model enabled: what the editors and the dashboard's warning read
+  platform_enabled "$1" && [ -n "$(platform_models_enabled "$1" | head -1)" ]
+}
+# A regular job whose model is invalid for its own platform is credited to
+# the platform's default here, exactly like an enabled security block always
+# was (effective(), above) -- but the run gate that actually launches a job
+# skips one like that rather than silently running it on the default. So
+# this list answers "counts as using this platform", never "runs there".
+platform_jobs_on() { # platform_jobs_on <platform> [model] -> one line per enabled job (its id) or enabled security block ("security:<project>") counted as using it; a model may be a family
+  platforms_jq "$(platform_default_model anthropic)" "$(platform_default_model openai)" \
+    'uses[] | select(.p == $p) | select($m == "" or .m == $m or .m == resolved($m)) | .who' -r --arg p "$1" --arg m "${2:-}"
+}
+
+platform_cli_name() { case "$1" in anthropic) printf 'claude' ;; openai) printf 'codex' ;; opencode) printf 'opencode' ;; esac; }
+platform_install_hint() {
   case "$1" in
-    anthropic)
-      [ -x "$bin" ] || { printf 'claude not found at %s (set AGENTLOOP_CLAUDE_BIN)' "$bin"; return 1; } ;;
-    openai)
-      [ -x "$bin" ] || { printf 'codex not found at %s (set AGENTLOOP_CODEX_BIN)' "$bin"; return 1; }
-      # Any non-zero is "not signed in". The CLI's exit code when it is not was
-      # left unmeasured on purpose (measuring it meant logging the working
-      # account out); a 0 without a login fails on the first turn as api_error,
-      # which is an honest line in tick.log either way.
-      "$bin" login status >/dev/null 2>&1 \
-        || { printf 'codex is not signed in (run: codex login)'; return 1; } ;;
-    *) printf 'unknown platform %s' "$1"; return 1 ;;
+    anthropic) printf 'npm i -g @anthropic-ai/claude-code' ;;
+    openai)    printf 'npm i -g @openai/codex, then codex login' ;;
+    opencode)  printf 'brew install opencode' ;;
   esac
-  return 0
+}
+platform_bin_env() { # the AGENTLOOP_*_BIN override for a platform, or nothing
+  case "$1" in
+    anthropic) printf '%s' "${AGENTLOOP_CLAUDE_BIN:-}" ;;
+    openai)    printf '%s' "${AGENTLOOP_CODEX_BIN:-}" ;;
+    opencode)  printf '%s' "${AGENTLOOP_OPENCODE_BIN:-}" ;;
+  esac
+}
+platform_bin_source() { # env | file | auto -- which layer platform_bin's answer came from
+  if [ -n "$(platform_bin_env "$1")" ]; then printf 'env'
+  elif [ -n "$(platforms_field "$1" bin)" ]; then printf 'file'
+  else printf 'auto'; fi
+}
+platform_bin() { # platform_bin <platform> -> the CLI's path: the environment override, else config/platforms.json's bin, else the detected default
+  local v
+  v="$(platform_bin_env "$1")"
+  if [ -n "$v" ]; then printf '%s' "$v"; return; fi
+  v="$(platforms_field "$1" bin)"
+  if [ -n "$v" ]; then expand_home "$v"; return; fi
+  case "$1" in anthropic) printf '%s' "$CLAUDE_BIN" ;; openai) printf '%s' "$CODEX_BIN" ;; opencode) printf '%s' "$OPENCODE_BIN" ;; esac
+}
+
+# The live check behind every readiness answer: is the binary there, which
+# version, is there a session, as whom. Never stored -- it costs 0.04-0.14 s
+# (`codex login status`, `claude auth status --json`, `--version`), so the
+# Settings page, `status` and every launch simply ask again.
+platform_check() { # platform_check <platform> -> one JSON object; always exits 0
+  local p="$1" bin src found=false ver="" acct="" reason="" ready=false supported=true
+  if ! platform_listed "$p"; then
+    "$JQ" -nc --arg p "$p" '{platform:$p, supported:false, ready:false, bin:"", bin_found:false, bin_source:"", version:"", account:"", reason:("unknown platform " + $p)}'
+    return 0
+  fi
+  platform_planned "$p" && supported=false
+  bin="$(platform_bin "$p")"; src="$(platform_bin_source "$p")"
+  if [ -f "$bin" ] && [ -x "$bin" ]; then found=true; ver="$("$bin" --version 2>/dev/null | head -1)"; fi
+  if [ "$found" = false ]; then
+    reason="$(platform_cli_name "$p") not found at $bin — set the path in Settings (or AGENTLOOP_$(platform_cli_name "$p" | tr '[:lower:]' '[:upper:]')_BIN); install: $(platform_install_hint "$p")"
+  elif [ "$supported" = false ]; then
+    reason="runs on OpenCode arrive with the OpenCode engine"
+  else
+    case "$p" in
+      anthropic)
+        local out cfgdir rc; cfgdir="$(installed_config_dir)"
+        if [ -n "$cfgdir" ]; then out="$(CLAUDE_CONFIG_DIR="$cfgdir" "$bin" auth status --json 2>/dev/null)"; rc=$?
+        else out="$("$bin" auth status --json 2>/dev/null)"; rc=$?; fi
+        if [ "$rc" -eq 0 ] && printf '%s' "$out" | "$JQ" -e '.loggedIn == true' >/dev/null 2>&1; then
+          ready=true
+          acct="$(printf '%s' "$out" | "$JQ" -r '[(.email // ""), ((.subscriptionType // "") | if . == "" then "" else . + " plan" end)] | map(select(. != "")) | join(" · ")' 2>/dev/null)"
+          [ -n "$acct" ] || acct="signed in"
+        else
+          case "$out" in
+            *loggedIn*)
+              if [ -n "$cfgdir" ]; then reason="claude is not signed in in $cfgdir (run: CLAUDE_CONFIG_DIR=$cfgdir claude auth login)"
+              else reason="claude is not signed in (run: claude auth login)"; fi ;;
+            *) # no `auth status` on this CLI (pre-2.1): the binary counts as ready, as it always did
+               ready=true; acct="unknown — claude auth status needs Claude Code 2.1+" ;;
+          esac
+        fi ;;
+      openai)
+        local line
+        if line="$("$bin" login status 2>&1)"; then ready=true; acct="$(printf '%s\n' "$line" | head -1)"
+        else reason="codex is not signed in (run: codex login)"; fi ;;
+    esac
+  fi
+  "$JQ" -nc --arg p "$p" --argjson supported "$supported" --argjson ready "$ready" --arg bin "$bin" \
+    --argjson found "$found" --arg src "$src" --arg ver "$ver" --arg acct "$acct" --arg reason "$reason" \
+    '{platform:$p, supported:$supported, ready:$ready, bin:$bin, bin_found:$found, bin_source:$src, version:$ver, account:$acct, reason:$reason}'
+}
+
+platform_ready() { # platform_ready <platform> -> 0; or 1 with the reason on stdout (platform_check decides)
+  local j; j="$(platform_check "$1")"
+  [ "$(printf '%s' "$j" | "$JQ" -r '.ready')" = "true" ] && return 0
+  printf '%s' "$(printf '%s' "$j" | "$JQ" -r '.reason')"
+  return 1
+}
+
+# --- the catalogs a platform can enable from --------------------------------------
+anthropic_catalog_ids() { # every claude-* id this install can name, most capable family and newest generation first
+  local bin real
+  bin="$(platform_bin anthropic)"
+  real="$("$PYTHON" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$bin" 2>/dev/null || printf '%s' "$bin")"
+  {
+    # the CLI's own list: the ids compiled into the binary (what the server's picker has always scanned)
+    [ -r "$real" ] && LC_ALL=C grep -aoE 'claude-(opus|sonnet|haiku|fable)-[0-9]+(-[0-9]+)*' "$real" 2>/dev/null
+    [ -f "$MODELS_FILE" ] && "$JQ" -r '.resolved[]?.id // empty' "$MODELS_FILE" 2>/dev/null
+    [ -f "$JOBS_FILE" ] && "$JQ" -r '.jobs[]? | .model // empty | select(startswith("claude-"))' "$JOBS_FILE" 2>/dev/null
+    [ -f "$PROJECTS_FILE" ] && "$JQ" -r '.projects[]? | ((.security | objects) // {}).model // empty | select(startswith("claude-"))' "$PROJECTS_FILE" 2>/dev/null
+  } | "$JQ" -R . | "$JQ" -rs '
+    def fam: (capture("^claude-(?<f>[a-z]+)") | .f) // "";
+    def nums: [scan("[0-9]+") | tonumber | -.];
+    # fam is bound to $f BEFORE the array | index(...) pipe below, because that pipe
+    # changes "." to the priority array itself -- calling fam(.) after it would feed
+    # capture() an array instead of the id string (jq: "cannot be matched, as it is
+    # not a string"). Binding first keeps "." on the id for both sort keys.
+    unique | sort_by(fam as $f | [((["opus","sonnet","haiku","fable"] | index($f)) // 9), nums]) | .[]' 2>/dev/null
+}
+platform_catalog_ids() { # platform_catalog_ids <platform> -> what set-models may enable, one id per line: the VISIBLE catalog, what the Settings page lists
+  case "$1" in anthropic) anthropic_catalog_ids ;; openai) openai_catalog_visible ;; *) : ;; esac
+}
+
+platform_models_json() { # platform_models_json <platform> <stale true|false> <reason> -> the catalog with `enabled` per model
+  local p="$1" stale="${2:-false}" reason="${3:-}" enabled cat_at arr pricing='{}'
+  enabled="$(platform_models_enabled "$p" | "$JQ" -R . | "$JQ" -sc .)"
+  case "$p" in
+    anthropic)
+      cat_at="$(num "$("$JQ" -r '[.resolved[]?.at // 0] | max // 0' "$MODELS_FILE" 2>/dev/null)")"
+      arr="$(anthropic_catalog_ids | "$JQ" -R . | "$JQ" -sc .)"; [ -n "$arr" ] || arr='[]'
+      printf '%s' "$arr" | "$JQ" -c --arg p "$p" --argjson stale "$stale" --arg reason "$reason" --argjson enabled "$enabled" --argjson at "$cat_at" \
+        '{platform:$p, stale:$stale, reason:$reason, catalog_at:$at,
+          models: map({v:., label:., desc:"", efforts:["low","medium","high","xhigh","max"], deprecated_by:"", price:null,
+                       enabled: (. as $x | ($enabled | index($x)) != null)})}' ;;
+    openai)
+      cat_at="$(num "$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)")"
+      [ -f "$PRICING_FILE" ] && pricing="$("$JQ" -c '.openai // {}' "$PRICING_FILE" 2>/dev/null || echo '{}')"
+      arr=""; openai_catalog_available && arr="$("$JQ" -c '[.openai.models[] | select(.visibility == "list")] | sort_by(.priority)' "$MODELS_FILE" 2>/dev/null)"
+      [ -n "$arr" ] || arr='[]'
+      printf '%s' "$arr" | "$JQ" -c --arg p "$p" --argjson stale "$stale" --arg reason "$reason" --argjson enabled "$enabled" --argjson at "$cat_at" --argjson pricing "$pricing" \
+        '{platform:$p, stale:$stale, reason:$reason, catalog_at:$at,
+          models: map({v:.slug, label:(.display_name // .slug), desc:(.description // ""), efforts:(.efforts // []), deprecated_by:(.deprecated_by // ""),
+                       price: (($pricing[.slug] // null) | if . != null and (.input | type) == "number" and (.output | type) == "number" then {input:.input, output:.output} else null end),
+                       enabled: (.slug as $x | ($enabled | index($x)) != null)})}' ;;
+    *)
+      "$JQ" -nc --arg p "$p" '{platform:$p, stale:false, reason:"the model list arrives with the OpenCode engine", catalog_at:0, models:[]}' ;;
+  esac
+}
+
+platform_affected_note() { # platform_affected_note <platform> [model] -> the enabled jobs and blocks that lose their platform or model, as one sentence; nothing when none
+  local who n names
+  who="$(platform_jobs_on "$1" "${2:-}")"
+  n="$(num "$(printf '%s\n' "$who" | grep -c . 2>/dev/null)")"
+  [ "$n" -gt 0 ] || return 0
+  names="$(printf '%s\n' "$who" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+  if [ -n "${2:-}" ]; then
+    printf '%s enabled job%s (%s) run%s on %s with %s and will be skipped until it is enabled again\n' "$n" "$([ "$n" -eq 1 ] || printf s)" "$names" "$([ "$n" -eq 1 ] && printf s)" "$1" "$2"
+  else
+    printf '%s enabled job%s (%s) run%s on %s and will be skipped until it is enabled again\n' "$n" "$([ "$n" -eq 1 ] || printf s)" "$names" "$([ "$n" -eq 1 ] && printf s)" "$1"
+  fi
+}
+
+cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-models> <platform> [path]
+  local verb="${1:-}" p="${2:-}" j out rc list cur added removed id catalog
+  case "$verb" in check|enable|disable|set-bin|models|set-models) ;;
+    *) die "usage: agentloop platform <check|enable|disable|set-bin|models|set-models> <platform>" ;; esac
+  platform_listed "$p" || die "platform: unknown platform '$p' (one of: $PLATFORMS $PLATFORMS_PLANNED)"
+  # Every other verb reaches config/platforms.json and so seeds it in passing
+  # (enable/disable/set-bin/set-models through write_platforms, models through
+  # platform_models_enabled) -- except `check`, which answers entirely from
+  # platform_bin()/platform_check() and, whenever AGENTLOOP_*_BIN is set, never
+  # touches the file at all. `check` is the first thing a fresh Settings page
+  # calls, so ensure the seed here too rather than leaving a bin-env install to
+  # discover it only on its first write.
+  platforms_ensure
+  case "$verb" in
+    check) platform_check "$p" ;;
+    enable)
+      j="$(platform_check "$p")"
+      [ "$(printf '%s' "$j" | "$JQ" -r .ready)" = "true" ] || die "cannot enable $p: $(printf '%s' "$j" | "$JQ" -r .reason)"
+      write_platforms --arg p "$p" '.platforms[$p] = ((.platforms[$p] // {bin:"", models:[]}) + {enabled:true})'
+      echo "$p enabled" ;;
+    disable)
+      write_platforms --arg p "$p" '.platforms[$p] = ((.platforms[$p] // {bin:"", models:[]}) + {enabled:false})'
+      echo "$p disabled"
+      platform_affected_note "$p" ;;
+    set-bin)
+      local path="${3:-}" epath
+      if [ -n "$path" ]; then
+        epath="$(expand_home "$path")"
+        # A relative path only resolves against whoever's cwd calls it next --
+        # the tick runs from launchd, a different cwd entirely, and would not
+        # find it. Leave an already-absolute or ~-rooted path alone (expand_home
+        # resolves ~ from $HOME regardless of cwd, so it is already portable).
+        case "$path" in
+          /*|'~'*) ;;
+          *) path="$PWD/$path"; epath="$path" ;;
+        esac
+        [ -f "$epath" ] && [ -x "$epath" ] || die "set-bin: not executable: $path"
+      fi
+      write_platforms --arg p "$p" --arg b "$path" '.platforms[$p] = ((.platforms[$p] // {enabled:false, models:[]}) + {bin:$b})'
+      if [ -n "$path" ]; then echo "$p binary: $path"; else echo "$p binary: detected ($(platform_bin "$p"))"; fi ;;
+    models)
+      local stale=false reason=""
+      if [ "$p" = "openai" ]; then
+        # A refresh that fails keeps the catalog the launch gate reads and
+        # stamps why (resolve_models_openai's `stale_reason`); this call
+        # reports that as `stale` over the catalog it kept. A failure with
+        # nothing to keep leaves the {available:false} stub, which
+        # platform_models_json lists as empty -- still stale, with the
+        # refresh's own last line as the reason.
+        out="$(resolve_models_openai 2>&1)"; rc=$?
+        reason="$("$JQ" -r '.openai.stale_reason // empty' "$MODELS_FILE" 2>/dev/null)"
+        if [ -n "$reason" ]; then
+          stale=true; reason="refresh failed: $reason"
+        elif [ "$rc" -ne 0 ] || ! openai_catalog_available; then
+          stale=true; reason="refresh failed: $(printf '%s' "$out" | tail -1)"
+        fi
+      fi
+      platform_models_json "$p" "$stale" "$reason" ;;
+    set-models)
+      list="$(cat | "$JQ" -ec 'if type == "array" and all(.[]; type == "string") then . else error("not a list") end' 2>/dev/null)" \
+        || die "set-models: expected a JSON list of model ids on stdin"
+      # First-seen order, the same reduce platforms_seed already dedupes with,
+      # so a repeated id in the request is not written twice.
+      list="$(printf '%s' "$list" | "$JQ" -c 'reduce .[] as $m ([]; if index($m) then . else . + [$m] end)')"
+      cur="$(platform_models_enabled "$p" | "$JQ" -R . | "$JQ" -sc .)"
+      catalog="$(platform_catalog_ids "$p" | "$JQ" -R . | "$JQ" -sc .)"; [ -n "$catalog" ] || catalog='[]'
+      # every NEW id has to be in the catalog; one already enabled may stay even when a refresh dropped it
+      added="$(printf '%s' "$list" | "$JQ" -r --argjson cur "$cur" '.[] | select(. as $x | ($cur | index($x)) == null)')"
+      for id in $added; do
+        printf '%s' "$catalog" | "$JQ" -e --arg x "$id" 'index($x) != null' >/dev/null 2>&1 \
+          || die "set-models: '$id' is not in the $p catalog (refresh with: agentloop platform models $p)"
+      done
+      removed="$(printf '%s' "$cur" | "$JQ" -r --argjson new "$list" '.[] | select(. as $x | ($new | index($x)) == null)')"
+      write_platforms --arg p "$p" --argjson m "$list" '.platforms[$p] = ((.platforms[$p] // {enabled:false, bin:""}) + {models:$m})'
+      echo "$p models: $(printf '%s' "$list" | "$JQ" -r 'join(" ")')"
+      for id in $removed; do platform_affected_note "$p" "$id"; done ;;
+  esac
 }
 
 platform_caps() { # platform_caps <platform> <capability> -> 0 when the platform HAS it
@@ -1329,11 +1725,11 @@ platform_model_ok() { # platform_model_ok <platform> <model>
   esac
 }
 
-platform_default_model() { # platform_default_model <platform> (openai: empty without a catalog)
-  case "$1" in
-    anthropic) printf 'opus' ;;
-    openai)    openai_catalog_visible | head -1 ;;
-  esac
+platform_default_model() { # platform_default_model <platform> -> the first model switched on in Settings; nothing when none is
+  platform_models_enabled "$1" | head -1
+}
+platform_models_enabled_line() { # the enabled ids on one line, space-separated, no trailing space -- for messages
+  platform_models_enabled "$1" | tr '\n' ' ' | sed 's/ *$//'
 }
 
 platform_stderr_filter() { # platform_stderr_filter <platform> <errfile>
@@ -1525,7 +1921,7 @@ openai_catalog_all_efforts() { # the union of every VISIBLE model's efforts, fir
 
 # --- the OpenAI catalog, write side ------------------------------------------
 resolve_models_openai() { # refresh config/models.json's `openai` block from `codex debug models`
-  local raw source block tmp
+  local raw source block tmp kept
   tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
   if [ ! -f "$MODELS_FILE" ]; then
     echo '{"resolved":{}}' > "$MODELS_FILE"
@@ -1533,14 +1929,14 @@ resolve_models_openai() { # refresh config/models.json's `openai` block from `co
     echo "models.json was not valid JSON — reseeded"
     echo '{"resolved":{}}' > "$MODELS_FILE"
   fi
-  if [ ! -x "$CODEX_BIN" ]; then
+  if [ ! -x "$(platform_bin openai)" ]; then
     block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"codex not installed"}')"
   else
     source="codex debug models"
-    raw="$("$CODEX_BIN" debug models 2>/dev/null)"
+    raw="$("$(platform_bin openai)" debug models 2>/dev/null)"
     if ! printf '%s' "$raw" | "$JQ" -e '.models | type == "array"' >/dev/null 2>&1; then
       source="bundled"
-      raw="$("$CODEX_BIN" debug models --bundled 2>/dev/null)"
+      raw="$("$(platform_bin openai)" debug models --bundled 2>/dev/null)"
     fi
     if ! printf '%s' "$raw" | "$JQ" -e '.models | type == "array"' >/dev/null 2>&1; then
       block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"codex debug models returned no catalog"}')"
@@ -1555,6 +1951,27 @@ resolve_models_openai() { # refresh config/models.json's `openai` block from `co
           visibility:(.visibility // "list"), priority:(.priority // 999),
           deprecated_by:(.upgrade.model // ""), retires_at:(.upgrade.retirement_at // "")}]}')"
     fi
+  fi
+  # A refresh that failed -- no codex, an empty answer -- must not replace a
+  # catalog that still resolves real jobs: the launch gate reads
+  # .openai.models and would refuse every openai run until the next
+  # successful refresh. Keep the block it had and stamp when and why the
+  # attempt failed; `platform models` reads the stamp back as `stale`, and
+  # models_stale ages the block from that stamp, so the tick retries after
+  # MODELS_TTL exactly as it did over the stub -- not on every tick, which
+  # would spend the anthropic probing pass that rides along each time. A
+  # successful refresh writes a block that carries neither stamp. The
+  # {available:false} stub is written only when there is nothing to keep.
+  if openai_catalog_available && printf '%s' "$block" | "$JQ" -e '.available == false' >/dev/null 2>&1; then
+    kept="$(printf '%s' "$block" | "$JQ" -r .reason)"
+    if ! { "$JQ" --argjson at "$(now_epoch)" --arg r "$kept" '.openai.stale_at = $at | .openai.stale_reason = $r' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
+      rm -f "$tmp"
+      echo "openai -> could not write $MODELS_FILE"
+      return 1
+    fi
+    rm -f "$tmp"
+    echo "openai -> kept the previous catalog ($kept)"
+    return 0
   fi
   if ! { "$JQ" --argjson b "$block" '.openai = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
     rm -f "$tmp"
@@ -1571,7 +1988,7 @@ resolve_models_openai() { # refresh config/models.json's `openai` block from `co
 
 openai_catalog_ensure() { # resolve once, synchronously, when the block is missing and codex exists (0 s measured)
   openai_catalog_available && return 0
-  [ -x "$CODEX_BIN" ] || return 1
+  [ -x "$(platform_bin openai)" ] || return 1
   resolve_models_openai >/dev/null 2>&1
   openai_catalog_available
 }
@@ -2692,7 +3109,7 @@ global_daily_cap() { # -> dollars, or empty for "no cap"
 
 model_probe_ok() { # model_probe_ok <id> -> 0 when the API accepts it
   local out
-  out="$("$CLAUDE_BIN" -p --output-format json --model "$1" "ok" 2>&1)" || return 1
+  out="$("$(platform_bin anthropic)" -p --output-format json --model "$1" "ok" 2>&1)" || return 1
   printf '%s' "$out" | "$JQ" -e '
     (.is_error != true) and (((.result // "") | test("issue with the selected model"; "i")) | not)
   ' >/dev/null 2>&1
@@ -2701,7 +3118,7 @@ model_probe_ok() { # model_probe_ok <id> -> 0 when the API accepts it
 model_alias_baseline() { # what the CLI's own alias points at (no API call)
   # The init event is selected, not assumed first: with any hook configured
   # the CLI emits hook_started/hook_response system events ahead of it.
-  "$CLAUDE_BIN" -p --output-format stream-json --verbose --model "$1" "hi" 2>/dev/null \
+  "$(platform_bin anthropic)" -p --output-format stream-json --verbose --model "$1" "hi" 2>/dev/null \
     | "$JQ" -r 'select(.type=="system" and .subtype=="init") | .model // empty' 2>/dev/null \
     | head -1
 }
@@ -2762,8 +3179,11 @@ models_stale() { # 0 = either cache is missing or older than MODELS_TTL
   oldest="$("$JQ" -r '[.resolved[]?.at // 0] | min // 0' "$MODELS_FILE" 2>/dev/null)"
   case "$oldest" in ''|null|*[!0-9]*) oldest=0 ;; esac
   # The openai block ages the same way. Absent, it is stale by definition --
-  # which is what gets it written on the first tick after this upgrade.
-  oa="$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)"
+  # which is what gets it written on the first tick after this upgrade. It
+  # ages from the last ATTEMPT: a failed refresh keeps the catalog and stamps
+  # `stale_at` (resolve_models_openai) instead of moving `.at`, so the stamp
+  # is what keeps a missing codex from re-running the whole pass every tick.
+  oa="$("$JQ" -r '[.openai.at // 0, .openai.stale_at // 0] | max' "$MODELS_FILE" 2>/dev/null)"
   case "$oa" in ''|null|*[!0-9]*) oa=0 ;; esac
   [ "$oa" -lt "$oldest" ] && oldest="$oa"
   [ "$(( $(now_epoch) - oldest ))" -ge "$MODELS_TTL" ]
@@ -2947,6 +3367,12 @@ check_ui_artifacts() {
 cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   local pass=0 fail=0 tmp
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/alselftest.XXXXXX")"
+  # CODEX_BIN/CLAUDE_BIN/OPENCODE_BIN (the globals platform_bin() falls back
+  # to) were computed from these at load time; the suite below points at its
+  # own stand-ins by assigning those globals directly, or by prefixing a
+  # subprocess explicitly (cfg_al). An AGENTLOOP_*_BIN exported by the
+  # invoking shell must not reach platform_bin() here.
+  AGENTLOOP_CLAUDE_BIN=""; AGENTLOOP_CODEX_BIN=""; AGENTLOOP_OPENCODE_BIN=""
   ok()   { pass=$(( pass + 1 )); printf '  ok    %s\n' "$1"; }
   bad()  { fail=$(( fail + 1 )); printf '  FAIL  %s\n' "$1"; }
   want() { # want <label> <expected 0|1> <actual-rc>
@@ -2968,6 +3394,21 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   local TICK_LOG="$DATA_DIR/tick.log"
   local LOG_DIR="$DATA_DIR/logs" LOCK_DIR="$DATA_DIR/locks"
   local WORKTREES_DIR="$DATA_DIR/worktrees" RUNS_FILE="$DATA_DIR/runs.ndjson"
+  # The platforms file is read by every gate below through PLATFORMS_FILE,
+  # which was computed from the REAL config dir at load time. Shadowed here
+  # so a scenario that redirects JOBS_FILE alone can never seed or read the
+  # operator's own config/platforms.json; the guard at the end proves it.
+  local _real_pf="$PLATFORMS_FILE" _pf0
+  _pf0="$(stat -f %m "$PLATFORMS_FILE" 2>/dev/null || echo none)"
+  local PLATFORMS_FILE="$tmp/platforms.json"
+  # Permissive on purpose: the scenarios below launch runs on every model
+  # their fixtures name, and Settings is not what any of them is testing. A
+  # block that IS testing Settings writes a file of its own (pf_env, pc_al,
+  # dplat, sec_env below).
+  "$JQ" -n '{platforms:{
+    anthropic:{enabled:true, bin:"", models:["opus","sonnet","haiku","fable","claude-opus-5","claude-sonnet-5","claude-opus-4-8","claude-fable-5-1","claude-haiku-4-5-20251001"]},
+    openai:{enabled:true, bin:"", models:["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-a","gpt-b"]},
+    opencode:{enabled:false, bin:"", models:[]}}}' > "$PLATFORMS_FILE"
   mkdir -p "$DATA_DIR" "$LOG_DIR" "$LOCK_DIR" "$WORKTREES_DIR"
 
   echo "num() — a number from a command is always an integer"
@@ -3059,6 +3500,265 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   platform_effort_ok anthropic opus ultra;   want "ultra is not an anthropic effort"          1 $?
   platform_effort_ok anthropic opus "";      want "an empty effort is always fine"            0 $?
 
+  echo "config/platforms.json — seeded from what is in use, read by every gate"
+  local pf="$tmp/pf"; mkdir -p "$pf"
+  pf_env() { PLATFORMS_FILE="$pf/platforms.json"; JOBS_FILE="$pf/jobs.json"; PROJECTS_FILE="$pf/projects.json"; MODELS_FILE="$pf/models.json"; }
+  cat > "$pf/jobs.json" <<'JSON'
+{"jobs":[{"id":"a1","model":"claude-opus-5","prompt":"x"},
+         {"id":"a2","model":"opus","prompt":"x"},
+         {"id":"off","enabled":false,"model":"claude-sonnet-5","prompt":"x"},
+         {"id":"o1","platform":"openai","model":"gpt-5.6-luna","prompt":"x"},
+         {"id":"p1","project":"P","prompt":"x"}]}
+JSON
+  cat > "$pf/projects.json" <<'JSON'
+{"projects":[{"name":"P","platform":"openai","model":"gpt-5.6-sol",
+              "security":{"enabled":true,"platform":"anthropic","model":"claude-fable-5-1"}}]}
+JSON
+  "$JQ" -n '{resolved:{opus:{id:"claude-opus-5", at:1}},
+             openai:{at:1, source:"fixture", models:[
+               {slug:"gpt-5.6-luna", visibility:"list", priority:1},
+               {slug:"gpt-5.6-sol",  visibility:"list", priority:2}]}}' > "$pf/models.json"
+  type platforms_ensure >/dev/null 2>&1 && ok "the platforms file reader is defined" || bad "platforms_ensure does not exist"
+  ( pf_env; platforms_ensure )
+  [ -f "$pf/platforms.json" ] && ok "a missing platforms file is written on first use" || bad "platforms_ensure wrote nothing"
+  ( pf_env; platform_enabled anthropic ); want "anthropic is enabled: enabled jobs run on it" 0 $?
+  ( pf_env; platform_enabled openai );    want "openai is enabled: an enabled job and a project's jobs run on it" 0 $?
+  ( pf_env; platform_enabled opencode );  want "opencode is never enabled by the seed" 1 $?
+  got="$( pf_env; platform_models_enabled anthropic | tr '\n' ' ' )"
+  [ "$got" = "claude-opus-5 claude-fable-5-1 " ] \
+    && ok "anthropic's models: the ids in use, a family resolved through the cache, the disabled job's model left out, no repeats" \
+    || bad "anthropic models: '$got'"
+  got="$( pf_env; platform_models_enabled openai | tr '\n' ' ' )"
+  [ "$got" = "gpt-5.6-luna gpt-5.6-sol " ] && ok "openai's models: the job's own and the one inherited from the project" || bad "openai models: '$got'"
+  ( pf_env; platform_model_enabled anthropic opus );            want "a family counts as enabled when its cached id is" 0 $?
+  ( pf_env; platform_model_enabled anthropic claude-sonnet-5 ); want "a model no enabled job uses is not enabled" 1 $?
+  # The reverse of the family case: the seed writes a bare family (opus) when
+  # the cache had not resolved it yet, and a job naming the explicit id the
+  # cache later resolves it to has to count as switched on too.
+  printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["opus"]}}}\n' > "$pf/platforms-family.json"
+  ( pf_env; PLATFORMS_FILE="$pf/platforms-family.json"; platform_model_enabled anthropic claude-opus-5 ); want "an explicit id counts as enabled when the family it resolves from is" 0 $?
+  ( pf_env; platform_usable anthropic ); want "usable: enabled with a model" 0 $?
+  [ "$( pf_env; platform_jobs_on openai | tr '\n' ' ' )" = "o1 p1 " ] \
+    && ok "platform_jobs_on lists the enabled jobs of a platform" || bad "jobs on openai: $( pf_env; platform_jobs_on openai | tr '\n' ' ' )"
+  [ "$( pf_env; platform_jobs_on anthropic claude-fable-5-1 )" = "security:P" ] \
+    && ok "and an enabled security block, by its project" || bad "block: $( pf_env; platform_jobs_on anthropic claude-fable-5-1 )"
+
+  # A job with no model runs on its platform's default -- the seed has to
+  # credit that default, not an empty model, or every no-model job upgrades
+  # to "enabled but refused".
+  local pf3="$tmp/pf3"; mkdir -p "$pf3"
+  printf '{"jobs":[{"id":"nodef","prompt":"x"}]}\n' > "$pf3/jobs.json"
+  printf '{"resolved":{"opus":{"id":"claude-opus-5","at":1}}}\n' > "$pf3/models.json"
+  p3_env() { PLATFORMS_FILE="$pf3/platforms.json"; JOBS_FILE="$pf3/jobs.json"; PROJECTS_FILE="$pf3/projects.json"; MODELS_FILE="$pf3/models.json"; }
+  got="$( p3_env; platform_models_enabled anthropic | tr '\n' ' ' )"
+  [ "$got" = "claude-opus-5 " ] \
+    && ok "a job with no model contributes the anthropic default (opus), resolved through the cache" || bad "no-model job's contributed model: '$got'"
+  [ "$( p3_env; platform_jobs_on anthropic claude-opus-5 )" = "nodef" ] \
+    && ok "and it shows up under platform_jobs_on for that effective model" || bad "jobs on anthropic claude-opus-5: $( p3_env; platform_jobs_on anthropic claude-opus-5 )"
+
+  # A model invalid for its own platform (an openai job naming an anthropic
+  # family) is treated the same as no model at all: the platform's default.
+  local pf4="$tmp/pf4"; mkdir -p "$pf4"
+  printf '{"jobs":[{"id":"badmodel","platform":"openai","model":"opus","prompt":"x"}]}\n' > "$pf4/jobs.json"
+  "$JQ" -n '{resolved:{opus:{id:"claude-opus-5", at:1}},
+             openai:{at:1, source:"fixture", models:[
+               {slug:"gpt-a", visibility:"list", priority:1},
+               {slug:"gpt-b", visibility:"list", priority:2}]}}' > "$pf4/models.json"
+  p4_env() { PLATFORMS_FILE="$pf4/platforms.json"; JOBS_FILE="$pf4/jobs.json"; PROJECTS_FILE="$pf4/projects.json"; MODELS_FILE="$pf4/models.json"; }
+  got="$( p4_env; platform_models_enabled openai | tr '\n' ' ' )"
+  [ "$got" = "gpt-a " ] \
+    && ok "an openai job naming a model invalid there (opus) contributes the openai default instead" || bad "invalid-model job's contributed model: '$got'"
+  [ "$( p4_env; platform_jobs_on openai gpt-a )" = "badmodel" ] \
+    && ok "and platform_jobs_on matches it against that effective model too" || bad "jobs on openai gpt-a: $( p4_env; platform_jobs_on openai gpt-a )"
+
+  # Without ANY openai catalog ($ocat == []), the old valid() rejected every
+  # openai slug -- so effective() replaced even a job's OWN configured model
+  # with the (also empty) openai default, and it vanished from the seed. A
+  # job that today is merely skipped until `resolve-models openai` runs would
+  # be refused for good once a later task's gate reads this file. No catalog
+  # means "cannot validate", not "invalid" -- the configured slug is kept.
+  local pf6="$tmp/pf6"; mkdir -p "$pf6"
+  printf '{"jobs":[{"id":"o1","platform":"openai","model":"gpt-5.6-luna","prompt":"x"}]}\n' > "$pf6/jobs.json"
+  printf '{"resolved":{}}\n' > "$pf6/models.json"
+  p6_env() { PLATFORMS_FILE="$pf6/platforms.json"; JOBS_FILE="$pf6/jobs.json"; PROJECTS_FILE="$pf6/projects.json"; MODELS_FILE="$pf6/models.json"; }
+  got="$( p6_env; platform_models_enabled openai | tr '\n' ' ' )"
+  [ "$got" = "gpt-5.6-luna " ] \
+    && ok "no openai catalog at all: the configured slug is kept, not dropped for the empty default" \
+    || bad "no-catalog openai model: '$got'"
+
+  # An empty (0-byte) models.json used to make every read of it fail (jq -c
+  # on empty input prints nothing but still exits 0, so --argjson resolved
+  # "" blew up) -- the seed must still work with no cache at all.
+  local pf5="$tmp/pf5"; mkdir -p "$pf5"
+  printf '{"jobs":[{"id":"e1","prompt":"x"}]}\n' > "$pf5/jobs.json"
+  : > "$pf5/models.json"
+  ( PLATFORMS_FILE="$pf5/platforms.json"; JOBS_FILE="$pf5/jobs.json"; PROJECTS_FILE="$pf5/projects.json"; MODELS_FILE="$pf5/models.json"; platforms_ensure )
+  want "an empty models.json still seeds" 0 $?
+  [ -f "$pf5/platforms.json" ] && ok "and the file exists" || bad "platforms_ensure with an empty models.json wrote nothing"
+  [ "$( PLATFORMS_FILE="$pf5/platforms.json"; JOBS_FILE="$pf5/jobs.json"; PROJECTS_FILE="$pf5/projects.json"; MODELS_FILE="$pf5/models.json"; platform_models_enabled anthropic )" = "opus" ] \
+    && ok "and platform_models_enabled anthropic still prints opus (no cache: the family stays as it is)" \
+    || bad "anthropic models with no cache: '$( PLATFORMS_FILE="$pf5/platforms.json"; JOBS_FILE="$pf5/jobs.json"; PROJECTS_FILE="$pf5/projects.json"; MODELS_FILE="$pf5/models.json"; platform_models_enabled anthropic )'"
+
+  # a fresh install: only the two disabled example jobs -> nothing enabled, and the file still lists the three platforms
+  local pf2="$tmp/pf2"; mkdir -p "$pf2"; cp "$BASE_DIR/config/jobs.example.json" "$pf2/jobs.json"
+  ( PLATFORMS_FILE="$pf2/platforms.json"; JOBS_FILE="$pf2/jobs.json"; PROJECTS_FILE="$pf2/projects.json"; MODELS_FILE="$pf2/models.json"
+    platforms_ensure; platform_usable anthropic ); want "a fresh install enables nothing" 1 $?
+  "$JQ" -e '.platforms | keys == ["anthropic","openai","opencode"]' "$pf2/platforms.json" >/dev/null 2>&1 \
+    && ok "and still lists the three platforms" || bad "seed keys: $("$JQ" -c '.platforms | keys' "$pf2/platforms.json" 2>/dev/null)"
+  # an invalid file: nothing enabled, a reason, and never rewritten
+  printf '{oops' > "$pf2/platforms.json"
+  ( PLATFORMS_FILE="$pf2/platforms.json"; platform_enabled anthropic ); want "an invalid file enables nothing" 1 $?
+  [ -n "$( PLATFORMS_FILE="$pf2/platforms.json"; platforms_error )" ] && ok "and platforms_error names it" || bad "no error for an invalid file"
+  ( PLATFORMS_FILE="$pf2/platforms.json"; write_platforms '.platforms.anthropic.enabled = true' ) >/dev/null 2>&1; want "write_platforms refuses to write over an invalid file" 1 $?
+  [ "$(cat "$pf2/platforms.json")" = "{oops" ] && ok "and left it exactly as it was" || bad "the invalid file was rewritten"
+  ( pf_env; write_platforms '.platforms = "nope"' ) >/dev/null 2>&1; want "a filter that drops .platforms is discarded" 1 $?
+  ( pf_env; write_platforms '.platforms.openai.enabled = false' ) >/dev/null 2>&1; want "a good filter writes" 0 $?
+  ( pf_env; platform_enabled openai ); want "and the write is read back" 1 $?
+
+  echo "platform_bin() / platform_check() — where the CLI is, and whether it is signed in"
+  local pb="$tmp/pb" _pc; mkdir -p "$pb/bin"
+  printf '#!/bin/sh\necho "codex-cli 9.9.9"\n' > "$pb/bin/codex"; chmod +x "$pb/bin/codex"
+  printf '{"platforms":{"openai":{"enabled":true,"bin":"%s","models":[]}}}\n' "$pb/bin/codex" > "$pb/platforms.json"
+  type platform_check >/dev/null 2>&1 && ok "platform_check is defined" || bad "platform_check does not exist"
+  [ "$( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=/env/codex; platform_bin openai )" = "/env/codex" ] \
+    && ok "platform_bin: the environment override wins" || bad "env: $( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=/env/codex; platform_bin openai )"
+  [ "$( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=""; platform_bin openai )" = "$pb/bin/codex" ] \
+    && ok "platform_bin: then the file's bin" || bad "file: $( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=""; platform_bin openai )"
+  [ "$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; CODEX_BIN=/detected/codex; platform_bin openai )" = "/detected/codex" ] \
+    && ok "platform_bin: then the detected default" || bad "auto: $( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; CODEX_BIN=/detected/codex; platform_bin openai )"
+  [ "$( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=""; platform_bin_source openai )" = "file" ] \
+    && [ "$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; platform_bin_source openai )" = "auto" ] \
+    && [ "$( AGENTLOOP_CODEX_BIN=/env/codex; platform_bin_source openai )" = "env" ] \
+    && ok "platform_bin_source names the layer that answered" || bad "bin_source"
+  _pc="$( PLATFORMS_FILE="$pb/platforms.json"; AGENTLOOP_CODEX_BIN=""; platform_check openai )"
+  printf '%s' "$_pc" | "$JQ" -e --arg b "$pb/bin/codex" \
+    '.platform == "openai" and .supported == true and .ready == true and .bin == $b and .bin_found == true and .bin_source == "file" and .version == "codex-cli 9.9.9"' >/dev/null 2>&1 \
+    && ok "platform_check openai: found, version read, signed in through the stand-in" || bad "check openai: $_pc"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; CODEX_BIN="$BASE_DIR/test/fake-codex"; FAKE_CODEX_LOGGED_OUT=1 platform_check openai )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .reason' | tr '\n' '|')" = "false|codex is not signed in (run: codex login)|" ] \
+    && ok "platform_check openai: signed out, with today's sentence" || bad "signed out: $_pc"
+  [ "$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; CODEX_BIN=/nonexistent; platform_ready openai )" = "codex not found at /nonexistent — set the path in Settings (or AGENTLOOP_CODEX_BIN); install: npm i -g @openai/codex, then codex login" ] \
+    && ok "platform_ready: a missing binary names the path, the setting and the install command" || bad "not found: $( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CODEX_BIN=""; CODEX_BIN=/nonexistent; platform_ready openai )"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CLAUDE_BIN=""; CLAUDE_BIN="$BASE_DIR/test/fake-claude"; AGENTLOOP_CLAUDE_CONFIG_DIR=""; PLIST_PATH=/nonexistent; platform_check anthropic )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .account, .version' | tr '\n' '|')" = "true|fake@example.org · max plan|2.1.258 (Claude Code)|" ] \
+    && ok "platform_check anthropic: the account and plan come from claude auth status" || bad "check anthropic: $_pc"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CLAUDE_BIN=""; CLAUDE_BIN="$BASE_DIR/test/fake-claude"; AGENTLOOP_CLAUDE_CONFIG_DIR=""; PLIST_PATH=/nonexistent; FAKE_CLAUDE_LOGGED_OUT=1 platform_check anthropic )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .reason' | tr '\n' '|')" = "false|claude is not signed in (run: claude auth login)|" ] \
+    && ok "platform_check anthropic: signed out says how to sign in" || bad "anthropic signed out: $_pc"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CLAUDE_BIN=""; CLAUDE_BIN="$BASE_DIR/test/fake-claude"; AGENTLOOP_CLAUDE_CONFIG_DIR=/pinned/home; PLIST_PATH=/nonexistent; FAKE_CLAUDE_LOGGED_OUT=1 platform_check anthropic )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.reason')" = "claude is not signed in in /pinned/home (run: CLAUDE_CONFIG_DIR=/pinned/home claude auth login)" ] \
+    && ok "and names the pinned account directory when there is one" || bad "pinned signed out: $_pc"
+  printf '#!/bin/sh\necho "2.0.0 (Claude Code)"\n' > "$pb/bin/oldclaude"; chmod +x "$pb/bin/oldclaude"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_CLAUDE_BIN=""; CLAUDE_BIN="$pb/bin/oldclaude"; AGENTLOOP_CLAUDE_CONFIG_DIR=""; PLIST_PATH=/nonexistent; platform_check anthropic )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .account' | tr '\n' '|')" = "true|unknown — claude auth status needs Claude Code 2.1+|" ] \
+    && ok "a CLI without \`auth status\` counts as ready, and says the account is unknown" || bad "old cli: $_pc"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN=""; OPENCODE_BIN=/nonexistent; platform_check opencode )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.supported, .ready, .bin_found, .reason' | tr '\n' '|')" = "false|false|false|opencode not found at /nonexistent — set the path in Settings (or AGENTLOOP_OPENCODE_BIN); install: brew install opencode|" ] \
+    && ok "platform_check opencode: planned, and not found says how to install it" || bad "opencode missing: $_pc"
+  printf '#!/bin/sh\necho "1.18.30"\n' > "$pb/bin/opencode"; chmod +x "$pb/bin/opencode"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN=""; OPENCODE_BIN="$pb/bin/opencode"; platform_check opencode )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .bin_found, .version, .reason' | tr '\n' '|')" = "false|true|1.18.30|runs on OpenCode arrive with the OpenCode engine|" ] \
+    && ok "platform_check opencode: found and versioned, still not ready, with the reason" || bad "opencode found: $_pc"
+  [ "$(platform_check martian | "$JQ" -r .reason)" = "unknown platform martian" ] && ok "an unlisted platform is answered, never a crash" || bad "unlisted"
+
+  echo "agentloop platform … — the commands the Settings page is made of"
+  local pc="$tmp/pc" out rc _pm _pl; mkdir -p "$pc/config" "$pc/data"
+  printf '{"jobs":[{"id":"u1","model":"claude-opus-5","prompt":"x"},{"id":"u2","platform":"openai","model":"gpt-a","prompt":"x"}]}\n' > "$pc/config/jobs.json"
+  printf '{"projects":[]}\n' > "$pc/config/projects.json"
+  "$JQ" -n '{resolved:{opus:{id:"claude-opus-5",at:1}}, openai:{at:1, source:"fixture", models:[
+      {slug:"gpt-a", display_name:"A", description:"da", visibility:"list", priority:6, efforts:["low","high"], default_effort:"low", deprecated_by:"", retires_at:""},
+      {slug:"gpt-b", display_name:"B", description:"db", visibility:"list", priority:7, efforts:["low"], default_effort:"low", deprecated_by:"", retires_at:""}]}}' \
+    > "$pc/config/models.json"
+  printf '{"openai":{"gpt-a":{"input":4,"cached_input":0.4,"output":20,"source":"manual"}}}\n' > "$pc/config/pricing.json"
+  # `platform models openai` refreshes for real (resolve_models_openai, unconditional
+  # by design) -- so fake-codex's `debug models` has to answer with THIS catalog, not
+  # its own fixture, or the refresh would clobber config/models.json's seed above with
+  # unrelated slugs. Raw shape: what `codex debug models` itself returns, the same
+  # shape as test/fixtures/codex/models-catalog.stripped.json.
+  printf '{"models":[{"slug":"gpt-a","display_name":"A","description":"da","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"visibility":"list","priority":6},{"slug":"gpt-b","display_name":"B","description":"db","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"}],"visibility":"list","priority":7}]}' \
+    > "$pc/catalog.json"
+  pc_al() { AGENTLOOP_CONFIG="$pc/config" AGENTLOOP_DATA="$pc/data" AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" \
+            AGENTLOOP_CODEX_BIN="$BASE_DIR/test/fake-codex" AGENTLOOP_CLAUDE_CONFIG_DIR="" CODEX_HOME="$pc/codex-home" \
+            FAKE_CODEX_MODELS_JSON="$pc/catalog.json" "$BIN_DIR/agentloop" "$@"; }
+  # pc_al's own twin, pointed at a codex that is not there, for the "a failed
+  # refresh must not clobber the catalog" assertion below.
+  pc_al_nocodex() { AGENTLOOP_CONFIG="$pc/config" AGENTLOOP_DATA="$pc/data" AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" \
+            AGENTLOOP_CODEX_BIN=/nonexistent/codex AGENTLOOP_CLAUDE_CONFIG_DIR="" CODEX_HOME="$pc/codex-home" \
+            FAKE_CODEX_MODELS_JSON="$pc/catalog.json" "$BIN_DIR/agentloop" "$@"; }
+  pc_al platform check openai | "$JQ" -e '.ready == true' >/dev/null 2>&1; want "platform check prints platform_check's JSON" 0 $?
+  pc_al platform check martian >/dev/null 2>&1; want "platform check refuses an unlisted platform" 1 $?
+  # the seed happened on that first read: both platforms in use are enabled with their models
+  "$JQ" -e '.platforms.anthropic.enabled == true and .platforms.anthropic.models == ["claude-opus-5"] and .platforms.openai.models == ["gpt-a"]' "$pc/config/platforms.json" >/dev/null 2>&1 \
+    && ok "the first command seeded config/platforms.json from the jobs in use" || bad "seed: $(cat "$pc/config/platforms.json")"
+  out="$(pc_al platform disable openai 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && "$JQ" -e '.platforms.openai.enabled == false' "$pc/config/platforms.json" >/dev/null 2>&1 \
+    && ok "platform disable writes enabled:false" || bad "disable: rc=$rc $out"
+  case "$out" in *"1 enabled job (u2) runs on openai and will be skipped until it is enabled again"*) ok "and says which enabled jobs will be skipped" ;; *) bad "disable note: $out" ;; esac
+  out="$(FAKE_CODEX_LOGGED_OUT=1 pc_al platform enable openai 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && "$JQ" -e '.platforms.openai.enabled == false' "$pc/config/platforms.json" >/dev/null 2>&1 \
+    && ok "platform enable refuses while the check fails, and writes nothing" || bad "enable while signed out: rc=$rc $out"
+  case "$out" in *"cannot enable openai: codex is not signed in (run: codex login)"*) ok "and says why" ;; *) bad "enable refusal: $out" ;; esac
+  pc_al platform enable openai >/dev/null 2>&1; want "platform enable writes once the check passes" 0 $?
+  "$JQ" -e '.platforms.openai.enabled == true' "$pc/config/platforms.json" >/dev/null 2>&1 && ok "and the file says so" || bad "enable not written"
+  pc_al platform enable opencode >/dev/null 2>&1; want "platform enable refuses a planned platform" 1 $?
+  pc_al platform set-bin openai /nonexistent/codex >/dev/null 2>&1; want "set-bin refuses a path that is not executable" 1 $?
+  pc_al platform set-bin openai "$BASE_DIR/test/fake-codex" >/dev/null 2>&1; want "set-bin accepts an executable" 0 $?
+  [ "$("$JQ" -r '.platforms.openai.bin' "$pc/config/platforms.json")" = "$BASE_DIR/test/fake-codex" ] && ok "and writes it" || bad "bin not written"
+  pc_al platform set-bin openai "test/fake-codex" >/dev/null 2>&1; want "set-bin accepts a relative path" 0 $?
+  [ "$("$JQ" -r '.platforms.openai.bin' "$pc/config/platforms.json")" = "$BASE_DIR/test/fake-codex" ] \
+    && ok "and stores it made absolute against the cwd, not as typed" || bad "relative bin not absolutized: $("$JQ" -r '.platforms.openai.bin' "$pc/config/platforms.json")"
+  pc_al platform set-bin openai "" >/dev/null 2>&1
+  [ "$("$JQ" -r '.platforms.openai.bin' "$pc/config/platforms.json")" = "" ] && ok "set-bin with nothing goes back to detection" || bad "bin not cleared"
+  _pm="$(pc_al platform models openai 2>/dev/null)"
+  printf '%s' "$_pm" | "$JQ" -e '.platform == "openai" and .stale == false and (.models | map(.v)) == ["gpt-a","gpt-b"] and .models[0].enabled == true and .models[1].enabled == false and .models[0].price.input == 4 and .models[1].price == null and .models[0].efforts == ["low","high"]' >/dev/null 2>&1 \
+    && ok "platform models: the catalog in priority order, each slug with enabled, efforts and price" || bad "models openai: $_pm"
+  # A refresh that fails (codex missing) must not empty the catalog the launch
+  # gate reads: it should keep serving the last good one, marked stale.
+  _pm="$(pc_al_nocodex platform models openai 2>/dev/null)"
+  printf '%s' "$_pm" | "$JQ" -e '.stale == true and (.reason | test("refresh failed")) and (.models | map(.v)) == ["gpt-a","gpt-b"]' >/dev/null 2>&1 \
+    && ok "platform models: a failed refresh keeps the old catalog and says stale" || bad "models openai failed refresh: $_pm"
+  "$JQ" -e '.openai.models | length == 2' "$pc/config/models.json" >/dev/null 2>&1 \
+    && ok "and config/models.json still carries the pre-refresh catalog" || bad "models.json after failed refresh: $(cat "$pc/config/models.json")"
+  # The tick's own path (`_resolve_models` -> cmd_resolve_models ->
+  # resolve_models_openai, with no `platform models` around it): a good
+  # refresh carries no stale stamp, a failed one keeps the catalog and
+  # stamps when and why.
+  pc_al resolve-models openai >/dev/null 2>&1
+  "$JQ" -e '(.openai.models | length == 2) and ((.openai | has("stale_reason")) | not) and ((.openai | has("stale_at")) | not)' "$pc/config/models.json" >/dev/null 2>&1 \
+    && ok "resolve-models openai: a successful refresh carries no stale stamp" || bad "after a good refresh: $(cat "$pc/config/models.json")"
+  out="$(pc_al_nocodex resolve-models openai 2>&1)"
+  "$JQ" -e '(.openai.models | length == 2) and (.openai.stale_reason == "codex not installed") and (.openai.stale_at | type == "number")' "$pc/config/models.json" >/dev/null 2>&1 \
+    && ok "resolve-models openai: a failed refresh keeps the catalog and stamps stale_at/stale_reason" || bad "after a failed refresh: $(cat "$pc/config/models.json")"
+  case "$out" in *"openai -> kept the previous catalog (codex not installed)"*) ok "and says it kept the previous catalog" ;; *) bad "kept line: $out" ;; esac
+  _pm="$(pc_al platform models anthropic 2>/dev/null)"
+  printf '%s' "$_pm" | "$JQ" -e '.platform == "anthropic" and (.models | map(.v) | index("claude-opus-5")) != null and (.models[] | select(.v == "claude-opus-5") | .enabled) == true' >/dev/null 2>&1 \
+    && ok "platform models anthropic: the ids in use are listed and flagged" || bad "models anthropic: $_pm"
+  pc_al platform models opencode | "$JQ" -e '.models == [] and (.reason | length) > 0' >/dev/null 2>&1; want "platform models opencode: an empty list with the reason" 0 $?
+  printf '["gpt-zzz"]' | pc_al platform set-models openai >/dev/null 2>&1; want "set-models refuses an id outside the catalog" 1 $?
+  printf 'not json' | pc_al platform set-models openai >/dev/null 2>&1; want "set-models refuses anything but a JSON list" 1 $?
+  printf '' | pc_al platform set-models openai >/dev/null 2>&1; want "set-models refuses empty stdin" 1 $?
+  [ "$("$JQ" -c '.platforms.openai.models' "$pc/config/platforms.json")" = '["gpt-a"]' ] \
+    && ok "and leaves the file unchanged" || bad "set-models empty stdin wrote: $(cat "$pc/config/platforms.json")"
+  printf '["gpt-a","gpt-a"]' | pc_al platform set-models openai >/dev/null 2>&1
+  [ "$("$JQ" -c '.platforms.openai.models' "$pc/config/platforms.json")" = '["gpt-a"]' ] \
+    && ok "set-models dedupes a repeated id before writing" || bad "set-models dedupe wrote: $(cat "$pc/config/platforms.json")"
+  out="$(printf '["gpt-b"]' | pc_al platform set-models openai 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$("$JQ" -c '.platforms.openai.models' "$pc/config/platforms.json")" = '["gpt-b"]' ] \
+    && ok "set-models writes the list it was given" || bad "set-models: rc=$rc $out"
+  case "$out" in *"1 enabled job (u2) runs on openai with gpt-a and will be skipped until it is enabled again"*) ok "and names the jobs whose model was switched off" ;; *) bad "set-models note: $out" ;; esac
+  # an id already enabled may stay even when the catalog no longer carries it
+  "$JQ" '.platforms.openai.models = ["gpt-gone","gpt-b"]' "$pc/config/platforms.json" > "$pc/pf.next"; mv "$pc/pf.next" "$pc/config/platforms.json"
+  printf '["gpt-gone","gpt-a"]' | pc_al platform set-models openai >/dev/null 2>&1; want "set-models keeps an already-enabled id the catalog dropped" 0 $?
+  _pl="$(pc_al platforms 2>/dev/null)"
+  printf '%s' "$_pl" | "$JQ" -e '(keys | sort) == ["anthropic","openai","opencode"] and .opencode.supported == false and .openai.supported == true
+      and .openai.enabled == true and .openai.usable == true and .openai.models_enabled == ["gpt-gone","gpt-a"] and .openai.bin_source == "env"
+      and .openai.jobs_on_platform == 1 and .openai.jobs_using == {"gpt-a": 1} and .anthropic.jobs_using == {"claude-opus-5": 1}
+      and .opencode.usable == false and (.opencode.models_enabled == [])' >/dev/null 2>&1 \
+    && ok "platforms: the three platforms, each with enabled, usable, bin_source, models_enabled and the jobs using them" || bad "platforms: $_pl"
+  printf '{oops' > "$pc/config/platforms.json"
+  pc_al platforms 2>/dev/null | "$JQ" -e '._error | test("not a valid platforms file")' >/dev/null 2>&1; want "platforms carries _error when the file is unreadable" 0 $?
+  pc_al platform enable openai >/dev/null 2>&1; want "and enable refuses to write over it" 1 $?
+
   # The catalog readers, over a models.json of this test's own.
   mkdir -p "$tmp/cat"
   "$JQ" -n '{resolved:{}, openai:{at:1, source:"fixture", models:[
@@ -3078,10 +3778,14 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   local _catout
   _catout="$(
     MODELS_FILE="$tmp/cat/models.json"
+    # Settings lists the slugs in the order they were switched on, and that
+    # order -- not the catalog priority -- is what the default follows.
+    PLATFORMS_FILE="$tmp/cat/platforms.json"
+    printf '{"platforms":{"openai":{"enabled":true,"bin":"","models":["gpt-b","gpt-a"]}}}\n' > "$PLATFORMS_FILE"
     _upass=0; _ufail=0
     ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
     bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
-    [ "$(platform_default_model openai)" = "gpt-a" ] && ok "the default openai model is the listed slug with the lowest priority" || bad "default $(platform_default_model openai)"
+    [ "$(platform_default_model openai)" = "gpt-b" ] && ok "the default openai model is the first one switched on in Settings, whatever the catalog priority says" || bad "default $(platform_default_model openai)"
     platform_model_ok openai gpt-hidden; want "a hidden slug is accepted when written"      0 $?
     platform_model_ok openai gpt-nope;   want "a slug outside the catalog is refused"       1 $?
     platform_effort_ok openai gpt-a ultra; want "ultra is fine where the catalog lists it"  0 $?
@@ -3098,11 +3802,14 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   local _noneout
   _noneout="$(
     MODELS_FILE="$tmp/cat/none.json"
+    # Settings has a slug switched on; the catalog file does not exist.
+    PLATFORMS_FILE="$tmp/cat/none-platforms.json"
+    printf '{"platforms":{"openai":{"enabled":true,"bin":"","models":["gpt-a"]}}}\n' > "$PLATFORMS_FILE"
     _upass=0; _ufail=0
     ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
     bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
     platform_model_ok openai gpt-a; want "without a catalog every slug is refused" 1 $?
-    [ -z "$(platform_default_model openai)" ] && ok "and there is no default model" || bad "default without a catalog"
+    [ "$(platform_default_model openai)" = "gpt-a" ] && ok "and the default model is still what Settings switched on: it needs no catalog" || bad "default without a catalog: $(platform_default_model openai)"
     platform_effort_ok openai gpt-a ultra; want "but the effort vocabulary falls back to the union" 0 $?
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
@@ -3181,11 +3888,20 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
       && ok "resolve_models_openai: no codex -> .openai.reason says so" \
       || bad "reason '$("$JQ" -r '.openai.reason' "$MODELS_FILE")'"
 
+    # models_stale ages the openai block from the last ATTEMPT: a kept
+    # catalog (old .at, fresh stale_at) is not refreshed again on the next
+    # tick, which would spend the anthropic probing pass every minute.
+    MODELS_FILE="$tmp/rm/stale.json"
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{opus:{id:"x", at:$now}}, openai:{at:1, models:[]}}' > "$MODELS_FILE"
+    models_stale; want "models_stale: an openai block older than MODELS_TTL is stale" 0 $?
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{opus:{id:"x", at:$now}}, openai:{at:1, models:[], stale_at:$now, stale_reason:"codex not installed"}}' > "$MODELS_FILE"
+    models_stale; want "models_stale: a kept catalog with a fresh stale_at is not" 1 $?
+
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_rmout" | grep -v '^RESULT '
-  printf '%s\n' "$_rmout" | grep -qx 'RESULT ok=15 bad=0' \
-    && ok "resolve_models_openai over the fixture catalog: all 15 assertions reach the gate" \
+  printf '%s\n' "$_rmout" | grep -qx 'RESULT ok=17 bad=0' \
+    && ok "resolve_models_openai over the fixture catalog: all 17 assertions reach the gate" \
     || bad "resolve_models_openai over the fixture catalog did not: $(printf '%s\n' "$_rmout" | tail -1)"
 
   echo "resolve_pricing_openai() — the price table refreshes itself from the source, never inventing a number"
@@ -3370,56 +4086,76 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     AGENTLOOP_CLAUDE_CONFIG_DIR=""                # no pin from the shell and no plist from ~/Library:
     PLIST_PATH=/nonexistent                       # installed_config_dir answers nothing, the CLI default
     CODEX_BIN="$BASE_DIR/test/fake-codex"
+    # An AGENTLOOP_*_BIN exported by the invoking shell must never win over the stand-ins above.
+    AGENTLOOP_CLAUDE_BIN=""; AGENTLOOP_CODEX_BIN=""; AGENTLOOP_OPENCODE_BIN=""
+    OPENCODE_BIN=/nonexistent
     CONFIG_DIR="$tmp/sp"
     MODELS_FILE="$tmp/sp/models.json"
     PRICING_FILE="$tmp/sp/pricing.json"
+    PLATFORMS_FILE="$tmp/sp/platforms.json"
+    JOBS_FILE="$tmp/sp/jobs.json"
+    PROJECTS_FILE="$tmp/sp/projects.json"
     TICK_LOG="$tmp/sp/tick.log"
     cp "$BASE_DIR/config/pricing.example.json" "$PRICING_FILE"
+    printf '{"jobs":[]}\n' > "$tmp/sp/jobs.json"
+    printf '{"projects":[]}\n' > "$tmp/sp/projects.json"
+    printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},"openai":{"enabled":true,"bin":"","models":["gpt-5.6-sol"]},"opencode":{"enabled":false,"bin":"","models":[]}}}\n' > "$tmp/sp/platforms.json"
     _upass=0; _ufail=0
     ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
     bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
     resolve_models_openai >/dev/null
     _b="$(status_platforms_block)"
-    printf '%s\n' "$_b" | grep -q '^anthropic : 2.1.0 (Claude Code), account the CLI default' \
-      && ok "status_platforms_block: the Claude line carries the version and the account" \
-      || bad "anthropic line: $(printf '%s\n' "$_b" | head -1)"
-    printf '%s\n' "$_b" | grep -q '^openai    : codex-cli 0.148.0, signed in; catalog [0-9]*m ago (5 models); prices [0-9]*[mhd] ago; unpriced: none$' \
-      && ok "status_platforms_block: the Codex line carries version, sign-in, catalog age and size, price age, unpriced" \
-      || bad "openai line: $(printf '%s\n' "$_b" | tail -1)"
+    printf '%s\n' "$_b" | grep -q '^anthropic : enabled — 2.1.0 (Claude Code), unknown — claude auth status needs Claude Code 2.1+; 1 of 1 models enabled$' \
+      && ok "status_platforms_block: the Claude line carries enabled, version, account and the model count" \
+      || bad "anthropic line: $(printf '%s\n' "$_b" | sed -n 1p)"
+    printf '%s\n' "$_b" | grep -q '^openai    : enabled — codex-cli 0.148.0, Logged in using ChatGPT; 1 of 5 models enabled; catalog [0-9]*m ago (5 models); prices [0-9]*[mhd] ago; unpriced: none$' \
+      && ok "status_platforms_block: the Codex line adds catalog age and size, price age, unpriced" \
+      || bad "openai line: $(printf '%s\n' "$_b" | sed -n 2p)"
+    printf '%s\n' "$_b" | grep -q '^opencode  : planned — opencode not found at /nonexistent — set the path in Settings (or AGENTLOOP_OPENCODE_BIN); install: brew install opencode$' \
+      && ok "status_platforms_block: the planned platform says it is planned, and how to install it" \
+      || bad "opencode line: $(printf '%s\n' "$_b" | sed -n 3p)"
     # The pin the install carries, by either route (the variable; the plist a
     # previous install wrote), never the CLAUDE_CONFIG_DIR of this process.
     _b="$(AGENTLOOP_CLAUDE_CONFIG_DIR=/pinned/home status_platforms_block)"
-    printf '%s\n' "$_b" | grep -q '^anthropic : 2.1.0 (Claude Code), account /pinned/home$' \
-      && ok "status_platforms_block: a pinned account is named" \
-      || bad "pinned anthropic line: $(printf '%s\n' "$_b" | head -1)"
+    printf '%s\n' "$_b" | grep -q '^anthropic : enabled — 2.1.0 (Claude Code), unknown — claude auth status needs Claude Code 2.1+ (in /pinned/home); 1 of 1 models enabled$' \
+      && ok "status_platforms_block: a pinned account directory is named" \
+      || bad "pinned anthropic line: $(printf '%s\n' "$_b" | sed -n 1p)"
     printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
       '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
       '<plist version="1.0"><dict><key>Label</key><string>x</string>' \
       '<key>EnvironmentVariables</key><dict><key>CLAUDE_CONFIG_DIR</key><string>/plist/home</string></dict>' \
       '</dict></plist>' > "$tmp/sp/tick.plist"
     _b="$(PLIST_PATH="$tmp/sp/tick.plist" status_platforms_block)"
-    printf '%s\n' "$_b" | grep -q '^anthropic : 2.1.0 (Claude Code), account /plist/home$' \
+    printf '%s\n' "$_b" | grep -q '(in /plist/home); 1 of 1 models enabled$' \
       && ok "status_platforms_block: the account a previous install wrote into the plist is named" \
-      || bad "plist-pinned anthropic line: $(printf '%s\n' "$_b" | head -1)"
+      || bad "plist-pinned anthropic line: $(printf '%s\n' "$_b" | sed -n 1p)"
     # A table with no stamp at all (hand-written), and one visible slug dropped.
+    # Captured first, never piped straight into grep -q: under pipefail a grep
+    # that stops at its match hands the block a SIGPIPE on the lines still to
+    # come (opencode follows openai), and the pipeline reads as a failure.
     "$JQ" 'del(.openai["gpt-5.4-mini"]) | del(._refreshed_at, ._checked_at)' "$PRICING_FILE" > "$PRICING_FILE.next"; mv "$PRICING_FILE.next" "$PRICING_FILE"
-    status_platforms_block | grep -q 'prices never refreshed; unpriced: gpt-5.4-mini$' \
+    _b="$(status_platforms_block)"
+    printf '%s\n' "$_b" | grep -q 'prices never refreshed; unpriced: gpt-5.4-mini$' \
       && ok "status_platforms_block: an unstamped table says so, and an unpriced visible slug is named" \
-      || bad "after the edit: $(status_platforms_block | tail -1)"
+      || bad "after the edit: $(printf '%s\n' "$_b" | sed -n 2p)"
     _b="$(FAKE_CODEX_LOGGED_OUT=1 status_platforms_block)"
-    printf '%s\n' "$_b" | grep -q '^openai    : codex is not signed in (run: codex login)$' \
+    printf '%s\n' "$_b" | grep -q '^openai    : enabled — codex is not signed in (run: codex login)$' \
       && ok "status_platforms_block: signed out reads as platform_ready's own sentence" \
-      || bad "signed-out line: $(printf '%s\n' "$_b" | tail -1)"
+      || bad "signed-out line: $(printf '%s\n' "$_b" | sed -n 2p)"
     CODEX_BIN=/nonexistent
     _b="$(status_platforms_block)"
-    printf '%s\n' "$_b" | grep -q '^openai    : codex not found at /nonexistent (set AGENTLOOP_CODEX_BIN)$' \
+    printf '%s\n' "$_b" | grep -q '^openai    : enabled — codex not found at /nonexistent — set the path in Settings (or AGENTLOOP_CODEX_BIN); install: npm i -g @openai/codex, then codex login$' \
       && ok "status_platforms_block: no codex reads as not found, never a crash" \
-      || bad "no-codex line: $(printf '%s\n' "$_b" | tail -1)"
+      || bad "no-codex line: $(printf '%s\n' "$_b" | sed -n 2p)"
+    write_platforms '.platforms.anthropic.enabled = false' >/dev/null 2>&1
+    _b="$(status_platforms_block)"
+    printf '%s\n' "$_b" | grep -q '^anthropic : disabled — ' \
+      && ok "status_platforms_block: a platform switched off says disabled" || bad "disabled line: $(printf '%s\n' "$_b" | sed -n 1p)"
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_spout" | grep -v '^RESULT '
-  printf '%s\n' "$_spout" | grep -qx 'RESULT ok=7 bad=0' \
-    && ok "status_platforms_block over the stand-ins: all 7 assertions reach the gate" \
+  printf '%s\n' "$_spout" | grep -qx 'RESULT ok=9 bad=0' \
+    && ok "status_platforms_block over the stand-ins: all 9 assertions reach the gate" \
     || bad "status_platforms_block did not: $(printf '%s\n' "$_spout" | tail -1)"
   got="$(age_label "$(( $(now_epoch) + 600 ))")"
   [ "$got" = "0m ago" ] \
@@ -3593,6 +4329,9 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     > "$tmp/cfg/config/models.json"
   printf '{"jobs":[{"id":"cj","enabled":false,"cwd":"/tmp","prompt":"p","model":"opus","effort":"max","permission_mode":"dontAsk"}]}\n' \
     > "$tmp/cfg/config/jobs.json"
+  "$JQ" -n '{platforms:{anthropic:{enabled:true,bin:"",models:["opus"]},
+                        openai:{enabled:true,bin:"",models:["gpt-a","gpt-b"]},
+                        opencode:{enabled:false,bin:"",models:[]}}}' > "$tmp/cfg/config/platforms.json"
   cfg_al()  { AGENTLOOP_CONFIG="$tmp/cfg/config" AGENTLOOP_DATA="$tmp/cfg/data" AGENTLOOP_CODEX_BIN=/nonexistent "$BIN_DIR/agentloop" "$@"; }
   cfg_job() { "$JQ" -r --arg id "$1" ".jobs[] | select(.id==\$id) | $2" "$tmp/cfg/config/jobs.json"; }
   printf 'gemini' | cfg_al set-field cj platform >/dev/null 2>&1; want "an unknown platform is refused" 1 $?
@@ -3637,6 +4376,62 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     && ok "create under an openai project inherits the platform and takes its defaults" || bad "create under project: $(cfg_job pj '{platform,model,permission_mode}')"
   printf '{"id":"xj","platform":"openai","model":"opus","prompt":"p"}' | cfg_al create >/dev/null 2>&1; want "create refuses a model the platform does not know" 1 $?
   printf '{"id":"ej","platform":"openai","effort":"max","prompt":"p"}' | cfg_al create >/dev/null 2>&1; want "create refuses an effort the model does not offer" 1 $?
+  # the operator's own choice, on top of the CLI's (cj is back on anthropic
+  # after the round trip above: put it on openai first, or the CLI's own
+  # "not an openai model" refusal fires before Settings gets a say)
+  printf 'openai' | cfg_al set-field cj platform >/dev/null 2>&1
+  printf '["gpt-b"]' | cfg_al platform set-models openai >/dev/null 2>&1
+  out="$(printf 'gpt-a' | cfg_al set-field cj model 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && case "$out" in *"model 'gpt-a' is not enabled in Settings — openai enables: gpt-b"*) ok "set-field model refuses a catalog slug switched off in Settings, naming what is on" ;; *) bad "refusal: $out" ;; esac
+  [ "$rc" -eq 0 ] && bad "a switched-off model was accepted"
+  printf '["gpt-a","gpt-b"]' | cfg_al platform set-models openai >/dev/null 2>&1
+  "$JQ" '.platforms.openai.enabled = false' "$tmp/cfg/config/platforms.json" > "$tmp/cfg/pf.next"; mv "$tmp/cfg/pf.next" "$tmp/cfg/config/platforms.json"
+  out="$(printf 'openai' | cfg_al set-field cj platform 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && case "$out" in *"openai is not enabled in Settings — enable it there, or: agentloop platform enable openai"*) ok "set-field platform refuses a platform disabled in Settings" ;; *) bad "refusal: $out" ;; esac
+  printf 'opencode' | cfg_al set-field cj platform >/dev/null 2>&1; want "set-field platform refuses the planned platform" 1 $?
+  printf '{"id":"dj","platform":"openai","prompt":"p"}' | cfg_al create >/dev/null 2>&1; want "create refuses a disabled platform" 1 $?
+  "$JQ" '.platforms.openai.enabled = true' "$tmp/cfg/config/platforms.json" > "$tmp/cfg/pf.next"; mv "$tmp/cfg/pf.next" "$tmp/cfg/config/platforms.json"
+  printf '{"id":"dj","platform":"openai","model":"gpt-b","prompt":"p"}' | cfg_al create >/dev/null 2>&1; want "create accepts an enabled model on an enabled platform" 0 $?
+  printf '["gpt-a"]' | cfg_al platform set-models openai >/dev/null 2>&1
+  printf '{"id":"ej2","platform":"openai","model":"gpt-b","prompt":"p"}' | cfg_al create >/dev/null 2>&1; want "create refuses a model switched off in Settings" 1 $?
+  printf '["gpt-a","gpt-b"]' | cfg_al platform set-models openai >/dev/null 2>&1
+  # The launch-time twin of the create-time gate above: with nothing enabled
+  # for openai, `dj` (model gpt-b, still on openai from the round trip above)
+  # is skipped naming Settings as the cause. cfg_al's AGENTLOOP_CODEX_BIN
+  # points nowhere, so a gate that failed to fire here would fall through to
+  # the CLI readiness check instead and log "not ready" -- proving this gate
+  # runs before that one, not just that SOME refusal happened.
+  printf '[]' | cfg_al platform set-models openai >/dev/null 2>&1
+  : > "$tmp/cfg/data/tick.log"
+  cfg_al run dj >/dev/null 2>&1
+  grep -q "dj: no model is enabled for openai in Settings, skipped" "$tmp/cfg/data/tick.log" \
+    && ok "run: no model enabled on openai is skipped naming Settings, not codex readiness" \
+    || bad "tick.log: $(cat "$tmp/cfg/data/tick.log" 2>/dev/null)"
+  printf '["gpt-a","gpt-b"]' | cfg_al platform set-models openai >/dev/null 2>&1
+  printf '{"name":"np","platform":"openai","security":{"enabled":true,"model":"gpt-zzz"}}' | cfg_al project-set >/dev/null 2>&1; want "project-set refuses a security model that is not enabled" 1 $?
+  printf '{"name":"np","platform":"openai","security":{"enabled":true,"platform":"anthropic","model":"opus"}}' | cfg_al project-set >/dev/null 2>&1; want "project-set accepts an enabled security model on the block's own platform" 0 $?
+  "$JQ" '.platforms.anthropic.models = []' "$tmp/cfg/config/platforms.json" > "$tmp/cfg/pf.next"; mv "$tmp/cfg/pf.next" "$tmp/cfg/config/platforms.json"
+  printf '{"name":"np2","platform":"anthropic"}' | cfg_al project-set >/dev/null 2>&1; want "project-set refuses a platform that is enabled but has no model switched on" 1 $?
+  # The inherit case of set-field platform: cj (openai, gpt-a, no project)
+  # would inherit anthropic, which has nothing switched on right now -- the
+  # rewrite has no default to land on, so it is refused before anything is
+  # written, never a job whose model is the empty string.
+  out="$(printf '' | cfg_al set-field cj platform 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    case "$out" in
+      *"no model is enabled for anthropic in Settings — switch one on there first"*)
+        [ "$(cfg_job cj .platform)" = "openai" ] && [ "$(cfg_job cj .model)" = "gpt-a" ] \
+          && ok "set-field platform '' refuses to inherit a platform with no model on, and writes nothing" \
+          || bad "refused, but the job was touched: $(cfg_job cj '{platform,model}')" ;;
+      *) bad "inherit refusal text: $out" ;;
+    esac
+  else
+    bad "inheriting a platform with no model on was accepted: $(cfg_job cj '{platform,model}')"
+  fi
+  "$JQ" '.platforms.anthropic.models = ["opus"]' "$tmp/cfg/config/platforms.json" > "$tmp/cfg/pf.next"; mv "$tmp/cfg/pf.next" "$tmp/cfg/config/platforms.json"
+  [ "$( PLATFORMS_FILE="$tmp/cfg/config/platforms.json"; platform_default_model openai )" = "gpt-a" ] \
+    && ok "platform_default_model is the first model switched on" || bad "default: $( PLATFORMS_FILE="$tmp/cfg/config/platforms.json"; platform_default_model openai )"
+  [ -z "$( PLATFORMS_FILE="$tmp/cfg/config/platforms.json"; platform_default_model opencode )" ] && ok "and nothing for a platform with none" || bad "opencode default not empty"
 
   # project-set is the only door a project's platform is written through;
   # refuse an unknown one there, before any write -- the alternative
@@ -3698,10 +4493,15 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
 {"projects":[
  {"name":"Oa","cwd":"/tmp/oa","security":{"enabled":true,"platform":"openai","model":"gpt-zzz","effort":"max","permission_mode":"dontAsk"}},
  {"name":"Ob","cwd":"/tmp/ob","platform":"openai","security":{"enabled":true,"model":"gpt-b","effort":"high"}},
- {"name":"Oc","cwd":"/tmp/oc","security":{"enabled":true,"platform":"martian"}}]}
+ {"name":"Oc","cwd":"/tmp/oc","security":{"enabled":true,"platform":"martian"}},
+ {"name":"Oe","cwd":"/tmp/oe","security":{"enabled":true,"model":"claude-sonnet-5"}}]}
 JSON
   printf '{"jobs":[]}\n' > "$tmp/dplat/jobs.json"
+  "$JQ" -n '{platforms:{anthropic:{enabled:true,bin:"",models:["opus"]},
+                        openai:{enabled:true,bin:"",models:["gpt-a","gpt-b"]},
+                        opencode:{enabled:false,bin:"",models:[]}}}' > "$tmp/dplat/platforms.json"
   dplat() { ( JOBS_FILE="$tmp/dplat/jobs.json"; PROJECTS_FILE="$tmp/dplat/projects.json"; DATA_DIR="$tmp/dplat/data"
+              PLATFORMS_FILE="$tmp/dplat/platforms.json"
               MODELS_FILE="$tmp/cfg/config/models.json"; job_get "$1" "$2" '' ); }
   [ "$(dplat security-oa .platform)" = "openai" ] && ok "security.platform reaches the derived job" || bad "platform $(dplat security-oa .platform)"
   [ "$(dplat security-oa .model)" = "gpt-a" ] && ok "a model the platform does not know falls back to its default" || bad "model $(dplat security-oa .model)"
@@ -3717,6 +4517,9 @@ JSON
     && ok "the derived job on an openai PROJECT carries the subagent ban" || bad "Ob prompt lacks the ban"
   dplat security-oc .prompt | grep -qF 'Invoke the `security-analysis` skill' \
     && ok "the derived job that fell back to anthropic carries the by-name prompt" || bad "Oc prompt head: $(dplat security-oc .prompt | head -1)"
+  [ "$(dplat security-oe .model)" = "opus" ] && ok "a model switched off in Settings falls back to the first one switched on" || bad "Oe model $(dplat security-oe .model)"
+  grep -q "not enabled in Settings ('claude-sonnet-5' on anthropic) -- using opus" "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null \
+    && ok "and the derivation warning says so" || bad "no warning for Oe: $(cat "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null)"
 
   # openai with no catalog resolved yet: platform_default_model answers
   # nothing for it, so the model must come out empty rather than some other
@@ -3727,7 +4530,10 @@ JSON
 {"projects":[{"name":"Od","cwd":"/tmp/od","security":{"enabled":true,"platform":"openai"}}]}
 JSON
   printf '{"jobs":[]}\n' > "$tmp/dnocat/jobs.json"
+  # openai switched on with no model: the derived model has to stay empty
+  printf '{"platforms":{"openai":{"enabled":true,"bin":"","models":[]}}}\n' > "$tmp/dnocat/platforms.json"
   dnocat() { ( JOBS_FILE="$tmp/dnocat/jobs.json"; PROJECTS_FILE="$tmp/dnocat/projects.json"; DATA_DIR="$tmp/dnocat/data"
+               PLATFORMS_FILE="$tmp/dnocat/platforms.json"
                MODELS_FILE="$tmp/dnocat/no-such-models.json"; job_get "$1" "$2" '' ); }
   [ -z "$(dnocat security-od .model)" ] \
     && ok "openai with no catalog resolved yet: the derived job's model is empty, not a broken slug" \
@@ -3736,6 +4542,32 @@ JSON
   case "$warn" in
     *"no OpenAI catalog is resolved yet"*"resolve-models openai"*)
       ok "and the warning names the missing catalog and the refresh command" ;;
+    *) bad "warning: $warn" ;;
+  esac
+
+  # A project with no model at all on anthropic -- sdefault comes out empty
+  # here too, but there is no catalog to blame it on (only openai has one):
+  # the warning must name anthropic and "no model is enabled", never send the
+  # operator to refresh a catalog that was never the problem. A separate
+  # scratch dir/fixture, like dnocat's own, so dplat and dnocat keep their
+  # values.
+  mkdir -p "$tmp/dnomodel/data"
+  cat > "$tmp/dnomodel/projects.json" <<'JSON'
+{"projects":[{"name":"Of","cwd":"/tmp/of","security":{"enabled":true}}]}
+JSON
+  printf '{"jobs":[]}\n' > "$tmp/dnomodel/jobs.json"
+  printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":[]}}}\n' > "$tmp/dnomodel/platforms.json"
+  dnomodel() { ( JOBS_FILE="$tmp/dnomodel/jobs.json"; PROJECTS_FILE="$tmp/dnomodel/projects.json"; DATA_DIR="$tmp/dnomodel/data"
+                 PLATFORMS_FILE="$tmp/dnomodel/platforms.json"
+                 MODELS_FILE="$tmp/dnomodel/no-such-models.json"; job_get "$1" "$2" '' ); }
+  [ -z "$(dnomodel security-of .model)" ] \
+    && ok "anthropic with no model enabled: the derived job's model is empty too" \
+    || bad "model '$(dnomodel security-of .model)'"
+  warn="$(cat "$tmp/dnomodel/data/security/derivation-warnings.txt" 2>/dev/null)"
+  case "$warn" in
+    *"resolve-models"*) bad "warning sent anthropic to refresh an OpenAI catalog: $warn" ;;
+    *"project 'Of' runs on anthropic but no model is enabled for it in Settings"*)
+      ok "and the warning names anthropic and the real cause, not a catalog" ;;
     *) bad "warning: $warn" ;;
   esac
 
@@ -5494,6 +6326,9 @@ NASTY
   [ "$(size_of "$_real_exec")" = "$_exec0" ] \
     && ok "the real exec.log is byte-identical after the suite" \
     || bad "the suite appended to the real exec.log ($_exec0 -> $(size_of "$_real_exec") bytes)"
+  [ "$(stat -f %m "$_real_pf" 2>/dev/null || echo none)" = "$_pf0" ] \
+    && ok "the suite never touched the real config/platforms.json" \
+    || bad "the suite created or rewrote $_real_pf"
 
   echo "log_rotate() — a log that grows without bound is capped, never lost"
   printf 'old line\n' > "$tmp/r.log"
@@ -7130,6 +7965,10 @@ SH
  {"id":"argv-plain","enabled":false,"cwd":"$argvdir/work","prompt":"PROMPT-SENTINEL",
   "permission_mode":"bypassPermissions"}]}
 JSON
+  # What Settings switched on for these launches. Explicit: the seed would
+  # find three disabled jobs, enable nothing, and every run below would be
+  # refused at the platform gate before a launch line ever existed.
+  printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["opus"]}}}\n' > "$argvdir/config/platforms.json"
   st_argv_run() { # st_argv_run <job-id> -- the recorded argv of one real launch
     rm -f "$argvdir/out"
     AGENTLOOP_CONFIG="$argvdir/config" AGENTLOOP_DATA="$argvdir/data" \
@@ -7140,7 +7979,7 @@ JSON
   st_argv_idx() { printf '%s\n' "$1" | awk -F'\t' -v w="$2" '$2==w {print $1; exit}'; }
   st_argv_at()  { printf '%s\n' "$1" | awk -F'\t' -v i="$2" '$1==i {print $2; exit}'; }
   st_argv_argc() { printf '%s\n' "$1" | awk -F'\t' '$1=="ARGC" {print $2; exit}'; }
-  local av_deny av_both av_plain di ai mi
+  local av_deny av_both av_plain av_filebin di ai mi
   av_deny="$(st_argv_run argv-deny)"
   di="$(st_argv_idx "$av_deny" '--disallowedTools')"
   ( [ -n "$di" ] && [ "$(st_argv_at "$av_deny" "$((di + 1))")" = "Agent" ] ) \
@@ -7185,6 +8024,24 @@ JSON
   ( [ -n "$mi" ] && [ "$((mi + 1))" = "$(st_argv_argc "$av_plain")" ] ) \
     && ok "and -- is there regardless, so the prompt is guarded with or without a tool flag" \
     || bad "-- is emitted only alongside a tool flag — the guard is conditional, and one day it will be missing"
+
+  # The gate and the launch must agree on the binary. Same recording
+  # stand-in, but no AGENTLOOP_CLAUDE_BIN this time: config/platforms.json's
+  # own `bin` is the only route to it, so a recorded PROMPT-SENTINEL argument
+  # can only have come from the real launch -- platform_check's own
+  # --version/auth-status probes write the same file, but never the prompt.
+  printf '{"platforms":{"anthropic":{"enabled":true,"bin":"%s","models":["opus"]}}}\n' \
+    "$argvdir/claude" > "$argvdir/config/platforms.json"
+  rm -f "$argvdir/out"
+  AGENTLOOP_CONFIG="$argvdir/config" AGENTLOOP_DATA="$argvdir/data" \
+    AGENTLOOP_CLAUDE_BIN="" AL_ARGV_OUT="$argvdir/out" \
+    "$BIN_DIR/agentloop" run argv-plain >/dev/null 2>&1
+  av_filebin="$(cat "$argvdir/out" 2>/dev/null)"
+  mi="$(st_argv_idx "$av_filebin" '--')"
+  ( [ -n "$mi" ] && [ "$((mi + 1))" = "$(st_argv_argc "$av_filebin")" ] \
+    && case "$(st_argv_at "$av_filebin" "$((mi + 1))")" in PROMPT-SENTINEL*) true ;; *) false ;; esac ) \
+    && ok "run_job launches config/platforms.json's own bin, the same one platform_ready checked" \
+    || bad "the launch never reached the file's bin — no launch argv reached the recorder: $av_filebin"
 
   # The prompt explains the absence. It does not enforce it (the flag does),
   # but an agent that finds a tool missing with no reason given wastes turns
@@ -7745,6 +8602,7 @@ EOF
               "worktree":{"enabled":true}}]}
 JSON
   printf '{"jobs":[]}\n' > "$sec/cfg/jobs.json"
+  printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},"openai":{"enabled":false,"bin":"","models":[]},"opencode":{"enabled":false,"bin":"","models":[]}}}\n' > "$sec/cfg/platforms.json"
   secjid="$(security_job_id "Sec App")"
   secdb="$sec/security.db"
   # Everything below runs against this scratch ledger, never the operator's.
@@ -7752,6 +8610,7 @@ JSON
   # exists to make impossible (see security_db).
   sec_env() {
     PROJECTS_FILE="$sec/cfg/projects.json"; JOBS_FILE="$sec/cfg/jobs.json"
+    PLATFORMS_FILE="$sec/cfg/platforms.json"
     CONFIG_DIR="$sec/cfg"; DATA_DIR="$sec/data"; LOCK_DIR="$sec/data/locks"
     TICK_LOG="$sec/data/tick.log"; RUNS_FILE="$sec/data/runs.ndjson"
     AGENTLOOP_SECURITY_DB="$secdb"
@@ -8044,42 +8903,40 @@ JSON
     && ok "a success-close of an analysis whose deterministic phases never ran lands capped, and says so" \
     || bad "engine close of an unprepared analysis -> $secnoprep (want capped,true)"
 
-  echo "claude_config_dir — an analysis signs in as the account its security block names"
-  # The derived job is the ONLY place an analysis can carry a config dir: there
-  # is no jobs.json row to edit, so security_derived_jobs puts the security
-  # block's value on the job it builds. run_job read only the PROJECT's, so the
-  # setting was inert -- an operator who pointed the analysis at a different
-  # Claude account (a client login for client code) got no error and no effect,
-  # and the analysis quietly signed in as the project's account instead.
+  echo "claude_config_dir — no longer a project's or a block's to set: ignored, and said"
   local ccd="$tmp/ccd" ccdjid ccdbody
   mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/proj-account" "$ccd/sec-account"
   cat > "$ccd/cfg/projects.json" <<JSON
 {"projects":[{"name":"Ccd App","cwd":"$ccd","claude_config_dir":"$ccd/proj-account",
-              "security":{"enabled":true,"claude_config_dir":"$ccd/sec-account"}}]}
+              "security":{"enabled":true,"model":"claude-opus-5","claude_config_dir":"$ccd/sec-account"}}]}
 JSON
   cat > "$ccd/cfg/jobs.json" <<JSON
 {"jobs":[{"id":"ccd-plain","project":"Ccd App","prompt":"x","enabled":false}]}
 JSON
+  printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]}}}\n' > "$ccd/cfg/platforms.json"
   ccd_env() {
-    PROJECTS_FILE="$ccd/cfg/projects.json"; JOBS_FILE="$ccd/cfg/jobs.json"
+    PROJECTS_FILE="$ccd/cfg/projects.json"; JOBS_FILE="$ccd/cfg/jobs.json"; PLATFORMS_FILE="$ccd/cfg/platforms.json"
     DATA_DIR="$ccd/data"
   }
   ccdjid="$(security_job_id "Ccd App")"
-  [ "$( ( ccd_env; resolve "$ccdjid" claude_config_dir '' ) )" = "$ccd/sec-account" ] \
-    && ok "the derived job resolves the config dir its security block names" \
-    || bad "derived cfgdir -> '$( ( ccd_env; resolve "$ccdjid" claude_config_dir '' ) )' (want $ccd/sec-account)"
-  [ "$( ( ccd_env; resolve ccd-plain claude_config_dir '' ) )" = "$ccd/proj-account" ] \
-    && ok "and a plain job of the same project still inherits the project's" \
-    || bad "plain cfgdir -> '$( ( ccd_env; resolve ccd-plain claude_config_dir '' ) )' (want $ccd/proj-account)"
-  # Structural, because the two assertions above exercise `resolve` and run_job
-  # is what has to CALL it: reverting that one line would leave both green.
+  [ -z "$( ( ccd_env; job_get "$ccdjid" '.claude_config_dir' '' ) )" ] \
+    && ok "the derived security job no longer carries the block's claude_config_dir" \
+    || bad "derived job carries '$( ( ccd_env; job_get "$ccdjid" '.claude_config_dir' '' ) )'"
   ccdbody="$(sed -n '/^run_job() { # run_job <id>/,/^}/p' "$BIN_DIR/agentloop")"
   case "$ccdbody" in
-    *'run_cfgdir="$(resolve "$id" claude_config_dir'*)
-      ok "run_job reads the config dir through resolve, so the job's own value wins" ;;
-    *)
-      bad "run_job no longer resolves claude_config_dir through resolve() — a derived job's value is inert again" ;;
+    *'resolve "$id" claude_config_dir'*) bad "run_job still resolves claude_config_dir from the job or the project" ;;
+    *) ok "run_job no longer reads a per-project account: the install's pin is the only one" ;;
   esac
+  got="$( ( ccd_env; legacy_config_dir_warning ) )"
+  case "$got" in
+    *"WARNING: projects.json: claude_config_dir on Ccd App is ignored since this version — the account is the platform's, see Settings"*)
+      ok "status and install warn about a projects.json that still carries the field" ;;
+    *) bad "warning: '$got'" ;;
+  esac
+  got="$( printf '{"name":"Ccd App","claude_config_dir":"/x","security":{"enabled":true,"claude_config_dir":"/y"}}' | ( ccd_env; cmd_project_set ) 2>&1 )"
+  case "$got" in *"note: claude_config_dir is ignored since this version"*) ok "project-set drops the field and says so" ;; *) bad "project-set: $got" ;; esac
+  "$JQ" -e '.projects[0] | (has("claude_config_dir") | not) and ((.security | has("claude_config_dir")) | not)' "$ccd/cfg/projects.json" >/dev/null 2>&1 \
+    && ok "and the saved project carries the field at neither level" || bad "saved: $("$JQ" -c '.projects[0]' "$ccd/cfg/projects.json")"
 
   # The close used to overwrite the row unconditionally, which turned the one
   # honest thing an agent can say about its own run -- "I ran out of room" --
@@ -8547,15 +9404,28 @@ cmd_resolve_models() { # cmd_resolve_models [anthropic|openai] -- no argument do
   return "$rc"
 }
 
-cmd_platforms() { # one JSON object: what each platform offers and whether it is ready
-  local p ready reason perms efforts dm dp cat_at cat_ok pr_at pr_ck pr_src unpriced
-  for p in $PLATFORMS; do
-    if reason="$(platform_ready "$p")"; then ready=true; reason=""; else ready=false; fi
-    perms="$(platform_permissions "$p" | "$JQ" -R . | "$JQ" -sc .)"
-    if [ "$p" = "openai" ]; then efforts="$(openai_catalog_all_efforts | "$JQ" -R . | "$JQ" -sc .)"; else efforts="$(platform_efforts "$p" | "$JQ" -R . | "$JQ" -sc .)"; fi
-    dm="$(platform_default_model "$p")"; dp="$(platform_default_permission "$p" job)"
-    cat_at=0; cat_ok=false
-    pr_at=0; pr_ck=0; pr_src=""; unpriced="[]"
+cmd_platforms() { # one JSON object: what each listed platform offers, whether it is ready, and what the operator enabled
+  local p j ready reason perms efforts dm dp cat_at cat_ok pr_at pr_ck pr_src unpriced supported enabled usable bin src found men jon jus err
+  for p in $PLATFORMS $PLATFORMS_PLANNED; do
+    j="$(platform_check "$p")"
+    ready="$(printf '%s' "$j" | "$JQ" -r .ready)"; reason="$(printf '%s' "$j" | "$JQ" -r .reason)"
+    supported="$(printf '%s' "$j" | "$JQ" -r .supported)"; bin="$(printf '%s' "$j" | "$JQ" -r .bin)"
+    src="$(printf '%s' "$j" | "$JQ" -r .bin_source)"; found="$(printf '%s' "$j" | "$JQ" -r .bin_found)"
+    [ "$ready" = "true" ] && reason=""
+    if platform_known "$p"; then
+      perms="$(platform_permissions "$p" | "$JQ" -R . | "$JQ" -sc .)"
+      if [ "$p" = "openai" ]; then efforts="$(openai_catalog_all_efforts | "$JQ" -R . | "$JQ" -sc .)"; else efforts="$(platform_efforts "$p" | "$JQ" -R . | "$JQ" -sc .)"; fi
+      dm="$(platform_default_model "$p")"; dp="$(platform_default_permission "$p" job)"
+    else
+      perms='[]'; efforts='[]'; dm=""; dp=""
+    fi
+    if platform_enabled "$p"; then enabled=true; else enabled=false; fi
+    if platform_usable "$p"; then usable=true; else usable=false; fi
+    men="$(platform_models_enabled "$p" | "$JQ" -R . | "$JQ" -sc .)"
+    jon="$(num "$(platform_jobs_on "$p" | grep -c . 2>/dev/null)")"
+    jus="$(platforms_jq "$(platform_default_model anthropic)" "$(platform_default_model openai)" \
+             '[uses[] | select(.p == $p) | select(.m != "")] | group_by(.m) | map({key: .[0].m, value: length}) | from_entries' -c --arg p "$p")"
+    cat_at=0; cat_ok=false; pr_at=0; pr_ck=0; pr_src=""; unpriced="[]"
     if [ "$p" = "openai" ]; then
       cat_at="$(num "$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)")"
       openai_catalog_available && cat_ok=true
@@ -8569,14 +9439,21 @@ cmd_platforms() { # one JSON object: what each platform offers and whether it is
     fi
     "$JQ" -nc --arg p "$p" --argjson ready "$ready" --arg reason "$reason" \
       --argjson perms "$perms" --argjson efforts "$efforts" --arg dm "$dm" --arg dp "$dp" \
+      --argjson supported "$supported" --argjson enabled "$enabled" --argjson usable "$usable" \
+      --arg bin "$bin" --arg src "$src" --argjson found "$found" --argjson men "$men" --argjson jon "$jon" --argjson jus "$jus" \
       --argjson cat_at "$cat_at" --argjson cat_ok "$cat_ok" \
       --argjson pr_at "$pr_at" --argjson pr_ck "$pr_ck" --arg pr_src "$pr_src" --argjson unpriced "$unpriced" \
       '{($p): ({ready:$ready, reason:$reason, permissions:$perms, efforts:$efforts,
-                default_model:$dm, default_permission:$dp}
+                default_model:$dm, default_permission:$dp,
+                supported:$supported, enabled:$enabled, usable:$usable, bin:$bin, bin_source:$src, bin_found:$found,
+                models_enabled:$men, jobs_on_platform:$jon, jobs_using:$jus}
                + (if $p == "openai" then {catalog_at:$cat_at, catalog_available:$cat_ok,
                                           pricing_at:$pr_at, pricing_checked_at:$pr_ck,
                                           pricing_source:$pr_src, unpriced:$unpriced} else {} end))}'
-  done | "$JQ" -sc 'add'
+  done | "$JQ" -sc 'add' | {
+    err="$(platforms_error)"
+    if [ -n "$err" ]; then "$JQ" -c --arg e "$err" '. + {_error: $e}'; else cat; fi
+  }
 }
 
 # What a run that delivered nothing tells the operator. Split out of the
@@ -8624,29 +9501,12 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   local platform
   platform="$(resolve "$id" platform 'anthropic')"
   case "$platform" in ''|null) platform="anthropic" ;; esac
-  # Which account this run signs in as. A project pins one when its work belongs
-  # to a different Claude login than the scheduler's default — a company account
-  # for client work, a personal one for your own repos. It carries far more than
-  # billing: the config dir holds that account's settings, plugins, MCP servers
-  # AND its past sessions, so it must stay stable for a job or `--resume` below
-  # would go looking for the session in the other account's directory.
-  #
-  # THE JOB'S OWN VALUE FIRST, through the same `resolve` every other inherited
-  # field uses. Only the PROJECT's was read, which made the security block's
-  # `claude_config_dir` inert: `security_derived_jobs` puts it on the derived
-  # job (the job is the only place a derived analysis has to carry it — there
-  # is no jobs.json row to edit), and run_job then read straight past it and
-  # signed the analysis in as the project's account. An operator who set it
-  # precisely so the analysis would sign in as somebody else got no error and
-  # no effect.
-  #
-  # Nothing changes for a real job: `claude_config_dir` is not a field one can
-  # have. It is absent from config/jobs.example.json, it is not in
-  # `cmd_set_field`'s allowlist, and the dashboard's job editor never writes it
-  # — only the project editor and the project's security block do.
-  run_cfgdir="$(resolve "$id" claude_config_dir '')"
-  case "$run_cfgdir" in null) run_cfgdir="" ;; esac
-  run_cfgdir="$(expand_home "$run_cfgdir")"
+  # Which account this run signs in as: the install's pin, exported as
+  # CLAUDE_CONFIG_DIR at load time, and nothing else -- a project's or a
+  # security block's own claude_config_dir was removed in this version; the
+  # account is the platform's, shown in Settings. Empty here: the two readers
+  # below (the precheck's env, run_env) then leave the exported variable alone.
+  run_cfgdir=""
   # cwd, model, permission, budget and timeout inherit from the project when the
   # job doesn't set them (see resolve()).
   cwd="$(resolve "$id" cwd "$HOME")"
@@ -8705,20 +9565,34 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   [ -d "$cwd" ] || { log_tick "$id: cwd missing ($cwd), skipped"; return 1; }
   local _inert; _inert="$(permission_inert_warning "$platform" "$permission" "$allowed")"
   [ -z "$_inert" ] || log_tick "$id: $_inert"
-  # Refuse rather than let the CLI create the directory and find no credentials
-  # in it: that spends a launch to fail at the login prompt, and every later run
-  # would fail the same way with nothing saying why.
-  [ -z "$run_cfgdir" ] || [ -d "$run_cfgdir" ] || {
-    log_tick "$id: claude_config_dir missing ($run_cfgdir), skipped"; return 1; }
 
   # A run that cannot start is refused HERE, before a slot, a precheck or a
   # turn is spent, with the reason in tick.log -- the treatment `cwd missing`
   # gets. Each of these would otherwise fail at launch with nothing saying why.
   local not_ready
+  # The operator's own gates, before the CLI's: a planned platform, a
+  # platform switched off in Settings, nothing switched on to run it with.
+  # Each is one line before a slot is spent, the treatment `cwd missing` gets.
+  if platform_planned "$platform"; then
+    log_tick "$id: $platform is not supported yet — it arrives with the OpenCode engine, skipped"; return 1
+  fi
   platform_known "$platform" || { log_tick "$id: unknown platform '$platform', skipped"; return 1; }
+  platform_enabled "$platform" || { log_tick "$id: $platform is disabled in Settings (agentloop platform enable $platform), skipped"; return 1; }
+  # Still an operator gate, ahead of the CLI's own readiness check right below
+  # and the OpenAI block's catalog check further down: with nothing enabled,
+  # $model is empty, and the catalog check would otherwise refuse it with a
+  # misleading "not in the OpenAI catalog" message instead of naming the real
+  # cause.
+  if [ -z "$(platform_models_enabled "$platform" | head -1)" ]; then
+    log_tick "$id: no model is enabled for $platform in Settings, skipped"; return 1
+  fi
   if ! not_ready="$(platform_ready "$platform")"; then
     log_tick "$id: $platform is not ready ($not_ready), skipped"; return 1
   fi
+  # Resolved once, after the gate, so the binary that was checked is the
+  # binary that launches -- the env override, the file's own bin, or
+  # detection, in that order.
+  local cli_bin; cli_bin="$(platform_bin "$platform")"
   if [ "$platform" = "openai" ]; then
     [ "$interactive" != "true" ] \
       || { log_tick "$id: interactive is not available on openai (codex exec has no stdin protocol), skipped"; return 1; }
@@ -8735,6 +9609,12 @@ run_job() { # run_job <id> [--force] [resume-session-id]
       || log_tick "$id: allowed_tools is ignored on openai (codex has no tool allowlist)"
     [ -z "$disallowed" ] || [ "$disallowed" = "null" ] \
       || log_tick "$id: disallowed_tools is ignored on openai (codex cannot close a tool by flag)"
+  fi
+  # After the catalog: a model the CLI knows, but not the one Settings
+  # enabled (the enabled list is never empty here -- the gate above already
+  # refused that case).
+  if ! platform_model_enabled "$platform" "$model"; then
+    log_tick "$id: model '$model' is not enabled in Settings — $platform enables: $(platform_models_enabled_line "$platform"), skipped"; return 1
   fi
 
   # A resume continues the session of the run that was cut short, on the
@@ -9281,7 +10161,7 @@ If the work turns out to be already finished, or it can no longer be done at all
       "$(openai_writable_roots "$run_cwd" "$run_dir")"
     (
       cd "$run_cwd" || exit 1
-      exec env ${run_env[@]+"${run_env[@]}"} "$CODEX_BIN" ${PLATFORM_ARGV[@]+"${PLATFORM_ARGV[@]}"} \
+      exec env ${run_env[@]+"${run_env[@]}"} "$cli_bin" ${PLATFORM_ARGV[@]+"${PLATFORM_ARGV[@]}"} \
         > "$rawfifo" 2> "$logfile.err" < /dev/null
     ) &
     cli_pid=$!
@@ -9305,7 +10185,7 @@ If the work turns out to be already finished, or it can no longer be done at all
       # day someone hands this one a positional argument the guard is already
       # there. Confirmed harmless on CLI 2.1.258: a `--` with nothing after it
       # parses to no operands at all, and the run starts normally.
-      env ${run_env[@]+"${run_env[@]}"} "$CLAUDE_BIN" $args \
+      env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
         ${toolargs[@]+"${toolargs[@]}"} -- < "$fifo" > "$streamfile" 2> "$logfile.err"
     ) &
   else
@@ -9315,7 +10195,7 @@ If the work turns out to be already finished, or it can no longer be done at all
       # costs nothing when there is no option to terminate, and it is what
       # keeps the prompt a positional of its own rather than the tail of a
       # variadic option's value list. See the toolargs note above.
-      env ${run_env[@]+"${run_env[@]}"} "$CLAUDE_BIN" $args \
+      env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
         ${toolargs[@]+"${toolargs[@]}"} -- "$prompt" > "$streamfile" 2> "$logfile.err"
     ) &
   fi
@@ -9889,6 +10769,10 @@ cmd_tick() {
   # and doing it per log line would cost a wc(1) per line instead of two a tick.
   log_rotate "$TICK_LOG"
   log_rotate "$DATA_DIR/exec.log"
+  # An unreadable platforms file switches every platform off (platforms_json);
+  # say so once per tick rather than once per job, in the words the dashboard shows.
+  local _perr; _perr="$(platforms_error)"
+  [ -z "$_perr" ] || log_tick "config: $_perr"
   # Reap worktrees left by runs that died without cleaning up (safe teardown:
   # a session is kept unless it declared how it ended AND left nothing
   # undelivered — see the .ended write in run_job).
@@ -10136,6 +11020,7 @@ PLIST
   legacy_env_warnings
   legacy_scripts_warnings
   statusline_path_warning
+  legacy_config_dir_warning
 }
 
 cmd_uninstall() {
@@ -10158,40 +11043,50 @@ age_label() { # age_label <epoch> [zero-label]
   else                          printf '%sd ago' "$(( d / 86400 ))"; fi
 }
 
-# The two CLIs, one line each: version and readiness (platform_ready's own
-# sentence when not ready), for Claude the account the install pinned, and for
-# Codex the age of the catalog and of the price table plus the visible slugs
-# still unpriced -- the facts a "why did my openai job not run" question needs,
+# Every listed platform, one line each: whether Settings switched it on, the
+# CLI's version and readiness (platform_check's own sentence when not ready),
+# the account it signs in as, how many of its models are switched on -- and
+# for Codex the age of the catalog and of the price table plus the visible
+# slugs still unpriced: the facts a "why did my job not run" question needs,
 # printed where people already look (`agentloop status`, the end of
 # `agentloop install`).
-status_platforms_block() {
-  local bin ver reason acct n u
-  bin="$(platform_bin anthropic)"
-  if reason="$(platform_ready anthropic)"; then
-    ver="$("$bin" --version 2>/dev/null | head -1)"
+status_platforms_block() { # one line per listed platform: enabled or not, version, account, models switched on; the Codex facts a refused run needs
+  local p j ready ver acct reason state n_on n_all cfg mid fcid
+  for p in $PLATFORMS $PLATFORMS_PLANNED; do
+    j="$(platform_check "$p")"
+    ready="$(printf '%s' "$j" | "$JQ" -r .ready)"; ver="$(printf '%s' "$j" | "$JQ" -r .version)"
+    acct="$(printf '%s' "$j" | "$JQ" -r .account)"; reason="$(printf '%s' "$j" | "$JQ" -r .reason)"
+    if platform_planned "$p"; then printf '%-9s : planned — %s\n' "$p" "$reason"; continue; fi
+    if platform_enabled "$p"; then state=enabled; else state=disabled; fi
+    if [ "$ready" != "true" ]; then printf '%-9s : %s — %s\n' "$p" "$state" "$reason"; continue; fi
+    n_on="$(num "$(platform_models_enabled "$p" | grep -c . 2>/dev/null)")"
+    # A listed family (platforms.json can still carry a bare "opus", not yet
+    # resolved to an id) is folded to the id the cache holds for it before the
+    # union with the catalog -- unfolded, the family and the id the catalog
+    # already lists count as two, one more than the catalog actually has.
+    n_all="$(num "$({ platform_catalog_ids "$p"
+                       platform_models_enabled "$p" | while IFS= read -r mid; do
+                         fcid="$(family_cached_id "$mid")"
+                         printf '%s\n' "${fcid:-$mid}"
+                       done; } | sort -u | grep -c . 2>/dev/null)")"
     # The pin the INSTALL carries (the variable, then the plist), not this
     # process's CLAUDE_CONFIG_DIR: `agentloop status` typed in a plain shell
     # has none, and would call a pinned install the CLI default.
-    acct="$(installed_config_dir)"
-    printf 'anthropic : %s, account %s\n' "${ver:-claude}" "${acct:-the CLI default (~/.claude)}"
-  else
-    printf 'anthropic : %s\n' "$reason"
-  fi
-  bin="$(platform_bin openai)"
-  if reason="$(platform_ready openai)"; then
-    ver="$("$bin" --version 2>/dev/null | head -1)"
-    n="$(openai_catalog_visible 2>/dev/null | grep -c . || true)"
-    # Empty when every visible slug is priced -- sed sees no line at all then,
-    # so the "none" is the parameter expansion's, not a substitution's.
-    u="$(pricing_unpriced | tr '\n' ' ' | sed 's/ *$//')"
-    printf 'openai    : %s, signed in; catalog %s (%s models); prices %s; unpriced: %s\n' \
-      "${ver:-codex}" \
-      "$(age_label "$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)")" "${n:-0}" \
-      "$(age_label "$("$JQ" -r '._checked_at // ._refreshed_at // 0' "$PRICING_FILE" 2>/dev/null)" 'never refreshed')" \
-      "${u:-none}"
-  else
-    printf 'openai    : %s\n' "$reason"
-  fi
+    if [ "$p" = "anthropic" ]; then cfg="$(installed_config_dir)"; [ -z "$cfg" ] || acct="$acct (in $cfg)"; fi
+    printf '%-9s : %s — %s, %s; %s of %s models enabled' "$p" "$state" "${ver:-$(platform_cli_name "$p")}" "$acct" "$n_on" "$n_all"
+    if [ "$p" = "openai" ]; then
+      local n u
+      n="$(openai_catalog_visible 2>/dev/null | grep -c . || true)"
+      # Empty when every visible slug is priced -- sed sees no line at all then,
+      # so the "none" is the parameter expansion's, not a substitution's.
+      u="$(pricing_unpriced | tr '\n' ' ' | sed 's/ *$//')"
+      printf '; catalog %s (%s models); prices %s; unpriced: %s' \
+        "$(age_label "$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)")" "${n:-0}" \
+        "$(age_label "$("$JQ" -r '._checked_at // ._refreshed_at // 0' "$PRICING_FILE" 2>/dev/null)" 'never refreshed')" \
+        "${u:-none}"
+    fi
+    printf '\n'
+  done
 }
 
 cmd_status() {
@@ -10203,6 +11098,7 @@ cmd_status() {
   echo "data      : $DATA_DIR"
   echo "platforms :"
   status_platforms_block | sed 's/^/  /'
+  local _perr; _perr="$(platforms_error)"; [ -z "$_perr" ] || echo "  WARNING: $_perr"
   echo
   printf '%-20s %-8s %-9s %-11s %-9s %s\n' JOB ENABLED EVERY LAST STATUS COST
   # One jq over both files, for the same reason the tick does it (see
@@ -10227,6 +11123,7 @@ cmd_status() {
   legacy_env_warnings
   legacy_scripts_warnings
   statusline_path_warning
+  legacy_config_dir_warning
 }
 
 cmd_dashboard() {
@@ -10495,6 +11392,8 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
           die "model must be a family (opus, sonnet, haiku, fable) or a claude-* id"
         fi
       fi
+      platform_model_enabled "$p" "$value" \
+        || die "model '$value' is not enabled in Settings — $p enables: $(platform_models_enabled_line "$p") (switch it on there, or: agentloop platform set-models $p)"
       write_jobs --arg id "$id" --arg v "$value" \
         '.jobs = [.jobs[] | if .id == $id then .model = $v else . end]' ;;
     platform)
@@ -10506,7 +11405,10 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
       # project's platform, and the rewrites are checked against THAT.
       local eff cur dm proj
       case "$value" in
-        anthropic|openai) eff="$value" ;;
+        anthropic|openai)
+          eff="$value"
+          platform_usable "$value" || die "$value is not enabled in Settings — enable it there, or: agentloop platform enable $value" ;;
+        opencode) die "opencode is not supported yet — it arrives with the OpenCode engine" ;;
         "") proj="$(job_get "$id" '.project' '')"; eff="anthropic"
             if [ -n "$proj" ] && [ "$proj" != "null" ]; then eff="$(project_get "$proj" '.platform' 'anthropic')"; fi
             # A hand-edited project can carry a platform this engine does not
@@ -10519,14 +11421,22 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
       if [ "$eff" = "openai" ] && ! openai_catalog_ensure; then
         die "no OpenAI catalog yet: install codex, sign in, and run: agentloop resolve-models openai"
       fi
+      # The model rewrite is decided BEFORE the platform is written, so a
+      # refusal leaves the job exactly as it was. Only the inherit case can
+      # find no default: anthropic/openai went through platform_usable above,
+      # and a project's platform may have nothing switched on -- writing the
+      # empty string as the model would be a job no launch could resolve.
+      cur="$(job_get "$id" '.model' '')"; dm=""
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! platform_model_ok "$eff" "$cur"; then
+        dm="$(platform_default_model "$eff")"
+        [ -n "$dm" ] || die "no model is enabled for $eff in Settings — switch one on there first"
+      fi
       if [ -n "$value" ]; then
         write_jobs --arg id "$id" --arg v "$value" '.jobs = [.jobs[] | if .id == $id then .platform = $v else . end]'
       else
         write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.platform) else . end]'
       fi
-      cur="$(job_get "$id" '.model' '')"
-      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! platform_model_ok "$eff" "$cur"; then
-        dm="$(platform_default_model "$eff")"
+      if [ -n "$dm" ]; then
         write_jobs --arg id "$id" --arg v "$dm" '.jobs = [.jobs[] | if .id == $id then .model = $v else . end]'
         echo "model '$cur' is not a $eff model — rewritten to $dm"
       fi
@@ -10711,8 +11621,13 @@ cmd_create() { # reads a partial job object (JSON) from stdin
       if [ -n "$cproj" ] && [ "$cproj" != "null" ]; then cplat="$(project_get "$cproj" '.platform' 'anthropic')"; fi
       platform_known "$cplat" || cplat="anthropic" ;;
     anthropic|openai) : ;;
+    opencode) die "create: opencode is not supported yet — it arrives with the OpenCode engine" ;;
     *) die "create: platform must be anthropic or openai" ;;
   esac
+  # The operator's own gate, before the CLI's: refuse a platform Settings has
+  # not switched on before spending a `codex debug models` round trip on it,
+  # the same order run_job's launch gates use.
+  platform_usable "$cplat" || die "create: $cplat is not enabled in Settings — enable it there, or: agentloop platform enable $cplat"
   if [ "$cplat" = "openai" ] && ! openai_catalog_ensure; then
     die "create: no OpenAI catalog yet: install codex, sign in, and run: agentloop resolve-models openai"
   fi
@@ -10730,6 +11645,7 @@ cmd_create() { # reads a partial job object (JSON) from stdin
   cm="$(echo "$merged" | "$JQ" -r '.model // ""')"; cp="$(echo "$merged" | "$JQ" -r '.permission_mode // ""')"
   ce="$(echo "$merged" | "$JQ" -r '.effort // ""')"
   platform_model_ok "$cplat" "$cm" || die "create: model '$cm' is not a $cplat model"
+  platform_model_enabled "$cplat" "$cm" || die "create: model '$cm' is not enabled in Settings — $cplat enables: $(platform_models_enabled_line "$cplat")"
   platform_permission_ok "$cplat" "$cp" || die "create: permission_mode '$cp' is not a $cplat mode"
   platform_effort_ok "$cplat" "$cm" "$ce" || die "create: effort '$ce' is not a level of $cm on $cplat"
   write_jobs --argjson j "$merged" '.jobs += [$j]'
@@ -10758,9 +11674,39 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
     ''|null|anthropic|openai) : ;;
     *) die "project-set: platform must be anthropic or openai (or empty, to inherit nothing)" ;;
   esac
+  case "$plat" in
+    anthropic|openai) platform_usable "$plat" || die "project-set: $plat is not enabled in Settings — enable it there, or: agentloop platform enable $plat" ;;
+  esac
+  # The security block's own platform and model, under the same rules. The
+  # platform its model is judged against: the block's, else the project's as
+  # sent, else the project's as stored, else anthropic.
+  local sp sm eff_sp
+  sp="$(echo "$partial" | "$JQ" -r '((.security | objects) // {}).platform // ""')"
+  sm="$(echo "$partial" | "$JQ" -r '((.security | objects) // {}).model // ""')"
+  case "$sp" in
+    ''|null|anthropic|openai) : ;;
+    *) die "project-set: security.platform must be anthropic or openai (or empty, to inherit the project's)" ;;
+  esac
+  if [ -n "$sp" ] && [ "$sp" != "null" ]; then
+    platform_usable "$sp" || die "project-set: security.platform $sp is not enabled in Settings — enable it there, or: agentloop platform enable $sp"
+  fi
+  if [ -n "$sm" ] && [ "$sm" != "null" ]; then
+    eff_sp="$sp"
+    { [ -n "$eff_sp" ] && [ "$eff_sp" != "null" ]; } || eff_sp="$plat"
+    { [ -n "$eff_sp" ] && [ "$eff_sp" != "null" ]; } || eff_sp="$(project_get "$name" '.platform' 'anthropic')"
+    platform_known "$eff_sp" || eff_sp="anthropic"
+    platform_model_enabled "$eff_sp" "$sm" \
+      || die "project-set: security.model '$sm' is not enabled in Settings — $eff_sp enables: $(platform_models_enabled_line "$eff_sp")"
+  fi
+  # The account is the platform's now (see Settings): a claude_config_dir sent
+  # at either level is dropped from the partial AND from the stored project, and said.
+  if echo "$partial" | "$JQ" -e '((.claude_config_dir // "") != "") or ((((.security | objects) // {}).claude_config_dir // "") != "")' >/dev/null 2>&1; then
+    echo "note: claude_config_dir is ignored since this version — the account is the platform's, see Settings"
+  fi
+  partial="$(echo "$partial" | "$JQ" -c 'del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end')"
   if projects_json | "$JQ" -e --arg n "$name" 'any(.projects[]; .name==$n)' >/dev/null 2>&1; then
     write_projects --arg n "$name" --argjson p "$partial" \
-      '.projects = [.projects[] | if .name==$n then (. * $p) else . end]'
+      '.projects = [.projects[] | if .name==$n then ((. * $p) | del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end) else . end]'
   else
     write_projects --argjson p "$partial" '.projects += [$p]'
   fi
@@ -10948,6 +11894,9 @@ agentloop — durable local scheduler for headless Claude Code runs
                               source (daily on its own)
   agentloop platforms       what each platform offers (permission modes,
                               efforts, defaults) and whether it is ready
+  agentloop platform check|enable|disable|set-bin|models|set-models <platform> [path]
+                            what Settings › Platforms does: probe a CLI, switch a platform on or off,
+                            point at its binary, refresh its catalog, choose its models (JSON list on stdin)
   agentloop tick            internal — what launchd calls every minute
 
 Jobs are defined in $JOBS_FILE
@@ -11031,6 +11980,7 @@ case "${1:-}" in
   resolve-models) cmd_resolve_models "${2:-}" ;;
   resolve-pricing) cmd_resolve_pricing ;;
   platforms) cmd_platforms ;;
+  platform)  shift; cmd_platform "$@" ;;
   skills)    shift; cmd_skills "${1:-status}" ;;
   selftest)  cmd_selftest ;;
   running)   [ $# -ge 2 ] || die "usage: agentloop running <job-id>"; cmd_running "$2" ;;

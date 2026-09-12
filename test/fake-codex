@@ -16,13 +16,17 @@
 #   FAKE_CODEX_LOGGED_OUT  set to make `login status` exit 1
 #   FAKE_USED_5H/7D        the used_percent the rollout reports (default 5.0 / 2.0)
 #   CODEX_HOME             where the rollout is written; a test sets it, never ~/.codex
+#   FAKE_CODEX_MODELS_JSON  a raw `codex debug models` document to cat instead of
+#                           fixtures/codex/models-catalog.stripped.json -- lets a
+#                           test drive a real, successful `resolve_models_openai`
+#                           refresh to a catalog of its own; unset is today's fixture
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 case "${1:-}" in
   login)     [ -z "${FAKE_CODEX_LOGGED_OUT:-}" ] || exit 1
              echo "Logged in using ChatGPT"; exit 0 ;;
-  debug)     cat "$HERE/fixtures/codex/models-catalog.stripped.json"; exit 0 ;;   # debug models [--bundled]
+  debug)     cat "${FAKE_CODEX_MODELS_JSON:-$HERE/fixtures/codex/models-catalog.stripped.json}"; exit 0 ;;   # debug models [--bundled]
   --version) echo "codex-cli 0.148.0"; exit 0 ;;
   exec)      ;;
   *)         echo "fake-codex: unexpected invocation: $*" >&2; exit 2 ;;

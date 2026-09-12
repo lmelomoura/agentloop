@@ -38,7 +38,7 @@
    a file named for one of them. */
 import { $, AL, icon, eff, fmtAgo, fmtDur, money, effortLabel, fmtExpiresIn,
          resumeInFlight, markIfPending, projById } from "./page.js";
-import { jobFacts } from "./jobs-domain.js";
+import { jobFacts, platformState, platformChip } from "./jobs-domain.js";
 import { platformOf } from "./editor-domain.js";
 import { el, pageHeader, kpiCard } from "./chrome.js";
 
@@ -468,6 +468,10 @@ export function jobCard(j){
   const pill = el("span", "pill " + pillCls, disabled ? "disabled" : (idle ? "idle" : "enabled"));
   if(idle) pill.title = "Outside its active window — no runs until the window reopens";
   h2.appendChild(pill);
+  // A job whose platform or model was switched off in Settings says so on
+  // the card, so the refusal in tick.log is not the only place it shows.
+  const pchip = platformChip(platformState(j, projById(j.project || ""), AL.PLATFORMS));
+  if(pchip) h2.appendChild(pchip);
   card.appendChild(h2);
 
   // Disabling stops FUTURE runs; one already in flight keeps going. Say so,

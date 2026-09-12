@@ -597,10 +597,10 @@ def _run_save(srv, tmp_path, *, multi, name="save.js"):
                     effortFromIndex: (i) => ALApp.EFFORTS[+i||0] || "" };
     const effortGet = (id) => ALApp.effortFromIndex($(id).value);
     const sent = [];
-    const vals = {"pj-name":"Web","pj-desc":"","pj-cwd":"%s","pj-ccd":"","pj-base":"develop",
+    const vals = {"pj-name":"Web","pj-desc":"","pj-cwd":"%s","pj-base":"develop",
                   "pj-wt":"auto","pj-platform":"anthropic","sec-platform":"",
                   "pj-up":"","pj-down":"already here",
-                  "sec-enabled":false,"sec-model":"","sec-effort":"0","sec-perm":"bypassPermissions","sec-cfgdir":"",
+                  "sec-enabled":false,"sec-model":"","sec-effort":"0","sec-perm":"bypassPermissions",
                   "sec-profile-default":"standard","sec-max-budget":"","sec-daily-budget":"",
                   "sec-min-severity":"medium","sec-ignore":""};
     const $ = (id) => ({ get value(){ return vals[id]; }, set value(v){ vals[id]=v; },
@@ -664,10 +664,19 @@ def test_a_multi_repo_project_keeps_its_rows_and_leaves_the_project_base_alone(s
 def test_the_project_editor_has_a_security_pane(srv):
     page = srv.render_page("boot-authed")
     assert 'data-pjpane="security"' in page
-    for field in ("sec-enabled", "sec-model", "sec-effort", "sec-perm", "sec-cfgdir",
+    for field in ("sec-enabled", "sec-model", "sec-effort", "sec-perm",
                   "sec-profile-default", "sec-max-budget", "sec-daily-budget",
                   "sec-min-severity", "sec-ignore"):
         assert f'id="{field}"' in page, f"the security pane has no {field} field"
+
+
+def test_the_project_editor_no_longer_offers_an_account_of_its_own(srv):
+    """The account is the platform's, shown in Settings › Platforms; a per-project
+    or per-block claude_config_dir was removed with the Settings page."""
+    page = srv.render_page("boot-authed")
+    assert 'id="pj-ccd"' not in page
+    assert 'id="sec-cfgdir"' not in page
+    assert "claude_config_dir" not in _js(srv)
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -737,11 +746,11 @@ def test_saving_always_sends_the_whole_security_block_with_a_real_boolean(srv, t
     proj = next(e["project"] for op, e in sent if op == "project_set")
     sec = proj["security"]
     assert sec["enabled"] is False, f"enabled must be a real boolean, got {sec['enabled']!r}"
-    assert set(sec) == {"enabled", "platform", "model", "effort", "permission_mode", "claude_config_dir",
+    assert set(sec) == {"enabled", "platform", "model", "effort", "permission_mode",
                          "default_profile", "max_budget_usd", "daily_budget_usd",
                          "min_severity", "ignore_paths"}, f"security block: {sec}"
     assert sec["platform"] == "", "an empty platform must be SENT: it is how the block goes back to inheriting"
-    assert proj["platform"] == "anthropic", "the project's platform is always sent, like claude_config_dir"
+    assert proj["platform"] == "anthropic", "the project's platform is always sent"
     assert sec["max_budget_usd"] == "", "an empty budget must clear, not vanish from the payload"
     assert sec["default_profile"] == "standard"
     assert sec["min_severity"] == "medium"
@@ -775,10 +784,14 @@ def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
     deps = "\n".join(_plainfn(page, n) for n in
                      ("applyPlatformToSecurity", "secEffectivePlatform", "effortSet", "effortGet",
                       "ladderOf", "modelOptions"))
+    # modelEnabled and DISABLED_SUFFIX: modelOptionsFor reads both for the
+    # `current` value the pane now hands it on a re-apply (Task 9), so a model
+    # Settings switched off is shown flagged instead of silently dropped.
     vocab = "\n".join(_plainfn(app, n) for n in
                       ("effortsFor", "effortIndex", "effortFromIndex", "permissionsFor",
-                       "defaultPermissionFor", "defaultModelFor", "modelOptionsFor")) \
-        + "\n" + _const(app, "FALLBACK_EFFORTS") + _const(app, "FALLBACK_PERMISSIONS")
+                       "defaultPermissionFor", "defaultModelFor", "modelEnabled", "modelOptionsFor")) \
+        + "\n" + _const(app, "FALLBACK_EFFORTS") + _const(app, "FALLBACK_PERMISSIONS") \
+        + _const(app, "DISABLED_SUFFIX")
     script = tmp_path / "sec-platform.js"
     script.write_text(vocab + """
     const ALApp = {effortsFor, effortIndex, effortFromIndex, permissionsFor, defaultPermissionFor,
@@ -817,7 +830,10 @@ def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
     assert "GPT-5.5 · no price" in k["labels"] and k["perms"] == ["read-only", "workspace-write", "full-access"]
     assert "falls back to the platform's default" in k["help"]
     r = out["afterReset"]
-    assert r == {"model": "", "max": "5", "eff": "0", "perm": "bypassPermissions", "custom": True,
+    # custom is False on BOTH platforms now (Task 9): the list Settings
+    # switched on is the authority, so there is no typed-in id on Anthropic
+    # either -- the stub above starts it True to prove the apply turns it off.
+    assert r == {"model": "", "max": "5", "eff": "0", "perm": "bypassPermissions", "custom": False,
                  "none": "— Default (opus) —", "secPlatApplied": "anthropic"}, \
         "the pane records the platform it was built for on its way out"
 
@@ -1484,7 +1500,7 @@ def _jobs_table_deps(block):
               + _const(block, "JOB_COLS") + _const(block, "KPI_ICONS"))
     fns = ("el", "kpiCard", "filterBar", "tableCard", "tableFooter",
            "inWindow", "nextCheckAt", "jobFacts", "visibleJobs", "sortJobs",
-           "bulkOn", "bulkLabel", "jobsEmptyNote",
+           "bulkOn", "bulkLabel", "jobsEmptyNote", "platformOf", "modelEnabled", "platformState", "platformChip",
            "jobsHeaderSubtitle", "jobsKpis", "mountJobsToolbar",
            "paintJobFilterBar", "jobRow", "renderJobsTable", "renderJobsPage")
     return consts + "\n".join(_plainfn(block, n) for n in fns)
@@ -1525,6 +1541,7 @@ def _jobs_page_harness(deps):
     function fmtWhen(t){ return "when" + t; }
     function fmtIn(t){ return "in" + t; }
     function isFav(_name){ return false; }
+    function projById(_name){ return null; }
     function paintJobPickers(){}
     // Stubbed rather than extracted -- see _jobs_table_deps's own comment on
     // why pageHeader in particular cannot go through _plainfn.
@@ -3135,7 +3152,8 @@ def _job_card_deps(block):
             + _index_screen_deps(block, "fmtDays", "el", "jobFacts",
                                  "nextCheckAt", "inWindow", "probeVerdict",
                                  "nextRunNote", "spendTone", "checkList",
-                                 "sessionNotices", "platformOf", "jobCard"))
+                                 "sessionNotices", "platformOf", "modelEnabled", "platformState",
+                                 "platformChip", "jobCard"))
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -3164,6 +3182,507 @@ def test_the_job_card_names_the_platform_only_when_it_is_openai(srv, tmp_path):
     assert len(got["anthropic"]) == 1, f"one settings line per card, got {got['anthropic']}"
     assert "Anthropic ·" not in got["anthropic"][0], got["anthropic"]
     assert "opus" in got["anthropic"][0], "the Anthropic card still names its model, bare"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_platform_options_offer_only_what_settings_switched_on(srv, tmp_path):
+    """Until /api/models answers with the registry, both platforms (the page as
+    it was); once it does, only the usable ones -- and the job's current one
+    flagged rather than silently swapped."""
+    js = _app_js(srv)
+    deps = _const(js, "DISABLED_SUFFIX") + "\n".join(_plainfn(js, n) for n in ("registryKnown", "platformOptions"))
+    script = tmp_path / "platform-options.js"
+    script.write_text("""
+    const PLATFORM_LABELS = {anthropic: "Anthropic", openai: "OpenAI", opencode: "OpenCode"};
+    """ + deps + """
+    const before = platformOptions({}, "anthropic");
+    const p = {anthropic: {enabled: true, usable: true}, openai: {enabled: true, usable: false}};
+    const after = platformOptions(p, "anthropic");
+    const flagged = platformOptions(p, "openai");
+    // A planned platform (never wired up yet) is not something Settings
+    // switched off -- it must read that way, not as a stray disabled toggle.
+    const planned = platformOptions(p, "opencode");
+    console.log(JSON.stringify({before, after, flagged, planned}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert [o["v"] for o in out["before"]] == ["anthropic", "openai"]
+    assert [o["v"] for o in out["after"]] == ["anthropic"]
+    assert out["flagged"][-1] == {"v": "openai", "label": "OpenAI (disabled in Settings)", "flagged": True}
+    assert out["planned"][-1] == {"v": "opencode", "label": "OpenCode (not supported yet)", "flagged": True}
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_model_options_are_filtered_by_the_enabled_list_and_flag_the_current(srv, tmp_path):
+    js = _app_js(srv)
+    deps = _const(js, "DISABLED_SUFFIX") + "\n".join(_plainfn(js, n) for n in ("modelEnabled", "modelOptionsFor"))
+    script = tmp_path / "model-options.js"
+    script.write_text(deps + """
+    const P = {anthropic: {models: ["claude-opus-5", "claude-sonnet-5"], models_enabled: ["claude-opus-5"]},
+               openai: {models: [{v: "gpt-a", label: "A", desc: "da"}, {v: "gpt-b", label: "B"}], models_enabled: ["gpt-b"]}};
+    const a = modelOptionsFor("anthropic", P, null, "claude-sonnet-5");
+    const o = modelOptionsFor("openai", P, null, "gpt-b");
+    const legacy = modelOptionsFor("anthropic", {anthropic: {models: ["claude-opus-5", "claude-sonnet-5"]}}, null, "");
+    // A family value (opus) is not "off": claude-opus-5, a model of that
+    // family, is switched on -- it must not gain a flagged twin beside it.
+    const fam = modelOptionsFor("anthropic", P, null, "opus");
+    // No models_enabled at all (the registry has not answered yet): the
+    // job's own current model gets no verdict either, same as platformState.
+    const noRegistry = modelOptionsFor("anthropic", {anthropic: {models: ["claude-opus-5", "claude-sonnet-5"]}}, null, "claude-opus-5");
+    console.log(JSON.stringify({a, o, legacy, fam, noRegistry}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["a"] == [{"v": "claude-opus-5", "label": "claude-opus-5"},
+                        {"v": "claude-sonnet-5", "label": "claude-sonnet-5 (disabled in Settings)", "flagged": True}]
+    assert out["o"] == [{"v": "gpt-b", "label": "B"}]
+    assert [x["v"] for x in out["legacy"]] == ["claude-opus-5", "claude-sonnet-5"], "no models_enabled: nothing is filtered"
+    assert out["fam"] == [{"v": "claude-opus-5", "label": "claude-opus-5"}], \
+        "opus must not be flagged: claude-opus-5, a model of that family, is enabled"
+    assert out["noRegistry"] == [{"v": "claude-opus-5", "label": "claude-opus-5"},
+                                 {"v": "claude-sonnet-5", "label": "claude-sonnet-5"}], \
+        "no models_enabled: the job's own current model is not flagged either"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_model_enabled_is_one_rule_for_the_combo_the_chip_and_the_editor(srv, tmp_path):
+    """modelEnabled on its own, not only through its three callers -- the one
+    rule modelOptionsFor, platformState and the editor's Agent step all read
+    for whether Settings left a model switched on.
+
+    A family value is gated the engine's way: effective_model resolves it to
+    the id the cache holds NOW and platform_model_enabled checks THAT id, so
+    the page reads the same resolution off /api/models (`families`) -- a
+    family whose resolved id is off is off, even while another id of the
+    family is on (the day the daily pass moves opus to a new id, every family
+    job is refused at launch; the page must show the chip that day). A
+    payload without `families` (an older server) keeps the by-prefix guess.
+
+    The reverse also holds: an explicit id counts as on when its bare family
+    name -- what the seed writes before the cache ever resolved anything --
+    sits on the enabled list and `families` maps that family to this same
+    id; any OTHER id of that family still stays off."""
+    js = _app_js(srv)
+    script = tmp_path / "model-enabled.js"
+    script.write_text(_plainfn(js, "modelEnabled") + """
+    const P = {anthropic: {models_enabled: ["claude-opus-5"]}, openai: {models_enabled: ["gpt-a"]}};
+    // The registry with the cache's own resolutions: opus -> claude-opus-5.
+    const R = {anthropic: {models_enabled: ["claude-opus-5"], families: {opus: "claude-opus-5", sonnet: "claude-sonnet-5"}}};
+    // The daily pass moved opus to claude-opus-6 while Settings still lists
+    // claude-opus-5: the engine gates on claude-opus-6, which is off.
+    const M = {anthropic: {models_enabled: ["claude-opus-5"], families: {opus: "claude-opus-6"}}};
+    // The list names the family itself (the seed writes a bare `opus` when
+    // the cache had not resolved it yet): on, whatever it resolves to.
+    const F = {anthropic: {models_enabled: ["opus"], families: {opus: "claude-opus-6"}}};
+    // A family the cache has not resolved at all: the engine finds no id to
+    // check and refuses -- so does the page.
+    const U = {anthropic: {models_enabled: ["claude-haiku-4"], families: {opus: "claude-opus-5"}}};
+    console.log(JSON.stringify({
+      no_registry: modelEnabled("anthropic", "claude-sonnet-5", {}),
+      on_list: modelEnabled("anthropic", "claude-opus-5", P),
+      family_on: modelEnabled("anthropic", "opus", P),
+      family_off: modelEnabled("anthropic", "sonnet", P),
+      empty_model: modelEnabled("anthropic", "", P),
+      openai_off: modelEnabled("openai", "gpt-b", P),
+      resolved_on: modelEnabled("anthropic", "opus", R),
+      resolved_off: modelEnabled("anthropic", "sonnet", R),
+      moved: modelEnabled("anthropic", "opus", M),
+      listed_family: modelEnabled("anthropic", "opus", F),
+      // The inverse of listed_family: asking with the id "opus" resolves to,
+      // not with "opus" itself -- still on, through the same bare entry.
+      listed_family_resolved_id: modelEnabled("anthropic", "claude-opus-6", F),
+      // The containment case: F's family resolves to claude-opus-6, so a
+      // DIFFERENT id of that family must not ride along just because the
+      // family itself is on the list.
+      listed_family_other_id: modelEnabled("anthropic", "claude-opus-5", F),
+      unresolved: modelEnabled("anthropic", "haiku", U),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out == {"no_registry": True, "on_list": True, "family_on": True,
+                   "family_off": False, "empty_model": True, "openai_off": False,
+                   "resolved_on": True, "resolved_off": False,
+                   "moved": False, "listed_family": True,
+                   "listed_family_resolved_id": True, "listed_family_other_id": False,
+                   "unresolved": False}, out
+    assert out["family_on"] is True and out["moved"] is False, \
+        "the by-prefix guess is only for a payload without `families`; with them, the resolved id decides"
+    assert out["listed_family_resolved_id"] is True and out["listed_family_other_id"] is False, \
+        "a bare family name on the list enables only the id it currently resolves to, not every id of it"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_platform_state_names_a_platform_or_model_switched_off(srv, tmp_path):
+    js = _app_js(srv)
+    script = tmp_path / "platform-state.js"
+    script.write_text("\n".join(_plainfn(js, n) for n in ("platformOf", "modelEnabled", "platformState")) + """
+    function eff(j, f, d){ return (j && j[f] != null && j[f] !== "") ? j[f] : d; }
+    const P = {anthropic: {enabled: true, usable: true, models_enabled: ["claude-opus-5"], default_model: "claude-opus-5"},
+               openai: {enabled: false, usable: false, models_enabled: []}};
+    console.log(JSON.stringify({
+      ok: platformState({model: "claude-opus-5"}, null, P),
+      fam: platformState({model: "opus"}, null, P),
+      model: platformState({model: "claude-sonnet-5"}, null, P),
+      plat: platformState({platform: "openai", model: "gpt-a"}, null, P),
+      planned: platformState({platform: "opencode"}, null, P),
+      blind: platformState({model: "claude-sonnet-5"}, null, {}),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out == {"ok": "ok", "fam": "ok", "model": "model_disabled", "plat": "platform_disabled",
+                   "planned": "planned", "blind": "ok"}
+
+
+def test_the_card_and_the_row_show_the_platform_chip(srv):
+    js = _app_js(srv)
+    assert "platformChip(platformState(j, projById(j.project || \"\"), AL.PLATFORMS))" in _plainfn(js, "jobCard")
+    assert "platformChip(platformState(j, projById(j.project || \"\"), AL.PLATFORMS))" in _plainfn(js, "jobRow")
+    for name in ("platformOptions", "registryKnown", "hiddenModelCount", "platformState", "platformChip",
+                 "PLATFORM_LABELS", "modelEnabled", "DISABLED_SUFFIX"):
+        assert name in js.split("window.ALApp = {", 1)[1], f"{name} is not on window.ALApp"
+    assert "get PLATFORMS(){ return PLATFORMS; }" in _js(srv)
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_platform_chip_renders_each_state_the_pill_and_the_why(srv, tmp_path):
+    """platformChip's three non-ok states, run standing alone: the pill class
+    every one of them shares, what each says, and -- for the two Settings
+    actually switched off, not the planned platform that is not built yet --
+    that the title points at where to fix it."""
+    js = _app_js(srv)
+    deps = "\n".join(_plainfn(js, n) for n in ("el", "platformChip"))
+    script = tmp_path / "platform-chip.js"
+    # A minimal document.createElement stub -- just enough for el() to build
+    # the span platformChip fills in, with no real DOM behind it.
+    script.write_text("""
+    const document = {
+      createElement: (_tag) => ({className: "", textContent: "", title: ""}),
+    };
+    """ + deps + """
+    console.log(JSON.stringify({
+      ok: platformChip("ok"),
+      planned: platformChip("planned"),
+      platform_disabled: platformChip("platform_disabled"),
+      model_disabled: platformChip("model_disabled"),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["ok"] is None, "the ok state renders no chip at all"
+    for key, text in (("planned", "platform not supported yet"),
+                       ("platform_disabled", "platform disabled"),
+                       ("model_disabled", "model disabled")):
+        assert out[key]["className"] == "pill idle"
+        assert out[key]["textContent"] == text
+    assert "Settings › Platforms" not in out["planned"]["title"], \
+        "a planned platform was never switched off in Settings -- nothing to point at there"
+    assert "Settings › Platforms" in out["platform_disabled"]["title"]
+    assert "Settings › Platforms" in out["model_disabled"]["title"]
+
+
+# Settings › Platforms (Task 8): the page's own hosts and wiring, and the two
+# pure helpers ui/app/settings.js exports -- the one-line summary above the
+# cards and the status chip's word -- run standing alone under Node.
+def test_the_settings_page_is_reachable_and_has_its_two_panes(srv):
+    page = srv.render_page("boot-authed")
+    assert '<button class="navitem" data-view="settings" id="nav-settings"></button>' in page, "the Settings item is hidden"
+    for part in ("st-head", "st-tabs", "sttab-platforms", "sttab-profile", "st-platforms", "st-profile", "soon-settings"):
+        assert f'id="{part}"' in page, f"missing {part}"
+    js = _js(srv)
+    assert 'const VIEWS = ["overview","jobs","runs","projects","security","settings"];' in js
+    assert 'if(currentView === "settings") paintSettings();' in _plainfn(js, "setView")
+    assert "MODELS_CONFIGURED=" in _fn(js, "loadModels") and "MODELS_ERROR=" in _fn(js, "loadModels")
+    assert "ALApp.renderSettingsPage(" in _plainfn(js, "paintSettings")
+    assert "renderSettingsPage" in _app_js(srv).split("window.ALApp = {", 1)[1]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_settings_summary_and_the_status_chip(srv, tmp_path):
+    js = _app_js(srv)
+    script = tmp_path / "settings-words.js"
+    script.write_text("""
+    const REGISTRY = [{id: "anthropic"}, {id: "openai"}, {id: "opencode"}];
+    """ + "\n".join(_plainfn(js, n) for n in ("settingsSummary", "platformStatus")) + """
+    const P = {anthropic: {enabled: true, models_enabled: ["a", "b"]}, openai: {enabled: true, models_enabled: ["c"]}, opencode: {enabled: false, models_enabled: []}};
+    console.log(JSON.stringify({
+      summary: settingsSummary(P),
+      one: settingsSummary({anthropic: {enabled: true, models_enabled: ["a"]}}),
+      on: platformStatus({supported: true, enabled: true}, {ready: true, bin_found: true}),
+      off: platformStatus({supported: true, enabled: false}, {ready: true, bin_found: true}),
+      nobin: platformStatus({supported: true, enabled: false}, {ready: false, bin_found: false}),
+      nosession: platformStatus({supported: true, enabled: false}, {ready: false, bin_found: true}),
+      planned: platformStatus({supported: false, enabled: false}, {ready: false, bin_found: false}),
+      unchecked: platformStatus({supported: true, enabled: true}, null),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["summary"] == "2 of 3 platforms enabled · 3 models available to jobs"
+    assert out["one"] == "1 of 3 platforms enabled · 1 model available to jobs"
+    assert [out[k]["label"] for k in ("on", "off", "nobin", "nosession", "planned", "unchecked")] == \
+        ["Enabled", "Disabled", "Not installed", "Not signed in", "Coming soon", "Enabled"]
+    assert out["nobin"]["cls"] == "off" and out["nosession"]["cls"] == "idle" and out["planned"]["cls"] == "disabled"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_settings_summary_ignores_a_disabled_platforms_models(srv, tmp_path):
+    """platform_disable does not clear models_enabled, so a platform switched
+    off can still carry a list -- none of it is available to a job, and the
+    summary must not count it."""
+    js = _app_js(srv)
+    script = tmp_path / "settings-summary-disabled.js"
+    script.write_text("""
+    const REGISTRY = [{id: "anthropic"}, {id: "openai"}, {id: "opencode"}];
+    """ + _plainfn(js, "settingsSummary") + """
+    const P = {anthropic: {enabled: true, models_enabled: ["a", "b"]}, openai: {enabled: false, models_enabled: ["c"]}, opencode: {enabled: false, models_enabled: []}};
+    console.log(JSON.stringify({summary: settingsSummary(P)}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["summary"] == "1 of 3 platforms enabled · 2 models available to jobs", \
+        "a disabled platform's leftover models_enabled must not be counted"
+
+
+def test_the_settings_module_speaks_the_six_actions(srv):
+    src = (REPO / "ui" / "app" / "settings.js").read_text()
+    for op in ("platform_check", "platform_enable", "platform_disable", "platform_set_bin", "platform_models", "platform_set_models"):
+        assert f'"{op}"' in src, f"settings.js never calls {op}"
+    assert "Test the session first, then load the models" in src
+    assert "no longer in the catalog" in src
+    assert "delete live.checks[r.id]" in src, \
+        "a changed binary must invalidate the stale check and catalog"
+    assert "live.busy[extra.platform] = true" in src, \
+        "change() must lock the card while a save is in flight"
+    # A switch's own checkbox is an <input> too (it covers the whole label
+    # and is the real click target, per components.css), so the repaint's
+    # focus guard must check the type as well as the tag -- otherwise a
+    # toggle leaves its checkbox focused and paint() mistakes it for the
+    # Binary field, overwriting it with the checkbox's own value ("on").
+    assert 'active.type === "text"' in src, \
+        "the focus guard must exclude a switch's checkbox, which is an INPUT too"
+    params = re.search(r"function setupBanner\(([^)]*)\)", src).group(1)
+    assert len([p for p in params.split(",") if p.strip()]) == 3, \
+        "setupBanner must take (configured, error, withButton)"
+    assert '"btn primary open-settings"' in src, \
+        "the Open Settings button must be found by class"
+    assert 'id = "open-settings"' not in src and 'id="open-settings"' not in src, \
+        "the button must carry no id -- a later task mounts this banner on two views at once"
+
+
+def test_the_binary_field_saves_on_blur_not_on_a_repaints_change(srv):
+    """A repaint (the three open-page checks, any Test/Refresh/toggle on any
+    card, the 5 s config_sig re-read) can land while the operator is
+    mid-typing in the Binary field; Chrome fires "change" on the <input>
+    being torn out of the DOM by paint()'s `host.textContent = ""`, so a
+    listener on "change" posts whatever partial path happened to be typed so
+    far -- refused if it is not executable, saved and checked if it happens
+    to be. binaryBlock must save on blur (and Enter, which just blurs)
+    instead, and skip the save both for the blur a repaint's own teardown
+    causes and for one that lands after the element was already detached."""
+    fn = _plainfn(_app_js(srv), "binaryBlock")
+    assert 'inp.addEventListener("blur"' in fn, "the Binary field must save on blur"
+    assert 'inp.addEventListener("change"' not in fn, \
+        "a repaint tearing this input out must not save through \"change\" -- the switches' own " \
+        "checkboxes still use \"change\", but that listener lives outside binaryBlock"
+    assert "inp.isConnected" in fn, \
+        "a save must not fire for a blur reaching an input a repaint already detached"
+    assert "repainting" in fn, \
+        "a save must not fire for the blur a repaint's own host.textContent teardown causes"
+    assert "Chrome fires" in fn and "removed from the DOM" in fn, \
+        "the source must explain why: Chrome fires \"change\" on an input the repaint removes"
+
+
+def test_the_platform_card_shows_the_engines_own_note(srv):
+    """The spec's promise: a refusal from the engine appears in the card, in
+    the engine's own words, and switching a platform or a model off shows
+    what the command answers (the enabled jobs it leaves skipped). change()
+    keeps that per platform in live.notes; platformCard paints it right
+    after the header row. A refused set-bin must not lose what was typed,
+    and a throw mid-repaint must not leave the Binary field unable to save."""
+    src = (REPO / "ui" / "app" / "settings.js").read_text()
+    assert "live.notes[" in src, "change() must keep the engine's note per platform"
+    assert '"platnote' in src, "platformCard must paint the note with the platnote class"
+    fn = _plainfn(_app_js(srv), "binaryBlock")
+    assert fn.count("delete live.typedBin[r.id]") >= 2, \
+        "the typed path must be cleared both on a later successful save and on a revert to the stored value"
+    assert "delete live.notes[r.id]" in fn, \
+        "retyping the stored path by hand must clear the refusal note right away, not just the typed value"
+    fn = _plainfn(_app_js(srv), "paint")
+    assert "finally" in fn, \
+        "repainting must be cleared in a finally -- a throw mid-rebuild must not leave it stuck true"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_note_from_output_keeps_only_the_lines_after_the_first(srv, tmp_path):
+    """platform_affected_note's sentences (the enabled jobs a disable or a
+    model switch-off leaves skipped) are every line the engine prints after
+    its own first line -- joined by a space for the card; nothing when
+    there is only the one line."""
+    js = _app_js(srv)
+    script = tmp_path / "note-from-output.js"
+    script.write_text(_plainfn(js, "noteFromOutput") + """
+    console.log(JSON.stringify({
+      skipped: noteFromOutput("openai disabled\\n1 enabled job (u2) runs on openai and will be skipped until it is enabled again"),
+      plain: noteFromOutput("openai enabled"),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["skipped"] == "1 enabled job (u2) runs on openai and will be skipped until it is enabled again"
+    assert out["plain"] == ""
+
+
+# Settings › Platforms (Task 9): the editors offer only what Settings switched
+# on, the strip Overview and Jobs carry while nothing is configured, New job
+# diverted to Settings, the sidebar dot, and the landing after the profile.
+def test_the_editors_read_the_platform_list_from_the_registry(srv):
+    js = _js(srv)
+    assert "PLATFORM_OPTS" not in js, "the fixed two-platform list is gone: the registry decides"
+    assert js.count("ALApp.platformOptions(PLATFORMS") >= 7
+    assert "function modelOptions(p, current){ return ALApp.modelOptionsFor(p, PLATFORMS, groupModels, current); }" in js
+    assert "allowCustom:false" in js.split("const secModelCfg=", 1)[1].split("\n", 1)[0], "the enabled list is the authority: no typed-in model"
+    page = srv.render_page("boot-authed")
+    for part in ("ov-setup", "jobs-setup", "ed-model-help"):
+        assert f'id="{part}"' in page, f"missing {part}"
+    assert "Only platforms enabled in Settings › Platforms are offered" in page
+
+
+def test_new_job_is_diverted_to_settings_while_nothing_is_configured(srv):
+    js = _js(srv)
+    for hook in ("#new-job", "#ov-new-job"):
+        assert f'if(e.target.closest("{hook}")){{ if(MODELS_CONFIGURED===false){{ setView("settings");' in js, hook
+    assert 'if(e.target.closest(".open-settings")){ setView("settings"); return; }' in js
+    assert 'MODELS_CONFIGURED===false ? \'<span class="attn" title="No platform is enabled yet"></span>\' : ""' in _plainfn(js, "paintNav")
+    assert 'if(MODELS_CONFIGURED===false) setView("settings");' in _plainfn(js, "submitSetup")
+    assert "paintSetupBanners();" in _plainfn(js, "render")
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_agent_step_refuses_what_settings_switched_off(srv, tmp_path):
+    """Creating, or changing platform/model: a platform that is not usable or a
+    model not switched on is refused with the sentence that says where to fix
+    it; editing another field of a job whose model was switched off later is
+    still allowed (the refusal is the launch's). A job with no model of its
+    own -- the combo shows the platform's default -- compares against that
+    resolved default, not the empty string was.m literally is, so leaving it
+    untouched is never misread as a change."""
+    js = _js(srv)
+    app = _app_js(srv)
+    # The real rule, not a hand copy: modelOptionsFor and the Agent step both
+    # call ALApp.modelEnabled, and a hand-copied stub can silently drift from
+    # what the page actually ships.
+    deps = _plainfn(app, "modelEnabled")
+    script = tmp_path / "validate-agent.js"
+    script.write_text(deps + """
+    const vals = {"ed-id": "j", "ed-cwd": "/x", "ed-prompt": "p", "ed-hours-start": "", "ed-hours-end": "",
+                  "ed-platform": "openai", "ed-model": "gpt-a"};
+    const $ = (id) => ({ get value(){ return vals[id] || ""; } });
+    const getDays = () => [1];
+    const DATA = {jobs: []};
+    const projById = () => null;
+    const ALApp = { platformOf: (j) => (j && j.platform) || "anthropic",
+                    modelEnabled,
+                    defaultModelFor: (p, P) => ((P||{})[p]||{}).default_model || "" };
+    let PLATFORMS = {anthropic: {enabled: true, usable: true, models_enabled: ["claude-opus-5"]},
+                     openai: {enabled: true, usable: false, models_enabled: []}};
+    let creating = true, editingJob = null;
+    """ + _plainfn(js, "validateStep") + """
+    const out = {};
+    out.platformOff = validateStep("agent");
+    PLATFORMS.openai = {enabled: true, usable: true, models_enabled: ["gpt-b"]};
+    out.modelOff = validateStep("agent");
+    vals["ed-model"] = "gpt-b";
+    out.ok = validateStep("agent");
+    creating = false; editingJob = {id: "j", platform: "openai", model: "gpt-a"}; vals["ed-model"] = "gpt-a";
+    out.unchangedEdit = validateStep("agent");
+    vals["ed-model"] = "gpt-zzz";
+    out.changedEdit = validateStep("agent");
+    // No model of its own: the combo shows the platform's default (fill's own
+    // fix, this same wave), so leaving it there is unchanged, not a switch
+    // away from the empty string was.m literally is.
+    PLATFORMS.openai = {enabled: true, usable: true, models_enabled: ["gpt-b"], default_model: "gpt-b"};
+    editingJob = {id: "j", platform: "openai", model: ""}; vals["ed-model"] = "gpt-b";
+    out.unchangedNoModel = validateStep("agent");
+    PLATFORMS = {};
+    out.blind = validateStep("agent");
+    console.log(JSON.stringify(out));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["platformOff"] == "This platform is not enabled in Settings › Platforms — enable it there, or pick another."
+    assert out["modelOff"] == "This model is switched off in Settings › Platforms — switch it on there, or pick another."
+    assert out["ok"] is None and out["unchangedEdit"] is None and out["blind"] is None
+    assert out["changedEdit"].startswith("This model is switched off")
+    assert out["unchangedNoModel"] is None, \
+        "an unset model must compare against the resolved default, not against the literal empty string"
+
+
+def test_opening_a_job_or_project_shows_a_switched_off_model_flagged(srv):
+    """fill() and openProjectEditor() used to hand the model combo a bare id
+    with no option list, so an existing job or project security block whose
+    model Settings had since switched off showed the raw id with no flagged
+    row, and the help text under it contradicted what was on screen -- only
+    the NEXT re-apply (applyPlatformToJobEditor/applyPlatformToSecurity's own
+    `keep` path, which does pass the option list) caught up. Opening must show
+    the truth immediately, the same as a re-apply does."""
+    js = _js(srv)
+    assert 'modelCombo.set(j.model||ALApp.defaultModelFor(plat,PLATFORMS), modelOptions(plat, j.model||""));' in js
+    assert 'secModelCombo.set(sec.model||"", modelOptions(splat, sec.model||""));' in js
+
+
+def test_a_config_change_re_reads_the_model_registry(srv):
+    """The config signature covers config/platforms.json since Settings
+    exists, so a switch flipped by the CLI or another tab moves it -- and the
+    editors, the strip and the chips all read /api/models, which the poll
+    never re-fetched: an open page kept offering a platform the CLI had just
+    disabled until a reload. The re-read rides on the sig branch, the first
+    read included -- that IS the boot's /api/models GET now, so neither boot
+    path fires a second one (list_models reads and scans the CLI binary), and
+    retryModelsIfMissing stands down while that first request is in flight
+    instead of asking again beside it. enterDashboard still hands submitSetup
+    the round trip, so a fresh install lands on Settings with
+    MODELS_CONFIGURED settled."""
+    js = _js(srv)
+    assert "await loadConfig(); loadModels();" in _fn(js, "refresh"), \
+        "a moved config_sig must re-read /api/models along with /api/config"
+    for name in ("enterDashboard", "boot"):
+        assert "loadModels()" not in _anyfn(js, name), \
+            f"{name} fires its own /api/models GET beside the one refresh() already fired"
+    assert "return modelsLoad;" in _anyfn(js, "enterDashboard")
+    assert "modelsPending" in _plainfn(js, "retryModelsIfMissing"), \
+        "the retry must stand down while a request is already in flight"
+    body = _fn(js, "loadModels")
+    assert "modelsPending=true;" in body and "finally{ modelsPending=false; }" in body
+
+
+def test_a_stuck_models_fetch_does_not_silence_the_retry_forever(srv):
+    """modelsPending has no age cap of its own: a fetch that never settles --
+    a backgrounded tab, a connection dropped with no error -- leaves it true
+    forever, and retryModelsIfMissing stands down for good instead of ever
+    trying again. loadModels must stamp when a load started (modelsPendingSince),
+    and the retry must stop trusting a "pending" flag once it is 60s stale."""
+    js = _js(srv)
+    assert "modelsPendingSince" in _fn(js, "loadModels"), \
+        "loadModels must record when it started, or the retry has no way to tell a stuck load from a fresh one"
+    assert "60000" in _plainfn(js, "retryModelsIfMissing"), \
+        "the retry must age out a pending load past 60s, or a hung fetch silences every retry for the rest of the session"
+
+
+def test_the_settings_modules_own_posts_answer_a_lost_session_like_the_poll(srv):
+    """The Settings page's calls go through settings.js's own post(), not the
+    page's api(): a session that ran out, or was signed out from another tab,
+    used to come back as an "HTTP 401" toast over a page refresh() was about
+    to replace with the login screen, and change() then kept "HTTP 401" as
+    the card's note. post() now answers 401/428 the way refresh() does --
+    sessionLost(), no toast, an empty output change() keeps no note for --
+    through the page's one sessionLost, bound like toast is."""
+    js = _js(srv)
+    app = _app_js(srv)
+    assert "sessionLost" in _plainfn(app, "bindPage"), "page.js must bind sessionLost"
+    a, b = _init_call_object(js, "ALApp.init")
+    assert "sessionLost" in js[a:b], "the page must hand sessionLost to ALApp.init"
+    post = _plainfn(app, "post")
+    assert "sessionLost" in post and "r.status === 401 || r.status === 428" in post
+    code = _strip_comments(post)   # the source's own comment names the toast it avoids
+    assert "toast" not in code.split("sessionLost", 1)[0], \
+        "a lost session must not toast before it puts the login screen back"
+    src = (REPO / "ui" / "app" / "settings.js").read_text()
+    assert re.search(r'import\s*\{[^}]*sessionLost[^}]*\}\s*from\s*"\./page\.js"', src, re.S), \
+        "settings.js must import sessionLost from page.js"
+    assert "else if(j && j.output)" in src, "an empty output (a lost session) must leave no note on the card"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -7464,6 +7983,11 @@ _UNSTYLED_CLASS_ALLOWLIST = {
     "secfind-stat",
     "total",
     "unique",
+    # setupBanner's Open Settings button (settings.js): a pure MARKER class
+    # -- "btn primary" already carries its whole look -- so a click on it can
+    # be delegated by class once this banner is mounted on two views at once
+    # and an id can no longer be given to both.
+    "open-settings",
 }
 
 
@@ -9673,13 +10197,20 @@ def test_the_model_catalog_is_asked_for_again_until_it_arrives(srv, tmp_path):
         "permanent for this tab")
     script = tmp_path / "models-retry.js"
     script.write_text(
-        "let PLATFORMS={}, modelTries=0, nextModelTry=0, calls=0;\n"
+        "let PLATFORMS={}, modelTries=0, nextModelTry=0, calls=0,"
+        " modelsPending=false, modelsPendingSince=0;\n"
         "function loadModels(){ calls++; }\n"
         "let NOW=1000; Date.now=()=>NOW;\n"
         + _plainfn(js, "modelCatalogMissing") + "\n"
         + _plainfn(js, "retryModelsIfMissing") + """
     const out = {};
     out.missing_empty = modelCatalogMissing();
+    // A request already in flight (the first refresh()'s own, at boot) IS
+    // the retry: nothing is asked beside it, while it is still fresh.
+    modelsPending = true; modelsPendingSince = NOW;
+    for(let i=0;i<3;i++){ retryModelsIfMissing(); NOW += 5000; }
+    out.tries_while_pending = calls;
+    modelsPending = false;
     // Ten polls, five seconds apart, with the catalog never arriving.
     for(let i=0;i<10;i++){ retryModelsIfMissing(); NOW += 5000; }
     out.tries_first_50s = calls;
@@ -9692,11 +10223,25 @@ def test_the_model_catalog_is_asked_for_again_until_it_arrives(srv, tmp_path):
     const before = calls;
     for(let i=0;i<10;i++){ retryModelsIfMissing(); NOW += 5000; }
     out.tries_once_loaded = calls - before;
+    // A fetch that never settles: modelsPending stays true forever on its
+    // own, but a load "pending" for more than 60s must stop blocking the
+    // retry, or a hung fetch silences it for the rest of the session.
+    PLATFORMS = {}; modelTries = 0; nextModelTry = 0;
+    modelsPending = true; modelsPendingSince = NOW;
+    const beforeStale = calls;
+    retryModelsIfMissing();
+    out.tries_freshly_pending = calls - beforeStale;
+    NOW += 65000;
+    retryModelsIfMissing();
+    out.tries_once_stale = calls - beforeStale;
     console.log(JSON.stringify(out));
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
                                     text=True, check=True).stdout)
     assert out["missing_empty"] is True, "an empty PLATFORMS is not recognised as missing"
+    assert out["tries_while_pending"] == 0, (
+        "a request already in flight is the retry -- asking again beside it is the "
+        "double GET at boot this guard exists to avoid")
     assert out["missing_after"] is False, "the arrived catalog is still read as missing"
     assert out["tries_first_50s"] >= 5, (
         "the first polls after a miss do not re-ask, so a server that restarted "
@@ -9708,6 +10253,13 @@ def test_the_model_catalog_is_asked_for_again_until_it_arrives(srv, tmp_path):
         "it gives up completely instead of slowing down, so a server that comes "
         "back late is never noticed")
     assert out["tries_once_loaded"] == 0, "it keeps fetching a catalog it already has"
+    assert out["tries_freshly_pending"] == 0, (
+        "a load pending for well under 60s is still the retry in flight -- asking "
+        "again beside it is the double GET this guard exists to avoid")
+    assert out["tries_once_stale"] == 1, (
+        "a load stuck 'pending' past 60s must no longer count as one, or a fetch "
+        "that never settles -- a dropped connection, a backgrounded tab -- "
+        "silences every retry for the rest of the session")
 
 
 def test_an_empty_combo_says_which_kind_of_empty_it_is(srv):

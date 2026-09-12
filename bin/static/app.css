@@ -2819,5 +2819,60 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
   .row2{grid-template-columns:1fr}
   .spark{width:88px}
 }
-/* ui-bundle: a38e87abdd2d10421802bc8d426e4bcd0943e089df496c1dad5db7f22b0a4984 */
-/* ui-sources: 134b851fbcb498cab658c010ab60be13d9f3103555f575a9d140a3c3eccfbfdb */
+/* ------------------------------------------------ Settings › Platforms
+   One card per listed platform (ui/app/settings.js). Header with the mark,
+   the status pill and the enable switch; two blocks (Binary, Session); the
+   model rows, one switch each. Measures follow the approved artboards in
+   docs/superpowers/mockups/2026-09-11-platform-settings/. */
+.summary{display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--muted);margin:0 0 14px}
+.platcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);margin:0 0 16px;overflow:hidden}
+.platcard-h{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line2)}
+.platcard-ic{display:flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:10px;
+  background:var(--accent-soft);color:var(--accent);flex:none;font-size:13px;font-weight:700;letter-spacing:-.02em}
+.platcard-ic.off{background:var(--panel2);color:var(--muted);border:1px solid var(--line)}
+.platcard-t{flex:1 1 auto;min-width:0}
+.platcard-t b{display:block;font-size:14.5px;font-weight:640;letter-spacing:-.01em}
+.platcard-t span{display:block;font-size:12px;color:var(--muted)}
+.platcard-r{display:flex;align-items:center;gap:14px;flex:none}
+.swlabel{display:flex;flex-direction:column;align-items:flex-end;gap:3px;font-size:11.5px;color:var(--muted);text-align:right}
+.swrow{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--ink)}
+.platnote{display:flex;align-items:flex-start;gap:8px;padding:10px 20px;font-size:12.5px;color:var(--muted);border-bottom:1px solid var(--line2)} .platnote .ic{width:14px;height:14px;margin-top:2px;flex:none} .platnote.err{color:var(--err);background:var(--err-soft)}
+.platcard-g{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:0}
+.platcard-g > div{padding:14px 20px 16px}
+.platcard-g > div + div{border-left:1px solid var(--line2)}
+.platcard-g h3{margin:0 0 9px}
+.val{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;min-height:20px}
+.val .ic{width:15px;height:15px}
+.val.ok .ic{color:var(--ok)} .val.err .ic{color:var(--err)} .val.mute{color:var(--muted);font-weight:500}
+.val code{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:1px 6px;font-weight:500;font-size:12.5px}
+.platcard .sub{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5}
+.ctrl{display:flex;gap:8px;align-items:center;margin-top:10px}
+.ctrl input{flex:1 1 auto;min-width:0;font:inherit;font-size:13px;height:34px;padding:0 11px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--ink)}
+.ctrl input:focus{outline:none;border-color:var(--accent)}
+.models-h{display:flex;align-items:center;gap:10px;padding:12px 20px;border-top:1px solid var(--line2);background:var(--panel2)}
+.models-h .sp{flex:1 1 auto}
+.models-h .age{font-size:12px;color:var(--muted)}
+.mrow{display:flex;align-items:center;gap:14px;padding:10px 20px;border-top:1px solid var(--line2)}
+.mname{flex:1 1 auto;min-width:0}
+.mname b{display:block;font-size:13px;font-weight:600}
+.mname span{display:block;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mrow.offrow .mname b{color:var(--muted);font-weight:500}
+.mmeta{display:flex;align-items:center;gap:10px;font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.mmeta .price{font-weight:600;color:var(--ink)}
+.mrow.offrow .mmeta .price{color:var(--muted);font-weight:500}
+.mmeta .jobs{display:inline-flex;align-items:center;font-size:11px;font-weight:600;color:var(--accent);background:var(--accent-soft);border-radius:20px;padding:0 8px;line-height:18px}
+.mempty{padding:16px 20px 18px;border-top:1px solid var(--line2);font-size:12.5px;color:var(--muted)}
+/* the strip Overview and Jobs show while nothing is configured */
+.setup-banner{display:flex;align-items:center;gap:14px;padding:14px 18px;margin:0 0 20px;
+  background:var(--warn-soft);border:1px solid color-mix(in srgb,var(--warn) 35%,var(--line));border-radius:13px}
+.setup-banner .bic{display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:10px;
+  background:color-mix(in srgb,var(--warn) 14%,transparent);color:var(--warn);flex:none}
+.setup-banner .bic .ic{width:17px;height:17px}
+.setup-banner .btxt{flex:1 1 auto;min-width:0;line-height:1.45}
+.setup-banner .btxt b{display:block;font-size:13.5px;font-weight:640}
+.setup-banner .btxt span{display:block;font-size:12.5px;color:var(--muted)}
+/* the attention dot on the Settings item while nothing is configured -- the Runs counter's pulse, still */
+.navitem .attn{width:8px;height:8px;border-radius:50%;background:var(--warn);flex:none;margin-right:4px}
+@media (max-width: 900px){ .platcard-g{grid-template-columns:1fr} .platcard-g > div + div{border-left:0;border-top:1px solid var(--line2)} }
+/* ui-bundle: 6634c38b5ea1e9921e8f0738bd9ae0b932333b8c3bde8ed74a67214bcacebec4 */
+/* ui-sources: 12e71db424ecfc150aca58a3d2e36181e73d219156cbf5587f725f9b000562a9 */

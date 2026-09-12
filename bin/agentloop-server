@@ -62,6 +62,14 @@ CONFIG_DIR = Path(_env("CONFIG", BASE_DIR / "config"))
 DATA_DIR = Path(_env("DATA", BASE_DIR / "data"))
 JOBS_FILE = CONFIG_DIR / "jobs.json"
 PROJECTS_FILE = CONFIG_DIR / "projects.json"
+PLATFORMS_FILE = CONFIG_DIR / "platforms.json"
+# The registry the page draws: the two platforms that run, and the one that is
+# listed and detected but not launched yet. Mirrors PLATFORMS/PLATFORMS_PLANNED
+# in the engine; tests/test_platforms_api.py pins the two together through
+# `agentloop platforms`.
+PLATFORM_REGISTRY = ("anthropic", "openai", "opencode")
+PLATFORMS_PLANNED = ("opencode",)
+PLATFORM_BIN_ENV = {"anthropic": "CLAUDE_BIN", "openai": "CODEX_BIN", "opencode": "OPENCODE_BIN"}
 STATE_FILE = DATA_DIR / "state.json"
 RUNS_FILE = DATA_DIR / "runs.ndjson"
 TOKEN_FILE = CONFIG_DIR / "control.token"
@@ -2027,10 +2035,13 @@ def server_supervised():
 
 
 def config_sig():
-    """Fingerprint of the two config files, so the page can tell when the parts
+    """Fingerprint of the four config files, so the page can tell when the parts
     of the payload that almost never change actually did."""
     parts = []
-    for p in (JOBS_FILE, PROJECTS_FILE):
+    # models.json carries the `families` map /api/models resolves ids from --
+    # the day the daily pass moves a family to a new id, an open tab must
+    # re-read, so its stamp rides here too.
+    for p in (JOBS_FILE, PROJECTS_FILE, PLATFORMS_FILE, CONFIG_DIR / "models.json"):
         try:
             st = p.stat()
             parts.append(f"{st.st_mtime_ns}:{st.st_size}")
@@ -2584,6 +2595,128 @@ def _job_platform(job, projects):
     return p if p in PLATFORM_PERMISSIONS else "anthropic"
 
 
+def platforms_config():
+    """config/platforms.json as (platforms dict, error sentence).
+
+    The server never invents the seed: a missing file is written by the engine
+    (`agentloop platforms` runs platforms_ensure) and read back; a seed that
+    fails, or still leaves the file missing, reports the engine's own output
+    as `error`. An unreadable file (a transient OSError on one that does
+    exist) reads as nothing enabled with no error. An invalid file reads as
+    nothing enabled too, with the engine's own sentence as `error`.
+    """
+    if not PLATFORMS_FILE.exists():
+        ok, out = al(["platforms"])
+        if not ok or not PLATFORMS_FILE.exists():
+            # A seed that exited 0 and still left no file printed the
+            # registry JSON, not a reason -- that must never land in `error`.
+            return {}, (out if not ok else "") or f"{PLATFORMS_FILE} could not be seeded"
+    try:
+        text = PLATFORMS_FILE.read_text()
+    except OSError:
+        return {}, ""
+    bad = f"{PLATFORMS_FILE} is not a valid platforms file (not JSON, or no .platforms object) — no platform is enabled until it is fixed"
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}, bad
+    p = data.get("platforms") if isinstance(data, dict) else None
+    if not isinstance(p, dict):
+        return {}, bad                     # the engine's platforms_valid, mirrored
+    return p, ""
+
+
+def _bin_detect(p):
+    """The engine's detection, mirrored: platform_bin's last resort."""
+    home = Path.home()
+    if p == "anthropic":
+        local = home / ".local/bin/claude"
+        if os.access(local, os.X_OK):
+            return str(local)
+        return shutil.which("claude") or str(local)
+    if p == "openai":
+        return shutil.which("codex") or "/opt/homebrew/bin/codex"
+    found = shutil.which("opencode")
+    if found:
+        return found
+    alt = home / ".opencode/bin/opencode"
+    return str(alt) if os.access(alt, os.X_OK) else "/opt/homebrew/bin/opencode"
+
+
+def platform_bin(p, entry):
+    """(path, source): the environment override, else the file's bin, else detection --
+    exactly platform_bin/platform_bin_source in the engine."""
+    env = _env(PLATFORM_BIN_ENV[p]) or ""
+    if env:
+        return env, "env"                   # the engine prints the override raw, no ~ expansion
+    file_bin = (entry or {}).get("bin")
+    if isinstance(file_bin, str) and file_bin:
+        return os.path.expanduser(file_bin), "file"
+    return _bin_detect(p), "auto"
+
+
+def jobs_using(p, jobs, projects, resolved, default, catalog_slugs):
+    """(model id -> n, n jobs) over the enabled jobs and enabled security blocks
+    whose effective platform is `p` -- the engine's `uses` (PLATFORMS_JQ), in
+    python. A job or block with no model, or one invalid on this platform, is
+    credited to the platform's default model instead (the engine's
+    `effective`) and still counts on the platform either way: `n_jobs` counts
+    jobs/blocks, `out` only the ones that land on a real (non-empty) model id.
+    """
+
+    def rid(m):
+        r = resolved.get(m)
+        return (r.get("id") or m) if isinstance(r, dict) else m
+
+    def valid(m):
+        if p == "openai":
+            return not catalog_slugs or m in catalog_slugs   # an empty catalog validates nothing
+        return m in ("opus", "sonnet", "haiku", "fable") or m.startswith("claude-")
+
+    def effective(m):
+        return rid(m if (m and valid(m)) else default)
+
+    by_name = {e.get("name"): e for e in projects if isinstance(e, dict)}
+    out = {}
+    n_jobs = 0
+    for j in jobs:
+        if not isinstance(j, dict) or j.get("enabled") is False or _job_platform(j, projects) != p:
+            continue
+        proj = by_name.get(j.get("project") or "") or {}
+        m = effective(j.get("model") or proj.get("model") or "")
+        n_jobs += 1
+        if m:
+            out[m] = out.get(m, 0) + 1
+    for e in projects:
+        sec = e.get("security") if isinstance(e, dict) else None
+        if not isinstance(sec, dict) or sec.get("enabled") not in (True, "true"):
+            continue
+        sp = sec.get("platform") or e.get("platform") or "anthropic"
+        if (sp if sp in PLATFORM_PERMISSIONS else "anthropic") != p:
+            continue
+        m = effective(sec.get("model") or "")
+        n_jobs += 1
+        if m:
+            out[m] = out.get(m, 0) + 1
+    return out, n_jobs
+
+
+def platform_entry(p, cfg, jobs, projects, resolved, catalog_slugs):
+    """What Settings switched on for one platform, as /api/models carries it."""
+    entry = cfg.get(p) if isinstance(cfg.get(p), dict) else {}
+    enabled = entry.get("enabled") in (True, "true")        # the engine's tostring == "true", mirrored
+    models = [m for m in (entry.get("models") or []) if isinstance(m, str) and m]
+    b, src = platform_bin(p, entry)
+    default = models[0] if models else ""
+    using, n_jobs = jobs_using(p, jobs, projects, resolved, default, catalog_slugs)
+    return {"supported": p not in PLATFORMS_PLANNED, "enabled": enabled,
+            "usable": enabled and bool(models), "bin": b, "bin_source": src,
+            # The engine's own test (`-f && -x`): a directory is executable
+            # to os.access and is not a binary.
+            "bin_found": os.path.isfile(b) and os.access(b, os.X_OK), "models_enabled": models,
+            "jobs_on_platform": n_jobs, "jobs_using": using}
+
+
 def list_models():
     """Every concrete model id an ANTHROPIC job can be pinned to.
 
@@ -2601,11 +2734,18 @@ def list_models():
     be offered for a Claude job and then refused by `set-field model` with a
     500. `platforms.openai.models` is where those slugs belong.
     """
-    resolved = {}
+    cfg, err = platforms_config()
+    resolved, catalog_slugs = {}, set()
     try:
         data = json.loads((CONFIG_DIR / "models.json").read_text())
         resolved = data.get("resolved") or {}
+        odata = data.get("openai")
+        if isinstance(odata, dict):
+            catalog_slugs = {m["slug"] for m in (odata.get("models") or [])
+                              if isinstance(m, dict) and isinstance(m.get("slug"), str)}
     except Exception:  # noqa: BLE001
+        resolved = {}
+    if not isinstance(resolved, dict):
         resolved = {}
     families = []
     for fam, desc in MODEL_FAMILIES:
@@ -2628,9 +2768,11 @@ def list_models():
     for f in families:                      # whatever the families resolve to
         if f["id"]:
             ids.add(f["id"])
+    jobs, projects = [], []
     try:
+        jobs = read_json(JOBS_FILE, {}).get("jobs", [])
         projects = read_json(PROJECTS_FILE, {}).get("projects", [])
-        for j in json.loads(JOBS_FILE.read_text()).get("jobs", []):
+        for j in jobs:
             if _job_platform(j, projects) != "anthropic":
                 continue
             if _anthropic_model(j.get("model")):
@@ -2648,6 +2790,12 @@ def list_models():
             conn.close()
     except Exception:  # noqa: BLE001
         pass
+    # A hand edit can leave either file as e.g. {"jobs": null}: the try above
+    # then leaves jobs/projects as None, and jobs_using below has no try of
+    # its own around its "for j in jobs" -- normalise here so that a malformed
+    # file never takes /api/models down with it.
+    jobs = jobs if isinstance(jobs, list) else []
+    projects = projects if isinstance(projects, list) else []
     ids -= {f[0] for f in MODEL_FAMILIES}
 
     fam_order = [f[0] for f in MODEL_FAMILIES]
@@ -2656,12 +2804,30 @@ def list_models():
         f = next((i for i, x in enumerate(fam_order) if x in v), 9)
         return (f, [-int(n) for n in re.findall(r"\d+", v)])   # newest first
     models = sorted(ids, key=sort_key)
-    return {"models": models, "efforts": list(ANTHROPIC_EFFORTS),
-            "platforms": {"anthropic": {"available": True, "reason": "", "models": models,
-                                        "efforts": list(ANTHROPIC_EFFORTS),
-                                        "permissions": PLATFORM_PERMISSIONS["anthropic"],
-                                        "default_model": "opus"},
-                          "openai": _openai_platform()}}
+
+    anthropic = {"available": True, "reason": "", "models": models,
+                 "efforts": list(ANTHROPIC_EFFORTS),
+                 "permissions": PLATFORM_PERMISSIONS["anthropic"],
+                 "default_model": "",
+                 # What each family resolves to in the cache RIGHT NOW: the id
+                 # the engine's effective_model launches a family job with, and
+                 # so the id platform_model_enabled gates it on. The page's
+                 # modelEnabled reads this instead of guessing from the id's
+                 # prefix; a family the cache has not resolved is left out.
+                 "families": {f["v"]: f["id"] for f in families if f["id"]},
+                 "catalog_at": max([int(r.get("at") or 0) for r in resolved.values() if isinstance(r, dict)] or [0])}
+    anthropic.update(platform_entry("anthropic", cfg, jobs, projects, resolved, catalog_slugs))
+    # By construction the first id of the filtered models_enabled list, like the engine.
+    anthropic["default_model"] = (anthropic["models_enabled"] or [""])[0]
+    openai = _openai_platform()
+    openai.update(platform_entry("openai", cfg, jobs, projects, resolved, catalog_slugs))
+    openai["default_model"] = (openai["models_enabled"] or [""])[0]
+    opencode = {"available": False, "reason": "runs on OpenCode arrive with the OpenCode engine",
+                "models": [], "efforts": [], "permissions": [], "default_model": "", "catalog_at": 0}
+    opencode.update(platform_entry("opencode", cfg, jobs, projects, resolved, catalog_slugs))
+    platforms = {"anthropic": anthropic, "openai": openai, "opencode": opencode}
+    return {"models": models, "efforts": list(ANTHROPIC_EFFORTS), "platforms": platforms,
+            "configured": any(v["usable"] for v in platforms.values()), "error": err}
 
 
 def list_dirs(path):
@@ -3282,6 +3448,32 @@ def security_decide(body):
     return (200, {"ok": True}) if ok else (500, {"error": out})
 
 
+def platform_action(op, body):
+    """The six Settings ops, each one `agentloop platform <verb> <platform>` -- the
+    engine validates and refuses; this only shapes the request and relays the answer."""
+    platform = str(body.get("platform", "") or "").strip()
+    if platform not in PLATFORM_REGISTRY:
+        return 400, {"error": "unknown platform"}
+    verb = op[len("platform_"):].replace("_", "-")     # check enable disable set-bin models set-models
+    args = ["platform", verb, platform]
+    stdin = None
+    if op == "platform_set_bin":
+        args.append(str(body.get("bin", "") or ""))
+    elif op == "platform_set_models":
+        models = body.get("models")
+        if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
+            return 400, {"error": "models must be a list of ids"}
+        stdin = json.dumps(models)
+    ok, out = al(args, stdin=stdin)
+    if ok and op in ("platform_check", "platform_models"):
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            return 500, {"ok": False, "output": out}
+        return 200, {"ok": True, ("check" if op == "platform_check" else "catalog"): payload}
+    return (200 if ok else 500), {"ok": ok, "output": out}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "agentloop/3"
 
@@ -3556,6 +3748,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if op == "prefs_set":
             code, payload = set_pref(str(body.get("key", "")), body.get("value"))
+            return self._send(code, payload)
+
+        if op in ("platform_check", "platform_enable", "platform_disable",
+                  "platform_set_bin", "platform_models", "platform_set_models"):
+            code, payload = platform_action(op, body)
             return self._send(code, payload)
 
         # Behind the gate, unlike profile_create: this one edits a profile that

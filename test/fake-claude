@@ -24,7 +24,20 @@
 #                      (CLAUDE_CONFIG_DIR, empty line when it has none) — the
 #                      one fact the argv cannot show, since it travels in the
 #                      environment
+#   FAKE_CLAUDE_LOGGED_OUT  set to play a CLI with no session: `auth status` exits 1
 set -u
+
+# The two probes platform_check makes BEFORE a launch. Answered here, before
+# any recording below, so a FAKE_ARGV_OUT/FAKE_ACCOUNT_OUT set for the launch
+# never captures the probe instead of the run.
+case "${1:-}" in
+  --version) echo "2.1.258 (Claude Code)"; exit 0 ;;
+  auth)
+    if [ -n "${FAKE_CLAUDE_LOGGED_OUT:-}" ]; then
+      printf '{"loggedIn":false,"authMethod":"none"}\n'; exit 1
+    fi
+    printf '{"loggedIn":true,"authMethod":"claude.ai","email":"fake@example.org","subscriptionType":"max"}\n'; exit 0 ;;
+esac
 
 if [ -n "${FAKE_ACCOUNT_OUT:-}" ]; then
   printf '%s\n' "${CLAUDE_CONFIG_DIR:-}" > "$FAKE_ACCOUNT_OUT"

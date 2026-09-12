@@ -29,7 +29,8 @@
 import { bindPage } from "./page.js";
 import { pageHeader, kpiCard, tableFooter } from "./chrome.js";
 import { visibleJobs, jobFilters, bulkOn, bulkLabel,
-         clearJobFilters, jobProjectNames, sortJobs, JOB_COLS } from "./jobs-domain.js";
+         clearJobFilters, jobProjectNames, sortJobs, JOB_COLS,
+         platformState, platformChip } from "./jobs-domain.js";
 import { groupJobs, jobsEmptyNote, worktreesCard,
          renderOverviewHead, jobCard } from "./overview.js";
 import { renderJobsPage, jobsSort, jobsSetPage, initJobDrag } from "./jobs-table.js";
@@ -40,8 +41,11 @@ import { RF, renderRunsPage, runsSort, runsSetPage,
          clearRunFilters, runSearch, runProjectNames } from "./runs.js";
 import { changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, effortsFor,
          FALLBACK_PERMISSIONS, permissionsFor, defaultPermissionFor, defaultModelFor,
-         modelOptionsFor, platformOf, platformLabel, costParts, tokensText,
+         modelOptionsFor, platformOf, platformLabel, PLATFORM_LABELS, registryKnown,
+         platformOptions, hiddenModelCount, modelEnabled, DISABLED_SUFFIX,
+         costParts, tokensText,
          dayNumbers, shapeRepoRows, projectStepError } from "./editor-domain.js";
+import { renderSettingsPage, settingsSummary, platformStatus, setupBanner } from "./settings.js";
 
 function init(cc){
   bindPage(cc);
@@ -202,9 +206,38 @@ window.ALApp = { init, visibleJobs, jobFilters, bulkOn,
                  changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, effortsFor,
                  FALLBACK_PERMISSIONS, permissionsFor, defaultPermissionFor, defaultModelFor,
                  modelOptionsFor, platformOf, platformLabel,
+                 // PLATFORM_LABELS, registryKnown, platformOptions and
+                 // hiddenModelCount are Task 7's: the Platform/Model combos'
+                 // own read of what Settings switched on, alongside
+                 // modelOptionsFor's now-optional fourth argument above.
+                 // platformState and platformChip are jobs-domain.js's own
+                 // half of the same task -- the verdict jobCard and jobRow
+                 // both put on screen as a chip next to the status pill.
+                 PLATFORM_LABELS, registryKnown, platformOptions, hiddenModelCount,
+                 platformState, platformChip,
+                 // modelEnabled and DISABLED_SUFFIX are Task 7's fix wave 1:
+                 // the one rule modelOptionsFor and platformState both read
+                 // for whether Settings left a model switched on (a family
+                 // value like "opus" counts once an id of that family is on
+                 // the list), and the label suffix modelOptionsFor and
+                 // platformOptions both flag a switched-off value with.
+                 // Exported because a later task's validateStep reads
+                 // ALApp.modelEnabled for the editor's own Agent step.
+                 modelEnabled, DISABLED_SUFFIX,
                  // costParts and tokensText are the same plan's Task 4: what a
                  // run's cost cell and Tokens row say, shared by the Runs table
                  // (runs.js, by import) and the run dialog's renderLog/costHtml
                  // in bin/dashboard.html, which reaches them through here.
                  costParts, tokensText,
-                 dayNumbers, shapeRepoRows, projectStepError };
+                 dayNumbers, shapeRepoRows, projectStepError,
+                 // renderSettingsPage, settingsSummary, platformStatus and
+                 // setupBanner are Task 8's (the platforms UI plan):
+                 // Settings › Platforms, drawn whole by ui/app/settings.js.
+                 // The page's own paintSettings() calls
+                 // ALApp.renderSettingsPage() on entering the view and after
+                 // every /api/models re-read; settingsSummary and
+                 // platformStatus are the two pure helpers the contract
+                 // tests pin standing alone; setupBanner is the strip a
+                 // later task mounts on Overview and Jobs while nothing is
+                 // configured, reached from the page the same way.
+                 renderSettingsPage, settingsSummary, platformStatus, setupBanner };

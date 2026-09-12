@@ -23,6 +23,7 @@
   var refresh;
   var paintJobPickers;
   var normStatus;
+  var sessionLost;
   var openLog;
   var resumeTarget;
   var resumeTip;
@@ -60,6 +61,7 @@
       refresh,
       paintJobPickers,
       normStatus,
+      sessionLost,
       openLog,
       resumeTarget,
       resumeTip,
@@ -235,6 +237,185 @@
     return foot;
   }
 
+  // ui/app/editor-domain.js
+  function changedKeys(now, clean) {
+    return Object.keys(now).filter((k) => now[k] !== clean[k]);
+  }
+  var FALLBACK_EFFORTS = ["", "low", "medium", "high", "xhigh", "max"];
+  var EFFORTS = FALLBACK_EFFORTS;
+  function effortsFor(platform, model, platforms) {
+    const p = (platforms || {})[platform || "anthropic"];
+    if (!p) return FALLBACK_EFFORTS.slice();
+    let levels = null;
+    if ((platform || "anthropic") === "openai" && model) {
+      const m = (p.models || []).find((x) => x && x.v === model);
+      if (m && Array.isArray(m.efforts) && m.efforts.length) levels = m.efforts;
+    }
+    if (!levels && Array.isArray(p.efforts) && p.efforts.length) levels = p.efforts;
+    if (!levels) return [""];
+    return [""].concat(levels.filter((l) => typeof l === "string" && l));
+  }
+  function effortIndex(v, list) {
+    return Math.max(0, (list || FALLBACK_EFFORTS).indexOf(v || ""));
+  }
+  function effortFromIndex(raw, list) {
+    return (list || FALLBACK_EFFORTS)[+raw || 0] || "";
+  }
+  var FALLBACK_PERMISSIONS = {
+    anthropic: [
+      { v: "acceptEdits", label: "acceptEdits \u2014 edits allowed, commands ask" },
+      { v: "auto", label: "auto \u2014 the CLI decides per tool" },
+      { v: "bypassPermissions", label: "bypassPermissions \u2014 nothing asks" },
+      { v: "manual", label: "manual \u2014 everything asks (headless: everything denied)" },
+      { v: "dontAsk", label: "dontAsk \u2014 allowlisted tools only, no prompts" },
+      { v: "plan", label: "plan \u2014 read-only planning" }
+    ],
+    openai: [
+      { v: "read-only", label: "read-only \u2014 sandbox: no writes, no network" },
+      { v: "workspace-write", label: "workspace-write \u2014 sandbox: writes inside the workspace" },
+      { v: "full-access", label: "full-access \u2014 no sandbox, no approvals" }
+    ]
+  };
+  function permissionsFor(platform, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    const list = p && Array.isArray(p.permissions) && p.permissions.length ? p.permissions : FALLBACK_PERMISSIONS[key];
+    return list.map((o) => ({ v: o.v, label: o.label || o.v }));
+  }
+  function defaultPermissionFor(platform, kind) {
+    if (platform === "openai") return kind === "security" ? "full-access" : "workspace-write";
+    return "bypassPermissions";
+  }
+  function defaultModelFor(platform, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    if (p && p.default_model) return p.default_model;
+    return key === "anthropic" ? "opus" : "";
+  }
+  var DISABLED_SUFFIX = " (disabled in Settings)";
+  function modelEnabled(platform, model, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    if (!p || !Array.isArray(p.models_enabled)) return true;
+    if (!model) return true;
+    if (p.models_enabled.includes(model)) return true;
+    if (!/^(opus|sonnet|haiku|fable)$/.test(model)) {
+      return Object.entries(p.families || {}).some(([f, id]) => id === model && p.models_enabled.includes(f));
+    }
+    if (p.families && typeof p.families === "object") {
+      const id = p.families[model];
+      return typeof id === "string" && id !== "" && p.models_enabled.includes(id);
+    }
+    return p.models_enabled.some((id) => id.startsWith("claude-" + model + "-"));
+  }
+  function modelOptionsFor(platform, platforms, groupFn, current) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    const enabledList = p && Array.isArray(p.models_enabled) ? p.models_enabled : null;
+    const keep = (v) => !enabledList || enabledList.includes(v);
+    let opts;
+    if (key === "anthropic") {
+      const ids = (p && Array.isArray(p.models) ? p.models : []).filter(keep);
+      opts = groupFn ? groupFn(ids) : ids.map((v) => ({ v, label: v }));
+    } else {
+      const list = (p && Array.isArray(p.models) ? p.models : []).filter((m) => keep(m.v));
+      const noPrice = (m) => m.priced === false ? " \xB7 no price" : "";
+      const live2 = list.filter((m) => !m.deprecated_by).map((m) => ({
+        v: m.v,
+        label: (m.label || m.v) + (m.desc ? " \u2014 " + m.desc : "") + noPrice(m)
+      }));
+      const old = list.filter((m) => m.deprecated_by).map((m) => ({
+        v: m.v,
+        label: (m.label || m.v) + " \u2014 \u2192 " + m.deprecated_by + (m.retires_at ? ", retires " + String(m.retires_at).slice(0, 10) : "") + noPrice(m)
+      }));
+      opts = live2.concat(old);
+    }
+    if (current && !modelEnabled(platform, current, platforms)) {
+      opts.push({ v: current, label: current + DISABLED_SUFFIX, flagged: true });
+    }
+    return opts;
+  }
+  function platformOf(job, project) {
+    const own = job && job.platform;
+    if (own) return own === "openai" ? "openai" : "anthropic";
+    const pp = project && project.platform;
+    if (pp === "anthropic" || pp === "openai") return pp;
+    return "anthropic";
+  }
+  function platformLabel(p) {
+    return p === "openai" ? "OpenAI" : "Anthropic";
+  }
+  var PLATFORM_LABELS = { anthropic: "Anthropic", openai: "OpenAI", opencode: "OpenCode" };
+  function registryKnown(platforms) {
+    const a = platforms && platforms.anthropic;
+    return !!(a && a.enabled !== void 0);
+  }
+  function platformOptions(platforms, current) {
+    const known = ["anthropic", "openai"];
+    const have = registryKnown(platforms);
+    const out = known.filter((p) => !have || (platforms[p] || {}).usable === true).map((p) => ({ v: p, label: PLATFORM_LABELS[p] }));
+    if (current && !out.some((o) => o.v === current)) {
+      const label = current === "opencode" ? PLATFORM_LABELS.opencode + " (not supported yet)" : (PLATFORM_LABELS[current] || current) + DISABLED_SUFFIX;
+      out.push({ v: current, label, flagged: true });
+    }
+    return out;
+  }
+  function hiddenModelCount(platform, platforms) {
+    const key = platform === "openai" ? "openai" : "anthropic";
+    const p = (platforms || {})[key];
+    if (!p || !Array.isArray(p.models_enabled) || !Array.isArray(p.models)) return 0;
+    const ids = p.models.map((m) => typeof m === "string" ? m : m.v);
+    return ids.filter((v) => !p.models_enabled.includes(v)).length;
+  }
+  function dayNumbers(rawValues) {
+    return rawValues.map((v) => +v);
+  }
+  function shapeRepoRows(rawRows) {
+    return rawRows.map((r) => ({ name: r.name.trim(), path: r.path.trim(), base: r.base.trim() })).filter((r) => r.name && r.path);
+  }
+  function projectStepError(k, values) {
+    if (k === "project") {
+      const n = values.name;
+      if (!n) return { ok: false, message: "A project name is required." };
+      if (!values.editingProject && values.projects.some((p) => p.name === n))
+        return { ok: false, message: "A project with that name already exists." };
+      if (!values.cwd)
+        return { ok: false, message: "Pick a working directory \u2014 the folder its runs work in." };
+    }
+    if (k === "repos" && values.multi) {
+      const rows = values.repos;
+      if (!rows.length)
+        return { ok: false, message: "Add a repository, or go back to a single repository." };
+      if (!rows.some((r) => r.path === values.cwd))
+        return { ok: false, message: "One repo's path must be exactly the working directory from step 1 \u2014 that is the repo the agent starts in. None of these match it." };
+    }
+    return { ok: true };
+  }
+  function costParts(r, fmt) {
+    const basis = r && r.cost_basis || "reported";
+    if (basis === "none") return {
+      text: "\u2014",
+      cls: "cost-none",
+      tip: "No cost recorded: the model has no price in config/pricing.json, or the run ended without a final event"
+    };
+    if (basis === "estimated") return {
+      text: "~" + fmt(r && r.cost || 0),
+      cls: "cost-est",
+      tip: "Estimated from the run's tokens with config/pricing.json \u2014 the Codex CLI reports tokens, not dollars"
+    };
+    return { text: fmt(r && r.cost || 0), cls: "", tip: "" };
+  }
+  function tokensText(t) {
+    if (!t || typeof t !== "object") return "\u2014";
+    const n = (v) => Number(v || 0).toLocaleString("en-US");
+    const extra = [];
+    if (t.cached) extra.push(n(t.cached) + " cached");
+    if (t.cache_write) extra.push(n(t.cache_write) + " cache write");
+    let s = n(t.input) + " in" + (extra.length ? " (" + extra.join(", ") + ")" : "") + " \xB7 " + n(t.output) + " out";
+    if (t.reasoning) s += " (" + n(t.reasoning) + " reasoning)";
+    return s;
+  }
+
   // ui/app/jobs-domain.js
   var jobFilters = { project: "", status: "", query: "" };
   function inWindow(j, when) {
@@ -374,138 +555,22 @@
     none.sort((a, b) => String(a.j.id).localeCompare(String(b.j.id)));
     return have.concat(none);
   }
-
-  // ui/app/editor-domain.js
-  function changedKeys(now, clean) {
-    return Object.keys(now).filter((k) => now[k] !== clean[k]);
+  function platformState(j, project, platforms) {
+    if (j && j.platform === "opencode") return "planned";
+    const p = platformOf(j, project);
+    const entry = (platforms || {})[p];
+    if (!entry || entry.enabled === void 0) return "ok";
+    if (!entry.usable) return "platform_disabled";
+    const model = eff(j, "model", "") || entry.default_model || "";
+    if (model && !modelEnabled(p, model, platforms)) return "model_disabled";
+    return "ok";
   }
-  var FALLBACK_EFFORTS = ["", "low", "medium", "high", "xhigh", "max"];
-  var EFFORTS = FALLBACK_EFFORTS;
-  function effortsFor(platform, model, platforms) {
-    const p = (platforms || {})[platform || "anthropic"];
-    if (!p) return FALLBACK_EFFORTS.slice();
-    let levels = null;
-    if ((platform || "anthropic") === "openai" && model) {
-      const m = (p.models || []).find((x) => x && x.v === model);
-      if (m && Array.isArray(m.efforts) && m.efforts.length) levels = m.efforts;
-    }
-    if (!levels && Array.isArray(p.efforts) && p.efforts.length) levels = p.efforts;
-    if (!levels) return [""];
-    return [""].concat(levels.filter((l) => typeof l === "string" && l));
-  }
-  function effortIndex(v, list) {
-    return Math.max(0, (list || FALLBACK_EFFORTS).indexOf(v || ""));
-  }
-  function effortFromIndex(raw, list) {
-    return (list || FALLBACK_EFFORTS)[+raw || 0] || "";
-  }
-  var FALLBACK_PERMISSIONS = {
-    anthropic: [
-      { v: "acceptEdits", label: "acceptEdits \u2014 edits allowed, commands ask" },
-      { v: "auto", label: "auto \u2014 the CLI decides per tool" },
-      { v: "bypassPermissions", label: "bypassPermissions \u2014 nothing asks" },
-      { v: "manual", label: "manual \u2014 everything asks (headless: everything denied)" },
-      { v: "dontAsk", label: "dontAsk \u2014 allowlisted tools only, no prompts" },
-      { v: "plan", label: "plan \u2014 read-only planning" }
-    ],
-    openai: [
-      { v: "read-only", label: "read-only \u2014 sandbox: no writes, no network" },
-      { v: "workspace-write", label: "workspace-write \u2014 sandbox: writes inside the workspace" },
-      { v: "full-access", label: "full-access \u2014 no sandbox, no approvals" }
-    ]
-  };
-  function permissionsFor(platform, platforms) {
-    const key = platform === "openai" ? "openai" : "anthropic";
-    const p = (platforms || {})[key];
-    const list = p && Array.isArray(p.permissions) && p.permissions.length ? p.permissions : FALLBACK_PERMISSIONS[key];
-    return list.map((o) => ({ v: o.v, label: o.label || o.v }));
-  }
-  function defaultPermissionFor(platform, kind) {
-    if (platform === "openai") return kind === "security" ? "full-access" : "workspace-write";
-    return "bypassPermissions";
-  }
-  function defaultModelFor(platform, platforms) {
-    const key = platform === "openai" ? "openai" : "anthropic";
-    const p = (platforms || {})[key];
-    if (p && p.default_model) return p.default_model;
-    return key === "anthropic" ? "opus" : "";
-  }
-  function modelOptionsFor(platform, platforms, groupFn) {
-    const key = platform === "openai" ? "openai" : "anthropic";
-    const p = (platforms || {})[key];
-    if (key === "anthropic") {
-      const ids = p && Array.isArray(p.models) ? p.models : [];
-      return groupFn ? groupFn(ids) : ids.map((v) => ({ v, label: v }));
-    }
-    const list = p && Array.isArray(p.models) ? p.models : [];
-    const noPrice = (m) => m.priced === false ? " \xB7 no price" : "";
-    const live = list.filter((m) => !m.deprecated_by).map((m) => ({
-      v: m.v,
-      label: (m.label || m.v) + (m.desc ? " \u2014 " + m.desc : "") + noPrice(m)
-    }));
-    const old = list.filter((m) => m.deprecated_by).map((m) => ({
-      v: m.v,
-      label: (m.label || m.v) + " \u2014 \u2192 " + m.deprecated_by + (m.retires_at ? ", retires " + String(m.retires_at).slice(0, 10) : "") + noPrice(m)
-    }));
-    return live.concat(old);
-  }
-  function platformOf(job, project) {
-    const own = job && job.platform;
-    if (own) return own === "openai" ? "openai" : "anthropic";
-    const pp = project && project.platform;
-    if (pp === "anthropic" || pp === "openai") return pp;
-    return "anthropic";
-  }
-  function platformLabel(p) {
-    return p === "openai" ? "OpenAI" : "Anthropic";
-  }
-  function dayNumbers(rawValues) {
-    return rawValues.map((v) => +v);
-  }
-  function shapeRepoRows(rawRows) {
-    return rawRows.map((r) => ({ name: r.name.trim(), path: r.path.trim(), base: r.base.trim() })).filter((r) => r.name && r.path);
-  }
-  function projectStepError(k, values) {
-    if (k === "project") {
-      const n = values.name;
-      if (!n) return { ok: false, message: "A project name is required." };
-      if (!values.editingProject && values.projects.some((p) => p.name === n))
-        return { ok: false, message: "A project with that name already exists." };
-      if (!values.cwd)
-        return { ok: false, message: "Pick a working directory \u2014 the folder its runs work in." };
-    }
-    if (k === "repos" && values.multi) {
-      const rows = values.repos;
-      if (!rows.length)
-        return { ok: false, message: "Add a repository, or go back to a single repository." };
-      if (!rows.some((r) => r.path === values.cwd))
-        return { ok: false, message: "One repo's path must be exactly the working directory from step 1 \u2014 that is the repo the agent starts in. None of these match it." };
-    }
-    return { ok: true };
-  }
-  function costParts(r, fmt) {
-    const basis = r && r.cost_basis || "reported";
-    if (basis === "none") return {
-      text: "\u2014",
-      cls: "cost-none",
-      tip: "No cost recorded: the model has no price in config/pricing.json, or the run ended without a final event"
-    };
-    if (basis === "estimated") return {
-      text: "~" + fmt(r && r.cost || 0),
-      cls: "cost-est",
-      tip: "Estimated from the run's tokens with config/pricing.json \u2014 the Codex CLI reports tokens, not dollars"
-    };
-    return { text: fmt(r && r.cost || 0), cls: "", tip: "" };
-  }
-  function tokensText(t) {
-    if (!t || typeof t !== "object") return "\u2014";
-    const n = (v) => Number(v || 0).toLocaleString("en-US");
-    const extra = [];
-    if (t.cached) extra.push(n(t.cached) + " cached");
-    if (t.cache_write) extra.push(n(t.cache_write) + " cache write");
-    let s = n(t.input) + " in" + (extra.length ? " (" + extra.join(", ") + ")" : "") + " \xB7 " + n(t.output) + " out";
-    if (t.reasoning) s += " (" + n(t.reasoning) + " reasoning)";
-    return s;
+  function platformChip(st) {
+    if (st === "ok") return null;
+    const c = el("span", "pill idle");
+    c.textContent = st === "planned" ? "platform not supported yet" : st === "platform_disabled" ? "platform disabled" : "model disabled";
+    c.title = st === "planned" ? "This platform arrives with a later release \u2014 runs are refused until then" : "Switched off in Settings \u203A Platforms \u2014 runs are refused until it is switched on again, or the job picks another";
+    return c;
   }
 
   // ui/app/overview.js
@@ -804,6 +869,8 @@
     const pill = el("span", "pill " + pillCls, disabled ? "disabled" : idle ? "idle" : "enabled");
     if (idle) pill.title = "Outside its active window \u2014 no runs until the window reopens";
     h2.appendChild(pill);
+    const pchip = platformChip(platformState(j, projById(j.project || ""), AL.PLATFORMS));
+    if (pchip) h2.appendChild(pchip);
     card.appendChild(h2);
     if (disabled && nLive) {
       const w = el("div", "warnline");
@@ -1354,6 +1421,8 @@
       if (F.idle) pill.title = "Outside its active window \u2014 no runs until the window reopens";
       tdState.appendChild(pill);
     }
+    const pchip = platformChip(platformState(j, projById(j.project || ""), AL.PLATFORMS));
+    if (pchip) tdState.appendChild(pchip);
     tr.appendChild(tdState);
     const tdSched = el("td", "nowrap");
     tdSched.appendChild(el("span", "muted", "every"));
@@ -1853,8 +1922,8 @@
   };
   function filteredRuns(rf, liveRows, searchKeys2, sortKey4, sortDir4) {
     const fromT = rf.from ? Date.parse(rf.from) : null, toT = rf.to ? Date.parse(rf.to) : null;
-    const live = searchKeys2 ? [] : liveRows;
-    const rows = live.concat(AL.DATA.runs).filter((r) => {
+    const live2 = searchKeys2 ? [] : liveRows;
+    const rows = live2.concat(AL.DATA.runs).filter((r) => {
       if (r.live) {
         if (rf.project) {
           const rp = r.project || "";
@@ -2349,6 +2418,369 @@
     renderRunsTable();
   }
 
+  // ui/app/settings.js
+  var REGISTRY = [
+    { id: "anthropic", name: "Anthropic", cli: "claude", sub: "Claude Code \u2014 claude -p", mark: "A" },
+    { id: "openai", name: "OpenAI", cli: "codex", sub: "Codex CLI \u2014 codex exec --json", mark: "O" },
+    { id: "opencode", name: "OpenCode", cli: "opencode", sub: "opencode run \u2014 arrives with the next release", mark: "OC" }
+  ];
+  var live = { checks: {}, checkedAt: {}, catalogs: {}, busy: {}, notes: {}, typedBin: {} };
+  var ctx = null;
+  var probed = false;
+  var repainting = false;
+  async function post(op, extra) {
+    const r = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain", "X-AL-Token": TOKEN },
+      body: JSON.stringify(Object.assign({ op }, extra))
+    });
+    if (r.status === 401 || r.status === 428) {
+      sessionLost();
+      return { ok: false, output: "" };
+    }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) {
+      const output = j.output || j.error || "HTTP " + r.status;
+      toast(output, true);
+      return { ok: false, output };
+    }
+    return j;
+  }
+  function noteFromOutput(output) {
+    return (output || "").split("\n").slice(1).join(" ");
+  }
+  function settingsSummary(platforms) {
+    const entries = REGISTRY.map((r) => (platforms || {})[r.id] || {});
+    const enabled = entries.filter((p) => p.enabled === true).length;
+    const models = entries.reduce((n, p) => n + (p.enabled === true ? (p.models_enabled || []).length : 0), 0);
+    return enabled + " of " + REGISTRY.length + " platforms enabled \xB7 " + models + " model" + (models === 1 ? "" : "s") + " available to jobs";
+  }
+  function platformStatus(entry, check) {
+    if (entry && entry.supported === false) return { cls: "disabled", label: "Coming soon" };
+    if (check && check.bin_found === false) return { cls: "off", label: "Not installed" };
+    if (check && check.ready === false) return { cls: "idle", label: "Not signed in" };
+    return entry && entry.enabled ? { cls: "on", label: "Enabled" } : { cls: "disabled", label: "Disabled" };
+  }
+  function setupBanner(configured, error, withButton = true) {
+    if (configured !== false && !error) return null;
+    const b = el("div", "setup-banner");
+    const bic = el("div", "bic");
+    bic.appendChild(icon("alert"));
+    b.appendChild(bic);
+    const t = el("div", "btxt");
+    t.appendChild(el("b", null, error ? "The platform settings cannot be read." : "No platform is enabled yet."));
+    t.appendChild(el("span", null, error ? error : "Enable one in Settings \u203A Platforms and switch on at least one model; until then no job can be created. New job takes you there."));
+    b.appendChild(t);
+    if (withButton) {
+      const btn = el("button", "btn primary open-settings");
+      btn.type = "button";
+      btn.appendChild(icon("gear"));
+      btn.appendChild(document.createTextNode("Open Settings"));
+      b.appendChild(btn);
+    }
+    return b;
+  }
+  function ago(ms) {
+    if (!ms) return "";
+    const s = Math.max(0, Math.round((Date.now() - ms) / 1e3));
+    return s < 60 ? "checked " + s + " s ago" : "checked " + Math.round(s / 60) + " min ago";
+  }
+  function switchEl(on, disabled, title, ariaLabel, onToggle) {
+    const lab = el("label", "switch");
+    if (title) lab.title = title;
+    const inp = el("input");
+    inp.type = "checkbox";
+    inp.checked = !!on;
+    inp.disabled = !!disabled;
+    inp.setAttribute("aria-label", ariaLabel);
+    inp.addEventListener("change", () => onToggle(inp.checked));
+    lab.appendChild(inp);
+    lab.appendChild(el("span", "track"));
+    lab.appendChild(el("span", "knob"));
+    return lab;
+  }
+  function button(label, iconName, onClick, disabled) {
+    const b = el("button", "btn");
+    b.type = "button";
+    b.disabled = !!disabled;
+    if (iconName) b.appendChild(icon(iconName));
+    b.appendChild(document.createTextNode(label));
+    b.addEventListener("click", onClick);
+    return b;
+  }
+  async function runCheck(id) {
+    live.busy[id] = true;
+    paint();
+    const j = await post("platform_check", { platform: id });
+    if (j && j.check) {
+      live.checks[id] = j.check;
+      live.checkedAt[id] = Date.now();
+    }
+    live.busy[id] = false;
+    paint();
+    if (j && j.check && j.check.ready && !live.catalogs[id]) await loadCatalog(id);
+  }
+  async function loadCatalog(id) {
+    live.busy[id] = true;
+    paint();
+    const j = await post("platform_models", { platform: id });
+    if (j && j.catalog) live.catalogs[id] = j.catalog;
+    live.busy[id] = false;
+    paint();
+  }
+  async function change(op, extra) {
+    live.busy[extra.platform] = true;
+    paint();
+    try {
+      const j = await post(op, extra);
+      if (j && j.ok) {
+        toast(j.output.split("\n")[0], false, "check");
+        const note = noteFromOutput(j.output);
+        if (note) live.notes[extra.platform] = { text: note, err: false };
+        else delete live.notes[extra.platform];
+      } else if (j && j.output) {
+        live.notes[extra.platform] = { text: j.output, err: true };
+      }
+      if (ctx && ctx.onChange) await ctx.onChange();
+      return j && j.ok ? j : null;
+    } finally {
+      live.busy[extra.platform] = false;
+      paint();
+    }
+  }
+  function binaryBlock(r, entry, check) {
+    const box = el("div");
+    box.appendChild(el("h3", null, "Binary"));
+    const val = el("div", "val" + (check ? check.bin_found ? "" : " err" : " mute"));
+    if (check && !check.bin_found) {
+      val.appendChild(icon("xcircle"));
+      val.appendChild(document.createTextNode("Not found on the launchd PATH"));
+    } else {
+      const c = el("code", null, check && check.bin || entry.bin || "\u2026");
+      val.appendChild(c);
+    }
+    box.appendChild(val);
+    const src = { env: "from AGENTLOOP_" + r.cli.toUpperCase() + "_BIN", file: "set here", auto: "found on PATH" }[(check || entry).bin_source] || "";
+    const sub = el("div", "sub");
+    sub.textContent = check ? check.bin_found ? [src, check.version].filter(Boolean).join(" \xB7 ") + " \xB7 this is the path launchd sees, the one scheduled runs use" : "looked at " + check.bin + " \u2014 type the path if it lives elsewhere, or install it: " + (check.reason.split("install: ")[1] || check.reason) : live.busy[r.id] ? "checking\u2026" : "\u2014 not checked";
+    box.appendChild(sub);
+    const ctrl = el("div", "ctrl");
+    const inp = el("input");
+    inp.type = "text";
+    inp.value = live.typedBin[r.id] !== void 0 ? live.typedBin[r.id] : entry.bin || "";
+    inp.placeholder = "Use another binary\u2026 (leave empty to detect)";
+    inp.disabled = !!live.busy[r.id] || entry.supported === false;
+    const saveBin = async () => {
+      if (repainting || !inp.isConnected) return;
+      const v = inp.value.trim();
+      if (v === (entry.bin || "")) {
+        delete live.typedBin[r.id];
+        delete live.notes[r.id];
+        paint();
+        return;
+      }
+      live.typedBin[r.id] = v;
+      const ok = await change("platform_set_bin", { platform: r.id, bin: v });
+      if (!ok) return;
+      delete live.typedBin[r.id];
+      delete live.checks[r.id];
+      delete live.catalogs[r.id];
+      await runCheck(r.id);
+    };
+    inp.addEventListener("blur", saveBin);
+    inp.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      if (repainting || !inp.isConnected) return;
+      inp.blur();
+    });
+    ctrl.appendChild(inp);
+    ctrl.appendChild(button("Detect", "radar", async () => {
+      const ok = await change("platform_set_bin", { platform: r.id, bin: "" });
+      if (!ok) return;
+      delete live.typedBin[r.id];
+      delete live.checks[r.id];
+      delete live.catalogs[r.id];
+      await runCheck(r.id);
+    }, live.busy[r.id] || entry.supported === false));
+    box.appendChild(ctrl);
+    return box;
+  }
+  function sessionBlock(r, entry, check) {
+    const box = el("div");
+    box.appendChild(el("h3", null, "Session"));
+    const val = el("div", "val" + (check ? check.ready ? " ok" : check.bin_found ? " err" : " mute" : " mute"));
+    if (!check) {
+      val.textContent = live.busy[r.id] ? "checking\u2026" : "\u2014 not checked";
+    } else if (check.ready) {
+      val.appendChild(icon("check"));
+      const account = check.account || "unknown";
+      val.appendChild(document.createTextNode(account.startsWith("Logged in") ? account : "Signed in as " + account));
+    } else if (!check.bin_found) {
+      val.textContent = "\u2014 waiting for a binary";
+    } else {
+      val.appendChild(icon("xcircle"));
+      val.appendChild(document.createTextNode(check.reason));
+    }
+    box.appendChild(val);
+    const sub = el("div", "sub");
+    sub.textContent = entry.supported === false ? "the session test and the model list arrive with the OpenCode engine" : check ? ago(live.checkedAt[r.id]) + " with " + (r.id === "anthropic" ? "claude auth status" : "codex login status") : "";
+    box.appendChild(sub);
+    const ctrl = el("div", "ctrl");
+    ctrl.appendChild(button("Test", "refresh", () => runCheck(r.id), live.busy[r.id] || entry.supported === false || check && !check.bin_found));
+    ctrl.appendChild(el("span", "muted", "re-runs the sign-in check and the version probe"));
+    box.appendChild(ctrl);
+    return box;
+  }
+  function modelRow(r, entry, m, using, gone) {
+    const enabledNow = (entry.models_enabled || []).includes(m.v);
+    const row = el("div", "mrow" + (enabledNow ? "" : " offrow"));
+    if (gone) row.title = "the engine refuses a list with an id it cannot find";
+    const name = el("div", "mname");
+    name.appendChild(el("b", null, m.label || m.v));
+    name.appendChild(el("span", null, m.v + (m.desc ? " \u2014 " + m.desc : "") + (gone ? " \u2014 no longer in the catalog \u2014 switch it off before changing the others" : "") + (m.deprecated_by ? " \u2014 deprecated, \u2192 " + m.deprecated_by : "")));
+    row.appendChild(name);
+    const meta = el("div", "mmeta");
+    if (m.price) meta.appendChild(el("span", "price", "$" + m.price.input + " / $" + m.price.output));
+    else if (r.id === "openai" && !gone) meta.appendChild(el("span", null, "no price"));
+    if (m.efforts && m.efforts.length) meta.appendChild(el("span", null, m.efforts[0] + " \u2192 " + m.efforts[m.efforts.length - 1]));
+    const n = using[m.v] || 0;
+    if (n) meta.appendChild(el("span", "jobs", n + " job" + (n === 1 ? "" : "s")));
+    row.appendChild(meta);
+    row.appendChild(switchEl(enabledNow, live.busy[r.id], n ? n + " enabled job(s) use this model" : "", "Switch on " + m.v, async (on) => {
+      const cur = (entry.models_enabled || []).slice();
+      const next = on ? cur.includes(m.v) ? cur : cur.concat([m.v]) : cur.filter((v) => v !== m.v);
+      await change("platform_set_models", { platform: r.id, models: next });
+    }));
+    return row;
+  }
+  function modelsSection(r, entry, check, catalog) {
+    const frag = document.createDocumentFragment();
+    const head = el("div", "models-h");
+    head.appendChild(el("h3", null, "Models"));
+    const age = el("span", "age");
+    if (catalog) {
+      const from = r.id === "openai" ? "from codex debug models" : "from the installed CLI";
+      age.textContent = from + (catalog.stale ? " \u2014 " + catalog.reason : "") + (r.id === "anthropic" ? " \xB7 every Claude model takes effort low \u2192 max" : "");
+    } else if (entry.supported === false) {
+      age.textContent = "the providers you sign in to, listed by opencode models";
+    }
+    head.appendChild(age);
+    head.appendChild(el("span", "sp"));
+    const ready = !!(check && check.ready);
+    head.appendChild(button(catalog ? "Refresh" : "Load models", "refresh", () => loadCatalog(r.id), !ready || live.busy[r.id]));
+    frag.appendChild(head);
+    if (entry.supported === false) {
+      frag.appendChild(el("div", "mempty", "Nothing to switch on yet \u2014 OpenCode jobs, and this list, come with the next release. The card is here so the binary is found and named before that day."));
+      return frag;
+    }
+    if (!catalog) {
+      frag.appendChild(el("div", "mempty", live.busy[r.id] ? "Loading the models\u2026" : ready ? "The catalog could not be loaded \u2014 Load models to try again." : "Test the session first, then load the models."));
+      return frag;
+    }
+    const using = entry.jobs_using || {};
+    const seen = /* @__PURE__ */ new Set();
+    catalog.models.forEach((m) => {
+      seen.add(m.v);
+      frag.appendChild(modelRow(r, entry, m, using, false));
+    });
+    (entry.models_enabled || []).filter((v) => !seen.has(v)).forEach((v) => frag.appendChild(modelRow(r, entry, { v, label: v }, using, true)));
+    if (!catalog.models.length && !(entry.models_enabled || []).length) frag.appendChild(el("div", "mempty", "The catalog came back empty" + (catalog.reason ? " \u2014 " + catalog.reason : "") + "."));
+    return frag;
+  }
+  function platformCard(r, entry, check, catalog) {
+    const card = el("section", "platcard");
+    card.id = "platcard-" + r.id;
+    const h = el("div", "platcard-h");
+    h.appendChild(el("div", "platcard-ic" + (entry.supported === false ? " off" : ""), r.mark));
+    const t = el("div", "platcard-t");
+    t.appendChild(el("b", null, r.name));
+    t.appendChild(el("span", null, r.sub));
+    h.appendChild(t);
+    const right = el("div", "platcard-r");
+    const st = platformStatus(entry, check);
+    const pill = el("span", "pill " + st.cls, st.label);
+    right.appendChild(pill);
+    const sw = el("div", "swlabel");
+    const row = el("div", "swrow");
+    row.appendChild(document.createTextNode(entry.enabled ? "Enabled " : "Disabled "));
+    const canToggle = entry.supported !== false && !live.busy[r.id] && (entry.enabled || check && check.ready);
+    row.appendChild(switchEl(
+      !!entry.enabled,
+      !canToggle,
+      entry.supported === false ? "runs on OpenCode arrive with the next release" : canToggle ? "" : "unlocks when the session test passes",
+      "Enable " + r.name,
+      async (on) => {
+        await change(on ? "platform_enable" : "platform_disable", { platform: r.id });
+      }
+    ));
+    sw.appendChild(row);
+    const n = entry.jobs_on_platform || 0;
+    sw.appendChild(el("span", null, entry.supported === false ? "runs on OpenCode are not supported yet" : n ? n + " enabled job" + (n === 1 ? "" : "s") + " run" + (n === 1 ? "s" : "") + " here" : entry.enabled ? "jobs may pick this platform" : "unlocks when the session test passes"));
+    right.appendChild(sw);
+    h.appendChild(right);
+    card.appendChild(h);
+    const note = live.notes[r.id];
+    if (note) {
+      const nd = el("div", "platnote" + (note.err ? " err" : ""));
+      nd.appendChild(icon(note.err ? "alert" : "check"));
+      nd.appendChild(document.createTextNode(note.text));
+      card.appendChild(nd);
+    }
+    const g = el("div", "platcard-g");
+    g.appendChild(binaryBlock(r, entry, check));
+    g.appendChild(sessionBlock(r, entry, check));
+    card.appendChild(g);
+    card.appendChild(modelsSection(r, entry, check, catalog));
+    return card;
+  }
+  function paint() {
+    if (!ctx) return;
+    const head = $("st-head"), host = $("st-platforms");
+    if (!head || !host) return;
+    head.textContent = "";
+    head.appendChild(pageHeader({
+      icon: "gear",
+      title: "Settings",
+      subtitle: "Which agent CLIs this scheduler may run, and which of their models a job may pick."
+    }));
+    const active = document.activeElement;
+    let savedFocus = null;
+    if (active && active.tagName === "INPUT" && active.type === "text" && host.contains(active)) {
+      const card = active.closest("section.platcard");
+      if (card) savedFocus = { cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd };
+    }
+    repainting = true;
+    try {
+      host.textContent = "";
+      if (ctx.error) {
+        const b = setupBanner(false, ctx.error, false);
+        if (b) host.appendChild(b);
+      }
+      host.appendChild(el("div", "summary", settingsSummary(ctx.platforms)));
+      REGISTRY.forEach((r) => host.appendChild(platformCard(r, (ctx.platforms || {})[r.id] || {}, live.checks[r.id] || null, live.catalogs[r.id] || null)));
+    } finally {
+      repainting = false;
+    }
+    if (savedFocus) {
+      const card = $(savedFocus.cardId);
+      const inp = card && card.querySelector(".ctrl input");
+      if (inp) {
+        inp.value = savedFocus.value;
+        inp.setSelectionRange(savedFocus.selectionStart, savedFocus.selectionEnd);
+        inp.focus({ preventScroll: true });
+      }
+    }
+  }
+  function renderSettingsPage(c) {
+    ctx = c;
+    paint();
+    if (probed || c.configured === void 0) return;
+    probed = true;
+    REGISTRY.forEach((r) => {
+      if (!live.checks[r.id] && !live.busy[r.id]) runCheck(r.id);
+    });
+  }
+
   // ui/app/index.js
   function init(cc) {
     bindPage(cc);
@@ -2531,6 +2963,29 @@
     modelOptionsFor,
     platformOf,
     platformLabel,
+    // PLATFORM_LABELS, registryKnown, platformOptions and
+    // hiddenModelCount are Task 7's: the Platform/Model combos'
+    // own read of what Settings switched on, alongside
+    // modelOptionsFor's now-optional fourth argument above.
+    // platformState and platformChip are jobs-domain.js's own
+    // half of the same task -- the verdict jobCard and jobRow
+    // both put on screen as a chip next to the status pill.
+    PLATFORM_LABELS,
+    registryKnown,
+    platformOptions,
+    hiddenModelCount,
+    platformState,
+    platformChip,
+    // modelEnabled and DISABLED_SUFFIX are Task 7's fix wave 1:
+    // the one rule modelOptionsFor and platformState both read
+    // for whether Settings left a model switched on (a family
+    // value like "opus" counts once an id of that family is on
+    // the list), and the label suffix modelOptionsFor and
+    // platformOptions both flag a switched-off value with.
+    // Exported because a later task's validateStep reads
+    // ALApp.modelEnabled for the editor's own Agent step.
+    modelEnabled,
+    DISABLED_SUFFIX,
     // costParts and tokensText are the same plan's Task 4: what a
     // run's cost cell and Tokens row say, shared by the Runs table
     // (runs.js, by import) and the run dialog's renderLog/costHtml
@@ -2539,8 +2994,22 @@
     tokensText,
     dayNumbers,
     shapeRepoRows,
-    projectStepError
+    projectStepError,
+    // renderSettingsPage, settingsSummary, platformStatus and
+    // setupBanner are Task 8's (the platforms UI plan):
+    // Settings › Platforms, drawn whole by ui/app/settings.js.
+    // The page's own paintSettings() calls
+    // ALApp.renderSettingsPage() on entering the view and after
+    // every /api/models re-read; settingsSummary and
+    // platformStatus are the two pure helpers the contract
+    // tests pin standing alone; setupBanner is the strip a
+    // later task mounts on Overview and Jobs while nothing is
+    // configured, reached from the page the same way.
+    renderSettingsPage,
+    settingsSummary,
+    platformStatus,
+    setupBanner
   };
 })();
-/* ui-bundle: 6e77393fef21833ad896bc74737735379e2825530936c70a626bb0f1a065ca5b */
-/* ui-sources: 134b851fbcb498cab658c010ab60be13d9f3103555f575a9d140a3c3eccfbfdb */
+/* ui-bundle: 56ae655b096afaae6fb047d1fcc12e8eb12dc34dd9c62cce503c582b9b898e4c */
+/* ui-sources: 12e71db424ecfc150aca58a3d2e36181e73d219156cbf5587f725f9b000562a9 */
