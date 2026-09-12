@@ -25,7 +25,14 @@ whether the model has a price, in which case the CLI's own per-step `cost`
 is reported) and the price table (--pricing, config/pricing.json: the
 operator's row, from which an unpriced model is estimated with the CLI's own
 formula). Zero in the catalog is UNKNOWN, never free: measured, a provider
-with no price configured lists the same zeros as a free model.
+with no price configured lists the same zeros as a free model -- and so is
+a priced model whose steps carried no numeric `cost` at all, which falls
+through to the estimate, then to none, instead of reporting a silent zero.
+
+At EOF, only a turn that ended on an auto-rejected ask (measured 04, 18)
+becomes an error result naming the tool. A rule denial (measured 23) does
+not end the turn, so an EOF after one is a killed run left to the salvage
+path, the same as any other EOF with no result.
 """
 import argparse
 import json
@@ -54,6 +61,16 @@ def denial_of(state):
         return False
     err = state.get("error")
     return isinstance(err, str) and (err.startswith(REJECTED) or err.startswith(RULED_OUT))
+
+
+def rejection_of(state):
+    """True when a tool's terminal state is specifically the auto-rejected-ask
+    denial (measured 04, 18) -- narrower than denial_of, which also matches
+    the rule denial (measured 23) that does NOT end the turn at EOF."""
+    if not isinstance(state, dict) or state.get("status") != "error":
+        return False
+    err = state.get("error")
+    return isinstance(err, str) and err.startswith(REJECTED)
 
 
 def load_price(path, model):
@@ -134,8 +151,10 @@ class Normalizer:
         self.last_text = ""         # the last text part: `result.result`
         self.tokens = {"input": 0, "cached": 0, "cache_write": 0, "output": 0, "reasoning": 0}
         self.cost = 0.0             # the CLI's own per-step cost, summed
+        self.costed_steps = 0       # step_finish events that carried a numeric cost
         self.steps = 0              # step_finish events seen
         self.last_reason = ""       # the last step_finish reason
+        self.last_rejected = False  # the LAST tool event was an auto-rejected ask, not a rule denial
         self.denials = []           # permission_denials on the final event
         self.done = False           # a result has been emitted
 
@@ -172,6 +191,7 @@ class Normalizer:
             out = out.encode("utf-8")[:OUTPUT_CAP].decode("utf-8", errors="ignore") + "\n...[truncated]"
         if denial_of(state):
             self.denials.append({"tool_name": name, "tool_use_id": call, "tool_input": inp})
+        self.last_rejected = rejection_of(state)   # only an auto-rejected ask can end the turn at EOF
         return [self._assistant([{"type": "tool_use", "id": call, "name": name, "input": inp}]),
                 self._msg("user", [{"type": "tool_result", "tool_use_id": call,
                                     "content": out, "is_error": is_error}])]
@@ -185,26 +205,30 @@ class Normalizer:
                           "cache_read_input_tokens": self.tokens["cached"],
                           "cache_creation_input_tokens": self.tokens["cache_write"],
                           "output_tokens": self.tokens["output"] + self.tokens["reasoning"]}}
+        cost, basis = self._cost()          # a failed run keeps the cost the CLI already reported
         if error is None:
-            cost, basis = self._cost()
             base.update({"subtype": "success", "is_error": False, "result": self.last_text,
                          "total_cost_usd": cost, "cost_basis": basis,
                          "tokens": dict(self.tokens), "api_error_status": None})
         else:
             msg, status = error
             base.update({"subtype": "error_during_execution", "is_error": True, "result": msg,
-                         "total_cost_usd": None, "cost_basis": "none",
+                         "total_cost_usd": cost, "cost_basis": basis,
                          "tokens": dict(self.tokens) if self.steps else None,
                          "api_error_status": status})
         return base
 
     def _cost(self):
         """(total_cost_usd, cost_basis). The CLI's number when the catalog
-        prices the model; the operator's table when it does not; unknown
-        otherwise. A run with no step_finish at all has no tokens to price."""
+        prices the model AND at least one step_finish actually carried a
+        numeric `cost` (self.costed_steps); the operator's table when it
+        does not; unknown otherwise. A priced model whose steps never
+        carried a numeric cost falls through to the estimate instead of
+        reporting a silent zero. A run with no step_finish at all has no
+        tokens to price."""
         if not self.steps:
             return None, "none"
-        if self.priced:
+        if self.priced and self.costed_steps:
             return self.cost, "reported"        # the CLI's number, as it came: never rounded
         est = estimate(self.tokens, self.price)
         return (est, "estimated") if est is not None else (None, "none")
@@ -230,14 +254,18 @@ class Normalizer:
             c = part.get("cost")
             if isinstance(c, (int, float)) and not isinstance(c, bool):
                 self.cost += float(c)
-            reason = part.get("reason") or ""
+                self.costed_steps += 1
+            # A missing/empty reason (malformed) is treated like "tool-calls":
+            # more of the turn may still be coming, so accumulate and emit
+            # nothing, rather than ending the run as "the model stopped: unknown".
+            reason = part.get("reason") or "tool-calls"
             self.last_reason = reason
             if reason == "stop" and not self.done:
                 out.append(self._result())
             elif reason != "tool-calls" and not self.done:
                 # Not measured (length, error, content-filter, ...): the model
                 # stopped for a reason that is not "I am done".
-                out.append(self._result(error=("the model stopped: " + (reason or "unknown"), None)))
+                out.append(self._result(error=("the model stopped: " + reason, None)))
         elif kind == "error" and not self.done:
             err = ev.get("error") if isinstance(ev.get("error"), dict) else {}
             data = err.get("data") if isinstance(err.get("data"), dict) else {}
@@ -252,12 +280,14 @@ class Normalizer:
         return out
 
     def finish(self):
-        """EOF. A turn that ended on an auto-rejected permission (measured 04,
-        18: the last step closed on `tool-calls` and nothing followed) is an
-        error that names the tool -- never a silent, result-less run the
-        salvage would read as merely killed. Any other EOF without a result
+        """EOF. A turn that ended on an auto-rejected ask (measured 04, 18:
+        the LAST tool event was rejected, and the step closed on
+        `tool-calls`) is an error that names the tool -- never a silent,
+        result-less run the salvage would read as merely killed. A rule
+        denial (measured 23) does NOT end the turn -- the model keeps
+        going -- so an EOF after one, like any other EOF without a result,
         is left to the salvage path."""
-        if self.done or not self.denials or self.last_reason != "tool-calls":
+        if self.done or not self.last_rejected or self.last_reason != "tool-calls":
             return []
         d = self.denials[-1]
         msg = "the turn ended on a rejected permission: " + d["tool_name"]

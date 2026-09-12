@@ -12,6 +12,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -166,6 +167,16 @@ def test_an_unknown_finish_reason_ends_the_run_as_an_error():
     assert last["subtype"] == "error_during_execution" and "length" in last["result"]
 
 
+def test_a_missing_finish_reason_is_treated_like_tool_calls():
+    # A malformed step_finish with no `reason` at all must not be read as
+    # "the model stopped: unknown" -- it accumulates like "tool-calls" and
+    # emits nothing, since more of the turn may still be coming.
+    evs = events_of("01-trivial-turn.jsonl")
+    del evs[-1]["part"]["reason"]
+    out = normalize(events=evs)
+    assert all(e["type"] != "result" for e in out)
+
+
 # ------------------------------------------------------------ denials
 
 def test_a_rule_denial_is_a_permission_denial_and_the_turn_goes_on():
@@ -177,6 +188,26 @@ def test_a_rule_denial_is_a_permission_denial_and_the_turn_goes_on():
                                            "tool_input": {"command": "echo hello-from-bash ; whatever"}}]
     res = blocks(out, "tool_result", "user")[0]
     assert res["is_error"] is True and res["content"].startswith("The user has specified a rule")
+
+
+def test_a_rule_denial_does_not_end_the_turn_at_eof():
+    # Fixture 23 in full recovers (the model answers "attempted" after the
+    # denial). Cut right after the denial's step_finish (tool-calls) and hit
+    # EOF there instead: a rule denial must NOT be read as ending the turn --
+    # only an auto-rejected ask does that -- so this run is left to the
+    # salvage path, same as any other kill mid-turn.
+    evs = events_of("23-rule-denied-bash.jsonl")[:3]
+    out = normalize(events=evs)
+    assert all(e["type"] != "result" for e in out)
+
+
+def test_a_rule_denial_then_a_killed_step_still_emits_no_result():
+    # The run is killed one step later instead (the measured shape of 12: a
+    # lone step_start, nothing after). The rule denial two events back must
+    # still not make finish() fire.
+    evs = events_of("23-rule-denied-bash.jsonl")[:3] + events_of("12-interrupted-turn.jsonl")
+    out = normalize(events=evs)
+    assert all(e["type"] != "result" for e in out)
 
 
 def test_an_auto_rejected_ask_ends_the_run_as_tools_denied_at_eof():
@@ -248,6 +279,35 @@ def test_the_reported_cost_is_the_sum_of_every_step():
     assert last["cost_basis"] == "reported" and last["total_cost_usd"] == 0.0004
 
 
+def test_an_error_result_after_priced_steps_carries_the_reported_cost():
+    # An error result must not discard a cost the CLI already reported: it
+    # carries the same total_cost_usd/cost_basis a success would, computed
+    # from the same steps seen so far.
+    evs = events_of("01-trivial-turn.jsonl")
+    evs[-1]["part"]["reason"] = "length"
+    evs[-1]["part"]["cost"] = 0.0003
+    last = normalize(events=evs, priced=True)[-1]
+    assert last["type"] == "result" and last["is_error"] is True
+    assert last["cost_basis"] == "reported" and last["total_cost_usd"] == 0.0003
+
+
+def test_a_priced_model_with_no_numeric_cost_falls_through_to_the_estimate():
+    # A priced catalog model whose step_finish events never carried a
+    # numeric `cost` at all (not even zero) must not report a silent zero:
+    # it falls through to the estimate, then to none, exactly like an
+    # unpriced model would.
+    evs = events_of("03-tool-use.jsonl")
+    for e in evs:
+        if e["type"] == "step_finish":
+            del e["part"]["cost"]
+    last_none = normalize(events=evs, priced=True, price=None)[-1]
+    assert last_none["cost_basis"] == "none" and last_none["total_cost_usd"] is None
+    # 11974 in, 49 out at the output price, 15488 cached, 0 cache_write
+    expected = round((11974 * 1.0 + 49 * 2.0 + 15488 * 0.5 + 0 * 0.25) / 1_000_000, 6)
+    last_est = normalize(events=evs, priced=True, price=PRICE)[-1]
+    assert last_est["cost_basis"] == "estimated" and last_est["total_cost_usd"] == expected
+
+
 def test_an_unpriced_model_with_a_table_row_is_estimated_like_the_cli_does():
     last = normalize("24c-priced-reasoning.jsonl", priced=False, price=PRICE)[-1]
     # 11800 in, 32 out + 39 reasoning at the output price, 1856 cached
@@ -310,15 +370,27 @@ def test_the_cli_normalizes_stdin_and_copies_every_raw_line(tmp_path):
 def test_the_cli_flushes_the_init_line_before_the_stream_ends(tmp_path):
     # Feed step_start alone, keep stdin OPEN, and read the first line back:
     # a normalizer that buffered would leave the file empty for the whole
-    # run, and the watchdog would kill a live run at the stall window.
+    # run, and the watchdog would kill a live run at the stall window. Read
+    # it on a background thread with a hard join timeout, so a regression
+    # fails this test in 10s instead of hanging the suite forever.
     first = events_of("03-tool-use.jsonl")[0]
     p = subprocess.Popen([sys.executable, "-u", str(NORM), "--model", "m", "--permission", "full-access",
                           "--cwd", "/"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    read = {}
+
+    def read_first_line():
+        read["line"] = p.stdout.readline()          # blocks for ever if nothing was flushed
+
+    thread = threading.Thread(target=read_first_line, daemon=True)
     try:
         p.stdin.write(json.dumps(first) + "\n")
         p.stdin.flush()
-        line = p.stdout.readline()                  # blocks for ever if nothing was flushed
-        assert json.loads(line)["subtype"] == "init"
+        thread.start()
+        thread.join(timeout=10)
+        if thread.is_alive():
+            p.kill()
+            assert False, "the init line was not flushed within 10 s"
+        assert json.loads(read["line"])["subtype"] == "init"
     finally:
         p.stdin.close()
         p.wait(timeout=10)

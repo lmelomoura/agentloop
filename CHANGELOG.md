@@ -41,9 +41,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     command), `step_finish` summed into one `result` with the tokens
     (reasoning apart from output, and inside `usage.output_tokens`), the
     two measured denial phrases into `permission_denials`, an `error` into
-    an error result with its `statusCode`. The first line is out the
-    moment the CLI's first event arrives, flushed, because the watchdog
-    now reads an empty file as a dead run.
+    an error result with its `statusCode`; an EOF after a rule denial is
+    left to the salvage path, only an auto-rejected ask ends the run as an
+    error. The first line is out the moment the CLI's first event arrives,
+    flushed, because the watchdog now reads an empty file as a dead run.
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of
