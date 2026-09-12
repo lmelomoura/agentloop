@@ -2620,6 +2620,27 @@ E a seguir ao bloco "The operator's own choice, on top of the CLI's" (o `platfor
 
 `platforms_jq` passa a `platforms_jq <anthropic-default> <openai-default> <opencode-default> <jq-filter> [jq options…]`: `local adef="$1" odef="$2" ocdef="$3" filter="$4"; shift 4`, `occat='[]'`, `occat="$("$JQ" -ec '[.opencode.models[]?.id]' "$MODELS_FILE" 2>/dev/null)" || occat='[]'`, e `--arg ocdef "$ocdef" --argjson occat "$occat"` na chamada ao jq. Os três callers: `platforms_seed` → `platforms_jq opus "$(openai_catalog_visible | head -1)" "$(opencode_catalog_visible | head -1)" '…'` com `{platforms: {anthropic: entry("anthropic"), openai: entry("openai"), opencode: entry("opencode")}}`; as duas chamadas em `cmd_platforms` ganham `"$(platform_default_model opencode)"` como terceiro argumento. O comentário de cabeçalho de `platforms_jq` actualizado.
 
+**O caminho de actualização, com o ficheiro que uma instalação real tem hoje** (duas chaves, sem `opencode`). No mesmo bloco de selftest, depois dos casos de `create`:
+
+```bash
+  echo "upgrade path — a platforms.json without the opencode key, the file every install has today"
+  mkdir -p "$tmp/up/config" "$tmp/up/data"
+  printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},"openai":{"enabled":false,"bin":"","models":[]}}}\n' > "$tmp/up/config/platforms.json"
+  up_al() { AGENTLOOP_CONFIG="$tmp/up/config" AGENTLOOP_DATA="$tmp/up/data" AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode" "$BASE_DIR/bin/agentloop" "$@"; }
+  ( PLATFORMS_FILE="$tmp/up/config/platforms.json"; platforms_valid ); want "the two-key file is still a valid platforms file" 0 $?
+  ( PLATFORMS_FILE="$tmp/up/config/platforms.json"; platform_enabled opencode ); want "opencode reads as DISABLED, not as an error and not as enabled by default" 1 $?
+  ( PLATFORMS_FILE="$tmp/up/config/platforms.json"; platform_enabled anthropic ); want "and anthropic keeps its state" 0 $?
+  [ "$(up_al platforms | "$JQ" -r '.opencode.supported, .opencode.enabled, .opencode.usable' | tr '\n' '|')" = "true|false|false|" ] \
+    && ok "platforms lists the card from the registry, disabled, with no key in the file" || bad "platforms over the two-key file: $(up_al platforms | "$JQ" -c .opencode)"
+  up_al platform enable opencode >/dev/null 2>&1; want "platform enable opencode writes the key that was not there (the stand-in is ready)" 0 $?
+  "$JQ" -e '.platforms.opencode.enabled == true and .platforms.opencode.models == [] and .platforms.anthropic.enabled == true' "$tmp/up/config/platforms.json" >/dev/null 2>&1 \
+    && ok "the file now carries the key, enabled, and the other two are untouched" || bad "after enable: $(cat "$tmp/up/config/platforms.json")"
+  printf '["opencode/big-pickle"]' | up_al platform set-models opencode >/dev/null 2>&1; want "set-models writes into the new key" 0 $?
+  [ "$("$JQ" -r '.platforms.opencode.models[0]' "$tmp/up/config/platforms.json")" = "opencode/big-pickle" ] && ok "and the model is on the list" || bad "models: $("$JQ" -c .platforms.opencode "$tmp/up/config/platforms.json")"
+```
+
+(`up_al` corre o engine como processo, com o catálogo a vir do stand-in: `platform enable` chama `platform_check`, e `set-models` valida contra `platform_catalog_ids`, que resolve o catálogo se faltar; se `set-models` recusar por catálogo vazio, correr `up_al resolve-models opencode >/dev/null 2>&1` antes dele.)
+
 O caso de selftest `( pf_env; platform_enabled opencode ); want "opencode is never enabled by the seed" 1 $?` (~3554) passa a semear um job em opencode e a esperar `enabled: true`: ler o bloco `pf_env` para a fixture; escrever `{"jobs":[{"id":"oc","platform":"opencode","model":"opencode/big-pickle","enabled":true,…}]}` e `want "opencode is seeded enabled when an enabled job runs on it" 0 $?`.
 
 - [ ] **Step 6: O pytest do servidor que pinava o *planned***
@@ -2731,6 +2752,22 @@ def test_without_a_catalog_and_without_the_binary_the_entry_says_so(srv, monkeyp
     assert c["supported"] is True and c["available"] is False
     assert "opencode not installed" in c["reason"]
     assert c["models"] == [] and c["permissions"] and c["permissions"][0]["v"] == "full-access"
+
+
+def test_a_two_key_platforms_file_still_lists_the_opencode_card_disabled(srv, monkeypatch):
+    # The file every install has today has no opencode key; the card comes
+    # from the registry and reads disabled, never as an error.
+    cfg = Path(srv.CONFIG_DIR)
+    (cfg / "platforms.json").write_text(json.dumps({"platforms": {
+        "anthropic": {"enabled": True, "bin": "", "models": ["claude-opus-5"]},
+        "openai": {"enabled": False, "bin": "", "models": []}}}))
+    (cfg / "models.json").write_text(json.dumps({"resolved": {}}))
+    monkeypatch.setenv("AGENTLOOP_OPENCODE_BIN", "/nonexistent/opencode")
+    out = srv.list_models()
+    c = out["platforms"]["opencode"]
+    assert c["supported"] is True and c["enabled"] is False and c["usable"] is False
+    assert c["models_enabled"] == [] and out["error"] in ("", None)
+    assert out["platforms"]["anthropic"]["enabled"] is True
 
 
 def test_the_server_permission_lists_match_the_engine_for_opencode(srv):
