@@ -20,6 +20,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The OpenCode engine: a job, a project and a project's `security` block
+  can run on the `opencode` platform.** The third platform arrives the way
+  the second one did: measured first (`docs/superpowers/specs/2026-09-12-opencode-measurements/`,
+  35 runs of opencode-ai 1.18.30), then translated at the boundary
+  (`bin/platforms/opencode_stream.py`) so that no reader in the scheduler
+  learns a third dialect. What it cost to not have it: a job that named
+  `opencode` was refused at launch, and the models an operator had already
+  configured in that CLI (providers with their own keys, the free Zen
+  models) were out of reach of every job.
+  - The stand-in and the fixtures: `test/fake-opencode` emits the measured
+    shapes (a complete run, an undeclared ending, a dirty tree, a hang, an
+    auto-rejected permission, a rule denial, an unknown model, a rate
+    limit) and answers `--version`, `models`, `auth list` and `export`;
+    `test/fixtures/opencode/` holds the measurements the tests read.
+
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of
   hiding with one card per platform — find the binary (or point at it), test
