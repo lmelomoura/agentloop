@@ -1491,8 +1491,6 @@ platform_check() { # platform_check <platform> -> one JSON object; always exits 
   if [ -f "$bin" ] && [ -x "$bin" ]; then found=true; ver="$("$bin" --version 2>/dev/null | head -1)"; fi
   if [ "$found" = false ]; then
     reason="$(platform_cli_name "$p") not found at $bin — set the path in Settings (or AGENTLOOP_$(platform_cli_name "$p" | tr '[:lower:]' '[:upper:]')_BIN); install: $(platform_install_hint "$p")"
-  elif [ "$supported" = false ]; then
-    reason="runs on OpenCode arrive with the OpenCode engine"
   else
     case "$p" in
       anthropic)
@@ -1516,6 +1514,24 @@ platform_check() { # platform_check <platform> -> one JSON object; always exits 
         local line
         if line="$("$bin" login status 2>&1)"; then ready=true; acct="$(printf '%s\n' "$line" | head -1)"
         else reason="codex is not signed in (run: codex login)"; fi ;;
+      opencode)
+        # A CLI of providers, not of one account: ready when it lists a model
+        # to run (the providers with a key, plus the free Zen models that need
+        # none -- measured, 01), and the account line says how many
+        # credentials auth.json holds and which providers the catalog shows.
+        local list nmod ncred provs esc
+        list="$(run_bounded 30 "$bin" models --pure 2>/dev/null | grep -E '^[A-Za-z0-9_.-]+/' || true)"
+        nmod="$(num "$(printf '%s\n' "$list" | grep -c . 2>/dev/null)")"
+        if [ "$nmod" -gt 0 ]; then
+          ready=true
+          esc="$(printf '\033')"
+          # `auth list` draws a box with ANSI colours even off a TTY (measured); strip them before reading the count
+          ncred="$(run_bounded 30 "$bin" auth list 2>/dev/null | sed "s/${esc}\[[0-9;]*m//g" | grep -oE '[0-9]+ credentials' | head -1)"
+          provs="$(printf '%s\n' "$list" | cut -d/ -f1 | sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+          acct="${ncred:-0 credentials} · providers: $provs"
+        else
+          reason="no usable provider: run opencode auth login, or configure one in ~/.config/opencode/opencode.json"
+        fi ;;
     esac
   fi
   "$JQ" -nc --arg p "$p" --argjson supported "$supported" --argjson ready "$ready" --arg bin "$bin" \
@@ -1551,7 +1567,7 @@ anthropic_catalog_ids() { # every claude-* id this install can name, most capabl
     unique | sort_by(fam as $f | [((["opus","sonnet","haiku","fable"] | index($f)) // 9), nums]) | .[]' 2>/dev/null
 }
 platform_catalog_ids() { # platform_catalog_ids <platform> -> what set-models may enable, one id per line: the VISIBLE catalog, what the Settings page lists
-  case "$1" in anthropic) anthropic_catalog_ids ;; openai) openai_catalog_visible ;; *) : ;; esac
+  case "$1" in anthropic) anthropic_catalog_ids ;; openai) openai_catalog_visible ;; opencode) opencode_catalog_visible ;; *) : ;; esac
 }
 
 platform_models_json() { # platform_models_json <platform> <stale true|false> <reason> -> the catalog with `enabled` per model
@@ -1575,8 +1591,22 @@ platform_models_json() { # platform_models_json <platform> <stale true|false> <r
           models: map({v:.slug, label:(.display_name // .slug), desc:(.description // ""), efforts:(.efforts // []), deprecated_by:(.deprecated_by // ""),
                        price: (($pricing[.slug] // null) | if . != null and (.input | type) == "number" and (.output | type) == "number" then {input:.input, output:.output} else null end),
                        enabled: (.slug as $x | ($enabled | index($x)) != null)})}' ;;
+    opencode)
+      cat_at="$(num "$("$JQ" -r '.opencode.at // 0' "$MODELS_FILE" 2>/dev/null)")"
+      [ -f "$PRICING_FILE" ] && pricing="$("$JQ" -c '.opencode // {}' "$PRICING_FILE" 2>/dev/null || echo '{}')"
+      arr=""; opencode_catalog_available && arr="$("$JQ" -c '[.opencode.models[] | select(.status == "active")]' "$MODELS_FILE" 2>/dev/null)"
+      [ -n "$arr" ] || arr='[]'
+      # `price` is what the page shows per million: the catalog's own when it
+      # prices the model, else the operator's row, else null ("no price").
+      printf '%s' "$arr" | "$JQ" -c --arg p "$p" --argjson stale "$stale" --arg reason "$reason" --argjson enabled "$enabled" --argjson at "$cat_at" --argjson pricing "$pricing" \
+        '{platform:$p, stale:$stale, reason:$reason, catalog_at:$at,
+          models: map({v:.id, label:(.name // .id), provider:.provider, desc:"", efforts:(.variants // []), deprecated_by:"",
+                       tools:(.tools != false), context:(.context // 0),
+                       price: (if .priced == true then {input:.cost.input, output:.cost.output}
+                               else (($pricing[.id] // null) | if . != null and (.input | type) == "number" and (.output | type) == "number" then {input:.input, output:.output} else null end) end),
+                       enabled: (.id as $x | ($enabled | index($x)) != null)})}' ;;
     *)
-      "$JQ" -nc --arg p "$p" '{platform:$p, stale:false, reason:"the model list arrives with the OpenCode engine", catalog_at:0, models:[]}' ;;
+      "$JQ" -nc --arg p "$p" '{platform:$p, stale:false, reason:"unknown platform", catalog_at:0, models:[]}' ;;
   esac
 }
 
@@ -1649,6 +1679,14 @@ cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-m
         if [ -n "$reason" ]; then
           stale=true; reason="refresh failed: $reason"
         elif [ "$rc" -ne 0 ] || ! openai_catalog_available; then
+          stale=true; reason="refresh failed: $(printf '%s' "$out" | tail -1)"
+        fi
+      elif [ "$p" = "opencode" ]; then
+        out="$(resolve_models_opencode 2>&1)"; rc=$?
+        reason="$("$JQ" -r '.opencode.stale_reason // empty' "$MODELS_FILE" 2>/dev/null)"
+        if [ -n "$reason" ]; then
+          stale=true; reason="refresh failed: $reason"
+        elif [ "$rc" -ne 0 ] || ! opencode_catalog_available; then
           stale=true; reason="refresh failed: $(printf '%s' "$out" | tail -1)"
         fi
       fi
@@ -2021,6 +2059,156 @@ openai_catalog_ensure() { # resolve once, synchronously, when the block is missi
   openai_catalog_available
 }
 
+# --- the OpenCode catalog ---------------------------------------------------
+# config/models.json carries an `opencode` block, written by `resolve-models
+# opencode` from `opencode models --verbose`. Every model is `provider/model`,
+# the CLI's own name for it, split at the FIRST slash: a model id can carry a
+# slash of its own (measured: pdm_ai/openai/gpt-oss-120b). `priced` is true
+# when any of the four catalog prices is above zero -- zero in every field is
+# UNKNOWN, not free: a custom provider with no `cost` configured lists the
+# same zeros as a free Zen model (measured 24b). Without the block every
+# reader answers nothing, which is what makes an unresolved catalog REFUSE a
+# launch rather than guess an id.
+opencode_catalog_available() { # 0 when config/models.json carries an opencode catalog
+  [ -f "$MODELS_FILE" ] && "$JQ" -e '.opencode.models | type == "array"' "$MODELS_FILE" >/dev/null 2>&1
+}
+
+opencode_catalog_ids() { # every id, active or not, one per line, in the CLI's own order
+  opencode_catalog_available || return 0
+  "$JQ" -r '.opencode.models[].id' "$MODELS_FILE" 2>/dev/null
+}
+
+opencode_catalog_visible() { # the active ids: what the Settings page lists
+  opencode_catalog_available || return 0
+  "$JQ" -r '.opencode.models[] | select(.status == "active") | .id' "$MODELS_FILE" 2>/dev/null
+}
+
+opencode_catalog_efforts() { # opencode_catalog_efforts <id> -> the model's variants, one per line; nothing for a model without any
+  opencode_catalog_available || return 0
+  [ -n "${1:-}" ] || return 0
+  "$JQ" -r --arg m "$1" '.opencode.models[] | select(.id == $m) | .variants[]?' "$MODELS_FILE" 2>/dev/null
+}
+
+opencode_catalog_all_efforts() { # the union of every active model's variants, first-seen order
+  opencode_catalog_available || return 0
+  "$JQ" -r '
+    [.opencode.models[] | select(.status == "active") | .variants[]?]
+    | reduce .[] as $e ([]; if index($e) then . else . + [$e] end)
+    | .[]' "$MODELS_FILE" 2>/dev/null
+}
+
+opencode_catalog_priced() { # opencode_catalog_priced <id> -> 0 when the catalog prices the model
+  opencode_catalog_available || return 1
+  "$JQ" -e --arg m "$1" '.opencode.models[] | select(.id == $m) | .priced == true' "$MODELS_FILE" >/dev/null 2>&1
+}
+
+opencode_catalog_tools() { # opencode_catalog_tools <id> -> 0 unless the catalog says the model makes no tool calls
+  opencode_catalog_available || return 0
+  if "$JQ" -e --arg m "$1" '.opencode.models[] | select(.id == $m) | .tools == false' "$MODELS_FILE" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+resolve_models_opencode() { # refresh config/models.json's `opencode` block from `opencode models --verbose`
+  local raw block tmp kept version
+  tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
+  if [ ! -f "$MODELS_FILE" ]; then
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  elif ! "$JQ" -e . "$MODELS_FILE" >/dev/null 2>&1; then
+    echo "models.json was not valid JSON — reseeded"
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  fi
+  if [ ! -x "$(platform_bin opencode)" ]; then
+    block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"opencode not installed"}')"
+  else
+    # --pure: the operator's plugins have no business in a catalog read, and
+    # one of them rewrote a command in a run (measured 02). Bounded: a CLI
+    # that hangs must not hang the daily pass.
+    version="$(run_bounded 30 "$(platform_bin opencode)" --version 2>/dev/null | head -1)"
+    raw="$(run_bounded 60 "$(platform_bin opencode)" models --verbose --pure 2>/dev/null)"
+    # The format is a header line `provider/model` followed by one pretty
+    # JSON document per model; jq cannot read the two interleaved, python can.
+    # raw rides in through a process substitution, not a pipe: this
+    # invocation's stdin is already the heredoc below (python's own program
+    # text, read via `-`), so piping into the same fd would hand the parser's
+    # later sys.stdin.read() nothing -- stdin was already drained to EOF
+    # getting the program itself.
+    block="$("$PYTHON" - "$(now_epoch)" "$version" <(printf '%s\n' "$raw") <<'PY'
+import json, re, sys
+at, version, rawfile = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+with open(rawfile) as f:
+    text = f.read()
+models = []
+for chunk in re.split(r"^(?=[A-Za-z0-9_.-]+/[^\n{]+\n\{)", text, flags=re.M):
+    chunk = chunk.strip()
+    if not chunk:
+        continue
+    head, _, body = chunk.partition("\n")
+    try:
+        d = json.loads(body)
+    except Exception:
+        continue
+    provider, _, name = head.partition("/")
+    def num(v):
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+    cost = d.get("cost") if isinstance(d.get("cost"), dict) else {}
+    cache = cost.get("cache") if isinstance(cost.get("cache"), dict) else {}
+    prices = {"input": num(cost.get("input")), "output": num(cost.get("output")),
+              "cache_read": num(cache.get("read")), "cache_write": num(cache.get("write"))}
+    caps = d.get("capabilities") if isinstance(d.get("capabilities"), dict) else {}
+    limit = d.get("limit") if isinstance(d.get("limit"), dict) else {}
+    variants = d.get("variants") if isinstance(d.get("variants"), dict) else {}
+    models.append({"id": head, "provider": provider, "name": d.get("name") or name, "cost": prices,
+                   "priced": any(v > 0 for v in prices.values()),
+                   "context": limit.get("context") or 0, "output_limit": limit.get("output") or 0,
+                   "variants": list(variants.keys()), "tools": caps.get("toolcall") is not False,
+                   "reasoning": caps.get("reasoning") is True, "status": d.get("status") or "active"})
+if models:
+    print(json.dumps({"at": at, "source": "opencode models --verbose", "version": version, "models": models}))
+else:
+    print(json.dumps({"at": at, "available": False,
+                      "reason": "opencode models listed no model: no provider is usable"}))
+PY
+)"
+  fi
+  # A refresh that failed -- no opencode, an empty list -- must not replace a
+  # catalog that still resolves real jobs: keep the block it had, stamped
+  # with when and why, exactly as resolve_models_openai does; `platform
+  # models` reads the stamp back as `stale`, and models_stale ages the block
+  # from it. The {available:false} stub is written only when there is
+  # nothing to keep.
+  if opencode_catalog_available && printf '%s' "$block" | "$JQ" -e '.available == false' >/dev/null 2>&1; then
+    kept="$(printf '%s' "$block" | "$JQ" -r .reason)"
+    if ! { "$JQ" --argjson at "$(now_epoch)" --arg r "$kept" '.opencode.stale_at = $at | .opencode.stale_reason = $r' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
+      rm -f "$tmp"
+      echo "opencode -> could not write $MODELS_FILE"
+      return 1
+    fi
+    rm -f "$tmp"
+    echo "opencode -> kept the previous catalog ($kept)"
+    return 0
+  fi
+  if ! { "$JQ" --argjson b "$block" '.opencode = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
+    rm -f "$tmp"
+    echo "opencode -> could not write $MODELS_FILE"
+    return 1
+  fi
+  rm -f "$tmp"
+  if opencode_catalog_available; then
+    echo "opencode -> $(opencode_catalog_visible | tr '\n' ' ')(opencode models --verbose)"
+  else
+    echo "opencode -> unavailable: $(printf '%s' "$block" | "$JQ" -r .reason)"
+  fi
+}
+
+opencode_catalog_ensure() { # resolve once, synchronously, when the block is missing and opencode exists
+  opencode_catalog_available && return 0
+  [ -x "$(platform_bin opencode)" ] || return 1
+  resolve_models_opencode >/dev/null 2>&1
+  opencode_catalog_available
+}
+
 # --- the price table -----------------------------------------------------------
 # config/pricing.json prices OpenAI runs: the Codex stream carries tokens and
 # no dollars, so the estimate is tokens × this table. The official page
@@ -2265,6 +2453,26 @@ turn_is_over() { # turn_is_over <stream-file> ; 0 = the agent answered and is id
 # One `ps` sweep, closed transitively in awk, so a deep tool tree (shell -> make
 # -> pytest -> workers) counts in full. Isolated and side-effect free so
 # `agentloop selftest` can exercise the parsing directly.
+# A command with a deadline. macOS ships no `timeout`, and the two places that
+# need one -- `opencode models` behind platform_check, `opencode export` at
+# the end of a run -- must never hang the Settings page or a run's close on a
+# CLI that has stopped answering (measured 08c/34b: an OpenCode process can
+# wait for ever, silently). python3 is a hard dependency; its subprocess
+# timeout kills the child and this answers 124, the convention of `timeout`.
+run_bounded() { # run_bounded <seconds> <cmd...> -> the command's stdout and rc; 124 past the deadline
+  local secs="$1"; shift
+  "$PYTHON" - "$secs" "$@" <<'PY'
+import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1]), stdin=subprocess.DEVNULL).returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+except OSError as e:
+    print(str(e), file=sys.stderr)
+    sys.exit(127)
+PY
+}
+
 tree_cpu_seconds() { # tree_cpu_seconds <pid> -> integer CPU seconds (0 when gone)
   local root="${1:-}"
   case "$root" in ''|*[!0-9]*) echo 0; return ;; esac
@@ -3214,6 +3422,10 @@ models_stale() { # 0 = either cache is missing or older than MODELS_TTL
   oa="$("$JQ" -r '[.openai.at // 0, .openai.stale_at // 0] | max' "$MODELS_FILE" 2>/dev/null)"
   case "$oa" in ''|null|*[!0-9]*) oa=0 ;; esac
   [ "$oa" -lt "$oldest" ] && oldest="$oa"
+  local oc
+  oc="$("$JQ" -r '[.opencode.at // 0, .opencode.stale_at // 0] | max' "$MODELS_FILE" 2>/dev/null)"
+  case "$oc" in ''|null|*[!0-9]*) oc=0 ;; esac
+  [ "$oc" -lt "$oldest" ] && oldest="$oc"
   [ "$(( $(now_epoch) - oldest ))" -ge "$MODELS_TTL" ]
 }
 
@@ -3728,11 +3940,60 @@ JSON
   _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN=""; OPENCODE_BIN=/nonexistent; platform_check opencode )"
   [ "$(printf '%s' "$_pc" | "$JQ" -r '.supported, .ready, .bin_found, .reason' | tr '\n' '|')" = "false|false|false|opencode not found at /nonexistent — set the path in Settings (or AGENTLOOP_OPENCODE_BIN); install: brew install opencode|" ] \
     && ok "platform_check opencode: planned, and not found says how to install it" || bad "opencode missing: $_pc"
-  printf '#!/bin/sh\necho "1.18.30"\n' > "$pb/bin/opencode"; chmod +x "$pb/bin/opencode"
+  printf '#!/bin/sh\ncase "$1" in --version) echo "1.18.30";; esac\nexit 0\n' > "$pb/bin/opencode"; chmod +x "$pb/bin/opencode"
   _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN=""; OPENCODE_BIN="$pb/bin/opencode"; platform_check opencode )"
-  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .bin_found, .version, .reason' | tr '\n' '|')" = "false|true|1.18.30|runs on OpenCode arrive with the OpenCode engine|" ] \
-    && ok "platform_check opencode: found and versioned, still not ready, with the reason" || bad "opencode found: $_pc"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .bin_found, .version, .reason' | tr '\n' '|')" = "false|true|1.18.30|no usable provider: run opencode auth login, or configure one in ~/.config/opencode/opencode.json|" ] \
+    && ok "platform_check opencode: found and versioned, not ready while no model is listed, with the reason" || bad "opencode found: $_pc"
   [ "$(platform_check martian | "$JQ" -r .reason)" = "unknown platform martian" ] && ok "an unlisted platform is answered, never a crash" || bad "unlisted"
+
+  echo "the OpenCode catalog — resolve_models_opencode over the stand-in, and the readers"
+  local _oc; _oc="$tmp/oc"; mkdir -p "$_oc/config" "$_oc/data"
+  ( CONFIG_DIR="$_oc/config"; MODELS_FILE="$_oc/config/models.json"; AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode"
+    resolve_models_opencode >/dev/null 2>&1 ) ; want "resolve-models opencode exits 0 over the stand-in" 0 $?
+  "$JQ" -e '.opencode.models | length == 13' "$_oc/config/models.json" >/dev/null 2>&1 \
+    && ok "the block carries the 13 models the stand-in lists" || bad "opencode block: $("$JQ" -c '.opencode | {at, source, n: (.models | length)}' "$_oc/config/models.json")"
+  "$JQ" -e '.opencode.models[] | select(.id == "pdm_ai/openai/gpt-oss-120b") | .provider == "pdm_ai" and .name == "openai/gpt-oss-120b"' \
+    "$_oc/config/models.json" >/dev/null 2>&1 && ok "a slash inside the model id splits at the FIRST slash" || bad "gpt-oss row: $("$JQ" -c '.opencode.models[] | select(.id | test("gpt-oss"))' "$_oc/config/models.json")"
+  "$JQ" -e '.opencode.models[] | select(.id == "pdm_ai/glm-5.3-flash") | .priced == true and .cost.input == 0.033011 and .cost.output == 0.139816 and .tools == true and .reasoning == true and (.variants == ["max","high","non-think"]) and .context == 197144' \
+    "$_oc/config/models.json" >/dev/null 2>&1 && ok "a priced model carries its price, its variants, its tools and its context" || bad "glm row: $("$JQ" -c '.opencode.models[] | select(.id == "pdm_ai/glm-5.3-flash")' "$_oc/config/models.json")"
+  "$JQ" -e '.opencode.models[] | select(.id == "opencode/big-pickle") | .priced == false and .variants == [] and .status == "active"' \
+    "$_oc/config/models.json" >/dev/null 2>&1 && ok "a zero-cost model is UNPRICED, not free, and a model without variants offers no effort" || bad "big-pickle row: $("$JQ" -c '.opencode.models[] | select(.id == "opencode/big-pickle")' "$_oc/config/models.json")"
+  [ "$("$JQ" -r '.opencode.source, .opencode.version' "$_oc/config/models.json" | tr '\n' '|')" = "opencode models --verbose|1.18.30|" ] \
+    && ok "the block says where it came from and which CLI answered" || bad "source/version: $("$JQ" -c '.opencode | {source, version}' "$_oc/config/models.json")"
+  ( MODELS_FILE="$_oc/config/models.json"
+    [ "$(opencode_catalog_ids | grep -c .)" = "13" ] || exit 1
+    [ "$(opencode_catalog_visible | head -1)" = "opencode/big-pickle" ] || exit 2
+    [ "$(opencode_catalog_efforts pdm_ai/glm-5.3-flash | tr '\n' ' ')" = "max high non-think " ] || exit 3
+    [ -z "$(opencode_catalog_efforts opencode/big-pickle)" ] || exit 4
+    opencode_catalog_priced pdm_ai/glm-5.3-flash || exit 5
+    opencode_catalog_priced opencode/big-pickle && exit 6
+    opencode_catalog_tools pdm_ai/glm-5.3-flash || exit 7
+    opencode_catalog_all_efforts | grep -qx 'non-think' || exit 8
+    exit 0 ); want "the readers: ids, visible, efforts per model, priced, tools, the union of efforts" 0 $?
+  ( CONFIG_DIR="$_oc/config"; MODELS_FILE="$_oc/config/models.json"; AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode"; FAKE_OPENCODE_NO_MODELS=1; export FAKE_OPENCODE_NO_MODELS
+    resolve_models_opencode >/dev/null 2>&1 )
+  "$JQ" -e '(.opencode.models | length) == 13 and (.opencode.stale_reason | length) > 0' "$_oc/config/models.json" >/dev/null 2>&1 \
+    && ok "a refresh that lists nothing keeps the catalog it had, stamped stale" || bad "after an empty refresh: $("$JQ" -c '.opencode | {n: (.models | length), stale_reason}' "$_oc/config/models.json")"
+  ( CONFIG_DIR="$_oc/config"; MODELS_FILE="$_oc/config/models.json"; AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode"
+    resolve_models_opencode >/dev/null 2>&1 )
+  "$JQ" -e '.opencode | has("stale_reason") | not' "$_oc/config/models.json" >/dev/null 2>&1 \
+    && ok "and the next good refresh clears the stamp" || bad "stamp survived a good refresh"
+  ( CONFIG_DIR="$_oc/config"; MODELS_FILE="$_oc/config/none.json"; AGENTLOOP_OPENCODE_BIN=""; OPENCODE_BIN=/nonexistent
+    resolve_models_opencode >/dev/null 2>&1 )
+  [ "$("$JQ" -r '.opencode.available, .opencode.reason' "$_oc/config/none.json" | tr '\n' '|')" = "false|opencode not installed|" ] \
+    && ok "without the binary the block says so" || bad "no-binary block: $("$JQ" -c .opencode "$_oc/config/none.json")"
+
+  echo "platform_check opencode — ready when the CLI lists a model, and who the account is"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode"; platform_check opencode )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .version, .account' | tr '\n' '|')" = "true|1.18.30|0 credentials · providers: opencode, pdm_ai|" ] \
+    && ok "ready, versioned, and the account names the credentials and the providers" || bad "opencode check: $_pc"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode"; FAKE_OPENCODE_NO_MODELS=1; export FAKE_OPENCODE_NO_MODELS; platform_check opencode )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .reason' | tr '\n' '|')" = "false|no usable provider: run opencode auth login, or configure one in ~/.config/opencode/opencode.json|" ] \
+    && ok "with no model listed it is not ready, and says what to do" || bad "no-provider check: $_pc"
+
+  echo "run_bounded() — a command past its deadline is killed and reads as 124"
+  run_bounded 1 sleep 5; want "a 5 s sleep under a 1 s deadline exits 124" 124 $?
+  [ "$(run_bounded 5 echo bounded-ok)" = "bounded-ok" ] && ok "a command inside the deadline passes its stdout through" || bad "run_bounded ate the output"
 
   echo "agentloop platform … — the commands the Settings page is made of"
   local pc="$tmp/pc" out rc _pm _pl; mkdir -p "$pc/config" "$pc/data"
@@ -3750,8 +4011,12 @@ JSON
   # shape as test/fixtures/codex/models-catalog.stripped.json.
   printf '{"models":[{"slug":"gpt-a","display_name":"A","description":"da","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"visibility":"list","priority":6},{"slug":"gpt-b","display_name":"B","description":"db","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"}],"visibility":"list","priority":7}]}' \
     > "$pc/catalog.json"
+  # opencode is not under test here, and platform_check/platform models now
+  # actually run its binary (Task 3) -- pointed at nothing, same as the two
+  # above, so an operator's real opencode install is never reached.
   pc_al() { AGENTLOOP_CONFIG="$pc/config" AGENTLOOP_DATA="$pc/data" AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" \
             AGENTLOOP_CODEX_BIN="$BASE_DIR/test/fake-codex" AGENTLOOP_CLAUDE_CONFIG_DIR="" CODEX_HOME="$pc/codex-home" \
+            AGENTLOOP_OPENCODE_BIN=/nonexistent/opencode \
             FAKE_CODEX_MODELS_JSON="$pc/catalog.json" "$BIN_DIR/agentloop" "$@"; }
   # pc_al's own twin, pointed at a codex that is not there, for the "a failed
   # refresh must not clobber the catalog" assertion below.
@@ -3979,7 +4244,7 @@ JSON
     MODELS_FILE="$tmp/rm/stale.json"
     "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{opus:{id:"x", at:$now}}, openai:{at:1, models:[]}}' > "$MODELS_FILE"
     models_stale; want "models_stale: an openai block older than MODELS_TTL is stale" 0 $?
-    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{opus:{id:"x", at:$now}}, openai:{at:1, models:[], stale_at:$now, stale_reason:"codex not installed"}}' > "$MODELS_FILE"
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{opus:{id:"x", at:$now}}, openai:{at:1, models:[], stale_at:$now, stale_reason:"codex not installed"}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
     models_stale; want "models_stale: a kept catalog with a fresh stale_at is not" 1 $?
 
     echo "RESULT ok=$_upass bad=$_ufail"
@@ -9466,7 +9731,7 @@ cmd_precheck() { # <id> — run the job's precheck once and RECORD it, without t
   printf '%s\n(exit %s)\n' "$pc_out" "$pc_rc"
 }
 
-cmd_resolve_models() { # cmd_resolve_models [anthropic|openai] -- no argument does both
+cmd_resolve_models() { # cmd_resolve_models [anthropic|openai|opencode] -- no argument does all three
   # `rc` carries resolve_models_openai's status past the validation case below,
   # whose own 0 used to be the function's answer -- so a catalog that could not
   # be written exited 0 and the failure was invisible to the operator and to
@@ -9485,7 +9750,10 @@ cmd_resolve_models() { # cmd_resolve_models [anthropic|openai] -- no argument do
   case "$which" in
     ""|openai) resolve_models_openai || rc=$? ;;
   esac
-  case "$which" in ""|anthropic|openai) ;; *) die "resolve-models: unknown platform '$which'" ;; esac
+  case "$which" in
+    ""|opencode) resolve_models_opencode || rc=$? ;;
+  esac
+  case "$which" in ""|anthropic|openai|opencode) ;; *) die "resolve-models: unknown platform '$which'" ;; esac
   return "$rc"
 }
 

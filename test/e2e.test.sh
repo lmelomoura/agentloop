@@ -30,6 +30,9 @@ export AGENTLOOP_CLAUDE_BIN="$E2E/fake-claude"
 # against their real ~/.codex. Every `$AL` in this file must see the stand-in.
 export AGENTLOOP_CODEX_BIN="$E2E/fake-codex"
 export CODEX_HOME="$ROOT/codex-home"        # the stand-in's rollouts; never ~/.codex
+# The same for OpenCode: the daily catalog pass would otherwise run the
+# operator's real `opencode models --verbose` against their real config.
+export AGENTLOOP_OPENCODE_BIN="$E2E/fake-opencode"
 # the price source is a fixture: no test reaches the network
 export AGENTLOOP_PRICING_URL="file://$REPO/test/fixtures/pricing/litellm-sample.json"
 mkdir -p "$CODEX_HOME"

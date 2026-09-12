@@ -46,6 +46,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     error. The first line is out the moment the CLI's first event arrives,
     flushed, because the watchdog now reads an empty file as a dead run.
     (the flush is pinned by a test that runs the normalizer without -u)
+  - The catalog: `agentloop resolve-models opencode` reads `opencode models
+    --verbose` into `config/models.json` (id, provider, name, price, whether
+    it is priced at all, context, variants, tool calls), refreshed daily
+    with the other two and kept, stamped stale, when a refresh lists
+    nothing; `platform check opencode` is ready when the CLI lists a model
+    and names the credentials and the providers. `run_bounded` puts a
+    deadline under the two CLI calls a hung OpenCode could otherwise turn
+    into a hung Settings page.
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of
