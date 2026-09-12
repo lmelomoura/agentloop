@@ -45,6 +45,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     left to the salvage path, only an auto-rejected ask ends the run as an
     error. The first line is out the moment the CLI's first event arrives,
     flushed, because the watchdog now reads an empty file as a dead run.
+    (the flush is pinned by a test that runs the normalizer without -u)
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of

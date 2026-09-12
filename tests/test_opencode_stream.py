@@ -221,6 +221,17 @@ def test_an_auto_rejected_ask_ends_the_run_as_tools_denied_at_eof():
         assert last["api_error_status"] is None
 
 
+def test_a_rejection_then_a_new_step_is_not_read_as_how_the_run_ended():
+    # Fixture 04 in full ends on the rejection (EOF right after the
+    # step_finish that follows it). Here a new step_start (fixture 12's)
+    # arrives instead of EOF: the run kept going past the rejection, so
+    # last_rejected must not survive to color finish() -- this is left to
+    # the salvage path, same as any other kill mid-turn.
+    evs = events_of("04-auto-rejected-ask.jsonl") + events_of("12-interrupted-turn.jsonl")
+    out = normalize(events=evs)
+    assert all(e["type"] != "result" for e in out)
+
+
 def test_a_tool_removed_from_the_roster_is_drawn_as_invalid_not_denied():
     out = normalize("06-tool-denied-invalid.jsonl")
     names = [b["name"] for b in blocks(out, "tool_use", "assistant")]
@@ -373,8 +384,13 @@ def test_the_cli_flushes_the_init_line_before_the_stream_ends(tmp_path):
     # run, and the watchdog would kill a live run at the stall window. Read
     # it on a background thread with a hard join timeout, so a regression
     # fails this test in 10s instead of hanging the suite forever.
+    # No -u: this test's whole point is that the normalizer's own out.flush()
+    # delivers the line, so it must not pass just because -u already makes
+    # stdout unbuffered on its own. -u lives in the engine's launch line, not
+    # here -- if a regression ever dropped the flush call, this Popen must be
+    # the one that notices.
     first = events_of("03-tool-use.jsonl")[0]
-    p = subprocess.Popen([sys.executable, "-u", str(NORM), "--model", "m", "--permission", "full-access",
+    p = subprocess.Popen([sys.executable, str(NORM), "--model", "m", "--permission", "full-access",
                           "--cwd", "/"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     read = {}
 

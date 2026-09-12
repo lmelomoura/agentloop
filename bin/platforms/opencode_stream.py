@@ -239,6 +239,12 @@ class Normalizer:
         if not self.inited and ev.get("sessionID"):
             out.append(self._init(ev))
         kind = ev.get("type")
+        # A rejection only ends the turn at EOF if nothing followed it: any
+        # event that is not another tool_use, step_finish, or error (a new
+        # step_start, more text, ...) means the run kept going past it, so
+        # finish() must not read the stale rejection as how the run ended.
+        if kind not in ("tool_use", "step_finish", "error"):
+            self.last_rejected = False
         part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
         if kind == "text":
             text = part.get("text") or ""
