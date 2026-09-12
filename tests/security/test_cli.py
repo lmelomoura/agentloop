@@ -3642,6 +3642,34 @@ def test_opening_and_finishing_an_analysis_files_events(tmp_path):
     assert "analysis_finished" in kinds
 
 
+def test_closing_an_analysis_twice_files_one_finished_event_with_the_final_verdict(tmp_path):
+    """A row is closed twice by design -- the agent's own `--state done`, then
+    the engine with the run's real verdict and cost (see cmd_finish's own
+    docstring) -- and each close used to file an `analysis_finished` of its
+    own: on the Activity screen every analysis read as two identical
+    "finished" rows a minute apart (Minerva's #9 through #12, every one).
+    The note and the coverage table already replaced rather than appended on
+    the second close; the event now does too. ONE row, carrying the verdict
+    the second close settled on -- the same replace-not-append rule, so the
+    audit trail says `capped` when the row does, not the agent's earlier
+    `done`."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
+    run(db, "finish", "--analysis", str(aid), "--state", "capped",
+        "--spend", "1.5", "--note", "the run hit its turn cap")
+    # Read raw, NOT through `events`: that verb opens the ledger through
+    # `ledger.connect`, which folds pre-existing duplicate closes on its way
+    # in (see `_FOLD_DUPLICATE_CLOSES`) -- so it would report one row here
+    # whether or not `finish` itself had stopped writing two.
+    conn = sqlite3.connect(str(db))
+    finished = conn.execute(
+        "SELECT detail, related FROM event WHERE kind='analysis_finished'").fetchall()
+    assert len(finished) == 1, finished
+    assert finished[0][0].startswith("capped · "), finished[0][0]
+    assert finished[0][1] == str(aid)
+
+
 def test_a_decision_files_an_event_carrying_its_reason(tmp_path):
     db = tmp_path / "security.db"
     run(db, "decide", "--project", "web", "--fingerprint", "a" * 64,

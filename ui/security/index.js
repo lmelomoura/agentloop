@@ -90,7 +90,9 @@ function init(cc){
   iconLabel($("sec-act-reload"), "radar", "Refresh");
   iconLabel($("secactt-all"), "activity", "All activity");
   iconLabel($("secactt-analyses"), "shield", "Analyses");
-  iconLabel($("secactt-findings"), "search", "Findings");
+  iconLabel($("secactt-decisions"), "check2", "Decisions");
+  // The same glyph the project screen's own Reports tab wears (secpjt-reports).
+  iconLabel($("secactt-reports"), "file", "Reports");
   iconLabel($("secactt-settings"), "gear", "Settings");
   // Wrapped, not passed bare: secBackFromActivity/secBack (just below) now
   // take a `fromHistory` parameter (F4 history layer), and addEventListener
@@ -101,7 +103,8 @@ function init(cc){
   $("sec-act-reload").addEventListener("click", secActReload);
   $("secactt-all").addEventListener("click", () => secActSwitchTab(""));
   $("secactt-analyses").addEventListener("click", () => secActSwitchTab("analyses"));
-  $("secactt-findings").addEventListener("click", () => secActSwitchTab("findings"));
+  $("secactt-decisions").addEventListener("click", () => secActSwitchTab("decisions"));
+  $("secactt-reports").addEventListener("click", () => secActSwitchTab("reports"));
   $("secactt-settings").addEventListener("click", () => secActSwitchTab("settings"));
   // The house picker (F4 Activity polish), replacing the free-text
   // #sec-act-project <input> and its own `change` listener -- see

@@ -1109,7 +1109,7 @@ relates to:
 | kind | filed when |
 |---|---|
 | `analysis_started` | the ledger row is opened, naming the profile and branch |
-| `analysis_finished` | the row is closed, naming how (`done · standard on main`) |
+| `analysis_finished` | the row is closed, naming how (`done · standard on main`) — one event per analysis, not per close: the engine's second close rewrites it with the verdict it settled on rather than filing a twin beside it |
 | `decision_made` | *Accept risk* / *False positive*, carrying the written reason and the first 12 characters of the fingerprint |
 | `settings_changed` | a project is saved **and has security enabled** — a save on a project this area knows nothing about is not this area's history |
 | `report_exported` | a Markdown, JSON, HTML or SBOM report is actually rendered — filed after the render succeeds, never on the click |

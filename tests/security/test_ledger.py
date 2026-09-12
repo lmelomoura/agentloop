@@ -184,6 +184,71 @@ def test_events_filter_by_kind_and_paginate(conn):
     assert len(page) == 2
 
 
+def test_a_replacing_event_is_one_row_per_subject_carrying_the_latest_detail(conn):
+    """`replace=True` files at most ONE event per (project, kind, related):
+    the second call updates that row's detail and moment in place instead of
+    inserting beside it. Written for `cmd_finish`, which closes every
+    analysis twice by design (the agent's own close, then the engine's) and
+    used to file `analysis_finished` twice for it -- the Activity screen read
+    every close as two identical rows a minute apart."""
+    ledger.record_event(conn, "web", "analysis_finished", "done · deep on main",
+                        "7", replace=True)
+    first = ledger.events_for(conn, project="web")[0]
+    conn.execute("UPDATE event SET at = at - 60 WHERE id=?", (first["id"],))
+    conn.commit()
+    ledger.record_event(conn, "web", "analysis_finished", "capped · deep on main",
+                        "7", replace=True)
+    events = ledger.events_for(conn, project="web")
+    assert len(events) == 1
+    assert events[0]["id"] == first["id"]
+    assert events[0]["detail"] == "capped · deep on main"
+    # The moment moves with the close, the same way finish_analysis moves the
+    # row's own `ended` -- so the one event and the analysis row agree.
+    assert events[0]["at"] > first["at"] - 60
+    # Another analysis, or another project, is another subject: still a row
+    # of its own.
+    ledger.record_event(conn, "web", "analysis_finished", "done", "8", replace=True)
+    ledger.record_event(conn, "api", "analysis_finished", "done", "7", replace=True)
+    assert len(ledger.events_for(conn)) == 3
+
+
+def test_a_replacing_event_needs_a_subject_to_replace_by(conn):
+    """With no `related` there is nothing to key the replacement on -- the
+    call would silently collapse every such event of a project into one."""
+    with pytest.raises(ValueError):
+        ledger.record_event(conn, "web", "analysis_finished", "done", "",
+                            replace=True)
+
+
+def test_connect_collapses_duplicate_finished_events_keeping_the_newest(tmp_path):
+    """Every analysis closed before `cmd_finish` learned to replace already
+    holds two `analysis_finished` rows in the installed ledgers (see
+    `_ANALYSIS_COLUMNS`' own comment on the dev databases being the installed
+    base). The code fix alone leaves every one of them reading twice for
+    ever, so `connect` folds them once: the newest row survives, because its
+    moment is the one the analysis row's own `ended` was last written with."""
+    path = tmp_path / "security.db"
+    conn = ledger.connect(path)
+    conn.executemany(
+        "INSERT INTO event (project, kind, detail, related, at) VALUES (?,?,?,?,?)",
+        [("web", "analysis_finished", "done · deep on main", "12", 100),
+         ("web", "analysis_finished", "done · deep on main", "12", 160),
+         ("web", "analysis_finished", "done · deep on main", "11", 50),
+         ("api", "analysis_finished", "done · deep on main", "12", 70),
+         # Two exports of the same analysis are two real events -- another
+         # kind must never be folded.
+         ("web", "report_exported", "md report for analysis 12", "12", 200),
+         ("web", "report_exported", "html report for analysis 12", "12", 210)])
+    conn.commit()
+    conn.close()
+
+    conn = ledger.connect(path)
+    finished = [(e["project"], e["related"], e["at"]) for e in
+                ledger.events_for(conn, kinds=("analysis_finished",))]
+    assert sorted(finished) == [("api", "12", 70), ("web", "11", 50), ("web", "12", 160)]
+    assert len(ledger.events_for(conn, kinds=("report_exported",))) == 2
+
+
 def test_a_failed_re_report_does_not_leave_the_finding_with_half_its_occurrences(conn):
     """The upsert path deletes the old occurrences before inserting the new
     ones. If that insert then fails partway, the whole re-report -- the field
