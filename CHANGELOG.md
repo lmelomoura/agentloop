@@ -56,6 +56,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     into a hung Settings page; a CLI that hangs past its deadline is reported
     as a timeout, not as a missing provider, and the deadline ends the CLI's
     whole process group.
+  - The table: `opencode` is a running platform (`platform_known`), with
+    two permission modes that say what the CLI enforces (`full-access`, the
+    default, and `read-only`: there is no sandbox, so no "workspace" mode
+    that would promise one), the model's own `variants` as its effort
+    vocabulary (validated here: the CLI accepts anything in silence), the
+    job's `allowed_tools`/`disallowed_tools` translated into the permission
+    block the run is launched with (`Agent` closes `task`, `Bash(git push
+    *)` is a bash rule, deny wins), the launch line measured flag by flag
+    (`--pure --auto --print-logs --log-level ERROR --dir --title`), and
+    `platform_finish` reading the model that ran from `opencode export`.
+    `platform_normalizer` is what the launch now asks for, and
+    `prepare_inline` the capability that says which platform lets the
+    security agent run `prepare` itself.
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of
