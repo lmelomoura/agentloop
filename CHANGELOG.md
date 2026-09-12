@@ -362,6 +362,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Settings › Platforms counts every job configured for a model, not only the
+  ones switched on.** The "N jobs" badge beside a model and the line on the card
+  both came from a list that skipped anything with `enabled: false`, while the
+  page presented the number as *who uses this model*. An operator who had parked
+  his jobs while he worked on something else opened Settings and saw one job, on
+  the single model a security block used, and nothing at all on the four models
+  his other eight jobs name — including a model he had one job enabled on. Every
+  model those jobs would run on read as used by nobody, so switching it off, or
+  switching the whole platform off, looked free. Both counts now cover every
+  configured job and every security block a project carries, switched on or not,
+  and the card says which is which: *8 jobs run here (0 enabled)* when the two
+  numbers differ, plain *3 jobs run here* when they do not, and a model row's
+  tooltip spells out how many of its jobs are switched on. The two sentences that
+  really are about running are unchanged: a platform is still only *enabled* by
+  the seed when something would actually run on it, and the warning a switch-off
+  prints still counts only the enabled jobs it leaves skipped. The seed's model
+  list gained the same fix in passing — an upgrade now records the models of a
+  parked job too, so switching that job back on no longer lands on "model not
+  enabled in Settings" for a model that was in use the day before.
+
 - **The `committed_env_file` and `committed_key_file` hygiene rules ask git what
   is committed.** They read the working tree, and the working tree of an analysis
   is not only the clone: a build or a provisioning step writes into it after

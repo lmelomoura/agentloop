@@ -3438,6 +3438,42 @@ def test_the_settings_summary_ignores_a_disabled_platforms_models(srv, tmp_path)
         "a disabled platform's leftover models_enabled must not be counted"
 
 
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_card_line_counts_every_job_not_only_the_enabled_ones(srv, tmp_path):
+    """The reported defect: the card said "N enabled jobs run here" over a
+    number the page presents as "who uses this platform". An operator whose
+    jobs were all parked read that as "nothing runs here", and switching the
+    platform (or one of its models) off looked free. The count is now every
+    configured job, and the sentence only names the enabled ones when they
+    are fewer."""
+    js = _app_js(srv)
+    script = tmp_path / "settings-jobs-line.js"
+    script.write_text("\n".join(_plainfn(js, n) for n in ("platformJobsLine", "modelJobsTitle")) + """
+    console.log(JSON.stringify({
+      allOn:   platformJobsLine({enabled: true,  jobs_on_platform: 3, jobs_on_platform_enabled: 3}),
+      one:     platformJobsLine({enabled: true,  jobs_on_platform: 1, jobs_on_platform_enabled: 1}),
+      parked:  platformJobsLine({enabled: false, jobs_on_platform: 8, jobs_on_platform_enabled: 0}),
+      some:    platformJobsLine({enabled: true,  jobs_on_platform: 5, jobs_on_platform_enabled: 2}),
+      none:    platformJobsLine({enabled: true,  jobs_on_platform: 0, jobs_on_platform_enabled: 0}),
+      noneOff: platformJobsLine({enabled: false, jobs_on_platform: 0, jobs_on_platform_enabled: 0}),
+      planned: platformJobsLine({supported: false, jobs_on_platform: 0}),
+      title:     modelJobsTitle(2, 0),
+      titleOne:  modelJobsTitle(1, 1),
+      titleNone: modelJobsTitle(0, 0),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["allOn"] == "3 jobs run here" and out["one"] == "1 job runs here", out
+    assert out["parked"] == "8 jobs run here (0 enabled)", out
+    assert out["some"] == "5 jobs run here (2 enabled)", out
+    assert out["none"] == "jobs may pick this platform" and out["noneOff"] == "unlocks when the session test passes"
+    assert out["planned"] == "runs on OpenCode are not supported yet"
+    assert out["title"] == "2 jobs use this model (0 switched on)", out
+    assert out["titleOne"] == "1 job uses this model (1 switched on)" and out["titleNone"] == ""
+    assert "enabled job" not in _plainfn(js, "platformJobsLine"), \
+        "the card line must stop calling every configured job an enabled one"
+
+
 def test_the_settings_module_speaks_the_six_actions(srv):
     src = (REPO / "ui" / "app" / "settings.js").read_text()
     for op in ("platform_check", "platform_enable", "platform_disable", "platform_set_bin", "platform_models", "platform_set_models"):

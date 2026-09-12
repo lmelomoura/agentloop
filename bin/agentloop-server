@@ -2656,12 +2656,20 @@ def platform_bin(p, entry):
 
 
 def jobs_using(p, jobs, projects, resolved, default, catalog_slugs):
-    """(model id -> n, n jobs) over the enabled jobs and enabled security blocks
-    whose effective platform is `p` -- the engine's `uses` (PLATFORMS_JQ), in
-    python. A job or block with no model, or one invalid on this platform, is
-    credited to the platform's default model instead (the engine's
-    `effective`) and still counts on the platform either way: `n_jobs` counts
-    jobs/blocks, `out` only the ones that land on a real (non-empty) model id.
+    """(model id -> n, model id -> n switched on, n jobs, n switched on) over
+    EVERY job and EVERY security block whose effective platform is `p` -- the
+    engine's `uses` (PLATFORMS_JQ), in python.
+
+    Configuration, not the run queue: a job the operator parked still names a
+    model and still counts here, which is what the Settings page asks. The
+    `_on` halves are the other question -- who would run right now -- and the
+    page keeps them apart in words. Counting only the enabled ones under both
+    names is what showed an operator with parked jobs a model nobody used.
+
+    A job or block with no model, or one invalid on this platform, is credited
+    to the platform's default model instead (the engine's `effective`) and
+    still counts on the platform either way: `n_jobs` counts jobs/blocks, the
+    maps only the ones that land on a real (non-empty) model id.
     """
 
     def rid(m):
@@ -2677,28 +2685,33 @@ def jobs_using(p, jobs, projects, resolved, default, catalog_slugs):
         return rid(m if (m and valid(m)) else default)
 
     by_name = {e.get("name"): e for e in projects if isinstance(e, dict)}
-    out = {}
-    n_jobs = 0
-    for j in jobs:
-        if not isinstance(j, dict) or j.get("enabled") is False or _job_platform(j, projects) != p:
-            continue
-        proj = by_name.get(j.get("project") or "") or {}
-        m = effective(j.get("model") or proj.get("model") or "")
+    out, out_on = {}, {}
+    n_jobs = n_enabled = 0
+
+    def credit(m, on):
+        nonlocal n_jobs, n_enabled
         n_jobs += 1
+        n_enabled += 1 if on else 0
         if m:
             out[m] = out.get(m, 0) + 1
+            if on:
+                out_on[m] = out_on.get(m, 0) + 1
+
+    for j in jobs:
+        if not isinstance(j, dict) or _job_platform(j, projects) != p:
+            continue
+        proj = by_name.get(j.get("project") or "") or {}
+        credit(effective(j.get("model") or proj.get("model") or ""), j.get("enabled") is not False)
     for e in projects:
         sec = e.get("security") if isinstance(e, dict) else None
-        if not isinstance(sec, dict) or sec.get("enabled") not in (True, "true"):
+        # a project with no security block has nothing configured to count
+        if not isinstance(sec, dict):
             continue
         sp = sec.get("platform") or e.get("platform") or "anthropic"
         if (sp if sp in PLATFORM_PERMISSIONS else "anthropic") != p:
             continue
-        m = effective(sec.get("model") or "")
-        n_jobs += 1
-        if m:
-            out[m] = out.get(m, 0) + 1
-    return out, n_jobs
+        credit(effective(sec.get("model") or ""), sec.get("enabled") in (True, "true"))
+    return out, out_on, n_jobs, n_enabled
 
 
 def platform_entry(p, cfg, jobs, projects, resolved, catalog_slugs):
@@ -2708,13 +2721,17 @@ def platform_entry(p, cfg, jobs, projects, resolved, catalog_slugs):
     models = [m for m in (entry.get("models") or []) if isinstance(m, str) and m]
     b, src = platform_bin(p, entry)
     default = models[0] if models else ""
-    using, n_jobs = jobs_using(p, jobs, projects, resolved, default, catalog_slugs)
+    using, using_on, n_jobs, n_enabled = jobs_using(p, jobs, projects, resolved, default, catalog_slugs)
     return {"supported": p not in PLATFORMS_PLANNED, "enabled": enabled,
             "usable": enabled and bool(models), "bin": b, "bin_source": src,
             # The engine's own test (`-f && -x`): a directory is executable
             # to os.access and is not a binary.
             "bin_found": os.path.isfile(b) and os.access(b, os.X_OK), "models_enabled": models,
-            "jobs_on_platform": n_jobs, "jobs_using": using}
+            # jobs_on_platform/jobs_using: everything CONFIGURED here, parked
+            # jobs included -- the count the page shows. The *_enabled twins:
+            # only what would run right now.
+            "jobs_on_platform": n_jobs, "jobs_on_platform_enabled": n_enabled,
+            "jobs_using": using, "jobs_using_enabled": using_on}
 
 
 def list_models():

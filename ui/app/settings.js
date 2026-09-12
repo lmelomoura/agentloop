@@ -261,6 +261,28 @@ function sessionBlock(r, entry, check){
   return box;
 }
 
+// The two numbers behind these sentences answer two different questions, and
+// the page used to print one of them under the other's name. jobs_on_platform
+// is who is CONFIGURED to run here -- a job the operator parked still is;
+// jobs_on_platform_enabled is who would run right now. Calling the first
+// "enabled jobs" told an operator whose jobs were all parked that nothing used
+// the platform, so switching it (or one of its models) off looked free.
+function platformJobsLine(entry){
+  if(entry.supported === false) return "runs on OpenCode are not supported yet";
+  const n = entry.jobs_on_platform || 0;
+  if(!n) return entry.enabled ? "jobs may pick this platform" : "unlocks when the session test passes";
+  const on = entry.jobs_on_platform_enabled;
+  return n + " job" + (n === 1 ? "" : "s") + " run" + (n === 1 ? "s" : "") + " here"
+    + (typeof on === "number" && on !== n ? " (" + on + " enabled)" : "");
+}
+
+// A model row's badge counts everything; the tooltip is where the switched-on
+// half is spelled out, so the badge stays a short read.
+function modelJobsTitle(n, on){
+  if(!n) return "";
+  return n + " job" + (n === 1 ? "" : "s") + " use" + (n === 1 ? "s" : "") + " this model (" + (on || 0) + " switched on)";
+}
+
 function modelRow(r, entry, m, using, gone){
   const enabledNow = (entry.models_enabled || []).includes(m.v);
   const row = el("div", "mrow" + (enabledNow ? "" : " offrow"));
@@ -280,7 +302,7 @@ function modelRow(r, entry, m, using, gone){
   const n = using[m.v] || 0;
   if(n) meta.appendChild(el("span", "jobs", n + " job" + (n === 1 ? "" : "s")));
   row.appendChild(meta);
-  row.appendChild(switchEl(enabledNow, live.busy[r.id], n ? n + " enabled job(s) use this model" : "", "Switch on " + m.v, async (on) => {
+  row.appendChild(switchEl(enabledNow, live.busy[r.id], modelJobsTitle(n, (entry.jobs_using_enabled || {})[m.v] || 0), "Switch on " + m.v, async (on) => {
     const cur = (entry.models_enabled || []).slice();
     const next = on ? (cur.includes(m.v) ? cur : cur.concat([m.v])) : cur.filter(v => v !== m.v);
     await change("platform_set_models", {platform: r.id, models: next});
@@ -337,9 +359,7 @@ function platformCard(r, entry, check, catalog){
     "Enable " + r.name,
     async (on) => { await change(on ? "platform_enable" : "platform_disable", {platform: r.id}); }));
   sw.appendChild(row);
-  const n = entry.jobs_on_platform || 0;
-  sw.appendChild(el("span", null, entry.supported === false ? "runs on OpenCode are not supported yet"
-    : (n ? n + " enabled job" + (n === 1 ? "" : "s") + " run" + (n === 1 ? "s" : "") + " here" : (entry.enabled ? "jobs may pick this platform" : "unlocks when the session test passes"))));
+  sw.appendChild(el("span", null, platformJobsLine(entry)));
   right.appendChild(sw); h.appendChild(right); card.appendChild(h);
   // The engine's own answer, in its own words: a refusal (red, alert icon)
   // or -- a switch-off's sentence about the enabled jobs it leaves skipped --
