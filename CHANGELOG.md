@@ -313,6 +313,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The dashboard brand now includes an outlined `agentloop` wordmark at both
+  sign-in and sidebar sizes, with a dark-theme colour variant. Previously the
+  product name was ordinary browser text beside the robot, so its shape varied
+  with the installed fonts and did not form a consistent logo.
+
 - **The operator profile is Settings › Profile, and the sidebar photo goes
   there.** The photo, name, email and password form moved out of the dialog it
   lived in and into the tab that already carried its name; clicking the face at
