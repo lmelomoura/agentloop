@@ -150,6 +150,9 @@ OPENCODE_BIN="${AGENTLOOP_OPENCODE_BIN:-$_opencode_default}"
 # --verbose` gets double this; the selftest shortens it to keep the two hang
 # cases fast.
 OPENCODE_DEADLINE="${AGENTLOOP_OPENCODE_DEADLINE:-30}"
+# A non-numeric OPENCODE_DEADLINE, or 0, must fall back to the default instead
+# of reaching python as a bad float() or a deadline that always fires.
+case "$OPENCODE_DEADLINE" in ''|*[!0-9]*|0) OPENCODE_DEADLINE=30 ;; esac
 # Which Claude account every run signs in as. Claude Code keeps credentials,
 # settings, plugins, MCP servers and past sessions per config directory — one
 # signed-in account each — so this variable is the only thing that chooses
@@ -1533,6 +1536,11 @@ platform_check() { # platform_check <platform> -> one JSON object; always exits 
           # -- it must never read as one (measured 34b: a hung CLI answers
           # nothing at all, for ever).
           reason="opencode models timed out after ${OPENCODE_DEADLINE} s (the CLI hung; measured: a provider that never answers hangs it for ever)"
+        elif [ "$rc" -ne 0 ]; then
+          # An outright failure (a bad flag, a crash, a broken install) is a
+          # different fact again from "ran fine and found nothing" -- say so,
+          # and name the command that failed.
+          reason="opencode models failed (rc $rc) — see: $bin models --pure"
         elif [ "$nmod" -gt 0 ]; then
           ready=true
           esc="$(printf '\033')"
@@ -2154,14 +2162,14 @@ resolve_models_opencode() { # refresh config/models.json's `opencode` block from
       block="$("$JQ" -nc --argjson at "$(now_epoch)" --arg reason "opencode models --verbose timed out after $((OPENCODE_DEADLINE * 2)) s" \
         '{at:$at, available:false, reason:$reason}')"
     else
-    # The format is a header line `provider/model` followed by one pretty
-    # JSON document per model; jq cannot read the two interleaved, python can.
-    # raw rides in through a process substitution, not a pipe: this
-    # invocation's stdin is already the heredoc below (python's own program
-    # text, read via `-`), so piping into the same fd would hand the parser's
-    # later sys.stdin.read() nothing -- stdin was already drained to EOF
-    # getting the program itself.
-    block="$("$PYTHON" - "$(now_epoch)" "$version" <(printf '%s\n' "$raw") <<'PY'
+      # The format is a header line `provider/model` followed by one pretty
+      # JSON document per model; jq cannot read the two interleaved, python can.
+      # raw rides in through a process substitution, not a pipe: this
+      # invocation's stdin is already the heredoc below (python's own program
+      # text, read via `-`), so piping into the same fd would hand the parser's
+      # later sys.stdin.read() nothing -- stdin was already drained to EOF
+      # getting the program itself.
+      block="$("$PYTHON" - "$(now_epoch)" "$version" <(printf '%s\n' "$raw") <<'PY'
 import json, re, sys
 at, version, rawfile = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 with open(rawfile) as f:
@@ -2490,14 +2498,22 @@ turn_is_over() { # turn_is_over <stream-file> ; 0 = the agent answered and is id
 run_bounded() { # run_bounded <seconds> <cmd...> -> the command's stdout and rc; 124 past the deadline
   local secs="$1"; shift
   "$PYTHON" - "$secs" "$@" <<'PY'
-import subprocess, sys
+import os, signal, subprocess, sys
 try:
-    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1]), stdin=subprocess.DEVNULL).returncode)
-except subprocess.TimeoutExpired:
-    sys.exit(124)
+    p = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, start_new_session=True)
 except OSError as e:
     print(str(e), file=sys.stderr)
     sys.exit(127)
+try:
+    p.wait(timeout=float(sys.argv[1]))
+except subprocess.TimeoutExpired:
+    os.killpg(p.pid, signal.SIGTERM)
+    try:
+        p.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+    sys.exit(124)
+sys.exit(p.returncode)
 PY
 }
 
@@ -3979,6 +3995,12 @@ JSON
   _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN="$pb/bin/opencode-hang"; OPENCODE_DEADLINE=1; platform_check opencode )"
   [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .reason' | tr '\n' '|')" = "false|opencode models timed out after 1 s (the CLI hung; measured: a provider that never answers hangs it for ever)|" ] \
     && ok "platform_check opencode: a CLI past its deadline reads as a timeout, never as no usable provider" || bad "opencode hang: $_pc"
+  # An outright failure (rc 3, no output) is a third fact, distinct from both
+  # a timeout and an empty catalog -- it must name the rc and the command.
+  printf '#!/bin/sh\ncase "$1" in --version) echo 1.18.30;; *) exit 3;; esac\n' > "$pb/bin/opencode-broken"; chmod +x "$pb/bin/opencode-broken"
+  _pc="$( PLATFORMS_FILE="$pb/none.json"; AGENTLOOP_OPENCODE_BIN="$pb/bin/opencode-broken"; platform_check opencode )"
+  [ "$(printf '%s' "$_pc" | "$JQ" -r '.ready, .reason' | tr '\n' '|')" = "false|opencode models failed (rc 3) — see: $pb/bin/opencode-broken models --pure|" ] \
+    && ok "platform_check opencode: a CLI that fails outright is not read as no usable provider" || bad "opencode broken: $_pc"
   [ "$(platform_check martian | "$JQ" -r .reason)" = "unknown platform martian" ] && ok "an unlisted platform is answered, never a crash" || bad "unlisted"
 
   echo "the OpenCode catalog — resolve_models_opencode over the stand-in, and the readers"
@@ -4037,6 +4059,12 @@ JSON
   echo "run_bounded() — a command past its deadline is killed and reads as 124"
   run_bounded 1 sleep 5; want "a 5 s sleep under a 1 s deadline exits 124" 124 $?
   [ "$(run_bounded 5 echo bounded-ok)" = "bounded-ok" ] && ok "a command inside the deadline passes its stdout through" || bad "run_bounded ate the output"
+  # A grandchild that inherits stdout (the shape of a bun-spawned opencode
+  # helper process) must die too, not only the direct child -- 601, not 600,
+  # keeps this assertion from matching a sleep some other case left behind.
+  run_bounded 1 sh -c 'sleep 601 & sleep 601'; want "a hung process group under a 1 s deadline exits 124" 124 $?
+  [ "$(ps -ax -o command= | grep -c '^sleep 601$')" = "0" ] \
+    && ok "and no sleep 601 process is left running in its group" || bad "leaked sleep 601 count: $(ps -ax -o command= | grep -c '^sleep 601$')"
 
   echo "agentloop platform … — the commands the Settings page is made of"
   local pc="$tmp/pc" out rc _pm _pl; mkdir -p "$pc/config" "$pc/data"

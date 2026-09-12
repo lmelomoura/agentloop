@@ -54,7 +54,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     and names the credentials and the providers. `run_bounded` puts a
     deadline under the two CLI calls a hung OpenCode could otherwise turn
     into a hung Settings page; a CLI that hangs past its deadline is reported
-    as a timeout, not as a missing provider.
+    as a timeout, not as a missing provider, and the deadline ends the CLI's
+    whole process group.
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of
