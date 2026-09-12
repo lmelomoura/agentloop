@@ -34,6 +34,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     auto-rejected permission, a rule denial, an unknown model, a rate
     limit) and answers `--version`, `models`, `auth list` and `export`;
     `test/fixtures/opencode/` holds the measurements the tests read.
+  - The normalizer, `bin/platforms/opencode_stream.py`: the OpenCode events
+    become the stream-json every reader here already speaks -- `text` an
+    assistant message, a completed `tool_use` a tool_use and its result at
+    once (Claude's tool names, so the Timeline draws `Bash` with the
+    command), `step_finish` summed into one `result` with the tokens
+    (reasoning apart from output, and inside `usage.output_tokens`), the
+    two measured denial phrases into `permission_denials`, an `error` into
+    an error result with its `statusCode`. The first line is out the
+    moment the CLI's first event arrives, flushed, because the watchdog
+    now reads an empty file as a dead run.
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of
