@@ -685,14 +685,56 @@ document.documentElement.dataset.theme =
 
   <div class="view" id="view-settings" hidden>
   <!-- Settings › Platforms is drawn by ALApp.renderSettingsPage() (ui/app/settings.js)
-       into the two hosts below; the Profile tab keeps the "not built yet" note. -->
+       into the two hosts below; Profile is static markup, filled on the way into
+       the tab by fillProfile(). -->
   <div id="st-head"></div>
   <nav class="viewtabs" id="st-tabs">
     <button class="viewtab active" data-sttab="platforms" id="sttab-platforms"></button>
     <button class="viewtab" data-sttab="profile" id="sttab-profile"></button>
   </nav>
   <div class="pane" id="st-platforms"></div>
-  <div class="pane" id="st-profile" hidden><div class="soon" id="soon-settings"></div></div>
+  <!-- The one account, edited here. It lived in a dialog behind the sidebar
+       photo while this tab said "Not built yet" — one thing in two places, and
+       the tab lied about which. The ids are the dialog's, unchanged: pfFace(),
+       fillProfile() and saveProfile() still read exactly these. It wears the
+       Platforms tab's own card so the two tabs read as one page, and there is
+       no Cancel and no close button — a page is not something you dismiss. -->
+  <div class="pane" id="st-profile" hidden>
+    <section class="platcard">
+      <div class="platcard-h">
+        <div class="platcard-ic" id="pf-halo"></div>
+        <div class="platcard-t"><b>Your profile</b><span>The one account on this install</span></div>
+      </div>
+      <div class="pf-b">
+        <div class="pf-photo">
+          <div class="pf-face" id="pf-face"></div>
+          <div class="pf-photo-a">
+            <button type="button" class="btn ghost" id="pf-pick">Choose photo…</button>
+            <button type="button" class="btn ghost" id="pf-drop" hidden>Remove</button>
+            <input type="file" id="pf-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+          </div>
+        </div>
+        <p class="fieldhelp">Stored inside the database as part of your profile, not as a file on disk —
+          so there is nothing to serve and nothing left behind when you replace it. It is scaled down to
+          256&nbsp;px here before it is saved; the original never leaves your machine.</p>
+        <label for="pf-name">Name<span class="req" aria-hidden="true">*</span></label>
+        <input id="pf-name" type="text" autocomplete="name">
+        <label for="pf-email">Email<span class="req" aria-hidden="true">*</span></label>
+        <input id="pf-email" type="email" autocomplete="email">
+        <label for="pf-current">Change password</label>
+        <input id="pf-current" type="password" autocomplete="current-password" placeholder="Current password">
+        <input id="pf-pw" type="password" autocomplete="new-password" placeholder="New password">
+        <input id="pf-pw2" type="password" autocomplete="new-password" placeholder="Confirm new password">
+        <p class="fieldhelp">Leave all three empty to keep the password you have. Changing it asks for the
+          current one because a signed-in tab is not proof that you are the one at the keyboard. There is
+          still no reset — it is stored hashed and nothing on this machine can read it back.</p>
+      </div>
+      <div class="pf-f">
+        <div class="dlg-err" id="pf-err" hidden></div>
+        <button type="button" class="btn primary" id="pf-save">Save profile</button>
+      </div>
+    </section>
+  </div>
   </div><!-- /view-settings -->
 
   <footer id="foot"></footer>
@@ -1171,42 +1213,9 @@ document.documentElement.dataset.theme =
 </div>
 </form></dialog>
 
-<dialog id="profmodal"><form method="dialog">
-<div class="dlg-h"><div class="halo b-accent" id="pf-halo"></div>
-  <div class="dlg-ht"><span>Your profile</span>
-    <span class="dlg-sub">The one account on this install</span></div>
-  <button type="button" class="dlg-x" id="pf-x" title="Close"></button></div>
-<div class="dlg-b">
-  <div class="pf-photo">
-    <div class="pf-face" id="pf-face"></div>
-    <div class="pf-photo-a">
-      <button type="button" class="btn ghost" id="pf-pick">Choose photo…</button>
-      <button type="button" class="btn ghost" id="pf-drop" hidden>Remove</button>
-      <input type="file" id="pf-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
-    </div>
-  </div>
-  <p class="fieldhelp">Stored inside the database as part of your profile, not as a file on disk —
-    so there is nothing to serve and nothing left behind when you replace it. It is scaled down to
-    256&nbsp;px here before it is saved; the original never leaves your machine.</p>
-  <label for="pf-name">Name<span class="req" aria-hidden="true">*</span></label>
-  <input id="pf-name" type="text" autocomplete="name">
-  <label for="pf-email">Email<span class="req" aria-hidden="true">*</span></label>
-  <input id="pf-email" type="email" autocomplete="email">
-  <label for="pf-current">Change password</label>
-  <input id="pf-current" type="password" autocomplete="current-password" placeholder="Current password">
-  <input id="pf-pw" type="password" autocomplete="new-password" placeholder="New password">
-  <input id="pf-pw2" type="password" autocomplete="new-password" placeholder="Confirm new password">
-  <p class="fieldhelp">Leave all three empty to keep the password you have. Changing it asks for the
-    current one because a signed-in tab is not proof that you are the one at the keyboard. There is
-    still no reset — it is stored hashed and nothing on this machine can read it back.</p>
-</div>
-<div class="dlg-f">
-  <div class="spacer"></div>
-  <div class="dlg-err" id="pf-err" hidden></div>
-  <button type="button" class="btn ghost" id="pf-cancel">Cancel</button>
-  <button type="button" class="btn primary" id="pf-save">Save profile</button>
-</div>
-</form></dialog>
+<!-- The profile was a dialog here until it became Settings › Profile: the page
+     already advertised a tab for it, so the form lives in that tab's markup
+     (see #st-profile) and the sidebar photo navigates there. -->
 
 <dialog id="fsmodal">
   <div class="dlg-h"><div class="halo b-accent" id="fs-halo"></div><span>Choose a folder</span></div>
@@ -2738,8 +2747,8 @@ function renderRetained(){
    there with it; nothing in this file still reads any of them. */
 
 /* ------------------------------------------------------ the dialog contract
-   Seven dialogs -- editor, projmodal, profmodal, confirm, secreason,
-   fsmodal, seclaunch -- hold a form a person may be mid-typing into. Each
+   Six dialogs -- editor, projmodal, confirm, secreason, fsmodal, seclaunch
+   -- hold a form a person may be mid-typing into. Each
    is mounted once in this
    page's static markup, filled by its own "open" function, and never
    touched again until it closes: render() below, and everything it calls
@@ -2752,10 +2761,17 @@ function renderRetained(){
    every poll, on purpose). The contract is "never clobber state a person is
    entering", not "nothing here changes without a click".
 
-   Enforced by test_the_poll_never_reaches_into_a_form_dialog
-   (tests/test_page_contract.py), which scans render() and the functions it
-   calls directly -- not their callees in turn; see that test's own
-   docstring for the exact, honestly-stated limit of what it can catch. */
+   Settings › Profile is a PAGE, not a dialog, and the rule follows it there:
+   its card holds the same kind of half-typed form, so nothing the poll
+   reaches may read a #st-profile field either. fillProfile() runs on the way
+   into the tab, and paintSettings() refuses to refill while the caret is in
+   the card -- see both.
+
+   Enforced by test_the_poll_never_reaches_into_a_form_dialog and
+   test_the_poll_never_reaches_into_the_profile_card
+   (tests/test_page_contract.py), which scan render() and the functions it
+   calls directly -- not their callees in turn; see those tests' own
+   docstrings for the exact, honestly-stated limit of what they can catch. */
 function render(){
   const _g=DATA.generated?new Date(DATA.generated):null;
   $("updated").textContent=(_g&&!isNaN(_g))?_g.toLocaleString(undefined,{dateStyle:"medium",timeStyle:"medium"}):"";
@@ -3485,12 +3501,32 @@ function refillPlatformBound(){
   if(platformCombo) applyPlatformToJobEditor(edp, true);
   if(secPlatformCombo) applyPlatformToSecurity(secEffectivePlatform(), true);
 }
+/* Which of the two Settings tabs is showing. Two gestures select one -- the
+   strip, and the sidebar photo taking a shortcut to Profile -- so both come
+   through here rather than each doing its own class-and-hidden juggling and
+   drifting apart. */
+function selectSettingsTab(name){
+  document.querySelectorAll("#st-tabs .viewtab").forEach(b=>
+    b.classList.toggle("active", b.dataset.sttab===name));
+  $("st-platforms").hidden=(name!=="platforms");
+  $("st-profile").hidden=(name!=="profile");
+  // Filled on the way in, so the fields say what the server says however you
+  // arrived -- Platforms rebuilds itself from PLATFORMS the same way.
+  if(name==="profile") fillProfile();
+}
 // The Settings page repaints only on entering the view and when /api/models
 // answers -- never on the five-second poll, which would reset what the
 // operator is typing into a card.
 function paintSettings(){
   ALApp.renderSettingsPage({platforms: PLATFORMS, configured: MODELS_CONFIGURED, error: MODELS_ERROR,
     onChange: loadModels});
+  // Landing on Profile -- a reload, or leaving the view and coming back --
+  // has to show the operator row rather than whatever was left in the DOM.
+  // Not while the caret is inside the card, though: /api/models answering
+  // late lands here too, and a refill under someone's typing is exactly what
+  // the dialog contract exists to forbid.
+  const prof=$("st-profile");
+  if(!prof.hidden && !prof.contains(document.activeElement)) fillProfile();
 }
 // Overview and Jobs carry the same strip while nothing is configured; the
 // Settings page itself says it in its own summary.
@@ -5001,10 +5037,10 @@ function paintUser(){
 }
 
 /* ------------------------------------------------------------------ profile
-   The one account, edited in place. The photo is stored inline in the operator
-   row as a data: URI, which is only reasonable while it is small — so it is
-   scaled here, before it is sent, and the server refuses anything oversized
-   regardless (a limit only the client keeps is not a limit). */
+   The one account, edited in place on Settings › Profile. The photo is stored
+   inline in the operator row as a data: URI, which is only reasonable while it
+   is small — so it is scaled here, before it is sent, and the server refuses
+   anything oversized regardless (a limit only the client keeps is not a limit). */
 const AVATAR_PX = 256;
 let pfAvatar = null;   // null = untouched, "" = cleared, data: URI = replaced
 
@@ -5044,7 +5080,12 @@ function pfError(msg){
   box.hidden = !msg;
   box.innerHTML = msg ? I.alert + "<span>" + esc(msg) + "</span>" : "";
 }
-function openProfile(){
+/* Put the operator row into the fields. A dialog could do this on the way up,
+   because nothing else ever opened it; a tab can be arrived at three ways
+   (the strip, the sidebar photo, a reload), so the fill hangs off the arrival
+   rather than off any one of them. It is never on the poll's path — see the
+   dialog contract above, which Settings › Profile is held to as well. */
+function fillProfile(){
   const u = CFG.user || {};
   if(!u.configured) return;
   pfAvatar = null;
@@ -5053,7 +5094,14 @@ function openProfile(){
   ["pf-current","pf-pw","pf-pw2"].forEach(id=>$(id).value = "");
   pfError("");
   pfFace();
-  $("profmodal").showModal();
+}
+/* The sidebar photo's destination. Clicking a face is "let me at my profile",
+   so it goes the whole way: the Settings view, the Profile tab, and the caret
+   already in the field most people came to change. */
+function openProfile(){
+  if(!(CFG.user || {}).configured) return;
+  setView("settings");
+  selectSettingsTab("profile");
   $("pf-name").focus();
 }
 async function saveProfile(){
@@ -5074,7 +5122,15 @@ async function saveProfile(){
     if(!r.ok || j.ok === false){ pfError(j.error || ("HTTP " + r.status)); return; }
     CFG.user = j.user;
     paintUser();
-    $("profmodal").close();
+    // The form stays where it is — a page has nothing to close, and closing
+    // one would be the operator losing the thing they navigated to. The photo
+    // is the saved one again (pfAvatar back to "untouched"), and the three
+    // password boxes are emptied: a dialog used to carry them away on close,
+    // and a typed password left sitting on an open page is nobody's idea of
+    // an improvement.
+    pfAvatar = null;
+    ["pf-current","pf-pw","pf-pw2"].forEach(id=>$(id).value = "");
+    pfFace();
     toast("Profile saved", false, "check");
   } finally { btn.disabled = false; }
 }
@@ -5624,18 +5680,15 @@ document.addEventListener("click", async (e)=>{
 });
 
 $("pj-cancel").addEventListener("click", ()=>pjWiz.close());
-/* The profile modal, opened from the user block at the foot of the sidebar. The
+/* Settings › Profile, reached from the user block at the foot of the sidebar. The
    block is not a <button> — it holds one (sign out) — so the listener sits on
    the block and the inner button stops its own click from reaching it. */
 $("pf-halo").innerHTML=I.user;
-$("pf-x").innerHTML=I.x;
 $("side-user").addEventListener("click", openProfile);
-$("pf-x").addEventListener("click", ()=>$("profmodal").close());
-$("pf-cancel").addEventListener("click", ()=>$("profmodal").close());
 $("pf-save").addEventListener("click", saveProfile);
 $("pf-pick").addEventListener("click", ()=>$("pf-file").click());
 $("pf-drop").addEventListener("click", ()=>{ pfAvatar=""; $("pf-file").value=""; pfFace(); });
-$("profmodal").addEventListener("input", ()=>{ pfError(""); pfFace(); });
+$("st-profile").addEventListener("input", ()=>{ pfError(""); pfFace(); });
 $("pf-file").addEventListener("change", async (e)=>{
   const f = e.target.files && e.target.files[0];
   if(!f) return;
@@ -5804,18 +5857,13 @@ initSidebar();
 initPickers();
 initViews();
 paintUser();
-const soon=(what)=>I.hammer+"<b>Not built yet</b><p>"+what+"</p>";
-$("soon-settings").innerHTML=soon("Your profile — photo, name, email and password — plus the "
-  +"scheduler's own settings will live here. Nothing is editable yet.");
 // The Settings header itself is drawn by ALApp.renderSettingsPage() (ui/app/
 // settings.js) on entering the view; only the two tabs are labelled here.
 $("sttab-platforms").innerHTML=I.layers+"Platforms";
 $("sttab-profile").innerHTML=I.user+"Profile";
 $("st-tabs").addEventListener("click",(e)=>{
   const b=e.target.closest(".viewtab"); if(!b) return;
-  document.querySelectorAll("#st-tabs .viewtab").forEach(x=>x.classList.toggle("active", x===b));
-  $("st-platforms").hidden=(b.dataset.sttab!=="platforms");
-  $("st-profile").hidden=(b.dataset.sttab!=="profile");
+  selectSettingsTab(b.dataset.sttab);
 });
 // "New job" and "New project" are no longer static markup here -- each is
 // built into its own page's header by ALApp.renderJobsPage()/

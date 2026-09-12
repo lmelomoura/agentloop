@@ -313,6 +313,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The operator profile is Settings › Profile, and the sidebar photo goes
+  there.** The photo, name, email and password form moved out of the dialog it
+  lived in and into the tab that already carried its name; clicking the face at
+  the foot of the sidebar now navigates to Settings, selects Profile and puts
+  the caret in the name field, rather than throwing a modal over whatever page
+  you were on. The form is the same six fields with the same ids and the same
+  help text, wearing the Platforms tab's own card so the two tabs read as one
+  page — minus Cancel and the close button, because a page is not something you
+  dismiss. Saving leaves it standing, repaints the sidebar, and empties the
+  three password boxes the closing dialog used to carry away. What it cost to
+  not have it: Settings advertised a Profile tab that answered "Not built yet"
+  while the real thing hid behind a photo nothing said was clickable — one
+  setting in two places, and the tab lied about which.
+
 - **claude-cron is now agentloop.** The scheduler runs more than one agent from
   here on (see `docs/superpowers/specs/2026-09-06-platforms-anthropic-openai-design.md`),
   and a product named after one of them misnames the other. Everything that

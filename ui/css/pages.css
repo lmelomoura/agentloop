@@ -1,12 +1,13 @@
 /* Everything that is not shared vocabulary: the app shell (.shell, the
-   sidebar, the topbar, the "coming soon" placeholder), first run and login
+   sidebar, the topbar), first run and login
    (.setup, .checkrow), the Jobs/Runs/Projects view furniture that is
    specific to those tables (#view-jobs, #view-projects, .viewtabs, the
    project grouping), the pulse panel and its loop band, job cards and
    everything inside one (.card, .cardline, .spark, .actions, .menu-pop),
-   every dialog (#editor, #logmodal, #projmodal, #confirm, #profmodal,
+   the Settings page's own two tabs (.platcard and #st-profile),
+   every dialog (#editor, #logmodal, #projmodal, #confirm,
    #fsmodal, #sec-act-finding, #seclaunch, .dlg-*, the wizard tabs, the markdown editor,
-   the combobox, the terminal, profile, security and the security-project/
+   the combobox, the terminal, security and the security-project/
    security-index screens), the accessibility focus-ring floor, and every
    @media/@container query in the sheet -- responsive tweaks are kept here
    even where they adjust a components.css selector, since this file loads
@@ -100,13 +101,9 @@
   backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
 .topbar .burger{display:none}
 .topright{display:flex;align-items:center;gap:12px;margin-left:auto}
-/* A destination the menu offers but that has no page yet. Saying so beats an
-   empty panel that reads as a load that failed. */
-.soon{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);
-  padding:44px 22px;text-align:center;margin-top:26px}
-.soon .ic{width:26px;height:26px;color:var(--muted);opacity:.6}
-.soon b{display:block;font-size:14.5px;font-weight:640;margin:10px 0 5px}
-.soon p{margin:0 auto;max-width:52ch;font-size:12.5px;color:var(--muted);line-height:1.6}
+/* `.soon` -- the "Not built yet" panel a menu destination showed while it had
+   no page -- lived here until Settings › Profile became the last one to get
+   built. Nothing in the menu now opens on a placeholder. */
 /* --------------------------------------------------------------- first run
    No profile on this install → nothing else is reachable. Not a <dialog>: this
    must not be dismissible with Escape, and it covers the page rather than
@@ -815,9 +812,6 @@ dialog::backdrop{background:rgba(9,11,16,.55);backdrop-filter:blur(3px)}
 #editor>form,#projmodal>form{display:flex;flex-direction:column;min-height:0;flex:1 1 auto;overflow:hidden}
 #logmodal{max-width:min(1000px,95vw);width:1000px}
 #confirm{max-width:min(460px,92vw);width:460px}
-/* Narrower than the editors: this is six short fields, and stretching them to
-   880px makes a name box the width of the screen. */
-#profmodal{max-width:min(520px,94vw);width:520px}
 #editor .dlg-h,#editor .dlg-f,#logmodal .dlg-h,#logmodal .dlg-f,
 #projmodal .dlg-h,#projmodal .dlg-f{flex:none}
 /* The body is now the tab column, not the scroller: the strip stays put and
@@ -1183,17 +1177,6 @@ textarea:focus,.dlg-b input:focus,.dlg-b select:focus{outline:none;border-color:
    scale a KPI card's label uses) rather than the smaller size every other
    tab strip in this file still carries */
 .tabs.wiz .tab{font-size:13px;font-weight:600}
-/* ------------------------------------------------------------------- profile */
-.pf-photo{display:flex;align-items:center;gap:15px;margin-top:2px}
-.pf-face{width:64px;height:64px;border-radius:50%;flex:none;background:var(--accent);
-  color:var(--accent-ink);display:flex;align-items:center;justify-content:center;
-  font-size:22px;font-weight:640;letter-spacing:.02em;overflow:hidden}
-/* cover, not fill: a photo that is not square is cropped rather than stretched */
-.pf-face img{width:100%;height:100%;object-fit:cover;display:block}
-.pf-photo-a{display:flex;gap:8px;flex-wrap:wrap}
-/* Fields are spaced by the label above them, so the three password boxes — one
-   label between them — sat flush against each other. */
-#profmodal .dlg-b input + input{margin-top:8px}
 .confirm-msg{font-size:13px;color:var(--muted);margin:4px 0 0}
 .confirm-mono{font:11.5px/1.6 ui-monospace,"SF Mono",Menlo,monospace;background:var(--panel2);
   border:1px solid var(--line);border-radius:9px;padding:10px 12px;margin:12px 0 0;
@@ -2329,3 +2312,34 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 /* the attention dot on the Settings item while nothing is configured -- the Runs counter's pulse, still */
 .navitem .attn{width:8px;height:8px;border-radius:50%;background:var(--warn);flex:none;margin-right:4px}
 @media (max-width: 900px){ .platcard-g{grid-template-columns:1fr} .platcard-g > div + div{border-left:0;border-top:1px solid var(--line2)} }
+/* -------------------------------------------------- Settings › Profile
+   One .platcard, so the tab beside Platforms is recognisably the same page.
+   The field recipe is the job editor's (`#editor .dlg-b label`/`input`
+   further up) said again here rather than reached for: those rules are
+   scoped to the two dialogs they were written for, and this is a page. The
+   error chip is not -- `.dlg-err` is the app's one "the save refused"
+   chip, same words in the same place beside the button, and a page is not
+   reason enough for a second one.
+   Capped narrow for the reason the dialog was 520px: six short fields
+   stretched across a desktop makes a name box the width of the screen. */
+#st-profile{max-width:620px}
+#st-profile .platcard-ic .ic{width:18px;height:18px}
+#st-profile .pf-b{padding:16px 20px 18px}
+#st-profile .pf-b label{display:block;font-size:13px;font-weight:600;color:var(--muted);margin:16px 0 6px}
+#st-profile .pf-b input:not([type=file]){width:100%;font:inherit;font-size:13px;height:40px;padding:0 13px;
+  border:1px solid var(--line);border-radius:9px;background:var(--panel2);color:var(--ink)}
+#st-profile .pf-b input:focus{outline:none;border-color:var(--accent)}
+/* Fields are spaced by the label above them, so the three password boxes --
+   one label between them -- would sit flush against each other. */
+#st-profile .pf-b input + input{margin-top:8px}
+#st-profile .fieldhelp{font-size:12.5px;font-style:normal;line-height:1.45;margin:5px 0 0}
+#st-profile .pf-f{display:flex;align-items:center;justify-content:flex-end;gap:9px;
+  padding:13px 20px;border-top:1px solid var(--line2);background:var(--panel2)}
+/* -------------------------------------------------------------- the photo */
+.pf-photo{display:flex;align-items:center;gap:15px;margin-top:2px}
+.pf-face{width:64px;height:64px;border-radius:50%;flex:none;background:var(--accent);
+  color:var(--accent-ink);display:flex;align-items:center;justify-content:center;
+  font-size:22px;font-weight:640;letter-spacing:.02em;overflow:hidden}
+/* cover, not fill: a photo that is not square is cropped rather than stretched */
+.pf-face img{width:100%;height:100%;object-fit:cover;display:block}
+.pf-photo-a{display:flex;gap:8px;flex-wrap:wrap}
