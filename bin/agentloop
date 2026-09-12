@@ -1315,10 +1315,19 @@ PLATFORMS_JQ='
   def valid($p; $m): if $p == "openai" then (($ocat | length) == 0) or (($ocat | index($m)) != null)
                       else ($m == "opus" or $m == "sonnet" or $m == "haiku" or $m == "fable" or ($m | startswith("claude-"))) end;
   def effective($p; $m): if $m != "" and valid($p; $m) then $m else (if $p == "openai" then $odef else $adef end) end;
-  def uses: ([ ($jobs.jobs // [])[] | select(.enabled != false) | job_platform(.) as $p
-             | {who: .id, p: $p, m: resolved(effective($p; job_model(.)))} ]
-           + [ ($projects.projects // [])[] | select(sec_on(.)) | sec_platform(.) as $p
-             | {who: ("security:" + .name), p: $p, m: resolved(effective($p; (sec(.).model // "")))} ]);
+  # `uses` is CONFIGURATION, not the run queue: every job and every security
+  # block a project carries, whether or not it is switched on, each with `on`
+  # saying which. Filtering the switched-off ones out in here was one rule
+  # answering two questions -- "who is configured to use this model" (the
+  # Settings page) and "who would run right now" (the switch-off warning) --
+  # and the first read false for an operator with parked jobs: models nothing
+  # appeared to use, so switching them off looked free. Each caller now says
+  # which question it is asking; a project with no security block at all
+  # contributes nothing, since there is no block to be configured.
+  def uses: ([ ($jobs.jobs // [])[] | job_platform(.) as $p
+             | {who: .id, on: (.enabled != false), p: $p, m: resolved(effective($p; job_model(.)))} ]
+           + [ ($projects.projects // [])[] | select((.security | type) == "object") | sec_platform(.) as $p
+             | {who: ("security:" + .name), on: sec_on(.), p: $p, m: resolved(effective($p; (sec(.).model // "")))} ]);
 '
 
 platforms_jq() { # platforms_jq <anthropic-default> <openai-default> <jq-filter> [jq options…] -- runs the filter with $jobs, $projects, $resolved, $adef, $odef, $ocat bound and PLATFORMS_JQ's defs in scope
@@ -1334,9 +1343,17 @@ platforms_jq() { # platforms_jq <anthropic-default> <openai-default> <jq-filter>
     --arg adef "$adef" --arg odef "$odef" --argjson ocat "$ocat" "${PLATFORMS_JQ}${filter}"
 }
 
-platforms_seed() { # the file's first contents: a platform is enabled when an enabled job or an enabled security block runs on it, with the models they use
+# `enabled` and `models` ask different questions of the same list, so they
+# filter differently. A platform is enabled only when something would actually
+# run on it -- an upgrade must not switch on a platform whose every job the
+# operator parked. Its `models`, though, list what EVERY job configured for it
+# names, switched on or not: a disabled job is configuration the operator means
+# to use again, and seeding without it means switching that job back on lands
+# on a refusal ("model not enabled in Settings") for a model that was in use
+# before the upgrade.
+platforms_seed() { # the file's first contents: a platform is enabled when an enabled job or an enabled security block runs on it, with the models every job configured for it uses
   platforms_jq opus "$(openai_catalog_visible | head -1)" '
-    def entry($p): {enabled: ([uses[] | select(.p == $p)] | length > 0), bin: "",
+    def entry($p): {enabled: ([uses[] | select(.p == $p) | select(.on)] | length > 0), bin: "",
                     models: ([uses[] | select(.p == $p) | .m | select(. != "")] | reduce .[] as $m ([]; if index($m) then . else . + [$m] end))};
     {platforms: {anthropic: entry("anthropic"), openai: entry("openai"), opencode: {enabled: false, bin: "", models: []}}}' -c
 }
@@ -1416,9 +1433,18 @@ platform_usable() { # enabled AND at least one model enabled: what the editors a
 # was (effective(), above) -- but the run gate that actually launches a job
 # skips one like that rather than silently running it on the default. So
 # this list answers "counts as using this platform", never "runs there".
-platform_jobs_on() { # platform_jobs_on <platform> [model] -> one line per enabled job (its id) or enabled security block ("security:<project>") counted as using it; a model may be a family
+# The third argument is a FLAG with exactly one accepted spelling, `on`, and
+# the filter is handed a real boolean rather than that word: comparing the
+# string inside jq made every other value -- a typo, a `true`, a `yes` -- mean
+# "everything", silently, which is the wrong answer in the direction nobody
+# notices (more jobs listed, so a switch-off warning that over-warns rather
+# than fails).
+platform_jobs_on() { # platform_jobs_on <platform> [model] [only-enabled] -> one line per job (its id) or security block ("security:<project>") counted as using it, switched on or not; a model may be a family; the literal `on` as the third argument narrows it to the ones switched on
+  local only=false
+  [ "${3:-}" = "on" ] && only=true
   platforms_jq "$(platform_default_model anthropic)" "$(platform_default_model openai)" \
-    'uses[] | select(.p == $p) | select($m == "" or .m == $m or .m == resolved($m)) | .who' -r --arg p "$1" --arg m "${2:-}"
+    'uses[] | select(.p == $p) | select($m == "" or .m == $m or .m == resolved($m)) | select(($only | not) or .on) | .who' \
+    -r --arg p "$1" --arg m "${2:-}" --argjson only "$only"
 }
 
 platform_cli_name() { case "$1" in anthropic) printf 'claude' ;; openai) printf 'codex' ;; opencode) printf 'opencode' ;; esac; }
@@ -1556,7 +1582,9 @@ platform_models_json() { # platform_models_json <platform> <stale true|false> <r
 
 platform_affected_note() { # platform_affected_note <platform> [model] -> the enabled jobs and blocks that lose their platform or model, as one sentence; nothing when none
   local who n names
-  who="$(platform_jobs_on "$1" "${2:-}")"
+  # ENABLED only, and the sentence says so: a job nobody switched on is not
+  # skipped by a switch-off, so warning about it would be a lie.
+  who="$(platform_jobs_on "$1" "${2:-}" on)"
   n="$(num "$(printf '%s\n' "$who" | grep -c . 2>/dev/null)")"
   [ "$n" -gt 0 ] || return 0
   names="$(printf '%s\n' "$who" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
@@ -3525,13 +3553,14 @@ JSON
   ( pf_env; platform_enabled openai );    want "openai is enabled: an enabled job and a project's jobs run on it" 0 $?
   ( pf_env; platform_enabled opencode );  want "opencode is never enabled by the seed" 1 $?
   got="$( pf_env; platform_models_enabled anthropic | tr '\n' ' ' )"
-  [ "$got" = "claude-opus-5 claude-fable-5-1 " ] \
-    && ok "anthropic's models: the ids in use, a family resolved through the cache, the disabled job's model left out, no repeats" \
+  [ "$got" = "claude-opus-5 claude-sonnet-5 claude-fable-5-1 " ] \
+    && ok "anthropic's models: the ids in use, a family resolved through the cache, a switched-off job's model too, no repeats" \
     || bad "anthropic models: '$got'"
   got="$( pf_env; platform_models_enabled openai | tr '\n' ' ' )"
   [ "$got" = "gpt-5.6-luna gpt-5.6-sol " ] && ok "openai's models: the job's own and the one inherited from the project" || bad "openai models: '$got'"
   ( pf_env; platform_model_enabled anthropic opus );            want "a family counts as enabled when its cached id is" 0 $?
-  ( pf_env; platform_model_enabled anthropic claude-sonnet-5 ); want "a model no enabled job uses is not enabled" 1 $?
+  ( pf_env; platform_model_enabled anthropic claude-sonnet-5 ); want "the model of a job switched off is seeded too — parking a job is not un-configuring it" 0 $?
+  ( pf_env; platform_model_enabled anthropic claude-haiku-5 );  want "a model no job names at all is not enabled" 1 $?
   # The reverse of the family case: the seed writes a bare family (opus) when
   # the cache had not resolved it yet, and a job naming the explicit id the
   # cache later resolves it to has to count as switched on too.
@@ -3539,9 +3568,22 @@ JSON
   ( pf_env; PLATFORMS_FILE="$pf/platforms-family.json"; platform_model_enabled anthropic claude-opus-5 ); want "an explicit id counts as enabled when the family it resolves from is" 0 $?
   ( pf_env; platform_usable anthropic ); want "usable: enabled with a model" 0 $?
   [ "$( pf_env; platform_jobs_on openai | tr '\n' ' ' )" = "o1 p1 " ] \
-    && ok "platform_jobs_on lists the enabled jobs of a platform" || bad "jobs on openai: $( pf_env; platform_jobs_on openai | tr '\n' ' ' )"
+    && ok "platform_jobs_on lists the jobs of a platform" || bad "jobs on openai: $( pf_env; platform_jobs_on openai | tr '\n' ' ' )"
   [ "$( pf_env; platform_jobs_on anthropic claude-fable-5-1 )" = "security:P" ] \
-    && ok "and an enabled security block, by its project" || bad "block: $( pf_env; platform_jobs_on anthropic claude-fable-5-1 )"
+    && ok "and a security block, by its project" || bad "block: $( pf_env; platform_jobs_on anthropic claude-fable-5-1 )"
+  # Two questions, two answers: "who is configured to use this" (the count the
+  # Settings page shows) and "who would run right now" (what a switch-off
+  # skips). The third argument is what tells them apart.
+  [ "$( pf_env; platform_jobs_on anthropic | tr '\n' ' ' )" = "a1 a2 off security:P " ] \
+    && ok "platform_jobs_on lists a job switched off too — it is configured to use the platform" \
+    || bad "jobs on anthropic: $( pf_env; platform_jobs_on anthropic | tr '\n' ' ' )"
+  [ "$( pf_env; platform_jobs_on anthropic "" on | tr '\n' ' ' )" = "a1 a2 security:P " ] \
+    && ok "and the third argument narrows it to the ones actually switched on" \
+    || bad "enabled jobs on anthropic: $( pf_env; platform_jobs_on anthropic "" on | tr '\n' ' ' )"
+  got="$( pf_env; platform_affected_note anthropic )"
+  case "$got" in "3 enabled jobs (a1, a2, security:P) run on anthropic and will be skipped"*)
+      ok "and the switch-off sentence still counts only the enabled ones — nobody skips a job nobody enabled" ;;
+    *) bad "affected note: '$got'" ;; esac
 
   # A job with no model runs on its platform's default -- the seed has to
   # credit that default, not an empty model, or every no-model job upgrades
@@ -3585,6 +3627,37 @@ JSON
   [ "$got" = "gpt-5.6-luna " ] \
     && ok "no openai catalog at all: the configured slug is kept, not dropped for the empty default" \
     || bad "no-catalog openai model: '$got'"
+
+  # The reported defect, at its extreme: EVERY job on a platform is parked.
+  # The seed used to skip them all, so the upgrade wrote an empty model list
+  # and switching one of those jobs back on landed straight on a refusal --
+  # and the Settings page showed the models as used by nobody, which made
+  # switching them off look free. The models are seeded; `enabled` is the one
+  # thing that still asks whether anyone is actually running.
+  local pf7="$tmp/pf7"; mkdir -p "$pf7"
+  cat > "$pf7/jobs.json" <<'JSON'
+{"jobs":[{"id":"parked","enabled":false,"model":"claude-sonnet-5","prompt":"x"},
+         {"id":"parked-o","enabled":false,"platform":"openai","model":"gpt-x","prompt":"x"}]}
+JSON
+  printf '{"projects":[{"name":"Q","security":{"enabled":false,"model":"claude-fable-5-1"}}]}\n' > "$pf7/projects.json"
+  "$JQ" -n '{resolved:{}, openai:{at:1, source:"fixture", models:[{slug:"gpt-x", visibility:"list", priority:1}]}}' > "$pf7/models.json"
+  p7_env() { PLATFORMS_FILE="$pf7/platforms.json"; JOBS_FILE="$pf7/jobs.json"; PROJECTS_FILE="$pf7/projects.json"; MODELS_FILE="$pf7/models.json"; }
+  got="$( p7_env; platform_models_enabled anthropic | tr '\n' ' ' )"
+  [ "$got" = "claude-sonnet-5 claude-fable-5-1 " ] \
+    && ok "only parked jobs: the seed still lists their models, the disabled security block's included" \
+    || bad "parked-only anthropic models: '$got'"
+  [ "$( p7_env; platform_models_enabled openai | tr '\n' ' ' )" = "gpt-x " ] \
+    && ok "and the parked openai job's slug too" || bad "parked-only openai models: '$( p7_env; platform_models_enabled openai | tr '\n' ' ' )'"
+  ( p7_env; platform_enabled anthropic ); want "but the platform stays switched off: nobody is running on it" 1 $?
+  ( p7_env; platform_usable anthropic );  want "and so it is not usable either" 1 $?
+  [ "$( p7_env; platform_jobs_on anthropic | tr '\n' ' ' )" = "parked security:Q " ] \
+    && ok "platform_jobs_on names the parked job and block — this is the count the Settings page shows" \
+    || bad "parked jobs on anthropic: '$( p7_env; platform_jobs_on anthropic | tr '\n' ' ' )'"
+  [ -z "$( p7_env; platform_jobs_on anthropic "" on )" ] \
+    && ok "and none of them is switched on" || bad "enabled parked jobs: '$( p7_env; platform_jobs_on anthropic "" on )'"
+  [ -z "$( p7_env; platform_affected_note anthropic )" ] \
+    && ok "so a switch-off has nothing to warn about — a job nobody enabled is not skipped" \
+    || bad "parked-only affected note: '$( p7_env; platform_affected_note anthropic )'"
 
   # An empty (0-byte) models.json used to make every read of it fail (jq -c
   # on empty input prints nothing but still exits 0, so --argjson resolved
@@ -3753,8 +3826,20 @@ JSON
   printf '%s' "$_pl" | "$JQ" -e '(keys | sort) == ["anthropic","openai","opencode"] and .opencode.supported == false and .openai.supported == true
       and .openai.enabled == true and .openai.usable == true and .openai.models_enabled == ["gpt-gone","gpt-a"] and .openai.bin_source == "env"
       and .openai.jobs_on_platform == 1 and .openai.jobs_using == {"gpt-a": 1} and .anthropic.jobs_using == {"claude-opus-5": 1}
+      and .openai.jobs_on_platform_enabled == 1 and .openai.jobs_using_enabled == {"gpt-a": 1}
+      and .anthropic.jobs_on_platform_enabled == 1 and .anthropic.jobs_using_enabled == {"claude-opus-5": 1}
       and .opencode.usable == false and (.opencode.models_enabled == [])' >/dev/null 2>&1 \
-    && ok "platforms: the three platforms, each with enabled, usable, bin_source, models_enabled and the jobs using them" || bad "platforms: $_pl"
+    && ok "platforms: the three platforms, each with enabled, usable, bin_source, models_enabled and both counts of the jobs using them" || bad "platforms: $_pl"
+  # Every job in the fixture above is switched on, so the two maps come out
+  # identical there and a filter that had lost its `select(.on)` would read
+  # exactly like one that kept it. Park a job and the pair has to disagree.
+  cp "$pc/config/jobs.json" "$pc/jobs.orig"
+  "$JQ" '.jobs += [{"id":"u3","platform":"openai","model":"gpt-a","enabled":false,"prompt":"x"}]' "$pc/jobs.orig" > "$pc/config/jobs.json"
+  _pl="$(pc_al platforms 2>/dev/null)"
+  printf '%s' "$_pl" | "$JQ" -e '.openai.jobs_on_platform == 2 and .openai.jobs_using == {"gpt-a": 2}
+      and .openai.jobs_on_platform_enabled == 1 and .openai.jobs_using_enabled == {"gpt-a": 1}' >/dev/null 2>&1 \
+    && ok "and a parked job counts in jobs_using but never in jobs_using_enabled" || bad "platforms with a parked job: $_pl"
+  cp "$pc/jobs.orig" "$pc/config/jobs.json"
   printf '{oops' > "$pc/config/platforms.json"
   pc_al platforms 2>/dev/null | "$JQ" -e '._error | test("not a valid platforms file")' >/dev/null 2>&1; want "platforms carries _error when the file is unreadable" 0 $?
   pc_al platform enable openai >/dev/null 2>&1; want "and enable refuses to write over it" 1 $?
@@ -9405,7 +9490,7 @@ cmd_resolve_models() { # cmd_resolve_models [anthropic|openai] -- no argument do
 }
 
 cmd_platforms() { # one JSON object: what each listed platform offers, whether it is ready, and what the operator enabled
-  local p j ready reason perms efforts dm dp cat_at cat_ok pr_at pr_ck pr_src unpriced supported enabled usable bin src found men jon jus err
+  local p j ready reason perms efforts dm dp cat_at cat_ok pr_at pr_ck pr_src unpriced supported enabled usable bin src found men jon jone jus juse err
   for p in $PLATFORMS $PLATFORMS_PLANNED; do
     j="$(platform_check "$p")"
     ready="$(printf '%s' "$j" | "$JQ" -r .ready)"; reason="$(printf '%s' "$j" | "$JQ" -r .reason)"
@@ -9422,9 +9507,16 @@ cmd_platforms() { # one JSON object: what each listed platform offers, whether i
     if platform_enabled "$p"; then enabled=true; else enabled=false; fi
     if platform_usable "$p"; then usable=true; else usable=false; fi
     men="$(platform_models_enabled "$p" | "$JQ" -R . | "$JQ" -sc .)"
+    # Two pairs of numbers, deliberately. jobs_on_platform/jobs_using answer
+    # "who is CONFIGURED here" -- what the Settings page shows, parked jobs
+    # included -- and the *_enabled twins answer "who would run right now".
+    # One number under both names is the defect this pair replaces.
     jon="$(num "$(platform_jobs_on "$p" | grep -c . 2>/dev/null)")"
+    jone="$(num "$(platform_jobs_on "$p" "" on | grep -c . 2>/dev/null)")"
     jus="$(platforms_jq "$(platform_default_model anthropic)" "$(platform_default_model openai)" \
              '[uses[] | select(.p == $p) | select(.m != "")] | group_by(.m) | map({key: .[0].m, value: length}) | from_entries' -c --arg p "$p")"
+    juse="$(platforms_jq "$(platform_default_model anthropic)" "$(platform_default_model openai)" \
+             '[uses[] | select(.p == $p) | select(.on) | select(.m != "")] | group_by(.m) | map({key: .[0].m, value: length}) | from_entries' -c --arg p "$p")"
     cat_at=0; cat_ok=false; pr_at=0; pr_ck=0; pr_src=""; unpriced="[]"
     if [ "$p" = "openai" ]; then
       cat_at="$(num "$("$JQ" -r '.openai.at // 0' "$MODELS_FILE" 2>/dev/null)")"
@@ -9440,13 +9532,15 @@ cmd_platforms() { # one JSON object: what each listed platform offers, whether i
     "$JQ" -nc --arg p "$p" --argjson ready "$ready" --arg reason "$reason" \
       --argjson perms "$perms" --argjson efforts "$efforts" --arg dm "$dm" --arg dp "$dp" \
       --argjson supported "$supported" --argjson enabled "$enabled" --argjson usable "$usable" \
-      --arg bin "$bin" --arg src "$src" --argjson found "$found" --argjson men "$men" --argjson jon "$jon" --argjson jus "$jus" \
+      --arg bin "$bin" --arg src "$src" --argjson found "$found" --argjson men "$men" \
+      --argjson jon "$jon" --argjson jone "$jone" --argjson jus "$jus" --argjson juse "$juse" \
       --argjson cat_at "$cat_at" --argjson cat_ok "$cat_ok" \
       --argjson pr_at "$pr_at" --argjson pr_ck "$pr_ck" --arg pr_src "$pr_src" --argjson unpriced "$unpriced" \
       '{($p): ({ready:$ready, reason:$reason, permissions:$perms, efforts:$efforts,
                 default_model:$dm, default_permission:$dp,
                 supported:$supported, enabled:$enabled, usable:$usable, bin:$bin, bin_source:$src, bin_found:$found,
-                models_enabled:$men, jobs_on_platform:$jon, jobs_using:$jus}
+                models_enabled:$men, jobs_on_platform:$jon, jobs_on_platform_enabled:$jone,
+                jobs_using:$jus, jobs_using_enabled:$juse}
                + (if $p == "openai" then {catalog_at:$cat_at, catalog_available:$cat_ok,
                                           pricing_at:$pr_at, pricing_checked_at:$pr_ck,
                                           pricing_source:$pr_src, unpriced:$unpriced} else {} end))}'

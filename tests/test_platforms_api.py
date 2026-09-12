@@ -106,11 +106,20 @@ def test_the_registry_rides_on_api_models(srv, tmp_path, monkeypatch):
     # "nomodel" (no model) and Q's security block (no model) both fall back to
     # the platform's default -- the first enabled model, claude-opus-5 -- and
     # still count on the platform even though neither adds a new model key.
-    assert a["jobs_using"] == {"claude-opus-5": 4, "claude-fable-5-1": 1} and a["jobs_on_platform"] == 5
+    # "off" is switched off and still counts: the page presents these numbers
+    # as "who is configured to use this model", and a parked job is
+    # configuration the operator means to switch back on.
+    assert a["jobs_using"] == {"claude-opus-5": 4, "claude-fable-5-1": 1, "claude-sonnet-5": 1}
+    assert a["jobs_on_platform"] == 6 and a["jobs_on_platform_enabled"] == 5
+    # the same map with "off" taken back out -- this is what the model rows'
+    # tooltips count, so a filter that drifts here mislabels every row
+    assert a["jobs_using_enabled"] == {"claude-opus-5": 4, "claude-fable-5-1": 1}
     assert o["enabled"] is True and o["usable"] is True
     # "bad"'s model ("opus") is not a valid openai slug, so it falls back to
     # openai's default too and lands under the same key as "o".
-    assert o["jobs_using"] == {"gpt-5.6-luna": 2} and o["jobs_on_platform"] == 2
+    assert o["jobs_using"] == {"gpt-5.6-luna": 2}
+    assert o["jobs_on_platform"] == 2 and o["jobs_on_platform_enabled"] == 2
+    assert o["jobs_using_enabled"] == {"gpt-5.6-luna": 2}     # nothing parked on openai here
     assert c["supported"] is False and c["usable"] is False and c["available"] is False
     assert c["reason"] == "runs on OpenCode arrive with the OpenCode engine"
     assert out["configured"] is True and out["error"] == ""
@@ -121,6 +130,35 @@ def test_the_registry_rides_on_api_models(srv, tmp_path, monkeypatch):
     # What a family resolves to right now -- the id the engine gates a family
     # job on at launch; the families the cache has not resolved are left out.
     assert a["families"] == {"opus": "claude-opus-5"}
+
+
+def test_a_parked_jobs_model_still_counts_as_using_the_platform(srv, tmp_path, monkeypatch):
+    """The reported defect: an operator whose jobs are all switched off saw
+    "no jobs" on every model those jobs name, so switching the model off read
+    as free. The count the page shows is "who is configured to use this",
+    which includes a parked job; `jobs_on_platform_enabled` is the separate
+    number for "who would run right now"."""
+    monkeypatch.setattr(srv, "JOBS_FILE", tmp_path / "jobs.json")
+    monkeypatch.setattr(srv, "PROJECTS_FILE", tmp_path / "projects.json")
+    _write_models(srv, openai=_catalog_block())
+    srv.JOBS_FILE.write_text(json.dumps({"jobs": [
+        {"id": "parked", "enabled": False, "model": "claude-sonnet-5"},
+        {"id": "parked-o", "enabled": False, "platform": "openai", "model": "gpt-5.6-luna"}]}))
+    srv.PROJECTS_FILE.write_text(json.dumps({"projects": [
+        {"name": "P", "security": {"enabled": False, "model": "claude-fable-5-1"}}]}))
+    _write_platforms(srv, {
+        "anthropic": {"enabled": False, "bin": "", "models": []},
+        "openai": {"enabled": False, "bin": "", "models": []}})
+    p = srv.list_models()["platforms"]
+    a, o = p["anthropic"], p["openai"]
+    # the disabled job AND the disabled security block are both counted
+    assert a["jobs_using"] == {"claude-sonnet-5": 1, "claude-fable-5-1": 1}
+    assert a["jobs_on_platform"] == 2 and a["jobs_on_platform_enabled"] == 0
+    assert o["jobs_using"] == {"gpt-5.6-luna": 1}
+    assert o["jobs_on_platform"] == 1 and o["jobs_on_platform_enabled"] == 0
+    # the discriminating half: a parked job is in jobs_using and in NEITHER
+    # of the enabled twins, so the model rows read "(0 switched on)"
+    assert a["jobs_using_enabled"] == {} and o["jobs_using_enabled"] == {}
 
 
 def test_a_seed_that_leaves_no_file_reports_a_sentence_not_the_registry(srv, tmp_path, monkeypatch):

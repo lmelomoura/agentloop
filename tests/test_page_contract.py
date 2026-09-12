@@ -3383,7 +3383,11 @@ def test_platform_chip_renders_each_state_the_pill_and_the_why(srv, tmp_path):
 def test_the_settings_page_is_reachable_and_has_its_two_panes(srv):
     page = srv.render_page("boot-authed")
     assert '<button class="navitem" data-view="settings" id="nav-settings"></button>' in page, "the Settings item is hidden"
-    for part in ("st-head", "st-tabs", "sttab-platforms", "sttab-profile", "st-platforms", "st-profile", "soon-settings"):
+    # "soon-settings" was on this list until the Profile tab was built: the
+    # pane held a "Not built yet" panel, and the real profile form was in a
+    # dialog behind the sidebar photo. The pane now holds the form itself
+    # (test_the_profile_form_lives_in_the_profile_tab, below).
+    for part in ("st-head", "st-tabs", "sttab-platforms", "sttab-profile", "st-platforms", "st-profile"):
         assert f'id="{part}"' in page, f"missing {part}"
     js = _js(srv)
     assert 'const VIEWS = ["overview","jobs","runs","projects","security","settings"];' in js
@@ -3391,6 +3395,69 @@ def test_the_settings_page_is_reachable_and_has_its_two_panes(srv):
     assert "MODELS_CONFIGURED=" in _fn(js, "loadModels") and "MODELS_ERROR=" in _fn(js, "loadModels")
     assert "ALApp.renderSettingsPage(" in _plainfn(js, "paintSettings")
     assert "renderSettingsPage" in _app_js(srv).split("window.ALApp = {", 1)[1]
+
+
+# Settings › Profile: the operator profile used to be a <dialog> reached only
+# by clicking the sidebar photo, while the Settings tab that named it showed a
+# "Not built yet" panel -- one thing in two places, and the tab lied about
+# which. These three pin the move: the form is the tab's markup, the photo
+# navigates there, and saving leaves the page standing.
+PROFILE_PANE_IDS = ("pf-halo", "pf-face", "pf-pick", "pf-drop", "pf-file", "pf-name",
+                    "pf-email", "pf-current", "pf-pw", "pf-pw2", "pf-err", "pf-save")
+
+
+def _profile_pane(page):
+    """#st-profile's own static markup -- from its opening tag to the end of
+    the Settings view. The pane is the last thing in #view-settings, so that
+    view's own closing comment is the end marker; this is the same brace-free,
+    DOM-free slice _dialog_static_ids takes of a dialog, for the same reason
+    (nothing in this file parses HTML)."""
+    start = page.index('id="st-profile"')
+    return page[start:page.index("<!-- /view-settings -->", start)]
+
+
+def test_the_profile_form_lives_in_the_profile_tab(srv):
+    page = _page(srv)
+    assert '<dialog id="profmodal"' not in page, "the profile dialog came back"
+    pane = _profile_pane(page)
+    for pid in PROFILE_PANE_IDS:
+        assert f'id="{pid}"' in pane, f"{pid} is not inside #st-profile"
+    assert 'id="pf-save">Save profile<' in pane, "the Save button is not in the Profile pane"
+    assert 'class="platcard"' in pane, \
+        "the Profile card should wear the Platforms tab's own frame -- one page, two tabs"
+    # A page is not a dialog: there is nothing to dismiss, and nothing left
+    # saying the tab has not been built.
+    for gone in ("pf-cancel", "pf-x", "soon-settings"):
+        assert f'id="{gone}"' not in page, f"{gone} survived the move out of the dialog"
+
+
+def test_the_sidebar_photo_opens_settings_profile(srv):
+    js = _js(srv)
+    assert '$("side-user").addEventListener("click", openProfile);' in js, \
+        "the sidebar user block no longer opens the profile"
+    body = _plainfn(js, "openProfile")
+    assert "showModal" not in body, "openProfile still opens a dialog"
+    for reach in ('setView("settings")', 'selectSettingsTab("profile")', '$("pf-name").focus()'):
+        assert reach in body, f"openProfile does not {reach}"
+    tab = _plainfn(js, "selectSettingsTab")
+    assert '$("st-profile").hidden' in tab and "fillProfile()" in tab, \
+        "selecting the Profile tab must show the pane AND fill it"
+    # The strip's own clicks go through the same function, or the two ways in
+    # could leave the strip saying one thing and the panes another.
+    assert "selectSettingsTab(b.dataset.sttab)" in js
+    # And a reload that lands on the tab fills it too -- but never over a
+    # caret already in the card (/api/models answers into paintSettings).
+    paint = _plainfn(js, "paintSettings")
+    assert "fillProfile()" in paint and "document.activeElement" in paint, \
+        "paintSettings must fill the Profile tab on arrival, and refuse to while it is being typed into"
+
+
+def test_saving_the_profile_leaves_the_page_up_and_empties_the_passwords(srv):
+    body = _fn(_js(srv), "saveProfile")
+    assert ".close()" not in body, "a page has nothing to close"
+    assert '["pf-current","pf-pw","pf-pw2"].forEach(id=>$(id).value = "");' in body, \
+        "the dialog used to carry the typed password away on close; the page has to clear it"
+    assert "paintUser();" in body and 'toast("Profile saved"' in body
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -3436,6 +3503,50 @@ def test_the_settings_summary_ignores_a_disabled_platforms_models(srv, tmp_path)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
     assert out["summary"] == "1 of 3 platforms enabled · 2 models available to jobs", \
         "a disabled platform's leftover models_enabled must not be counted"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_card_line_counts_every_job_not_only_the_enabled_ones(srv, tmp_path):
+    """The reported defect: the card said "N enabled jobs run here" over a
+    number the page presents as "who uses this platform". An operator whose
+    jobs were all parked read that as "nothing runs here", and switching the
+    platform (or one of its models) off looked free. The count is now every
+    configured job, and the sentence only names the enabled ones when they
+    are fewer."""
+    js = _app_js(srv)
+    script = tmp_path / "settings-jobs-line.js"
+    script.write_text("\n".join(_plainfn(js, n) for n in ("platformJobsLine", "modelJobsTitle")) + """
+    console.log(JSON.stringify({
+      allOn:   platformJobsLine({enabled: true,  jobs_on_platform: 3, jobs_on_platform_enabled: 3}),
+      one:     platformJobsLine({enabled: true,  jobs_on_platform: 1, jobs_on_platform_enabled: 1}),
+      parked:  platformJobsLine({enabled: false, jobs_on_platform: 8, jobs_on_platform_enabled: 0}),
+      some:    platformJobsLine({enabled: true,  jobs_on_platform: 5, jobs_on_platform_enabled: 2}),
+      none:    platformJobsLine({enabled: true,  jobs_on_platform: 0, jobs_on_platform_enabled: 0}),
+      noneOff: platformJobsLine({enabled: false, jobs_on_platform: 0, jobs_on_platform_enabled: 0}),
+      planned: platformJobsLine({supported: false, jobs_on_platform: 0}),
+      title:     modelJobsTitle(2, 0),
+      titleOne:  modelJobsTitle(1, 1),
+      titleNone: modelJobsTitle(0, 0),
+      titleUnknown: modelJobsTitle(2, undefined),
+      lineUnknown:  platformJobsLine({enabled: true, jobs_on_platform: 2}),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["allOn"] == "3 jobs run here" and out["one"] == "1 job runs here", out
+    assert out["parked"] == "8 jobs run here (0 enabled)", out
+    assert out["some"] == "5 jobs run here (2 enabled)", out
+    assert out["none"] == "jobs may pick this platform" and out["noneOff"] == "unlocks when the session test passes"
+    assert out["planned"] == "runs on OpenCode are not supported yet"
+    assert out["title"] == "2 jobs use this model (0 switched on)", out
+    assert out["titleOne"] == "1 job uses this model (1 switched on)" and out["titleNone"] == ""
+    # A payload without the enabled halves (an older server, a cached response)
+    # must lose the clause, not read it as zero -- the line already did this,
+    # and a tooltip saying "(0 switched on)" about every model would be the
+    # same wrong-number-under-a-confident-name the whole fix is about.
+    assert out["titleUnknown"] == "2 jobs use this model", out
+    assert out["lineUnknown"] == "2 jobs run here", out
+    assert "enabled job" not in _plainfn(js, "platformJobsLine"), \
+        "the card line must stop calling every configured job an enabled one"
 
 
 def test_the_settings_module_speaks_the_six_actions(srv):
@@ -8096,7 +8207,7 @@ def test_the_job_disabled_pill_and_the_launchd_off_pill_use_different_classes():
 
 
 # ---- Phase 3 Task 1: render()'s dialog contract. Two of the page's dialogs
-# (editor, projmodal) are the obvious ones, but profmodal, confirm, secreason
+# (editor, projmodal) are the obvious ones, but confirm, secreason
 # and fsmodal hold exactly the same kind of thing: a form a person may be
 # mid-typing into. Every one of them is mounted once in the page's static
 # markup, filled by its own "open" function, and never touched again until it
@@ -8104,8 +8215,13 @@ def test_the_job_disabled_pill_and_the_launchd_off_pill_use_different_classes():
 # had ever wired render() into one of them, not because anything stopped it.
 # Phase 3 is about to restyle these dialogs; this is what turns the accident
 # into a rule that moving code cannot break silently.
+#
+# profmodal was on this list until the profile moved into Settings › Profile.
+# It did not stop being a half-typed form by becoming a page, so the rule
+# followed it: test_the_poll_never_reaches_into_the_profile_card, below,
+# holds #st-profile's own ids to exactly what this holds a dialog's to.
 
-FORM_DIALOGS = ("editor", "projmodal", "profmodal", "confirm", "secreason", "fsmodal",
+FORM_DIALOGS = ("editor", "projmodal", "confirm", "secreason", "fsmodal",
                 # seclaunch (Runs tab parity pass 2): the repo/branch/profile
                 # launcher, moved from an always-open strip on the Runs tab
                 # into its own dialog -- the free-text branch field is
@@ -8260,6 +8376,36 @@ def test_the_poll_never_reaches_into_a_form_dialog(srv):
         "the poll reaches directly into a form dialog's own markup, which "
         "would clobber whatever a person was doing in it:\n  "
         + "\n  ".join(violations)
+    )
+
+
+def test_the_poll_never_reaches_into_the_profile_card(srv):
+    """The same rule as above, for the one form that is no longer a dialog.
+    The operator profile moved out of <dialog id="profmodal"> and into
+    Settings › Profile, which took its ids off FORM_DIALOGS' books -- and a
+    half-typed name is exactly as easy to clobber on a page as it was in a
+    dialog. Same scan, same stated limit (direct calls only), one different
+    set of ids: everything inside #st-profile."""
+    ids = re.findall(r'id="([^"]+)"', _profile_pane(_page(srv)))
+    assert ids, "#st-profile has no ids in its static markup -- did the markup move?"
+
+    js, app_js, sec_js = _js(srv), _app_js(srv), _security_js(srv)
+    scanned = {}
+    for name in _DIALOG_POLL_PAGE_FNS:
+        scanned[f"{name}() (bin/dashboard.html)"] = _plainfn(js, name)
+    for name in _DIALOG_POLL_APP_FNS:
+        scanned[f"ALApp.{name}() (ui/app/)"] = _plainfn(app_js, name)
+    scanned["ALSecurity.render() (renderSecurity, ui/security/index.js)"] = (
+        _plainfn(sec_js, "renderSecurity"))
+
+    violations = [
+        f'{label} reads $("{gid}") -- belongs to Settings › Profile'
+        for label, body in scanned.items() for gid in ids
+        if re.search(r"""\$\(\s*(['"])""" + re.escape(gid) + r"""\1\s*\)""", body)
+    ]
+    assert not violations, (
+        "the poll reaches directly into the profile card, which would clobber "
+        "whatever a person was typing into it:\n  " + "\n  ".join(violations)
     )
 
 

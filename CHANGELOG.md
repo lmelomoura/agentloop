@@ -313,6 +313,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The operator profile is Settings › Profile, and the sidebar photo goes
+  there.** The photo, name, email and password form moved out of the dialog it
+  lived in and into the tab that already carried its name; clicking the face at
+  the foot of the sidebar now navigates to Settings, selects Profile and puts
+  the caret in the name field, rather than throwing a modal over whatever page
+  you were on. The form is the same six fields with the same ids and the same
+  help text, wearing the Platforms tab's own card so the two tabs read as one
+  page — minus Cancel and the close button, because a page is not something you
+  dismiss. Saving leaves it standing, repaints the sidebar, and empties the
+  three password boxes the closing dialog used to carry away. What it cost to
+  not have it: Settings advertised a Profile tab that answered "Not built yet"
+  while the real thing hid behind a photo nothing said was clickable — one
+  setting in two places, and the tab lied about which.
+
 - **claude-cron is now agentloop.** The scheduler runs more than one agent from
   here on (see `docs/superpowers/specs/2026-09-06-platforms-anthropic-openai-design.md`),
   and a product named after one of them misnames the other. Everything that
@@ -361,6 +375,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   about by `status` and `install`, and cleaned by the next save.
 
 ### Fixed
+
+- **Settings › Platforms counts every job configured for a model, not only the
+  ones switched on.** The "N jobs" badge beside a model and the line on the card
+  both came from a list that skipped anything with `enabled: false`, while the
+  page presented the number as *who uses this model*. An operator who had parked
+  his jobs while he worked on something else opened Settings and saw one job, on
+  the single model a security block used, and nothing at all on the four models
+  his other eight jobs name — including a model he had one job enabled on. Every
+  model those jobs would run on read as used by nobody, so switching it off, or
+  switching the whole platform off, looked free. Both counts now cover every
+  configured job and every security block a project carries, switched on or not,
+  and both places say which is which: the card reads *8 jobs run here (0
+  enabled)* when the two numbers differ and plain *3 jobs run here* when they do
+  not, and hovering a model's switch names how many of that model's jobs are
+  switched on — *2 jobs use this model (0 switched on)*. The two sentences that
+  really are about running are unchanged: a platform is still only *enabled* by
+  the seed when something would actually run on it, and the warning a switch-off
+  prints still counts only the enabled jobs it leaves skipped. The seed's model
+  list gained the same fix in passing — an upgrade now records the models of a
+  parked job too, so switching that job back on no longer lands on "model not
+  enabled in Settings" for a model that was in use the day before.
 
 - **The `committed_env_file` and `committed_key_file` hygiene rules ask git what
   is committed.** They read the working tree, and the working tree of an analysis

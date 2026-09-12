@@ -2631,6 +2631,17 @@
     box.appendChild(ctrl);
     return box;
   }
+  function platformJobsLine(entry) {
+    if (entry.supported === false) return "runs on OpenCode are not supported yet";
+    const n = entry.jobs_on_platform || 0;
+    if (!n) return entry.enabled ? "jobs may pick this platform" : "unlocks when the session test passes";
+    const on = entry.jobs_on_platform_enabled;
+    return n + " job" + (n === 1 ? "" : "s") + " run" + (n === 1 ? "s" : "") + " here" + (typeof on === "number" && on !== n ? " (" + on + " enabled)" : "");
+  }
+  function modelJobsTitle(n, on) {
+    if (!n) return "";
+    return n + " job" + (n === 1 ? "" : "s") + " use" + (n === 1 ? "s" : "") + " this model" + (typeof on === "number" ? " (" + on + " switched on)" : "");
+  }
   function modelRow(r, entry, m, using, gone) {
     const enabledNow = (entry.models_enabled || []).includes(m.v);
     const row = el("div", "mrow" + (enabledNow ? "" : " offrow"));
@@ -2646,7 +2657,8 @@
     const n = using[m.v] || 0;
     if (n) meta.appendChild(el("span", "jobs", n + " job" + (n === 1 ? "" : "s")));
     row.appendChild(meta);
-    row.appendChild(switchEl(enabledNow, live.busy[r.id], n ? n + " enabled job(s) use this model" : "", "Switch on " + m.v, async (on) => {
+    const onHere = entry.jobs_using_enabled ? entry.jobs_using_enabled[m.v] || 0 : void 0;
+    row.appendChild(switchEl(enabledNow, live.busy[r.id], modelJobsTitle(n, onHere), "Switch on " + m.v, async (on) => {
       const cur = (entry.models_enabled || []).slice();
       const next = on ? cur.includes(m.v) ? cur : cur.concat([m.v]) : cur.filter((v) => v !== m.v);
       await change("platform_set_models", { platform: r.id, models: next });
@@ -2714,8 +2726,7 @@
       }
     ));
     sw.appendChild(row);
-    const n = entry.jobs_on_platform || 0;
-    sw.appendChild(el("span", null, entry.supported === false ? "runs on OpenCode are not supported yet" : n ? n + " enabled job" + (n === 1 ? "" : "s") + " run" + (n === 1 ? "s" : "") + " here" : entry.enabled ? "jobs may pick this platform" : "unlocks when the session test passes"));
+    sw.appendChild(el("span", null, platformJobsLine(entry)));
     right.appendChild(sw);
     h.appendChild(right);
     card.appendChild(h);
@@ -3011,5 +3022,5 @@
     setupBanner
   };
 })();
-/* ui-bundle: 56ae655b096afaae6fb047d1fcc12e8eb12dc34dd9c62cce503c582b9b898e4c */
-/* ui-sources: 12e71db424ecfc150aca58a3d2e36181e73d219156cbf5587f725f9b000562a9 */
+/* ui-bundle: 4f8b73dbc5f355fa23ffc3297e72a86f303b73f97b3db6682333f0ee957fddb8 */
+/* ui-sources: 1519753038c0b70d9e479f60b3fc77b17c383243b2ff5a9630e2f23272c5bf81 */
