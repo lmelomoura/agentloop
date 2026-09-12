@@ -413,6 +413,52 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   deliberately untouched: what provisioning leaves behind is exactly what that
   rule exists to catch.
 
+- **An analysis no longer appears twice as "finished" on the Activity screen.**
+  Every analysis is closed twice by design — the agent's own `finish --state
+  done`, then the engine's close-out with the run's real verdict and cost, a
+  minute or so later — and each close filed an `analysis_finished` event of its
+  own. The note and the coverage table already replaced rather than appended on
+  the second close; the event did not, so Minerva's #9 through #12 each read as
+  two identical rows ("done · deep on main", 7:34 PM and 7:36 PM). `record_event`
+  now takes `replace=True`, which files at most one event per (project, kind,
+  related) and rewrites its detail and moment on the second close — so the one
+  row carries the verdict the close settled on and the same moment the analysis
+  row's own `ended` was written with, rather than the agent's first claim.
+  Ledgers that already hold the pairs are folded once on `connect` (the newest
+  row per analysis survives, for the same reason). What it cost to not have it:
+  a screen whose whole job is "what happened and when" reporting every analysis
+  finishing twice.
+
+- **The Activity screen's Settings tab shows settings changes, not report
+  downloads.** `report_exported` used to ride along under Settings "for want of
+  a better home" — the brief's own words, and its own name for the weakest seam
+  of that division — so clicking Settings showed a list of report exports and
+  nothing about configuration. Reports has a tab of its own now, wearing the
+  same glyph the project screen's Reports tab already does, and Settings is
+  `settings_changed` alone.
+
+- **The Activity screen's "Findings" tab is now "Decisions", and an empty
+  narrowed tab says what it was looking for and offers the way back.** The tab
+  lists one kind of event — a human's ruling on a finding (Accept risk / False
+  positive) — but was named after the findings themselves, so beside twelve
+  analyses full of findings it promised a list it never held (those live on the
+  project screen's own Findings tab) and read as broken when it was merely,
+  honestly, empty. Its empty state made it worse: "No activity recorded for
+  Minerva in the last 7 days" — false on its face, with the sidebar beside it
+  counting nine events in that same window. Each tab now opens its own sentence
+  ("No decision on a finding recorded for Minerva in the last 7 days.", "No
+  report exported …", …); only "All activity" may claim there was no activity at
+  all. Beneath it, "Show all activity" switches back to the unnarrowed table —
+  offered exactly when a tab narrowed it. The sidebar's "Most active projects"
+  card keeps the unnarrowed sentence, because that list is grouped from every
+  kind regardless of tab.
+
+- **The Activity screen's two sidebar cards have the gap between them that
+  every other rail here has.** The rail spaces its direct children with a flex
+  gap; this screen wrapped both cards in one plain `<div>` first, so the rail
+  saw a single child and the two cards sat touching. They are appended straight
+  into the rail now, the way the project screen's own sidebar already is.
+
 - **A reviewer's trial merge is no longer reported as work that would be lost.**
   Reviewing a change means measuring the *merged* tree, so a reviewer runs
   `git merge --no-commit` inside its own run directory — which leaves every

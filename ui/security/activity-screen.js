@@ -56,17 +56,39 @@ import { secBack, secShowAnalysis } from "./analysis.js";
 import { secOpenProject, secSwitchProjectTab } from "./project-screen.js";
 import { renderFindings, secFindTriggerLabel, secFindPositionPop } from "./findings-screen.js";
 
-// The mockup's own tab order, minus Users -- see this file's header comment.
-// Each tab is the SAME table, scoped to a subset of EVENT_KINDS; "All
-// activity"'s empty `kinds` means "every kind", not "no kind".
+// The mockup's own tab order, minus Users -- see this file's header comment
+// -- plus Reports. Each tab is the SAME table, scoped to a subset of
+// EVENT_KINDS; "All activity"'s empty `kinds` means "every kind", not "no
+// kind". `report_exported` used to ride along under Settings "for want of a
+// better home" (the brief's own words, and its own name for the weakest seam
+// of this division): clicking Settings then showed a list of report downloads
+// and nothing about configuration. A report is not a setting; it gets a tab.
+//
+// `empty` is the sentence's opening when THIS tab's table comes back empty
+// (secActEmptyMessage): a narrowed tab must say what it was looking for, not
+// "No activity recorded" -- false on its face with the sidebar beside it
+// counting nine events in the same window, and what made an empty Findings
+// tab read as a broken report rather than as a project nobody has decided a
+// finding on yet.
 const ACT_TABS = [
-  {key: "", label: "All activity", kinds: []},
-  {key: "analyses", label: "Analyses", kinds: ["analysis_started", "analysis_finished"]},
-  {key: "findings", label: "Findings", kinds: ["decision_made"]},
-  {key: "settings", label: "Settings", kinds: ["settings_changed", "report_exported"]},
+  {key: "", label: "All activity", kinds: [], empty: "No activity recorded"},
+  {key: "analyses", label: "Analyses", kinds: ["analysis_started", "analysis_finished"],
+   empty: "No analysis started or finished"},
+  // "Decisions", not the mockup's "Findings": the one kind here is a human's
+  // ruling on a finding (Accept risk / False positive), and a tab named
+  // Findings beside twelve analyses full of them promised a list of findings
+  // -- which live on the project screen's own Findings tab, not here -- and
+  // read as broken when it was merely, honestly, empty.
+  {key: "decisions", label: "Decisions", kinds: ["decision_made"],
+   empty: "No decision on a finding recorded"},
+  {key: "reports", label: "Reports", kinds: ["report_exported"],
+   empty: "No report exported"},
+  {key: "settings", label: "Settings", kinds: ["settings_changed"],
+   empty: "No settings change recorded"},
 ];
 const ACT_TAB_BUTTON_ID = {"": "secactt-all", analyses: "secactt-analyses",
-                           findings: "secactt-findings", settings: "secactt-settings"};
+                           decisions: "secactt-decisions", reports: "secactt-reports",
+                           settings: "secactt-settings"};
 // Day windows, translated into `since` client-side before the fetch --
 // `security_activity`'s own `since` is a raw timestamp, matching
 // `ledger.events_for`'s contract, so the "last N days" framing lives here,
@@ -403,7 +425,7 @@ function secActPaint(){
   const data = secActState.data;
   if(!data) return;
   host.appendChild(secActTable(data));
-  if(side) side.appendChild(secActSidebar(data));
+  if(side) secActFillSidebar(side, data);
 }
 
 /* ------------------------------------------------------------------ table
@@ -415,13 +437,21 @@ function secActPeriodPhrase(){
   return secActState.days <= 0 ? "at any time" : "in the last " + secActState.days + " days";
 }
 
-function secActEmptyMessage(){
+// `everyKind`: the un-narrowed sentence regardless of which tab is showing
+// -- for the sidebar's projects card, which is grouped from EVERY kind
+// (cmd_activity_data's own docstring: `kind` narrows the table only) and so
+// must not borrow the table's own tab-narrowed opening.
+function secActEmptyMessage(everyKind){
+  const tab = (everyKind ? null : ACT_TABS.find(t => t.key === secActState.tab)) || ACT_TABS[0];
   const scope = secActState.project ? "for " + secActState.project + " " : "";
-  // Names the range searched, so an empty screen reads as legibly empty
-  // rather than possibly broken -- the same rule every empty state in this
-  // area already follows (see index-screen.js's recent-analyses feed and
-  // findings-screen.js's own floor/filter messages).
-  return "No activity recorded " + scope + secActPeriodPhrase() + ".";
+  // Names the tab AND the range searched, so an empty screen reads as
+  // legibly empty rather than possibly broken -- the same rule every empty
+  // state in this area already follows (see index-screen.js's
+  // recent-analyses feed and findings-screen.js's own floor/filter
+  // messages). The tab half is what was missing: "No activity recorded for
+  // Minerva in the last 7 days" on the Findings tab, beside a sidebar
+  // counting nine events in that window, told the reader something false.
+  return tab.empty + " " + scope + secActPeriodPhrase() + ".";
 }
 
 // [key, label] tuples, SEC_PROJECT_COLS-shaped (index-screen.js) even
@@ -440,7 +470,23 @@ const SEC_ACT_TABLE_COLS = [
 
 function secActTable(data){
   const events = data.events || [];
-  if(!events.length) return secEl("div", "tblempty", secActEmptyMessage());
+  if(!events.length){
+    const box = secEl("div", "tblempty", secActEmptyMessage());
+    // The way out of a narrowed tab, offered exactly when a tab narrowed the
+    // table: an empty Findings tab with nine events one tab over used to be
+    // a dead end the reader had to reason their way out of. On "All
+    // activity" itself there is nothing wider to show, so no button
+    // promises one.
+    if(secActState.tab){
+      const act = secEl("div", "tblempty-action");
+      const b = secEl("button", "btn ghost", "Show all activity");
+      b.type = "button";
+      b.onclick = () => secActSwitchTab("");
+      act.appendChild(b);
+      box.appendChild(act);
+    }
+    return box;
+  }
 
   const wrap = secEl("div", "table-card");
   const scroll = secEl("div", "table-scroll");
@@ -648,11 +694,15 @@ function secActPager(data){
    projects. No "top active users": with one operator that is a list of
    one, which is not an insight -- the brief's own reasoning for cutting the
    mockup's Users tab, carried down to the sidebar too. */
-function secActSidebar(data){
-  const wrap = document.createElement("div");
-  wrap.appendChild(secActSummaryCard(data.summary || {}));
-  wrap.appendChild(secActProjectsCard(data.projects || []));
-  return wrap;
+function secActFillSidebar(side, data){
+  // Appended straight into the rail, never through a wrapper <div>: the
+  // rail (#sec-act-side, .secpjside in ui/css/components.css) spaces its
+  // DIRECT children with a 16px flex gap, the same way overview-tab.js
+  // fills the project screen's own #sec-pj-side. The wrapper this used to
+  // build put both cards inside ONE child, so the gap between them never
+  // existed and the two cards sat touching.
+  side.appendChild(secActSummaryCard(data.summary || {}));
+  side.appendChild(secActProjectsCard(data.projects || []));
 }
 
 function secActSummaryCard(summary){
@@ -704,7 +754,8 @@ function secActProjectsCard(projects){
     return box;
   }
   if(!projects.length){
-    box.appendChild(secEl("div", "tblempty", secActEmptyMessage()));
+    // `true`: every kind -- see secActEmptyMessage's own comment.
+    box.appendChild(secEl("div", "tblempty", secActEmptyMessage(true)));
     return box;
   }
   const list = secEl("div", "seclist");

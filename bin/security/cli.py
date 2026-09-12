@@ -1995,10 +1995,19 @@ def cmd_finish(args):
     # `row`'s own project and branch, never a flag the caller passed: `finish`
     # has two callers and neither one necessarily agrees with the row about
     # what it is closing, so the event has to come from the row itself.
+    #
+    # `replace`: ONE event per analysis, not one per close. This function
+    # runs twice on one analysis (see the docstring), and each run used to
+    # file its own `analysis_finished` -- the Activity screen then read every
+    # analysis as two identical "finished" rows a minute apart. The third
+    # writer of this close to get the replace-not-append rule, after the
+    # note's `part not in note` and `coverage.merge` above; the second close
+    # rewrites the detail with the verdict it settled on, so the trail says
+    # `capped` when the row does rather than the agent's earlier `done`.
     try:
         ledger.record_event(conn, row["project"], "analysis_finished",
                             f"{state} · {row['profile']} on {row['branch']}",
-                            str(args.analysis))
+                            str(args.analysis), replace=True)
     except sqlite3.Error:
         # Best-effort, same reasoning as cmd_open_analysis: finish_analysis
         # above already closed the row with its real verdict and spend, and

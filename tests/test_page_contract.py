@@ -6553,15 +6553,16 @@ def test_the_empty_state_names_the_period_and_the_project_scope(srv, tmp_path):
     legibly empty rather than possibly broken. Both halves of the range
     (the day window AND, once scoped, the project) have to be nameable."""
     block = _security_js(srv)
-    deps = _activity_deps(block, "secActPeriodPhrase", "secActEmptyMessage")
+    deps = _const(block, "ACT_TABS") + _activity_deps(
+        block, "secActPeriodPhrase", "secActEmptyMessage")
     script = tmp_path / "act-empty.js"
     script.write_text(_PROJECT_DOM_HARNESS + """
-    let secActState = {project: "", days: 30};
+    let secActState = {project: "", tab: "", days: 30};
     """ + deps + """
     const unscoped30 = secActEmptyMessage();
-    secActState = {project: "", days: 0};
+    secActState = {project: "", tab: "", days: 0};
     const unscopedAll = secActEmptyMessage();
-    secActState = {project: "web", days: 7};
+    secActState = {project: "web", tab: "", days: 7};
     const scoped7 = secActEmptyMessage();
     console.log(JSON.stringify({unscoped30, unscopedAll, scoped7}));
     """)
@@ -6574,14 +6575,48 @@ def test_the_empty_state_names_the_period_and_the_project_scope(srv, tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_empty_state_names_the_tab_it_is_empty_for(srv, tmp_path):
+    """A tab narrows the table to a few kinds, and an empty narrowed table
+    used to say "No activity recorded for Minerva in the last 7 days" --
+    false on its face, with the sidebar beside it counting nine events in
+    that same window. The reader had no way to tell "nothing happened" from
+    "nothing of THIS kind happened", which is what made the Findings tab read
+    as a broken report rather than as a project nobody has decided a finding
+    on yet. Each named tab now says what it was looking for; only "All
+    activity" may claim there was no activity at all."""
+    block = _security_js(srv)
+    deps = _const(block, "ACT_TABS") + _activity_deps(
+        block, "secActPeriodPhrase", "secActEmptyMessage")
+    script = tmp_path / "act-empty-tab.js"
+    script.write_text(_PROJECT_DOM_HARNESS + """
+    let secActState = {project: "Minerva", tab: "", days: 7};
+    """ + deps + """
+    const out = {};
+    for(const t of ACT_TABS){ secActState.tab = t.key; out[t.key || "all"] = secActEmptyMessage(); }
+    console.log(JSON.stringify(out));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert out["all"].startswith("No activity recorded"), out["all"]
+    for key, word in (("analyses", "analys"), ("decisions", "decision"),
+                      ("reports", "report"), ("settings", "settings")):
+        assert word in out[key].lower(), f"the {key} tab's empty state must name what it shows: {out[key]}"
+        assert not out[key].startswith("No activity recorded"), \
+            f"a narrowed tab must not claim there was no activity at all: {out[key]}"
+        assert "for Minerva" in out[key] and "7 days" in out[key], out[key]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_the_table_is_empty_state_when_no_events_match(srv, tmp_path):
     block = _security_js(srv)
     deps = _activity_deps(block, "secEl", "secActPeriodPhrase", "secActEmptyMessage",
                           "secActRow", "secActRelatedCell", "secActTable")
-    consts = _const(block, "EVENT_KIND_LABEL") + _const(block, "ACT_ANALYSIS_KINDS")
+    consts = (_const(block, "EVENT_KIND_LABEL") + _const(block, "ACT_ANALYSIS_KINDS")
+              + _const(block, "ACT_TABS"))
     script = tmp_path / "act-table-empty.js"
     script.write_text(_PROJECT_DOM_HARNESS + """
-    let secActState = {project: "", days: 30};
+    let secActState = {project: "", tab: "", days: 30};
+    function secActSwitchTab(_key){}
     """ + consts + deps + """
     console.log(JSON.stringify(collectAll(secActTable({events: []}), [])));
     """)
@@ -6589,6 +6624,43 @@ def test_the_table_is_empty_state_when_no_events_match(srv, tmp_path):
                                     capture_output=True, text=True, check=True).stdout)
     joined = " ".join(r["text"] for r in out)
     assert "No activity recorded" in joined and "30 days" in joined, joined
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_an_empty_narrowed_tab_offers_the_way_back_to_all_activity(srv, tmp_path):
+    """The sentence (test above) says what the tab was looking for; this is
+    the way out. An empty Findings tab with nine events in the same window
+    one tab over used to be a dead end the reader had to reason their way
+    out of. "Show all activity" is offered exactly when a tab narrowed the
+    table -- on "All activity" itself there is nothing wider to show, so no
+    button promises one."""
+    block = _security_js(srv)
+    deps = _activity_deps(block, "secEl", "secActPeriodPhrase", "secActEmptyMessage",
+                          "secActRow", "secActRelatedCell", "secActTable")
+    consts = (_const(block, "EVENT_KIND_LABEL") + _const(block, "ACT_ANALYSIS_KINDS")
+              + _const(block, "ACT_TABS"))
+    script = tmp_path / "act-table-empty-escape.js"
+    script.write_text(_PROJECT_DOM_HARNESS + """
+    let secActState = {project: "Minerva", tab: "decisions", days: 7};
+    let switchedTo = null;
+    function secActSwitchTab(key){ switchedTo = key; }
+    """ + consts + deps + """
+    function escapeButton(node){
+      return collectAll(node, []).find(r => r.text === "Show all activity") || null;
+    }
+    const narrowed = secActTable({events: []});
+    const narrowedButton = escapeButton(narrowed);
+    // Press it: the real element is the one whose onclick was set.
+    (function press(n){ if(n.onclick){ n.onclick(); return; } (n.childNodes || []).forEach(press); })(narrowed);
+    secActState.tab = "";
+    const wideButton = escapeButton(secActTable({events: []}));
+    console.log(JSON.stringify({narrowedButton: !!narrowedButton, switchedTo, wideButton: !!wideButton}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert out["narrowedButton"], "an empty narrowed tab must offer 'Show all activity'"
+    assert out["switchedTo"] == "", f"the button must switch to the All-activity tab: {out}"
+    assert not out["wideButton"], "'All activity' has nothing wider to offer -- no button there"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -6654,11 +6726,12 @@ def test_most_active_projects_is_hidden_behind_one_line_once_scoped(srv, tmp_pat
     to one project, listing it again as "the most active project" is a
     list of one, which is not an insight."""
     block = _security_js(srv)
-    deps = _activity_deps(block, "secEl", "secIcon", "secActPeriodPhrase",
-                          "secActEmptyMessage", "_scopeToProject", "secActProjectsCard")
+    deps = _const(block, "ACT_TABS") + _activity_deps(
+        block, "secEl", "secIcon", "secActPeriodPhrase",
+        "secActEmptyMessage", "_scopeToProject", "secActProjectsCard")
     script = tmp_path / "act-projects.js"
     script.write_text(_PROJECT_DOM_HARNESS + """
-    let secActState = {project: "", days: 30};
+    let secActState = {project: "", tab: "", days: 30};
     function secActLoad(){}
     """ + deps + """
     const unscoped = collectAll(
@@ -6667,12 +6740,49 @@ def test_most_active_projects_is_hidden_behind_one_line_once_scoped(srv, tmp_pat
     secActState.project = "web";
     const scoped = collectAll(secActProjectsCard([{project: "web", count: 3}]), [])
       .map(r => r.text).join(" | ");
-    console.log(JSON.stringify({unscoped, scoped}));
+    // The projects list is grouped from EVERY kind (cmd_activity_data's own
+    // docstring: `kind` narrows the table only), so its empty line must
+    // never borrow the table's tab-narrowed sentence -- on the Decisions
+    // tab with no events at all it is still "no activity", not "no decisions".
+    secActState = {project: "", tab: "decisions", days: 30};
+    const emptyOnATab = collectAll(secActProjectsCard([]), []).map(r => r.text).join(" | ");
+    console.log(JSON.stringify({unscoped, scoped, emptyOnATab}));
     """)
     out = json.loads(subprocess.run(["node", str(script)],
                                     capture_output=True, text=True, check=True).stdout)
     assert "web" in out["unscoped"] and "3 events" in out["unscoped"], out["unscoped"]
     assert "Scoped to one project" in out["scoped"], out["scoped"]
+    assert "No activity recorded" in out["emptyOnATab"] and "decision" not in out["emptyOnATab"], \
+        f"the projects card counts every kind, so its empty line must not be tab-narrowed: {out['emptyOnATab']}"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_sidebar_cards_are_direct_children_of_the_rail(srv, tmp_path):
+    """The rail (#sec-act-side, `.secpjside` in ui/css/components.css) spaces
+    its DIRECT children with a 16px flex gap -- which is how every other rail
+    in this area gets the space between its cards (overview-tab.js appends
+    straight into #sec-pj-side). This screen used to wrap both of its cards in
+    one plain <div> first, so the rail saw a single child and the two cards
+    sat touching. Pinned on the shape rather than on a computed style: a fake
+    DOM has no layout, but a wrapper is visible in the tree."""
+    block = _security_js(srv)
+    deps = _const(block, "ACT_TABS") + _const(block, "EVENT_KINDS") + _const(
+        block, "EVENT_KIND_LABEL") + _activity_deps(
+        block, "secEl", "secIcon", "secActPeriodPhrase", "secActEmptyMessage",
+        "_scopeToProject", "secActSummaryCard", "secActProjectsCard", "secActFillSidebar")
+    script = tmp_path / "act-side-shape.js"
+    script.write_text(_PROJECT_DOM_HARNESS + """
+    let secActState = {project: "", tab: "", days: 30};
+    function secActLoad(){}
+    """ + deps + """
+    const side = new FakeElement("aside");
+    secActFillSidebar(side, {summary: {analysis_started: 2}, projects: [{project: "web", count: 3}]});
+    console.log(JSON.stringify(side.childNodes.map(c => c.className)));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert len(out) == 2, f"the rail must hold the two cards themselves, not a wrapper: {out}"
+    assert all("card" in cls for cls in out), out
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -6735,15 +6845,15 @@ def test_switching_the_kind_tab_marks_only_that_tab_active(srv, tmp_path):
       return { toggle(name, on){ if(on) set.add(name); else set.delete(name); },
                contains(name){ return set.has(name); } };
     }});
-    secActSwitchTab("findings");
-    const active = ["secactt-all", "secactt-analyses", "secactt-findings", "secactt-settings"]
+    secActSwitchTab("decisions");
+    const active = Object.values(ACT_TAB_BUTTON_ID)
       .filter(id => $(id).classList.contains("active"));
     console.log(JSON.stringify(active));
     """)
     out = json.loads(subprocess.run(["node", str(script)],
                                     capture_output=True, text=True, check=True).stdout)
-    assert out == ["secactt-findings"], \
-        f"switching to 'findings' must mark only its own tab active: {out}"
+    assert out == ["secactt-decisions"], \
+        f"switching to 'decisions' must mark only its own tab active: {out}"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -6777,8 +6887,38 @@ def test_activity_query_requests_the_exact_kinds_for_each_tab(srv, tmp_path):
     assert out["all"] == [], \
         f"'All activity' must send no kind filter -- empty means every kind: {out['all']}"
     assert out["analyses"] == ["analysis_started", "analysis_finished"], out["analyses"]
-    assert out["findings"] == ["decision_made"], out["findings"]
-    assert out["settings"] == ["settings_changed", "report_exported"], out["settings"]
+    assert out["decisions"] == ["decision_made"], out["decisions"]
+    # Reports has its own tab. `report_exported` used to ride along under
+    # Settings "for want of a better home" (the brief's own words for the
+    # weakest seam of this division) -- so clicking Settings showed a list
+    # of report downloads and nothing about configuration.
+    assert out["reports"] == ["report_exported"], out["reports"]
+    assert out["settings"] == ["settings_changed"], out["settings"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_every_activity_tab_has_a_button_in_the_markup_and_a_wire_in_init(srv, tmp_path):
+    """ACT_TABS is the vocabulary; the buttons live in bin/dashboard.html
+    (static markup) and are labelled and wired by ui/security/index.js's own
+    init(). Three places that have to agree, none of which reads the other
+    two -- a fifth tab (Reports) added to the vocabulary alone would filter
+    correctly and be unreachable from the page."""
+    block = _security_js(srv)
+    consts = _const(block, "ACT_TABS") + _const(block, "ACT_TAB_BUTTON_ID")
+    script = tmp_path / "act-tab-ids.js"
+    script.write_text(consts + """
+    console.log(JSON.stringify(ACT_TABS.map(t => [t.key, ACT_TAB_BUTTON_ID[t.key] || null])));
+    """)
+    pairs = json.loads(subprocess.run(["node", str(script)],
+                                      capture_output=True, text=True, check=True).stdout)
+    html = (REPO / "bin" / "dashboard.html").read_text()
+    init = (UI_ROOT / "security" / "index.js").read_text()
+    for key, button_id in pairs:
+        assert button_id, f"tab {key!r} has no entry in ACT_TAB_BUTTON_ID"
+        assert f'id="{button_id}"' in html, f"no <button id={button_id!r}> in dashboard.html"
+        assert f'iconLabel($("{button_id}")' in init, f"{button_id} is never labelled in index.js"
+        assert f'$("{button_id}").addEventListener("click", () => secActSwitchTab("{key}"))' in init, \
+            f"{button_id} is not wired to secActSwitchTab({key!r}) in index.js"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")

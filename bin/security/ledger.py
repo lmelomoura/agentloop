@@ -244,8 +244,26 @@ def connect(path) -> sqlite3.Connection:
             # Same guarantee as the analysis loop above: both halves are
             # literals in the tuple, and PRAGMA has said the column is absent.
             conn.execute(f"ALTER TABLE finding ADD COLUMN {name} {ddl}")
+    conn.execute(_FOLD_DUPLICATE_CLOSES)
     conn.commit()
     return conn
+
+
+# Every analysis closed before `record_event` grew `replace` holds TWO
+# `analysis_finished` rows -- one per close, see that function's docstring --
+# in the same installed base `_ANALYSIS_COLUMNS` describes. The code fix alone
+# leaves every one of them reading twice on the Activity screen for ever, so
+# `connect` folds them: the NEWEST row per (project, analysis) survives,
+# because its moment is the one `finish_analysis` last wrote into the row's
+# own `ended`. Idempotent and cheap (the table is small and indexed by
+# project), so it simply runs with the schema rather than behind a version
+# flag this module has never needed. `related <> ''` keeps rows that name no
+# analysis -- none are written today -- from being folded into one another.
+_FOLD_DUPLICATE_CLOSES = """
+DELETE FROM event WHERE kind = 'analysis_finished' AND related <> '' AND id NOT IN (
+  SELECT MAX(id) FROM event WHERE kind = 'analysis_finished' AND related <> ''
+  GROUP BY project, related)
+"""
 
 
 def mark_prepared(conn, analysis_id, produced=()) -> None:
@@ -872,15 +890,42 @@ def store_sbom(conn, project, repo, branch, analysis_id, document: dict) -> None
     conn.commit()
 
 
-def record_event(conn, project, kind, detail="", related="") -> None:
+def record_event(conn, project, kind, detail="", related="", *,
+                 replace=False) -> None:
+    """File what happened. One row per call -- except under `replace`.
+
+    `replace=True` files at most ONE event per (project, kind, related): a
+    second call updates that row's detail and moment in place rather than
+    inserting beside it. It exists for the one writer that runs twice on one
+    subject by design: `cmd_finish` closes every analysis twice (the agent's
+    own close, then the engine's, minutes apart -- see its docstring), and
+    each close used to file an `analysis_finished` of its own, so the
+    Activity screen read every analysis as two identical "finished" rows.
+    The note (`part not in note`) and the coverage table (`coverage.merge`)
+    already had a replace-not-append rule for exactly this double run; the
+    event was the one thing that close writes that did not.
+
+    The MOMENT moves with the replacing call, the same way `finish_analysis`
+    rewrites the row's own `ended` on every close -- so the one event and the
+    analysis row it describes never disagree about when the close happened,
+    and the detail is the row's final verdict, not the agent's first claim.
+    """
     if kind not in EVENT_KINDS:
         raise ValueError(f"unknown event kind: {kind}")
+    detail, related, now = str(detail)[:500], str(related)[:120], int(time.time())
     with conn:
+        if replace:
+            if not related:
+                raise ValueError("a replacing event needs a `related` to "
+                                 "replace by")
+            done = conn.execute(
+                "UPDATE event SET detail=?, at=? WHERE project=? AND kind=?"
+                " AND related=?", (detail, now, project, kind, related))
+            if done.rowcount:
+                return
         conn.execute(
             "INSERT INTO event (project, kind, detail, related, at)"
-            " VALUES (?,?,?,?,?)",
-            (project, kind, str(detail)[:500], str(related)[:120],
-             int(time.time())))
+            " VALUES (?,?,?,?,?)", (project, kind, detail, related, now))
 
 
 def events_for(conn, project=None, kinds=(), since=0, limit=100, offset=0):

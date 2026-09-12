@@ -164,6 +164,9 @@ td .projtag{white-space:nowrap}
 .isopill.auto{background:var(--accent-soft);color:var(--accent)}
 .tblempty{text-align:center;color:var(--muted);padding:34px 12px}
 .tblempty .ic{width:22px;height:22px;vertical-align:-5px;margin-right:8px;opacity:.6}
+/* The one action an empty state may carry beneath its sentence -- the
+   Activity screen's "Show all activity" on an empty narrowed tab. */
+.tblempty-action{margin-top:12px}
 .paneblurb{margin:0 0 14px;font-size:12.5px;color:var(--muted);max-width:96ch;line-height:1.6}
 .secthead{display:flex;align-items:center;justify-content:space-between;margin:26px 0 12px}
 td .projtag{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted)}
@@ -2888,5 +2891,5 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 /* cover, not fill: a photo that is not square is cropped rather than stretched */
 .pf-face img{width:100%;height:100%;object-fit:cover;display:block}
 .pf-photo-a{display:flex;gap:8px;flex-wrap:wrap}
-/* ui-bundle: 7d1d9aa4641ba299216e5b1c8c960afaf026e99ecca831d1f58a13f6f23b2444 */
-/* ui-sources: 1519753038c0b70d9e479f60b3fc77b17c383243b2ff5a9630e2f23272c5bf81 */
+/* ui-bundle: 7610818620bf0dbe8dca097f9cf32c9c20d807b847f9c6eb366b9af89352f9ec */
+/* ui-sources: 6ac2e42761645fa261dc2b3c1e2cfb5d7b92d5c97d9afad9843e3ad528aa2080 */

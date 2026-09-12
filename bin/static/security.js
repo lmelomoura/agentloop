@@ -1020,15 +1020,42 @@
 
   // ui/security/activity-screen.js
   var ACT_TABS = [
-    { key: "", label: "All activity", kinds: [] },
-    { key: "analyses", label: "Analyses", kinds: ["analysis_started", "analysis_finished"] },
-    { key: "findings", label: "Findings", kinds: ["decision_made"] },
-    { key: "settings", label: "Settings", kinds: ["settings_changed", "report_exported"] }
+    { key: "", label: "All activity", kinds: [], empty: "No activity recorded" },
+    {
+      key: "analyses",
+      label: "Analyses",
+      kinds: ["analysis_started", "analysis_finished"],
+      empty: "No analysis started or finished"
+    },
+    // "Decisions", not the mockup's "Findings": the one kind here is a human's
+    // ruling on a finding (Accept risk / False positive), and a tab named
+    // Findings beside twelve analyses full of them promised a list of findings
+    // -- which live on the project screen's own Findings tab, not here -- and
+    // read as broken when it was merely, honestly, empty.
+    {
+      key: "decisions",
+      label: "Decisions",
+      kinds: ["decision_made"],
+      empty: "No decision on a finding recorded"
+    },
+    {
+      key: "reports",
+      label: "Reports",
+      kinds: ["report_exported"],
+      empty: "No report exported"
+    },
+    {
+      key: "settings",
+      label: "Settings",
+      kinds: ["settings_changed"],
+      empty: "No settings change recorded"
+    }
   ];
   var ACT_TAB_BUTTON_ID = {
     "": "secactt-all",
     analyses: "secactt-analyses",
-    findings: "secactt-findings",
+    decisions: "secactt-decisions",
+    reports: "secactt-reports",
     settings: "secactt-settings"
   };
   var ACT_PERIODS = [[7, "7 days"], [30, "30 days"], [90, "90 days"], [0, "All time"]];
@@ -1246,14 +1273,15 @@
     const data = secActState.data;
     if (!data) return;
     host.appendChild(secActTable(data));
-    if (side) side.appendChild(secActSidebar(data));
+    if (side) secActFillSidebar(side, data);
   }
   function secActPeriodPhrase() {
     return secActState.days <= 0 ? "at any time" : "in the last " + secActState.days + " days";
   }
-  function secActEmptyMessage() {
+  function secActEmptyMessage(everyKind) {
+    const tab = (everyKind ? null : ACT_TABS.find((t) => t.key === secActState.tab)) || ACT_TABS[0];
     const scope = secActState.project ? "for " + secActState.project + " " : "";
-    return "No activity recorded " + scope + secActPeriodPhrase() + ".";
+    return tab.empty + " " + scope + secActPeriodPhrase() + ".";
   }
   var SEC_ACT_TABLE_COLS = [
     ["time", "Time"],
@@ -1264,7 +1292,18 @@
   ];
   function secActTable(data) {
     const events = data.events || [];
-    if (!events.length) return secEl("div", "tblempty", secActEmptyMessage());
+    if (!events.length) {
+      const box = secEl("div", "tblempty", secActEmptyMessage());
+      if (secActState.tab) {
+        const act = secEl("div", "tblempty-action");
+        const b = secEl("button", "btn ghost", "Show all activity");
+        b.type = "button";
+        b.onclick = () => secActSwitchTab("");
+        act.appendChild(b);
+        box.appendChild(act);
+      }
+      return box;
+    }
     const wrap = secEl("div", "table-card");
     const scroll = secEl("div", "table-scroll");
     const table = document.createElement("table");
@@ -1395,11 +1434,9 @@
     foot.appendChild(nav);
     return foot;
   }
-  function secActSidebar(data) {
-    const wrap = document.createElement("div");
-    wrap.appendChild(secActSummaryCard(data.summary || {}));
-    wrap.appendChild(secActProjectsCard(data.projects || []));
-    return wrap;
+  function secActFillSidebar(side, data) {
+    side.appendChild(secActSummaryCard(data.summary || {}));
+    side.appendChild(secActProjectsCard(data.projects || []));
   }
   function secActSummaryCard(summary) {
     const box = secEl("div", "card secact-sidecard");
@@ -1432,7 +1469,7 @@
       return box;
     }
     if (!projects.length) {
-      box.appendChild(secEl("div", "tblempty", secActEmptyMessage()));
+      box.appendChild(secEl("div", "tblempty", secActEmptyMessage(true)));
       return box;
     }
     const list = secEl("div", "seclist");
@@ -5120,13 +5157,15 @@
     iconLabel($("sec-act-reload"), "radar", "Refresh");
     iconLabel($("secactt-all"), "activity", "All activity");
     iconLabel($("secactt-analyses"), "shield", "Analyses");
-    iconLabel($("secactt-findings"), "search", "Findings");
+    iconLabel($("secactt-decisions"), "check2", "Decisions");
+    iconLabel($("secactt-reports"), "file", "Reports");
     iconLabel($("secactt-settings"), "gear", "Settings");
     $("sec-act-back").addEventListener("click", () => secBackFromActivity());
     $("sec-act-reload").addEventListener("click", secActReload);
     $("secactt-all").addEventListener("click", () => secActSwitchTab(""));
     $("secactt-analyses").addEventListener("click", () => secActSwitchTab("analyses"));
-    $("secactt-findings").addEventListener("click", () => secActSwitchTab("findings"));
+    $("secactt-decisions").addEventListener("click", () => secActSwitchTab("decisions"));
+    $("secactt-reports").addEventListener("click", () => secActSwitchTab("reports"));
     $("secactt-settings").addEventListener("click", () => secActSwitchTab("settings"));
     secActInitProjectPicker();
     wireActivityFindingDialog();
@@ -5185,5 +5224,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: 20a79c744bffe82c21b79d103546d78595f23f9f117db57365c009a88216cfdd */
-/* ui-sources: 1519753038c0b70d9e479f60b3fc77b17c383243b2ff5a9630e2f23272c5bf81 */
+/* ui-bundle: 44f47183af1aa235594635ff6b8c2a291dd2b452521f905f642d81aa94b99a9a */
+/* ui-sources: 6ac2e42761645fa261dc2b3c1e2cfb5d7b92d5c97d9afad9843e3ad528aa2080 */
