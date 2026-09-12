@@ -2636,6 +2636,22 @@ E a seguir ao bloco "The operator's own choice, on top of the CLI's" (o `platfor
 
 `platforms_jq` passa a `platforms_jq <anthropic-default> <openai-default> <opencode-default> <jq-filter> [jq options…]`: `local adef="$1" odef="$2" ocdef="$3" filter="$4"; shift 4`, `occat='[]'`, `occat="$("$JQ" -ec '[.opencode.models[]?.id]' "$MODELS_FILE" 2>/dev/null)" || occat='[]'`, e `--arg ocdef "$ocdef" --argjson occat "$occat"` na chamada ao jq. Os três callers: `platforms_seed` → `platforms_jq opus "$(openai_catalog_visible | head -1)" "$(opencode_catalog_visible | head -1)" '…'` com `{platforms: {anthropic: entry("anthropic"), openai: entry("openai"), opencode: entry("opencode")}}`; as duas chamadas em `cmd_platforms` ganham `"$(platform_default_model opencode)"` como terceiro argumento. O comentário de cabeçalho de `platforms_jq` actualizado.
 
+**O invariante do registo contra o jq** (a forma como o contador de jobs se enganou na entrega 1: uma plataforma que o registo conhece e o `PLATFORMS_JQ` não). No mesmo bloco, antes dos casos de `set-field`:
+
+```bash
+  echo "PLATFORMS_JQ — every platform the registry runs is known to the jq, with its own model"
+  local _pj _pjm
+  for _pj in $PLATFORMS; do
+    case "$_pj" in anthropic) _pjm="claude-opus-5" ;; openai) _pjm="gpt-a" ;; opencode) _pjm="pdm_ai/glm-5.3-flash" ;; *) _pjm="" ;; esac
+    [ "$( JOBS_FILE="$tmp/cfg/config/jobs.json"; PROJECTS_FILE="$tmp/cfg/config/projects.json"; MODELS_FILE="$tmp/cfg/config/models.json"
+          platforms_jq opus gpt-a pdm_ai/glm-5.3-flash '($p | known), (valid($p; $m) | tostring), effective($p; $m)' -r --arg p "$_pj" --arg m "$_pjm" | tr '\n' '|' )" = "$_pj|true|$_pjm|" ] \
+      && ok "$_pj: known keeps it, valid accepts its model, effective keeps its model" \
+      || bad "$_pj through PLATFORMS_JQ: $( JOBS_FILE="$tmp/cfg/config/jobs.json"; PROJECTS_FILE="$tmp/cfg/config/projects.json"; MODELS_FILE="$tmp/cfg/config/models.json"; platforms_jq opus gpt-a pdm_ai/glm-5.3-flash '($p | known), (valid($p; $m) | tostring), effective($p; $m)' -r --arg p "$_pj" --arg m "$_pjm" | tr '\n' '|' )"
+  done
+```
+
+(O `case` está fora de qualquer `$( )`. A fixture `$tmp/cfg/config/models.json` desse bloco traz os catálogos OpenAI e OpenCode; o ciclo percorre `$PLATFORMS` para que uma quarta plataforma sem ramo no jq falhe aqui, com o seu nome.) E, depois de a T7 fechar, confirmar à mão o sintoma que este invariante guarda: `agentloop platforms` sobre uma config de rascunho com um job em `opencode` credita-o a `jobs_on_platform` **do opencode**, com o **seu** modelo em `jobs_using`, não a `anthropic` com `opus`.
+
 **O caminho de actualização, com o ficheiro que uma instalação real tem hoje** (duas chaves, sem `opencode`). No mesmo bloco de selftest, depois dos casos de `create`:
 
 ```bash
