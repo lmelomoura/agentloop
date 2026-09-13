@@ -11,6 +11,7 @@ is what keeps the two from drifting, the way the backoff curve test does.
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 ENGINE = REPO / "bin" / "agentloop"
 FAKE_CODEX = REPO / "test" / "fake-codex"
+FAKE_OPENCODE = REPO / "test" / "fake-opencode"
 FIX = REPO / "test" / "fixtures" / "codex"
 
 
@@ -120,13 +122,13 @@ def test_the_registry_rides_on_api_models(srv, tmp_path, monkeypatch):
     assert o["jobs_using"] == {"gpt-5.6-luna": 2}
     assert o["jobs_on_platform"] == 2 and o["jobs_on_platform_enabled"] == 2
     assert o["jobs_using_enabled"] == {"gpt-5.6-luna": 2}     # nothing parked on openai here
-    # The engine no longer refuses opencode (bin/agentloop, this delivery) --
-    # `supported` should follow. It still reads False here: this server's
-    # module-level PLATFORMS_PLANNED and the list_models() opencode literal
-    # are its OWN mirror of the registry, not read from the engine, and stay
-    # exactly as they were pending T8's _opencode_platform() (which is also
-    # where a real "opencode not installed" reason will come from `reason`
-    # rather than the placeholder sentence list_models() still hardcodes).
+    # The server's registry runs opencode (bin/agentloop, this delivery), so
+    # `supported` follows the same PLATFORMS_PLANNED mirror as the other two
+    # and reads True. The entry itself is unavailable: the autouse fixture
+    # above points AGENTLOOP_OPENCODE_BIN nowhere, so _opencode_platform()'s
+    # own probe finds no binary to resolve a catalog from, and the entry
+    # reads its own "opencode not installed" reason rather than a value
+    # list_models() invents.
     assert c["supported"] is True and c["usable"] is False
     assert c["available"] is False and "opencode not installed" in c["reason"]
     assert out["configured"] is True and out["error"] == ""
@@ -485,6 +487,13 @@ def test_a_missing_block_is_resolved_once_when_codex_exists(srv, monkeypatch):
     # own shutil.which("opencode") probe fire, adding a second, unwanted call.
     monkeypatch.setattr(srv.shutil, "which", lambda name: "/opt/homebrew/bin/codex" if name == "codex" else None)
     monkeypatch.setattr(srv.os.path, "exists", lambda p: False)
+    # _opencode_platform's probe now goes through _bin_detect, whose last
+    # resort is os.access on ~/.opencode/bin/opencode and then a hard-coded
+    # Homebrew path -- neither mock above touches os.access, and a machine
+    # with a real opencode install at either path would otherwise fire a
+    # second, unwanted al() here (and fake_al above does not even take that
+    # call's new env= kwarg).
+    monkeypatch.setattr(srv.os, "access", lambda p, mode: False)
     monkeypatch.delenv("AGENTLOOP_OPENCODE_BIN", raising=False)
     o = srv.list_models()["platforms"]["openai"]
     assert calls == [["resolve-models", "openai"]]
@@ -505,8 +514,63 @@ def test_a_missing_block_without_codex_is_reported_not_resolved(srv, monkeypatch
     # is a non-empty (if bogus) path, which alone would make
     # _opencode_platform think the CLI exists and call the forbidden al().
     monkeypatch.delenv("AGENTLOOP_OPENCODE_BIN", raising=False)
+    # _bin_detect's own last resort (~/.opencode/bin, then a hard-coded
+    # Homebrew path) is checked with os.access, not os.path.exists -- a
+    # machine with a real opencode install at either path must not make
+    # this test host-dependent either.
+    monkeypatch.setattr(srv.os, "access", lambda p, mode: False)
     o = srv.list_models()["platforms"]["openai"]
     assert o["available"] is False and "codex" in o["reason"]
+
+
+def test_a_missing_opencode_block_is_resolved_through_the_detected_binary(srv, monkeypatch):
+    """T8 fix wave 1, finding 1: the probe used to know only PATH and the
+    hard-coded Homebrew path, so a CLI the official installer puts under
+    ~/.opencode/bin read as "not installed" until the next daily pass. It now
+    goes through _bin_detect -- platform_entry's own detection -- plus an
+    os.access check, so AGENTLOOP_OPENCODE_BIN (standing in here for that
+    installer path, which the old probe never consulted at all) resolves the
+    catalog on the very first /api/models, proving the sync resolve ran
+    through the detected binary rather than sitting unresolved."""
+    _write_models(srv)   # {"resolved": {...}}, no "opencode" key: nothing to read back yet
+    monkeypatch.setenv("AGENTLOOP_OPENCODE_BIN", str(FAKE_OPENCODE))
+    c = srv.list_models()["platforms"]["opencode"]
+    assert c["available"] is True and c["reason"] == ""
+    # test/fixtures/opencode/models-verbose.txt: 13 models, every one "active"
+    assert len(c["models"]) == 13
+
+
+def test_a_hung_opencode_cli_gets_the_engines_short_deadline_not_als(srv, monkeypatch, tmp_path):
+    """T8 fix wave 1, finding 2: al()'s own 30s subprocess timeout used to race
+    the engine's 60s `models --verbose` deadline, so a hung CLI got killed by
+    al() first -- before run_bounded's own deadline could fire and write a
+    stub -- leaving config/models.json's opencode block untouched and making
+    every following /api/models repeat the same 30s wait. The in-request
+    resolve now passes AGENTLOOP_OPENCODE_DEADLINE=10 (20s once doubled for
+    --verbose), which always finishes inside al()'s window and lets the
+    engine write its own timeout stub instead."""
+    _write_models(srv)   # no "opencode" key: the probe below must run resolve-models
+    stub = tmp_path / "opencode-hang"
+    stub.write_text(
+        "#!/bin/bash\n"
+        "case \"$1\" in\n"
+        "  --version) echo 1.0.0 ;;\n"
+        "  *) exec sleep 601 ;;\n"   # 601, not 600: unique against every other stand-in's hang mode
+        "esac\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("AGENTLOOP_OPENCODE_BIN", str(stub))
+    start = time.monotonic()
+    c = srv.list_models()["platforms"]["opencode"]
+    elapsed = time.monotonic() - start
+    assert elapsed < 28, f"took {elapsed:.1f}s -- al()'s 30s timeout, not the engine's stub, must have fired"
+    assert c["available"] is False
+    assert "timed out" in c["reason"]
+    # run_bounded ends the WHOLE process group on its own deadline -- the
+    # stand-in's sleep (601, picked to be unique) must not outlive the request.
+    left = subprocess.run("ps -ax -o command= | grep -c '^sleep 601$'",
+                           shell=True, capture_output=True, text=True).stdout.strip()
+    assert left == "0", "sleep 601 is still running: run_bounded did not kill the process group"
 
 
 def test_the_permission_vocabulary_matches_the_engine(srv, tmp_path):

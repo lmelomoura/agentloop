@@ -7498,12 +7498,14 @@ NASTY
   [ -z "$got" ] && ok "an openai window past its reset says nothing" || bad "expired openai window gated: $got"
 
   # opencode has no window at all -- nothing captures one for it -- so the
-  # gate must never hold a run back on it. The jq behind rl_gate exits 4 (no
-  # output at all) rather than 1 on an empty block, so this checks "let it
-  # through" (any nonzero exit) rather than pinning one exact code. Scoped to
-  # the scratch dir like every other rl_gate call above -- never the real one.
-  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/oc.json"; rl_gate opencode ) >/dev/null 2>&1
-  if [ $? -eq 0 ]; then bad "rl_gate held an opencode run back"; else ok "rl_gate opencode never holds a run back: there are no windows"; fi
+  # gate must never hold a run back on it, even when the SAME file holds a
+  # real, spent window for another platform (rl_at, not an empty/missing
+  # file -- a missing file would let anything through trivially and prove
+  # nothing about opencode specifically).
+  got="$(rl_at openai five_hour 0.97 "$soon" opencode)"
+  [ -z "$got" ] && ok "rl_gate opencode never holds a run back: there are no windows for it" || bad "rl_gate opencode: $got"
+  got="$(rl_at openai five_hour 0.97 "$soon" openai)"
+  case "$got" in *"the openai five_hour window is 97% used"*) ok "...while rl_gate openai on that same file still holds" ;; *) bad "openai gate on the same file: $got" ;; esac
 
   echo "statusline-rate-limits.sh — the figure the run stream never carries"
   # The stream only reports utilisation once the CLI has decided to warn (0.75),
@@ -7790,7 +7792,7 @@ NASTY
     *) bad "the command did not report an active hold" ;;
   esac
   case "$(usg '{}' '{"anthropic":{"five_hour":{"status":"allowed","utilization":0.3,"resets_at":'"$soon2"',"seen_at":0,"source":"statusline"}},"openai":{"five_hour":{"status":"allowed","utilization":0.05,"resets_at":'"$soon2"',"seen_at":0,"source":"rollout","plan_type":"plus"}}}')" in
-    *"anthropic five_hour: 30% used"*"openai five_hour: 5% used"*"rollout"*) ok "usage lists both platforms, each window named by its platform" ;;
+    *"anthropic five_hour: 30% used"*"openai five_hour: 5% used"*"rollout"*"opencode: no usage windows"*) ok "usage lists both platforms, each window named by its platform" ;;
     *) bad "usage output did not list both platforms" ;;
   esac
 

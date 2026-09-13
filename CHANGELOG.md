@@ -102,7 +102,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     the effort ladder, whether the model makes tool calls. `agentloop
     platforms`, `status` and `usage` say what they say for the other two,
     OpenCode's way: the catalog's age, the enabled models still unpriced,
-    and that there are no usage windows to wait for.
+    and that there are no usage windows to wait for; the first `/api/models`
+    on an install whose catalog is not resolved yet resolves it through the
+    detected binary, with a short deadline so a hung CLI leaves its timeout
+    stub instead of a 30-second hang on every request.
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of
