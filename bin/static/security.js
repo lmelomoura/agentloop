@@ -2800,6 +2800,18 @@
     const stBadge = secEl("span", "secstate " + secStateKey(f), SEC_STATE_LABEL[f.state] || f.state);
     stBadge.title = SEC_STATE_HELP[f.state] || "";
     tdState.appendChild(stBadge);
+    const fe = f.fixed_elsewhere;
+    if (fe && fe.branch) {
+      const where = fe.branch + (fe.commit ? " @ " + String(fe.commit).slice(0, 12) : "");
+      const merged = fe.in_this_branch === true, pending = fe.in_this_branch === false;
+      const feBadge = secEl(
+        "span",
+        "secstate fixed-elsewhere " + (merged ? "merged" : pending ? "pending" : "unknown"),
+        merged ? "fix already here" : pending ? "fixed on " + fe.branch : "fixed on " + fe.branch + " (?)"
+      );
+      feBadge.title = merged ? "Fixed on " + where + ", and that commit is already in this branch \u2014 very likely resolved here too. Re-analyse this branch to confirm; nothing is marked fixed until somebody looks again." : pending ? "Fixed on " + where + ", and that commit is NOT in this branch yet \u2014 the hole is real here; read that fix before writing a new one." : "Fixed on " + where + "; whether that fix is in this branch could not be determined (" + (fe.unknown_reason || "unknown") + ").";
+      tdState.appendChild(feBadge);
+    }
     tr.appendChild(tdState);
     const tdFirst = document.createElement("td");
     tdFirst.textContent = f.first_seen ? fmtWhen(f.first_seen) : "\u2014";
@@ -5262,5 +5274,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: dfe02f49a48200a6981339c35b58ba5fce958f13f8b86df2e37c4984c74106d9 */
-/* ui-sources: 05293b4e3db02b403043b1947ce75c1b9d1824705fd2e408985bc9ac896a175d */
+/* ui-bundle: bc1a2d671fc7b5d39c0e346f1be44d5d660562bb1691cbaba3bf45783efe233e */
+/* ui-sources: 58979b37f9c9b6d7d9710f6e29c83e6964cc1e4cc453a8df3db7e36561cc957f */

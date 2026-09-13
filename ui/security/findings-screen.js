@@ -1071,6 +1071,28 @@ function secFindRow(fs, f){
   const stBadge = secEl("span", "secstate " + secStateKey(f), SEC_STATE_LABEL[f.state] || f.state);
   stBadge.title = SEC_STATE_HELP[f.state] || "";
   tdState.appendChild(stBadge);
+  // FIXED ELSEWHERE: a second, quieter badge beside the state -- never in its
+  // place. `fixed_elsewhere` is an annotation the server attaches to an OPEN
+  // row when another branch of the same repository gave the same fingerprint
+  // up as fixed (queries._annotate_fixed_elsewhere). The state stays what it
+  // is, because ancestry proves the fix is present, not that the finding is
+  // absent; what this badge adds is WHERE the fix is and whether it is
+  // already in this branch. Three cases, three texts: nothing is drawn for
+  // "could not tell" beyond saying so, and nothing at all when nobody
+  // anywhere fixed it.
+  const fe = f.fixed_elsewhere;
+  if(fe && fe.branch){
+    const where = fe.branch + (fe.commit ? " @ " + String(fe.commit).slice(0, 12) : "");
+    const merged = fe.in_this_branch === true, pending = fe.in_this_branch === false;
+    const feBadge = secEl("span", "secstate fixed-elsewhere " + (merged ? "merged" : pending ? "pending" : "unknown"),
+                          merged ? "fix already here" : pending ? "fixed on " + fe.branch : "fixed on " + fe.branch + " (?)");
+    feBadge.title = merged
+      ? "Fixed on " + where + ", and that commit is already in this branch — very likely resolved here too. Re-analyse this branch to confirm; nothing is marked fixed until somebody looks again."
+      : pending
+        ? "Fixed on " + where + ", and that commit is NOT in this branch yet — the hole is real here; read that fix before writing a new one."
+        : "Fixed on " + where + "; whether that fix is in this branch could not be determined (" + (fe.unknown_reason || "unknown") + ").";
+    tdState.appendChild(feBadge);
+  }
   tr.appendChild(tdState);
 
   // FIRST SEEN
