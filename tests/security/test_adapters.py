@@ -555,11 +555,11 @@ def test_the_default_narrows_the_real_engine_with_nothing_configured(tmp_path):
 
     assert len(raw_gitleaks(root)) == 3, "the tree must be noisy to the engine"
 
-    loud, _, _, _ = adapters.gitleaks_scan(root, [ignores.DEFAULTS_OFF])
+    loud, _, _, _, _ = adapters.gitleaks_scan(root, [ignores.DEFAULTS_OFF])
     assert sorted(f["occurrences"][0]["file"] for f in loud) == [
         ".env.example", "app.env", "tests/fixtures/fake.env"], loud
 
-    quiet, notes, _, _ = adapters.gitleaks_scan(root)
+    quiet, notes, _, _, _ = adapters.gitleaks_scan(root)
     assert [f["occurrences"][0]["file"] for f in quiet] == ["app.env"], quiet
     assert notes, "the scan still has to describe itself"
 
@@ -582,7 +582,7 @@ def test_the_engine_reads_the_history_a_deleted_file_no_longer_has(tmp_path):
     git(root, "add", "-A")
     git(root, "commit", "-qm", "remove")
 
-    findings, notes, _, _ = adapters.gitleaks_scan(root)
+    findings, notes, _, _, _ = adapters.gitleaks_scan(root)
     assert findings is not None, notes
     historical = [f for f in findings if f["historical"]]
     assert historical, f"the history sweep found nothing: {notes}"
@@ -598,7 +598,7 @@ def test_a_root_that_is_not_a_checkout_costs_the_history_not_the_scan(tmp_path):
     and it has to be SAID, because "no history findings" and "the history
     was never read" are the same silence otherwise."""
     root = plant(tmp_path / "loose")
-    findings, notes, _, _ = adapters.gitleaks_scan(root)
+    findings, notes, _, _, _ = adapters.gitleaks_scan(root)
     assert findings is not None
     assert any(f["rule"] == "aws-access-token" for f in findings)
     assert any("history sweep did not complete" in n for n in notes), notes
@@ -798,7 +798,7 @@ def test_an_unreadable_history_is_a_declared_gap_not_a_clean_report(tmp_path,
     reopened through a neighbouring door.
     """
     root = break_it(history_repo(tmp_path / "repo"))
-    findings, notes, history, _ = adapters.gitleaks_scan(root)
+    findings, notes, history, _, _ = adapters.gitleaks_scan(root)
     assert findings is not None, notes
     assert notes_say_history_gap(notes), notes
     assert not notes_claim_full_history(notes), notes
@@ -815,7 +815,7 @@ def test_a_shallow_clone_never_claims_the_full_history(tmp_path):
     shallow = tmp_path / "shallow"
     subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{deep}",
                     str(shallow)], check=True, capture_output=True, text=True)
-    findings, notes, history, _ = adapters.gitleaks_scan(shallow)
+    findings, notes, history, _, _ = adapters.gitleaks_scan(shallow)
     assert findings is not None, notes
     assert not notes_claim_full_history(notes), notes
     assert any("shallow clone" in n for n in notes), notes
@@ -828,7 +828,7 @@ def test_a_readable_history_still_says_it_read_the_full_history(tmp_path):
     gap, and a guard that now declares one everywhere would be broken the
     other way -- silently, because a gap note reads like diligence."""
     root = history_repo(tmp_path / "repo")
-    findings, notes, history, _ = adapters.gitleaks_scan(root)
+    findings, notes, history, _, _ = adapters.gitleaks_scan(root)
     assert findings is not None, notes
     assert [f for f in findings if f["historical"]], f"the finding is gone: {notes}"
     assert notes_claim_full_history(notes), notes
@@ -844,7 +844,7 @@ def test_a_repository_with_no_commits_declares_no_history_gap(tmp_path):
     spot."""
     root = plant(tmp_path / "fresh")
     git(root, "init", "-q")
-    findings, notes, _, _ = adapters.gitleaks_scan(root)
+    findings, notes, _, _, _ = adapters.gitleaks_scan(root)
     assert findings is not None, notes
     assert any(f["rule"] == "aws-access-token" for f in findings)
     assert not notes_say_history_gap(notes), notes
@@ -855,7 +855,7 @@ def test_an_unreadable_history_still_keeps_the_working_tree_findings(tmp_path):
     """A gap in one half is not a reason to lose the other half."""
     root = break_objects(history_repo(tmp_path / "repo"))
     (root / "app.env").write_text(f"AWS_ACCESS_KEY_ID={AWS_KEY}\n")
-    findings, notes, _, _ = adapters.gitleaks_scan(root)
+    findings, notes, _, _, _ = adapters.gitleaks_scan(root)
     assert findings is not None, notes
     assert any(not f["historical"] and f["occurrences"][0]["file"] == "app.env"
                for f in findings), findings
@@ -871,7 +871,7 @@ def test_when_neither_pass_ran_both_reasons_are_reported(monkeypatch, tmp_path):
     # The tree pass fails for its own, different reason.
     monkeypatch.setattr(engines, "run_json",
                         lambda *a, **k: (None, "gitleaks is not installed."))
-    findings, notes, _, _ = adapters.gitleaks_scan(root)
+    findings, notes, _, _, _ = adapters.gitleaks_scan(root)
     assert findings is None, findings
     blob = " ".join(notes)
     assert "not installed" in blob, notes
@@ -885,7 +885,7 @@ def test_neither_pass_ran_says_one_reason_once(monkeypatch, tmp_path):
     root = history_repo(tmp_path / "repo")
     monkeypatch.setattr(engines, "run_json",
                         lambda *a, **k: (None, "gitleaks is not installed."))
-    _findings, notes, _, _ = adapters.gitleaks_scan(root)
+    _findings, notes, _, _, _ = adapters.gitleaks_scan(root)
     assert notes.count("gitleaks is not installed.") == 1, notes
 
 
@@ -908,7 +908,7 @@ def test_a_full_history_that_was_swept_is_reported_ok(monkeypatch, tmp_path):
     """The control: the one state that earns the secret row a `ran`."""
     root = history_repo(tmp_path / "repo")
     _clean_reports(monkeypatch)
-    findings, notes, history, _ = adapters.gitleaks_scan(root)
+    findings, notes, history, _, _ = adapters.gitleaks_scan(root)
     assert findings == []
     assert history == adapters.HISTORY_OK
     assert notes_claim_full_history(notes), notes
@@ -924,7 +924,7 @@ def test_a_shallow_clones_sweep_is_reported_shallow_beside_its_gap_note(
     subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{deep}",
                     str(shallow)], check=True, capture_output=True, text=True)
     _clean_reports(monkeypatch)
-    _findings, notes, history, _ = adapters.gitleaks_scan(shallow)
+    _findings, notes, history, _, _ = adapters.gitleaks_scan(shallow)
     assert history == adapters.HISTORY_SHALLOW
     assert adapters.SHALLOW_GAP in notes, notes
 
@@ -933,7 +933,7 @@ def test_a_history_git_cannot_walk_is_reported_gone_beside_its_gap_note(
         monkeypatch, tmp_path):
     root = break_objects(history_repo(tmp_path / "repo"))
     _clean_reports(monkeypatch)
-    findings, notes, history, _ = adapters.gitleaks_scan(root)
+    findings, notes, history, _, _ = adapters.gitleaks_scan(root)
     assert findings is not None, "the tree pass still ran and still counts"
     assert history == adapters.HISTORY_GONE
     assert notes_say_history_gap(notes), notes
@@ -952,7 +952,7 @@ def test_a_history_pass_that_wrote_no_report_is_gone_whatever_git_said(
         return (None, "gitleaks timed out.") if args[0] == "git" else ([], "")
 
     monkeypatch.setattr(engines, "run_json", one_pass)
-    findings, notes, history, _ = adapters.gitleaks_scan(root)
+    findings, notes, history, _, _ = adapters.gitleaks_scan(root)
     assert findings is not None, notes
     assert history == adapters.HISTORY_GONE
     assert notes_say_history_gap(notes), notes
@@ -987,13 +987,23 @@ def _dir_pass(seen):
     return next((args, timeout) for args, timeout in seen if args[0] == "dir")
 
 
-def test_the_history_pass_reads_the_whole_history_without_a_cursor(monkeypatch, tmp_path):
+def test_the_history_pass_reads_the_whole_history_in_ranges_without_a_cursor(monkeypatch, tmp_path):
+    """gitleaks reads a range in one go and reports nothing until it is done,
+    so a pass the budget cut left nothing behind and the next analysis
+    started over. The history is read in ranges of HISTORY_CHUNK commits,
+    oldest first, each its own `--log-opts` (which drops the engine's
+    default `--all`: the branch's history, not every remote branch's), and
+    the cursor is the last range that completed. A repository shorter than
+    one chunk is one range ending at HEAD."""
     root = history_repo(tmp_path / "repo")
+    head = adapters._head_sha(root)
     seen = _record_passes(monkeypatch)
-    adapters.gitleaks_scan(root)
+    _f, _n, history, _t, reached = adapters.gitleaks_scan(root)
     args, timeout = _git_pass(seen)
-    assert "--log-opts" not in args, args
-    assert timeout == engines.HISTORY_TIMEOUT, "the history passes' own budget"
+    at = args.index("--log-opts")
+    assert args[at + 1] == head, "one range, ending at HEAD, all of its history"
+    assert 0 < timeout <= engines.HISTORY_TIMEOUT, "each range gets what is left of the budget"
+    assert history == adapters.HISTORY_OK and reached == head
     _dir_args, dir_timeout = _dir_pass(seen)
     assert "--log-opts" not in _dir_args
     assert dir_timeout in (None, engines.SCAN_TIMEOUT), "the tree pass keeps the engines' budget"
@@ -1001,14 +1011,42 @@ def test_the_history_pass_reads_the_whole_history_without_a_cursor(monkeypatch, 
 
 def test_the_history_pass_reads_only_the_commits_since_the_cursor(monkeypatch, tmp_path):
     root = history_repo(tmp_path / "repo")
+    head = adapters._head_sha(root)
+    first = subprocess.run(["git", "-C", str(root), "rev-list", "--max-parents=0", "HEAD"],
+                           capture_output=True, text=True).stdout.split()[0]
     seen = _record_passes(monkeypatch)
-    findings, _notes, history, tree = adapters.gitleaks_scan(root, since="a" * 40)
-    args, timeout = _git_pass(seen)
+    findings, _notes, history, tree, reached = adapters.gitleaks_scan(root, since=first)
+    args, _timeout = _git_pass(seen)
     at = args.index("--log-opts")
-    assert args[at + 1] == "a" * 40 + "..HEAD"
-    assert timeout == engines.HISTORY_TIMEOUT
+    assert args[at + 1] == f"{first}..{head}", "from the cursor to the end of the only range"
     assert "--log-opts" not in _dir_pass(seen)[0], "the tree has no cursor"
     assert findings == [] and history == adapters.HISTORY_OK and tree == adapters.TREE_OK
+    assert reached == head
+
+
+def test_a_history_range_the_budget_cuts_keeps_what_was_read(monkeypatch, tmp_path):
+    """Three ranges of one commit each (HISTORY_CHUNK shrunk to 1): the
+    second range's engine call fails, so the pass reports the first range's
+    findings, the cursor at the end of the first range, and a gap the note
+    states; the row reads `warning`, never `ran`."""
+    root = history_repo(tmp_path / "repo")
+    shas = subprocess.run(["git", "-C", str(root), "rev-list", "--reverse", "HEAD"],
+                          capture_output=True, text=True).stdout.split()
+    assert len(shas) >= 2
+    monkeypatch.setattr(adapters, "HISTORY_CHUNK", 1)
+    calls = []
+
+    def run_json(name, args, cwd, **kw):
+        calls.append(list(args))
+        if args[0] == "git" and len([c for c in calls if c[0] == "git"]) == 2:
+            return None, "gitleaks timed out after 1s"
+        return [], ""
+    monkeypatch.setattr(engines, "run_json", run_json)
+    findings, notes, history, tree, reached = adapters.gitleaks_scan(root)
+    assert reached == shas[0], "the cursor is the end of the last range that completed"
+    assert history == adapters.HISTORY_GONE and tree == adapters.TREE_OK
+    assert any("did not complete" in n and "the next analysis continues" in n for n in notes), notes
+    assert findings == []
 
 
 @needs_gitleaks
@@ -1056,14 +1094,14 @@ def test_a_project_config_that_silences_the_scan_is_declared(tmp_path):
     tree with and without the file, and the note has to tell them apart.
     """
     root = plant(tmp_path / "repo")
-    loud, loud_notes, _, _ = adapters.gitleaks_scan(root)
+    loud, loud_notes, _, _, _ = adapters.gitleaks_scan(root)
     assert loud, "the planted tree must be noisy without the project's config"
     assert not any("gitleaks.toml" in n for n in loud_notes), loud_notes
 
     (root / ".gitleaks.toml").write_text(
         "[extend]\nuseDefault = true\n\n"
         "[allowlist]\nregexes = ['''.*''']\npaths = ['''.*''']\n")
-    quiet, quiet_notes, _, _ = adapters.gitleaks_scan(root)
+    quiet, quiet_notes, _, _, _ = adapters.gitleaks_scan(root)
     assert quiet == [], f"the project's own allowlist should have silenced it: {quiet}"
     assert any("gitleaks.toml" in n for n in quiet_notes), (
         f"a repository that told the scanner not to look must be declared, "

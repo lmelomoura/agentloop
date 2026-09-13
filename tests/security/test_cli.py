@@ -3189,7 +3189,7 @@ def test_the_secret_row_is_a_warning_when_the_history_was_not_swept_in_full(
                         lambda name: "/usr/bin/gitleaks" if name == "gitleaks" else None)
     monkeypatch.setattr(security_cli.adapters, "gitleaks_scan",
                         lambda root, ignore_paths=(), since=None: ([], [gap, engine_note], history,
-                                                       security_cli.adapters.TREE_OK))
+                                                       security_cli.adapters.TREE_OK, None))
     security_cli.main(["prepare", "--analysis", str(aid), "--root", str(root),
                        "--db", str(db), "--offline"])
     note = json.loads(capsys.readouterr().out)["coverage_note"]
@@ -3218,7 +3218,7 @@ def test_the_secret_row_is_ran_only_when_the_full_history_was_swept(
     monkeypatch.setattr(security_cli.adapters, "gitleaks_scan",
                         lambda root, ignore_paths=(), since=None: (
                             [], [engine_note], security_cli.adapters.HISTORY_OK,
-                            security_cli.adapters.TREE_OK))
+                            security_cli.adapters.TREE_OK, security_cli.secrets.head_sha(root)))
     security_cli.main(["prepare", "--analysis", str(aid), "--root", str(root),
                        "--db", str(db), "--offline"])
     capsys.readouterr()
@@ -3376,8 +3376,9 @@ def test_the_secret_row_reads_ran_once_the_cut_sweep_has_caught_up(
 
     def fake_engine(root, ignore_paths=(), since=None):
         handed.append(since)
+        # A complete pass reaches HEAD: that is the cursor the engine hands back.
         return ([], [engine_note], security_cli.adapters.HISTORY_OK,
-                security_cli.adapters.TREE_OK)
+                security_cli.adapters.TREE_OK, security_cli.secrets.head_sha(root))
     monkeypatch.setattr(security_cli.adapters, "engine_path",
                         lambda name: "/usr/bin/gitleaks" if name == "gitleaks" else None)
     monkeypatch.setattr(security_cli.adapters, "gitleaks_scan", fake_engine)

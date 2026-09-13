@@ -104,7 +104,7 @@ SCAN_TIMEOUT = 600
 # and continues in the next analysis (see `scan_history`) instead of starting
 # over. Overridable per install, in seconds, because the right number is a
 # property of the repositories an install analyses.
-HISTORY_TIMEOUT = int(os.environ.get("AGENTLOOP_SECURITY_HISTORY_TIMEOUT", "1800"))
+HISTORY_TIMEOUT = int(os.environ.get("AGENTLOOP_SECURITY_HISTORY_TIMEOUT", "7200"))
 
 # The largest report this module will read off disk, in bytes.
 #

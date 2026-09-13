@@ -30,6 +30,7 @@ and not left to whatever the engine's defaults happen to skip.
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
@@ -685,28 +686,21 @@ def gitleaks_scan(root, ignore_paths=(), since=None):
                   # why that asymmetry is stated and not hidden.
                   "--max-target-megabytes",
                   str(secrets.GITLEAKS_MAX_TARGET_MEGABYTES)]
-        # The cursor rides in `--log-opts`, which gitleaks passes to its own
-        # `git log`; `<since>..HEAD` is the range the built-in sweep reads
-        # for the same cursor, so the two passes of one analysis cover the
-        # same commits.
-        log_opts = ["--log-opts", f"{since}..HEAD"] if since else []
         # BOTH PASSES AT ONCE. They read the same checkout, each writes its
         # own report file (`run_json` names it), and the history pass is the
-        # long one: on the measured repository it ran to its budget while the
-        # tree pass waited behind it. The recording order below is untouched
-        # -- history first, then tree -- because it is the order the results
-        # are READ in, not the order the processes finish.
+        # long one. The recording order below is untouched -- history first,
+        # then tree -- because it is the order the results are READ in, not
+        # the order the processes finish.
+        reached = None
         if state == HISTORY_GONE:
             history, history_note = None, HISTORY_UNREADABLE.format(reason=why)
             tree, tree_note = engines.run_json("gitleaks", ["dir", ".", *common], root)
         else:
             with ThreadPoolExecutor(max_workers=2) as pool:
-                history_job = pool.submit(engines.run_json, "gitleaks",
-                                          ["git", ".", *log_opts, *common], root,
-                                          timeout=engines.HISTORY_TIMEOUT)
+                history_job = pool.submit(_gitleaks_history, root, common, since)
                 tree_job = pool.submit(engines.run_json, "gitleaks",
                                        ["dir", ".", *common], root)
-            history, history_note = history_job.result()
+            history, history_note, reached = history_job.result()
             tree, tree_note = tree_job.result()
 
     if history is None and tree is None:
@@ -756,7 +750,86 @@ def gitleaks_scan(root, ignore_paths=(), since=None):
     # for.
     if project_config(root) is not None:
         notes.append(PROJECT_CONFIG_NOTE)
-    return findings, notes, state, TREE_OK if tree is not None else TREE_GONE
+    if history is not None and reached is not None and state != HISTORY_GONE:
+        # A pass the budget cut short is a partial pass: what it reached is
+        # real (the caller records it as the cursor) and the rest is a gap
+        # the note states, so the row reads `warning`, never `ran`.
+        if reached != _head_sha(root):
+            state = HISTORY_GONE
+            notes.append(secrets.HISTORY_GAP.format(
+                reason=f"gitleaks stopped at its {engines.HISTORY_TIMEOUT}s budget at "
+                       f"{reached[:7]}; the next analysis continues from there"))
+    return findings, notes, state, TREE_OK if tree is not None else TREE_GONE, reached
+
+
+# gitleaks reads a range of commits in one go and reports nothing until it
+# is done, so a pass its budget cut left nothing behind: the next analysis
+# started over, and on a history of 21,601 commits (2,000 of them take
+# gitleaks about three minutes on the measured laptop, all cores busy) no
+# analysis ever got to the end. The history is read in ranges of
+# HISTORY_CHUNK commits, oldest first, each its own `--log-opts` (which also
+# drops gitleaks' default `--all`: the branch's own history, not every
+# remote branch's -- 32,061 commits against 21,601 on the measured
+# repository), and the cursor advances after every range that completed:
+# a stop or a budget keeps what was read, and the next analysis continues.
+HISTORY_CHUNK = 2000
+
+
+def _head_sha(root):
+    out = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                         capture_output=True, text=True, check=False)
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def _history_chunks(root, since):
+    """The chunk ends, oldest first, of `since..HEAD` (all of HEAD's history
+    without a cursor): every HISTORY_CHUNK-th commit and HEAD last."""
+    rev = f"{since}..HEAD" if since else "HEAD"
+    out = subprocess.run(["git", "-C", str(root), "rev-list", "--reverse", rev],
+                         capture_output=True, text=True, check=False)
+    if out.returncode != 0:
+        return []
+    shas = out.stdout.split()
+    if not shas:
+        return []
+    ends = shas[HISTORY_CHUNK - 1::HISTORY_CHUNK]
+    if not ends or ends[-1] != shas[-1]:
+        ends.append(shas[-1])
+    return ends
+
+
+def _gitleaks_history(root, common, since):
+    """(report, note, reached): gitleaks over the history in ranges, within
+    `engines.HISTORY_TIMEOUT`. `report` is the merged report of the ranges
+    that completed (a dict shaped like one gitleaks report: a list), `note`
+    the failure of the first range that did not, `reached` the last commit a
+    completed range ended at -- None when none did."""
+    import time as clock
+    deadline = clock.monotonic() + engines.HISTORY_TIMEOUT
+    ends = _history_chunks(root, since)
+    if not ends:
+        # Nothing since the cursor: an empty pass is a complete one.
+        return [], "", since or _head_sha(root)
+    total = len(ends)
+    merged = []
+    prev = since
+    reached = None
+    for i, end in enumerate(ends, start=1):
+        left = deadline - clock.monotonic()
+        if left <= 0:
+            return merged if reached else None, (
+                f"gitleaks did not finish within {engines.HISTORY_TIMEOUT}s"), reached
+        log_opts = f"{prev}..{end}" if prev else end
+        report, note = engines.run_json("gitleaks", ["git", ".", "--log-opts", log_opts, *common],
+                                        root, timeout=max(1, int(left)))
+        if report is None:
+            return merged if reached else None, note, reached
+        merged.extend(report if isinstance(report, list) else [])
+        reached = end
+        prev = end
+        print(f"prepare: gitleaks history range {i}/{total} done "
+              f"(~{i * HISTORY_CHUNK} commits)", file=sys.stderr, flush=True)
+    return merged, "", reached
 
 
 # ------------------------------------------------------- the dependency scan

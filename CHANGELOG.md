@@ -496,6 +496,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   phase now runs in a process group of its own, recorded on the run's slot,
   the stop signals the group, and the early-stop record closes the analysis
   as `failed` through the same door the classifier uses.
+- **The gitleaks history pass reads the history in ranges and keeps its
+  cursor.** gitleaks reads a range in one go and reports nothing until it
+  is done, so a pass its budget cut left nothing behind and the next
+  analysis started over; on 21,601 commits (2,000 take it about three
+  minutes on the measured laptop, every core busy) no analysis ever
+  reached the end. It now reads ranges of 2,000 commits, oldest first,
+  each its own `--log-opts` (which also drops the engine's default
+  `--all`: the branch's history, 21,601 commits, not every remote
+  branch's, 32,061), writes a progress line per range, and the cursor
+  advances after every range that completed. The history budget
+  (`AGENTLOOP_SECURITY_HISTORY_TIMEOUT`) defaults to 7200 s so a first
+  pass over a large history completes; every later analysis reads only
+  the commits since.
+- **The SAST pre-pass reads `ran` when Semgrep answered.** It read
+  `warning` even when Semgrep ran perfectly, by design (a pre-pass with
+  uneven rule coverage), and the operator read it as a phase that half-
+  failed on every analysis; the `sast` row below it says who covers the
+  category. The caveats stay in the note.
+- **`prepare` imports `engines`.** The version-probe change above called
+  `engines.warm_versions()` from a module that had not imported `engines`,
+  so every `prepare` died at once with `NameError`; caught by the CLI
+  tests the change had skipped.
 - **An engine's version is probed once, first, on an idle machine.** With
   the phases running at once, semgrep's `--version` (a python start-up)
   landed on a machine saturated by gitleaks and trivy, outlived the probe's
