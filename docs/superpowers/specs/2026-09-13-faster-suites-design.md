@@ -113,11 +113,20 @@ O desenho:
   `E2E_WORKERS` (omissão 4; `1` dá o comportamento de hoje, byte a byte, e é
   o que se usa para bissectar uma falha).
 
-| | e2e | selftest | parede da bateria |
+| | e2e sozinho | selftest (embute o e2e) | parede da bateria |
 |---|---|---|---|
-| hoje | 176 s | 269 s | ~7m |
-| alavanca 0 (medida) | 176 s | 269 s | ~7m — sem ganho |
-| **alavanca 1** (4 trabalhadores) | **~55 s** | **~150 s** | **~4m** (estimativa por medir) |
+| antes | 305 s | ~270 s | ~7m |
+| alavanca 0 (medida) | — | — | ~7m — sem ganho |
+| **alavanca 1, MEDIDA** (4 trabalhadores) | **84 s** | **208 s** | **~6m** |
+
+**O que foi entregue, com os números medidos (2026-09-13), não os estimados.**
+O e2e sozinho caiu 3,6× (305 → 84 s), exactamente o que a partição previa.
+Dentro do selftest a queda é menor (270 → 208 s), porque os quatro
+trabalhadores partilham a máquina com o resto da suite — a estimativa de
+~150 s estava optimista e fica aqui corrigida. A parede da bateria completa
+fica em ~6 minutos, não nos 2m30 do título; o título é o que a spec queria e
+esta tabela é o que ela conseguiu. A alavanca seguinte, se um dia for
+precisa, é a suite de segurança (150 s, quatro engines) — não o selftest.
 
 O tecto do e2e é o trabalhador mais lento, e o trabalhador mais lento é
 limitado pelos `sleep` dos seus cenários — não pela CPU. Com os 39 s de
