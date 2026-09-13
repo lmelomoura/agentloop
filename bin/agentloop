@@ -657,8 +657,12 @@ security_prompt() { # security_prompt <project> <repo> <branch> <profile> <analy
   # the ENGINE has already run prepare in the worktree before the launch
   # (run_job), so the prompt says the phase ran instead of asking for it --
   # measured on two real analyses: the model skipped the command once, and
-  # the Codex shell tool cut it once before it finished. A missing seventh
-  # argument is anthropic: every caller before platforms passed six.
+  # the Codex shell tool cut it once before it finished. On OpenCode the
+  # skill is named BOTH ways -- by name and by path -- prepare has already
+  # run engine-side same as Codex, and the `task` tool (Agent's name on this
+  # CLI) is closed by the permission block itself, so the prompt only has to
+  # state that closure, not ask for it. A missing seventh argument is
+  # anthropic: every caller before platforms passed six.
   local skill_para agents_para prepare_para
   if [ "${7:-anthropic}" = "openai" ]; then
     skill_para="The deterministic phases -- secrets, dependency CVEs, SBOM, hygiene and
@@ -676,6 +680,29 @@ door -- do the whole analysis yourself, in this one thread. Two earlier analyses
 spent their whole budget fanning the SAST pass out to six subagents and triaged
 none of the deterministic findings -- which is the part that matters most. Spend
 the budget on triage first."
+  elif [ "${7:-anthropic}" = "opencode" ]; then
+    # The skill by NAME (the CLI lists ~/.claude/skills to the model and
+    # loads one by name through its `skill` tool: measured 26, 27) AND by
+    # path, so a machine where the link is missing still finds it. The
+    # deterministic phase already ran engine-side (prepare_inline is off);
+    # the `task` tool is closed by the permission block the derived job's
+    # `disallowed_tools: Agent` translates to (measured 22), so the prompt
+    # states a fact rather than pleading.
+    skill_para="The deterministic phases -- secrets, dependency CVEs, SBOM, hygiene and
+infrastructure-as-code misconfigurations -- ALREADY RAN for this analysis,
+before you started: the engine ran \`agentloop security prepare\` in this
+worktree. Do not run it again; the skill file's first step is done.
+Invoke the \`security-analysis\` skill (your \`skill\` tool lists it; the file
+is \`$SKILLS_DIR/security-analysis/SKILL.md\`) and follow the rest of it exactly.
+It is mandatory."
+    prepare_para="The coverage note of that deterministic phase is on the analysis
+(\`agentloop security checklist --analysis $5\` prints it as coverage_note); if
+it is not empty you must repeat it in your final message."
+    agents_para="The \`task\` tool is closed for this run, by rule: there are no subagents.
+Two earlier analyses spent their whole budget fanning the SAST pass out to six
+subagents and triaged none of the deterministic findings -- which is the part
+that matters most. Do the work yourself, in this one session, and spend the
+budget on triage first."
   else
     skill_para="Invoke the \`security-analysis\` skill and follow it exactly. It is mandatory."
     prepare_para="YOUR FIRST COMMAND, before anything else:
@@ -3765,6 +3792,7 @@ cmd_skills() { # agentloop skills [install]
   [ -d "$SKILLS_DIR" ] || die "no skills/ directory in $BASE_DIR"
   printf '  %s\n' "$USER_SKILLS"
   skills_link_into "$USER_SKILLS" "$action" || _skills_pending=$?
+  echo "  OpenCode reads ~/.claude/skills too (measured), so the same link serves both CLIs"
   # Codex only when its home exists: creating ~/.codex on a machine that never
   # installed that CLI would be this tool inventing another tool's directory.
   if [ -d "$CODEX_HOME_DIR" ]; then
@@ -4838,6 +4866,8 @@ JSON
       && ok "cmd_skills status: with a Codex home, its root reports the skill missing" || bad "status: $_st"
     printf '%s\n' "$_st" | grep -qF 'run `agentloop skills install`' \
       && ok "cmd_skills status: and says how to fix it" || bad "no nag line in: $_st"
+    printf '%s\n' "$_st" | grep -qF 'OpenCode reads ~/.claude/skills too' \
+      && ok "cmd_skills status: says OpenCode reads the same link" || bad "no OpenCode line in: $_st"
     cmd_skills install >/dev/null
     [ "$(readlink "$tmp/skl/codexhome/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
       && ok "cmd_skills install: security-analysis is linked under the Codex root too" \
@@ -4849,8 +4879,8 @@ JSON
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_skout" | grep -v '^RESULT '
-  printf '%s\n' "$_skout" | grep -qx 'RESULT ok=6 bad=0' \
-    && ok "cmd_skills over two scratch roots: all 6 assertions reach the gate" \
+  printf '%s\n' "$_skout" | grep -qx 'RESULT ok=7 bad=0' \
+    && ok "cmd_skills over two scratch roots: all 7 assertions reach the gate" \
     || bad "cmd_skills over two scratch roots did not: $(printf '%s\n' "$_skout" | tail -1)"
 
   echo "status_platforms_block() — one line per platform, with the Codex facts a refused run needs"
@@ -5330,9 +5360,10 @@ JSON
   [ "$("$JQ" -r '.platforms.opencode.models[0]' "$tmp/up/config/platforms.json")" = "opencode/big-pickle" ] && ok "and the model is on the list" || bad "models: $("$JQ" -c .platforms.opencode "$tmp/up/config/platforms.json")"
 
   echo "security_prompt() — the platform decides how the skill is named and how subagents are forbidden"
-  local _pa _po
+  local _pa _po _pc
   _pa="$(security_prompt P R B quick 7 'x/**' anthropic)"
   _po="$(security_prompt P R B quick 7 'x/**' openai)"
+  _pc="$(security_prompt P R B quick 7 'x/**' opencode)"
   [ "$(security_prompt P R B quick 7 'x/**')" = "$_pa" ] \
     && ok "security_prompt: no platform argument reads as anthropic" || bad "the six-argument call differs from anthropic"
   printf '%s\n' "$_pa" | grep -qF 'Invoke the `security-analysis` skill' \
@@ -5351,6 +5382,20 @@ JSON
     && bad "openai prompt still speaks of the Agent tool" || ok "security_prompt openai: never speaks of the Agent tool"
   printf '%s\n' "$_pa" | grep -qF 'security prepare --analysis 7' && printf '%s\n' "$_pa" | grep -qF 'YOUR FIRST COMMAND' \
     && ok "security_prompt anthropic: prepare is still the agent's first command, with the analysis id filled in" || bad "the anthropic prompt lost its prepare line"
+  printf '%s\n' "$_pc" | grep -qF 'Invoke the `security-analysis` skill' \
+    && ok "security_prompt opencode: invokes the skill by name" || bad "opencode head: $(printf '%s\n' "$_pc" | head -1)"
+  printf '%s\n' "$_pc" | grep -qF "is \`$SKILLS_DIR/security-analysis/SKILL.md\`" \
+    && ok "security_prompt opencode: and by path too, for a machine where the link is missing" || bad "opencode lacks the skill by path: $(printf '%s\n' "$_pc" | sed -n '5,6p')"
+  printf '%s\n' "$_pc" | grep -qF 'ALREADY RAN for this analysis' \
+    && ok "security_prompt opencode: says the deterministic phase already ran, engine-side" || bad "opencode head: $(printf '%s\n' "$_pc" | head -1)"
+  printf '%s\n' "$_pc" | grep -qF 'YOUR FIRST COMMAND' \
+    && bad "opencode prompt still asks the agent to run prepare" || ok "security_prompt opencode: never asks the agent to run prepare"
+  printf '%s\n' "$_pc" | grep -qF 'The `task` tool is closed for this run' \
+    && ok "security_prompt opencode: the task tool is closed for this run, by rule" || bad "opencode prompt lacks the by-rule paragraph"
+  printf '%s\n' "$_pc" | grep -qF 'Do not spawn subagents' \
+    && bad "the Codex-only wording leaked into the opencode prompt" || ok "security_prompt opencode: never says the Codex-only 'do not spawn subagents'"
+  printf '%s\n' "$_pc" | grep -q 'Agent. tool' \
+    && bad "opencode prompt still speaks of the Agent tool" || ok "security_prompt opencode: never speaks of the Agent tool"
 
   echo "security_derived_jobs() — the block's platform, with the same fallback-and-warn as its permission mode"
   mkdir -p "$tmp/dplat/data"
@@ -5392,9 +5437,8 @@ JSON
   [ "$(dplat security-oe .model)" = "opus" ] && ok "a model switched off in Settings falls back to the first one switched on" || bad "Oe model $(dplat security-oe .model)"
   grep -q "not enabled in Settings ('claude-sonnet-5' on anthropic) -- using opus" "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null \
     && ok "and the derivation warning says so" || bad "no warning for Oe: $(cat "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null)"
-  # NOTE: the by-rule subagent paragraph ("The `task` tool is closed for this
-  # run") does not exist in the prompt until T9 -- that assertion belongs
-  # there, not here.
+  dplat security-of .prompt | grep -qF 'The `task` tool is closed for this run' \
+    && ok "the derived job on opencode carries the by-rule paragraph" || bad "Of prompt lacks the task paragraph"
   [ "$(dplat security-of .platform)" = "opencode" ] && [ "$(dplat security-of .model)" = "pdm_ai/glm-5.3-flash" ] && [ "$(dplat security-of .effort)" = "high" ] \
     && [ "$(dplat security-of .permission_mode)" = "full-access" ] && [ "$(dplat security-of .disallowed_tools)" = "Agent" ] \
     && ok "an opencode block: platform, model, a variant the model lists, full-access, and Agent closed (task: deny)" || bad "Of: $(dplat security-of '{platform,model,effort,permission_mode,disallowed_tools}')"

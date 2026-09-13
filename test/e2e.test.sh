@@ -868,5 +868,36 @@ lastrun | jq -r .note | grep -q 'no output at all for 4s' && ok "the empty-strea
 [ ! -e "$ROOT"/data/logs/j41c/*.raw.fifo ] && ok "and the FIFO was removed" || bad "FIFO left behind"
 
 echo
+echo "42. a security analysis on OpenCode goes through the stand-in, closes task by rule, and closes done"
+jq --arg cwd "$ROOT/work/app" '.projects += [{"name":"sandbox-oc","cwd":$cwd,"base":"main","worktree":{"enabled":true},
+   "security":{"enabled":true,"platform":"opencode","model":"pdm_ai/glm-5.3-flash","max_budget_usd":5}}]' \
+   "$ROOT/config/projects.json" > "$ROOT/projects.next" && mv "$ROOT/projects.next" "$ROOT/config/projects.json"
+argv42="$ROOT/argv-42"; prompt42="$ROOT/prompt-42"; cfg42="$ROOT/cfg-42"; rm -f "$argv42" "$prompt42" "$cfg42"
+out42="$(AL_SECURITY_ENGINES=off FAKE_SKIP_PREPARE=1 FAKE_ARGV_OUT="$argv42" FAKE_PROMPT_OUT="$prompt42" FAKE_CONFIG_OUT="$cfg42" \
+  FAKE_MODE=complete FAKE_SESSION=ses_sec FAKE_COST=0.0002 \
+  "$AL" security analyze sandbox-oc anything main quick 2>&1)"
+aid42="$(secid "$out42")"
+[ -n "$aid42" ] && ok "the analysis opened: $aid42" || bad "no analysis id in: $out42"
+[ "$(secstate sandbox-oc "$aid42")" = "done" ] \
+  && ok "and closed done: the engine ran security prepare before the agent, and the close found nothing untriaged" \
+  || bad "state '$(secstate sandbox-oc "$aid42")'"
+grep -q 'deterministic phase ran before the agent (prepare' "$ROOT/data/tick.log" \
+  && ok "the engine ran prepare before launching opencode (prepare_inline is off)" || bad "no engine-side prepare line"
+[ "$(at_in "$argv42" 1)" = "run" ] && ok "it went down the OpenCode launch line" || bad "argv: $(tr '\n' ' ' < "$argv42" 2>/dev/null)"
+mi="$(idx_in "$argv42" -m)"; [ -n "${mi:-}" ] && [ "$(at_in "$argv42" $((mi + 1)))" = "pdm_ai/glm-5.3-flash" ] \
+  && ok "-m carries the block's model" || bad "-m '$(at_in "$argv42" $((${mi:-0} + 1)))'"
+[ "$(jq -r '.permission.task' "$cfg42")" = "deny" ] && ok "task is closed BY RULE in the permission block (Agent -> task: deny)" || bad "permission: $(jq -c .permission "$cfg42")"
+[ -n "$(idx_in "$argv42" --auto)" ] && ok "--auto: full-access, the security default on opencode" || bad "no --auto"
+grep -q 'The `task` tool is closed for this run' "$prompt42" && ok "the prompt says the task tool is closed, by rule" || bad "no task paragraph in the prompt"
+grep -q 'security-analysis/SKILL.md' "$prompt42" && grep -q 'Invoke the `security-analysis` skill' "$prompt42" \
+  && ok "and names the skill by name AND by path (the CLI reads ~/.claude/skills: measured)" || bad "the prompt lacks the skill by name or by path"
+grep -q 'ALREADY RAN for this analysis' "$prompt42" && ! grep -q 'YOUR FIRST COMMAND' "$prompt42" \
+  && ok "the prompt says the deterministic phase already ran" || bad "the prompt still asks the agent to run prepare"
+grep -q 'Do not spawn subagents' "$prompt42" && bad "the Codex-only wording leaked into the opencode prompt" || ok "no Codex wording"
+[ "$(lastrun | jq -r .id)" = "security-sandbox-oc" ] && [ "$(lastrun | jq -r .platform)" = "opencode" ] && [ "$(lastrun | jq -r .cost_basis)" = "reported" ] \
+  && ok "the journal has the derived job's run on opencode, with the CLI's own cost" || bad "$(lastrun | jq -c '{id,platform,cost_basis}')"
+sleep 1
+
+echo
 printf '\n  %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

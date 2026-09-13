@@ -106,6 +106,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     on an install whose catalog is not resolved yet resolves it through the
     detected binary, with a short deadline so a hung CLI leaves its timeout
     stub instead of a 30-second hang on every request.
+  - Security analyses run on OpenCode: the derived job's `Agent` in
+    `disallowed_tools` closes the `task` tool by rule, `prepare` runs
+    engine-side before the agent (the tool's own timeout was not measured
+    and `prepare` can take minutes), and the prompt names the skill by name
+    and by path. Nothing new to link: OpenCode reads `~/.claude/skills`.
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of
