@@ -16,33 +16,31 @@ set -u
 
 E2E="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$E2E/.." && pwd)"
-ROOT="$E2E/sandbox"
-trap 'rm -rf "$ROOT"' EXIT
-rm -rf "$ROOT"; mkdir -p "$ROOT"/{config,data,remote,work}
 
+# ---------------------------------------------------------------- a sandbox
+# Everything that lives under ONE sandbox root: the config and data trees the
+# engine is pointed at, the stand-ins, the fake remote and the seed checkout,
+# and the two config files every scenario starts from. A function rather than
+# top-level code because E2E_WORKERS=4 runs one sandbox PER WORKER, side by
+# side under this directory -- the scenarios are independent in their data
+# (no job is made twice, no scenario reads another's state) and coupled only
+# by this root and by `lastrun`, which asks for its own job (run_of).
+#
+# NOT INDENTED, deliberately: two heredocs below end on a bare `JSON`, and a
+# terminator with two spaces in front of it is not a terminator -- the
+# heredoc runs on to the next bare `JSON` in the file and swallows every
+# helper and scenario in between as file content. bash -n does not notice.
+e2e_sandbox() { # e2e_sandbox <root>
+ROOT="$1"
+rm -rf "$ROOT"; mkdir -p "$ROOT"/{config,data,remote,work}
 export AGENTLOOP_CONFIG="$ROOT/config"
 export AGENTLOOP_DATA="$ROOT/data"
 export AGENTLOOP_CLAUDE_BIN="$E2E/fake-claude"
-# Here rather than beside the OpenAI scenarios below, because the FIRST `tick`
-# of this file already reaches for Codex: with no config/models.json the tick
-# finds the catalog stale and detaches `_resolve_models`, which runs `codex
-# debug models` through `$(command -v codex)` -- the operator's real CLI,
-# against their real ~/.codex. Every `$AL` in this file must see the stand-in.
 export AGENTLOOP_CODEX_BIN="$E2E/fake-codex"
 export CODEX_HOME="$ROOT/codex-home"        # the stand-in's rollouts; never ~/.codex
-# The same for OpenCode: the daily catalog pass would otherwise run the
-# operator's real `opencode models --verbose` against their real config.
 export AGENTLOOP_OPENCODE_BIN="$E2E/fake-opencode"
-# the price source is a fixture: no test reaches the network
 export AGENTLOOP_PRICING_URL="file://$REPO/test/fixtures/pricing/litellm-sample.json"
 mkdir -p "$CODEX_HOME"
-AL="$REPO/bin/agentloop"
-
-pass=0; fail=0
-ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
-bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
-
-# ---------------------------------------------------------------- the fixture
 git init -q --bare "$ROOT/remote/origin.git"
 git init -q "$ROOT/work/app"
 git -C "$ROOT/work/app" remote add origin "$ROOT/remote/origin.git"
@@ -65,6 +63,15 @@ cat > "$ROOT/config/platforms.json" <<'JSON'
               "openai":{"enabled":true,"bin":"","models":["gpt-5.6-sol"]},
               "opencode":{"enabled":true,"bin":"","models":["opencode/big-pickle","pdm_ai/glm-5.3-flash"]}}}
 JSON
+}
+
+AL="$REPO/bin/agentloop"
+
+pass=0; fail=0
+ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
+bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
+
+# ---------------------------------------------------------------- the fixture
 
 mkjob() { # mkjob <id> <mode>
   E2E_JOB="$1"
@@ -100,6 +107,54 @@ secnote() {
 }
 
 echo
+# ------------------------------------------------ helpers, hoisted
+# Defined once, before any scenario. They used to sit where the OpenAI and
+# OpenCode scenarios begin, so a worker starting at 20 or 38 had no
+# mkjob_openai, no lastrun and no mkjob_opencode until scenario 12 or 28
+# had run -- which, in its own sandbox, it never had.
+
+# <index><TAB><argument>. `at <n>` is the n-th argument, `idx <word>` its index.
+at()  { awk -F'\t' -v i="$1" '$1==i {print $2; exit}' "$argv"; }
+
+idx() { awk -F'\t' -v w="$1" '$2==w {print $1; exit}' "$argv"; }
+
+mkjob_openai() { # mkjob_openai <id> [permission]
+  E2E_JOB="$1"
+  printf '{"jobs":[{"id":"%s","project":"sandbox","enabled":false,"platform":"openai","model":"gpt-5.6-sol","effort":"high","prompt":"do the thing",
+    "interval_seconds":3600,"permission_mode":"%s","max_parallel":1}]}\n' "$1" "${2:-workspace-write}" \
+    > "$ROOT/config/jobs.json"
+  mkdir -p "$ROOT/config/prechecks"
+  printf '#!/bin/bash\nexit 0\n' > "$ROOT/config/prechecks/$1.sh"
+  chmod +x "$ROOT/config/prechecks/$1.sh"
+}
+
+# The run of ONE job -- the last recorded for it -- rather than the last line
+# of the journal, which is only the same thing while every scenario runs
+# alone in one sandbox in sequence. Scenarios read their own run through
+# `lastrun`, which asks for the job the last mkjob* made (E2E_JOB); a scenario
+# whose run belongs to a job it did not make (a derived security job) sets
+# E2E_JOB itself. Keyed on the record's own `"id":"<job>"` -- record_run
+# writes `id` first -- and the closing quote keeps j1 from matching j10.
+run_of() { grep -F "\"id\":\"$1\"" "$ROOT/data/runs.ndjson" 2>/dev/null | tail -1; }
+
+lastrun() { run_of "$E2E_JOB"; }
+
+# <index><TAB><argument> readers over a recorded argv file
+at_in()  { awk -F'\t' -v i="$2" '$1==i {print $2; exit}' "$1"; }
+
+idx_in() { awk -F'\t' -v w="$2" '$2==w {print $1; exit}' "$1"; }
+
+mkjob_opencode() { # mkjob_opencode <id> [permission] [model] [extra-json-fields]
+  E2E_JOB="$1"
+  printf '{"jobs":[{"id":"%s","project":"sandbox","enabled":false,"platform":"opencode","model":"%s","effort":"high","prompt":"do the thing",
+    "interval_seconds":3600,"permission_mode":"%s","max_parallel":1%s}]}\n' "$1" "${3:-pdm_ai/glm-5.3-flash}" "${2:-full-access}" "${4:-}" \
+    > "$ROOT/config/jobs.json"
+  mkdir -p "$ROOT/config/prechecks"
+  printf '#!/bin/bash\nexit 0\n' > "$ROOT/config/prechecks/$1.sh"
+  chmod +x "$ROOT/config/prechecks/$1.sh"
+}
+
+scenario_1() {
 echo "1. a run that declares a clean ending is torn down and removed"
 mkjob j1 complete
 FAKE_MODE=complete FAKE_SESSION=sess-clean "$AL" run j1 >/dev/null 2>&1
@@ -107,6 +162,9 @@ sleep 2
 [ -z "$(dirs j1)" ] && ok "its run directory is gone" || bad "left $(dirs j1)"
 
 echo
+}
+
+scenario_2() {
 echo "2. a run that never declares an ending keeps its tree, marked open"
 mkjob j2 undeclared
 FAKE_MODE=undeclared FAKE_SESSION=sess-cut "$AL" run j2 >/dev/null 2>&1
@@ -118,6 +176,9 @@ d2="$(dirs j2 | head -1)"
   && ok "with the session bound to it" || bad "session not bound"
 
 echo
+}
+
+scenario_3() {
 echo "3. a resume continues in that same directory, not a fresh one"
 FAKE_MODE=complete FAKE_SESSION=sess-cut "$AL" resume j2 sess-cut >/dev/null 2>&1
 sleep 2
@@ -127,6 +188,9 @@ grep -q "resumed sess-cut in its own tree" "$ROOT/data/tick.log" 2>/dev/null \
   || bad "left $(dirs j2)"
 
 echo
+}
+
+scenario_4() {
 echo "4. work on no remote is reported, and the tree is still kept"
 mkjob j3 dirty
 FAKE_MODE=dirty FAKE_SESSION=sess-dirty "$AL" run j3 >/dev/null 2>&1
@@ -137,6 +201,9 @@ grep -q 'UNDELIVERED' "$ROOT/data/runs.ndjson" 2>/dev/null \
   && ok "and the run says UNDELIVERED" || bad "no UNDELIVERED note in the journal"
 
 echo
+}
+
+scenario_5() {
 echo "5. an open session nobody resumes expires and is reclaimed"
 AGENTLOOP_SESSION_TTL=0 "$AL" tick >/dev/null 2>&1
 sleep 1
@@ -146,6 +213,9 @@ grep -q 'expired after' "$ROOT/data/tick.log" 2>/dev/null \
   && ok "and said so in the tick log" || bad "nothing in tick.log about the expiry"
 
 echo
+}
+
+scenario_6() {
 echo "6. a directory from before this version is adopted, not deleted"
 mkdir -p "$ROOT/data/worktrees/j4/20200101T000000Z-1/app"
 git init -q "$ROOT/data/worktrees/j4/20200101T000000Z-1/app"
@@ -160,6 +230,9 @@ sleep 1
   && ok "adopted as open, with a fresh clock" || bad "marked '$(ended j4 20200101T000000Z-1)'"
 
 echo
+}
+
+scenario_7() {
 echo "7. a slot from a previous boot holds nothing"
 mkdir -p "$ROOT/data/locks/j5/99999"
 echo "$$" > "$ROOT/data/locks/j5/99999/pid"
@@ -180,6 +253,9 @@ sleep 1
 # the same three shapes.
 
 echo
+}
+
+scenario_8() {
 echo "8. a detached security analysis returns fast, and the run closes it once it ends"
 t0=$(date +%s)
 out8="$(FAKE_MODE=complete FAKE_SESSION=sess-sec-done "$AL" security analyze --detach sandbox anything main quick)"
@@ -196,6 +272,9 @@ while [ "$w" -lt 20 ] && [ "$(secstate sandbox "$aid8")" = "running" ]; do sleep
 sleep 1   # let run_job's own teardown release the derived job's slot before the next scenario
 
 echo
+}
+
+scenario_9() {
 echo "9. an agent that dies on launch still closes its analysis -- failed, not stuck running"
 cat > "$ROOT/dead-claude" <<'SH'
 #!/usr/bin/env bash
@@ -212,6 +291,9 @@ while [ "$w" -lt 20 ] && [ "$(secstate sandbox "$aid9")" = "running" ]; do sleep
 sleep 1
 
 echo
+}
+
+scenario_10() {
 echo "10. a row stuck 'running' with no live run cannot brick the button"
 sha="$(git -C "$ROOT/work/app" rev-parse HEAD)"
 stuck_out="$("$AL" security open-analysis --project sandbox --repo sandbox --branch main \
@@ -229,6 +311,9 @@ AGENTLOOP_SECURITY_STALE_GRACE=0 FAKE_MODE=complete FAKE_SESSION=sess-sec-fresh 
   || bad "stuck row $stuck_id left '$(secstate sandbox "$stuck_id")'"
 
 echo
+}
+
+scenario_11() {
 echo "11. an agent that never ran the deterministic phases cannot close done"
 # Nothing engine-side runs `prepare` on Claude Code (on Codex the engine does
 # -- scenario 24). An agent that skips its first command
@@ -251,6 +336,9 @@ case "$(secnote sandbox "$aid11")" in
 esac
 
 echo
+}
+
+scenario_12() {
 echo "12. the analysis is launched with the Agent tool closed and its prompt intact"
 # THE ONE SCENARIO THAT READS AN ARGV. Everything above steers `fake-claude` by
 # env var and never looks at how it was invoked -- which is why this suite was
@@ -264,9 +352,6 @@ argv="$ROOT/launch-argv"
 rm -f "$argv"
 FAKE_ARGV_OUT="$argv" FAKE_MODE=complete FAKE_SESSION=sess-sec-argv \
   "$AL" security analyze sandbox anything main quick >/dev/null 2>&1
-# <index><TAB><argument>. `at <n>` is the n-th argument, `idx <word>` its index.
-at()  { awk -F'\t' -v i="$1" '$1==i {print $2; exit}' "$argv"; }
-idx() { awk -F'\t' -v w="$1" '$2==w {print $1; exit}' "$argv"; }
 argc="$(awk -F'\t' '$1=="ARGC" {print $2; exit}' "$argv" 2>/dev/null)"
 di="$(idx '--disallowedTools' 2>/dev/null)"
 [ -n "${di:-}" ] && [ "$(at "$((di + 1))")" = "Agent" ] \
@@ -297,29 +382,11 @@ jq -e '(.openai.models[] | select(.slug=="gpt-5.6-sol") | .efforts | index("ultr
   "$ROOT/config/models.json" >/dev/null \
   && ok "gpt-5.6-sol's efforts include ultra" \
   || bad "gpt-5.6-sol has no ultra effort"
-mkjob_openai() { # mkjob_openai <id> [permission]
-  E2E_JOB="$1"
-  printf '{"jobs":[{"id":"%s","project":"sandbox","enabled":false,"platform":"openai","model":"gpt-5.6-sol","effort":"high","prompt":"do the thing",
-    "interval_seconds":3600,"permission_mode":"%s","max_parallel":1}]}\n' "$1" "${2:-workspace-write}" \
-    > "$ROOT/config/jobs.json"
-  mkdir -p "$ROOT/config/prechecks"
-  printf '#!/bin/bash\nexit 0\n' > "$ROOT/config/prechecks/$1.sh"
-  chmod +x "$ROOT/config/prechecks/$1.sh"
-}
-# The run of ONE job -- the last recorded for it -- rather than the last line
-# of the journal, which is only the same thing while every scenario runs
-# alone in one sandbox in sequence. Scenarios read their own run through
-# `lastrun`, which asks for the job the last mkjob* made (E2E_JOB); a scenario
-# whose run belongs to a job it did not make (a derived security job) sets
-# E2E_JOB itself. Keyed on the record's own `"id":"<job>"` -- record_run
-# writes `id` first -- and the closing quote keeps j1 from matching j10.
-run_of() { grep -F "\"id\":\"$1\"" "$ROOT/data/runs.ndjson" 2>/dev/null | tail -1; }
-lastrun() { run_of "$E2E_JOB"; }
-# <index><TAB><argument> readers over a recorded argv file
-at_in()  { awk -F'\t' -v i="$2" '$1==i {print $2; exit}' "$1"; }
-idx_in() { awk -F'\t' -v w="$2" '$2==w {print $1; exit}' "$1"; }
 
 echo
+}
+
+scenario_13() {
 echo "13. an OpenAI run goes through the Codex stand-in and reads as a clean success"
 mkjob_openai j13
 FAKE_MODE=complete FAKE_SESSION=thr-clean "$AL" run j13 >/dev/null 2>&1
@@ -347,6 +414,9 @@ jq -e '.openai.five_hour.utilization == 0.05 and .openai.five_hour.source == "ro
   && ok "the run's rollout fed the openai usage windows" || bad "rate-limits.json: $(cat "$ROOT/data/rate-limits.json" 2>/dev/null)"
 
 echo
+}
+
+scenario_14() {
 echo "14. an OpenAI run that never declares an ending keeps its tree, bound to the thread id"
 mkjob_openai j14
 FAKE_MODE=undeclared FAKE_SESSION=thr-cut "$AL" run j14 >/dev/null 2>&1
@@ -357,6 +427,9 @@ d14="$(dirs j14 | head -1)"
   && ok ".session holds the thread id" || bad ".session not bound to the thread"
 
 echo
+}
+
+scenario_15() {
 echo "15. a resume of that thread reattaches, and launches as exec resume in the process cwd"
 argv15="$ROOT/argv-15"; rm -f "$argv15"
 FAKE_ARGV_OUT="$argv15" FAKE_MODE=complete FAKE_SESSION=thr-cut "$AL" resume j14 thr-cut >/dev/null 2>&1
@@ -372,6 +445,9 @@ ti="$(idx_in "$argv15" thr-cut)"; mi="$(idx_in "$argv15" --)"
   && ok "the thread id precedes --, and the prompt follows it" || bad "thread id at '$ti', -- at '$mi'"
 
 echo
+}
+
+scenario_16() {
 echo "16. work on no remote is reported for an OpenAI run too"
 mkjob_openai j16
 FAKE_MODE=dirty FAKE_SESSION=thr-dirty "$AL" run j16 >/dev/null 2>&1
@@ -379,6 +455,9 @@ sleep 2
 lastrun | grep -q 'UNDELIVERED' && [ -n "$(dirs j16)" ] && ok "UNDELIVERED, and the tree is kept" || bad "no UNDELIVERED note, or tree gone"
 
 echo
+}
+
+scenario_17() {
 echo "17. the launch line of a fresh OpenAI run, read back off the stand-in's argv"
 argv17="$ROOT/argv-17"; rm -f "$argv17"
 mkjob_openai j17 read-only
@@ -405,6 +484,9 @@ dd="$(idx_in "$argv17" --)"; [ -n "$dd" ] && [ "$((dd + 1))" = "$argc17" ] \
   && ok "the prompt is the one argument after --" || bad "-- at '$dd', argc $argc17"
 
 echo
+}
+
+scenario_17b() {
 echo "17b. a workspace-write run gets back the network AND the git directory its commits write to"
 argv17b="$ROOT/argv-17b"; rm -f "$argv17b"
 mkjob_openai j17b workspace-write
@@ -423,6 +505,9 @@ case "$wr17b" in
 esac
 
 echo
+}
+
+scenario_18() {
 echo "18. a spent OpenAI quota is rate_limited, outside the backoff"
 mkjob_openai j18
 echo '{"j18":{"fail_streak":2}}' > "$ROOT/data/state.json"
@@ -435,6 +520,9 @@ sleep 2
   && ok "and the fuller openai window is marked spent until its reset" || bad "window status $(jq -c .openai "$ROOT/data/rate-limits.json")"
 
 echo
+}
+
+scenario_19() {
 echo "19. a stop ends an OpenAI run that will not end by itself"
 mkjob_openai j19
 FAKE_MODE=hang FAKE_SESSION=thr-hang "$AL" run j19 >/dev/null 2>&1 &
@@ -446,6 +534,9 @@ wait
 [ ! -e "$ROOT"/data/logs/j19/*.raw.fifo ] && ok "the FIFO was removed" || bad "FIFO left behind"
 
 echo
+}
+
+scenario_20() {
 echo "20. a run that cannot start is refused in tick.log before it costs a slot"
 mkjob_openai j20
 FAKE_CODEX_LOGGED_OUT=1 "$AL" run j20 >/dev/null 2>&1
@@ -466,6 +557,9 @@ sleep 2
 [ "$(lastrun | jq -r .status)" = "success" ] && ok "and the run itself went on to finish" || bad "status $(lastrun | jq -r .status)"
 
 echo
+}
+
+scenario_21() {
 echo "21. the run-end hook learns the platform, the cost basis and the tokens"
 mkdir -p "$ROOT/config/hooks"
 printf '#!/bin/bash\nprintf "%%s %%s %%s\\n" "$AL_PLATFORM" "$AL_COST_BASIS" "$AL_TOKENS" > "%s/hook-21.out"\n' "$ROOT" > "$ROOT/config/hooks/on-run-end.sh"
@@ -480,6 +574,9 @@ esac
 rm -f "$ROOT/config/hooks/on-run-end.sh"
 
 echo
+}
+
+scenario_22() {
 echo "22. a session is resumed on the platform it ran on, or not at all"
 mkjob_openai j22
 FAKE_MODE=undeclared FAKE_SESSION=thr-moved "$AL" run j22 >/dev/null 2>&1
@@ -494,6 +591,9 @@ grep -q 'j22: refusing to resume thr-moved — this session belongs to openai; t
 [ -n "$(dirs j22)" ] && ok "and the open session's tree is left where it was" || bad "the tree was taken"
 
 echo
+}
+
+scenario_23() {
 echo "23. the price table refreshes from the source and names what it could not price"
 # The seeded example table prices gpt-5.4-mini and the source does not carry it,
 # so its row would simply be KEPT (that rule has its own selftest case). Drop it
@@ -513,6 +613,9 @@ jq -e '.openai["gpt-5.6-sol"].cache_write == 5' "$ROOT/config/pricing.json" >/de
 grep -q 'pricing: no price for gpt-5.4-mini' "$ROOT/data/tick.log" && ok "and tick.log says so" || bad "no tick.log line"
 
 echo
+}
+
+scenario_24() {
 echo "24. a security analysis on OpenAI goes through the Codex stand-in, forbids subagents in words, and closes done"
 # A second project, on the openai platform, over the same repository. Its
 # derived job takes the block's platform and the platform's security default
@@ -554,6 +657,9 @@ E2E_JOB=security-sandbox-oa   # the derived job, which no mkjob made
 sleep 1
 
 echo
+}
+
+scenario_25() {
 echo "25. the account the installer pinned is the account the agent signs in as"
 # The chain nobody had driven end to end: launchd hands the tick the plist's
 # EnvironmentVariables, the engine reads AGENTLOOP_CLAUDE_CONFIG_DIR (and
@@ -576,6 +682,9 @@ FAKE_ACCOUNT_OUT="$acct25" CLAUDE_CONFIG_DIR="$ROOT/someones-session" \
 sleep 1
 
 echo
+}
+
+scenario_26() {
 echo "26. a job on a platform switched off in Settings is skipped before it costs a slot"
 mkjob j26
 "$AL" platform disable anthropic >/dev/null 2>&1
@@ -589,6 +698,9 @@ sleep 2
 [ "$(lastrun | jq -r .session)" = "sess-26b" ] && ok "enabled again, the same job runs" || bad "no run after enable: $(lastrun)"
 
 echo
+}
+
+scenario_27() {
 echo "27. a model switched off in Settings is refused, and the line names what is enabled"
 mkjob_openai j27
 printf '["gpt-5.6-luna"]' | "$AL" platform set-models openai >/dev/null 2>&1
@@ -598,6 +710,9 @@ grep -q "j27: model 'gpt-5.6-sol' is not enabled in Settings — openai enables:
 printf '["gpt-5.6-sol"]' | "$AL" platform set-models openai >/dev/null 2>&1
 
 echo
+}
+
+scenario_28() {
 echo "28. upgrade path: no platforms file and an enabled job -> seeded from it, and the run is unchanged"
 mkjob j28
 jq '.jobs[0].enabled = true | .jobs[0].model = "claude-opus-5"' "$ROOT/config/jobs.json" > "$ROOT/config/jobs.next" && mv "$ROOT/config/jobs.next" "$ROOT/config/jobs.json"
@@ -643,17 +758,11 @@ JSON
 jq -e '.opencode.models | length == 13' "$ROOT/config/models.json" >/dev/null \
   && ok "resolve-models opencode wrote the catalog from the stand-in's models --verbose" \
   || bad "no opencode catalog after resolve-models"
-mkjob_opencode() { # mkjob_opencode <id> [permission] [model] [extra-json-fields]
-  E2E_JOB="$1"
-  printf '{"jobs":[{"id":"%s","project":"sandbox","enabled":false,"platform":"opencode","model":"%s","effort":"high","prompt":"do the thing",
-    "interval_seconds":3600,"permission_mode":"%s","max_parallel":1%s}]}\n' "$1" "${3:-pdm_ai/glm-5.3-flash}" "${2:-full-access}" "${4:-}" \
-    > "$ROOT/config/jobs.json"
-  mkdir -p "$ROOT/config/prechecks"
-  printf '#!/bin/bash\nexit 0\n' > "$ROOT/config/prechecks/$1.sh"
-  chmod +x "$ROOT/config/prechecks/$1.sh"
-}
 
 echo
+}
+
+scenario_29() {
 echo "29. an OpenCode run goes through the stand-in and reads as a clean success"
 mkjob_opencode j29 full-access opencode/big-pickle
 FAKE_MODE=complete FAKE_SESSION=ses_clean "$AL" run j29 >/dev/null 2>&1
@@ -673,10 +782,17 @@ s29="$(ls "$ROOT"/data/logs/j29/*.stream.ndjson 2>/dev/null | head -1)"
 head -1 "$s29" | jq -e '.subtype=="init" and .platform=="opencode"' >/dev/null 2>&1 \
   && ok "the normalized stream opens with the init event" || bad "first line: $(head -1 "$s29")"
 [ ! -e "$ROOT"/data/logs/j29/*.raw.fifo ] && ok "the FIFO was removed" || bad "FIFO left behind"
-jq -e 'has("opencode") | not' "$ROOT/data/rate-limits.json" >/dev/null 2>&1 \
+# "no opencode block" is also true of a file that does not exist yet -- it
+# only exists once an OpenAI run has written its own windows, which in file
+# order scenario 13 did, and in a sandbox starting at 27 nothing has. jq on a
+# missing file exits 2, which read here as "an opencode block appeared".
+{ [ ! -f "$ROOT/data/rate-limits.json" ] || jq -e 'has("opencode") | not' "$ROOT/data/rate-limits.json" >/dev/null 2>&1; } \
   && ok "no usage window was invented for opencode" || bad "rate-limits.json grew an opencode block"
 
 echo
+}
+
+scenario_30() {
 echo "30. an OpenCode run that never declares an ending keeps its tree, bound to the session"
 mkjob_opencode j30
 FAKE_MODE=undeclared FAKE_SESSION=ses_cut "$AL" run j30 >/dev/null 2>&1
@@ -686,6 +802,9 @@ d30="$(dirs j30 | head -1)"
 [ "$(cat "$ROOT/data/worktrees/j30/$d30/.session" 2>/dev/null)" = "ses_cut" ] && ok ".session holds the sessionID" || bad ".session not bound"
 
 echo
+}
+
+scenario_31() {
 echo "31. a resume reattaches, and launches with -s AND --dir on the session's own directory"
 argv31="$ROOT/argv-31"; dir31="$ROOT/dir-31"; rm -f "$argv31" "$dir31"
 FAKE_ARGV_OUT="$argv31" FAKE_DIR_OUT="$dir31" FAKE_MODE=complete FAKE_SESSION=ses_cut "$AL" resume j30 ses_cut >/dev/null 2>&1
@@ -701,6 +820,9 @@ esac
 [ "$(lastrun | jq -r .session)" = "ses_cut" ] && [ "$(lastrun | jq -r .resumed_from)" = "ses_cut" ] && ok "the journal has the same session, resumed" || bad "$(lastrun | jq -c '{session,resumed_from}')"
 
 echo
+}
+
+scenario_32() {
 echo "32. work on no remote is reported for an OpenCode run too"
 mkjob_opencode j32
 FAKE_MODE=dirty FAKE_SESSION=ses_dirty "$AL" run j32 >/dev/null 2>&1
@@ -708,6 +830,9 @@ sleep 2
 lastrun | grep -q 'UNDELIVERED' && [ -n "$(dirs j32)" ] && ok "UNDELIVERED, and the tree is kept" || bad "no UNDELIVERED note, or tree gone"
 
 echo
+}
+
+scenario_33() {
 echo "33. the launch line and the permission block of a fresh OpenCode run, read back off the stand-in"
 argv33="$ROOT/argv-33"; cfg33="$ROOT/cfg-33"; dir33="$ROOT/dir-33"; rm -f "$argv33" "$cfg33" "$dir33"
 mkjob_opencode j33 full-access pdm_ai/glm-5.3-flash ',"disallowed_tools":"Agent,Bash(git push *)"'
@@ -733,6 +858,9 @@ grep -q "j33: disallowed_tools is ignored" "$ROOT/data/tick.log" && bad "the lis
 [ "$(lastrun | jq -r .status)" = "success" ] && ok "and the run went on to finish" || bad "status $(lastrun | jq -r .status)"
 
 echo
+}
+
+scenario_33b() {
 echo "33b. read-only launches with the four denies, and a tool the table does not know is named"
 cfg33b="$ROOT/cfg-33b"; rm -f "$cfg33b"
 mkjob_opencode j33b read-only pdm_ai/glm-5.3-flash ',"allowed_tools":"Read,Nonesuch"'
@@ -743,6 +871,9 @@ sleep 1
 grep -q "j33b: allowed_tools: Nonesuch is not a tool OpenCode has; ignored" "$ROOT/data/tick.log" && ok "the unknown tool name is one line in tick.log" || bad "no note for Nonesuch"
 
 echo
+}
+
+scenario_34() {
 echo "34. a tool denied by rule during the run is tools_denied, like a --disallowedTools hit on Claude"
 mkjob_opencode j34
 FAKE_MODE=deny FAKE_SESSION=ses_deny "$AL" run j34 >/dev/null 2>&1
@@ -751,6 +882,9 @@ sleep 2
   && ok "error / tools_denied (the stream carried the denial: opencode has that capability, Codex never did)" || bad "$(lastrun | jq -c '{status,cause}')"
 
 echo
+}
+
+scenario_35() {
 echo "35. a rate limit is rate_limited, outside the backoff, with no window to mark"
 mkjob_opencode j35
 echo '{"j35":{"fail_streak":2}}' > "$ROOT/data/state.json"
@@ -759,9 +893,12 @@ sleep 2
 [ "$(lastrun | jq -r .status)" = "error" ] && [ "$(lastrun | jq -r .cause)" = "rate_limited" ] \
   && ok "error / rate_limited (APIError with statusCode 429)" || bad "$(lastrun | jq -c '{status,cause}')"
 [ "$(jq -r '.j35.fail_streak' "$ROOT/data/state.json")" = "2" ] && ok "fail_streak untouched" || bad "streak $(jq -r '.j35.fail_streak' "$ROOT/data/state.json")"
-jq -e 'has("opencode") | not' "$ROOT/data/rate-limits.json" >/dev/null 2>&1 && ok "and still no opencode window: the next run comes at the job's own interval" || bad "an opencode window appeared"
+{ [ ! -f "$ROOT/data/rate-limits.json" ] || jq -e 'has("opencode") | not' "$ROOT/data/rate-limits.json" >/dev/null 2>&1; } && ok "and still no opencode window: the next run comes at the job's own interval" || bad "an opencode window appeared"
 
 echo
+}
+
+scenario_35b() {
 echo "35b. an unknown model at run time is an error whose reason is in .err, not on the stream"
 mkjob_opencode j35b full-access pdm_ai/glm-5.3-flash ',"max_budget_usd":1'
 FAKE_MODE=error FAKE_SESSION=ses_err "$AL" run j35b >/dev/null 2>&1
@@ -776,6 +913,9 @@ grep -q 'j35b: max_budget_usd 1 not applied: the cost of this run is unknown (no
   && ok "the cap note says no step reported a cost, not no price for a priced model" || bad "cap note: $(grep 'j35b: max_budget' "$ROOT/data/tick.log" | tail -1)"
 
 echo
+}
+
+scenario_36() {
 echo "36. a stop ends an OpenCode run that will not end by itself"
 mkjob_opencode j36 full-access pdm_ai/glm-5.3-flash ',"max_budget_usd":1'
 FAKE_MODE=hang FAKE_SESSION=ses_hang "$AL" run j36 >/dev/null 2>&1 &
@@ -788,6 +928,9 @@ wait
 lastrun | jq -r .note | grep -q 'not applied' && bad "a stopped run got the cap note" || ok "a stopped run gets no cap note: its cost is unknown because it died, not because the model has no price"
 
 echo
+}
+
+scenario_37() {
 echo "37. a run that cannot start is refused in tick.log before it costs a slot"
 mkjob_opencode j37
 FAKE_OPENCODE_NO_MODELS=1 "$AL" run j37 >/dev/null 2>&1
@@ -820,6 +963,9 @@ grep -q "j37: effort 'ultra' is not a variant of pdm_ai/glm-5.3-flash — launch
 [ "$(lastrun | jq -r .status)" = "success" ] && ok "and finished" || bad "status $(lastrun | jq -r .status)"
 
 echo
+}
+
+scenario_38() {
 echo "38. the run-end hook learns the platform, the cost basis and the tokens"
 mkdir -p "$ROOT/config/hooks"
 printf '#!/bin/bash\nprintf "%%s %%s %%s\\n" "$AL_PLATFORM" "$AL_COST_BASIS" "$AL_TOKENS" > "%s/hook-38.out"\n' "$ROOT" > "$ROOT/config/hooks/on-run-end.sh"
@@ -834,6 +980,9 @@ esac
 rm -f "$ROOT/config/hooks/on-run-end.sh"
 
 echo
+}
+
+scenario_39() {
 echo "39. a model the catalog prices records the CLI's own cost, reported"
 mkjob_opencode j39
 FAKE_MODE=complete FAKE_SESSION=ses_paid FAKE_COST=0.0002 "$AL" run j39 >/dev/null 2>&1
@@ -842,6 +991,9 @@ sleep 2
   && ok "cost 0.0004 reported: two steps at 0.0002, the CLI's number, not an estimate" || bad "cost $(lastrun | jq -c '{cost,cost_basis}')"
 
 echo
+}
+
+scenario_40() {
 echo "40. a per-run cap over an unknown cost says so instead of never firing"
 mkjob_opencode j40 full-access opencode/big-pickle ',"max_budget_usd":1'
 FAKE_MODE=complete FAKE_SESSION=ses_cap "$AL" run j40 >/dev/null 2>&1
@@ -852,6 +1004,9 @@ lastrun | jq -r .note | grep -q 'max_budget_usd \$1 not applied' && ok "and so d
 [ "$(lastrun | jq -r .status)" = "success" ] && ok "without changing the status" || bad "status $(lastrun | jq -r .status)"
 
 echo
+}
+
+scenario_41() {
 echo "41. a run that never writes a byte is killed at the stall timeout, whatever its CPU does"
 # Measured on OpenCode (evidence 35): a hung CLI process burns ~1 CPU second
 # every 75 s of idling, which the watchdog's "CPU changed" test reads as
@@ -867,6 +1022,9 @@ sleep 1
 lastrun | jq -r .note | grep -q 'no output at all for 4s' && ok "the note names the rule: no output at all" || bad "note: $(lastrun | jq -r .note)"
 
 echo
+}
+
+scenario_41b() {
 echo "41b. a run that wrote its first event and then went quiet is still judged by the old rule"
 mkjob j41b
 sed -i '' 's/"max_parallel":1/"max_parallel":1,"stall_timeout_seconds":4/' "$ROOT/config/jobs.json"
@@ -876,6 +1034,9 @@ lastrun | jq -r .note | grep -q 'no output and no CPU for 4s' && ok "killed by t
 lastrun | jq -r .note | grep -q 'no output at all' && bad "the empty-stream rule fired on a run that had written" || ok "the empty-stream rule never touches a run that wrote a byte"
 
 echo
+}
+
+scenario_41c() {
 echo "41c. the case that motivated the rule: an OpenCode run whose provider never answers"
 mkjob_opencode j41c
 sed -i '' 's/"max_parallel":1/"max_parallel":1,"stall_timeout_seconds":4/' "$ROOT/config/jobs.json"
@@ -886,6 +1047,9 @@ lastrun | jq -r .note | grep -q 'no output at all for 4s' && ok "the empty-strea
 [ ! -e "$ROOT"/data/logs/j41c/*.raw.fifo ] && ok "and the FIFO was removed" || bad "FIFO left behind"
 
 echo
+}
+
+scenario_42() {
 echo "42. a security analysis on OpenCode goes through the stand-in, closes task by rule, and closes done"
 jq --arg cwd "$ROOT/work/app" '.projects += [{"name":"sandbox-oc","cwd":$cwd,"base":"main","worktree":{"enabled":true},
    "security":{"enabled":true,"platform":"opencode","model":"pdm_ai/glm-5.3-flash","max_budget_usd":5}}]' \
@@ -917,6 +1081,90 @@ E2E_JOB=security-sandbox-oc   # the derived job, which no mkjob made
 [ "$(lastrun | jq -r .id)" = "security-sandbox-oc" ] && [ "$(lastrun | jq -r .platform)" = "opencode" ] && [ "$(lastrun | jq -r .cost_basis)" = "reported" ] \
   && ok "the journal has the derived job's run on opencode, with the CLI's own cost" || bad "$(lastrun | jq -c '{id,platform,cost_basis}')"
 sleep 1
+
+}
+
+
+# ---------------------------------------------------------------- the runner
+# The scenarios in file order. E2E_WORKERS=1 (the default until the parallel
+# runs have proven themselves) runs them all in one sandbox, in this order,
+# with the output every reader of this file has always seen. E2E_WORKERS=4
+# runs the four static lists below side by side, one sandbox each, and prints
+# the four outputs in list order -- never interleaved, which is unreadable
+# the day something fails.
+#
+# THE LISTS ARE CONTIGUOUS RANGES OF THE FILE ORDER, on purpose. Four
+# scenarios depend on an earlier one's sandbox state (3 resumes 2's run, 15
+# resumes 14's and reads 12's `mi`, 31 resumes 30's), and a contiguous range
+# preserves every such order without anyone having to find the rest. They
+# were balanced on measured durations (2026-09-13: 312 s in all, the two
+# security analyses 37 s each, most others 4-5 s): 79 / 82 / 72 / 78 s. A new
+# scenario goes at the END of the file and into the LAST list, or, if it is
+# heavy, wherever it keeps the lists within a few seconds of each other --
+# and the count assertion below fails if it is forgotten from every list.
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42"
+E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
+E2E_LIST_2="20 21 22 23 24 25 26"
+E2E_LIST_3="27 28 29 30 31 32 33 33b 34 35 35b 36 37"
+E2E_LIST_4="38 39 40 41 41b 41c 42"
+
+# What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
+# price table, and the two catalogs resolved from the stand-ins. These used to
+# be done in passing by scenario 12 (openai) and scenario 28 (opencode), and
+# every later scenario leaned on that without saying so -- which held only
+# while all of them ran in one sandbox in file order, and broke the moment a
+# worker started at 20 or 38. Done here, per sandbox, and still done again by
+# 12 and 28 where they always were: both are idempotent, and 28 in
+# particular deletes and reseeds platforms.json around its own resolve.
+e2e_catalogs() {
+  cp "$REPO/config/pricing.example.json" "$ROOT/config/pricing.json"
+  "$AL" resolve-models openai >/dev/null 2>&1
+  "$AL" resolve-models opencode >/dev/null 2>&1
+}
+
+e2e_run_list() { # e2e_run_list <root> <ids...> -> runs them in order in that sandbox
+  local root="$1"; shift
+  e2e_sandbox "$root"
+  e2e_catalogs
+  local sid
+  for sid in "$@"; do "scenario_$sid"; done
+}
+
+E2E_WORKERS="${E2E_WORKERS:-1}"
+case "$E2E_WORKERS" in 1|4) ;; *) echo "E2E_WORKERS must be 1 or 4 (got $E2E_WORKERS)" >&2; exit 2 ;; esac
+
+# every scenario is in exactly one list -- a scenario added to the file and
+# forgotten from the lists would silently never run
+_listed="$(printf "%s\n" $E2E_LIST_1 $E2E_LIST_2 $E2E_LIST_3 $E2E_LIST_4 | sort)"
+_all="$(printf "%s\n" $E2E_ALL | sort)"
+if [ "$_listed" != "$_all" ]; then
+  echo "the worker lists and the scenario set disagree:" >&2
+  diff <(printf "%s\n" "$_all") <(printf "%s\n" "$_listed") >&2 || true
+  exit 2
+fi
+
+if [ "$E2E_WORKERS" = 1 ]; then
+  trap 'rm -rf "$E2E/sandbox"' EXIT
+  e2e_run_list "$E2E/sandbox" $E2E_ALL
+else
+  trap 'rm -rf "$E2E"/sandbox-[1-4] "$E2E"/e2e-out-[1-4] "$E2E"/e2e-rc-[1-4]' EXIT
+  _pids=""
+  for _w in 1 2 3 4; do
+    eval "_list=\$E2E_LIST_$_w"
+    # a subshell: pass/fail are its own and come back through a file, because
+    # a child cannot hand a variable to its parent
+    ( e2e_run_list "$E2E/sandbox-$_w" $_list > "$E2E/e2e-out-$_w" 2>&1
+      printf "%s %s\n" "$pass" "$fail" > "$E2E/e2e-rc-$_w" ) &
+    _pids="$_pids $!"
+  done
+  for _p in $_pids; do wait "$_p"; done
+  pass=0; fail=0
+  for _w in 1 2 3 4; do
+    cat "$E2E/e2e-out-$_w"
+    read -r _p _f < "$E2E/e2e-rc-$_w"
+    pass=$((pass + _p)); fail=$((fail + _f))
+  done
+fi
 
 echo
 printf '\n  %s passed, %s failed\n' "$pass" "$fail"

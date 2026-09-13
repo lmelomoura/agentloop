@@ -737,9 +737,25 @@ fleet that stays stuck does not notify every minute until you turn it off.
 Two suites, both offline and free:
 
 ```bash
-agentloop selftest        # the engine (bash)
+agentloop selftest        # the engine (bash) — runs test/e2e.test.sh inside it
 python3 -m pytest tests/    # the control server (python)
 ```
+
+`test/e2e.test.sh` is **not run on its own**: `selftest` runs it, and counts
+its checks in its own total. Running it a second time beside `selftest` costs
+about five minutes for nothing and the two collide on `test/sandbox`.
+
+The e2e's 47 scenarios can run four at a time, one sandbox each:
+
+```bash
+E2E_WORKERS=4 bash test/e2e.test.sh    # ~85 s instead of ~5 min, same 181 checks
+E2E_WORKERS=1 bash test/e2e.test.sh    # the file order, in one sandbox: bisect with this
+```
+
+The four worker lists are contiguous ranges of the file order (a few
+scenarios resume an earlier one's run, and a range keeps that), balanced on
+measured durations. A new scenario goes at the end of the file and into the
+last list; the script refuses to start if a scenario is in no list.
 
 `selftest` exercises the logic that can end a run early, lose money or corrupt
 state: integer parsing from command output, the assertion that decides an

@@ -47,6 +47,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The e2e suite runs four scenarios at a time, one sandbox each:
+  `E2E_WORKERS=4 bash test/e2e.test.sh`.** Measured, it is 65% of the
+  selftest — 312 s for 47 scenarios, the two security analyses 37 s each —
+  and the scenarios were independent in their data all along, coupled only
+  by one sandbox, a `lastrun` that meant "the last line of the journal", and
+  a handful of helpers and catalog resolves that lived in the middle of the
+  file and so only existed after scenario 12 or 28 had run. Each scenario is
+  now a function, the sandbox is built per worker, the catalogs are a stated
+  prerequisite of every sandbox, and four contiguous ranges of the file order
+  (which keep every resume-after-the-previous-one dependency) are balanced on
+  the measured durations. Same 181 checks either way; `E2E_WORKERS=1` is the
+  file order in one sandbox, for bisecting. `selftest` embeds the e2e, so it
+  gets the same cut without anyone running the e2e twice.
+
 - **An open finding now says where it was fixed on another branch, and
   whether that fix is already in this one.** A finding found on `develop`
   and fixed on `main` stayed open on `develop` until `develop` was analysed
