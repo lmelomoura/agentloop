@@ -89,13 +89,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     onto it rewrites a model, an effort or a permission mode the platform
     does not know to its defaults and says so, and `set-field model`
     validates the value against the OpenCode catalog. The derived security
-    job accepts `opencode` too (reachable today only by hand-editing
-    `projects.json`: `project-set` itself keeps refusing it as a project's
-    own platform, unchanged in this delivery) and now refuses a model the
-    catalog marks as making no tool calls, falling back the way an
-    unavailable catalog already did. `config/platforms.json`'s seed treats
-    OpenCode exactly as it treats the other two, rather than always seeding
-    it disabled.
+    job accepts `opencode` too (previously reachable only by hand-editing
+    `projects.json`, since `project-set` refused it as a project's own
+    platform) and now refuses a model the catalog marks as making no tool
+    calls, falling back the way an unavailable catalog already did.
+    `config/platforms.json`'s seed treats OpenCode exactly as it treats the
+    other two, rather than always seeding it disabled; `project-set` takes
+    `platform: opencode` on a project and on its security block.
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of

@@ -5205,6 +5205,14 @@ JSON
     && ok "project-set refuses an unknown platform, and writes nothing" \
     || bad "project-set gemini: rc=$rc out=$out"
 
+  # opencode is still disabled in this fixture's platforms.json at this point
+  # (turned on below, for the "configuration -- opencode" cases) -- project-set
+  # is the only door a project's platform is set through, so it has to gate
+  # opencode's usability exactly like it gates openai's.
+  out="$(printf '{"name":"pj-oc-off","cwd":"/tmp","platform":"opencode"}' | cfg_al project-set 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && case "$out" in *"is not enabled in Settings"*) ok "project-set refuses platform opencode while it is disabled in Settings" ;; *) bad "refusal text: $out" ;; esac
+  [ "$rc" -eq 0 ] && bad "project-set accepted platform opencode while disabled in Settings"
+
   # A project this corrupt can now only exist by a hand-edit (project-set
   # itself refuses it, just above) -- standing in for a projects.json older
   # than that guard, or edited by hand. A job that inherits from it must not
@@ -5270,6 +5278,16 @@ JSON
   printf '{"id":"oc-new","platform":"opencode","prompt":"x","interval_seconds":60}' | cfg_al create >/dev/null 2>&1; want "create with platform opencode" 0 $?
   [ "$(cfg_job oc-new '.model, .permission_mode' | tr '\n' '|')" = "pdm_ai/glm-5.3-flash|full-access|" ] \
     && ok "a created opencode job takes the platform's defaults" || bad "created: $(cfg_job oc-new '{model,permission_mode}')"
+  # project-set is the door cmd_set_field and cmd_create above do not open --
+  # a project's OWN platform, and its security block's, on opencode now that
+  # Settings has it usable.
+  out="$(printf '{"name":"pj-oc","cwd":"/tmp","platform":"opencode"}' | cfg_al project-set 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$("$JQ" -r --arg n "pj-oc" '.projects[] | select(.name==$n) | .platform' "$tmp/cfg/config/projects.json")" = "opencode" ] \
+    && ok "project-set accepts platform opencode on a project once Settings has it usable" \
+    || bad "project-set pj-oc: rc=$rc out=$out"
+  out="$(printf '{"name":"pj-oc2","cwd":"/tmp","security":{"enabled":true,"platform":"opencode","model":"pdm_ai/glm-5.3-flash"}}' | cfg_al project-set 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "project-set accepts platform opencode on a security block, with an enabled catalog model" \
+    || bad "project-set pj-oc2: rc=$rc out=$out"
 
   echo "upgrade path — a platforms.json without the opencode key, the file every install has today"
   mkdir -p "$tmp/up/config" "$tmp/up/data"
@@ -12632,11 +12650,11 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
   # projects.json can still produce.
   plat="$(echo "$partial" | "$JQ" -r '.platform // ""')"
   case "$plat" in
-    ''|null|anthropic|openai) : ;;
-    *) die "project-set: platform must be anthropic or openai (or empty, to inherit nothing)" ;;
+    ''|null|anthropic|openai|opencode) : ;;
+    *) die "project-set: platform must be anthropic, openai or opencode (or empty, to inherit nothing)" ;;
   esac
   case "$plat" in
-    anthropic|openai) platform_usable "$plat" || die "project-set: $plat is not enabled in Settings — enable it there, or: agentloop platform enable $plat" ;;
+    anthropic|openai|opencode) platform_usable "$plat" || die "project-set: $plat is not enabled in Settings — enable it there, or: agentloop platform enable $plat" ;;
   esac
   # The security block's own platform and model, under the same rules. The
   # platform its model is judged against: the block's, else the project's as
@@ -12645,8 +12663,8 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
   sp="$(echo "$partial" | "$JQ" -r '((.security | objects) // {}).platform // ""')"
   sm="$(echo "$partial" | "$JQ" -r '((.security | objects) // {}).model // ""')"
   case "$sp" in
-    ''|null|anthropic|openai) : ;;
-    *) die "project-set: security.platform must be anthropic or openai (or empty, to inherit the project's)" ;;
+    ''|null|anthropic|openai|opencode) : ;;
+    *) die "project-set: security.platform must be anthropic, openai or opencode (or empty, to inherit the project's)" ;;
   esac
   if [ -n "$sp" ] && [ "$sp" != "null" ]; then
     platform_usable "$sp" || die "project-set: security.platform $sp is not enabled in Settings — enable it there, or: agentloop platform enable $sp"

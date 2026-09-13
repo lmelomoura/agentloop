@@ -63,12 +63,14 @@ DATA_DIR = Path(_env("DATA", BASE_DIR / "data"))
 JOBS_FILE = CONFIG_DIR / "jobs.json"
 PROJECTS_FILE = CONFIG_DIR / "projects.json"
 PLATFORMS_FILE = CONFIG_DIR / "platforms.json"
-# The registry the page draws: the two platforms that run, and the one that is
-# listed and detected but not launched yet. Mirrors PLATFORMS/PLATFORMS_PLANNED
-# in the engine; tests/test_platforms_api.py pins the two together through
+# The registry the page draws: the platforms that run, and (via
+# PLATFORMS_PLANNED) any that are listed and detected but not launched yet --
+# none today; the tuple stays for the next platform that is planned but not
+# shipped. Mirrors PLATFORMS/PLATFORMS_PLANNED in the engine;
+# tests/test_platforms_api.py pins the two together through
 # `agentloop platforms`.
 PLATFORM_REGISTRY = ("anthropic", "openai", "opencode")
-PLATFORMS_PLANNED = ("opencode",)
+PLATFORMS_PLANNED = ()
 PLATFORM_BIN_ENV = {"anthropic": "CLAUDE_BIN", "openai": "CODEX_BIN", "opencode": "OPENCODE_BIN"}
 STATE_FILE = DATA_DIR / "state.json"
 RUNS_FILE = DATA_DIR / "runs.ndjson"
@@ -2839,7 +2841,8 @@ def list_models():
     openai = _openai_platform()
     openai.update(platform_entry("openai", cfg, jobs, projects, resolved, catalog_slugs))
     openai["default_model"] = (openai["models_enabled"] or [""])[0]
-    opencode = {"available": False, "reason": "runs on OpenCode arrive with the OpenCode engine",
+    opencode = {"available": False,
+                "reason": "opencode not installed: install it, configure a provider, then agentloop resolve-models opencode",
                 "models": [], "efforts": [], "permissions": [], "default_model": "", "catalog_at": 0}
     opencode.update(platform_entry("opencode", cfg, jobs, projects, resolved, catalog_slugs))
     platforms = {"anthropic": anthropic, "openai": openai, "opencode": opencode}
