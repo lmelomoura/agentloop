@@ -326,23 +326,54 @@ function secFindHeader(fs, data){
   // document exists to be handed to an agent, which is why it names the
   // branch of every finding and the commit each branch was read at.
   //
+  // ONE BUTTON, A MENU BEHIND IT -- the same <details>/<summary>/.menu-pop
+  // kebab the Reports tab's own row draws for JSON/HTML/SBOM (see
+  // project-screen.js's secPjRunRow for the position:fixed and closeMenus()
+  // reasoning, identical here). Two buttons side by side made the format the
+  // loudest thing in a header whose job is filters; the format is a detail of
+  // the download, so it lives one click in, where this page already puts one.
+  //
   // `data.total` is what the table is showing right now, filters and severity
   // floor and all; it travels so the document's header can explain itself to
   // a reader who filtered to Critical and got everything ("The screen was
   // showing 3 of these"). The download itself is never filtered -- the line
   // under the numbers on this very screen already promises that.
   const shown = Number.isFinite(data && data.total) ? data.total : null;
-  ["md", "json"].forEach((fmt) => {
-    const b = secEl("button", "btn ghost");
-    b.type = "button";
-    if(fmt === "md") b.appendChild(secIcon("download"));
-    b.appendChild(document.createTextNode(fmt === "md" ? "Export" : "JSON"));
-    b.title = fmt === "md"
-      ? "Download every recorded finding in this project, all branches, as Markdown"
-      : "The same document as JSON";
-    b.onclick = () => secDownloadFindings(fs.project, fmt, shown, b);
-    actions.appendChild(b);
+  const exportKebab = document.createElement("details");
+  exportKebab.className = "secidx-kebab";
+  const exportSummary = document.createElement("summary");
+  exportSummary.className = "btn ghost";
+  exportSummary.title = "Download every recorded finding in this project, all branches";
+  exportSummary.appendChild(secIcon("download"));
+  exportSummary.appendChild(document.createTextNode("Export"));
+  exportSummary.onclick = (e) => { e.stopPropagation(); closeMenus(); };
+  exportKebab.appendChild(exportSummary);
+  const exportPop = secEl("div", "menu-pop");
+  exportPop.setAttribute("role", "menu");
+  [["md", "Markdown"], ["json", "JSON"]].forEach(([fmt, label]) => {
+    const item = document.createElement("button");
+    item.setAttribute("role", "menuitem");
+    item.appendChild(secIcon("file"));
+    item.appendChild(document.createTextNode(label));
+    item.onclick = (e) => {
+      e.stopPropagation();
+      exportKebab.open = false;
+      secDownloadFindings(fs.project, fmt, shown, item);
+    };
+    exportPop.appendChild(item);
   });
+  exportKebab.appendChild(exportPop);
+  exportKebab.ontoggle = () => {
+    exportPop.hidden = !exportKebab.open;
+    if(!exportKebab.open) return;
+    const r = exportSummary.getBoundingClientRect();
+    exportPop.style.position = "fixed";
+    exportPop.style.top = (r.bottom + 6) + "px";
+    exportPop.style.right = (window.innerWidth - r.right) + "px";
+    exportPop.style.left = "auto";
+    exportPop.style.bottom = "auto";
+  };
+  actions.appendChild(exportKebab);
   actions.appendChild(savedWrap);
   head.appendChild(actions);
   wrap.appendChild(head);

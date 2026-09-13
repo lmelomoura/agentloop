@@ -32,8 +32,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   seeing it clean call for opposite actions. Resolved findings come last,
   under a heading that says no action is needed. Markdown or JSON, from
   `agentloop security export-findings --project X --format md|json` or the
-  button; filters and the severity floor are not applied, and the document's
-  header says so beside the count the screen was showing.
+  button — the format is chosen from the same kebab menu the Reports tab
+  already uses; filters and the severity floor are not applied, and the
+  document's header says so beside the count the screen was showing.
 
 - **The OpenCode engine: a job, a project and a project's `security` block
   can run on the `opencode` platform.** The third platform arrives the way

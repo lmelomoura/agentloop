@@ -2196,15 +2196,44 @@
     };
     actions.appendChild(saveBtn);
     const shown = Number.isFinite(data && data.total) ? data.total : null;
-    ["md", "json"].forEach((fmt) => {
-      const b = secEl("button", "btn ghost");
-      b.type = "button";
-      if (fmt === "md") b.appendChild(secIcon("download"));
-      b.appendChild(document.createTextNode(fmt === "md" ? "Export" : "JSON"));
-      b.title = fmt === "md" ? "Download every recorded finding in this project, all branches, as Markdown" : "The same document as JSON";
-      b.onclick = () => secDownloadFindings(fs.project, fmt, shown, b);
-      actions.appendChild(b);
+    const exportKebab = document.createElement("details");
+    exportKebab.className = "secidx-kebab";
+    const exportSummary = document.createElement("summary");
+    exportSummary.className = "btn ghost";
+    exportSummary.title = "Download every recorded finding in this project, all branches";
+    exportSummary.appendChild(secIcon("download"));
+    exportSummary.appendChild(document.createTextNode("Export"));
+    exportSummary.onclick = (e) => {
+      e.stopPropagation();
+      closeMenus();
+    };
+    exportKebab.appendChild(exportSummary);
+    const exportPop = secEl("div", "menu-pop");
+    exportPop.setAttribute("role", "menu");
+    [["md", "Markdown"], ["json", "JSON"]].forEach(([fmt, label]) => {
+      const item = document.createElement("button");
+      item.setAttribute("role", "menuitem");
+      item.appendChild(secIcon("file"));
+      item.appendChild(document.createTextNode(label));
+      item.onclick = (e) => {
+        e.stopPropagation();
+        exportKebab.open = false;
+        secDownloadFindings(fs.project, fmt, shown, item);
+      };
+      exportPop.appendChild(item);
     });
+    exportKebab.appendChild(exportPop);
+    exportKebab.ontoggle = () => {
+      exportPop.hidden = !exportKebab.open;
+      if (!exportKebab.open) return;
+      const r = exportSummary.getBoundingClientRect();
+      exportPop.style.position = "fixed";
+      exportPop.style.top = r.bottom + 6 + "px";
+      exportPop.style.right = window.innerWidth - r.right + "px";
+      exportPop.style.left = "auto";
+      exportPop.style.bottom = "auto";
+    };
+    actions.appendChild(exportKebab);
     actions.appendChild(savedWrap);
     head.appendChild(actions);
     wrap.appendChild(head);
@@ -5262,5 +5291,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: 074b046501cf3b207ab8862188ba6093f1be9382866cd90bb8802315851c9ed7 */
-/* ui-sources: 6c5a4e1ecfa374770e3aa5445a638f8231afc806f90240ea532eada9e41a7335 */
+/* ui-bundle: 1d05f718f01892e651644e30bfbc6784ea5fc1352c0cb9d6be5b7a514ce01364 */
+/* ui-sources: 7310c0d1b176a6631da4dd4bed826771fa9051148abecba4f7866129be3382bc */

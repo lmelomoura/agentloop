@@ -10890,6 +10890,23 @@ def test_the_export_button_calls_the_export_route_and_never_the_reports_tab(srv)
         "of every branch")
 
 
+def test_export_is_one_button_with_the_house_menu_behind_it(srv):
+    """The same <details>/<summary>/.menu-pop kebab the Reports tab's own row
+    draws for JSON/HTML/SBOM. Two buttons side by side made the format the
+    loudest thing in a header whose job is filters; asserted as structure
+    rather than as a count of buttons, because the point is that this page
+    reuses the one menu pattern it already has instead of growing a second."""
+    head = _plainfn(_security_js(srv), "secFindHeader")
+    assert 'exportKebab.className = "secidx-kebab"' in head, head[-1500:]
+    assert '"menu-pop"' in head and 'setAttribute("role", "menu")' in head
+    assert head.count('setAttribute("role", "menuitem")') >= 1
+    # both formats reachable, and only through the menu
+    assert '["md", "Markdown"], ["json", "JSON"]' in head
+    # the same closeMenus()/position:fixed contract every other kebab honours,
+    # or this one stays open behind the next menu the operator opens
+    assert "closeMenus()" in head and 'exportPop.style.position = "fixed"' in head
+
+
 def test_the_export_download_names_the_file_from_the_server_not_from_itself(srv):
     # The project name is free text an operator typed and the server sanitises
     # it into the Content-Disposition. A second copy of that rule here would be
