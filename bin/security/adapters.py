@@ -560,31 +560,40 @@ def _is_shallow(root) -> bool:
 def gitleaks_scan(root, ignore_paths=(), since=None):
     """Every secret gitleaks can find in `root`, tree and history.
 
-    Returns `(findings, notes, history, tree)`. `findings` is None when
-    NEITHER pass produced a report -- the caller's signal that the built-in
-    scanner is on its own for this analysis. When at least one pass answered,
-    the built-in scanner runs BESIDE this one and `cli._scan_secrets` merges
-    the two lists by fingerprint: the built-in's findings are minted under
-    this engine's rule names for the types `taxonomy.RULE_RENAMES` maps, so a
-    credential both saw is one identity, not two entries whose remediations
-    contradict each other. That merge is the caller's; this function reports
-    what the engine saw and nothing about the other scanner.
+    Returns `(findings, notes, history, tree, reached)` -- FIVE values on
+    every path, the early "neither pass ran" return included: the caller
+    unpacks five, and a path that returned four took the secret phase down
+    with `ValueError` on exactly the analyses the built-in fallback is for.
+    `findings` is None when NEITHER pass produced a report -- the caller's
+    signal that the built-in scanner is on its own for this analysis. When
+    at least one pass answered, the built-in scanner runs BESIDE this one and
+    `cli._scan_secrets` merges the two lists by fingerprint: the built-in's
+    findings are minted under this engine's rule names for the types
+    `taxonomy.RULE_RENAMES` maps, so a credential both saw is one identity,
+    not two entries whose remediations contradict each other. That merge is
+    the caller's; this function reports what the engine saw and nothing
+    about the other scanner.
 
     `since` IS THE HISTORY CURSOR, a commit the previous analysis's history
     pass had already read up to (`cli._scan_secrets` keeps it in the ledger,
-    per branch and per scanner). With one, the `git` pass is handed
-    `--log-opts <since>..HEAD` and reads only the commits since; without one
-    it reads the whole history, as it always did. The engine does not say
-    where it got to, so the caller advances the cursor to HEAD only when this
-    pass wrote a report (`history` is `HISTORY_OK`), and carries the history
-    findings of earlier analyses itself -- this function reports what THIS
-    pass saw. Measured on gitleaks 8.30.1: a range that names no commit
-    (`HEAD..HEAD`) exits 0 with `[]`, so an analysis with nothing new costs the
-    engine a walk and no findings. The `git` pass runs on
-    `engines.HISTORY_TIMEOUT`, the history passes' own budget, and the `dir`
-    pass on the engines' `SCAN_TIMEOUT` as before: the history grows with the
-    age of a repository, the tree with its size, and one number for both hit
-    the same ceiling twice in series on the repository that measured it.
+    per branch and per scanner). With one, the `git` pass reads only the
+    commits since; without one it reads the whole history. Either way it
+    reads in ranges of `HISTORY_CHUNK` commits (`_gitleaks_history`), and
+    `reached` IS WHERE IT GOT TO: the last commit a completed range ended at,
+    HEAD when every range completed, None when none did -- or when the
+    history was not read at all. The caller records it as the cursor, so a
+    pass the budget cut keeps what it read and the next analysis continues
+    from there; it carries the history findings of earlier analyses itself,
+    since this function reports what THIS pass saw. An analysis with nothing
+    new -- no commit since the cursor -- is not handed to the engine at all:
+    `_history_chunks` finds no range, the pass is complete without a walk,
+    and `reached` is the cursor it was handed (measured on gitleaks 8.30.1
+    before the ranges: `HEAD..HEAD` exits 0 with `[]`, a walk for nothing).
+    The `git` pass runs on `engines.HISTORY_TIMEOUT`, the history passes'
+    own budget, and the `dir` pass on the engines' `SCAN_TIMEOUT` as before:
+    the history grows with the age of a repository, the tree with its size,
+    and one number for both hit the same ceiling twice in series on the
+    repository that measured it.
 
     `history` IS WHAT THE HISTORY SWEEP ACTUALLY COVERED, one of the three
     `HISTORY_*` states above, and `tree` IS WHETHER THE TREE PASS WROTE A
@@ -715,7 +724,11 @@ def gitleaks_scan(root, ignore_paths=(), since=None):
         # `_scan_secrets` reads a None here as "the engine contributed
         # nothing" and runs the built-in scanner over both halves instead.
         notes += [n for n in dict.fromkeys((history_note, tree_note)) if n]
-        return None, notes, HISTORY_GONE, TREE_GONE
+        # No range completed, so no cursor: the fifth value is None here, not
+        # absent. This return once had four values against the other's five,
+        # and the caller's unpack raised on exactly the analyses the fallback
+        # exists for -- a gitleaks on PATH that answered neither pass.
+        return None, notes, HISTORY_GONE, TREE_GONE, None
 
     findings = []
     if history is None:

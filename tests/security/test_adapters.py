@@ -1055,19 +1055,22 @@ def test_the_real_engine_reports_only_what_lies_past_the_cursor(tmp_path):
     and deletes the file in its second, so the whole history reports it, a
     cursor AT the first commit does not (`--log-opts` is a real `git log`
     range, exclusive of its left end: only the deleting commit is in it), and
-    a cursor at HEAD reads nothing and still counts as a pass that ran."""
+    a cursor at HEAD reads nothing and still counts as a pass that ran -- and
+    every one of the three ends with the cursor at HEAD, the empty pass
+    included, since a pass with nothing to read is a complete one."""
     root = history_repo(tmp_path / "repo")
     first, head = subprocess.run(
         ["git", "rev-list", "--reverse", "HEAD"], cwd=root, check=True,
         capture_output=True, text=True).stdout.split()
-    whole, _notes, history, _tree = adapters.gitleaks_scan(root)
-    assert history == adapters.HISTORY_OK
+    whole, _notes, history, _tree, reached = adapters.gitleaks_scan(root)
+    assert history == adapters.HISTORY_OK and reached == head
     assert [f["occurrences"][0]["file"] for f in whole if f["historical"]] == ["prod.env"]
-    since_first, _notes, history, _tree = adapters.gitleaks_scan(root, since=first)
-    assert history == adapters.HISTORY_OK
+    since_first, _notes, history, _tree, reached = adapters.gitleaks_scan(root, since=first)
+    assert history == adapters.HISTORY_OK and reached == head
     assert [f for f in since_first if f["historical"]] == [], since_first
-    nothing, _notes, history, _tree = adapters.gitleaks_scan(root, since=head)
-    assert history == adapters.HISTORY_OK and [f for f in nothing if f["historical"]] == []
+    nothing, _notes, history, _tree, reached = adapters.gitleaks_scan(root, since=head)
+    assert history == adapters.HISTORY_OK and reached == head
+    assert [f for f in nothing if f["historical"]] == []
 
 
 def test_a_history_finding_carries_its_commit_count_as_a_number():
