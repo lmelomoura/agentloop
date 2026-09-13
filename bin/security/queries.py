@@ -215,6 +215,74 @@ def fixed_elsewhere(conn, project, repo, branch, fingerprints):
     return out
 
 
+def _annotate_fixed_elsewhere(conn, project, rows, repo_paths):
+    """Attach `fixed_elsewhere` to every OPEN row whose fingerprint another
+    branch of the same repository has given up as fixed -- and, when git can
+    be asked, whether that proof is already an ancestor of the row's branch.
+
+    NOTHING HERE CHANGES A ROW'S `state`. Ancestry proves the fix is present,
+    not that the finding is absent: a branch can reintroduce the same pattern
+    in its own commits. So `fixed` keeps meaning what it means (somebody
+    looked again), and this is an annotation beside it, with
+    `in_this_branch` True, False, or absent when git could not say -- never
+    False for "could not say", which would read as "the fix is not here"
+    when nobody looked.
+
+    COST IS O(branches), NOT O(rows). One `fixed_elsewhere` per (repo,
+    branch) the rows come from, one `head_of` per branch a proof sits on,
+    one `contains` per (proof branch, row branch) pair -- all memoised for
+    this call. A project with 300 open findings across 3 branches asks git a
+    handful of times, and a finding count that grew tenfold would not change
+    that.
+    """
+    open_rows = [r for r in rows if is_open(r["state"])]
+    if not open_rows:
+        return
+    from . import branchgit
+
+    # fingerprints open per (repo, branch): the unit fixed_elsewhere answers for
+    by_scope = {}
+    for r in open_rows:
+        by_scope.setdefault((r.get("repo", ""), r["branch"]), set()).add(r["fingerprint"])
+    proofs = {}   # (repo, branch) -> {fingerprint: proof}
+    for (repo, branch), fps in by_scope.items():
+        proofs[(repo, branch)] = fixed_elsewhere(conn, project, repo, branch, fps)
+
+    heads, contained = {}, {}   # memo: (repo, branch) -> sha | None ; (repo, commit, branch) -> bool | None
+
+    def head(repo, branch):
+        key = (repo, branch)
+        if key not in heads:
+            path = repo_paths.get(repo)
+            heads[key] = branchgit.head_of(path, branch) if path else None
+        return heads[key]
+
+    def contains(repo, commit, branch):
+        key = (repo, commit, branch)
+        if key not in contained:
+            path = repo_paths.get(repo)
+            tip = head(repo, branch)
+            contained[key] = (branchgit.contains(path, commit, tip)
+                              if path and tip and commit else None)
+        return contained[key]
+
+    for r in open_rows:
+        repo = r.get("repo", "")
+        proof = proofs.get((repo, r["branch"]), {}).get(r["fingerprint"])
+        if not proof:
+            continue
+        note = {"branch": proof["branch"], "commit": proof["commit"],
+                "analysis_id": proof["analysis_id"], "at": proof["at"]}
+        verdict = contains(repo, proof["commit"], r["branch"])
+        if verdict is None:
+            note["unknown_reason"] = ("no checkout configured for this repository"
+                                      if not repo_paths.get(repo)
+                                      else "git could not answer (missing branch, unknown commit, or too slow)")
+        else:
+            note["in_this_branch"] = verdict
+        r["fixed_elsewhere"] = note
+
+
 def finding_counts_by_analysis(conn, project):
     """How many findings each analysis of `project` recorded, keyed by
     analysis id -- a plain `COUNT(*)`, never `checklist()`'s diff/decision
@@ -948,7 +1016,7 @@ def first_seen_map(conn, project):
 
 
 def finding_rows(conn, project, filters=None, sort="severity",
-                 direction="desc", page=1, per_page=25):
+                 direction="desc", page=1, per_page=25, repo_paths=None):
     """The findings browser: one checklist per branch -- the latest finished
     analysis of each -- unioned. That union is what lets the browser show a
     state at all: it is the state that branch's newest analysis gives the
@@ -1054,6 +1122,9 @@ def finding_rows(conn, project, filters=None, sort="severity",
             row = dict(finding)
             row["branch"] = br
             row["analysis_id"] = a["id"]
+            # The repository the analysis filed this under: what the
+            # fixed-elsewhere annotation keys its git question on.
+            row["repo"] = a.get("repo", "")
             rows.append(row)
 
     first_seen = first_seen_map(conn, project)
@@ -1127,6 +1198,8 @@ def finding_rows(conn, project, filters=None, sort="severity",
         keyf = lambda r: r.get(sort, "")
         reverse = direction == "desc"
     rows.sort(key=keyf, reverse=reverse)
+
+    _annotate_fixed_elsewhere(conn, project, rows, repo_paths or {})
 
     total, unique = len(rows), len({r["fingerprint"] for r in rows})
     start = (page - 1) * per_page
