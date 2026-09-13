@@ -1086,12 +1086,15 @@ sleep 1
 
 
 # ---------------------------------------------------------------- the runner
-# The scenarios in file order. E2E_WORKERS=1 (the default until the parallel
-# runs have proven themselves) runs them all in one sandbox, in this order,
-# with the output every reader of this file has always seen. E2E_WORKERS=4
-# runs the four static lists below side by side, one sandbox each, and prints
-# the four outputs in list order -- never interleaved, which is unreadable
-# the day something fails.
+# The scenarios in file order. E2E_WORKERS=4, the default, runs the four
+# static lists below side by side, one sandbox each, and prints the four
+# outputs in list order -- never interleaved, which is unreadable the day
+# something fails. E2E_WORKERS=1 runs them all in one sandbox, in file order,
+# with the output every reader of this file has always seen: bisect with it.
+# The default moved to 4 only after ten consecutive four-worker runs passed
+# clean (2026-09-13, 84-89 s each, 181/181): a parallel suite that fails one
+# time in ten teaches everybody to press "retry", and from then on protects
+# nothing.
 #
 # THE LISTS ARE CONTIGUOUS RANGES OF THE FILE ORDER, on purpose. Four
 # scenarios depend on an earlier one's sandbox state (3 resumes 2's run, 15
@@ -1130,7 +1133,7 @@ e2e_run_list() { # e2e_run_list <root> <ids...> -> runs them in order in that sa
   for sid in "$@"; do "scenario_$sid"; done
 }
 
-E2E_WORKERS="${E2E_WORKERS:-1}"
+E2E_WORKERS="${E2E_WORKERS:-4}"
 case "$E2E_WORKERS" in 1|4) ;; *) echo "E2E_WORKERS must be 1 or 4 (got $E2E_WORKERS)" >&2; exit 2 ;; esac
 
 # every scenario is in exactly one list -- a scenario added to the file and

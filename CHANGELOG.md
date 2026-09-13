@@ -57,9 +57,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   now a function, the sandbox is built per worker, the catalogs are a stated
   prerequisite of every sandbox, and four contiguous ranges of the file order
   (which keep every resume-after-the-previous-one dependency) are balanced on
-  the measured durations. Same 181 checks either way; `E2E_WORKERS=1` is the
-  file order in one sandbox, for bisecting. `selftest` embeds the e2e, so it
-  gets the same cut without anyone running the e2e twice.
+  the measured durations. Same 181 checks either way; four is the default
+  after ten consecutive clean runs, and `E2E_WORKERS=1` is the file order
+  in one sandbox, for bisecting. `selftest` embeds the e2e, so it drops
+  from ~4m30 to ~3m30 without anyone running the e2e twice; on its own the
+  e2e goes from ~5 min to ~85 s. `test/suites.sh` runs the whole battery
+  from one command and prints the four numbers.
 
 - **An open finding now says where it was fixed on another branch, and
   whether that fix is already in this one.** A finding found on `develop`
