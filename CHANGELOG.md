@@ -20,6 +20,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Every e2e scenario reads its own job's run, not the last line of the
+  journal.** `lastrun` was `tail -1 runs.ndjson`, which is the right run only
+  while every scenario runs alone, in one sandbox, in sequence — a scenario
+  inserted in the middle would have read its neighbour's. It now asks for the
+  job the scenario made (`run_of <job>`), keyed on the record's own id. Same
+  181 checks, same output; and it is what lets the scenarios stop depending
+  on their order.
+
 - **Status: Fixed on the Findings tab shows the fixed findings.** With "Show
   resolved findings" off it showed nothing — the toggle dropped every resolved
   row first, then the status filter ran over what was left, which by
@@ -38,6 +46,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   resize, the way a native select does.
 
 ### Added
+
+- **The e2e suite runs four scenarios at a time, one sandbox each:
+  `E2E_WORKERS=4 bash test/e2e.test.sh`.** Measured, it is 65% of the
+  selftest — 312 s for 47 scenarios, the two security analyses 37 s each —
+  and the scenarios were independent in their data all along, coupled only
+  by one sandbox, a `lastrun` that meant "the last line of the journal", and
+  a handful of helpers and catalog resolves that lived in the middle of the
+  file and so only existed after scenario 12 or 28 had run. Each scenario is
+  now a function, the sandbox is built per worker, the catalogs are a stated
+  prerequisite of every sandbox, and four contiguous ranges of the file order
+  (which keep every resume-after-the-previous-one dependency) are balanced on
+  the measured durations. Same 181 checks either way; four is the default
+  after ten consecutive clean runs, and `E2E_WORKERS=1` is the file order
+  in one sandbox, for bisecting. `selftest` embeds the e2e, so it drops
+  from ~4m30 to ~3m30 without anyone running the e2e twice; on its own the
+  e2e goes from ~5 min to ~85 s. `test/suites.sh` runs the whole battery
+  from one command and prints the four numbers.
 
 - **An open finding now says where it was fixed on another branch, and
   whether that fix is already in this one.** A finding found on `develop`
