@@ -73,12 +73,13 @@ jobs:
   # Seconds, and it fails first when something obvious is wrong.
   checks:
     name: selftest and server suite
-    # macOS, AND THAT IS NOT A PREFERENCE. `cmd_selftest` in bin/agentloop
-    # calls `date -v0H -v0M -v0S` and `date -u -v-"${m}"M` with no fallback
-    # (bin/agentloop:3989 and :4173) — `-v` is BSD date, which GNU date on a
-    # Linux runner does not have. The product's own gate does not run on Linux,
-    # so neither does this job. Running the rest of the suite on a platform the
-    # product cannot selftest on would report on a configuration nobody ships.
+    # macOS, AND THAT IS NOT A PREFERENCE. `cmd_selftest` (test/selftest.sh,
+    # sourced by bin/agentloop when the verb runs) calls `date -v0H -v0M -v0S`
+    # and `date -u -v-"${m}"M` with no fallback — `-v` is BSD date, which GNU
+    # date on a Linux runner does not have. The product's own gate does not
+    # run on Linux, so neither does this job. Running the rest of the suite on
+    # a platform the product cannot selftest on would report on a
+    # configuration nobody ships.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

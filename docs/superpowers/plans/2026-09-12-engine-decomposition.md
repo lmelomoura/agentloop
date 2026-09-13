@@ -30,19 +30,23 @@ de as poder distinguir.
 - **Nunca `git add -A` nem `git add .`** — há ficheiros `.before-*` e
   `.claude-flow/` por rastrear. Adicionar sempre por caminho.
 - **Nenhum ficheiro versionado com um home real** (`/Users/<nome>`).
-- **As quatro suites no fim de cada tarefa**, em primeiro plano, nunca o e2e
-  ao mesmo tempo que o selftest (partilham `test/sandbox`):
+- **As suites no fim de cada tarefa**, em primeiro plano. O e2e **não se
+  corre à parte**: o selftest corre-o lá dentro e conta os seus checks no
+  total (correr os dois ao mesmo tempo colide em `test/sandbox`). A bateria
+  toda é `bash test/suites.sh` (entrega dos testes rápidos, 2026-09-13), ou:
 
   ```bash
   bash bin/agentloop selftest
   python3.13 -m pytest tests --ignore=tests/security -p no:cacheprovider -q
   TRIVY_SKIP_DB_UPDATE=true TRIVY_SKIP_JAVA_DB_UPDATE=true TRIVY_SKIP_CHECK_UPDATE=true python3.13 -m pytest tests/security -p no:cacheprovider -q --deselect tests/security/test_both_configurations.py::test_the_security_suite_is_green_with_the_engines_on
-  bash test/e2e.test.sh
   ```
 
-  **Os números têm de ficar iguais, não maiores:** selftest 730/0, e2e 99/0,
-  pytest 552, security 1038 (nesta máquina). Um número que suba sem uma
-  tarefa ter acrescentado um teste é sinal de que alguma coisa mudou.
+  **Os números têm de ficar iguais, não maiores.** Medidos a 2026-09-13 sobre
+  `main` em `2962690`, antes da Tarefa 1: **selftest 858/0** (com os 181 do
+  e2e lá dentro), **pytest 636**, **security 1109 + 1 deselected**. Os
+  números de 12 de Setembro (730/99/552/1038) datam de antes da entrega
+  OpenCode e das três entregas seguintes. Um número que suba sem uma tarefa
+  ter acrescentado um teste é sinal de que alguma coisa mudou.
 - **Pré-requisito:** o merge da entrega OpenCode. As tarefas 4 e 5 dessa
   entrega mexem no `run_job`. Não começar antes.
 
@@ -79,6 +83,14 @@ de as poder distinguir.
    sai de `bin/agentloop` para `test/selftest.sh`, **verbatim**, com os três
    auxiliares `ok`, `bad` e `want` que vivem lá dentro.
 
+   **Vão também `check_ui_artifact` e `check_ui_artifacts`** (decisão de
+   2026-09-13, ao executar): reportam por `ok`/`bad`, que só existem dentro
+   de `cmd_selftest`, portanto nunca foram chamáveis de mais lado nenhum —
+   são suite, não motor. Ficam antes de `cmd_selftest` no ficheiro novo, na
+   ordem em que estavam, e o teste `tests/test_page_contract.py` que fatiava
+   o motor de `check_ui_artifact() {` a `cmd_selftest()` passa a fatiar
+   `test/selftest.sh` com as mesmas âncoras.
+
 4. `test/selftest.sh` começa com um cabeçalho que diz o que é e porque é
    carregado e não executado (em inglês, como todo o código):
 
@@ -109,7 +121,9 @@ de as poder distinguir.
 6. `diff /tmp/selftest-before.txt <(bash bin/agentloop selftest 2>&1)` —
    **vazio**. A suite tem de dizer exactamente o mesmo, linha a linha.
 7. `git diff --stat`: um ficheiro novo, `bin/agentloop` a perder ~5 958
-   linhas e a ganhar quatro. Nada mais.
+   linhas e a ganhar quatro. Nada mais. (Medido a 2026-09-13: perdeu 6 529 —
+   a suite cresceu com as entregas entre os dois dias, e os dois verificadores
+   de artefactos vão com ela — e ganhou 5: o ramo do `case` em cinco linhas.)
 8. A partir de um symlink, para provar a resolução do caminho real:
 
    ```bash
