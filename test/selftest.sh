@@ -1858,20 +1858,22 @@ EOF
   want "an empty run dir is a no-op, not a write to /.session" 0 $?
   [ ! -f "/.session" ] && ok "and nothing landed at the filesystem root" || bad "wrote /.session"
 
-  echo "run_job() — the session is bound from BOTH call sites, not just the loop"
+  echo "run_launch_and_watch() — the session is bound from BOTH call sites, not just the loop"
   # A structural assertion, deliberately. The two calls look interchangeable to
   # anyone reading them without the timing context, so the realistic way this
   # regresses is somebody deleting the second as a duplicate — and every
   # behavioural test here would still pass, because bind_session itself is
   # fine. What breaks is only which runs reach it: the polling one alone loses
   # every run that dies inside the 30s window, and the post-wait one alone
-  # loses every run killed with -9. Both, or the guarantee is gone.
-  got="$(sed -n '/^run_job()/,/^}/p' "$BIN_DIR/agentloop" | grep -c 'bind_session "\$run_dir"')"
+  # loses every run killed with -9. Both, or the guarantee is gone. Read from
+  # run_launch_and_watch, where the launch and its watch live now: the
+  # polling call is in its watchdog, the post-wait one right after `wait`.
+  got="$(sed -n '/^run_launch_and_watch()/,/^}/p' "$BIN_DIR/agentloop" | grep -c 'bind_session "\$run_dir"')"
   [ "${got:-0}" -ge 2 ] \
     && ok "both bind_session call sites are still there ($got)" \
-    || bad "run_job has $got bind_session call sites, expected 2 — see the plan for why each is load-bearing"
+    || bad "run_launch_and_watch has $got bind_session call sites, expected 2 — see the plan for why each is load-bearing"
 
-  echo "run_job() — the undelivered-work rule runs LAST, and never on a stopped run"
+  echo "run_classify() — the undelivered-work rule runs LAST, and never on a stopped run"
   # A structural assertion, deliberately. run_job is never invoked directly
   # anywhere in this suite (it needs a mocked agent CLI, a real worktree, a
   # budget cap...), and wt_undelivered_work / undelivered_note are both already
@@ -1885,7 +1887,10 @@ EOF
   # STOPPED record with a less informative one. Both are one-line edits that
   # look like harmless cleanup.
   local budget_at undelivered_at guard_line budget_n undelivered_n case_at
-  got="$(sed -n '/^run_job()/,/^}/p' "$BIN_DIR/agentloop")"
+  # The classifier is run_classify now; the indentation the checks below rely
+  # on (two spaces = a bare statement of the function's own body) is the same
+  # there as it was in run_job.
+  got="$(sed -n '/^run_classify()/,/^}/p' "$BIN_DIR/agentloop")"
   # -c (a count), not just -n | head -1: a SECOND "BUDGET LIMITED:" or a
   # duplicated call site would make head -1 silently anchor on whichever
   # comes first, and the ordering compare below would pass or fail on the
@@ -1931,7 +1936,7 @@ EOF
     && ok "undelivered is checked before the status guard, not nested inside it" \
     || bad "the undelivered check (line ${undelivered_at:-?}) is not before the status guard (line ${case_at:-?}) -- it may be gated to success/warning again, leaving error/stopped unchecked"
 
-  echo "run_job() — .ended is decided by declared_ending + undelivered, not by status"
+  echo "run_classify() — .ended is decided by declared_ending + undelivered, not by status"
   # Structural, like the two checks just above: run_job cannot be exercised
   # end-to-end here without a mocked agent CLI, so the only thing that can
   # catch a revert of finding 9.3 is reading the text. The regression this
@@ -1939,24 +1944,78 @@ EOF
   # esac` -- a SMALLER, more innocent-looking diff than what replaced it, and
   # every behavioural test in this file would stay green: nothing here drives
   # run_job far enough to write a real .ended file.
-  ended_body="$(sed -n '/^run_job()/,/^}/p' "$BIN_DIR/agentloop")"
+  ended_body="$(sed -n '/^run_classify()/,/^}/p' "$BIN_DIR/agentloop")"
   got="$(printf '%s\n' "$ended_body" \
           | grep -c '\[ "\$declared_ending" = "true" \] && \[ -z "\${undelivered:-}" \]')"
   [ "${got:-0}" -eq 1 ] \
     && ok "the .ended gate reads declared_ending and undelivered ($got)" \
-    || bad "run_job's .ended gate no longer tests declared_ending+undelivered (matched $got times)"
+    || bad "run_classify's .ended gate no longer tests declared_ending+undelivered (matched $got times)"
   # declared_ending itself has to be computed UNCONDITIONALLY, not only while
   # status is still success (the shape it had before 9.3, when it fed only the
   # UNDECLARED ENDING warning). Gating it on status would make it silently
   # false for every run this classifier calls `warning` -- stray stderr, an
   # empty result, NOTHING TO DO -- which is exactly the case 9.3 exists to
   # stop losing: a warning run that DID say how it ended. Checked by exact
-  # indentation: two spaces means a bare statement in run_job's own body: put
+  # indentation: two spaces means a bare statement in run_classify's own body: put
   # back inside `if [ "$status" = "success" ]`, it would indent four.
   [ "$(printf '%s\n' "$ended_body" | grep -c '^  declared_ending=false$')" -eq 1 ] \
     && ok "declared_ending=false is a bare statement, not nested inside a status guard" \
     || bad "declared_ending's assignment is no longer an unconditional top-level statement"
 
+  echo "run_job's parts — every RJ_* is assigned on its owner's first line, and nothing else goes back"
+  # Structural, like the three above, and it guards the ONE defect taking
+  # run_job apart can introduce. Its three parts (run_refusals,
+  # run_launch_and_watch, run_classify) hand their results back as RJ_*
+  # globals. A global a function reads without having assigned it first
+  # carries whatever an earlier call in the same shell left there -- nothing
+  # loops run_job in one shell today (cmd_tick detaches each run), and the
+  # rule is what keeps that from ever mattering: every RJ_* a function
+  # mentions is assigned on its FIRST line, before any path can return.
+  # And the parts read run_job's locals through dynamic scope, so the other
+  # way to smuggle a result out is to assign one of those locals from
+  # inside -- an interface nobody can see from the call site. Every name a
+  # part assigns is therefore either its own `local` or an RJ_*.
+  local _rj_fn _rj_body _rj_first _rj_v _rj_bad _rj_locals _rj_mine _rj_writes
+  _rj_locals="$(sed -n '/^run_job()/,/^}/p' "$BIN_DIR/agentloop" \
+    | grep -E '^[[:space:]]*local ' | sed -E 's/^[[:space:]]*local (-a )?//' \
+    | tr ' ' '\n' | sed -E 's/=.*//' | grep -E '^[a-z_][a-z0-9_]*$' | sort -u)"
+  for _rj_fn in run_refusals run_launch_and_watch run_classify; do
+    _rj_body="$(sed -n "/^$_rj_fn()/,/^}/p" "$BIN_DIR/agentloop")"
+    [ -n "$_rj_body" ] || { bad "$_rj_fn is not in the engine"; continue; }
+    _rj_first="$(printf '%s\n' "$_rj_body" | sed -n 2p)"
+    _rj_bad=""
+    for _rj_v in $(printf '%s\n' "$_rj_body" | grep -oE 'RJ_[A-Z_]+' | sort -u); do
+      case "$_rj_first" in *"$_rj_v="*) ;; *) _rj_bad="$_rj_bad $_rj_v" ;; esac
+    done
+    [ -z "$_rj_bad" ] \
+      && ok "$_rj_fn assigns every RJ_* it mentions on its first line" \
+      || bad "$_rj_fn mentions$_rj_bad without assigning it on its first line — a value could carry over from an earlier call in the same shell"
+    # The names it declares itself, subshells included (`) & local x=$!`).
+    _rj_mine="$(printf '%s\n' "$_rj_body" | grep -E '^[[:space:]]*(\) & )?local ' \
+      | sed -E 's/^[[:space:]]*(\) & )?local (-a )?//' | tr ' ' '\n' | sed -E 's/=.*//' \
+      | grep -E '^[a-z_][a-z0-9_]*$' | sort -u)"
+    # The names it assigns: at a line's start, or after `; `, `&& `, `|| `,
+    # `then `, `else ` on the same line.
+    _rj_writes="$(printf '%s\n' "$_rj_body" \
+      | grep -oE '(^[[:space:]]*|; |&& |\|\| |then |else )[a-z_][a-z0-9_]*\+?=' \
+      | sed -E 's/^.*[[:space:]]//; s/\+?=$//' | sort -u)"
+    _rj_bad=""
+    for _rj_v in $_rj_writes; do
+      printf '%s\n' "$_rj_locals" | grep -qx "$_rj_v" || continue   # not a run_job local
+      printf '%s\n' "$_rj_mine"   | grep -qx "$_rj_v" && continue   # its own, shadowing
+      _rj_bad="$_rj_bad $_rj_v"
+    done
+    [ -z "$_rj_bad" ] \
+      && ok "$_rj_fn assigns none of run_job's locals behind its back" \
+      || bad "$_rj_fn assigns$_rj_bad — run_job's own local(s), through dynamic scope: an interface no call site shows"
+  done
+  # The three are called, and in the order the run has always gone: refuse,
+  # launch, classify.
+  _rj_body="$(sed -n '/^run_job()/,/^}/p' "$BIN_DIR/agentloop")"
+  [ "$(printf '%s\n' "$_rj_body" | grep -E '^  (run_refusals |run_launch_and_watch |run_classify$)' \
+        | sed -E 's/^ *//; s/ .*//' | tr '\n' ' ')" = "run_refusals run_launch_and_watch run_classify " ] \
+    && ok "run_job calls the three, once each, in that order" \
+    || bad "run_job's calls read: $(printf '%s\n' "$_rj_body" | grep -E '^  (run_refusals |run_launch_and_watch |run_classify$)' | tr '\n' ' ')"
 
   echo "cpu_tree_sum() — a busy tool tree is proof of life, not a stall"
   # A run whose agent is quiet because a test suite is grinding away in a child
@@ -2675,7 +2734,9 @@ EOF
   echo "never pushed" > "$rdErr/one/undelivered-err.txt"
   printf '{"result":"RUN COMPLETE: done, but a tool call was denied along the way"}' \
     > "$tmp/err.logfile.json"
-  errsnippet="$(sed -n '/^  declared_ending=false$/,/^  # Consecutive failures drive the backoff/p' \
+  # The block lives in run_classify now, and ends where its results go back
+  # to run_job -- the comment right after the .ended write is the anchor.
+  errsnippet="$(sed -n '/^  declared_ending=false$/,/^  # What goes back to run_job, and nothing else does/p' \
                   "$BIN_DIR/agentloop")"
   [ -n "$errsnippet" ] || bad "could not extract the .ended classifier block -- its anchors moved"
   (

@@ -129,9 +129,18 @@ vigiar, e classificar o fim.
 Parti-la nas onze seria pior do que deixá-la como está. O bash não devolve
 valores: com quarenta locais vivos, onze funções significam onze contratos
 de variáveis globais, e uma global que uma fase se esquece de reinicializar
-**vaza para a corrida seguinte** — o `tick` corre vários jobs no mesmo
-processo. Trocaríamos uma função grande e legível por onze pequenas e um
-estado partilhado invisível. Isso é regressão disfarçada de arrumação.
+**vaza para a corrida seguinte** se duas corridas partilharem um shell.
+Trocaríamos uma função grande e legível por onze pequenas e um estado
+partilhado invisível. Isso é regressão disfarçada de arrumação.
+
+> **Correcção medida a 2026-09-13, ao executar.** Esta spec dizia aqui que
+> "o `tick` corre vários jobs no mesmo processo", e os próprios comentários
+> do `run_job` dizem o mesmo. É falso: `cmd_tick` lança cada corrida devida
+> num processo à parte (`nohup bash "$SELF" _exec <id>`), e `run`, `resume`
+> e `security analyze` chamam `run_job` uma vez cada. Hoje nenhuma corrida
+> partilha um shell com outra. A regra das globais e o cenário de duas
+> corridas num só shell ficam na mesma — são o que impede que isso alguma
+> vez importe — mas a justificação é essa, não uma fuga que existe hoje.
 
 A regra deste desenho é **interface pequena, não bloco grande**: só sai o que
 comunica com o resto por poucos valores nomeados. Pelo mesmo critério com que
@@ -144,6 +153,20 @@ o motor já usa `PLATFORM_ARGV` e `PF_MODEL_ID`.
 | `run_refusals` | as portas de recusa antes do lançamento (planned, unknown, disabled, sem modelo activado, not ready, as verificações do openai, modelo fora do catálogo) | `id`, `platform`, `model`, `permission`, `interactive` | 0 ou 1; a razão já escrita em `tick.log`, como hoje |
 | `run_launch_and_watch` | o FIFO, o normalizador, o `exec` do CLI, o subshell do watchdog, o `wait`, a nota do normalizador | o argv já montado, o ambiente, `streamfile`, `logfile`, `stall`, `timeout` | `RJ_CHILD_RC`, `RJ_WATCHDOG_NOTE`, `RJ_NORMALIZER_RC` |
 | `run_classify` | tudo depois do `wait`: filtro de stderr, `platform_finish`, o classificador, o tecto de orçamento, trabalho não entregue, o contrato de fim | `id`, `run_dir`, `streamfile`, `status` inicial | `RJ_STATUS`, `RJ_REASON` |
+
+**Como ficou (2026-09-13), onde difere da tabela.** O bloco `opencode`, que
+entrou depois desta spec, estreita o `effort` e constrói o bloco de
+permissões antes de gastar um slot: `run_refusals` recebe também `effort`,
+`allowed` e `disallowed` e publica `RJ_EFFORT` e `RJ_OPENCODE_CONFIG`. As
+outras duas funções **lêem** os locais do `run_job` por âmbito dinâmico
+(dois dos valores são arrays, que o bash 3.2 não passa por nome; vinte
+posicionais seriam pior do que uma lista no cabeçalho), e **escrevem** só
+`RJ_*`: `run_launch_and_watch` publica ainda `RJ_CHILD_PID`, e
+`run_classify` começa no classificador — a leitura do resultado (`cost`,
+`turns`, `session`, `platform_finish`) fica no `run_job` — e publica também
+`RJ_CAUSE` e `RJ_DENIALS`, que o registo e a linha de log precisam. A
+asserção estrutural cobre as duas regras: cada `RJ_*` atribuída na primeira
+linha da dona, e nenhuma função a atribuir um local do `run_job` por trás.
 
 Três funções tiram à volta de **600 das 1 201 linhas** e cada uma tem um
 contrato que cabe numa linha. O que fica em `run_job` é a espinha: resolver,

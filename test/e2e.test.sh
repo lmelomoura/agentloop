@@ -1084,6 +1084,42 @@ sleep 1
 
 }
 
+scenario_43() {
+echo "43. two runs in ONE shell: the second inherits nothing from the first"
+# run_job hands its parts' results back as RJ_* globals (run_refusals,
+# run_launch_and_watch, run_classify). cmd_tick detaches every run into its
+# own process, so no two runs share a shell today -- which is exactly why no
+# other scenario here would notice one carrying over into the next. This
+# drives run_job twice in one shell, the way an in-process loop would: the
+# engine sourced (`--help` prints and returns), the first run left dirty and
+# ends warning with UNDELIVERED on its note, the second clean. An RJ_REASON
+# or RJ_STATUS that carried over would land on the second run's record.
+cat > "$ROOT/config/jobs.json" <<JSON
+{"jobs":[{"id":"j43a","project":"sandbox","enabled":false,"prompt":"do the thing",
+          "interval_seconds":3600,"permission_mode":"bypassPermissions","max_parallel":1},
+         {"id":"j43b","project":"sandbox","enabled":false,"prompt":"do the thing",
+          "interval_seconds":3600,"permission_mode":"bypassPermissions","max_parallel":1}]}
+JSON
+mkdir -p "$ROOT/config/prechecks"
+printf '#!/bin/bash\nexit 0\n' > "$ROOT/config/prechecks/j43a.sh"; chmod +x "$ROOT/config/prechecks/j43a.sh"
+printf '#!/bin/bash\nexit 0\n' > "$ROOT/config/prechecks/j43b.sh"; chmod +x "$ROOT/config/prechecks/j43b.sh"
+# `$0`, not `$1`: the engine finds its siblings (worktree-lib.sh) from $0,
+# and a sourced file sees the shell's own $0 -- so the binary's path goes
+# in as the command name of `bash -c`, not as an argument.
+bash -c '. "$0" --help >/dev/null 2>&1
+         FAKE_MODE=dirty    FAKE_SESSION=sess-43a run_job j43a --force >/dev/null 2>&1
+         FAKE_MODE=complete FAKE_SESSION=sess-43b run_job j43b --force >/dev/null 2>&1' "$AL"
+sleep 2
+[ "$(run_of j43a | jq -r .status)" = "warning" ] && run_of j43a | jq -r .note | grep -q 'UNDELIVERED' \
+  && ok "the first run ends warning, with its undelivered work on the note" || bad "first: $(run_of j43a | jq -c '{status,note}')"
+[ "$(run_of j43b | jq -r .status)" = "success" ] && [ "$(run_of j43b | jq -r .note)" = "" ] && [ "$(run_of j43b | jq -r .cause)" = "" ] \
+  && ok "the second, in the same shell, ends success with an empty note: nothing of the first on it" \
+  || bad "second: $(run_of j43b | jq -c '{status,note,cause}')"
+[ "$(run_of j43b | jq -r .session)" = "sess-43b" ] && ok "and its record is its own (session sess-43b)" \
+  || bad "second run's session: $(run_of j43b | jq -r .session)"
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1105,11 +1141,11 @@ sleep 1
 # scenario goes at the END of the file and into the LAST list, or, if it is
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # and the count assertion below fails if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26"
 E2E_LIST_3="27 28 29 30 31 32 33 33b 34 35 35b 36 37"
-E2E_LIST_4="38 39 40 41 41b 41c 42"
+E2E_LIST_4="38 39 40 41 41b 41c 42 43"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

@@ -32,6 +32,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   counts the same 858 checks. A binary copied away from its checkout says
   what is missing instead of `No such file or directory`.
 
+- **`run_job` is 796 lines, in five readable steps, instead of 1,335 with
+  forty locals alive at once.** Three blocks with a small interface left it,
+  each a function of its own and each moved verbatim: `run_refusals` (the
+  operator's gates, the CLI's readiness, the openai and opencode blocks, the
+  model against Settings — 0 to go on, 1 to refuse, the reason in tick.log
+  as before), `run_launch_and_watch` (the FIFO, the normalizer, the exec of
+  the CLI, the interactive turn loop, the watchdog, the wait) and
+  `run_classify` (the verdict, the stop override, NOTHING TO DO, UNDECLARED
+  ENDING, BUDGET LIMITED, undelivered work, `.ended`). What comes back comes
+  back as `RJ_*` globals, every one assigned on its owner's first line, and
+  the parts assign none of `run_job`'s locals behind its back — the selftest
+  reads the text and holds all three to both rules, and the e2e drives two
+  runs through one shell and checks the second inherits nothing. Nothing a
+  run does changed: the same tick.log lines in the same order, the same
+  record, the same 858 checks green plus the ten new ones (seven structural,
+  three in the e2e). Whoever changes how a run is launched now opens a
+  function of 230 lines whose inputs are listed at the top.
+
 ### Fixed
 
 - **A gitleaks that answers neither pass no longer takes the secret phase
