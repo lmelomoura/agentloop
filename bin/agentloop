@@ -1891,17 +1891,34 @@ platform_models_enabled_line() { # the enabled ids on one line, space-separated,
   platform_models_enabled "$1" | tr '\n' ' ' | sed 's/ *$//'
 }
 
-platform_stderr_filter() { # platform_stderr_filter <platform> <errfile>
+platform_stderr_filter() { # platform_stderr_filter <platform> <errfile> [job-id]
   # The classifier counts stderr bytes, and `codex exec` prints one line on
   # every run whatever happens: "Reading additional input from stdin...".
   # Without this, every OpenAI run would be a warning. Exactly that line,
   # whole, and nothing else: anything more is still stderr and still a warning.
+  #
+  # OpenCode runs with `--print-logs --log-level ERROR`, and the one ERROR it
+  # logs on a healthy run is `message="stream error"`: the provider dropped
+  # the connection mid-answer and the CLI retried (measured 38: two of them
+  # in a 51-minute analysis that went on to `RUN COMPLETE`). Whether the
+  # retry worked is already decided by the stream -- an `error` event, or an
+  # EOF with no result, when it did not -- so the line is never the deciding
+  # fact, and a run that finished is not a warning for it. The count goes to
+  # tick.log, so the outage is still on record; any other ERROR line stays.
   case "$1" in
     openai)
       [ -s "$2" ] || return 0
       local tmp; tmp="$(mktemp "$2.XXXXXX" 2>/dev/null)" || return 0
       grep -vxF 'Reading additional input from stdin...' "$2" > "$tmp" 2>/dev/null
       mv -f "$tmp" "$2" 2>/dev/null || rm -f "$tmp" ;;
+    opencode)
+      [ -s "$2" ] || return 0
+      local tmp n; tmp="$(mktemp "$2.XXXXXX" 2>/dev/null)" || return 0
+      n="$(grep -cE '^timestamp=.* level=ERROR .* message="stream error"' "$2" 2>/dev/null | tr -d ' ')"
+      case "$n" in ''|0) rm -f "$tmp"; return 0 ;; esac
+      grep -vE '^timestamp=.* level=ERROR .* message="stream error"' "$2" > "$tmp" 2>/dev/null
+      mv -f "$tmp" "$2" 2>/dev/null || rm -f "$tmp"
+      [ -z "${3:-}" ] || log_tick "$3: opencode logged $n stream error(s) (the provider dropped the connection; the CLI retried and the run went on) — not counted against the run" ;;
   esac
   return 0
 }
@@ -5214,6 +5231,18 @@ JSON
   printf 'Reading additional input from stdin...\n' > "$tmp/e4.err"
   platform_stderr_filter anthropic "$tmp/e4.err"
   [ -s "$tmp/e4.err" ] && ok "anthropic stderr is never touched" || bad "anthropic stderr was filtered"
+  local _se='timestamp=2026-09-13T18:05:46.820Z level=ERROR run=5284a776 message="stream error" providerID=pdm_ai modelID=GLM-5.3-NVFP4 session.id=ses_x small=false agent=build mode=primary error.error="AI_APICallError: Cannot connect to API: The socket connection was closed unexpectedly"'
+  printf '%s\n%s\n' "$_se" "$_se" > "$tmp/e5.err"
+  : > "$tmp/e5.tick"
+  TICK_LOG="$tmp/e5.tick" platform_stderr_filter opencode "$tmp/e5.err" job-x
+  [ ! -s "$tmp/e5.err" ] && ok "opencode: a stderr of retried stream errors only is emptied (measured 38)" || bad "left: $(cat "$tmp/e5.err")"
+  grep -q 'job-x: opencode logged 2 stream error(s)' "$tmp/e5.tick" && ok "and tick.log carries the count" || bad "tick: $(cat "$tmp/e5.tick")"
+  printf '%s\ntimestamp=2026-09-13T18:05:47.000Z level=ERROR run=5284a776 message="tool failed" tool=bash\n' "$_se" > "$tmp/e6.err"
+  TICK_LOG="$tmp/e5.tick" platform_stderr_filter opencode "$tmp/e6.err"
+  [ "$(cat "$tmp/e6.err")" = 'timestamp=2026-09-13T18:05:47.000Z level=ERROR run=5284a776 message="tool failed" tool=bash' ] && ok "opencode: any other ERROR line stays" || bad "left: $(cat "$tmp/e6.err")"
+  printf 'level=INFO message="stream error"\n' > "$tmp/e7.err"
+  platform_stderr_filter opencode "$tmp/e7.err"
+  [ -s "$tmp/e7.err" ] && ok "opencode: only the CLI's own ERROR log line shape is removed" || bad "a non-matching line was removed"
 
   echo "platform_argv_openai() — the measured launch line, for a fresh run and a resume"
   platform_argv_openai "" /tmp/w gpt-a high workspace-write "PROMPT"
@@ -11626,7 +11655,7 @@ If the work turns out to be already finished, or it can no longer be done at all
     -1) wdreason="${wdreason:+$wdreason · }normalizer killed: the CLI's stdout stayed open 10s after it exited" ;;
     *)  wdreason="${wdreason:+$wdreason · }normalizer exited $nrc" ;;
   esac
-  platform_stderr_filter "$platform" "$logfile.err"
+  platform_stderr_filter "$platform" "$logfile.err" "$id"
 
   # Extract the final result event; synthesize an error object if the stream
   # ended without one (crash, timeout kill) so classification still works.
