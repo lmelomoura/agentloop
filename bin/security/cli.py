@@ -2358,11 +2358,18 @@ def cmd_export_findings(args):
         sys.exit(f"no analysis has ever run for project {args.project!r}"
                  + (f" — known: {', '.join(known)}" if known else ""))
 
+    repo_paths = {}
+    for item in (args.repo_path or []):
+        name, sep, path = item.partition("=")
+        if not sep or not name or not path:
+            sys.exit(f"export-findings: --repo-path expects name=path, got {item!r}")
+        repo_paths[name] = path
     rows, page = [], 1
     while True:
         payload = queries.finding_rows(conn, args.project,
                                        filters={"show_resolved": True},
-                                       page=page, per_page=queries.MAX_PER_PAGE)
+                                       page=page, per_page=queries.MAX_PER_PAGE,
+                                       repo_paths=repo_paths)
         rows.extend(payload["rows"])
         if len(rows) >= payload["total"] or not payload["rows"]:
             break
@@ -3270,6 +3277,7 @@ def main(argv=None):
     # know the page's filters, and a header without the comparison is still
     # true, only less helpful.
     ef.add_argument("--shown", type=int, default=None)
+    ef.add_argument("--repo-path", action="append", default=None, dest="repo_path")
 
     de = sub.add_parser("decide", parents=[dbflag]); de.set_defaults(fn=cmd_decide)
     for flag in ("project", "fingerprint", "reason"):

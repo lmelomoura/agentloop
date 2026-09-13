@@ -328,6 +328,20 @@ def _consolidated_meta_lines(project, groups, meta):
     if counts:
         out.append("- **Open by severity:** "
                    + " · ".join(f"{sev} {counts[sev]}" for sev in SEVERITIES if counts.get(sev)))
+    # WHAT IS ALREADY DONE SOMEWHERE ELSE, up front. An agent handed 79
+    # findings of which 20 have a fix on another branch should know before it
+    # starts which 20 -- and the header is where it looks first.
+    merged = sum(1 for g in groups for f in g["open"]
+                 if (f.get("fixed_elsewhere") or {}).get("in_this_branch") is True)
+    pending = sum(1 for g in groups for f in g["open"]
+                  if (f.get("fixed_elsewhere") or {}).get("in_this_branch") is False)
+    if merged or pending:
+        bits = []
+        if merged:
+            bits.append(f"{merged} whose fix is already in the branch (re-analyse before touching them)")
+        if pending:
+            bits.append(f"{pending} fixed on another branch but not yet in this one")
+        out.append("- **Fixed elsewhere:** " + "; ".join(bits))
     shown = meta.get("shown_on_screen")
     if shown is not None and shown != open_n:
         out.append(f"- **The screen was showing {shown} of these.** Filters and the"
@@ -379,6 +393,7 @@ def _consolidated_finding_md(f, branch):
                    + (f" · OWASP {f['owasp']}" if f.get("owasp") else ""))
     if f.get("scope"):
         out.append(f"- **Scope:** {_scope_label(f['scope'])}")
+    out += _fixed_elsewhere_md(f)
     # WHERE, before WHY. An agent opens files; a location it can pass straight
     # to an editor is worth more than a paragraph it has to parse for one.
     if f.get("occurrences"):
@@ -391,6 +406,25 @@ def _consolidated_finding_md(f, branch):
         out += ["", f"**Remediation:** {f['remediation']}"]
     out.append("")
     return out
+
+
+def _fixed_elsewhere_md(f):
+    """One line, or none. Three sentences for three facts, and the one that
+    matters most -- "the fix is already here, re-analyse" -- is the one an
+    agent must read before it starts editing."""
+    fe = f.get("fixed_elsewhere")
+    if not fe:
+        return []
+    where = f"`{fe.get('branch', '?')}`" + (f" at `{fe['commit'][:12]}`" if fe.get("commit") else "")
+    if fe.get("in_this_branch") is True:
+        return [f"- **Fixed elsewhere:** fixed on {where}, and that commit is ALREADY in this"
+                " branch — very likely resolved here too; re-analyse this branch before"
+                " doing anything."]
+    if fe.get("in_this_branch") is False:
+        return [f"- **Fixed elsewhere:** fixed on {where}, not yet in this branch — see"
+                " that fix before writing a new one."]
+    return [f"- **Fixed elsewhere:** fixed on {where}; whether it is in this branch could"
+            f" not be determined ({fe.get('unknown_reason', 'unknown')})."]
 
 
 def consolidated_as_markdown(project, groups, meta):
@@ -459,7 +493,8 @@ def _consolidated_finding_json(f, branch):
             "rationale": f.get("rationale", ""),
             "remediation": f.get("remediation", ""),
             "first_seen": f.get("first_seen", 0),
-            "analysis_id": f.get("analysis_id")}
+            "analysis_id": f.get("analysis_id"),
+            "fixed_elsewhere": f.get("fixed_elsewhere")}
 
 
 def consolidated_as_html(project, groups, meta):
@@ -498,12 +533,15 @@ def consolidated_as_html(project, groups, meta):
                        + (f" · OWASP {e(f['owasp'])}" if f.get("owasp") else "") + "</p>"
                        if f.get("cwe") else "")
                 scope = (f"<p>Scope: {e(_scope_label(f['scope']))}</p>" if f.get("scope") else "")
+                fe_lines = _fixed_elsewhere_md(f)
+                fe = (f'<p class="note">{e(fe_lines[0].lstrip("- ").replace("**", ""))}</p>'
+                      if fe_lines else "")
                 parts.append(
                     f'<div class="f {e(f["severity"])}"><h4>[{e(f["severity"])}] {e(f["title"])}</h4>'
                     f"<p>Fingerprint <code>{e(f['fingerprint'])}</code> · Branch"
                     f" <code>{e(g['branch'])}</code> · {e(f['state'])}</p>"
                     f"<p>Rule <code>{e(f['rule'])}</code> ({e(f['category'])})</p>"
-                    f"{cls}{scope}"
+                    f"{cls}{scope}{fe}"
                     + (f"<ul>{locs}</ul>" if locs else "")
                     + (f"<p>{e(f['rationale'])}</p>" if f.get("rationale") else "")
                     + (f"<p><strong>Remediation:</strong> {e(f['remediation'])}</p>"

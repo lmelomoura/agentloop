@@ -3130,6 +3130,11 @@ def security_findings_export(project, fmt, shown=None):
     args = ["security", "export-findings", "--project", project, "--format", fmt]
     if shown is not None:
         args += ["--shown", str(int(shown))]
+    # The same repository paths the page verb gets, so the document's
+    # "fixed elsewhere" lines can say whether a fix is already in the branch
+    # instead of "could not be determined" on every one of them.
+    for rname, rpath in sorted(_project_meta(project).get("repo_paths", {}).items()):
+        args += ["--repo-path", f"{rname}={rpath}"]
     ok, out = al(args)
     if not ok:
         if "no analysis has ever run" in out:
