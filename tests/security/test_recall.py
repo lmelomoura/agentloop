@@ -266,14 +266,19 @@ def _engine_reading(rule, path, line=1, historical=False):
 def _pretend_gitleaks_saw(monkeypatch, findings, notes=(), history=None, tree=None):
     """The engine path staged without the binary: `engine_path` says gitleaks
     is here and `gitleaks_scan` answers with exactly `findings`. What the
-    BUILT-IN sees is not staged -- it runs for real over the tree."""
+    BUILT-IN sees is not staged -- it runs for real over the tree. The
+    stand-in answers with the real function's five values: the cursor is
+    HEAD when the history pass completed, as a real one's is, and None
+    when there was no such pass."""
     history = adapters.HISTORY_OK if history is None else history
     tree = adapters.TREE_OK if tree is None else tree
     monkeypatch.setattr(adapters, "engine_path",
                         lambda name: "/usr/bin/gitleaks" if name == "gitleaks" else None)
-    monkeypatch.setattr(adapters, "gitleaks_scan",
-                        lambda root, ignore_paths=(), since=None: (list(findings), list(notes),
-                                                       history, tree))
+
+    def scan(root, ignore_paths=(), since=None):
+        reached = secrets.head_sha(root) if history == adapters.HISTORY_OK else None
+        return list(findings), list(notes), history, tree, reached
+    monkeypatch.setattr(adapters, "gitleaks_scan", scan)
 
 
 def _cli_json(db, *args):
@@ -489,16 +494,18 @@ def test_the_secret_row_is_ran_only_when_both_engine_passes_wrote_a_report(
 def test_the_tree_outcome_is_a_returned_value_and_not_a_sentence(tmp_path, monkeypatch):
     """`gitleaks_scan` exposes the tree pass the way it exposes the history
     state -- as the fourth value -- so `_scan_secrets` never has to look for a
-    string in a note to know whether the working tree was scanned."""
+    string in a note to know whether the working tree was scanned. Five
+    values on every path: the "neither pass ran" return is the one that
+    once came back with four, and `_scan_secrets` unpacks five."""
     root = _git_repo(tmp_path / "repo", {"README.md": "clean\n"})
     _gitleaks_passes(monkeypatch, ([], ""), (None, "gitleaks timed out."))
-    findings, _notes, history, tree = adapters.gitleaks_scan(root)
+    findings, _notes, history, tree, _reached = adapters.gitleaks_scan(root)
     assert findings is not None and history == adapters.HISTORY_OK
     assert tree == adapters.TREE_GONE
     _gitleaks_passes(monkeypatch, ([], ""), ([], ""))
     assert adapters.gitleaks_scan(root)[3] == adapters.TREE_OK
     _gitleaks_passes(monkeypatch, (None, "x"), (None, "x"))
-    assert adapters.gitleaks_scan(root)[2:] == (adapters.HISTORY_GONE, adapters.TREE_GONE)
+    assert adapters.gitleaks_scan(root)[2:] == (adapters.HISTORY_GONE, adapters.TREE_GONE, None)
 
 
 # The third `ran` condition, pinned: the built-in's history sweep has to have
@@ -609,7 +616,7 @@ def test_a_tree_record_over_the_built_ins_ceiling_is_dropped_by_the_adapter(
             (tree_records if args[0] == "dir" else history_records), ""))
 
     passes([record("band.txt"), record("over.txt")], [])
-    findings, _notes, _history, tree = adapters.gitleaks_scan(root)
+    findings, _notes, _history, tree, _reached = adapters.gitleaks_scan(root)
     assert tree == adapters.TREE_OK
     assert {f["occurrences"][0]["file"] for f in findings} == {"band.txt"}, findings
     # A history record of the same over-cap file is NOT dropped: the history

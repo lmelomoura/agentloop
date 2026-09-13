@@ -20,6 +20,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A gitleaks that answers neither pass no longer takes the secret phase
+  down with it.** The history-in-ranges change gave `gitleaks_scan` a fifth
+  value, the cursor, on the path where a pass ran -- and left the early
+  return for "neither pass produced a report" at four, so the caller's
+  unpack raised `ValueError` on exactly the analyses the built-in fallback
+  exists for (a binary on PATH that would not report a version, a history
+  git could not walk beside a tree pass that timed out): `prepare: secrets
+  FAILED` instead of the built-in sweep running on its own. Every path now
+  returns five, the cursor being None when no range completed. The security
+  suite was red on `main` for the same reason -- 15 tests, the same
+  unpack -- plus one that still asserted the history budget at its old
+  1800 s; the budget's comment said the same, and the code has been 7200 s
+  since the ranges arrived. Both now say what the code does.
+
 - **An OpenCode run that outlives a context compaction is recorded to its
   end.** At ~167k tokens the CLI compacts the session on its own: a step of
   its own whose text is the model's summary, closed on `stop`, then a

@@ -396,7 +396,10 @@ def test_the_history_sweep_runs_on_the_history_budget(tmp_path, monkeypatch):
     assert findings == [] and swept is False and reached is None
     assert f"stopped at its {engines.HISTORY_TIMEOUT}s budget" in note
     assert "starts over" in note
-    assert engines.HISTORY_TIMEOUT == 1800 > engines.SCAN_TIMEOUT == 600
+    # 7200, not the 1800 it opened at: gitleaks reads about 2,000 commits in
+    # three minutes on the measured laptop, and the budget has to hold a
+    # FIRST pass over 21,601 (test_engines pins the number and its override).
+    assert engines.HISTORY_TIMEOUT == 7200 > engines.SCAN_TIMEOUT == 600
     assert (inspect.signature(engines.run_json).parameters["timeout"].default
             == engines.SCAN_TIMEOUT)
 

@@ -99,11 +99,16 @@ SCAN_TIMEOUT = 600
 # commits (372 MB, 969,185 lines): each history pass ran into the 600 s ceiling
 # above, in series, and neither produced a finding -- 1,200 s of the 1,721 s
 # `prepare` took, spent covering nothing. The `git log -p -U0` alone takes 55 s
-# there and the built-in sweep 277-390 s, so 1800 s is room to finish rather
-# than a ceiling to hit; and a sweep that still hits it now stops at a cursor
-# and continues in the next analysis (see `scan_history`) instead of starting
-# over. Overridable per install, in seconds, because the right number is a
-# property of the repositories an install analyses.
+# there and the built-in sweep 277-390 s; gitleaks is the slow one -- about
+# three minutes per 2,000 commits on the measured laptop, every core busy
+# (`adapters.HISTORY_CHUNK`), so 21,601 commits is most of an hour -- and
+# 7200 s is room for a FIRST pass over a history that size to finish rather
+# than a ceiling to hit. A sweep that still hits it stops at a cursor and
+# continues in the next analysis (see `scan_history` and
+# `adapters._gitleaks_history`) instead of starting over; every later
+# analysis reads only the commits since. Overridable per install, in seconds,
+# because the right number is a property of the repositories an install
+# analyses.
 HISTORY_TIMEOUT = int(os.environ.get("AGENTLOOP_SECURITY_HISTORY_TIMEOUT", "7200"))
 
 # The largest report this module will read off disk, in bytes.
