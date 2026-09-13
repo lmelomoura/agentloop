@@ -163,6 +163,58 @@ def checklist(conn, analysis_id):
     return result
 
 
+def fixed_elsewhere(conn, project, repo, branch, fingerprints):
+    """For each of `fingerprints`, open on `branch`: where else in the same
+    repository the same fingerprint is `fixed`, if anywhere.
+
+    Returns {fingerprint: {branch, commit, analysis_id, at}} for the ones that
+    have such a place, choosing the most recently analysed branch when more
+    than one has it. A fingerprint nobody anywhere gave up as fixed is simply
+    absent from the result.
+
+    REUSES `checklist`, NEVER RE-DERIVES `fixed`. A finding is fixed when a
+    producer that saw it looked again and did not find it (`diff._proven`),
+    and when no human decision overrides that -- one function already answers
+    that, per analysis, with every rule it needs. A second query here that
+    read the finding table for "rows absent from the latest analysis" would
+    be a second copy of that state machine, and this repository has been
+    bitten by exactly that three times in one delivery.
+
+    ONE ANALYSIS PER BRANCH -- the latest finished one, the same scope
+    `finding_rows` itself is built from -- not every analysis that ever ran.
+    A project with ten branches pays ten `checklist` calls, each of them
+    served from the connection's own `_checklist_cache` when `finding_rows`
+    has already made it (checklist memoises on `conn`), never a hundred.
+
+    Same repository only: a fingerprint is stable across branches of one
+    repository, and in another repository it is another thing with the same
+    name.
+    """
+    wanted = set(fingerprints or ())
+    if not wanted:
+        return {}
+    out = {}
+    others = [r["branch"] for r in conn.execute(
+        "SELECT DISTINCT branch FROM analysis WHERE project=? AND repo=?"
+        " AND branch != ? AND state IN ('done','capped')",
+        (project, repo, branch))]
+    for other in others:
+        a = _latest_finished(conn, project, other)
+        if not a:
+            continue
+        _an, findings = checklist(conn, a["id"])
+        for f in findings:
+            fp = f["fingerprint"]
+            if fp not in wanted or f.get("state") != "fixed":
+                continue
+            prev = out.get(fp)
+            # the newest proof wins when two branches both have one
+            if prev is None or a["started"] > prev["at"]:
+                out[fp] = {"branch": other, "commit": a.get("commit_sha", ""),
+                           "analysis_id": a["id"], "at": a["started"]}
+    return out
+
+
 def finding_counts_by_analysis(conn, project):
     """How many findings each analysis of `project` recorded, keyed by
     analysis id -- a plain `COUNT(*)`, never `checklist()`'s diff/decision
