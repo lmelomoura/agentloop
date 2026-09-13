@@ -20,6 +20,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **An OpenCode run that outlives a context compaction is recorded to its
+  end.** At ~167k tokens the CLI compacts the session on its own: a step of
+  its own whose text is the model's summary, closed on `stop`, then a
+  synthetic "Continue if you have next steps..." and the model goes on. The
+  normalizer took that `stop` for the end of the run and ignored the half
+  hour that followed, so a 51-minute analysis that ended on `RUN COMPLETE`
+  was filed with the summary as its final words (UNDECLARED ENDING), 129
+  turns, and the cost and tokens up to the compaction. A result is now
+  superseded when the CLI goes on after it: the last one is the run's, with
+  every step's tokens and cost; the CLI's continuation is shown as a message
+  put to the agent, not as its words; and an EOF after the CLI went on past
+  a `stop` without reaching another is an error result, never the stale
+  success (measured 38).
+
+- **A finished OpenCode run is no longer a warning because the provider
+  dropped the connection and the CLI retried.** The CLI runs with
+  `--print-logs --log-level ERROR`, and the one ERROR a healthy run logs is
+  `message="stream error"`; the stream already says whether the retry
+  worked (an `error` event, or an EOF with no result, when it did not), so
+  the stderr line is never the deciding fact. Those lines leave the stderr
+  before the classifier counts it, the way Codex's "Reading additional
+  input from stdin..." does; the count goes to tick.log, and any other
+  ERROR line still makes the run a warning.
+
 - **Every e2e scenario reads its own job's run, not the last line of the
   journal.** `lastrun` was `tail -1 runs.ndjson`, which is the right run only
   while every scenario runs alone, in one sandbox, in sequence — a scenario

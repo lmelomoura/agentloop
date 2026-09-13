@@ -33,6 +33,15 @@ At EOF, only a turn that ended on an auto-rejected ask (measured 04, 18)
 becomes an error result naming the tool. A rule denial (measured 23) does
 not end the turn, so an EOF after one is a killed run left to the salvage
 path, the same as any other EOF with no result.
+
+A `stop` is not always the end (measured 38): at ~167k tokens the CLI
+compacts the session on its own -- a step whose text is the model's
+summary, closed on `stop` -- then injects a synthetic "Continue if you have
+next steps..." part and the model goes on. The result emitted at that
+`stop` is superseded by the one at the real end (the engine reads the LAST
+result), with every step's tokens and cost; an EOF after the CLI went on
+past a `stop` without reaching another is an error result, so the stale
+success never stands as the run's verdict.
 """
 import argparse
 import json
@@ -156,7 +165,8 @@ class Normalizer:
         self.last_reason = ""       # the last step_finish reason
         self.last_rejected = False  # the LAST tool event was an auto-rejected ask, not a rule denial
         self.denials = []           # permission_denials on the final event
-        self.done = False           # a result has been emitted
+        self.done = False           # a result has been emitted, and nothing followed it
+        self.went_on = False        # the CLI kept talking after a result (a compaction)
 
     # -- envelopes ---------------------------------------------------------
     def _msg(self, role, blocks):
@@ -247,11 +257,29 @@ class Normalizer:
         # finish() must not read the stale rejection as how the run ended.
         if kind not in ("tool_use", "step_finish", "error"):
             self.last_rejected = False
+        # Nor is a result final while the CLI keeps talking (measured 38: the
+        # compaction's `stop`, then the synthetic continuation and more
+        # steps). Proof that the session went on -- a new step, a text (the
+        # CLI's own continuation included), a tool, an error -- reopens the
+        # run: the next `stop` emits a fresh result over the same, still-
+        # growing counters, and the engine reads the last one. A bare
+        # second step_finish is not proof of anything (measured: the CLI
+        # never opens a step without step_start) and stays one result.
+        if self.done and kind in ("step_start", "text", "tool_use", "error"):
+            self.done = False
+            self.went_on = True
         part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
         if kind == "text":
             text = part.get("text") or ""
-            self.last_text = text
-            out.append(self._assistant([{"type": "text", "text": text}]))
+            if part.get("synthetic") is True:
+                # The CLI's own words, put to the model (the post-compaction
+                # "Continue if you have next steps..."): a message TO the
+                # agent, so the Terminal prints it on the human's side, and
+                # never the run's last text nor one of its turns.
+                out.append(self._msg("user", [{"type": "text", "text": text}]))
+            else:
+                self.last_text = text
+                out.append(self._assistant([{"type": "text", "text": text}]))
         elif kind == "tool_use":
             out.extend(self._tool(part))
         elif kind == "step_finish":
@@ -299,7 +327,16 @@ class Normalizer:
         denial (measured 23) does NOT end the turn -- the model keeps
         going -- so an EOF after one, like any other EOF without a result,
         is left to the salvage path."""
-        if self.done or not self.last_rejected or self.last_reason != "tool-calls":
+        if self.done:
+            return []
+        if self.went_on:
+            # The CLI went on past a `stop` (a compaction) and never reached
+            # another: killed, or died. Without this the compaction's stale
+            # success would be the last result in the stream, and the run
+            # would be filed as finished on the strength of a summary.
+            return [self._result(error=("the CLI went on after a context compaction and ended "
+                                        "without a final answer", None))]
+        if not self.last_rejected or self.last_reason != "tool-calls":
             return []
         d = self.denials[-1]
         msg = "the turn ended on a rejected permission: " + d["tool_name"]
