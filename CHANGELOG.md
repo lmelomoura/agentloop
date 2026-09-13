@@ -455,6 +455,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The built-in history sweep stops at the tree sweep's 2 MB ceiling.**
+  It promised no file-size cap; on a history with 503 blobs over 2 MB (the
+  largest 130 MB) its 30-minute budget went into diffing a few of their
+  revisions before it had read 2,000 commits. `core.bigFileThreshold` on
+  the `git log` turns such a blob into "Binary files differ", no patch is
+  computed, and the note says how many revisions were not read.
 - **The deterministic phase runs its scanners at once and says where it
   is.** The secret sweeps, hygiene, the trivy pair, syft and semgrep ran
   one after the other (1,721 s on the measured repository); they run at
