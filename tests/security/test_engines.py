@@ -551,3 +551,33 @@ def test_the_temporary_directory_does_not_survive_the_call(
     assert note == ""
     assert not Path(data["report"]).exists()
     assert not Path(data["tmpdir"]).exists()
+
+
+def test_the_version_probe_answers_once_per_process(monkeypatch, tmp_path):
+    """`prepare` asks each engine's version more than once, and the phases
+    run at once: the probes landed on a saturated machine and semgrep's
+    python start-up outlived the probe's patience, so its phase was skipped
+    as "installed but did not report a version" (seen on a real analysis).
+    One probe per engine per process, taken first, on an idle machine; a
+    missing or silent engine is asked again, so a test that swaps the
+    binary is not lied to."""
+    from security import engines
+    fake = tmp_path / "fakeengine"
+    fake.write_text("#!/bin/sh\necho 9.9.9\n")
+    fake.chmod(0o755)
+    calls = []
+    real_run = engines.subprocess.run
+
+    def counting(cmd, **kw):
+        calls.append(cmd)
+        return real_run(cmd, **kw)
+    monkeypatch.setattr(engines, "find", lambda name: str(fake) if name == "gitleaks" else None)
+    monkeypatch.setattr(engines.subprocess, "run", counting)
+    monkeypatch.setattr(engines, "_VERSIONS", {})
+    assert engines.version_of("gitleaks") == "9.9.9"
+    assert engines.version_of("gitleaks") == "9.9.9"
+    assert len(calls) == 1, "the second call read the remembered answer"
+    assert engines.version_of("trivy") is None and engines.version_of("trivy") is None
+    assert len(calls) == 1, "an engine that is not there is not remembered as absent"
+    engines.warm_versions(("gitleaks", "trivy"))
+    assert len(calls) == 1, "warming reads the remembered answer and re-asks only the absent one"

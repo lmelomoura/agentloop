@@ -148,6 +148,23 @@ def find(name: str):
     return shutil.which(name)
 
 
+# The version probe's answers, per engine, for the life of the process.
+# `prepare` asks for each engine's version more than once (the adapter, then
+# `run_json`), and since the phases run at once the probes used to land on a
+# machine already saturated by the scanners: semgrep, whose `--version` is a
+# python start-up, took longer than the probe's patience under gitleaks and
+# trivy, and its whole phase was skipped as "installed but did not report a
+# version" (seen on a real analysis). The probes now run once, first, on an
+# idle machine (`warm_versions`), and every later call reads the answer.
+_VERSIONS = {}
+
+
+def warm_versions(names=None):
+    """Probe every engine's version now, before anything else runs."""
+    for name in (names if names is not None else tuple(PURGE)):
+        version_of(name)
+
+
 def version_of(name: str):
     """The engine's own version string, or None if it will not answer.
 
@@ -158,6 +175,12 @@ def version_of(name: str):
     path = find(name)
     if not path:
         return None
+    # Keyed by the binary's path, not the name: a test that swaps the
+    # binary under a process, or an operator who installs another build,
+    # gets that binary's own answer.
+    if (name, path) in _VERSIONS:
+        return _VERSIONS[(name, path)]
+    version = None
     for flag in ("--version", "version"):
         try:
             # errors="replace": an engine is free to put raw bytes in its
@@ -165,12 +188,19 @@ def version_of(name: str):
             # UnicodeDecodeError -- a ValueError, which slips past the
             # handler below and out of a function documented to return None.
             out = subprocess.run([path, flag], capture_output=True, text=True,
-                                 errors="replace", timeout=30)
+                                 errors="replace", timeout=120)
         except (OSError, subprocess.SubprocessError):
             continue
         if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip().splitlines()[0]
-    return None
+            version = out.stdout.strip().splitlines()[0]
+            break
+    # Only an answer is remembered: an engine that was not there, or would
+    # not say, is asked again next time -- tests swap binaries under a
+    # process, and an operator may install one between two calls of a
+    # long-lived server.
+    if version is not None:
+        _VERSIONS[(name, path)] = version
+    return version
 
 
 def _strip(obj, fields):
