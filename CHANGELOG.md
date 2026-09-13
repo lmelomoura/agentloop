@@ -463,6 +463,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   phase now runs in a process group of its own, recorded on the run's slot,
   the stop signals the group, and the early-stop record closes the analysis
   as `failed` through the same door the classifier uses.
+- **The candidate gate is a substring search, not a regex.** The
+  alternation that gated the rule battery still walked every position of a
+  line of megabytes (57% of the sweep's time, measured); the gate is eight
+  `find` calls and one lower-cased pass now, with overlapping windows merged.
+  Measured on the repository that timed the sweep out for a day: the whole
+  history, 21,601 commits, in 26 seconds.
 - **The secret rules read a long line through windows.** A minified bundle
   or a dump is one line of megabytes; eight rules walked it at every
   position, for every commit that touched the file, and the sweep spent 99%
