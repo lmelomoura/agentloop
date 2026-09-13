@@ -1,0 +1,47 @@
+measurement 38 -- the CLI compacts the session on its own and goes on; the
+provider drops the connection and the CLI retries
+opencode-ai 1.18.30, macOS, 2026-09-13, observed on a real security analysis
+(analysis 9 of the operator's repository, run 20260913T173040Z-27420, model
+pdm_ai/GLM-5.3-NVFP4, --variant max, --pure --auto --print-logs --log-level
+ERROR, launched by the engine), not on a probe: 51 minutes, 129 model
+events before the compaction and ~70 after, rc 0.
+
+Compaction, at 167,738 tokens of context (step_finish tokens.total):
+
+  step_finish  reason=tool-calls  tokens.total 167738 (cache.read 160768)
+  step_start                                       msg_09bf4b38b001...
+  text         "## Objective\n- ...\n## Progress ...\n## Next steps ..."
+               (the model's summary of the session, ~7.5k output tokens,
+               written in the prompt's language)
+  step_finish  reason=stop  tokens {input 87038, output 7582, cache.read 0}
+               cost 0.009660644898   <- a `stop`, mid-run
+  text         "Continue if you have next steps, or stop and ask for
+               clarification if you are unsure how to proceed."
+               part.synthetic: true, part.metadata: {compaction_continue:
+               true}, its own messageID, 67 ms after the stop
+  step_start                                       msg_09bf773df001...
+  tool_use ... (the model goes on, ~70 more events, 35 more minutes)
+  ...
+  text         "RUN COMPLETE: ..."   step_finish reason=stop   exit 0
+
+So `step_finish.reason: stop` is NOT always the end of the run (README, "um
+turno tem um passo por chamada ao modelo... `stop` no último"): the
+compaction step ends on one and the session goes on. The normalizer used to
+emit the run's result at the first `stop` and ignore everything after it:
+this run was filed with the compaction's summary as its final text (no
+`RUN COMPLETE`, so UNDECLARED ENDING), 129 turns, and the cost and tokens
+up to the compaction (0.1212 of the 0.1466 USD the steps reported).
+
+Stderr, 2 lines (38-compaction-continues.stderr.txt), both mid-run:
+  level=ERROR message="stream error" ... AI_APICallError: Cannot connect to
+  API: The socket connection was closed unexpectedly
+The CLI retried both times and the run went on to `RUN COMPLETE`; nothing in
+the JSON stream marks them. The classifier counted the stderr bytes and filed
+the finished run as `warning` ("STDERR: the CLI wrote 2 line(s)...").
+
+38-compaction-continues.jsonl is the fixture cut from this run: event
+shapes, ids, timestamps, tokens and costs verbatim for the 10 events around
+the compaction; the tool inputs/outputs and the summary's text replaced
+(the repository is private); the final step (text + stop) added in the same
+shape, with the run's real closing line trimmed. The raw stream itself was
+pruned by the server once the run was indexed.

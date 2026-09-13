@@ -484,3 +484,76 @@ def test_the_cli_flushes_the_init_line_before_the_stream_ends(tmp_path):
     finally:
         p.stdin.close()
         p.wait(timeout=10)
+
+
+# ------------------------------------------------------ a compaction mid-run
+
+def test_a_context_compaction_does_not_end_the_run():
+    # Measured 38 (a 51-minute security analysis, opencode-ai 1.18.30): at
+    # 167k tokens the CLI compacts the session on its own -- a step of its
+    # own whose text is the model's summary, closed on `reason: stop` -- then
+    # injects a synthetic "Continue if you have next steps..." part and the
+    # model goes on for another half hour. That `stop` is not the end of the
+    # run: the run's ONE result must be the last one, carrying the agent's
+    # final words and every step's tokens and cost.
+    out = normalize("38-compaction-continues.jsonl", priced=True)
+    results = [e for e in out if e["type"] == "result"]
+    assert results[-1] is out[-1]
+    last = results[-1]
+    assert last["subtype"] == "success" and last["is_error"] is False
+    assert last["result"].startswith("RUN COMPLETE:")
+    assert last["cost_basis"] == "reported"
+    assert last["total_cost_usd"] == round(0.001900218377 + 0.009660644898 + 0.002677211405 + 0.0041, 12)
+    assert last["tokens"]["input"] == 6639 + 87038 + 20191 + 30000
+    assert last["tokens"]["output"] == 331 + 7582 + 2433 + 1000
+    assert last["tokens"]["cached"] == 160768 + 0 + 11776 + 10000
+
+
+def test_the_compaction_summary_is_the_agents_text_but_the_continuation_is_not():
+    # The summary is written by the model: an assistant text, like any other.
+    # The "Continue if you have next steps..." part is the CLI's own
+    # (`synthetic: true`, `metadata.compaction_continue`): it is shown as a
+    # message put TO the agent, never counted as a turn, never the result.
+    out = normalize("38-compaction-continues.jsonl")
+    agent = [b["text"] for b in blocks(out, "text", "assistant")]
+    assert any(t.startswith("## Objective") for t in agent)
+    assert not any(t.startswith("Continue if you have next steps") for t in agent)
+    you = [b["text"] for b in blocks(out, "text", "user")]
+    assert you == ["Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."]
+    # num_turns counts the model's events: 3 tool_use + 2 texts on this fixture
+    assert out[-1]["num_turns"] == 5
+
+
+def test_a_run_cut_off_after_a_compaction_is_not_the_compaction_result():
+    # EOF after the CLI went on past a `stop` but before another one (killed
+    # by the watchdog, or the CLI died): the stale success from the
+    # compaction must not stand as the run's result. It is an error that
+    # says so, with the cost the CLI reported up to there.
+    evs = events_of("38-compaction-continues.jsonl")[:-3]      # drop the final step
+    out = normalize(events=evs, priced=True)
+    results = [e for e in out if e["type"] == "result"]
+    assert len(results) == 2 and results[-1] is out[-1]
+    last = results[-1]
+    assert last["is_error"] is True and last["subtype"] == "error_during_execution"
+    assert "compaction" in last["result"] and "without a final answer" in last["result"]
+    assert last["total_cost_usd"] == round(0.001900218377 + 0.009660644898 + 0.002677211405, 12)
+
+
+def test_a_plain_stop_at_the_end_is_still_one_result():
+    # The ordinary run (measured 01): one stop, one result, nothing at EOF.
+    out = normalize("01-trivial-turn.jsonl")
+    assert [e["type"] for e in out].count("result") == 1
+
+
+def test_an_api_error_after_a_compaction_is_the_runs_verdict():
+    # The continuation the CLI asked for fails outright (the 401 shape of
+    # measured 16, after the compaction's stop): the run ended on that
+    # error, not on the summary the compaction wrote.
+    evs = events_of("38-compaction-continues.jsonl")[:6]      # up to the synthetic continuation
+    err = events_of("16-api-error-401.jsonl")
+    evs.append(next(e for e in err if e["type"] == "error"))
+    out = normalize(events=evs, priced=True)
+    last = out[-1]
+    assert last["type"] == "result" and last["is_error"] is True
+    assert last["api_error_status"] == 401
+    assert [e["type"] for e in out].count("result") == 2
