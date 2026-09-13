@@ -819,3 +819,41 @@ def test_history_skips_a_file_over_the_ceiling_and_says_so(tmp_path):
     assert swept is True and reached
     assert [h["occurrences"][0]["file"] for h in hist] == ["prod.env"], "the big file was not read"
     assert "did not read 1 revision of files larger than 2 MB" in note
+
+
+def test_every_rule_is_reachable_through_the_candidate_gate():
+    """The gate in front of the battery must let every rule's match through:
+    a shape the gate does not know would be found on a short line and lost
+    on a long one. One planted value per rule, on a line past the window
+    threshold, found in both shapes."""
+    from security.secrets import _hits, _LONG_LINE
+    planted = {
+        "aws_access_key": "AKIA" + "IOSFODNN7EXAMPLE",
+        "github_token": "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8",
+        "slack_token": "xoxb-" + "1234567890-abcdefghij",
+        "stripe_key": "sk_live_" + "4eC39HqLyjWDarjtT1zdp7dc",
+        "openai_key": "sk-" + "abcdefghijklmnopqrstuvwxyz012345",
+        "google_api_key": "AIza" + "SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q",
+        "generic_secret": "api_key = 'Zq8vLm3Np6Xr2Tk9Wb4Yc7Hd1Jf5Gs0A'",
+    }
+    for rule, value in planted.items():
+        short = f"x = 1; {value}; y = 2"
+        long = ("z" * (_LONG_LINE + 500)) + " " + value + " " + ("z" * 700)
+        assert [h[0] for h in _hits(short)] == [rule], rule
+        assert [h[0] for h in _hits(long)] == [rule], f"{rule} lost on a long line"
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7Yb3ZpQk9wVt2LmN4RsX8HcJ1FgD6KaE0uWq5TzP3nBvC2rM\n"
+    assert [h[0] for h in _hits(pem)] == ["private_key"]
+    assert [h[0] for h in _hits(("m" * (_LONG_LINE + 10)) + " " + pem)] == ["private_key"]
+
+
+def test_a_long_line_is_scanned_in_windows_not_walked_whole():
+    """Two megabytes of one line with one key in it: found, at line 1, in
+    well under a second. Walked whole by eight rules it took seconds per
+    commit, and a history has thousands of such commits."""
+    import time as clock
+    from security.secrets import _hits
+    line = ("a" * 1_000_000) + " AKIA" + "IOSFODNN7EXAMPLE " + ("b" * 1_000_000)
+    t0 = clock.perf_counter()
+    hits = list(_hits("first\n" + line + "\nlast"))
+    assert hits == [("aws_access_key", "critical", 2)]
+    assert clock.perf_counter() - t0 < 1.0

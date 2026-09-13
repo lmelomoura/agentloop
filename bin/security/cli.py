@@ -1242,6 +1242,16 @@ def _scan_iac(root, offline: bool, ignore_paths=()):
 def cmd_prepare(args):
     """The deterministic phases, run inside the worktree by the agent's first
     command. Seconds, and no tokens."""
+    # A process group of its own, so a stop can end every scanner this phase
+    # spawns (gitleaks, trivy, semgrep, syft, git) with one signal to the
+    # group: seen on a real install, a stop during this phase killed the run
+    # wrapper alone and the scanners ran on to the end of a 30-minute budget.
+    # The engine reads the group off the pid it recorded; a caller that is
+    # not the engine (the tests, a hand run) loses nothing by the call.
+    try:
+        os.setpgrp()
+    except OSError:
+        pass
     conn = _conn(args)
     # Resolved before it is judged: `--root ~/..` and `--root /srv/../..` both
     # reach the filesystem root while looking like a checkout.

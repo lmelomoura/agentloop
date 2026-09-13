@@ -3250,6 +3250,13 @@ run_record_stopped_early() { # <id> <slot-dir>
     '{last_end:$end, last_status:"stopped", last_run_start:$start, last_run_status:"stopped"}')"
   record_run "$id" "stopped" "$start" "$end" "0" "0" "$sid" "${logf:-}" "$note" "false" "" "$project" \
              "${model_family:-$model}" "" "" "" "$(job_platform "$id")" "none" "null"
+  # A derived security job stopped here left its analysis `running` in the
+  # ledger with no run behind it: the page said so, refused a second Analyse
+  # on the project, and the operator had to close the row by hand. The run's
+  # verdict is `stopped`, which security_close_analysis files as `failed`
+  # (nothing else; a job that is not derived returns at once), the same
+  # close the classifier gives a run stopped after its agent ran.
+  security_close_analysis "$id" stopped 0 "$note"
   if [ -f "$slot/child" ]; then
     log_tick "$id: stopped by the user after its agent had already run"
   else
@@ -8230,6 +8237,34 @@ PY
   [ -n "$got" ] && [ -f "$got" ] && ok "a stop with no logfile breadcrumb still writes one" \
     || bad "log path '$got'"
   rm -rf "$tmp/locks/j9/778"
+  # A derived security job stopped before its agent started left its analysis
+  # `running` for ever (seen on a real install: the page refused a second
+  # Analyse and the row had to be closed by hand). The record closes the
+  # analysis with the run's own verdict, through the same door the
+  # classifier uses, and a plain job never reaches that door.
+  local sl5="$tmp/locks/security-app/779"
+  mkdir -p "$sl5"; echo 779 > "$sl5/pid"; echo 1700000000 > "$sl5/start"; : > "$sl5/stopped"
+  : > "$tmp/secpy.calls"
+  ( CONFIG_DIR="$tmp/cfg"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/stop5.ndjson"
+    STATE_FILE="$tmp/stopstate.json"; LOG_DIR="$tmp/stoplogs"; TICK_LOG="$tmp/stop.tick"
+    AL_SECURITY_ANALYSIS_ID=41
+    security_py() { printf '%s\n' "$*" >> "$tmp/secpy.calls"; }
+    run_record_stopped_early security-app "$sl5" ) >/dev/null 2>&1
+  grep -q '^finish --analysis 41 --state failed' "$tmp/secpy.calls" \
+    && ok "a derived job stopped before its agent closes its analysis as failed" \
+    || bad "security_py calls: $(cat "$tmp/secpy.calls")"
+  : > "$tmp/secpy.calls"
+  local sl6="$tmp/locks/j9/781"
+  mkdir -p "$sl6"; echo 781 > "$sl6/pid"; echo 1700000000 > "$sl6/start"; : > "$sl6/stopped"
+  ( CONFIG_DIR="$tmp/cfg"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/stop6.ndjson"
+    STATE_FILE="$tmp/stopstate.json"; LOG_DIR="$tmp/stoplogs"; TICK_LOG="$tmp/stop.tick"
+    AL_SECURITY_ANALYSIS_ID=41
+    security_py() { printf '%s\n' "$*" >> "$tmp/secpy.calls"; }
+    run_record_stopped_early j9 "$sl6" ) >/dev/null 2>&1
+  [ "$("$JQ" -r '.status' "$tmp/stop6.ndjson" 2>/dev/null | head -1)" = "stopped" ] && [ ! -s "$tmp/secpy.calls" ] \
+    && ok "and a plain job stopped early is journaled without touching the security ledger" \
+    || bad "plain job: status $("$JQ" -r '.status' "$tmp/stop6.ndjson" 2>/dev/null | head -1), security_py calls: $(cat "$tmp/secpy.calls")"
+  rm -rf "$tmp/locks/security-app" "$tmp/locks/j9/781"
   # Twice must not produce two rows: the normal path drops `journaled` the moment
   # it files its own record, and this must respect that.
   : > "$sl/journaled"
@@ -10435,6 +10470,25 @@ _stop_slot() { # <id> <slot-dir>
     echo "stopping $id run $(basename "$slot") (agent pid $child)"
     return 0
   fi
+  # The deterministic phase, before any agent: `$slot/prepare` names the
+  # subshell that runs it, and cmd_prepare put itself and every scanner it
+  # spawned in a process group of that subshell's child. The subshell is
+  # TERMed by pid and the group by its python's pgid, read from ps, so the
+  # scanners go with it; the wrapper below then files the record as it does
+  # for any early stop. The same `0` guard as the child above.
+  local prep prep_pgid
+  prep="$(cat "$slot/prepare" 2>/dev/null || true)"
+  if [ -n "$prep" ] && [ "$prep" != "0" ] && kill -0 "$prep" 2>/dev/null; then
+    prep_pgid="$(ps -o pgid= -p "$prep" 2>/dev/null | tr -d ' ')"
+    kill -TERM "$prep" 2>/dev/null
+    case "$prep_pgid" in ''|0|*[!0-9]*) ;; *) kill -TERM -- "-$prep_pgid" 2>/dev/null ;; esac
+    # Whatever cmd_prepare put in a group of its own: its pid is the
+    # subshell's child, and its pgid is that pid.
+    for _pp in $(pgrep -P "$prep" 2>/dev/null); do
+      kill -TERM -- "-$_pp" 2>/dev/null; kill -TERM "$_pp" 2>/dev/null
+    done
+    echo "stopping $id run $(basename "$slot") (deterministic phase, pid $prep)"
+  fi
   # No agent yet — stopped in the seconds between claiming the slot and spawning.
   # This used to just delete the slot, so the run vanished from the table with
   # nothing written anywhere: no row, no log, no record that it had ever been
@@ -11327,12 +11381,23 @@ If the work turns out to be already finished, or it can no longer be done at all
   # sidecar, never to $logfile.err: a byte on that file turns a clean run
   # into `warning` (errbytes, below), and this is not the agent's stderr.
   if ! platform_caps "$platform" prepare_inline && [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ] && [ -z "$resume_sid" ]; then
-    local _prep_ignore _prep_t0 _prep_t1 _prep_secs _prep_rc=0
+    local _prep_ignore _prep_t0 _prep_t1 _prep_secs _prep_pid _prep_rc=0
     _prep_ignore="$("$JQ" -r '.ignore // ""' "$(security_request_path "$id")" 2>/dev/null)"
     _prep_t0="$(now_epoch)"
+    # In its own process group, recorded on the slot: a stop that lands during
+    # this phase has to end the scanners too. cmd_prepare calls os.setpgrp()
+    # the moment it starts, so the group is its pid and every scanner it
+    # spawns (gitleaks, trivy, semgrep, syft, git) inherits it; _stop_slot
+    # reads `$slot/prepare` and TERMs the group. Seen on a real install: a
+    # stop during prepare killed the wrapper alone and left the python and
+    # three git processes running to the end of a 30-minute budget.
     ( cd "$run_cwd" || exit 1
       security_py prepare --analysis "$AL_SECURITY_ANALYSIS_ID" --root "$run_cwd" \
-        --ignore "$_prep_ignore" ) >> "$logfile.prepare" 2>&1 || _prep_rc=$?
+        --ignore "$_prep_ignore" ) >> "$logfile.prepare" 2>&1 &
+    _prep_pid=$!
+    printf '%s\n' "$_prep_pid" > "$slot/prepare" 2>/dev/null || true
+    wait "$_prep_pid" || _prep_rc=$?
+    rm -f "$slot/prepare" 2>/dev/null || true
     _prep_t1="$(now_epoch)"
     _prep_secs=$((_prep_t1 - _prep_t0))
     if [ "$_prep_rc" -eq 0 ]; then
