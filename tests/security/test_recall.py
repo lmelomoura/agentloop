@@ -553,7 +553,8 @@ def test_a_checkout_with_no_commits_leaves_the_secret_row_ran(tmp_path, monkeypa
 
 IN_BAND = 2_050_000           # > 2 x 10^6 and <= _MAX_BYTES: BOTH must see it on the tree
 OVER_CAP = 2_200_000          # > _MAX_BYTES and <= 3 x 10^6: the post-filter drops it, not the flag
-BEYOND_GIT_MODE = 4_200_000   # what gitleaks' git mode skips at `3`; the built-in history reads it
+BEYOND_GIT_MODE = 4_200_000   # what gitleaks' git mode skips at `3`; since the history
+                              # sweep took the tree sweep's 2 MB ceiling, neither reads it
 
 
 def _plant_of_size(root, rel, size):
@@ -624,8 +625,13 @@ def test_the_cap_is_exact_on_the_tree_and_the_history_is_the_built_ins_alone(
         tmp_path, monkeypatch):
     """The three sizes that matter, against the real binary. In the band both
     see it on the tree (the parity claim); just over the ceiling neither does
-    on the tree; a committed file beyond what gitleaks' git mode reads is a
-    history finding of the built-in alone -- the documented asymmetry."""
+    on the tree; and a committed file over the ceiling is found by NOBODY --
+    the built-in history sweep used to read it alone, and stopped when it took
+    the tree sweep's 2 MB ceiling (measured: on a history with 503 blobs over
+    2 MB the 30-minute budget went into a few of their revisions before 2,000
+    commits were read). That is a real loss of coverage, so the thing this
+    test now guards is that it is DECLARED: the note says how many revisions
+    went unread and what that means, rather than the scan going quiet."""
     monkeypatch.setenv("AL_SECURITY_ENGINES", "on")
     root = _git_repo(tmp_path / "repo", {"README.md": "clean\n"})
     _plant_of_size(root, "beyond.txt", BEYOND_GIT_MODE)
@@ -634,12 +640,18 @@ def test_the_cap_is_exact_on_the_tree_and_the_history_is_the_built_ins_alone(
     _plant_of_size(root, "over.txt", OVER_CAP)   # untracked: tree only
     findings, notes, _lines, _producer, status = security_cli._scan_secrets(root, [])
     by_file = {f["occurrences"][0]["file"]: f for f in findings}
-    assert set(by_file) == {"band.txt", "beyond.txt"}, sorted(by_file)
+    assert set(by_file) == {"band.txt"}, sorted(by_file)
     assert by_file["band.txt"]["seen_by"] == ["gitleaks", "secrets"]
     assert not by_file["band.txt"]["historical"]
-    assert by_file["beyond.txt"]["seen_by"] == ["secrets"]
-    assert by_file["beyond.txt"]["historical"]
     assert status == coverage.RAN, notes
+    # `beyond.txt` is committed and over the ceiling: nobody reads it, and the
+    # history note is the only place a reader learns that. Asserted on the
+    # sentence, not on a count, because a number with no sentence around it is
+    # what made this gap invisible in the first place.
+    assert any("history sweep did not read 1 revision" in n
+               and "larger than 2 MB" in n
+               and "would not be found here" in n
+               for n in notes), notes
     # Two files over the ceiling sit in the tree, and the sentence says which
     # sweep it is about: the history read one of them regardless.
     assert any("2 larger than 2 MB" in n and "in the working tree" in n
