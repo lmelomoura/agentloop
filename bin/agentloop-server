@@ -3130,6 +3130,11 @@ def security_findings_export(project, fmt, shown=None):
     args = ["security", "export-findings", "--project", project, "--format", fmt]
     if shown is not None:
         args += ["--shown", str(int(shown))]
+    # The same repository paths the page verb gets, so the document's
+    # "fixed elsewhere" lines can say whether a fix is already in the branch
+    # instead of "could not be determined" on every one of them.
+    for rname, rpath in sorted(_project_meta(project).get("repo_paths", {}).items()):
+        args += ["--repo-path", f"{rname}={rpath}"]
     ok, out = al(args)
     if not ok:
         if "no analysis has ever run" in out:
@@ -3267,9 +3272,22 @@ def _project_meta(name):
     for p in read_json(PROJECTS_FILE, {}).get("projects", []):
         if p.get("name") == name:
             sec = p.get("security") if isinstance(p.get("security"), dict) else {}
+            # WHERE EACH REPOSITORY IS ON DISK, by the name the ledger files it
+            # under -- the same rule bin/agentloop's project_repo_path and
+            # vocabulary.js's secRepos apply: a project with `repos` names
+            # each by `r.name`; a project with only `cwd` has one repository
+            # named after the project itself. The ledger stores the name and
+            # never the path (this file's own comment on findings-page says
+            # why), so the path travels from here for the one question that
+            # needs it: whether a fix proven on another branch is already an
+            # ancestor of this one.
+            repos = [r for r in (p.get("repos") or []) if isinstance(r, dict) and r.get("name")]
+            paths = ({r["name"]: (r.get("path") or "") for r in repos} if repos
+                     else {name: (p.get("cwd") or "")})
             return {"base": p.get("base", "") or "",
-                   "default_profile": sec.get("default_profile", "") or ""}
-    return {"base": "", "default_profile": ""}
+                    "default_profile": sec.get("default_profile", "") or "",
+                    "repo_paths": {k: v for k, v in paths.items() if v}}
+    return {"base": "", "default_profile": "", "repo_paths": {}}
 
 
 def security_project(project):
@@ -3512,6 +3530,13 @@ def security_findings(params):
     args = ["security", "findings-page", "--project", project,
            "--sort", sort, "--dir", direction,
            "--page", str(page), "--per-page", str(per_page)]
+    # One `--repo-path name=path` per repository, so the CLI can ask git
+    # whether a fix proven elsewhere is already in a row's branch. Argv, as a
+    # list element each -- never shell -- and only for repositories the
+    # config actually places; a project with none configured asks no git
+    # question at all.
+    for rname, rpath in sorted(_project_meta(project).get("repo_paths", {}).items()):
+        args += ["--repo-path", f"{rname}={rpath}"]
     for s in severity:
         args += ["--severity", s]
     for s in state:

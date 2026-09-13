@@ -32,6 +32,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **An open finding now says where it was fixed on another branch, and
+  whether that fix is already in this one.** A finding found on `develop`
+  and fixed on `main` stayed open on `develop` until `develop` was analysed
+  again — correctly, since until it carries the fix the hole is there — but
+  nothing said the fix existed, or that it was already merged in and only a
+  re-analysis was missing. The Findings tab draws a second badge beside the
+  state: *fixed on main* (amber: the hole is real here, the fix is over
+  there) or *fix already here* (green: the commit is an ancestor of this
+  branch — re-analyse to confirm). The state itself never changes: git can
+  prove a fix is present, not that a finding is absent, since a branch can
+  reintroduce the same pattern on its own. Nothing is marked fixed until
+  somebody looks again. The consolidated export carries the same in its
+  header and on each finding, so an agent handed the list knows before it
+  starts which findings are already done elsewhere. Git is asked once per
+  branch pair, never per finding.
+
 - **The Findings tab's Export button downloads every finding of the project,
   across every branch, as one document.** It used to open the Reports tab,
   whose downloads are one report per *analysis* — so somebody standing in

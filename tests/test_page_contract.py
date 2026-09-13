@@ -10953,3 +10953,28 @@ def test_the_export_download_names_the_file_from_the_server_not_from_itself(srv)
 def test_the_export_carries_the_token_like_every_other_get_on_this_api(srv):
     fn = _plainfn(_security_js(srv), "secDownloadFindings")
     assert '"X-AL-Token":TOKEN' in fn.replace(" ", ""), fn
+
+
+# ---- The "fixed elsewhere" badge: beside the state, never in its place.
+
+def test_the_fixed_elsewhere_badge_qualifies_the_state_and_never_replaces_it(srv):
+    """The server annotates an OPEN row with where the same fingerprint was
+    given up as fixed and whether that commit is already an ancestor of this
+    branch. The row draws that as a second, quieter badge after the state
+    pill. The state pill itself is untouched, because ancestry proves the fix
+    is present, not that the finding is absent."""
+    row = _plainfn(_security_js(srv), "secFindRow")
+    # the state pill is built first and exactly as before
+    assert 'secEl("span", "secstate " + secStateKey(f), SEC_STATE_LABEL[f.state] || f.state)' in row
+    # the badge is a second element appended after it, keyed on the annotation
+    assert "f.fixed_elsewhere" in row
+    assert '"secstate fixed-elsewhere "' in row
+    assert 'tdState.appendChild(feBadge)' in row
+    # three cases, three texts -- and the third says "could not tell", never
+    # renders an unknown as "not here"
+    assert '"fix already here"' in row
+    assert '"fixed on " + fe.branch' in row
+    assert "could not be determined" in row
+    assert "fe.in_this_branch === true" in row and "fe.in_this_branch === false" in row
+    # nothing is drawn when nobody anywhere fixed it
+    assert "if(fe && fe.branch)" in row

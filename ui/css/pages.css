@@ -1453,6 +1453,16 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 .secstate.new,.secstate.regressed{background:var(--err-soft);color:var(--err);border-color:transparent}
 .secstate.partial{background:var(--warn-soft);color:var(--warn);border-color:transparent}
 .secstate.fixed{background:var(--ok-soft);color:var(--ok);border-color:transparent}
+/* The "fixed elsewhere" badge sits BESIDE the state pill, never in its place:
+   the state is what the ledger knows, this is what git adds. Quieter than the
+   state on purpose (lowercase, a hair smaller): it qualifies, it does not
+   replace. `merged` borrows the ok tone -- the fix is here, re-analyse --
+   `pending` the warn tone -- the hole is real here, the fix is over there --
+   and `unknown` stays neutral, because "could not tell" has no colour. */
+.secstate.fixed-elsewhere{display:block;width:fit-content;margin:4px 0 0;text-transform:none;letter-spacing:0;
+  font-size:10px;white-space:normal;line-height:1.3}
+.secstate.fixed-elsewhere.merged{background:var(--ok-soft);color:var(--ok);border-color:transparent}
+.secstate.fixed-elsewhere.pending{background:var(--warn-soft);color:var(--warn);border-color:transparent}
 .secwhere{margin:9px 0 0;padding-left:18px;font:11.5px/1.65 ui-monospace,"SF Mono",Menlo,monospace;
   color:var(--muted);word-break:break-all}
 .secfinding p{margin:8px 0 0;font-size:12.5px;line-height:1.6}

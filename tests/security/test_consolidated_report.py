@@ -135,3 +135,40 @@ def test_the_sbom_bundle_lists_every_branch_and_says_it_is_not_a_merge():
     assert doc["branches"][0]["sbom"] is None          # said, not omitted
     assert doc["branches"][1]["sbom"]["bomFormat"] == "CycloneDX"
     assert "not a merge" in doc["format"]
+
+
+def test_a_fix_already_in_the_branch_is_said_first_and_tells_the_agent_to_reanalyse():
+    rows = [_f("a" * 16, "high", fixed_elsewhere={"branch": "main", "commit": "c0ffee" * 7,
+                                                  "analysis_id": 9, "at": 1, "in_this_branch": True}),
+            _f("b" * 16, "high", fixed_elsewhere={"branch": "main", "commit": "c0ffee" * 7,
+                                                  "analysis_id": 9, "at": 1, "in_this_branch": False}),
+            _f("c" * 16, "high")]
+    md = report.consolidated_as_markdown("P", report._consolidated_groups(rows, META), {})
+    # the header counts both kinds before any finding is listed
+    head = md.split("## `")[0]
+    assert "1 whose fix is already in the branch" in head
+    assert "1 fixed on another branch but not yet in this one" in head
+    # and each finding says its own case, in words an agent acts on
+    assert "ALREADY in this branch" in md and "re-analyse this branch" in md
+    assert "not yet in this branch — see that fix" in md
+    # a finding nobody fixed anywhere says nothing about it
+    c_block = md.split("#### [high] finding cccc")[1]
+    assert "Fixed elsewhere" not in c_block
+
+
+def test_an_undetermined_ancestry_is_said_as_undetermined_never_as_absent():
+    rows = [_f("a" * 16, "high", fixed_elsewhere={"branch": "main", "commit": "abc",
+                                                  "unknown_reason": "no checkout configured"})]
+    md = report.consolidated_as_markdown("P", report._consolidated_groups(rows, META), {})
+    assert "could not be determined (no checkout configured)" in md
+    assert "not yet in this branch" not in md and "ALREADY" not in md
+
+
+def test_the_json_and_html_carry_the_same_annotation():
+    fe = {"branch": "main", "commit": "d" * 40, "analysis_id": 3, "at": 2, "in_this_branch": True}
+    rows = [_f("a" * 16, "high", fixed_elsewhere=fe)]
+    groups = report._consolidated_groups(rows, META)
+    doc = json.loads(report.consolidated_as_json("P", groups, {}))
+    assert doc["branches"][0]["open"][0]["fixed_elsewhere"] == fe
+    html_doc = report.consolidated_as_html("P", groups, {})
+    assert "ALREADY in this branch" in html_doc

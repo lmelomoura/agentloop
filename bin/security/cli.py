@@ -2358,11 +2358,18 @@ def cmd_export_findings(args):
         sys.exit(f"no analysis has ever run for project {args.project!r}"
                  + (f" — known: {', '.join(known)}" if known else ""))
 
+    repo_paths = {}
+    for item in (args.repo_path or []):
+        name, sep, path = item.partition("=")
+        if not sep or not name or not path:
+            sys.exit(f"export-findings: --repo-path expects name=path, got {item!r}")
+        repo_paths[name] = path
     rows, page = [], 1
     while True:
         payload = queries.finding_rows(conn, args.project,
                                        filters={"show_resolved": True},
-                                       page=page, per_page=queries.MAX_PER_PAGE)
+                                       page=page, per_page=queries.MAX_PER_PAGE,
+                                       repo_paths=repo_paths)
         rows.extend(payload["rows"])
         if len(rows) >= payload["total"] or not payload["rows"]:
             break
@@ -3046,10 +3053,20 @@ def cmd_findings_page(args):
         "q": args.q,
         "fingerprint": args.fingerprint,
     }
+    # `--repo-path name=path`, one per repository, from the server (this file
+    # never reads projects.json). A value with no `=` is a mistake worth a
+    # sentence, not a silently ignored path.
+    repo_paths = {}
+    for item in (args.repo_path or []):
+        name, sep, path = item.partition("=")
+        if not sep or not name or not path:
+            sys.exit(f"findings-page: --repo-path expects name=path, got {item!r}")
+        repo_paths[name] = path
     try:
         result = queries.finding_rows(conn, args.project, filters,
                                       sort=args.sort, direction=args.direction,
-                                      page=args.page, per_page=args.per_page)
+                                      page=args.page, per_page=args.per_page,
+                                      repo_paths=repo_paths)
     except ValueError as exc:
         sys.exit(f"findings-page: {exc}")
     result["filters"] = ledger.saved_filters(conn, args.project)
@@ -3260,6 +3277,7 @@ def main(argv=None):
     # know the page's filters, and a header without the comparison is still
     # true, only less helpful.
     ef.add_argument("--shown", type=int, default=None)
+    ef.add_argument("--repo-path", action="append", default=None, dest="repo_path")
 
     de = sub.add_parser("decide", parents=[dbflag]); de.set_defaults(fn=cmd_decide)
     for flag in ("project", "fingerprint", "reason"):
@@ -3331,6 +3349,7 @@ def main(argv=None):
     fpg.add_argument("--category", action="append", default=None,
                      choices=FINDING_CATEGORIES)
     fpg.add_argument("--branch", action="append", default=None)
+    fpg.add_argument("--repo-path", action="append", default=None, dest="repo_path")
     fpg.add_argument("--analysis", action="append", type=int, default=None)
     fpg.add_argument("--q", default="")
     fpg.add_argument("--path", default="")
