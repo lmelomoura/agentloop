@@ -10869,3 +10869,42 @@ def test_the_runs_header_never_presents_a_stale_listing_as_a_fresh_one(srv, tmp_
     assert "busy" in out["stale_empty"] and "Nothing recorded yet" not in out["stale_empty"], (
         "an index that would not answer is reported as an empty history, which is "
         "the exact lie this flag exists to stop")
+
+
+# ---- The Export button downloads; it does not navigate.
+#
+# It used to call secSwitchProjectTab("reports"), on the reasoning that the
+# project already had a download surface there. That surface is one report per
+# ANALYSIS, and the person standing in front of a table of every finding across
+# every branch wants those. These pin the shape rather than the wording: a
+# regression here is silent -- the button still looks like a button and still
+# does something -- so the assertions are about WHERE it points.
+
+def test_the_export_button_calls_the_export_route_and_never_the_reports_tab(srv):
+    block = _security_js(srv)
+    head = _plainfn(block, "secFindHeader")
+    assert "secDownloadFindings(" in head, head[-1200:]
+    assert 'secSwitchProjectTab("reports")' not in head, (
+        "the Export button navigated to the Reports tab again — that tab's "
+        "downloads are per analysis, and this button is about every finding "
+        "of every branch")
+
+
+def test_the_export_download_names_the_file_from_the_server_not_from_itself(srv):
+    # The project name is free text an operator typed and the server sanitises
+    # it into the Content-Disposition. A second copy of that rule here would be
+    # one more pair that has to agree by hand -- the sibling per-analysis
+    # download already carries such a pair for REPORT_EXTENSIONS -- so this one
+    # reads the header back instead. Same origin, so it can.
+    block = _security_js(srv)
+    fn = _plainfn(block, "secDownloadFindings")
+    assert 'r.headers.get("Content-Disposition")' in fn, fn
+    assert "/api/security/findings-export?project=" in fn
+    # and the fallback never invents a name out of the project
+    helper = _plainfn(block, "_nameFromDisposition")
+    assert "[\\\\/]" in helper or "\\\\/" in helper, helper
+
+
+def test_the_export_carries_the_token_like_every_other_get_on_this_api(srv):
+    fn = _plainfn(_security_js(srv), "secDownloadFindings")
+    assert '"X-AL-Token":TOKEN' in fn.replace(" ", ""), fn

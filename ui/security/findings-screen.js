@@ -96,6 +96,7 @@ import { SEV_KPI_ICON, SEV_KPI_TONE } from "./overview-tab.js";
 import { secAskReason } from "./reason.js";
 import { secInvalidateProject, secSwitchProjectTab } from "./project-screen.js";
 import { secShowAnalysis, secBack } from "./analysis.js";
+import { secDownloadFindings } from "./actions.js";
 
 // Mirrors bin/security/queries.py's SORTABLE, and bin/agentloop-server's
 // FINDING_CATEGORIES -- duplicated here, not fetched, because the filter bar
@@ -317,17 +318,31 @@ function secFindHeader(fs, data){
     if(savedWrap.ontoggle) savedWrap.ontoggle();
   };
   actions.appendChild(saveBtn);
-  const exportBtn = secEl("button", "btn ghost");
-  exportBtn.type = "button";
-  exportBtn.appendChild(secIcon("download"));
-  exportBtn.appendChild(document.createTextNode("Export"));
-  // Reuses the project's own Reports tab -- the report/download surface
-  // this project already offers (secRenderProjectReports,
-  // reports-tab.js: Markdown/JSON/HTML/SBOM per analysis) -- rather than
-  // inventing a second export path with no downloads of its own behind it.
-  exportBtn.title = "Open this project's Reports tab";
-  exportBtn.onclick = () => secSwitchProjectTab("reports");
-  actions.appendChild(exportBtn);
+  // EXPORT DOWNLOADS, IT DOES NOT NAVIGATE. It used to open the Reports tab,
+  // on the reasoning that the project already had a download surface there --
+  // but that surface is one report per ANALYSIS, and somebody standing in
+  // front of a table of every finding across every branch wants those, not a
+  // document about one run. The reader is usually not even a person: the
+  // document exists to be handed to an agent, which is why it names the
+  // branch of every finding and the commit each branch was read at.
+  //
+  // `data.total` is what the table is showing right now, filters and severity
+  // floor and all; it travels so the document's header can explain itself to
+  // a reader who filtered to Critical and got everything ("The screen was
+  // showing 3 of these"). The download itself is never filtered -- the line
+  // under the numbers on this very screen already promises that.
+  const shown = Number.isFinite(data && data.total) ? data.total : null;
+  ["md", "json"].forEach((fmt) => {
+    const b = secEl("button", "btn ghost");
+    b.type = "button";
+    if(fmt === "md") b.appendChild(secIcon("download"));
+    b.appendChild(document.createTextNode(fmt === "md" ? "Export" : "JSON"));
+    b.title = fmt === "md"
+      ? "Download every recorded finding in this project, all branches, as Markdown"
+      : "The same document as JSON";
+    b.onclick = () => secDownloadFindings(fs.project, fmt, shown, b);
+    actions.appendChild(b);
+  });
   actions.appendChild(savedWrap);
   head.appendChild(actions);
   wrap.appendChild(head);

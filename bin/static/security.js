@@ -1017,6 +1017,41 @@
     if (!a) return;
     await secDownloadReport(a.id, fmt, $("sec-dl-" + fmt));
   }
+  function _nameFromDisposition(header, fallback) {
+    const m = /filename="([^"]+)"/.exec(header || "");
+    if (m && m[1] && !/[\\/]/.test(m[1])) return m[1];
+    return fallback;
+  }
+  async function secDownloadFindings(project, fmt, shown, btn) {
+    if (btn) btn.disabled = true;
+    const dk = ["findings_export", project, fmt];
+    markPending(...dk);
+    try {
+      let url = "/api/security/findings-export?project=" + encodeURIComponent(project) + "&format=" + encodeURIComponent(fmt);
+      if (Number.isFinite(shown)) url += "&shown=" + encodeURIComponent(shown);
+      const r = await fetch(url, { headers: { "X-AL-Token": TOKEN } });
+      if (!r.ok) {
+        const j = await r.json().catch(() => null);
+        throw new Error(j && j.error || "HTTP " + r.status);
+      }
+      const blobUrl = URL.createObjectURL(await r.blob());
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = _nameFromDisposition(
+        r.headers.get("Content-Disposition"),
+        "findings." + fmt
+      );
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 3e4);
+    } catch (e) {
+      toast("Export failed \u2014 " + e.message, true);
+    } finally {
+      clearPending(...dk);
+      if (btn) btn.disabled = false;
+    }
+  }
 
   // ui/security/activity-screen.js
   var ACT_TABS = [
@@ -2160,13 +2195,16 @@
       if (savedWrap.ontoggle) savedWrap.ontoggle();
     };
     actions.appendChild(saveBtn);
-    const exportBtn = secEl("button", "btn ghost");
-    exportBtn.type = "button";
-    exportBtn.appendChild(secIcon("download"));
-    exportBtn.appendChild(document.createTextNode("Export"));
-    exportBtn.title = "Open this project's Reports tab";
-    exportBtn.onclick = () => secSwitchProjectTab("reports");
-    actions.appendChild(exportBtn);
+    const shown = Number.isFinite(data && data.total) ? data.total : null;
+    ["md", "json"].forEach((fmt) => {
+      const b = secEl("button", "btn ghost");
+      b.type = "button";
+      if (fmt === "md") b.appendChild(secIcon("download"));
+      b.appendChild(document.createTextNode(fmt === "md" ? "Export" : "JSON"));
+      b.title = fmt === "md" ? "Download every recorded finding in this project, all branches, as Markdown" : "The same document as JSON";
+      b.onclick = () => secDownloadFindings(fs.project, fmt, shown, b);
+      actions.appendChild(b);
+    });
     actions.appendChild(savedWrap);
     head.appendChild(actions);
     wrap.appendChild(head);
@@ -5224,5 +5262,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: c758400fed6bb1471fdaba9551e4808a69f0dbef07f5a15e23445edc110778c6 */
-/* ui-sources: 511693ab12aa5851b5f29c75a638e0ea0fd7160ce118161264f280020dc13262 */
+/* ui-bundle: 074b046501cf3b207ab8862188ba6093f1be9382866cd90bb8802315851c9ed7 */
+/* ui-sources: 6c5a4e1ecfa374770e3aa5445a638f8231afc806f90240ea532eada9e41a7335 */

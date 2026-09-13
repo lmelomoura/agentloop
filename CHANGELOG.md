@@ -20,6 +20,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The Findings tab's Export button downloads every finding of the project,
+  across every branch, as one document.** It used to open the Reports tab,
+  whose downloads are one report per *analysis* — so somebody standing in
+  front of a table of 79 findings from several branches was handed a file
+  about one run. The new document is written for the reader it exists for,
+  which is usually not a person: every finding names the branch it was found
+  on and the commit that branch was analysed at, so an agent knows where to
+  apply a fix and whether the code in front of it is the code that was read.
+  A branch with nothing on it is listed saying so — not seeing a branch and
+  seeing it clean call for opposite actions. Resolved findings come last,
+  under a heading that says no action is needed. Markdown or JSON, from
+  `agentloop security export-findings --project X --format md|json` or the
+  button; filters and the severity floor are not applied, and the document's
+  header says so beside the count the screen was showing.
+
 - **The OpenCode engine: a job, a project and a project's `security` block
   can run on the `opencode` platform.** The third platform arrives the way
   the second one did: measured first (`docs/superpowers/specs/2026-09-12-opencode-measurements/`,
