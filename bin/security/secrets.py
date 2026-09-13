@@ -709,14 +709,17 @@ def scan_history(root, since_sha, ignore=(), rename=None, budget=None):
     unattended for minutes on a large repository, and a line that says
     `2000/21607` is the difference between a sweep and a hang.
 
-    NO FILE-SIZE CAP, BY CONSTRUCTION -- an asymmetry with the tree sweep and
-    with gitleaks, stated here rather than claimed away. `git log -p` streams
-    every added line of every commit; there is no file to `stat` and no size
-    to stop at, so a credential in a committed 40 MB bundle is found here.
-    `scan_tree` stops at `_MAX_BYTES`, and gitleaks' `git` mode applies its own
-    rule to the flag it is handed (`GITLEAKS_MAX_TARGET_MEGABYTES`), so such a
-    finding is this sweep's alone -- `seen_by == ["secrets"]` -- and correctly
-    so.
+    THE SAME FILE-SIZE CEILING AS THE TREE SWEEP. This used to promise no
+    cap "by construction" -- `git log -p` has no file to stat -- and the
+    construction cost the whole sweep: a history with 503 blobs over 2 MB
+    (the largest 130 MB) spent a 30-minute budget diffing a few of their
+    revisions before 2,000 commits were read. `core.bigFileThreshold` on the
+    `git log` makes git print "Binary files differ" for a blob over
+    `_MAX_BYTES` instead of a patch; the sweep counts those lines and the
+    note says how many revisions were not read, the way `scan_tree` says
+    its own. gitleaks' `git` mode stops at `GITLEAKS_MAX_TARGET_MEGABYTES`,
+    the same ceiling rounded up, so the two history sweeps agree on what a
+    large file is.
 
     THE HISTORY IS STREAMED, LINE BY LINE, AS BYTES. This used to collect
     `git log -p` whole with `text=True`: on a real repository (21,607
@@ -763,8 +766,20 @@ def scan_history(root, since_sha, ignore=(), rename=None, budget=None):
         # `reached` above). git walks the range before printing the first
         # patch, which on the measured repository is a second of the 55 the
         # log itself takes.
+        # THE SAME 2 MiB CEILING AS THE TREE SWEEP, on the history too.
+        # `core.bigFileThreshold` makes git treat a blob over it as binary,
+        # so `log -p` prints "Binary files differ" for it instead of
+        # computing a patch. Measured: 503 blobs over 2 MB in one history,
+        # the largest 130 MB, and a 30-minute budget went into diffing a
+        # handful of their revisions (xdl_diff, one commit at a time)
+        # before the sweep had read its first 2,000 commits. The docstring
+        # used to promise no cap here "by construction"; the construction
+        # cost the whole sweep, and the tree sweep and gitleaks already stop
+        # at this size. Every file it skips is counted below and said in the
+        # note, the way the tree sweep says its own.
         proc = subprocess.Popen(
-            ["git", "-C", str(root), "log", "-p", "-U0", "--no-color", "--no-merges",
+            ["git", "-C", str(root), "-c", f"core.bigFileThreshold={_MAX_BYTES}",
+             "log", "-p", "-U0", "--no-color", "--no-merges",
              "--diff-filter=AM", "--reverse", rev],
             stdout=subprocess.PIPE, stderr=errf, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
@@ -822,6 +837,7 @@ def scan_history(root, since_sha, ignore=(), rename=None, budget=None):
     # seen, so it never names a commit the cut fell inside.
     reached = None
     commits = 0
+    big_revisions = 0
     total = None
     # The prefixes are told apart on the bytes, and only the lines this sweep
     # keeps are decoded: a hundred million lines of patch go through this
@@ -885,6 +901,11 @@ def scan_history(root, since_sha, ignore=(), rename=None, budget=None):
             continue
         if skip_path:
             continue
+        if raw.startswith(b"Binary files "):
+            # What `core.bigFileThreshold` above turned into a one-liner: a
+            # revision of a file over the ceiling, never read.
+            big_revisions += 1
+            continue
         if not raw.startswith(b"+") or raw.startswith(b"+++"):
             continue
         added.append(raw[1:].decode("utf-8", errors="replace").rstrip("\r\n"))
@@ -930,7 +951,22 @@ def scan_history(root, since_sha, ignore=(), rename=None, budget=None):
     # printed a patch was (see the docstring). The last one seen is the
     # fallback for a HEAD git will not resolve, which cannot happen on a log
     # that just read cleanly and is guarded anyway.
-    return _findings_of(groups), "", True, head_sha(root) or commit_sha
+    return (_findings_of(groups), _big_files_note(big_revisions), True,
+            head_sha(root) or commit_sha)
+
+
+HISTORY_BIG_FILES_NOTE = ("The history sweep did not read {count} {revisions} of "
+                          "files larger than 2 MB: a credential committed in a "
+                          "file that size would not be found here (the working "
+                          "tree sweep stops at the same size).")
+
+
+def _big_files_note(big_revisions):
+    """One sentence for the revisions the ceiling skipped, or ""."""
+    if not big_revisions:
+        return ""
+    return HISTORY_BIG_FILES_NOTE.format(
+        count=big_revisions, revisions="revision" if big_revisions == 1 else "revisions")
 
 
 def _findings_of(groups):

@@ -797,3 +797,25 @@ def test_history_survives_bytes_that_are_not_utf8(tmp_path):
     assert note == "" and swept is True
     assert [h["rule"] for h in hist] == ["aws_access_key"]
     assert hist[0]["historical"] is True
+
+
+def test_history_skips_a_file_over_the_ceiling_and_says_so(tmp_path):
+    """Measured: 503 blobs over 2 MB in one history, the largest 130 MB, and
+    a 30-minute budget went into diffing a few of their revisions before the
+    sweep had read 2,000 commits. git treats a blob over `_MAX_BYTES` as
+    binary here, so no patch is computed for it; the key in the small file of
+    the same commit is still found, and the note counts what was skipped."""
+    from security import secrets as secrets_mod
+    run = lambda *a: subprocess.run(a, cwd=tmp_path, check=True, capture_output=True)
+    run("git", "init", "-q")
+    run("git", "config", "user.email", "t@example.com")
+    run("git", "config", "user.name", "t")
+    big = ("x" * 1000 + "\n") * (secrets_mod._MAX_BYTES // 1000 + 10)
+    (tmp_path / "dump.sql").write_text(big + f"AWS_ACCESS_KEY_ID={AWS}\n")
+    (tmp_path / "prod.env").write_text(f"AWS_ACCESS_KEY_ID={AWS}\n")
+    run("git", "add", "-A")
+    run("git", "commit", "-qm", "big and small")
+    hist, note, swept, reached = scan_history(tmp_path, None)
+    assert swept is True and reached
+    assert [h["occurrences"][0]["file"] for h in hist] == ["prod.env"], "the big file was not read"
+    assert "did not read 1 revision of files larger than 2 MB" in note
