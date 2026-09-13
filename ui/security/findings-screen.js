@@ -89,7 +89,7 @@
    by tests/test_page_contract.py and must keep both their name and their
    contract. */
 import { api, toast, fmtWhen, tableFooter, closeMenus, kpiCard } from "./page.js";
-import { secEl, secIcon, secFetch } from "./dom.js";
+import { secEl, secIcon, secFetch, secPlaceMenu } from "./dom.js";
 import { SEC_STATES, SEC_STATE_LABEL, SEC_STATE_HELP, SEV_ORDER, SEC_NEVER,
          secMinSeverity, secSevKey, secStateKey, secVisible, secCategoryMeta } from "./vocabulary.js";
 import { SEV_KPI_ICON, SEV_KPI_TONE } from "./overview-tab.js";
@@ -350,7 +350,11 @@ function secFindHeader(fs, data){
   exportKebab.appendChild(exportSummary);
   const exportPop = secEl("div", "menu-pop");
   exportPop.setAttribute("role", "menu");
-  [["md", "Markdown"], ["json", "JSON"]].forEach(([fmt, label]) => {
+  // The same three the Reports tab's kebab offers, in the same order, so the
+  // two menus read as one habit. Markdown stays reachable from the CLI
+  // (`agentloop security export-findings --format md`) for an agent that
+  // reads it better; it is not on the menu because the menu is the operator's.
+  [["json", "JSON"], ["html", "HTML"], ["sbom", "SBOM"]].forEach(([fmt, label]) => {
     const item = document.createElement("button");
     item.setAttribute("role", "menuitem");
     item.appendChild(secIcon("file"));
@@ -363,16 +367,7 @@ function secFindHeader(fs, data){
     exportPop.appendChild(item);
   });
   exportKebab.appendChild(exportPop);
-  exportKebab.ontoggle = () => {
-    exportPop.hidden = !exportKebab.open;
-    if(!exportKebab.open) return;
-    const r = exportSummary.getBoundingClientRect();
-    exportPop.style.position = "fixed";
-    exportPop.style.top = (r.bottom + 6) + "px";
-    exportPop.style.right = (window.innerWidth - r.right) + "px";
-    exportPop.style.left = "auto";
-    exportPop.style.bottom = "auto";
-  };
+  secPlaceMenu(exportKebab, exportSummary, exportPop, "right");
   actions.appendChild(exportKebab);
   actions.appendChild(savedWrap);
   head.appendChild(actions);
@@ -592,16 +587,7 @@ export function secFindPositionPop(details, trigger, pop){
   pop.setAttribute("role", "menu");
   pop.hidden = true;
   details.appendChild(pop);
-  details.ontoggle = () => {
-    pop.hidden = !details.open;
-    if(!details.open) return;
-    const r = trigger.getBoundingClientRect();
-    pop.style.position = "fixed";
-    pop.style.top = (r.bottom + 6) + "px";
-    pop.style.left = r.left + "px";
-    pop.style.right = "auto";
-    pop.style.bottom = "auto";
-  };
+  secPlaceMenu(details, trigger, pop, "left");
 }
 
 function secFindMultiPicker(label, options, selected, onToggle){
@@ -1195,16 +1181,7 @@ function secFindActionsCell(fs, f){
     // secFindPositionPop's own comment) -- right-aligned, since this is the
     // table's own last column and a left-aligned popover would routinely
     // open past the viewport's own right edge.
-    kebab.ontoggle = () => {
-      pop.hidden = !kebab.open;
-      if(!kebab.open) return;
-      const r = summary.getBoundingClientRect();
-      pop.style.position = "fixed";
-      pop.style.top = (r.bottom + 6) + "px";
-      pop.style.left = "auto";
-      pop.style.right = (window.innerWidth - r.right) + "px";
-      pop.style.bottom = "auto";
-    };
+    secPlaceMenu(kebab, summary, pop, "right");
     td.appendChild(kebab);
   }
   return td;

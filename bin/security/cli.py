@@ -2374,10 +2374,26 @@ def cmd_export_findings(args):
         branch_meta[a["branch"]] = {"id": a["id"], "profile": a.get("profile", ""),
                                     "commit_sha": row.get("commit_sha", "")}
 
-    groups = report._consolidated_groups(rows, branch_meta)
     meta = {"at": int(time.time()), "shown_on_screen": args.shown}
-    renderer = (report.consolidated_as_json if args.format == "json"
-                else report.consolidated_as_markdown)
+    if args.format == "sbom":
+        # Not a report over the findings at all: the stored inventory of each
+        # branch, side by side. Same branch set as the findings above, so a
+        # branch with findings and no lockfile appears with `sbom: null`.
+        entries = []
+        for br, m in branch_meta.items():
+            try:
+                text = _sbom_document(conn, m["id"])
+                sbom = json.loads(text) if text and text.strip() else None
+            except (SystemExit, ValueError, LookupError):
+                sbom = None
+            entries.append({"branch": br, "analysis_id": m["id"],
+                            "commit_sha": m.get("commit_sha", ""), "sbom": sbom})
+        print(report.consolidated_sboms(args.project, entries, meta))
+        return
+    groups = report._consolidated_groups(rows, branch_meta)
+    renderer = {"json": report.consolidated_as_json,
+                "html": report.consolidated_as_html,
+                "md": report.consolidated_as_markdown}[args.format]
     print(renderer(args.project, groups, meta))
 
 
@@ -3234,7 +3250,7 @@ def main(argv=None):
     ef = sub.add_parser("export-findings", parents=[dbflag])
     ef.set_defaults(fn=cmd_export_findings)
     ef.add_argument("--project", required=True)
-    ef.add_argument("--format", required=True, choices=("md", "json"))
+    ef.add_argument("--format", required=True, choices=("md", "json", "html", "sbom"))
     # What the SCREEN was showing when the button was pressed, so the header
     # can explain a document larger than the page. Optional: the CLI does not
     # know the page's filters, and a header without the comparison is still

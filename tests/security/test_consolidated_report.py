@@ -110,3 +110,28 @@ def test_resolved_is_the_ledger_s_own_definition_not_a_second_copy():
     for state in RESOLVED_STATES:
         groups = report._consolidated_groups([_f("a" * 16, "high", state=state)], META)
         assert groups[0]["open"] == [] and len(groups[0]["resolved"]) == 1
+
+
+def test_the_html_is_the_same_document_with_the_same_order_and_escapes_what_it_prints():
+    rows = [_f("b" * 16, "high", title="<b>not markup</b>", branch="main"),
+            _f("a" * 16, "critical", branch="main",
+               occurrences=[{"file": "app/<x>.py", "line": 3}])]
+    meta = {"main": {"id": 1, "commit_sha": "0011223344556677", "profile": "deep"}}
+    doc = report.consolidated_as_html("P & Q", report._consolidated_groups(rows, meta), {})
+    # escaped, never rendered: a title comes from analysed code
+    assert "&lt;b&gt;not markup&lt;/b&gt;" in doc and "<b>not markup</b>" not in doc
+    assert "app/&lt;x&gt;.py" in doc
+    assert "P &amp; Q" in doc
+    # same order as the Markdown: critical before high
+    assert doc.index("a" * 16) < doc.index("b" * 16)
+    assert "001122334455" in doc
+
+
+def test_the_sbom_bundle_lists_every_branch_and_says_it_is_not_a_merge():
+    entries = [{"branch": "main", "analysis_id": 1, "commit_sha": "c1", "sbom": {"bomFormat": "CycloneDX"}},
+               {"branch": "develop", "analysis_id": 2, "commit_sha": "c2", "sbom": None}]
+    doc = json.loads(report.consolidated_sboms("P", entries, {"at": 5}))
+    assert [b["branch"] for b in doc["branches"]] == ["develop", "main"]
+    assert doc["branches"][0]["sbom"] is None          # said, not omitted
+    assert doc["branches"][1]["sbom"]["bomFormat"] == "CycloneDX"
+    assert "not a merge" in doc["format"]

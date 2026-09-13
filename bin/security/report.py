@@ -460,3 +460,80 @@ def _consolidated_finding_json(f, branch):
             "remediation": f.get("remediation", ""),
             "first_seen": f.get("first_seen", 0),
             "analysis_id": f.get("analysis_id")}
+
+
+def consolidated_as_html(project, groups, meta):
+    """The same document as HTML, for a reader with a browser and no editor.
+    Same grouping, same order, same header: one grouping, three renderers."""
+    e = html.escape
+    lines = _consolidated_meta_lines(project, groups, meta)
+    parts = [f"<!doctype html><meta charset=utf-8><title>Findings — {e(project)}</title>"
+             f"<style>{_CSS}</style>",
+             f"<h1>Findings — {e(project)}</h1>", "<ul>"]
+    # The header lines are Markdown-shaped (`- **Label:** value`); strip the
+    # emphasis rather than render it, so the two renderers share one source
+    # of truth for what the header says.
+    for ln in lines:
+        parts.append(f"<li>{e(ln.lstrip('- ').replace('**', ''))}</li>")
+    parts += ["</ul>",
+              "<p>Each finding below names the branch it was found on and the commit"
+              " that branch was analysed at. Apply a fix on that branch; a fix made"
+              " elsewhere is not recorded against this finding until that branch is"
+              " analysed again.</p>"]
+    for g in groups:
+        a = g["analysis"] or {}
+        at = f" at <code>{e(a['commit_sha'][:12])}</code>" if a.get("commit_sha") else ""
+        prof = f" · {e(a['profile'])}" if a.get("profile") else ""
+        parts.append(f"<h2><code>{e(g['branch'])}</code>{at}{prof}</h2>")
+        if not g["open"] and not g["resolved"]:
+            parts.append('<p class="note">No findings recorded on this branch.</p>')
+            continue
+        if g["open"]:
+            parts.append(f"<h3>Open — {len(g['open'])}</h3>")
+            for f in g["open"]:
+                locs = "".join(f"<li><code>{e(o['file'])}</code>"
+                               + (f":{int(o['line'])}" if o.get("line") else "") + "</li>"
+                               for o in f.get("occurrences", []))
+                cls = (f"<p>Class: {e(f['cwe'])}"
+                       + (f" · OWASP {e(f['owasp'])}" if f.get("owasp") else "") + "</p>"
+                       if f.get("cwe") else "")
+                scope = (f"<p>Scope: {e(_scope_label(f['scope']))}</p>" if f.get("scope") else "")
+                parts.append(
+                    f'<div class="f {e(f["severity"])}"><h4>[{e(f["severity"])}] {e(f["title"])}</h4>'
+                    f"<p>Fingerprint <code>{e(f['fingerprint'])}</code> · Branch"
+                    f" <code>{e(g['branch'])}</code> · {e(f['state'])}</p>"
+                    f"<p>Rule <code>{e(f['rule'])}</code> ({e(f['category'])})</p>"
+                    f"{cls}{scope}"
+                    + (f"<ul>{locs}</ul>" if locs else "")
+                    + (f"<p>{e(f['rationale'])}</p>" if f.get("rationale") else "")
+                    + (f"<p><strong>Remediation:</strong> {e(f['remediation'])}</p>"
+                       if f.get("remediation") else "")
+                    + "</div>")
+        if g["resolved"]:
+            parts.append(f"<h3>Resolved on this branch — {len(g['resolved'])} (no action needed)</h3><ul>")
+            for f in g["resolved"]:
+                parts.append(f"<li>[{e(f['severity'])}] {e(f['title'])} — {e(f['state'])}"
+                             f" · <code>{e(f['fingerprint'][:12])}</code></li>")
+            parts.append("</ul>")
+    return "".join(parts)
+
+
+def consolidated_sboms(project, entries, meta):
+    """One document carrying the SBOM of each branch's latest analysis.
+
+    NOT a merged CycloneDX. Two branches' inventories are two inventories --
+    merging them would claim a dependency set no commit ever held -- so this
+    wraps them side by side, each under its branch and the analysis it came
+    from, and says so in the envelope. A branch whose analysis stored no SBOM
+    (no lockfile in the tree) is listed with `sbom: null` rather than left
+    out, for the reason the Markdown lists a clean branch: absence has to be
+    said, or a reader cannot tell "no inventory" from "not looked at".
+    """
+    doc = {"project": project,
+           "exported_at": int(meta.get("at") or time.time()),
+           "format": "one CycloneDX document per branch, side by side; not a merge",
+           "branches": [{"branch": en["branch"], "analysis_id": en.get("analysis_id"),
+                         "commit_sha": en.get("commit_sha", ""),
+                         "sbom": en.get("sbom")}
+                        for en in sorted(entries, key=lambda x: x["branch"])]}
+    return json.dumps(doc, indent=2)

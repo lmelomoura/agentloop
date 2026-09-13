@@ -32,12 +32,22 @@ def export(srv, monkeypatch):
 
 def test_a_format_outside_the_list_is_refused_at_the_edge(export):
     srv, calls = export
-    code, body, headers = srv.security_findings_export("web", "html")
-    # html never reaches the engine: the route checks the format itself, and
+    code, body, headers = srv.security_findings_export("web", "pdf")
+    # pdf never reaches the engine: the route checks the format itself, and
     # this asserts the handler agrees with it rather than trusting the caller
-    assert code == 400 or headers is None
-    code, body, headers = srv.security_findings_export("web", "md")
-    assert code == 200 and headers is not None
+    assert code == 400 and headers is None
+    for fmt in ("md", "json", "html", "sbom"):
+        code, body, headers = srv.security_findings_export("web", fmt)
+        assert code == 200 and headers is not None, fmt
+
+
+def test_the_sbom_bundle_is_not_named_like_a_single_cyclonedx(export):
+    # One CycloneDX per branch side by side is not a CycloneDX document, and
+    # SBOM tooling fed a `.cdx.json` of it would choke on the envelope.
+    srv, _ = export
+    _, _, headers = srv.security_findings_export("web", "sbom")
+    assert headers["Content-Disposition"].endswith('findings-web.sboms.json"')
+    assert ".cdx.json" not in headers["Content-Disposition"]
 
 
 def test_a_project_nobody_analysed_is_a_404_not_an_empty_file(export):

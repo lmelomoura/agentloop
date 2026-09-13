@@ -3092,7 +3092,14 @@ def security_report_guard(fmt):
 
 
 FINDINGS_EXPORT_FORMATS = {"md": "text/markdown; charset=utf-8",
-                           "json": "application/json; charset=utf-8"}
+                           "json": "application/json; charset=utf-8",
+                           "html": "text/html; charset=utf-8",
+                           "sbom": "application/json; charset=utf-8"}
+# The SBOM export is one CycloneDX per branch side by side, not a single
+# CycloneDX, so it does not take the `.cdx.json` name SBOM tooling reads --
+# a tool fed this file would choke on the envelope and the name would have
+# lied about what was inside.
+FINDINGS_EXPORT_EXTENSIONS = {"sbom": "sboms.json"}
 # Every character a download filename may carry, and nothing else. The name is
 # built from a PROJECT NAME -- free text an operator typed -- which is the one
 # input the sibling report route never has to handle: it is given an integer
@@ -3131,8 +3138,9 @@ def security_findings_export(project, fmt, shown=None):
     al(["security", "event", "--project", project,
         "--kind", "findings_exported",
         "--detail", f"{fmt} export of every finding, all branches"])
+    ext = FINDINGS_EXPORT_EXTENSIONS.get(fmt, fmt)
     return 200, out, {"Content-Disposition":
-                      f'attachment; filename="{_download_name(project, fmt)}"'}
+                      f'attachment; filename="{_download_name(project, ext)}"'}
 
 
 def security_report(analysis_id, fmt):

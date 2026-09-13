@@ -141,7 +141,7 @@ export async function secDownloadFindings(project, fmt, shown, btn){
     const link = document.createElement("a");
     link.href = blobUrl;
     link.download = _nameFromDisposition(r.headers.get("Content-Disposition"),
-                                         "findings." + fmt);
+                                         "findings." + (fmt === "sbom" ? "sboms.json" : fmt));
     document.body.appendChild(link);
     link.click();
     link.remove();
