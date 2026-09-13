@@ -120,8 +120,15 @@ def test_the_registry_rides_on_api_models(srv, tmp_path, monkeypatch):
     assert o["jobs_using"] == {"gpt-5.6-luna": 2}
     assert o["jobs_on_platform"] == 2 and o["jobs_on_platform_enabled"] == 2
     assert o["jobs_using_enabled"] == {"gpt-5.6-luna": 2}     # nothing parked on openai here
-    assert c["supported"] is False and c["usable"] is False and c["available"] is False
-    assert c["reason"] == "runs on OpenCode arrive with the OpenCode engine"
+    # The engine no longer refuses opencode (bin/agentloop, this delivery) --
+    # `supported` should follow. It still reads False here: this server's
+    # module-level PLATFORMS_PLANNED and the list_models() opencode literal
+    # are its OWN mirror of the registry, not read from the engine, and stay
+    # exactly as they were pending T8's _opencode_platform() (which is also
+    # where a real "opencode not installed" reason will come from `reason`
+    # rather than the placeholder sentence list_models() still hardcodes).
+    assert c["supported"] is True and c["usable"] is False
+    assert c["available"] is False and "opencode not installed" in c["reason"]
     assert out["configured"] is True and out["error"] == ""
     assert a["bin_source"] == "env" and a["bin"].endswith("test/fake-claude")
     # the keys the page reads today are still there, unchanged in shape
