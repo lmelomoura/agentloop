@@ -455,6 +455,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A stop during the deterministic phase ends the scanners and closes the
+  analysis.** The stop killed the run wrapper alone: the python `prepare`,
+  gitleaks and its git processes ran on to the end of a 30-minute budget,
+  and the analysis stayed `running` in the ledger with no run behind it, so
+  the page refused a second Analyse until the row was closed by hand. The
+  phase now runs in a process group of its own, recorded on the run's slot,
+  the stop signals the group, and the early-stop record closes the analysis
+  as `failed` through the same door the classifier uses.
+- **The secret rules read a long line through windows.** A minified bundle
+  or a dump is one line of megabytes; eight rules walked it at every
+  position, for every commit that touched the file, and the sweep spent 99%
+  of its budget there. One alternation of every rule's literal prefix gates
+  the battery, and on a line past 4,096 characters the rules run only on
+  the slice around each candidate: the same matches at the same line, in
+  the time of one C-level scan.
 - **The built-in history sweep stops at the tree sweep's 2 MB ceiling.**
   It promised no file-size cap; on a history with 503 blobs over 2 MB (the
   largest 130 MB) its 30-minute budget went into diffing a few of their

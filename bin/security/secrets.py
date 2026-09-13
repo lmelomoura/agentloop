@@ -251,6 +251,25 @@ def _pem_body_follows(rest_of_line: str, next_line: str) -> bool:
     return bool(_PEM_BODY.search(rest_of_line) or _PEM_BODY.search(next_line))
 
 
+# WHAT EVERY RULE ABOVE STARTS WITH, as one alternation of literals: the
+# prefix each shaped credential carries, and the five words the generic rule
+# keys on. It is the gate in front of the battery: a chunk or a line with no
+# candidate in it costs one C-level scan and no Python loop, and on a long
+# line the battery runs only on windows around the candidates. Every rule's
+# match contains one of these, so the gate never hides a hit -- the two are
+# pinned together by test_every_rule_is_reachable_through_the_candidate_gate.
+_CANDIDATE = re.compile(r"AKIA|ASIA|gh[opusr]_|xox[baprs]-|(?:sk|rk)_live_|sk-|AIza|"
+                        r"-----BEGIN|(?i:password|passwd|secret|token|api_?key)")
+# A line longer than this is not a line of source: a minified bundle, a
+# dump, a data file. Measured: the sweep spent 99% of a 30-minute budget in
+# `re.search` over such lines, eight rules at every position of two
+# megabytes, for every commit that touched the file. The window around a
+# candidate is wide enough for the longest shape any rule matches.
+_LONG_LINE = 4096
+_WINDOW_BEFORE = 16
+_WINDOW_AFTER = 320
+
+
 def _hits(text: str):
     """Yield (rule, severity, line_number) for every match. The value stays here.
 
@@ -258,20 +277,36 @@ def _hits(text: str):
     needs to see past the line it matched on: a PEM header is a finding only
     when its body follows (`_pem_body_follows`), and in a PEM file the body is
     the next line.
+
+    A LONG LINE IS READ THROUGH WINDOWS. Every rule's match contains one of
+    `_CANDIDATE`'s literals, so on a line past `_LONG_LINE` the battery runs
+    only on the slice around each candidate -- the same matches, at the
+    same line number, without eight regexes walking a two-megabyte line.
     """
     lines = text.splitlines()
     for lineno, line in enumerate(lines, start=1):
-        for name, severity, pattern, min_entropy in _RULES:
-            for m in pattern.finditer(line):
-                candidate = m.group(1)
-                if name == "generic_secret" and _is_placeholder(candidate):
-                    continue
-                if name == "private_key" and not _pem_body_follows(
-                        line[m.end():], lines[lineno] if lineno < len(lines) else ""):
-                    continue
-                if min_entropy and _entropy(candidate) < min_entropy:
-                    continue
-                yield name, severity, lineno
+        following = lines[lineno] if lineno < len(lines) else ""
+        if len(line) <= _LONG_LINE:
+            pieces = [line] if _CANDIDATE.search(line) else []
+        else:
+            pieces = [line[max(0, m.start() - _WINDOW_BEFORE):m.start() + _WINDOW_AFTER]
+                      for m in _CANDIDATE.finditer(line)]
+        seen = set()
+        for piece in pieces:
+            for name, severity, pattern, min_entropy in _RULES:
+                for m in pattern.finditer(piece):
+                    candidate = m.group(1)
+                    if name == "generic_secret" and _is_placeholder(candidate):
+                        continue
+                    if name == "private_key" and not _pem_body_follows(
+                            piece[m.end():], following):
+                        continue
+                    if min_entropy and _entropy(candidate) < min_entropy:
+                        continue
+                    if (name, candidate) in seen:
+                        continue
+                    seen.add((name, candidate))
+                    yield name, severity, lineno
 
 
 def looks_like_a_secret(text: str):
@@ -817,7 +852,7 @@ def scan_history(root, since_sha, ignore=(), rename=None, budget=None):
         # battery: a chunk with no candidate at all -- nearly every one --
         # costs eight searches and no Python loop. The rules carry no anchor,
         # so anything `_hits` would find on a line is found on the chunk too.
-        if not any(pattern.search(text) for _, _, pattern, _ in _RULES):
+        if not _CANDIDATE.search(text):
             added.clear()
             return
         for rule, severity, _ in _hits(text):
