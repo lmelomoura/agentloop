@@ -268,6 +268,32 @@ _CANDIDATE = re.compile(r"AKIA|ASIA|gh[opusr]_|xox[baprs]-|(?:sk|rk)_live_|sk-|A
 _LONG_LINE = 4096
 _WINDOW_BEFORE = 16
 _WINDOW_AFTER = 320
+# The same gate as `_CANDIDATE`, as plain substrings for `str.find`: on a
+# line of megabytes the regex alternation still walks every position, and
+# the sweep measured 57% of its time in that scan; `find` runs at memory
+# speed. The case-sensitive literals are looked for as they are, the five
+# generic words on a lower-cased copy. `gh[opusr]_` and `xox[baprs]-` are
+# widened to `gh` + `_` and `xox` (a superset: a window with a false
+# candidate costs the battery one slice and finds nothing).
+_LITERALS = ("AKIA", "ASIA", "_live_", "sk-", "AIza", "-----BEGIN", "xox", "gh")
+_WORDS = ("password", "passwd", "secret", "token", "api_key", "apikey")
+
+
+def _candidate_starts(line):
+    """Every offset a rule could match at on a long line, ascending."""
+    starts = set()
+    for lit in _LITERALS:
+        at = line.find(lit)
+        while at != -1:
+            starts.add(at)
+            at = line.find(lit, at + 1)
+    low = line.lower()
+    for word in _WORDS:
+        at = low.find(word)
+        while at != -1:
+            starts.add(at)
+            at = low.find(word, at + 1)
+    return sorted(starts)
 
 
 def _hits(text: str):
@@ -289,8 +315,16 @@ def _hits(text: str):
         if len(line) <= _LONG_LINE:
             pieces = [line] if _CANDIDATE.search(line) else []
         else:
-            pieces = [line[max(0, m.start() - _WINDOW_BEFORE):m.start() + _WINDOW_AFTER]
-                      for m in _CANDIDATE.finditer(line)]
+            # Windows that overlap are one window: a bundle full of the word
+            # "token" would otherwise hand the battery a slice per occurrence.
+            pieces = []
+            for at in _candidate_starts(line):
+                lo, hi = max(0, at - _WINDOW_BEFORE), at + _WINDOW_AFTER
+                if pieces and lo <= pieces[-1][1]:
+                    pieces[-1][1] = max(pieces[-1][1], hi)
+                else:
+                    pieces.append([lo, hi])
+            pieces = [line[lo:hi] for lo, hi in pieces]
         seen = set()
         for piece in pieces:
             for name, severity, pattern, min_entropy in _RULES:
@@ -852,7 +886,11 @@ def scan_history(root, since_sha, ignore=(), rename=None, budget=None):
         # battery: a chunk with no candidate at all -- nearly every one --
         # costs eight searches and no Python loop. The rules carry no anchor,
         # so anything `_hits` would find on a line is found on the chunk too.
-        if not _CANDIDATE.search(text):
+        # The chunk gate on substrings too: a regex alternation over a chunk
+        # of megabytes walks every position; eight `find` calls and one
+        # lower-case pass do not.
+        low = text.lower()
+        if not (any(lit in text for lit in _LITERALS) or any(w in low for w in _WORDS)):
             added.clear()
             return
         for rule, severity, _ in _hits(text):
