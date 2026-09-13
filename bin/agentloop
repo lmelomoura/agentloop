@@ -12291,7 +12291,14 @@ cmd_install() {
   </dict>
   <key>StandardOutPath</key><string>$DATA_DIR/launchd.out.log</string>
   <key>StandardErrorPath</key><string>$DATA_DIR/launchd.err.log</string>
-  <key>ProcessType</key><string>Background</string>
+  <!-- Standard, not Background. Everything a run spawns inherits this
+       agent's QoS: at Background, macOS pins the whole tree to the
+       efficiency cores and throttles it. Measured on a security analysis:
+       gitleaks took 57 minutes on a range it does in 3.5 from a terminal,
+       semgrep 497 s against 60 s, and the built-in history sweep 8 minutes
+       for what it does in seconds; a platform check that answers in 1.4 s
+       timed out at 30 s. -->
+  <key>ProcessType</key><string>Standard</string>
 </dict>
 </plist>
 PLIST
@@ -12324,7 +12331,10 @@ PLIST
   </dict>
   <key>StandardOutPath</key><string>$DATA_DIR/server.log</string>
   <key>StandardErrorPath</key><string>$DATA_DIR/server.log</string>
-  <key>ProcessType</key><string>Background</string>
+  <!-- Standard for the same reason as the tick's: the engine calls the
+       server makes (platform checks, catalog resolves, the analyses it
+       launches) ran throttled to the efficiency cores at Background. -->
+  <key>ProcessType</key><string>Standard</string>
 </dict>
 </plist>
 PLIST
