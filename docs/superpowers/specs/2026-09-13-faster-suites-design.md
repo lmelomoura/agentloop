@@ -48,8 +48,24 @@ alguma falhar.
 
 | | parede |
 |---|---|
-| hoje | ~7m |
-| **com a alavanca 0** | **~4m30** (o máximo das três, que é o selftest) |
+| hoje, em sequência | ~7m |
+| previsto | ~4m30 (o máximo das três) |
+| **MEDIDO, 2026-09-13** | **7m04 — ganho ZERO** |
+
+**A previsão estava errada e a medição mata a alavanca.** Verifiquei que as
+três suites não partilham *estado* e concluí daí que ganhariam tempo. Não
+ganham: partilham o recurso que interessa. O selftest lança centenas de
+processos e a suite de segurança corre quatro engines; a competir pela CPU, o
+selftest estica exactamente o que as outras poupam. 424 s em paralelo contra
+~420 s em sequência.
+
+Fica escrito com o número para ninguém repetir a inferência: *não partilham
+estado* não implica *ganham tempo juntas*.
+
+O que sobra desta alavanca não é paralelismo, é a **duplicação**: o e2e estava
+a ser corrido à parte por quem seguisse o README, e o selftest já o embute.
+Deixar de o correr duas vezes poupa 2m30 reais a quem o fazia — e isso não é
+paralelismo, é parar de fazer trabalho a dobrar.
 
 Risco: praticamente nenhum. As suites já correm em processos separados com
 sandboxes separadas; só passam a correr ao mesmo tempo. O que muda de
@@ -100,8 +116,8 @@ O desenho:
 | | e2e | selftest | parede da bateria |
 |---|---|---|---|
 | hoje | 176 s | 269 s | ~7m |
-| alavanca 0 | 176 s | 269 s | ~4m30 |
-| **alavancas 0 + 1** (4 trabalhadores) | **~55 s** | **~150 s** | **~2m30** |
+| alavanca 0 (medida) | 176 s | 269 s | ~7m — sem ganho |
+| **alavanca 1** (4 trabalhadores) | **~55 s** | **~150 s** | **~4m** (estimativa por medir) |
 
 O tecto do e2e é o trabalhador mais lento, e o trabalhador mais lento é
 limitado pelos `sleep` dos seus cenários — não pela CPU. Com os 39 s de
