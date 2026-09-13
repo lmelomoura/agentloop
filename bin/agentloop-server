@@ -2485,6 +2485,10 @@ PLATFORM_PERMISSIONS = {
         {"v": "workspace-write", "label": "workspace-write — sandbox: writes inside the workspace"},
         {"v": "full-access", "label": "full-access — no sandbox, no approvals"},
     ],
+    "opencode": [
+        {"v": "full-access", "label": "full-access — every tool, no approvals (the worktree is the isolation)"},
+        {"v": "read-only", "label": "read-only — no edit, write, bash or subagents"},
+    ],
 }
 ANTHROPIC_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
@@ -2572,6 +2576,77 @@ def _openai_platform():
             "default_model": models[0]["v"] if models else "",
             "pricing_at": table.get("_refreshed_at") if _num(table.get("_refreshed_at")) else 0,
             "pricing_source": source_url if isinstance(source_url, str) else "",
+            "unpriced": [m["v"] for m in models if not m["priced"]]}
+
+
+def _opencode_platform():
+    """The opencode entry of /api/models, from config/models.json's `opencode`
+    block (written by `resolve-models opencode`). Missing altogether, it is
+    resolved ONCE, synchronously, when the CLI exists (about a second:
+    `opencode models --verbose` reads the CLI's own cache); without the CLI
+    the answer is `available: false` and the reason. A model is `priced`
+    when the CLI's catalog prices it OR the operator's table carries a row
+    for it -- a manual row of zeros is a price (a declared free model); a
+    catalog of zeros is not (measured: a provider with no cost configured
+    lists the same zeros as a free one)."""
+    path = CONFIG_DIR / "models.json"
+
+    def block():
+        try:
+            return (json.loads(path.read_text()) or {}).get("opencode")
+        except Exception:  # noqa: BLE001
+            return None
+
+    b = block()
+    if b is None:
+        exe = _env("OPENCODE_BIN") or shutil.which("opencode") or \
+            ("/opt/homebrew/bin/opencode" if os.path.exists("/opt/homebrew/bin/opencode") else None)
+        if exe:
+            al(["resolve-models", "opencode"])
+            b = block()
+    empty = {"models": [], "efforts": [], "permissions": PLATFORM_PERMISSIONS["opencode"],
+             "default_model": "", "unpriced": []}
+    if not isinstance(b, dict) or not isinstance(b.get("models"), list):
+        reason = (b or {}).get("reason") if isinstance(b, dict) else None
+        return {"available": False, "reason": reason or "opencode not installed: install it, configure a provider, then agentloop resolve-models opencode",
+                "catalog_at": (b or {}).get("at", 0) if isinstance(b, dict) else 0, **empty}
+    try:
+        table = json.loads((CONFIG_DIR / "pricing.json").read_text()) or {}
+    except Exception:  # noqa: BLE001
+        table = {}
+    rows = table.get("opencode") if isinstance(table, dict) else None
+    rows = rows if isinstance(rows, dict) else {}
+
+    def _num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    def price_of(m):
+        cost = m.get("cost") if isinstance(m.get("cost"), dict) else {}
+        if m.get("priced") is True:
+            return {"input": cost.get("input", 0), "cached_input": cost.get("cache_read", 0),
+                    "output": cost.get("output", 0), "cache_write": cost.get("cache_write", 0)}
+        row = rows.get(m.get("id"))
+        if not isinstance(row, dict) or not all(_num(row.get(k)) for k in ("input", "cached_input", "output")):
+            return None
+        return {"input": row["input"], "cached_input": row["cached_input"], "output": row["output"],
+                "cache_write": row.get("cache_write") if _num(row.get("cache_write")) else 0}
+
+    def _model(m):
+        price = price_of(m)
+        return {"v": m["id"], "label": m.get("name") or m["id"], "provider": m.get("provider") or "",
+                "desc": "", "efforts": list(m.get("variants") or []), "default_effort": "",
+                "deprecated_by": "", "retires_at": "", "priced": price is not None, "price": price,
+                "tools": m.get("tools") is not False, "context": m.get("context") or 0}
+
+    models = [_model(m) for m in b["models"] if isinstance(m, dict) and m.get("id") and m.get("status", "active") == "active"]
+    efforts, seen = [], set()
+    for m in models:
+        for e in m["efforts"]:
+            if e not in seen:
+                seen.add(e); efforts.append(e)
+    return {"available": True, "reason": "", "catalog_at": b.get("at", 0),
+            "models": models, "efforts": efforts, "permissions": PLATFORM_PERMISSIONS["opencode"],
+            "default_model": models[0]["v"] if models else "",
             "unpriced": [m["v"] for m in models if not m["priced"]]}
 
 
@@ -2681,6 +2756,8 @@ def jobs_using(p, jobs, projects, resolved, default, catalog_slugs):
     def valid(m):
         if p == "openai":
             return not catalog_slugs or m in catalog_slugs   # an empty catalog validates nothing
+        if p == "opencode":
+            return not catalog_slugs or m in catalog_slugs   # same rule, the opencode catalog's ids
         return m in ("opus", "sonnet", "haiku", "fable") or m.startswith("claude-")
 
     def effective(m):
@@ -2754,7 +2831,7 @@ def list_models():
     500. `platforms.openai.models` is where those slugs belong.
     """
     cfg, err = platforms_config()
-    resolved, catalog_slugs = {}, set()
+    resolved, catalog_slugs, opencode_ids = {}, set(), set()
     try:
         data = json.loads((CONFIG_DIR / "models.json").read_text())
         resolved = data.get("resolved") or {}
@@ -2762,6 +2839,10 @@ def list_models():
         if isinstance(odata, dict):
             catalog_slugs = {m["slug"] for m in (odata.get("models") or [])
                               if isinstance(m, dict) and isinstance(m.get("slug"), str)}
+        odata_oc = data.get("opencode")
+        if isinstance(odata_oc, dict):
+            opencode_ids = {m["id"] for m in (odata_oc.get("models") or [])
+                             if isinstance(m, dict) and m.get("id")}
     except Exception:  # noqa: BLE001
         resolved = {}
     if not isinstance(resolved, dict):
@@ -2841,10 +2922,9 @@ def list_models():
     openai = _openai_platform()
     openai.update(platform_entry("openai", cfg, jobs, projects, resolved, catalog_slugs))
     openai["default_model"] = (openai["models_enabled"] or [""])[0]
-    opencode = {"available": False,
-                "reason": "opencode not installed: install it, configure a provider, then agentloop resolve-models opencode",
-                "models": [], "efforts": [], "permissions": [], "default_model": "", "catalog_at": 0}
-    opencode.update(platform_entry("opencode", cfg, jobs, projects, resolved, catalog_slugs))
+    opencode = _opencode_platform()
+    opencode.update(platform_entry("opencode", cfg, jobs, projects, resolved, opencode_ids))
+    opencode["default_model"] = (opencode["models_enabled"] or [""])[0]
     platforms = {"anthropic": anthropic, "openai": openai, "opencode": opencode}
     return {"models": models, "efforts": list(ANTHROPIC_EFFORTS), "platforms": platforms,
             "configured": any(v["usable"] for v in platforms.values()), "error": err}

@@ -92,10 +92,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     job accepts `opencode` too (previously reachable only by hand-editing
     `projects.json`, since `project-set` refused it as a project's own
     platform) and now refuses a model the catalog marks as making no tool
-    calls, falling back the way an unavailable catalog already did.
+    calls, falling back the way a model switched off in Settings already does.
     `config/platforms.json`'s seed treats OpenCode exactly as it treats the
     other two, rather than always seeding it disabled; `project-set` takes
     `platform: opencode` on a project and on its security block.
+  - `/api/models` carries the OpenCode catalog per model: the provider, the
+    price per million (the CLI's own, or the operator's row in
+    `config/pricing.json`'s new `opencode` block, or none), the variants as
+    the effort ladder, whether the model makes tool calls. `agentloop
+    platforms`, `status` and `usage` say what they say for the other two,
+    OpenCode's way: the catalog's age, the enabled models still unpriced,
+    and that there are no usage windows to wait for.
 
 - **Settings › Platforms, and `config/platforms.json`: a job may only pick a
   platform and a model somebody switched on.** The Settings item comes out of

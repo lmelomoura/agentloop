@@ -8880,8 +8880,8 @@ def test_the_anthropic_fallback_permissions_say_what_the_server_says(srv, tmp_pa
     """The page opens on the fallback and swaps to the server's list on the
     first fetch; if the two differed, the labels would flip on screen. So
     FALLBACK_PERMISSIONS is PLATFORM_PERMISSIONS (bin/agentloop-server)
-    verbatim -- v AND label, in the server's order -- for both platforms, not
-    only the Anthropic one that drifted. The JS object is read by node,
+    verbatim -- v AND label, in the server's order -- for all three
+    platforms, not only the Anthropic one that drifted. The JS object is read by node,
     exactly as the page reads it (turning its source into JSON by string
     replacement would trip on the trailing commas); the server's is the
     literal in its source."""
@@ -8892,8 +8892,8 @@ def test_the_anthropic_fallback_permissions_say_what_the_server_says(srv, tmp_pa
     server = (REPO / "bin" / "agentloop-server").read_text()
     brace = server.index("{", server.index("\nPLATFORM_PERMISSIONS = "))
     table = ast.literal_eval(server[brace:_scan_balanced(server, brace)])
-    assert set(fallback) == set(table) == {"anthropic", "openai"}
-    for platform in ("anthropic", "openai"):
+    assert set(fallback) == set(table) == {"anthropic", "openai", "opencode"}
+    for platform in ("anthropic", "openai", "opencode"):
         assert [(o["v"], o["label"]) for o in fallback[platform]] \
             == [(o["v"], o["label"]) for o in table[platform]], platform
 

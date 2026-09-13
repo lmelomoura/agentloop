@@ -139,6 +139,97 @@ def test_the_registry_rides_on_api_models(srv, tmp_path, monkeypatch):
     assert a["families"] == {"opus": "claude-opus-5"}
 
 
+def test_the_opencode_entry_reads_the_catalog_and_prices_from_it(srv, monkeypatch, tmp_path):
+    cfg = Path(srv.CONFIG_DIR)
+    (cfg / "models.json").write_text(json.dumps({"resolved": {}, "opencode": {
+        "at": 1789226000, "source": "opencode models --verbose", "version": "1.18.30", "models": [
+            {"id": "opencode/big-pickle", "provider": "opencode", "name": "Big Pickle",
+             "cost": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}, "priced": False,
+             "context": 200000, "output_limit": 32000, "variants": [], "tools": True, "reasoning": True, "status": "active"},
+            {"id": "pdm_ai/glm-5.3-flash", "provider": "pdm_ai", "name": "glm-5.3-flash",
+             "cost": {"input": 0.033011, "output": 0.139816, "cache_read": 0, "cache_write": 0}, "priced": True,
+             "context": 197144, "output_limit": 65000, "variants": ["max", "high", "non-think"], "tools": True,
+             "reasoning": True, "status": "active"},
+            {"id": "pdm_ai/old", "provider": "pdm_ai", "name": "old", "cost": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+             "priced": False, "context": 1, "output_limit": 1, "variants": [], "tools": False, "reasoning": False, "status": "retired"}]}}))
+    (cfg / "pricing.json").write_text(json.dumps({"opencode": {
+        "opencode/big-pickle": {"input": 0, "cached_input": 0, "output": 0, "cache_write": 0, "source": "manual"}}}))
+    # Through srv.PLATFORMS_FILE, not a literal path under CONFIG_DIR: the
+    # autouse _isolated_registry fixture above points PLATFORMS_FILE at a
+    # tmp_path of its own so list_models() never seeds/discards the real
+    # engine's file, and platforms_config() reads that current reference.
+    _write_platforms(srv, {
+        "anthropic": {"enabled": True, "bin": "", "models": ["claude-opus-5"]},
+        "openai": {"enabled": False, "bin": "", "models": []},
+        "opencode": {"enabled": True, "bin": "", "models": ["pdm_ai/glm-5.3-flash"]}})
+    monkeypatch.setenv("AGENTLOOP_OPENCODE_BIN", "/nonexistent/opencode")
+    c = srv.list_models()["platforms"]["opencode"]
+    assert c["supported"] is True and c["available"] is True and c["reason"] == ""
+    assert c["catalog_at"] == 1789226000
+    assert [m["v"] for m in c["models"]] == ["opencode/big-pickle", "pdm_ai/glm-5.3-flash"]   # retired: out
+    glm = c["models"][1]
+    assert glm["label"] == "glm-5.3-flash" and glm["provider"] == "pdm_ai"
+    assert glm["efforts"] == ["max", "high", "non-think"] and glm["default_effort"] == ""
+    assert glm["priced"] is True and glm["price"] == {"input": 0.033011, "cached_input": 0, "output": 0.139816, "cache_write": 0}
+    assert glm["tools"] is True and glm["context"] == 197144
+    pickle = c["models"][0]
+    assert pickle["priced"] is True and pickle["price"]["input"] == 0          # the operator's manual zero row IS a price
+    assert pickle["efforts"] == []
+    assert c["efforts"] == ["max", "high", "non-think"]
+    assert [p["v"] for p in c["permissions"]] == ["full-access", "read-only"]
+    assert c["default_model"] == "pdm_ai/glm-5.3-flash" and c["usable"] is True
+    assert c["unpriced"] == []
+
+
+def test_an_unpriced_opencode_model_is_named(srv, monkeypatch):
+    cfg = Path(srv.CONFIG_DIR)
+    (cfg / "models.json").write_text(json.dumps({"resolved": {}, "opencode": {"at": 1, "source": "x", "version": "1.18.30", "models": [
+        {"id": "opencode/big-pickle", "provider": "opencode", "name": "Big Pickle", "cost": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+         "priced": False, "context": 1, "output_limit": 1, "variants": [], "tools": True, "reasoning": True, "status": "active"}]}}))
+    (cfg / "pricing.json").write_text(json.dumps({"opencode": {}}))
+    c = srv.list_models()["platforms"]["opencode"]
+    assert c["models"][0]["priced"] is False and c["models"][0]["price"] is None
+    assert c["unpriced"] == ["opencode/big-pickle"]
+
+
+def test_without_a_catalog_and_without_the_binary_the_entry_says_so(srv, monkeypatch):
+    cfg = Path(srv.CONFIG_DIR)
+    (cfg / "models.json").write_text(json.dumps({"resolved": {}}))
+    monkeypatch.setenv("AGENTLOOP_OPENCODE_BIN", "/nonexistent/opencode")
+    c = srv.list_models()["platforms"]["opencode"]
+    assert c["supported"] is True and c["available"] is False
+    assert "opencode not installed" in c["reason"]
+    assert c["models"] == [] and c["permissions"] and c["permissions"][0]["v"] == "full-access"
+
+
+def test_a_two_key_platforms_file_still_lists_the_opencode_card_disabled(srv, monkeypatch):
+    # The file every install has today has no opencode key; the card comes
+    # from the registry and reads disabled, never as an error.
+    _write_platforms(srv, {
+        "anthropic": {"enabled": True, "bin": "", "models": ["claude-opus-5"]},
+        "openai": {"enabled": False, "bin": "", "models": []}})
+    cfg = Path(srv.CONFIG_DIR)
+    (cfg / "models.json").write_text(json.dumps({"resolved": {}}))
+    monkeypatch.setenv("AGENTLOOP_OPENCODE_BIN", "/nonexistent/opencode")
+    out = srv.list_models()
+    c = out["platforms"]["opencode"]
+    assert c["supported"] is True and c["enabled"] is False and c["usable"] is False
+    assert c["models_enabled"] == [] and out["error"] in ("", None)
+    assert out["platforms"]["anthropic"]["enabled"] is True
+
+
+def test_the_server_permission_lists_match_the_engine_for_opencode(srv):
+    # The engine is the authority on the vocabulary; the server mirrors it.
+    # tests/test_platforms_api.py already pins anthropic and openai this way
+    # (read that test and call the engine exactly as it does; the shape below
+    # is the plain `agentloop platforms` call).
+    env = {**os.environ, "AGENTLOOP_CONFIG": str(srv.CONFIG_DIR), "AGENTLOOP_DATA": str(srv.DATA_DIR),
+           "AGENTLOOP_OPENCODE_BIN": "/nonexistent/opencode"}
+    out = subprocess.run([str(REPO / "bin" / "agentloop"), "platforms"], capture_output=True, text=True, env=env, timeout=60)
+    engine = json.loads(out.stdout)
+    assert [p["v"] for p in srv.PLATFORM_PERMISSIONS["opencode"]] == engine["opencode"]["permissions"]
+
+
 def test_a_parked_jobs_model_still_counts_as_using_the_platform(srv, tmp_path, monkeypatch):
     """The reported defect: an operator whose jobs are all switched off saw
     "no jobs" on every model those jobs name, so switching the model off read
@@ -390,7 +481,11 @@ def test_a_missing_block_is_resolved_once_when_codex_exists(srv, monkeypatch):
         _write_models(srv, openai=_catalog_block())
         return True, "ok"
     monkeypatch.setattr(srv, "al", fake_al)
-    monkeypatch.setattr(srv.shutil, "which", lambda name: "/opt/homebrew/bin/codex")
+    # name-aware: a blanket truthy path would also make _opencode_platform's
+    # own shutil.which("opencode") probe fire, adding a second, unwanted call.
+    monkeypatch.setattr(srv.shutil, "which", lambda name: "/opt/homebrew/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr(srv.os.path, "exists", lambda p: False)
+    monkeypatch.delenv("AGENTLOOP_OPENCODE_BIN", raising=False)
     o = srv.list_models()["platforms"]["openai"]
     assert calls == [["resolve-models", "openai"]]
     assert o["available"] is True
@@ -406,6 +501,10 @@ def test_a_missing_block_without_codex_is_reported_not_resolved(srv, monkeypatch
     # must not make "no codex" a host-dependent result.
     monkeypatch.setattr(srv.os.path, "exists", lambda p: False)
     monkeypatch.delenv("AGENTLOOP_CODEX_BIN", raising=False)
+    # Same story for opencode: the autouse fixture's AGENTLOOP_OPENCODE_BIN
+    # is a non-empty (if bogus) path, which alone would make
+    # _opencode_platform think the CLI exists and call the forbidden al().
+    monkeypatch.delenv("AGENTLOOP_OPENCODE_BIN", raising=False)
     o = srv.list_models()["platforms"]["openai"]
     assert o["available"] is False and "codex" in o["reason"]
 

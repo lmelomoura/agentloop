@@ -90,6 +90,10 @@ export const FALLBACK_PERMISSIONS = {
     {v: "workspace-write", label: "workspace-write — sandbox: writes inside the workspace"},
     {v: "full-access", label: "full-access — no sandbox, no approvals"},
   ],
+  opencode: [
+    {v: "full-access", label: "full-access — every tool, no approvals (the worktree is the isolation)"},
+    {v: "read-only", label: "read-only — no edit, write, bash or subagents"},
+  ],
 };
 
 export function permissionsFor(platform, platforms){

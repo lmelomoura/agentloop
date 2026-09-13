@@ -274,6 +274,10 @@
       { v: "read-only", label: "read-only \u2014 sandbox: no writes, no network" },
       { v: "workspace-write", label: "workspace-write \u2014 sandbox: writes inside the workspace" },
       { v: "full-access", label: "full-access \u2014 no sandbox, no approvals" }
+    ],
+    opencode: [
+      { v: "full-access", label: "full-access \u2014 every tool, no approvals (the worktree is the isolation)" },
+      { v: "read-only", label: "read-only \u2014 no edit, write, bash or subagents" }
     ]
   };
   function permissionsFor(platform, platforms) {
@@ -3022,5 +3026,5 @@
     setupBanner
   };
 })();
-/* ui-bundle: 4f8b73dbc5f355fa23ffc3297e72a86f303b73f97b3db6682333f0ee957fddb8 */
-/* ui-sources: 1fbf00b37828a6f34eb9c63bfcead7502f451a7a7e38e98725d2b92711b75dad */
+/* ui-bundle: 4ec1d8c62acda3cf5fbd9def1dd38eb330a63f84f1ec7c3d84480fcee7df8a70 */
+/* ui-sources: e66ebd00bc79ef1e58796748580e822548736164cb5a0ecce9bb6600aa54f33c */

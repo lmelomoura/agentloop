@@ -140,7 +140,8 @@ CLAUDE_BIN="${AGENTLOOP_CLAUDE_BIN:-$_claude_default}"
 # there after every run.
 CODEX_BIN="${AGENTLOOP_CODEX_BIN:-$(command -v codex 2>/dev/null || echo /opt/homebrew/bin/codex)}"
 CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
-# OpenCode: listed and detected, never launched in this release (PLATFORMS_PLANNED).
+# OpenCode: the third platform's own binary, detected the same way as
+# Claude's and Codex's above.
 if command -v opencode >/dev/null 2>&1; then _opencode_default="$(command -v opencode)"
 elif [ -x "$HOME/.opencode/bin/opencode" ]; then _opencode_default="$HOME/.opencode/bin/opencode"
 else _opencode_default="/opt/homebrew/bin/opencode"; fi
@@ -1311,12 +1312,12 @@ job_platform() { # job_platform <id>
 # platform, still runs -- on that platform's default -- so the seed has to
 # credit the default to it, not an empty string. platform_default_model is
 # the function that knows the default, but platforms_jq never calls it (nor
-# any openai_catalog_* reader -- openai_catalog_visible already sits on the
-# seed's own path, feeding $odef) directly: platform_default_model reads the
-# enabled models back out of THIS file, and calling it, or a catalog reader
-# it comes to depend on, from in here would be that same loop one layer
-# down. So platforms_jq takes both platforms'
-# defaults as arguments, and each caller works out its own (see platforms_seed vs.
+# any catalog reader -- openai_catalog_visible and opencode_catalog_visible
+# already sit on the seed's own path, feeding $odef and $ocdef) directly:
+# platform_default_model reads the enabled models back out of THIS file, and
+# calling it, or a catalog reader it comes to depend on, from in here would
+# be that same loop one layer down. So platforms_jq takes all three
+# platforms' defaults as arguments, and each caller works out its own (see platforms_seed vs.
 # platform_jobs_on below: the seed can only use what it can compute without
 # this file; a live read uses the real thing).
 PLATFORMS_JQ='
@@ -2464,6 +2465,16 @@ pricing_unpriced() { # the visible catalog slugs with no numeric price, one per 
   done
 }
 
+opencode_unpriced() { # the enabled opencode ids with no price in the catalog nor in the table, one per line
+  local m
+  for m in $(platform_models_enabled opencode); do
+    opencode_catalog_priced "$m" && continue
+    [ -s "$PRICING_FILE" ] && "$JQ" -e --arg m "$m" '.opencode[$m] | (.input|type) == "number" and (.cached_input|type) == "number" and (.output|type) == "number"' \
+      "$PRICING_FILE" >/dev/null 2>&1 && continue
+    printf '%s\n' "$m"
+  done
+}
+
 pricing_report_missing() { # pricing_report_missing <slugs> — the daily warning, when a visible slug still has no price
   [ -n "${1:-}" ] || return 0
   log_tick "pricing: no price for ${1}— those runs record cost_basis none and the dollar caps do not see their spend (add a manual row to config/pricing.json, or wait for the source)"
@@ -3504,6 +3515,10 @@ cmd_usage() {
   else
     local p reason
     for p in $PLATFORMS; do
+      if [ "$p" = "opencode" ]; then
+        echo "opencode: no usage windows — each provider has its own API, and nothing on the stream or in the export reports one"
+        continue
+      fi
       "$JQ" -r --arg p "$p" --argjson now "$now" '
         (.[$p] // {}) | to_entries[]
         | .value as $v
@@ -4029,6 +4044,8 @@ JSON
   pfoc_env() { PLATFORMS_FILE="$pfoc/platforms.json"; JOBS_FILE="$pfoc/jobs.json"; PROJECTS_FILE="$pfoc/projects.json"; MODELS_FILE="$pfoc/models.json"; }
   ( pfoc_env; platforms_ensure )
   ( pfoc_env; platform_enabled opencode ); want "opencode is seeded enabled when an enabled job runs on it" 0 $?
+  [ "$( pfoc_env; platform_models_enabled opencode | tr '\n' ' ' )" = "opencode/big-pickle " ] \
+    && ok "and the seed carries the model that job names" || bad "opencode models seeded: '$( pfoc_env; platform_models_enabled opencode | tr '\n' ' ' )'"
   got="$( pf_env; platform_models_enabled anthropic | tr '\n' ' ' )"
   [ "$got" = "claude-opus-5 claude-sonnet-5 claude-fable-5-1 " ] \
     && ok "anthropic's models: the ids in use, a family resolved through the cache, a switched-off job's model too, no repeats" \
@@ -4494,7 +4511,8 @@ JSON
       and .openai.jobs_on_platform == 1 and .openai.jobs_using == {"gpt-a": 1} and .anthropic.jobs_using == {"claude-opus-5": 1}
       and .openai.jobs_on_platform_enabled == 1 and .openai.jobs_using_enabled == {"gpt-a": 1}
       and .anthropic.jobs_on_platform_enabled == 1 and .anthropic.jobs_using_enabled == {"claude-opus-5": 1}
-      and .opencode.usable == false and (.opencode.models_enabled == [])' >/dev/null 2>&1 \
+      and .opencode.usable == false and (.opencode.models_enabled == [])
+      and .opencode.supported == true and (.opencode | has("unpriced"))' >/dev/null 2>&1 \
     && ok "platforms: the three platforms, each with enabled, usable, bin_source, models_enabled and both counts of the jobs using them" || bad "platforms: $_pl"
   # Every job in the fixture above is switched on, so the two maps come out
   # identical there and a filter that had lost its `select(.on)` would read
@@ -4845,8 +4863,7 @@ JSON
     PLIST_PATH=/nonexistent                       # installed_config_dir answers nothing, the CLI default
     CODEX_BIN="$BASE_DIR/test/fake-codex"
     # An AGENTLOOP_*_BIN exported by the invoking shell must never win over the stand-ins above.
-    AGENTLOOP_CLAUDE_BIN=""; AGENTLOOP_CODEX_BIN=""; AGENTLOOP_OPENCODE_BIN=""
-    OPENCODE_BIN=/nonexistent
+    AGENTLOOP_CLAUDE_BIN=""; AGENTLOOP_CODEX_BIN=""; AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode"
     CONFIG_DIR="$tmp/sp"
     MODELS_FILE="$tmp/sp/models.json"
     PRICING_FILE="$tmp/sp/pricing.json"
@@ -4857,11 +4874,12 @@ JSON
     cp "$BASE_DIR/config/pricing.example.json" "$PRICING_FILE"
     printf '{"jobs":[]}\n' > "$tmp/sp/jobs.json"
     printf '{"projects":[]}\n' > "$tmp/sp/projects.json"
-    printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},"openai":{"enabled":true,"bin":"","models":["gpt-5.6-sol"]},"opencode":{"enabled":false,"bin":"","models":[]}}}\n' > "$tmp/sp/platforms.json"
+    printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},"openai":{"enabled":true,"bin":"","models":["gpt-5.6-sol"]},"opencode":{"enabled":true,"bin":"","models":[]}}}\n' > "$tmp/sp/platforms.json"
     _upass=0; _ufail=0
     ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
     bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
     resolve_models_openai >/dev/null
+    resolve_models_opencode >/dev/null
     _b="$(status_platforms_block)"
     printf '%s\n' "$_b" | grep -q '^anthropic : enabled — 2.1.0 (Claude Code), unknown — claude auth status needs Claude Code 2.1+; 1 of 1 models enabled$' \
       && ok "status_platforms_block: the Claude line carries enabled, version, account and the model count" \
@@ -4869,8 +4887,8 @@ JSON
     printf '%s\n' "$_b" | grep -q '^openai    : enabled — codex-cli 0.148.0, Logged in using ChatGPT; 1 of 5 models enabled; catalog [0-9]*m ago (5 models); prices [0-9]*[mhd] ago; unpriced: none$' \
       && ok "status_platforms_block: the Codex line adds catalog age and size, price age, unpriced" \
       || bad "openai line: $(printf '%s\n' "$_b" | sed -n 2p)"
-    printf '%s\n' "$_b" | grep -q '^opencode  : disabled — opencode not found at /nonexistent — set the path in Settings (or AGENTLOOP_OPENCODE_BIN); install: brew install opencode (or: npm i -g opencode-ai)$' \
-      && ok "the opencode line says disabled and why the binary is missing" \
+    printf '%s\n' "$_b" | grep -q '^opencode  : enabled — 1.18.30, 0 credentials · providers: opencode, pdm_ai; 0 of 13 models enabled; catalog [0-9]*m ago (13 models); unpriced: none$' \
+      && ok "the opencode line adds the account's providers, the catalog age and size, and the enabled models still unpriced" \
       || bad "opencode line: $(printf '%s\n' "$_b" | sed -n 3p)"
     # The pin the install carries, by either route (the variable; the plist a
     # previous install wrote), never the CLAUDE_CONFIG_DIR of this process.
@@ -5269,6 +5287,9 @@ JSON
   printf '%s' "$out" | grep -q "unknown OpenCode model 'opencode/nope' — the catalog lists: opencode/big-pickle pdm_ai/glm-5.3-flash pdm_ai/vision" \
     && ok "an id outside the catalog is refused, naming the catalog" || bad "no catalog refusal: $out"
   printf 'high' | cfg_al set-field cj effort >/dev/null 2>&1; want "an effort a model without variants does not offer is refused" 1 $?
+  out="$(printf 'high' | cfg_al set-field cj effort 2>&1)"
+  printf '%s' "$out" | grep -qF "this model offers no effort levels (leave it empty)" \
+    && ok "and says the model offers no effort levels at all, not an empty list with nothing in it" || bad "no-effort refusal: $out"
   printf 'pdm_ai/glm-5.3-flash' | cfg_al set-field cj model >/dev/null 2>&1
   printf 'high' | cfg_al set-field cj effort >/dev/null 2>&1; want "and accepted on a model that lists it" 0 $?
   printf 'read-only' | cfg_al set-field cj permission_mode >/dev/null 2>&1; want "read-only is an opencode mode" 0 $?
@@ -7475,6 +7496,14 @@ NASTY
   [ -z "$got" ] && ok "a spent anthropic window does not gate an openai run" || bad "cross-platform gate: $got"
   got="$(rl_at openai five_hour 0.97 "$gone" openai)"
   [ -z "$got" ] && ok "an openai window past its reset says nothing" || bad "expired openai window gated: $got"
+
+  # opencode has no window at all -- nothing captures one for it -- so the
+  # gate must never hold a run back on it. The jq behind rl_gate exits 4 (no
+  # output at all) rather than 1 on an empty block, so this checks "let it
+  # through" (any nonzero exit) rather than pinning one exact code. Scoped to
+  # the scratch dir like every other rl_gate call above -- never the real one.
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/oc.json"; rl_gate opencode ) >/dev/null 2>&1
+  if [ $? -eq 0 ]; then bad "rl_gate held an opencode run back"; else ok "rl_gate opencode never holds a run back: there are no windows"; fi
 
   echo "statusline-rate-limits.sh — the figure the run stream never carries"
   # The stream only reports utilisation once the CLI has decided to warn (0.75),
@@ -10278,7 +10307,9 @@ cmd_platforms() { # one JSON object: what each listed platform offers, whether i
     [ "$ready" = "true" ] && reason=""
     if platform_known "$p"; then
       perms="$(platform_permissions "$p" | "$JQ" -R . | "$JQ" -sc .)"
-      if [ "$p" = "openai" ]; then efforts="$(openai_catalog_all_efforts | "$JQ" -R . | "$JQ" -sc .)"; else efforts="$(platform_efforts "$p" | "$JQ" -R . | "$JQ" -sc .)"; fi
+      if [ "$p" = "openai" ]; then efforts="$(openai_catalog_all_efforts | "$JQ" -R . | "$JQ" -sc .)"
+      elif [ "$p" = "opencode" ]; then efforts="$(opencode_catalog_all_efforts | "$JQ" -R . | "$JQ" -sc .)"
+      else efforts="$(platform_efforts "$p" | "$JQ" -R . | "$JQ" -sc .)"; fi
       dm="$(platform_default_model "$p")"; dp="$(platform_default_permission "$p" job)"
     else
       perms='[]'; efforts='[]'; dm=""; dp=""
@@ -10307,6 +10338,10 @@ cmd_platforms() { # one JSON object: what each listed platform offers, whether i
       pr_ck="$(num "$("$JQ" -r '._checked_at // 0' "$PRICING_FILE" 2>/dev/null)")"
       pr_src="$("$JQ" -r '._source_url | if type == "string" then . else "" end' "$PRICING_FILE" 2>/dev/null)"
       unpriced="$(pricing_unpriced | "$JQ" -R . | "$JQ" -sc .)"
+    elif [ "$p" = "opencode" ]; then
+      cat_at="$(num "$("$JQ" -r '.opencode.at // 0' "$MODELS_FILE" 2>/dev/null)")"
+      opencode_catalog_available && cat_ok=true
+      unpriced="$(opencode_unpriced | "$JQ" -R . | "$JQ" -sc .)"
     fi
     "$JQ" -nc --arg p "$p" --argjson ready "$ready" --arg reason "$reason" \
       --argjson perms "$perms" --argjson efforts "$efforts" --arg dm "$dm" --arg dp "$dp" \
@@ -10322,7 +10357,9 @@ cmd_platforms() { # one JSON object: what each listed platform offers, whether i
                 jobs_using:$jus, jobs_using_enabled:$juse}
                + (if $p == "openai" then {catalog_at:$cat_at, catalog_available:$cat_ok,
                                           pricing_at:$pr_at, pricing_checked_at:$pr_ck,
-                                          pricing_source:$pr_src, unpriced:$unpriced} else {} end))}'
+                                          pricing_source:$pr_src, unpriced:$unpriced}
+                  elif $p == "opencode" then {catalog_at:$cat_at, catalog_available:$cat_ok, unpriced:$unpriced}
+                  else {} end))}'
   done | "$JQ" -sc 'add' | {
     err="$(platforms_error)"
     if [ -n "$err" ]; then "$JQ" -c --arg e "$err" '. + {_error: $e}'; else cat; fi
@@ -12056,6 +12093,13 @@ status_platforms_block() { # one line per listed platform: enabled or not, versi
         "$(age_label "$("$JQ" -r '._checked_at // ._refreshed_at // 0' "$PRICING_FILE" 2>/dev/null)" 'never refreshed')" \
         "${u:-none}"
     fi
+    if [ "$p" = "opencode" ]; then
+      local nu
+      nu="$(opencode_unpriced | tr '\n' ' ' | sed 's/ *$//')"
+      printf '; catalog %s (%s models); unpriced: %s' \
+        "$(age_label "$("$JQ" -r '.opencode.at // 0' "$MODELS_FILE" 2>/dev/null)")" \
+        "$(opencode_catalog_visible 2>/dev/null | grep -c . || true)" "${nu:-none}"
+    fi
     printf '\n'
   done
 }
@@ -12320,7 +12364,12 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
         write_jobs --arg id "$id" --arg v "$value" \
           '.jobs = [.jobs[] | if .id == $id then .effort = $v else . end]'
       else
-        die "effort must be one of: $(platform_efforts "$p" "$pm" | tr '\n' ',' | sed 's/,$//; s/,/, /g') (or empty)"
+        local levels; levels="$(platform_efforts "$p" "$pm" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+        if [ -n "$levels" ]; then
+          die "effort must be one of: $levels (or empty)"
+        else
+          die "this model offers no effort levels (leave it empty)"
+        fi
       fi ;;
     timeout_seconds|stall_timeout_seconds)
       # Both are optional: empty clears them (no absolute cap / no stall guard).
@@ -12400,9 +12449,10 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
       fi
       # The model rewrite is decided BEFORE the platform is written, so a
       # refusal leaves the job exactly as it was. Only the inherit case can
-      # find no default: anthropic/openai went through platform_usable above,
-      # and a project's platform may have nothing switched on -- writing the
-      # empty string as the model would be a job no launch could resolve.
+      # find no default: anthropic/openai/opencode went through
+      # platform_usable above, and a project's platform may have nothing
+      # switched on -- writing the empty string as the model would be a job
+      # no launch could resolve.
       cur="$(job_get "$id" '.model' '')"; dm=""
       if [ -n "$cur" ] && [ "$cur" != "null" ] && ! platform_model_ok "$eff" "$cur"; then
         dm="$(platform_default_model "$eff")"
