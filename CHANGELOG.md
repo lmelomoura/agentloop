@@ -463,6 +463,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   phase now runs in a process group of its own, recorded on the run's slot,
   the stop signals the group, and the early-stop record closes the analysis
   as `failed` through the same door the classifier uses.
+- **A stop during the deterministic phase signals the phase's own group,
+  never the wrapper's.** The stop TERMed the process group of the subshell
+  that runs `prepare`, which is the run wrapper's own group: the wrapper
+  died before it could file the record, the analysis stayed `running`, and
+  the python (in the group `cmd_prepare` makes for itself) ran on as an
+  orphan with its scanners. The stop now signals each child of the
+  subshell by its own group first, then the subshell by pid; the wrapper
+  files the record and closes the analysis as before.
 - **The candidate gate is a substring search, not a regex.** The
   alternation that gated the rule battery still walked every position of a
   line of megabytes (57% of the sweep's time, measured); the gate is eight

@@ -10476,17 +10476,23 @@ _stop_slot() { # <id> <slot-dir>
   # TERMed by pid and the group by its python's pgid, read from ps, so the
   # scanners go with it; the wrapper below then files the record as it does
   # for any early stop. The same `0` guard as the child above.
-  local prep prep_pgid
+  local prep _pp
   prep="$(cat "$slot/prepare" 2>/dev/null || true)"
   if [ -n "$prep" ] && [ "$prep" != "0" ] && kill -0 "$prep" 2>/dev/null; then
-    prep_pgid="$(ps -o pgid= -p "$prep" 2>/dev/null | tr -d ' ')"
-    kill -TERM "$prep" 2>/dev/null
-    case "$prep_pgid" in ''|0|*[!0-9]*) ;; *) kill -TERM -- "-$prep_pgid" 2>/dev/null ;; esac
-    # Whatever cmd_prepare put in a group of its own: its pid is the
-    # subshell's child, and its pgid is that pid.
+    # THE CHILDREN FIRST, EACH BY ITS OWN GROUP, THEN THE SUBSHELL BY PID --
+    # and never the subshell's process group. The subshell is a plain fork
+    # of the run wrapper and shares the wrapper's group, so a signal to
+    # that group reached the wrapper itself (measured: it died before it
+    # could file the record, the analysis stayed running, and the python --
+    # in the group of its own cmd_prepare made -- ran on as an orphan with
+    # its scanners). The python is the subshell's child and its pgid is its
+    # own pid: `-pid` to it is the whole deterministic phase, scanners
+    # included. Read before the subshell is signalled, or there is no
+    # parent left to ask.
     for _pp in $(pgrep -P "$prep" 2>/dev/null); do
       kill -TERM -- "-$_pp" 2>/dev/null; kill -TERM "$_pp" 2>/dev/null
     done
+    kill -TERM "$prep" 2>/dev/null
     echo "stopping $id run $(basename "$slot") (deterministic phase, pid $prep)"
   fi
   # No agent yet — stopped in the seconds between claiming the slot and spawning.
