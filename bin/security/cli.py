@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from security import adapters, coverage, deps, diff, fingerprint, hygiene, ignores, ledger, osv, queries, report, secrets, taxonomy  # noqa: E402
+from security import adapters, coverage, deps, diff, engines, fingerprint, hygiene, ignores, ledger, osv, queries, report, secrets, taxonomy  # noqa: E402
 
 REQUIRED_FINDING_KEYS = ("fingerprint", "category", "rule", "severity", "title")
 
@@ -816,7 +816,7 @@ def _scan_secrets(root, ignore, sweeps=None):
             history_job = pool.submit(secrets.scan_history, root, since, ignore,
                                       rename=_SECRET_RENAMES)
             tree_job = pool.submit(secrets.scan_tree, root, ignore, rename=_SECRET_RENAMES)
-        engine, notes, history, tree = engine_job.result()
+        engine, notes, history, tree, engine_reached = engine_job.result()
         if engine is not None:
             # The engine's list is its history readings then its tree
             # readings (see `gitleaks_scan` on why that order); the carried
@@ -825,14 +825,14 @@ def _scan_secrets(root, ignore, sweeps=None):
             engine_history = _carry_history(
                 engine_cached, [f for f in engine if f.get("historical")], ignore)
             engine = engine_history + [f for f in engine if not f.get("historical")]
-            if history == adapters.HISTORY_OK:
-                # The engine does not say where it got to, so the cursor is
-                # HEAD -- and only when its pass wrote a report over a full
-                # clone: a shallow clone's sweep saw nothing before the
-                # cut-off, and a cursor at its HEAD would keep the commits a
-                # later `fetch --unshallow` brings from ever being read.
-                _record_sweep(sweeps, PRODUCER_GITLEAKS, secrets.head_sha(root),
-                              engine_history)
+            if engine_reached and history != adapters.HISTORY_SHALLOW:
+                # The cursor is the last commit a completed range ended at
+                # (`adapters._gitleaks_history`): a pass the budget cut keeps
+                # what it read, and the next analysis continues. Never on a
+                # shallow clone: its sweep saw nothing before the cut-off,
+                # and a cursor there would keep the commits a later `fetch
+                # --unshallow` brings from ever being read.
+                _record_sweep(sweeps, PRODUCER_GITLEAKS, engine_reached, engine_history)
             if engine_restarted:
                 restart_notes.append(HISTORY_RESTART_NOTE.format(
                     scanner=_SCANNER_NAMES[PRODUCER_GITLEAKS],
@@ -1104,15 +1104,16 @@ def _scan_sast(root, offline: bool, ignore_paths=()):
     the whole category pending": the agent's own findings still close on the
     agent's own evidence.
 
-    THE ONE PHASE WHOSE SUCCESS IS STILL A `warning`, and the only status
-    decision in this file that is not about a missing binary. Semgrep running
-    perfectly is a PRE-pass: `adapters.SAST_PREPASS_NOTE` says so, and its
-    coverage is not remotely even -- 147 rules for Python against ONE for
-    shell, measured, over a product whose core is 8,263 lines of bash. A
-    `ran` here would tell a reader of the table that the SAST phase is covered
-    when the pass that actually covers it is the agent's, which has not
-    happened yet at this point in the analysis. So this phase reads `ran`
-    never, `warning` when Semgrep answered, `skipped` when it did not.
+    `ran` WHEN SEMGREP ANSWERED, `skipped` WHEN IT DID NOT. This phase used
+    to read `warning` even when Semgrep ran perfectly, on the reasoning that
+    a pre-pass with uneven rule coverage (147 rules for Python against one
+    for shell, measured) must not read as SAST coverage; the operator read
+    that as the phase having half-failed on every analysis, and the row
+    below it -- `sast`, the agent's own pass, the one that covers the
+    category -- already says who covers SAST. The pre-pass ran over the
+    whole tree: that is `ran`. What it could not read (the files Semgrep
+    parsed only partly, named in the note) and what it is (a pre-pass,
+    `adapters.SAST_PREPASS_NOTE`) stay in the note, where the caveats live.
     """
     if offline:
         return [], [OFFLINE_SAST_NOTE], "", coverage.SKIPPED
@@ -1127,7 +1128,7 @@ def _scan_sast(root, offline: bool, ignore_paths=()):
     if findings is None:
         reason = (notes[0] if notes else "semgrep produced no report").rstrip(".")
         return [], [adapters.SAST_GAP.format(reason=reason)], "", coverage.SKIPPED
-    return findings, notes, PRODUCER_SEMGREP, coverage.WARNING
+    return findings, notes, PRODUCER_SEMGREP, coverage.RAN
 
 
 # Said when `_scan_sbom` returns no document at all, and the ONE sentence that
