@@ -20,6 +20,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Status: Fixed on the Findings tab shows the fixed findings.** With "Show
+  resolved findings" off it showed nothing — the toggle dropped every resolved
+  row first, then the status filter ran over what was left, which by
+  construction held no fixed row. A project with dozens of fixed findings
+  read "No findings match these filters". The toggle hides resolved findings
+  by default; a status the operator names is an explicit request and wins.
+
 - **Every dropdown menu in the Security area closes when you scroll, and
   opens inside the viewport.** The eight kebabs and pickers there positioned
   themselves once, on open, with `position:fixed` — scroll any container and
