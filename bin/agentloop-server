@@ -3091,6 +3091,50 @@ def security_report_guard(fmt):
     return 200, None
 
 
+FINDINGS_EXPORT_FORMATS = {"md": "text/markdown; charset=utf-8",
+                           "json": "application/json; charset=utf-8"}
+# Every character a download filename may carry, and nothing else. The name is
+# built from a PROJECT NAME -- free text an operator typed -- which is the one
+# input the sibling report route never has to handle: it is given an integer
+# id. A project called `../etc/passwd`, or one with a quote in it, must come
+# out of here as a flat token or the Content-Disposition header is the
+# caller's to write.
+_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _download_name(project, ext):
+    slug = _FILENAME_SAFE.sub("-", project).strip("-.") or "project"
+    return f"findings-{slug[:60]}.{ext}"
+
+
+def security_findings_export(project, fmt, shown=None):
+    """The consolidated findings document and its download header.
+
+    404 for a project the ledger has never analysed, never an empty document:
+    the verb refuses it too, and this turns that refusal into the status code
+    the page can tell apart from "nothing to report".
+    """
+    # Checked HERE as well as at the route. The route is the only caller today,
+    # but this function is the one that puts an extension into a download
+    # header, and a guard that lives only in the caller is a guard the next
+    # caller does not have.
+    if fmt not in FINDINGS_EXPORT_FORMATS:
+        return 400, {"error": f"format must be one of {sorted(FINDINGS_EXPORT_FORMATS)}"}, None
+    args = ["security", "export-findings", "--project", project, "--format", fmt]
+    if shown is not None:
+        args += ["--shown", str(int(shown))]
+    ok, out = al(args)
+    if not ok:
+        if "no analysis has ever run" in out:
+            return 404, {"error": out.strip()}, None
+        return 500, {"error": out.strip()}, None
+    al(["security", "event", "--project", project,
+        "--kind", "findings_exported",
+        "--detail", f"{fmt} export of every finding, all branches"])
+    return 200, out, {"Content-Disposition":
+                      f'attachment; filename="{_download_name(project, fmt)}"'}
+
+
 def security_report(analysis_id, fmt):
     """The rendered report body and its download header for one analysis.
 
@@ -3864,6 +3908,25 @@ class Handler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 return self._send(500, {"error": str(exc)})
             return self._send(200, body, REPORT_FORMATS[fmt], extra_headers=headers)
+        if path == "/api/security/findings-export":
+            q = parse_qs(urlparse(self.path).query)
+            fmt = (q.get("format") or [""])[0]
+            if fmt not in FINDINGS_EXPORT_FORMATS:
+                return self._send(400, {"error": "format must be one of "
+                                                 f"{sorted(FINDINGS_EXPORT_FORMATS)}"})
+            project = (q.get("project") or [""])[0]
+            if not project:
+                return self._send(400, {"error": "project is required"})
+            shown = (q.get("shown") or [""])[0]
+            # Shape-checked and then dropped if it is not a number, never
+            # refused: it is a cosmetic count for the document's header, and a
+            # bad one must not cost the operator the download.
+            shown = int(shown) if shown.isdigit() else None
+            code, body, headers = security_findings_export(project, fmt, shown)
+            if headers is None:
+                return self._send(code, body)
+            return self._send(code, body, FINDINGS_EXPORT_FORMATS[fmt],
+                              extra_headers=headers)
         if path == "/api/fs":
             p = (parse_qs(urlparse(self.path).query).get("path") or [""])[0]
             try:
