@@ -519,6 +519,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   phase now runs in a process group of its own, recorded on the run's slot,
   the stop signals the group, and the early-stop record closes the analysis
   as `failed` through the same door the classifier uses.
+- **The launchd agents run at Standard QoS, not Background.** Both plists
+  said `ProcessType: Background`, and everything a run spawns inherits the
+  agent's QoS: macOS pinned the whole tree to the efficiency cores and
+  throttled it. Measured on one security analysis: gitleaks 57 minutes on
+  a range it does in 3.5 from a terminal, semgrep 497 s against 60 s, the
+  built-in history sweep 8 minutes for what it does in seconds, and a
+  platform check that answers in 1.4 s timing out at 30 s. `install.sh`
+  (or `agentloop install`) rewrites the plists; a run launched before the
+  reinstall keeps the old class.
 - **The gitleaks history pass reads the history in ranges and keeps its
   cursor.** gitleaks reads a range in one go and reports nothing until it
   is done, so a pass its budget cut left nothing behind and the next
