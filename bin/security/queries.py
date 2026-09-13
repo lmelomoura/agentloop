@@ -1138,8 +1138,16 @@ def finding_rows(conn, project, filters=None, sort="severity",
         # reach `rows` at all.
         r["first_seen"] = first_seen.get(r["fingerprint"], 0)
 
+    # `show_resolved` off hides resolved findings BY DEFAULT -- it is a
+    # convenience, not a veto. A Status filter that names a resolved state is
+    # an explicit request for exactly those rows, and used to lose to this
+    # gate: the resolved rows were dropped here first, then "state == fixed"
+    # was applied to what was left, which by construction held no fixed row.
+    # Status: Fixed showed "No findings match these filters" on a project with
+    # dozens of them. A state the operator asked for by name passes the gate.
+    asked_for = set(f.get("state") or ())
     if not f.get("show_resolved"):
-        rows = [r for r in rows if is_open(r["state"])]
+        rows = [r for r in rows if is_open(r["state"]) or r["state"] in asked_for]
     for key in ("severity", "state", "category", "branch"):
         if f.get(key):
             rows = [r for r in rows if r.get(key) in f[key]]

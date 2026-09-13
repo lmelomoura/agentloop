@@ -1390,6 +1390,27 @@ def test_state_filter_selects_only_the_named_state(conn):
     assert new_only["rows"][0]["branch"] == "develop"
 
 
+def test_a_state_asked_for_by_name_is_shown_even_with_resolved_hidden(conn):
+    """Status: Fixed with "Show resolved findings" OFF used to show nothing --
+    the resolved rows were dropped by the toggle first, then the state filter
+    ran over what was left. The toggle hides resolved findings by DEFAULT; a
+    state the operator names is an explicit request and wins."""
+    _analysis(conn, "main", findings=[("critical", "secret")])
+    _analysis(conn, "main", findings=[])            # the secret is now fixed
+    _analysis(conn, "develop", findings=[("high", "sast")])  # still new
+
+    fixed = queries.finding_rows(conn, "web", {"show_resolved": False, "state": ["fixed"]})
+    assert [r["state"] for r in fixed["rows"]] == ["fixed"]
+    # the same with the key simply absent, which is what the page sends
+    assert [r["state"] for r in queries.finding_rows(conn, "web", {"state": ["fixed"]})["rows"]] == ["fixed"]
+    # and asking for an OPEN state does not let resolved rows through
+    new_only = queries.finding_rows(conn, "web", {"state": ["new"]})
+    assert [r["state"] for r in new_only["rows"]] == ["new"]
+    # with no state filter at all, the default still hides resolved
+    assert all(queries.is_open(r["state"])
+               for r in queries.finding_rows(conn, "web", {})["rows"])
+
+
 def test_path_filter_matches_case_insensitively_on_both_sides(conn):
     aid = ledger.start_analysis(conn, "web", "web", "main", "s", "quick", "r")
     ledger.record_finding(conn, aid, {
