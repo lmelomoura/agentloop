@@ -1353,6 +1353,9 @@ def cmd_prepare(args):
     # serial run produces; only the wall-clock changed. A phase that raises
     # still fails the whole prepare, after the others have been waited for,
     # so no scanner is left running under a dead parent.
+    # The engines' versions, probed once and first, on a machine nothing
+    # else of this phase has loaded yet: see `engines.warm_versions`.
+    engines.warm_versions()
     started = time.perf_counter()
     def _progress(text):
         print(f"prepare: {text}", file=sys.stderr, flush=True)

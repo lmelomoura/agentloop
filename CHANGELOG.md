@@ -463,6 +463,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   phase now runs in a process group of its own, recorded on the run's slot,
   the stop signals the group, and the early-stop record closes the analysis
   as `failed` through the same door the classifier uses.
+- **An engine's version is probed once, first, on an idle machine.** With
+  the phases running at once, semgrep's `--version` (a python start-up)
+  landed on a machine saturated by gitleaks and trivy, outlived the probe's
+  30 s, and the whole SAST pre-pass was skipped as "installed but did not
+  report a version" (seen on a real analysis). The probes run before the
+  phases fan out, are remembered per binary for the process, and get 120 s.
+- **A run that ends `warning` says why.** Stray bytes on stderr or an empty
+  final message filed the run as `warning` with an empty note; the note
+  now says how many lines the CLI wrote and quotes the first (on OpenCode:
+  the provider's connection drops the CLI recovered from), or that the
+  run ended without a final message.
 - **A stop during the deterministic phase signals the phase's own group,
   never the wrapper's.** The stop TERMed the process group of the subshell
   that runs `prepare`, which is the run wrapper's own group: the wrapper

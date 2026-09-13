@@ -11735,6 +11735,19 @@ If the work turns out to be already finished, or it can no longer be done at all
     status="error"
   elif [ "${errbytes:-0}" -gt 0 ] || [ "${result_len:-0}" -eq 0 ]; then
     status="warning"
+    # SAY WHY. A warning with an empty note read as "something is wrong and
+    # nobody will tell you what": on a real run the CLI had logged five
+    # "stream error" lines (the provider dropped the connection, the CLI
+    # went on) and the record said nothing. The note names the count and
+    # the first line, trimmed to one sentence; a result of zero length is
+    # named as that.
+    if [ -z "$wdreason" ]; then
+      if [ "${errbytes:-0}" -gt 0 ]; then
+        wdreason="STDERR: the CLI wrote $(wc -l < "$logfile.err" 2>/dev/null | tr -d ' ') line(s) on stderr and the run went on, e.g. $(head -c 300 "$logfile.err" 2>/dev/null | head -1 | sed 's/^[[:space:]]*//' | cut -c1-220)"
+      else
+        wdreason="EMPTY RESULT: the run ended without a final message"
+      fi
+    fi
   else
     status="success"
   fi
