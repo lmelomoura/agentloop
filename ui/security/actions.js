@@ -103,3 +103,49 @@ export async function secDownload(fmt){
   if(!a) return;
   await secDownloadReport(a.id, fmt, $("sec-dl-" + fmt));
 }
+
+// The consolidated findings document: every finding of one project, across
+// branches, in one file. Its sibling above downloads ONE analysis's report and
+// builds the filename itself, mirroring REPORT_EXTENSIONS by hand because "a
+// fetch never turns Content-Disposition into a download name on its own".
+//
+// That is true, and it is also not the whole sentence: a fetch does not use
+// the header, but on the same origin it can READ it. This one does, so the
+// name the browser writes is the name the server sanitised -- the project name
+// here is free text an operator typed, and a second copy of the sanitising
+// rule in JavaScript would be one more pair that has to agree by hand. The
+// local fallback exists for the header being absent, never to second-guess it.
+function _nameFromDisposition(header, fallback){
+  const m = /filename="([^"]+)"/.exec(header || "");
+  // Anything with a path separator in it is refused rather than repaired: the
+  // server does not produce one, so a name carrying one is not a name this
+  // page should be writing to disk under.
+  if(m && m[1] && !/[\\/]/.test(m[1])) return m[1];
+  return fallback;
+}
+
+export async function secDownloadFindings(project, fmt, shown, btn){
+  if(btn) btn.disabled = true;
+  const dk = ["findings_export", project, fmt];
+  markPending(...dk);
+  try{
+    let url = "/api/security/findings-export?project=" + encodeURIComponent(project)
+            + "&format=" + encodeURIComponent(fmt);
+    if(Number.isFinite(shown)) url += "&shown=" + encodeURIComponent(shown);
+    const r = await fetch(url, {headers:{"X-AL-Token":TOKEN}});
+    if(!r.ok){
+      const j = await r.json().catch(() => null);
+      throw new Error((j && j.error) || ("HTTP " + r.status));
+    }
+    const blobUrl = URL.createObjectURL(await r.blob());
+    const link = document.createElement("a");
+    link.href = blobUrl;
+    link.download = _nameFromDisposition(r.headers.get("Content-Disposition"),
+                                         "findings." + (fmt === "sbom" ? "sboms.json" : fmt));
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
+  }catch(e){ toast("Export failed — " + e.message, true); }
+  finally{ clearPending(...dk); if(btn) btn.disabled = false; }
+}

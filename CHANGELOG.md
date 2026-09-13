@@ -18,7 +18,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every dropdown menu in the Security area closes when you scroll, and
+  opens inside the viewport.** The eight kebabs and pickers there positioned
+  themselves once, on open, with `position:fixed` — scroll any container and
+  the trigger moved while the options stayed put, floating free of the button
+  that opened them; and a left-aligned picker near the right edge opened off
+  the screen, clipped. One shared placement now does what the eight copies
+  did, plus what none of them did: it clamps to the viewport (flipping above
+  the trigger when there is more room there) and closes on any scroll or
+  resize, the way a native select does.
+
 ### Added
+
+- **The Findings tab's Export button downloads every finding of the project,
+  across every branch, as one document.** It used to open the Reports tab,
+  whose downloads are one report per *analysis* — so somebody standing in
+  front of a table of 79 findings from several branches was handed a file
+  about one run. The new document is written for the reader it exists for,
+  which is usually not a person: every finding names the branch it was found
+  on and the commit that branch was analysed at, so an agent knows where to
+  apply a fix and whether the code in front of it is the code that was read.
+  A branch with nothing on it is listed saying so — not seeing a branch and
+  seeing it clean call for opposite actions. Resolved findings come last,
+  under a heading that says no action is needed. Markdown or JSON, from
+  `agentloop security export-findings --project X --format md|json` or the
+  button, which offers JSON, HTML and SBOM from the same kebab menu the
+  Reports tab already uses (Markdown stays on the CLI, for an agent that
+  reads it better). The SBOM export is one CycloneDX per branch side by
+  side and is named `.sboms.json`, not `.cdx.json`: two branches'
+  inventories are two inventories, and a merge would claim a dependency
+  set no commit ever held. Filters and the severity floor are not
+  applied, and the document's header says so beside the count the screen
+  was showing.
 
 - **The OpenCode engine: a job, a project and a project's `security` block
   can run on the `opencode` platform.** The third platform arrives the way

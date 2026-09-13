@@ -89,13 +89,14 @@
    by tests/test_page_contract.py and must keep both their name and their
    contract. */
 import { api, toast, fmtWhen, tableFooter, closeMenus, kpiCard } from "./page.js";
-import { secEl, secIcon, secFetch } from "./dom.js";
+import { secEl, secIcon, secFetch, secPlaceMenu } from "./dom.js";
 import { SEC_STATES, SEC_STATE_LABEL, SEC_STATE_HELP, SEV_ORDER, SEC_NEVER,
          secMinSeverity, secSevKey, secStateKey, secVisible, secCategoryMeta } from "./vocabulary.js";
 import { SEV_KPI_ICON, SEV_KPI_TONE } from "./overview-tab.js";
 import { secAskReason } from "./reason.js";
 import { secInvalidateProject, secSwitchProjectTab } from "./project-screen.js";
 import { secShowAnalysis, secBack } from "./analysis.js";
+import { secDownloadFindings } from "./actions.js";
 
 // Mirrors bin/security/queries.py's SORTABLE, and bin/agentloop-server's
 // FINDING_CATEGORIES -- duplicated here, not fetched, because the filter bar
@@ -317,17 +318,57 @@ function secFindHeader(fs, data){
     if(savedWrap.ontoggle) savedWrap.ontoggle();
   };
   actions.appendChild(saveBtn);
-  const exportBtn = secEl("button", "btn ghost");
-  exportBtn.type = "button";
-  exportBtn.appendChild(secIcon("download"));
-  exportBtn.appendChild(document.createTextNode("Export"));
-  // Reuses the project's own Reports tab -- the report/download surface
-  // this project already offers (secRenderProjectReports,
-  // reports-tab.js: Markdown/JSON/HTML/SBOM per analysis) -- rather than
-  // inventing a second export path with no downloads of its own behind it.
-  exportBtn.title = "Open this project's Reports tab";
-  exportBtn.onclick = () => secSwitchProjectTab("reports");
-  actions.appendChild(exportBtn);
+  // EXPORT DOWNLOADS, IT DOES NOT NAVIGATE. It used to open the Reports tab,
+  // on the reasoning that the project already had a download surface there --
+  // but that surface is one report per ANALYSIS, and somebody standing in
+  // front of a table of every finding across every branch wants those, not a
+  // document about one run. The reader is usually not even a person: the
+  // document exists to be handed to an agent, which is why it names the
+  // branch of every finding and the commit each branch was read at.
+  //
+  // ONE BUTTON, A MENU BEHIND IT -- the same <details>/<summary>/.menu-pop
+  // kebab the Reports tab's own row draws for JSON/HTML/SBOM (see
+  // project-screen.js's secPjRunRow for the position:fixed and closeMenus()
+  // reasoning, identical here). Two buttons side by side made the format the
+  // loudest thing in a header whose job is filters; the format is a detail of
+  // the download, so it lives one click in, where this page already puts one.
+  //
+  // `data.total` is what the table is showing right now, filters and severity
+  // floor and all; it travels so the document's header can explain itself to
+  // a reader who filtered to Critical and got everything ("The screen was
+  // showing 3 of these"). The download itself is never filtered -- the line
+  // under the numbers on this very screen already promises that.
+  const shown = Number.isFinite(data && data.total) ? data.total : null;
+  const exportKebab = document.createElement("details");
+  exportKebab.className = "secidx-kebab";
+  const exportSummary = document.createElement("summary");
+  exportSummary.className = "btn ghost";
+  exportSummary.title = "Download every recorded finding in this project, all branches";
+  exportSummary.appendChild(secIcon("download"));
+  exportSummary.appendChild(document.createTextNode("Export"));
+  exportSummary.onclick = (e) => { e.stopPropagation(); closeMenus(); };
+  exportKebab.appendChild(exportSummary);
+  const exportPop = secEl("div", "menu-pop");
+  exportPop.setAttribute("role", "menu");
+  // The same three the Reports tab's kebab offers, in the same order, so the
+  // two menus read as one habit. Markdown stays reachable from the CLI
+  // (`agentloop security export-findings --format md`) for an agent that
+  // reads it better; it is not on the menu because the menu is the operator's.
+  [["json", "JSON"], ["html", "HTML"], ["sbom", "SBOM"]].forEach(([fmt, label]) => {
+    const item = document.createElement("button");
+    item.setAttribute("role", "menuitem");
+    item.appendChild(secIcon("file"));
+    item.appendChild(document.createTextNode(label));
+    item.onclick = (e) => {
+      e.stopPropagation();
+      exportKebab.open = false;
+      secDownloadFindings(fs.project, fmt, shown, item);
+    };
+    exportPop.appendChild(item);
+  });
+  exportKebab.appendChild(exportPop);
+  secPlaceMenu(exportKebab, exportSummary, exportPop, "right");
+  actions.appendChild(exportKebab);
   actions.appendChild(savedWrap);
   head.appendChild(actions);
   wrap.appendChild(head);
@@ -546,16 +587,7 @@ export function secFindPositionPop(details, trigger, pop){
   pop.setAttribute("role", "menu");
   pop.hidden = true;
   details.appendChild(pop);
-  details.ontoggle = () => {
-    pop.hidden = !details.open;
-    if(!details.open) return;
-    const r = trigger.getBoundingClientRect();
-    pop.style.position = "fixed";
-    pop.style.top = (r.bottom + 6) + "px";
-    pop.style.left = r.left + "px";
-    pop.style.right = "auto";
-    pop.style.bottom = "auto";
-  };
+  secPlaceMenu(details, trigger, pop, "left");
 }
 
 function secFindMultiPicker(label, options, selected, onToggle){
@@ -1149,16 +1181,7 @@ function secFindActionsCell(fs, f){
     // secFindPositionPop's own comment) -- right-aligned, since this is the
     // table's own last column and a left-aligned popover would routinely
     // open past the viewport's own right edge.
-    kebab.ontoggle = () => {
-      pop.hidden = !kebab.open;
-      if(!kebab.open) return;
-      const r = summary.getBoundingClientRect();
-      pop.style.position = "fixed";
-      pop.style.top = (r.bottom + 6) + "px";
-      pop.style.left = "auto";
-      pop.style.right = (window.innerWidth - r.right) + "px";
-      pop.style.bottom = "auto";
-    };
+    secPlaceMenu(kebab, summary, pop, "right");
     td.appendChild(kebab);
   }
   return td;

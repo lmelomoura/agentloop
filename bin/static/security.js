@@ -290,6 +290,48 @@
     if (!r.ok) throw new Error(j && (j.error || j.output) || "HTTP " + r.status);
     return j;
   }
+  function secPlaceMenu(details, trigger, pop, align) {
+    const MARGIN = 8, GAP = 6;
+    let onMove = null;
+    const close = () => {
+      if (details.open) details.open = false;
+    };
+    const detach = () => {
+      if (!onMove) return;
+      window.removeEventListener("scroll", onMove, true);
+      window.removeEventListener("resize", onMove);
+      onMove = null;
+    };
+    details.ontoggle = () => {
+      pop.hidden = !details.open;
+      if (!details.open) {
+        detach();
+        return;
+      }
+      const r = trigger.getBoundingClientRect();
+      pop.style.position = "fixed";
+      pop.style.bottom = "auto";
+      if (align === "right") {
+        pop.style.left = "auto";
+        pop.style.right = Math.max(MARGIN, window.innerWidth - r.right) + "px";
+      } else {
+        pop.style.right = "auto";
+        pop.style.left = r.left + "px";
+      }
+      pop.style.top = r.bottom + GAP + "px";
+      const p = pop.getBoundingClientRect();
+      if (align !== "right" && p.right > window.innerWidth - MARGIN) {
+        pop.style.left = Math.max(MARGIN, window.innerWidth - MARGIN - p.width) + "px";
+      }
+      if (p.bottom > window.innerHeight - MARGIN) {
+        const above = r.top - GAP - p.height;
+        pop.style.top = (above >= MARGIN ? above : Math.max(MARGIN, window.innerHeight - MARGIN - p.height)) + "px";
+      }
+      onMove = close;
+      window.addEventListener("scroll", onMove, true);
+      window.addEventListener("resize", onMove);
+    };
+  }
 
   // ui/security/history.js
   function secRunFor(a) {
@@ -775,16 +817,7 @@
     fTrigger.onclick = (e) => e.stopPropagation();
     const filters = $("sec-run-filterpick");
     const fPop = $("sec-run-filterpop");
-    filters.ontoggle = () => {
-      fPop.hidden = !filters.open;
-      if (!filters.open) return;
-      const r = fTrigger.getBoundingClientRect();
-      fPop.style.position = "fixed";
-      fPop.style.top = r.bottom + 6 + "px";
-      fPop.style.right = window.innerWidth - r.right + "px";
-      fPop.style.left = "auto";
-      fPop.style.bottom = "auto";
-    };
+    secPlaceMenu(filters, fTrigger, fPop, "right");
     secFindCatPicker = makePicker("sec-find-catpick", {
       icon: secIconHTML("filter"),
       label: "Category",
@@ -1016,6 +1049,41 @@
     const a = secState.analysis;
     if (!a) return;
     await secDownloadReport(a.id, fmt, $("sec-dl-" + fmt));
+  }
+  function _nameFromDisposition(header, fallback) {
+    const m = /filename="([^"]+)"/.exec(header || "");
+    if (m && m[1] && !/[\\/]/.test(m[1])) return m[1];
+    return fallback;
+  }
+  async function secDownloadFindings(project, fmt, shown, btn) {
+    if (btn) btn.disabled = true;
+    const dk = ["findings_export", project, fmt];
+    markPending(...dk);
+    try {
+      let url = "/api/security/findings-export?project=" + encodeURIComponent(project) + "&format=" + encodeURIComponent(fmt);
+      if (Number.isFinite(shown)) url += "&shown=" + encodeURIComponent(shown);
+      const r = await fetch(url, { headers: { "X-AL-Token": TOKEN } });
+      if (!r.ok) {
+        const j = await r.json().catch(() => null);
+        throw new Error(j && j.error || "HTTP " + r.status);
+      }
+      const blobUrl = URL.createObjectURL(await r.blob());
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = _nameFromDisposition(
+        r.headers.get("Content-Disposition"),
+        "findings." + (fmt === "sbom" ? "sboms.json" : fmt)
+      );
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 3e4);
+    } catch (e) {
+      toast("Export failed \u2014 " + e.message, true);
+    } finally {
+      clearPending(...dk);
+      if (btn) btn.disabled = false;
+    }
   }
 
   // ui/security/activity-screen.js
@@ -2160,13 +2228,36 @@
       if (savedWrap.ontoggle) savedWrap.ontoggle();
     };
     actions.appendChild(saveBtn);
-    const exportBtn = secEl("button", "btn ghost");
-    exportBtn.type = "button";
-    exportBtn.appendChild(secIcon("download"));
-    exportBtn.appendChild(document.createTextNode("Export"));
-    exportBtn.title = "Open this project's Reports tab";
-    exportBtn.onclick = () => secSwitchProjectTab("reports");
-    actions.appendChild(exportBtn);
+    const shown = Number.isFinite(data && data.total) ? data.total : null;
+    const exportKebab = document.createElement("details");
+    exportKebab.className = "secidx-kebab";
+    const exportSummary = document.createElement("summary");
+    exportSummary.className = "btn ghost";
+    exportSummary.title = "Download every recorded finding in this project, all branches";
+    exportSummary.appendChild(secIcon("download"));
+    exportSummary.appendChild(document.createTextNode("Export"));
+    exportSummary.onclick = (e) => {
+      e.stopPropagation();
+      closeMenus();
+    };
+    exportKebab.appendChild(exportSummary);
+    const exportPop = secEl("div", "menu-pop");
+    exportPop.setAttribute("role", "menu");
+    [["json", "JSON"], ["html", "HTML"], ["sbom", "SBOM"]].forEach(([fmt, label]) => {
+      const item = document.createElement("button");
+      item.setAttribute("role", "menuitem");
+      item.appendChild(secIcon("file"));
+      item.appendChild(document.createTextNode(label));
+      item.onclick = (e) => {
+        e.stopPropagation();
+        exportKebab.open = false;
+        secDownloadFindings(fs.project, fmt, shown, item);
+      };
+      exportPop.appendChild(item);
+    });
+    exportKebab.appendChild(exportPop);
+    secPlaceMenu(exportKebab, exportSummary, exportPop, "right");
+    actions.appendChild(exportKebab);
     actions.appendChild(savedWrap);
     head.appendChild(actions);
     wrap.appendChild(head);
@@ -2286,16 +2377,7 @@
     pop.setAttribute("role", "menu");
     pop.hidden = true;
     details.appendChild(pop);
-    details.ontoggle = () => {
-      pop.hidden = !details.open;
-      if (!details.open) return;
-      const r = trigger.getBoundingClientRect();
-      pop.style.position = "fixed";
-      pop.style.top = r.bottom + 6 + "px";
-      pop.style.left = r.left + "px";
-      pop.style.right = "auto";
-      pop.style.bottom = "auto";
-    };
+    secPlaceMenu(details, trigger, pop, "left");
   }
   function secFindMultiPicker(label, options, selected, onToggle) {
     const field = secEl("div", "secfind-fpick");
@@ -2785,16 +2867,7 @@
         kebab.open = false;
       });
       kebab.appendChild(pop);
-      kebab.ontoggle = () => {
-        pop.hidden = !kebab.open;
-        if (!kebab.open) return;
-        const r = summary.getBoundingClientRect();
-        pop.style.position = "fixed";
-        pop.style.top = r.bottom + 6 + "px";
-        pop.style.left = "auto";
-        pop.style.right = window.innerWidth - r.right + "px";
-        pop.style.bottom = "auto";
-      };
+      secPlaceMenu(kebab, summary, pop, "right");
       td.appendChild(kebab);
     }
     return td;
@@ -3344,16 +3417,7 @@
     };
     pop.appendChild(report);
     kebab.appendChild(pop);
-    kebab.ontoggle = () => {
-      pop.hidden = !kebab.open;
-      if (!kebab.open) return;
-      const rect = summary.getBoundingClientRect();
-      pop.style.position = "fixed";
-      pop.style.top = rect.bottom + 6 + "px";
-      pop.style.right = window.innerWidth - rect.right + "px";
-      pop.style.left = "auto";
-      pop.style.bottom = "auto";
-    };
+    secPlaceMenu(kebab, summary, pop, "right");
     return kebab;
   }
   function secBranchTrendText(trend) {
@@ -4057,16 +4121,7 @@
       pop.appendChild(item);
     });
     kebab.appendChild(pop);
-    kebab.ontoggle = () => {
-      pop.hidden = !kebab.open;
-      if (!kebab.open) return;
-      const r = summary.getBoundingClientRect();
-      pop.style.position = "fixed";
-      pop.style.top = r.bottom + 6 + "px";
-      pop.style.right = window.innerWidth - r.right + "px";
-      pop.style.left = "auto";
-      pop.style.bottom = "auto";
-    };
+    secPlaceMenu(kebab, summary, pop, "right");
     actions.appendChild(kebab);
     head.appendChild(actions);
     host.appendChild(head);
@@ -4502,16 +4557,7 @@
     };
     pop.appendChild(editBtn);
     kebab.appendChild(pop);
-    kebab.ontoggle = () => {
-      pop.hidden = !kebab.open;
-      if (!kebab.open) return;
-      const r = summary.getBoundingClientRect();
-      pop.style.position = "fixed";
-      pop.style.top = r.bottom + 6 + "px";
-      pop.style.right = window.innerWidth - r.right + "px";
-      pop.style.left = "auto";
-      pop.style.bottom = "auto";
-    };
+    secPlaceMenu(kebab, summary, pop, "right");
     tdActions.appendChild(kebab);
     tr.appendChild(tdActions);
     return tr;
@@ -5098,15 +5144,7 @@
       pop.appendChild(item);
     });
     wrap.appendChild(pop);
-    wrap.ontoggle = () => {
-      if (!wrap.open) return;
-      const r = trigger.getBoundingClientRect();
-      pop.style.position = "fixed";
-      pop.style.top = r.bottom + 6 + "px";
-      pop.style.right = window.innerWidth - r.right + "px";
-      pop.style.left = "auto";
-      pop.style.bottom = "auto";
-    };
+    secPlaceMenu(wrap, trigger, pop, "right");
     return wrap;
   }
   function secIndexFindingsCard(donut, categories, cappedNote, recent) {
@@ -5224,5 +5262,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: c758400fed6bb1471fdaba9551e4808a69f0dbef07f5a15e23445edc110778c6 */
-/* ui-sources: 511693ab12aa5851b5f29c75a638e0ea0fd7160ce118161264f280020dc13262 */
+/* ui-bundle: dfe02f49a48200a6981339c35b58ba5fce958f13f8b86df2e37c4984c74106d9 */
+/* ui-sources: 05293b4e3db02b403043b1947ce75c1b9d1824705fd2e408985bc9ac896a175d */

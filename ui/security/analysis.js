@@ -1,7 +1,7 @@
 /* --------------------------------------------------------- one project */
 import { $, AL, api, toast, projById, fmtDur, fmtWhen, money, createCombo,
          makePicker, pushNav, markPending, clearPending, isPending } from "./page.js";
-import { secIcon, secIconHTML, secEl, secFetch } from "./dom.js";
+import { secIcon, secIconHTML, secEl, secFetch, secPlaceMenu } from "./dom.js";
 import { SEC_POLL_MS, SEC_PROFILES, SEC_STATES, SEC_STATE_HELP, SEC_STATE_LABEL,
          SEC_NEVER, secCategoryMeta, secCfg, secDefaultProfile, secMinSeverity,
          secPlatformLabel, secRepos, secSevKey, secSevRank, secStateKey, secVisible } from "./vocabulary.js";
@@ -688,16 +688,7 @@ export function secInitFindBar(){
   // but the fix is cheap and the alternative -- a popover that silently
   // clips or mispositions the one time a caller nests this bar somewhere
   // narrower -- is not something to find out live a second time.
-  filters.ontoggle = () => {
-    fPop.hidden = !filters.open;
-    if(!filters.open) return;
-    const r = fTrigger.getBoundingClientRect();
-    fPop.style.position = "fixed";
-    fPop.style.top = (r.bottom + 6) + "px";
-    fPop.style.right = (window.innerWidth - r.right) + "px";
-    fPop.style.left = "auto";
-    fPop.style.bottom = "auto";
-  };
+  secPlaceMenu(filters, fTrigger, fPop, "right");
 
   secFindCatPicker = makePicker("sec-find-catpick", {
     icon: secIconHTML("filter"), label: "Category",

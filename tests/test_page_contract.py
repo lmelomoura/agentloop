@@ -4651,6 +4651,15 @@ const document = {
 function icon(_name){ return document.createElement("span"); }
 function fmtAgo(t){ return "t" + String(t); }
 function fmtDur(s){ return "d" + String(s); }
+// dom.js's secPlaceMenu wires a <details> menu's ontoggle to position:fixed
+// placement, viewport clamping and close-on-scroll -- every kebab and picker
+// in this area calls it as it is BUILT. Stubbed to the one structural thing
+// a builder relies on (an ontoggle exists), deliberately trivial: none of
+// these tests is about where a menu lands, and the real one reads `window`,
+// which this harness does not have.
+function secPlaceMenu(details, _trigger, pop, _align){
+  details.ontoggle = () => { pop.hidden = !details.open; };
+}
 // Flattens a rendered node into a list of {cls, title, text} records, one per
 // element in the tree -- `text` is each element's own aggregated
 // textContent, so a search for a rendered word does not need to know which
@@ -10869,3 +10878,78 @@ def test_the_runs_header_never_presents_a_stale_listing_as_a_fresh_one(srv, tmp_
     assert "busy" in out["stale_empty"] and "Nothing recorded yet" not in out["stale_empty"], (
         "an index that would not answer is reported as an empty history, which is "
         "the exact lie this flag exists to stop")
+
+
+# ---- The Export button downloads; it does not navigate.
+#
+# It used to call secSwitchProjectTab("reports"), on the reasoning that the
+# project already had a download surface there. That surface is one report per
+# ANALYSIS, and the person standing in front of a table of every finding across
+# every branch wants those. These pin the shape rather than the wording: a
+# regression here is silent -- the button still looks like a button and still
+# does something -- so the assertions are about WHERE it points.
+
+def test_the_export_button_calls_the_export_route_and_never_the_reports_tab(srv):
+    block = _security_js(srv)
+    head = _plainfn(block, "secFindHeader")
+    assert "secDownloadFindings(" in head, head[-1200:]
+    assert 'secSwitchProjectTab("reports")' not in head, (
+        "the Export button navigated to the Reports tab again — that tab's "
+        "downloads are per analysis, and this button is about every finding "
+        "of every branch")
+
+
+def test_export_is_one_button_with_the_house_menu_behind_it(srv):
+    """The same <details>/<summary>/.menu-pop kebab the Reports tab's own row
+    draws for JSON/HTML/SBOM. Two buttons side by side made the format the
+    loudest thing in a header whose job is filters; asserted as structure
+    rather than as a count of buttons, because the point is that this page
+    reuses the one menu pattern it already has instead of growing a second."""
+    head = _plainfn(_security_js(srv), "secFindHeader")
+    assert 'exportKebab.className = "secidx-kebab"' in head, head[-1500:]
+    assert '"menu-pop"' in head and 'setAttribute("role", "menu")' in head
+    assert head.count('setAttribute("role", "menuitem")') >= 1
+    # the same three the Reports tab's kebab offers, in the same order
+    assert '["json", "JSON"], ["html", "HTML"], ["sbom", "SBOM"]' in head
+    # placed by the ONE shared helper every kebab and picker in this area now
+    # uses (dom.js's secPlaceMenu: fixed placement, viewport clamp, close on
+    # scroll) rather than by a ninth hand-copied ontoggle block; and it still
+    # closes every other open menu as it opens
+    assert 'secPlaceMenu(exportKebab, exportSummary, exportPop, "right")' in head
+    assert "closeMenus()" in head
+
+
+def test_every_menu_in_the_security_area_is_placed_by_the_shared_helper(srv):
+    """The eight hand-copied ontoggle blocks shared two defects the copies had
+    faithfully reproduced -- a menu that stayed put while its trigger scrolled
+    away, and a left-aligned one that opened off the right edge -- and the fix
+    is one function. This pins that nobody writes a ninth copy."""
+    block = _security_js(srv)
+    helper = _plainfn(block, "secPlaceMenu")
+    assert 'addEventListener("scroll", onMove, true)' in helper, helper
+    assert "window.innerWidth - MARGIN" in helper
+    # no menu positions itself any more: the only `.style.position = "fixed"`
+    # left in this area is inside the helper
+    outside = block.replace(helper, "")
+    assert 'style.position = "fixed"' not in outside, (
+        "a menu is positioning itself by hand again — use secPlaceMenu")
+
+
+def test_the_export_download_names_the_file_from_the_server_not_from_itself(srv):
+    # The project name is free text an operator typed and the server sanitises
+    # it into the Content-Disposition. A second copy of that rule here would be
+    # one more pair that has to agree by hand -- the sibling per-analysis
+    # download already carries such a pair for REPORT_EXTENSIONS -- so this one
+    # reads the header back instead. Same origin, so it can.
+    block = _security_js(srv)
+    fn = _plainfn(block, "secDownloadFindings")
+    assert 'r.headers.get("Content-Disposition")' in fn, fn
+    assert "/api/security/findings-export?project=" in fn
+    # and the fallback never invents a name out of the project
+    helper = _plainfn(block, "_nameFromDisposition")
+    assert "[\\\\/]" in helper or "\\\\/" in helper, helper
+
+
+def test_the_export_carries_the_token_like_every_other_get_on_this_api(srv):
+    fn = _plainfn(_security_js(srv), "secDownloadFindings")
+    assert '"X-AL-Token":TOKEN' in fn.replace(" ", ""), fn

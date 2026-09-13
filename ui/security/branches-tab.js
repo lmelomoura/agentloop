@@ -21,7 +21,7 @@
    add up to more than either. The KPI, the column header and the rail
    card's own "(all branches)" each carry their half of it. */
 import { $, fmtAgo, fmtWhen, kpiCard, projById, tableFooter } from "./page.js";
-import { secEl, secIcon } from "./dom.js";
+import { secEl, secIcon, secPlaceMenu } from "./dom.js";
 import { SEC_NEVER, SEC_FLOOR_SCOPE_NOTE } from "./vocabulary.js";
 import { secIndexDonutSvg, secIndexDonutLegend, secIndexCategories,
          secCappedScopeNote } from "./index-screen.js";
@@ -508,16 +508,7 @@ function secBrKebab(r){
   pop.appendChild(report);
 
   kebab.appendChild(pop);
-  kebab.ontoggle = () => {
-    pop.hidden = !kebab.open;
-    if(!kebab.open) return;
-    const rect = summary.getBoundingClientRect();
-    pop.style.position = "fixed";
-    pop.style.top = (rect.bottom + 6) + "px";
-    pop.style.right = (window.innerWidth - rect.right) + "px";
-    pop.style.left = "auto";
-    pop.style.bottom = "auto";
-  };
+  secPlaceMenu(kebab, summary, pop, "right");
   return kebab;
 }
 
