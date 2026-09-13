@@ -20,6 +20,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Every e2e scenario reads its own job's run, not the last line of the
+  journal.** `lastrun` was `tail -1 runs.ndjson`, which is the right run only
+  while every scenario runs alone, in one sandbox, in sequence — a scenario
+  inserted in the middle would have read its neighbour's. It now asks for the
+  job the scenario made (`run_of <job>`), keyed on the record's own id. Same
+  181 checks, same output; and it is what lets the scenarios stop depending
+  on their order.
+
 - **Status: Fixed on the Findings tab shows the fixed findings.** With "Show
   resolved findings" off it showed nothing — the toggle dropped every resolved
   row first, then the status filter ran over what was left, which by

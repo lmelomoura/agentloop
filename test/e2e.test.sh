@@ -67,6 +67,7 @@ cat > "$ROOT/config/platforms.json" <<'JSON'
 JSON
 
 mkjob() { # mkjob <id> <mode>
+  E2E_JOB="$1"
   printf '{"jobs":[{"id":"%s","project":"sandbox","enabled":false,"prompt":"do the thing",
     "interval_seconds":3600,"permission_mode":"bypassPermissions","max_parallel":1}]}\n' "$1" \
     > "$ROOT/config/jobs.json"
@@ -297,6 +298,7 @@ jq -e '(.openai.models[] | select(.slug=="gpt-5.6-sol") | .efforts | index("ultr
   && ok "gpt-5.6-sol's efforts include ultra" \
   || bad "gpt-5.6-sol has no ultra effort"
 mkjob_openai() { # mkjob_openai <id> [permission]
+  E2E_JOB="$1"
   printf '{"jobs":[{"id":"%s","project":"sandbox","enabled":false,"platform":"openai","model":"gpt-5.6-sol","effort":"high","prompt":"do the thing",
     "interval_seconds":3600,"permission_mode":"%s","max_parallel":1}]}\n' "$1" "${2:-workspace-write}" \
     > "$ROOT/config/jobs.json"
@@ -304,7 +306,15 @@ mkjob_openai() { # mkjob_openai <id> [permission]
   printf '#!/bin/bash\nexit 0\n' > "$ROOT/config/prechecks/$1.sh"
   chmod +x "$ROOT/config/prechecks/$1.sh"
 }
-lastrun() { tail -1 "$ROOT/data/runs.ndjson" 2>/dev/null; }
+# The run of ONE job -- the last recorded for it -- rather than the last line
+# of the journal, which is only the same thing while every scenario runs
+# alone in one sandbox in sequence. Scenarios read their own run through
+# `lastrun`, which asks for the job the last mkjob* made (E2E_JOB); a scenario
+# whose run belongs to a job it did not make (a derived security job) sets
+# E2E_JOB itself. Keyed on the record's own `"id":"<job>"` -- record_run
+# writes `id` first -- and the closing quote keeps j1 from matching j10.
+run_of() { grep -F "\"id\":\"$1\"" "$ROOT/data/runs.ndjson" 2>/dev/null | tail -1; }
+lastrun() { run_of "$E2E_JOB"; }
 # <index><TAB><argument> readers over a recorded argv file
 at_in()  { awk -F'\t' -v i="$2" '$1==i {print $2; exit}' "$1"; }
 idx_in() { awk -F'\t' -v w="$2" '$2==w {print $1; exit}' "$1"; }
@@ -538,6 +548,7 @@ grep -q 'security-analysis/SKILL.md' "$prompt24" && ok "and names the skill file
 grep -q 'Agent. tool' "$prompt24" && bad "the prompt still speaks of the Agent tool" || ok "and never speaks of the Agent tool"
 grep -q 'ALREADY RAN for this analysis' "$prompt24" && ! grep -q 'YOUR FIRST COMMAND' "$prompt24" \
   && ok "the prompt says the deterministic phase already ran" || bad "the prompt still asks the agent to run prepare, or never says the engine did"
+E2E_JOB=security-sandbox-oa   # the derived job, which no mkjob made
 [ "$(lastrun | jq -r .id)" = "security-sandbox-oa" ] && [ "$(lastrun | jq -r .platform)" = "openai" ] && [ "$(lastrun | jq -r .cost_basis)" = "estimated" ] \
   && ok "the journal has the derived job's run on openai, priced by estimate" || bad "$(lastrun | jq -c '{id,platform,cost_basis}')"
 sleep 1
@@ -633,6 +644,7 @@ jq -e '.opencode.models | length == 13' "$ROOT/config/models.json" >/dev/null \
   && ok "resolve-models opencode wrote the catalog from the stand-in's models --verbose" \
   || bad "no opencode catalog after resolve-models"
 mkjob_opencode() { # mkjob_opencode <id> [permission] [model] [extra-json-fields]
+  E2E_JOB="$1"
   printf '{"jobs":[{"id":"%s","project":"sandbox","enabled":false,"platform":"opencode","model":"%s","effort":"high","prompt":"do the thing",
     "interval_seconds":3600,"permission_mode":"%s","max_parallel":1%s}]}\n' "$1" "${3:-pdm_ai/glm-5.3-flash}" "${2:-full-access}" "${4:-}" \
     > "$ROOT/config/jobs.json"
@@ -901,6 +913,7 @@ grep -q 'security-analysis/SKILL.md' "$prompt42" && grep -q 'Invoke the `securit
 grep -q 'ALREADY RAN for this analysis' "$prompt42" && ! grep -q 'YOUR FIRST COMMAND' "$prompt42" \
   && ok "the prompt says the deterministic phase already ran" || bad "the prompt still asks the agent to run prepare"
 grep -q 'Do not spawn subagents' "$prompt42" && bad "the Codex-only wording leaked into the opencode prompt" || ok "no Codex wording"
+E2E_JOB=security-sandbox-oc   # the derived job, which no mkjob made
 [ "$(lastrun | jq -r .id)" = "security-sandbox-oc" ] && [ "$(lastrun | jq -r .platform)" = "opencode" ] && [ "$(lastrun | jq -r .cost_basis)" = "reported" ] \
   && ok "the journal has the derived job's run on opencode, with the CLI's own cost" || bad "$(lastrun | jq -c '{id,platform,cost_basis}')"
 sleep 1
