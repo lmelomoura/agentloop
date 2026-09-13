@@ -11,6 +11,11 @@ import json
 import time
 
 from . import coverage
+# One definition of what "resolved" means, imported rather than repeated:
+# a second copy is how the export and the screen would come to disagree
+# about which findings are still work. queries imports diff and ledger,
+# never report, so this cannot cycle.
+from .queries import RESOLVED_STATES
 
 STATES = ("new", "regressed", "open", "partial", "pending", "fixed", "accepted", "false_positive")
 # Ordered most severe first. `info` is last on purpose: it is below the default
@@ -286,3 +291,172 @@ def as_html(analysis, findings, coverage_note):
             f"<ul>{locs}</ul><p>{e(f['rationale'])}</p>"
             f"<p><strong>Remediation:</strong> {e(f['remediation'])}</p></div>")
     return "".join(parts)
+
+
+# --------------------------------------------------------- consolidated
+# EVERY finding of a project, across branches, in one document -- the other
+# three renderers above answer "what did this analysis find"; this one answers
+# "what is there to fix, and where". Its reader is an agent with no context,
+# which is what sets its shape: the branch on every finding (without it there
+# is no way to know where to apply a fix), the commit each branch was analysed
+# at (so the agent can tell whether the code it is reading is the code that
+# was read), and a header that says what the document does NOT contain before
+# the reader can be misled by its silence.
+
+def _consolidated_meta_lines(project, groups, meta):
+    """The header, as a list of lines. Every number a reader needs to know
+    whether to trust the list, before the list."""
+    total = sum(len(g["open"]) + len(g["resolved"]) for g in groups)
+    open_n = sum(len(g["open"]) for g in groups)
+    res_n = total - open_n
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(meta.get("at") or time.time()))
+    out = [f"- **Exported:** {when}",
+           f"- **Branches:** {len(groups)}",
+           f"- **Findings:** {open_n} open" + (f", {res_n} resolved (listed last)" if res_n else "")]
+    # THE FILTERS THE SCREEN HAD ON, SAID OUT LOUD. Someone who narrowed the
+    # page to Critical and then exported gets every severity in the file; the
+    # page already promises that ("Downloads always contain every recorded
+    # finding, whatever the severity floor shows") but the promise lives on
+    # the page, not in the file, and the file is what the agent reads.
+    # WORST FIRST, AND ONLY WHAT IS OPEN. "3 open" does not say whether to
+    # start now or after lunch; "1 critical, 1 high" does. Resolved findings
+    # are left out of this line on purpose -- they are not work.
+    counts = {}
+    for g in groups:
+        for f in g["open"]:
+            counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    if counts:
+        out.append("- **Open by severity:** "
+                   + " · ".join(f"{sev} {counts[sev]}" for sev in SEVERITIES if counts.get(sev)))
+    shown = meta.get("shown_on_screen")
+    if shown is not None and shown != open_n:
+        out.append(f"- **The screen was showing {shown} of these.** Filters and the"
+                   " project's severity floor are NOT applied to this document:"
+                   " it carries everything recorded.")
+    else:
+        out.append("- Filters and the project's severity floor are not applied to"
+                   " this document: it carries everything recorded.")
+    return out
+
+
+def _consolidated_groups(rows, branch_meta):
+    """`rows` (queries.finding_rows, every page) grouped by branch, each group
+    split into open and resolved and each list ordered.
+
+    ORDER IS PART OF THE CONTRACT: branch alphabetically, then severity worst
+    first, then fingerprint. The last key is not decoration -- without a total
+    order, two exports of an unchanged project differ in the order of two
+    equally severe findings, and the first thing anyone does with two of these
+    files is diff them.
+    """
+    sev_rank = {s: i for i, s in enumerate(SEVERITIES)}
+    by_branch = {}
+    for r in rows:
+        by_branch.setdefault(r["branch"], []).append(r)
+    groups = []
+    for br in sorted(set(list(by_branch) + list(branch_meta))):
+        items = sorted(by_branch.get(br, []),
+                       key=lambda r: (sev_rank.get(r["severity"], len(SEVERITIES)),
+                                      r["fingerprint"]))
+        m = branch_meta.get(br, {})
+        groups.append({"branch": br, "analysis": m,
+                       "open": [r for r in items if r["state"] not in RESOLVED_STATES],
+                       "resolved": [r for r in items if r["state"] in RESOLVED_STATES]})
+    return groups
+
+
+def _consolidated_finding_md(f, branch):
+    """One finding, with everything an agent needs to act and nothing it does
+    not. The fingerprint leads because it is the identity that survives
+    branches and analyses, and it is what the agent quotes back when it
+    reports what it fixed."""
+    out = [f"#### [{f['severity']}] {f['title']}", "",
+           f"- **Fingerprint:** `{f['fingerprint']}`",
+           f"- **Branch:** `{branch}`",
+           f"- **State:** {f['state']} · **Rule:** `{f['rule']}` ({f['category']})"]
+    if f.get("cwe"):
+        out.append(f"- **Class:** {f['cwe']}"
+                   + (f" · OWASP {f['owasp']}" if f.get("owasp") else ""))
+    if f.get("scope"):
+        out.append(f"- **Scope:** {_scope_label(f['scope'])}")
+    # WHERE, before WHY. An agent opens files; a location it can pass straight
+    # to an editor is worth more than a paragraph it has to parse for one.
+    if f.get("occurrences"):
+        out.append("- **Where:**")
+        out += [f"    - `{o['file']}`" + (f":{o['line']}" if o.get("line") else "")
+                for o in f["occurrences"]]
+    if f.get("rationale"):
+        out += ["", f["rationale"]]
+    if f.get("remediation"):
+        out += ["", f"**Remediation:** {f['remediation']}"]
+    out.append("")
+    return out
+
+
+def consolidated_as_markdown(project, groups, meta):
+    """Every finding of `project`, by branch, for a reader with no context."""
+    out = [f"# Findings — {project}", ""]
+    out += _consolidated_meta_lines(project, groups, meta)
+    out += ["",
+            "Each finding below names the branch it was found on and the commit that"
+            " branch was analysed at. Apply a fix on that branch; a fix made"
+            " elsewhere is not recorded against this finding until that branch is"
+            " analysed again.",
+            ""]
+    for g in groups:
+        a = g["analysis"] or {}
+        at = f" at `{a['commit_sha'][:12]}`" if a.get("commit_sha") else ""
+        prof = f" · {a['profile']}" if a.get("profile") else ""
+        out += [f"## `{g['branch']}`{at}{prof}", ""]
+        if not g["open"] and not g["resolved"]:
+            # A CLEAN BRANCH IS SAID, NEVER OMITTED. An agent that does not see
+            # a branch cannot tell "nothing to do here" from "nobody looked",
+            # and those two call for opposite actions.
+            out += ["_No findings recorded on this branch._", ""]
+            continue
+        if g["open"]:
+            out += [f"### Open — {len(g['open'])}", ""]
+            for f in g["open"]:
+                out += _consolidated_finding_md(f, g["branch"])
+        if g["resolved"]:
+            out += [f"### Resolved on this branch — {len(g['resolved'])} (no action needed)", ""]
+            for f in g["resolved"]:
+                out += [f"- [{f['severity']}] {f['title']} — {f['state']}"
+                        f" · `{f['fingerprint'][:12]}`"]
+            out.append("")
+    return "\n".join(out)
+
+
+def consolidated_as_json(project, groups, meta):
+    """The same document for a reader that parses. Same order, same content:
+    two renderers over one grouping, never two groupings."""
+    doc = {"project": project,
+           "exported_at": int(meta.get("at") or time.time()),
+           "filters_applied": False,
+           "severity_floor_applied": False,
+           "shown_on_screen": meta.get("shown_on_screen"),
+           "branches": []}
+    for g in groups:
+        a = g["analysis"] or {}
+        doc["branches"].append({
+            "branch": g["branch"],
+            "analysis_id": a.get("id"),
+            "commit_sha": a.get("commit_sha", ""),
+            "profile": a.get("profile", ""),
+            "open": [_consolidated_finding_json(f, g["branch"]) for f in g["open"]],
+            "resolved": [_consolidated_finding_json(f, g["branch"]) for f in g["resolved"]]})
+    return json.dumps(doc, indent=2, sort_keys=False)
+
+
+def _consolidated_finding_json(f, branch):
+    return {"fingerprint": f["fingerprint"], "branch": branch,
+            "severity": f["severity"], "state": f["state"],
+            "category": f["category"], "rule": f["rule"], "title": f["title"],
+            "cwe": f.get("cwe", ""), "owasp": f.get("owasp", ""),
+            "scope": f.get("scope", ""),
+            "occurrences": [{"file": o["file"], "line": o.get("line")}
+                            for o in f.get("occurrences", [])],
+            "rationale": f.get("rationale", ""),
+            "remediation": f.get("remediation", ""),
+            "first_seen": f.get("first_seen", 0),
+            "analysis_id": f.get("analysis_id")}
