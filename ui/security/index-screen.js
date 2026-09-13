@@ -19,7 +19,7 @@
    leaving a project screen where an analysis may have just finished). */
 import { $, fmtAgo, pageHeader, kpiCard, tableFooter, openProjectEditor, makePicker,
          closeMenus } from "./page.js";
-import { secIcon, secIconHTML, secEl, secFetch } from "./dom.js";
+import { secIcon, secIconHTML, secEl, secFetch, secPlaceMenu } from "./dom.js";
 import { SEC_NEVER, SEC_FLOOR_SCOPE_NOTE, secRuleMeta } from "./vocabulary.js";
 // secSwitchProjectTab: "View full report" (Phase 4 Task 4) opens a project
 // straight onto its own Reports tab -- see secViewFullReportButton, below.
@@ -691,16 +691,7 @@ function secIndexProjectRow(p){
   // that can never disagree with the element's own state -- the identical
   // fix secFindSavedFilters' own ontoggle already uses (findings-screen.js),
   // for the identical race, found there first.
-  kebab.ontoggle = () => {
-    pop.hidden = !kebab.open;
-    if(!kebab.open) return;
-    const r = summary.getBoundingClientRect();
-    pop.style.position = "fixed";
-    pop.style.top = (r.bottom + 6) + "px";
-    pop.style.right = (window.innerWidth - r.right) + "px";
-    pop.style.left = "auto";
-    pop.style.bottom = "auto";
-  };
+  secPlaceMenu(kebab, summary, pop, "right");
   tdActions.appendChild(kebab);
   tr.appendChild(tdActions);
 
@@ -1660,15 +1651,7 @@ function secFindingsPeriodPicker(){
   // identical fix secIndexProjectRow's own kebab already needed for the
   // same `.table-card{overflow:hidden}` clip -- see that popup's own
   // `ontoggle` comment.
-  wrap.ontoggle = () => {
-    if(!wrap.open) return;
-    const r = trigger.getBoundingClientRect();
-    pop.style.position = "fixed";
-    pop.style.top = (r.bottom + 6) + "px";
-    pop.style.right = (window.innerWidth - r.right) + "px";
-    pop.style.left = "auto";
-    pop.style.bottom = "auto";
-  };
+  secPlaceMenu(wrap, trigger, pop, "right");
   return wrap;
 }
 

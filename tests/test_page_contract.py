@@ -4651,6 +4651,15 @@ const document = {
 function icon(_name){ return document.createElement("span"); }
 function fmtAgo(t){ return "t" + String(t); }
 function fmtDur(s){ return "d" + String(s); }
+// dom.js's secPlaceMenu wires a <details> menu's ontoggle to position:fixed
+// placement, viewport clamping and close-on-scroll -- every kebab and picker
+// in this area calls it as it is BUILT. Stubbed to the one structural thing
+// a builder relies on (an ontoggle exists), deliberately trivial: none of
+// these tests is about where a menu lands, and the real one reads `window`,
+// which this harness does not have.
+function secPlaceMenu(details, _trigger, pop, _align){
+  details.ontoggle = () => { pop.hidden = !details.open; };
+}
 // Flattens a rendered node into a list of {cls, title, text} records, one per
 // element in the tree -- `text` is each element's own aggregated
 // textContent, so a search for a rendered word does not need to know which
@@ -10900,11 +10909,30 @@ def test_export_is_one_button_with_the_house_menu_behind_it(srv):
     assert 'exportKebab.className = "secidx-kebab"' in head, head[-1500:]
     assert '"menu-pop"' in head and 'setAttribute("role", "menu")' in head
     assert head.count('setAttribute("role", "menuitem")') >= 1
-    # both formats reachable, and only through the menu
-    assert '["md", "Markdown"], ["json", "JSON"]' in head
-    # the same closeMenus()/position:fixed contract every other kebab honours,
-    # or this one stays open behind the next menu the operator opens
-    assert "closeMenus()" in head and 'exportPop.style.position = "fixed"' in head
+    # the same three the Reports tab's kebab offers, in the same order
+    assert '["json", "JSON"], ["html", "HTML"], ["sbom", "SBOM"]' in head
+    # placed by the ONE shared helper every kebab and picker in this area now
+    # uses (dom.js's secPlaceMenu: fixed placement, viewport clamp, close on
+    # scroll) rather than by a ninth hand-copied ontoggle block; and it still
+    # closes every other open menu as it opens
+    assert 'secPlaceMenu(exportKebab, exportSummary, exportPop, "right")' in head
+    assert "closeMenus()" in head
+
+
+def test_every_menu_in_the_security_area_is_placed_by_the_shared_helper(srv):
+    """The eight hand-copied ontoggle blocks shared two defects the copies had
+    faithfully reproduced -- a menu that stayed put while its trigger scrolled
+    away, and a left-aligned one that opened off the right edge -- and the fix
+    is one function. This pins that nobody writes a ninth copy."""
+    block = _security_js(srv)
+    helper = _plainfn(block, "secPlaceMenu")
+    assert 'addEventListener("scroll", onMove, true)' in helper, helper
+    assert "window.innerWidth - MARGIN" in helper
+    # no menu positions itself any more: the only `.style.position = "fixed"`
+    # left in this area is inside the helper
+    outside = block.replace(helper, "")
+    assert 'style.position = "fixed"' not in outside, (
+        "a menu is positioning itself by hand again — use secPlaceMenu")
 
 
 def test_the_export_download_names_the_file_from_the_server_not_from_itself(srv):

@@ -52,3 +52,65 @@ export async function secFetch(path){
   if(!r.ok) throw new Error((j && (j.error || j.output)) || ("HTTP " + r.status));
   return j;
 }
+
+/* ONE menu placement for every <details>/<summary>/.menu-pop in this area.
+   Eight copies of the same ontoggle block used to live across five files,
+   and all eight shared two defects the copies had faithfully reproduced:
+
+   - the position was computed ONCE, on open, from getBoundingClientRect().
+     Scroll any container afterwards and the trigger moves while the menu,
+     being position:fixed, stays where it was -- the options float free of
+     the button that opened them;
+   - a left-aligned menu near the right edge was placed at the trigger's own
+     left and ran off the viewport, clipped.
+
+   position:fixed itself is right and stays: `.table-card{overflow:hidden}`
+   clips an absolutely-positioned popup, which is why every copy used it.
+   What changes is that the menu now closes on any scroll or resize while it
+   is open (the way a native <select> does -- following the trigger frame by
+   frame is unusual and never what the operator meant), and it is clamped to
+   the viewport with an 8px margin on the right and the bottom, flipping
+   above the trigger when there is more room there than below. */
+export function secPlaceMenu(details, trigger, pop, align){
+  const MARGIN = 8, GAP = 6;
+  let onMove = null;
+  const close = () => { if(details.open) details.open = false; };
+  const detach = () => {
+    if(!onMove) return;
+    window.removeEventListener("scroll", onMove, true);
+    window.removeEventListener("resize", onMove);
+    onMove = null;
+  };
+  details.ontoggle = () => {
+    pop.hidden = !details.open;
+    if(!details.open){ detach(); return; }
+    const r = trigger.getBoundingClientRect();
+    pop.style.position = "fixed";
+    pop.style.bottom = "auto";
+    if(align === "right"){
+      pop.style.left = "auto";
+      pop.style.right = Math.max(MARGIN, window.innerWidth - r.right) + "px";
+    }else{
+      pop.style.right = "auto";
+      pop.style.left = r.left + "px";
+    }
+    pop.style.top = (r.bottom + GAP) + "px";
+    // Measured AFTER the first placement, because a hidden popup has no size
+    // to clamp against until it is shown.
+    const p = pop.getBoundingClientRect();
+    if(align !== "right" && p.right > window.innerWidth - MARGIN){
+      pop.style.left = Math.max(MARGIN, window.innerWidth - MARGIN - p.width) + "px";
+    }
+    if(p.bottom > window.innerHeight - MARGIN){
+      const above = r.top - GAP - p.height;
+      pop.style.top = (above >= MARGIN ? above
+                       : Math.max(MARGIN, window.innerHeight - MARGIN - p.height)) + "px";
+    }
+    // `true`: capture, so a scroll inside ANY container reaches this, not
+    // only the window's own. Registered on open and removed on close, never
+    // left behind on a menu that was torn down open.
+    onMove = close;
+    window.addEventListener("scroll", onMove, true);
+    window.addEventListener("resize", onMove);
+  };
+}

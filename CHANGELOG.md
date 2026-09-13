@@ -18,6 +18,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every dropdown menu in the Security area closes when you scroll, and
+  opens inside the viewport.** The eight kebabs and pickers there positioned
+  themselves once, on open, with `position:fixed` — scroll any container and
+  the trigger moved while the options stayed put, floating free of the button
+  that opened them; and a left-aligned picker near the right edge opened off
+  the screen, clipped. One shared placement now does what the eight copies
+  did, plus what none of them did: it clamps to the viewport (flipping above
+  the trigger when there is more room there) and closes on any scroll or
+  resize, the way a native select does.
+
 ### Added
 
 - **The Findings tab's Export button downloads every finding of the project,

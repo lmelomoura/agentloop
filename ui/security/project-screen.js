@@ -34,7 +34,7 @@
    which stays analysis.js's. */
 import { $, closeMenus, fmtAgo, fmtWhen, openLog, openProjectEditor, projById,
          tableFooter, pushNav, isPending } from "./page.js";
-import { secIcon, secEl, secFetch } from "./dom.js";
+import { secIcon, secEl, secFetch, secPlaceMenu } from "./dom.js";
 import { SEC_NEVER, SEC_FLOOR_SCOPE_NOTE, secMinSeverity,
          secPosture, secVisible } from "./vocabulary.js";
 import { secState } from "./state.js";
@@ -733,16 +733,7 @@ function secRenderRunHead(){
     pop.appendChild(item);
   });
   kebab.appendChild(pop);
-  kebab.ontoggle = () => {
-    pop.hidden = !kebab.open;
-    if(!kebab.open) return;
-    const r = summary.getBoundingClientRect();
-    pop.style.position = "fixed";
-    pop.style.top = (r.bottom + 6) + "px";
-    pop.style.right = (window.innerWidth - r.right) + "px";
-    pop.style.left = "auto";
-    pop.style.bottom = "auto";
-  };
+  secPlaceMenu(kebab, summary, pop, "right");
   actions.appendChild(kebab);
 
   head.appendChild(actions);
