@@ -2328,6 +2328,59 @@ def cmd_render(args):
     print(renderer(analysis, findings, note))
 
 
+def cmd_export_findings(args):
+    """Every finding of a project, across branches, as one document.
+
+    THE SAME PATH THE SCREEN READS, paged to exhaustion. `queries.finding_rows`
+    is what the Findings tab is drawn from -- one checklist per branch, the
+    latest finished analysis of each, unioned -- so the export and the screen
+    can never come to disagree about what exists. A second query here would be
+    a second answer to the same question, which is how this repository has
+    been bitten before.
+
+    NO FILTERS. Not "the filters are ignored": the arguments do not exist, so
+    there is no room for the question of whether they were applied. The page
+    already promises a download carries every recorded finding whatever the
+    severity floor shows; this keeps that promise and says so in the header.
+    """
+    conn = _conn(args)
+    # A project the ledger has never analysed is a typo far more often than it
+    # is a real empty project, and an empty document is the worst possible
+    # answer to a typo: an agent reads it, finds nothing to do, and reports
+    # that everything is fine.
+    known = [r["project"] for r in conn.execute(
+        "SELECT DISTINCT project FROM analysis ORDER BY project")]
+    if args.project not in known:
+        sys.exit(f"no analysis has ever run for project {args.project!r}"
+                 + (f" — known: {', '.join(known)}" if known else ""))
+
+    rows, page = [], 1
+    while True:
+        payload = queries.finding_rows(conn, args.project,
+                                       filters={"show_resolved": True},
+                                       page=page, per_page=queries.MAX_PER_PAGE)
+        rows.extend(payload["rows"])
+        if len(rows) >= payload["total"] or not payload["rows"]:
+            break
+        page += 1
+
+    # The commit each branch was read at: on the analysis row, not on the
+    # picker entry `finding_rows` returns, and worth the extra read -- without
+    # it the agent cannot tell whether the code in front of it is the code
+    # that was scanned.
+    branch_meta = {}
+    for a in payload.get("analyses", []):
+        row = dict(queries._analysis_row(conn, a["id"]))
+        branch_meta[a["branch"]] = {"id": a["id"], "profile": a.get("profile", ""),
+                                    "commit_sha": row.get("commit_sha", "")}
+
+    groups = report._consolidated_groups(rows, branch_meta)
+    meta = {"at": int(time.time()), "shown_on_screen": args.shown}
+    renderer = (report.consolidated_as_json if args.format == "json"
+                else report.consolidated_as_markdown)
+    print(renderer(args.project, groups, meta))
+
+
 def cmd_decide(args):
     """A permanent, project-wide judgement. Refused while an analysis is live.
 
@@ -3177,6 +3230,16 @@ def main(argv=None):
     rd.add_argument("--analysis", type=int, required=True)
     rd.add_argument("--format", required=True,
                     choices=("json", "md", "html", "sbom"))
+
+    ef = sub.add_parser("export-findings", parents=[dbflag])
+    ef.set_defaults(fn=cmd_export_findings)
+    ef.add_argument("--project", required=True)
+    ef.add_argument("--format", required=True, choices=("md", "json"))
+    # What the SCREEN was showing when the button was pressed, so the header
+    # can explain a document larger than the page. Optional: the CLI does not
+    # know the page's filters, and a header without the comparison is still
+    # true, only less helpful.
+    ef.add_argument("--shown", type=int, default=None)
 
     de = sub.add_parser("decide", parents=[dbflag]); de.set_defaults(fn=cmd_decide)
     for flag in ("project", "fingerprint", "reason"):
