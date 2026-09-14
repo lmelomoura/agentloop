@@ -4169,16 +4169,371 @@ undelivered_note() { # undelivered_note <description>
   printf 'UNDELIVERED: %s. The run made changes that exist on no remote, so nothing was handed over — push the branch, or resume this run to finish it, before treating the ticket as done.' "$1"
 }
 
-run_job() { # run_job <id> [--force] [resume-session-id]
-  # A RESUME picks the failed run's own session back up (`claude --resume <sid>`)
-  # instead of starting the job afresh: same task, same conversation, continuing
-  # where it stopped. It is always forced (the precheck describes the board now,
-  # not the work this session was already doing) and it produces a normal run —
-  # its own log, stream, timeline and journal record, nothing lost.
-  local id="$1" force="${2:-}" resume_sid="${3:-}"
-  [ -n "$resume_sid" ] && force="--force"
-  local cwd prompt model effort budget timeout stall permission allowed disallowed precheck project proj_desc interactive fifo
-  local run_cwd worktree run_dir run_env run_cfgdir _envln slot max_par
+# ---------------------------------------------------------- run_job, in parts
+#
+# run_job used to be 1,335 lines with forty locals alive at once. Three
+# blocks with a small interface left it: the refusal gates, the launch and
+# its watch, and the classifier. Each is a function below, and each follows
+# ONE rule about state -- it writes nothing but its own locals and the RJ_*
+# globals it owns, every RJ_* assigned on the function's first line so no
+# value can carry over from an earlier call in the same shell. Today
+# cmd_tick detaches every run into its own process (`_exec`), so nothing
+# does carry over; the rule is what keeps that from ever mattering, and
+# the selftest holds every function to it by reading the text.
+#
+# run_launch_and_watch and run_classify READ run_job's locals through
+# bash's dynamic scope rather than taking twenty positionals (two of the
+# inputs are arrays, which bash 3.2 cannot pass by name); each header lists
+# what it reads. They never assign one: what goes back goes back as RJ_*.
+
+# run_refusals <id> <platform> <model> <effort> <permission> <allowed> <disallowed> <interactive>
+#   -> 0 to go on, 1 to refuse -- the reason already in tick.log, exactly as
+#   before: the caller reconstructs nothing. The operator's gates, then the
+#   CLI's own readiness, then the platform blocks (openai, opencode), then
+#   the model against Settings, in the order they always ran.
+#   Publishes RJ_EFFORT (the effort as launched: opencode drops one its
+#   catalog does not list for the model) and RJ_OPENCODE_CONFIG (the
+#   permission block's JSON line, empty on any other platform) -- the two
+#   values the opencode block used to leave in run_job's locals.
+run_refusals() {
+  RJ_EFFORT=""; RJ_OPENCODE_CONFIG=""
+  local id="$1" platform="$2" model="$3" effort="$4" permission="$5" allowed="$6" disallowed="$7" interactive="$8"
+  # A run that cannot start is refused HERE, before a slot, a precheck or a
+  # turn is spent, with the reason in tick.log -- the treatment `cwd missing`
+  # gets. Each of these would otherwise fail at launch with nothing saying why.
+  local not_ready
+  # The operator's own gates, before the CLI's: a planned platform, a
+  # platform switched off in Settings, nothing switched on to run it with.
+  # Each is one line before a slot is spent, the treatment `cwd missing` gets.
+  if platform_planned "$platform"; then
+    log_tick "$id: $platform is listed but does not run yet (planned), skipped"; return 1
+  fi
+  platform_known "$platform" || { log_tick "$id: unknown platform '$platform', skipped"; return 1; }
+  platform_enabled "$platform" || { log_tick "$id: $platform is disabled in Settings (agentloop platform enable $platform), skipped"; return 1; }
+  # Still an operator gate, ahead of the CLI's own readiness check right below
+  # and the OpenAI block's catalog check further down: with nothing enabled,
+  # $model is empty, and the catalog check would otherwise refuse it with a
+  # misleading "not in the OpenAI catalog" message instead of naming the real
+  # cause.
+  if [ -z "$(platform_models_enabled "$platform" | head -1)" ]; then
+    log_tick "$id: no model is enabled for $platform in Settings, skipped"; return 1
+  fi
+  if ! not_ready="$(platform_ready "$platform")"; then
+    log_tick "$id: $platform is not ready ($not_ready), skipped"; return 1
+  fi
+  if [ "$platform" = "openai" ]; then
+    [ "$interactive" != "true" ] \
+      || { log_tick "$id: interactive is not available on openai (codex exec has no stdin protocol), skipped"; return 1; }
+    platform_model_ok openai "$model" \
+      || { log_tick "$id: model '$model' is not in the OpenAI catalog (run: agentloop resolve-models openai), skipped"; return 1; }
+    platform_permission_ok openai "$permission" \
+      || { log_tick "$id: permission_mode '$permission' is not an OpenAI mode (read-only, workspace-write, full-access), skipped"; return 1; }
+    local successor; successor="$(openai_catalog_successor "$model")"
+    [ -z "$successor" ] || log_tick "$id: model '$model' is deprecated — its successor is $successor"
+    # Codex has no tool allow/deny list and cannot close a tool by flag
+    # (measured: --disable multi_agent leaves spawn_agent in the roster), so
+    # the two fields are ignored here, and said to be.
+    [ -z "$allowed" ] || [ "$allowed" = "null" ] \
+      || log_tick "$id: allowed_tools is ignored on openai (codex has no tool allowlist)"
+    [ -z "$disallowed" ] || [ "$disallowed" = "null" ] \
+      || log_tick "$id: disallowed_tools is ignored on openai (codex cannot close a tool by flag)"
+  fi
+  if [ "$platform" = "opencode" ]; then
+    # The CLI reads stdin as part of the PROMPT (measured 13b): there is no
+    # protocol for a human to talk to a live run.
+    [ "$interactive" != "true" ] \
+      || { log_tick "$id: interactive is not available on opencode (opencode run has no stdin protocol: it reads stdin as part of the prompt), skipped"; return 1; }
+    platform_model_ok opencode "$model" \
+      || { log_tick "$id: model '$model' is not in the OpenCode catalog (run: agentloop resolve-models opencode), skipped"; return 1; }
+    platform_permission_ok opencode "$permission" \
+      || { log_tick "$id: permission_mode '$permission' is not an OpenCode mode (full-access, read-only), skipped"; return 1; }
+    # The CLI accepts any --variant in silence (measured 11b): an effort the
+    # catalog does not list for this model is dropped here, and said to be,
+    # rather than passed to change nothing.
+    if [ -n "$effort" ] && ! platform_effort_ok opencode "$model" "$effort"; then
+      log_tick "$id: effort '$effort' is not a variant of $model — launched without an effort"
+      effort=""
+    fi
+    # A model that makes no tool calls (the catalog says so) still runs -- a
+    # prompt that needs no tool is legitimate -- but the operator is told.
+    opencode_catalog_tools "$model" \
+      || log_tick "$id: model '$model' makes no tool calls (catalog) — the agent can only answer in text"
+    # The permission block this run launches with, built and validated HERE --
+    # before a slot, a precheck or a log dir is spent -- so the one way this
+    # ever fails (a broken $PYTHON: opencode_config_content always prints a
+    # JSON first line otherwise) costs the run nothing to refuse. `_occ1`
+    # (its first line, the JSON) is kept in a `local` that outlives this
+    # block, for the run_env section further down to read; every note on the
+    # later lines goes to tick.log now.
+    local _occ _oc_rc _occ1 _ocnote
+    _occ="$(opencode_config_content "$permission" "$allowed" "$disallowed")"; _oc_rc=$?
+    _occ1="$(printf '%s\n' "$_occ" | head -1)"
+    if [ "$_oc_rc" -ne 0 ] || [ -z "$_occ1" ]; then
+      log_tick "$id: could not build the OpenCode permission block, skipped"
+      return 1
+    fi
+    printf '%s\n' "$_occ" | tail -n +2 | while IFS= read -r _ocnote; do
+      [ -n "$_ocnote" ] && log_tick "$id: $_ocnote"
+    done
+  fi
+  # After the catalog: a model the CLI knows, but not the one Settings
+  # enabled (the enabled list is never empty here -- the gate above already
+  # refused that case).
+  if ! platform_model_enabled "$platform" "$model"; then
+    log_tick "$id: model '$model' is not enabled in Settings — $platform enables: $(platform_models_enabled_line "$platform"), skipped"; return 1
+  fi
+  RJ_EFFORT="$effort"
+  case "$platform" in opencode) RJ_OPENCODE_CONFIG="$_occ1" ;; esac
+  return 0
+}
+
+# run_launch_and_watch -> 0 once the run has ended, 1 when there was no
+#   launch line for the platform (nothing of the run exists on disk then, and
+#   the state already says error). Reads from run_job: id, slot, platform,
+#   interactive, resume_sid, run_cwd, run_dir, model, effort, permission,
+#   prompt, stamp, cli_bin, args, streamfile, logfile, stall, timeout, and
+#   the two arrays run_env and toolargs. The FIFO, the normalizer, the exec
+#   of the CLI, the interactive turn loop, the watchdog, the wait, and the
+#   normalizer's own note, unchanged. `$slot/child` is still written the
+#   moment the agent is spawned -- that file, not a variable, is what
+#   `agentloop stop` reads.
+#   Publishes RJ_CHILD_PID, RJ_CHILD_RC (0 for an interactive run this side
+#   ended, as before), RJ_NORMALIZER_RC and RJ_WATCHDOG_NOTE.
+run_launch_and_watch() {
+  RJ_CHILD_PID=""; RJ_CHILD_RC=""; RJ_NORMALIZER_RC=""; RJ_WATCHDOG_NOTE=""
+  local fifo rc args="$args"
+  fifo=""
+  local cli_pid="" normalizer="" rawfifo="" nrc=0
+  local normalizer_py; normalizer_py="$(platform_normalizer "$platform")"
+  if [ -n "$normalizer_py" ]; then
+    # A platform with a normalizer: the CLI writes its own dialect; every
+    # reader here wants stream-json. The CLI's stdout goes down a FIFO into
+    # the normalizer, which writes the canonical stream to $streamfile and a
+    # verbatim copy to $streamfile.raw. `exec` makes the subshell BECOME the
+    # CLI, so $child below is the CLI's own pid: stop (TERM), the watchdog's
+    # tree_cpu_seconds and wait all keep working unchanged. `< /dev/null` is
+    # what keeps both CLIs from waiting on stdin for ever (measured on each).
+    #
+    # The launch line first, the FIFO after it: the `*)` arm is unreachable
+    # by construction (platform_normalizer names exactly these two), and the
+    # day a platform gains a normalizer without a launch line, the refusal
+    # must come before anything of the run exists on disk, with the state
+    # saying error rather than the `running` set above.
+    local -a normargs=()
+    case "$platform" in
+      openai)
+        platform_argv_openai "$resume_sid" "$run_cwd" "$model" "$effort" "$permission" "$prompt" \
+          "$(openai_writable_roots "$run_cwd" "$run_dir")"
+        normargs=(--model "$model" --permission "$permission" --cwd "$run_cwd" \
+                  --pricing "$PRICING_FILE" --raw-out "$streamfile.raw") ;;
+      opencode)
+        platform_argv_opencode "$resume_sid" "$run_cwd" "$model" "$effort" "$prompt" "agentloop $id $stamp"
+        normargs=(--model "$model" --permission "$permission" --cwd "$run_cwd" \
+                  --catalog "$MODELS_FILE" --pricing "$PRICING_FILE" --raw-out "$streamfile.raw") ;;
+      *)
+        log_tick "$id: no launch line for platform $platform"
+        state_set "$id" last_status '"error"'
+        run_cleanup "$id" "$slot"; trap - EXIT
+        return 1 ;;
+    esac
+    rawfifo="$logfile.raw.fifo"
+    rm -f "$rawfifo"; mkfifo "$rawfifo" 2>/dev/null
+    (
+      cd "$run_cwd" || exit 1
+      exec env ${run_env[@]+"${run_env[@]}"} "$cli_bin" ${PLATFORM_ARGV[@]+"${PLATFORM_ARGV[@]}"} \
+        > "$rawfifo" 2> "$logfile.err" < /dev/null
+    ) &
+    cli_pid=$!
+    "$PYTHON" -u "$normalizer_py" ${normargs[@]+"${normargs[@]}"} < "$rawfifo" > "$streamfile" 2>> "$logfile.err" &
+    normalizer=$!
+  elif [ "$interactive" = "true" ]; then
+    # `--input-format stream-json` accepts further user messages on stdin while
+    # the run is going, which is what makes the dashboard's terminal two-way.
+    # The prompt is sent as the first message instead of as an argument.
+    fifo="$logfile.stdin"
+    rm -f "$fifo"; mkfifo "$fifo" 2>/dev/null
+    args="$args --input-format stream-json --replay-user-messages"
+    (
+      cd "$run_cwd" || exit 1
+      # A bare trailing `--`, and yes it is deliberate. THIS branch has no
+      # positional for a variadic flag to swallow -- the prompt goes down the
+      # fifo -- so nothing here is broken today. It is written the same as the
+      # branch below so the two launches cannot drift apart, and so that the
+      # day someone hands this one a positional argument the guard is already
+      # there. Confirmed harmless on CLI 2.1.258: a `--` with nothing after it
+      # parses to no operands at all, and the run starts normally.
+      env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
+        ${toolargs[@]+"${toolargs[@]}"} -- < "$fifo" > "$streamfile" 2> "$logfile.err"
+    ) &
+  else
+    (
+      cd "$run_cwd" || exit 1
+      # `--` before the prompt, ALWAYS -- not only when a tool flag is set. It
+      # costs nothing when there is no option to terminate, and it is what
+      # keeps the prompt a positional of its own rather than the tail of a
+      # variadic option's value list. See the toolargs note above.
+      env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
+        ${toolargs[@]+"${toolargs[@]}"} -- "$prompt" > "$streamfile" 2> "$logfile.err"
+    ) &
+  fi
+  local child=$!
+  [ -z "$normalizer" ] || child="$cli_pid"   # a platform with a normalizer: $! was the normalizer
+
+  if [ "$interactive" = "true" ]; then
+    exec 9> "$fifo"                       # hold it open: EOF would end the turn loop
+    "$JQ" -nc --arg t "$prompt" \
+      '{type:"user",message:{role:"user",content:[{type:"text",text:$t}]}}' >&9
+    state_set "$id" last_fifo "$("$JQ" -nc --arg p "$fifo" '$p')"
+  fi
+  # Publish the agent's PID so `agentloop stop` can end this run cleanly.
+  echo "$child" > "$slot/child" 2>/dev/null || true
+
+  # An interactive run does not end on its own: stdin is held open, so after each
+  # answer the agent simply waits for more. This ends it once the conversation is
+  # over — after a `result` event, give the human a short window to type; any new
+  # output (their replayed message, or the agent working again) cancels it.
+  if [ "$interactive" = "true" ]; then
+    (
+      # The decision is a POSITIVE ASSERTION about the transcript's current
+      # state — "the conversation is finished and quiet" — never an inference
+      # from a counter. turn_is_over() has to say yes twice, INTERACTIVE_GRACE
+      # apart, with the file unchanged in between, before anything is killed.
+      while kill -0 "$child" 2>/dev/null; do
+        sleep 2
+        turn_is_over "$streamfile" || continue
+        size="$(num "$(wc -c < "$streamfile" 2>/dev/null)")"
+        waited=0
+        while [ "$waited" -lt "$INTERACTIVE_GRACE" ]; do
+          sleep 2
+          waited="$(num "$(( waited + 2 ))")"
+          kill -0 "$child" 2>/dev/null || exit 0
+          [ "$(num "$(wc -c < "$streamfile" 2>/dev/null)")" != "$size" ] && break
+        done
+        # Re-assert after the wait: anything new, or a transcript that no longer
+        # ends on a result, means the agent is working again — leave it alone.
+        [ "$(num "$(wc -c < "$streamfile" 2>/dev/null)")" != "$size" ] && continue
+        turn_is_over "$streamfile" || continue
+        [ "$waited" -ge "$INTERACTIVE_GRACE" ] || continue
+        printf 'interactive: conversation idle for %ss after the last answer\n' \
+          "$INTERACTIVE_GRACE" > "$logfile.turnend"
+        kill -TERM "$child" 2>/dev/null
+        exit 0
+      done
+    ) & local turnloop=$!
+  fi
+
+  # Liveness watchdog. It asks "is this run still doing anything?", not "has it
+  # taken too long" — the stream file grows with every agent event, so while it
+  # grows the agent is alive and we leave it alone however many hours it needs.
+  # We kill only when it has been silent for $stall seconds (a genuine hang), or
+  # when an explicit absolute cap $timeout is set and exceeded. The reason is
+  # written to the watchdog file so the run can explain itself afterwards.
+  #
+  # "Silent" means BOTH signals are quiet. The stream alone is not enough: it
+  # stops for the entire duration of a single tool call, so a long test suite
+  # reads as a hang and gets killed at $stall for doing exactly what it was
+  # asked to do. CPU burnt by the run's process tree covers that gap — while a
+  # child is computing, the run is working, and only a run that is neither
+  # emitting events nor burning CPU is genuinely hung.
+  local wdfile="$logfile.watchdog"
+  : > "$wdfile"
+  (
+    local last_size=-1 last_cpu=-1 last_change now size cpu began poll="$WATCHDOG_POLL"
+    began="$(now_epoch)"; last_change="$began"
+    while kill -0 "$child" 2>/dev/null; do
+      # Bind this run dir to its session the moment the transcript names one,
+      # so a machine that goes down mid-run still leaves the directory findable.
+      bind_session "$run_dir" "$streamfile"
+      sleep "$poll"
+      kill -0 "$child" 2>/dev/null || break
+      now="$(now_epoch)"
+      size="$(wc -c < "$streamfile" 2>/dev/null | tr -d ' ')"; size="${size:-0}"
+      cpu="$(num "$(tree_cpu_seconds "$child")")"
+      if [ "$size" != "$last_size" ] || [ "$cpu" != "$last_cpu" ]; then
+        last_size="$size"; last_cpu="$cpu"; last_change="$now"
+      fi
+      # A stream still EMPTY this long after the launch is a dead run,
+      # whatever the CPU says. Measured on OpenCode (evidence 35): a CLI
+      # whose provider never answers, or a resume the CLI took to another
+      # directory, hangs with no output for ever and still gains a CPU
+      # second every minute or so of idling -- which the test below reads as
+      # life, so the stall never fired and timeout_seconds has no default.
+      # Every healthy run of every platform writes its first event within
+      # seconds (Claude's init, Codex's thread.started, OpenCode's
+      # step_start when the model starts answering), so this rule changes
+      # the fate of no run that ever wrote a byte. A CPU floor was weighed
+      # and rejected: the slowest legitimate work here (docker builds, trivy
+      # pulling its policies, a clone on a bad link) burns its CPU outside
+      # the run's process tree and survives today by the same tick.
+      if [ "$stall" -gt 0 ] && [ "${size:-0}" -eq 0 ] && [ "$((now - began))" -ge "$stall" ]; then
+        printf 'stalled: no output at all for %ss (the CLI never started answering; killed by watchdog)\n' "$stall" > "$wdfile"
+        kill -TERM "$child" 2>/dev/null; break
+      fi
+      if [ "$stall" -gt 0 ] && [ "$((now - last_change))" -ge "$stall" ]; then
+        printf 'stalled: no output and no CPU for %ss (killed by watchdog)\n' "$stall" > "$wdfile"
+        kill -TERM "$child" 2>/dev/null; break
+      fi
+      if [ "$timeout" -gt 0 ] && [ "$((now - began))" -ge "$timeout" ]; then
+        printf 'absolute timeout: reached the %ss cap (killed by watchdog)\n' "$timeout" > "$wdfile"
+        kill -TERM "$child" 2>/dev/null; break
+      fi
+    done
+  ) & local watchdog=$!
+  wait "$child"; rc=$?
+  if [ -n "$normalizer" ]; then
+    # The normalizer ends at EOF on the FIFO. A process the CLI left behind
+    # can hold the FIFO's write end open after the CLI itself is gone (a
+    # backgrounded tool, a server it started), so the wait is bounded: what is
+    # on disk by then is the transcript, and the note says what happened.
+    local _nw=0
+    while kill -0 "$normalizer" 2>/dev/null && [ "$_nw" -lt 100 ]; do sleep 0.1; _nw=$((_nw + 1)); done
+    if kill -0 "$normalizer" 2>/dev/null; then
+      kill "$normalizer" 2>/dev/null; wait "$normalizer" 2>/dev/null; nrc=-1
+    else
+      wait "$normalizer"; nrc=$?
+    fi
+    rm -f "$rawfifo"
+  fi
+  # Again, now that the transcript is final. The watchdog polls every 30s and
+  # its first pass runs before the child has even exec'd, so a run that dies
+  # inside that first window would otherwise never be bound — and a run that
+  # dies early is exactly the one a resume is for. Here the file is static and
+  # complete, so this pass cannot miss what the polling one raced.
+  bind_session "$run_dir" "$streamfile"
+  kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
+  if [ "$interactive" = "true" ]; then
+    kill "${turnloop:-0}" 2>/dev/null; wait "${turnloop:-0}" 2>/dev/null
+    exec 9>&- 2>/dev/null || true
+    rm -f "$fifo"
+    state_set "$id" last_fifo '""'
+  fi
+  local wdreason=""
+  [ -s "$wdfile" ] && wdreason="$(cat "$wdfile")"
+  rm -f "$wdfile"
+  case "$nrc" in
+    0) ;;
+    -1) wdreason="${wdreason:+$wdreason · }normalizer killed: the CLI's stdout stayed open 10s after it exited" ;;
+    *)  wdreason="${wdreason:+$wdreason · }normalizer exited $nrc" ;;
+  esac
+  # An interactive run is ENDED BY US once the conversation goes quiet, so its
+  # exit status is a signal, not a failure. Treat that as a clean exit.
+  if [ -f "$logfile.turnend" ]; then rc=0; rm -f "$logfile.turnend"; fi
+  RJ_CHILD_PID="$child"; RJ_CHILD_RC="$rc"; RJ_NORMALIZER_RC="$nrc"; RJ_WATCHDOG_NOTE="$wdreason"
+  return 0
+}
+
+# run_classify -> the verdict, from everything the run left behind. Reads
+#   from run_job: id, rc, logfile, wdreason, slot, run_dir, cost, cost_basis,
+#   _no_result, tokens_json, model, model_id. The classifier, the stop
+#   override, NOTHING TO DO, UNDECLARED ENDING, BUDGET LIMITED, the
+#   undelivered-work rule and the `.ended` contract, in the order the
+#   selftest holds them to (the order IS the mechanism: see the comments
+#   inside).
+#   Publishes RJ_STATUS, RJ_REASON (the note, appended to as before),
+#   RJ_CAUSE and RJ_DENIALS.
+run_classify() {
+  RJ_STATUS=""; RJ_REASON=""; RJ_CAUSE=""; RJ_DENIALS=""
+  local status wdreason="$wdreason"
   # declared_ending and undelivered decide .ended (see the classifier below,
   # near UNDECLARED ENDING and wt_undelivered_work). Declared HERE, at the top,
   # same as run_dir and worktree below: `.ended`'s own read of $declared_ending
@@ -4194,6 +4549,256 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   # default for an error or a stopped run, which the `.ended` gate below would
   # then read as "nothing undelivered" without ever having asked.
   local declared_ending="false" undelivered=""
+  # Classify the run: error / warning / success.
+  #   error   — the process failed, the CLI reported an error, or the agent had
+  #             tools denied (a blocked agent silently doing nothing is a failure,
+  #             not a success — it must surface loudly);
+  #   warning — the run completed but something smells: stderr output, or an
+  #             empty agent result;
+  #   success — clean run, agent produced a result, nothing denied.
+  local denials subtype result_len errbytes cause
+  denials="$("$JQ" -r '.permission_denials // [] | length' "$logfile" 2>/dev/null || echo 0)"
+  subtype="$("$JQ" -r '.subtype // "success"' "$logfile" 2>/dev/null || echo success)"
+  result_len="$("$JQ" -r '.result // "" | length' "$logfile" 2>/dev/null || echo 0)"
+  errbytes="$(wc -c < "$logfile.err" 2>/dev/null | tr -d ' ')"
+  if [ "$rc" -ne 0 ] || [ "$subtype" != "success" ] \
+     || ! "$JQ" -e '.is_error != true' "$logfile" >/dev/null 2>&1; then
+    status="error"
+  elif [ "${denials:-0}" -gt 0 ]; then
+    status="error"
+  elif [ "${errbytes:-0}" -gt 0 ] || [ "${result_len:-0}" -eq 0 ]; then
+    status="warning"
+    # SAY WHY. A warning with an empty note read as "something is wrong and
+    # nobody will tell you what": on a real run the CLI had logged five
+    # "stream error" lines (the provider dropped the connection, the CLI
+    # went on) and the record said nothing. The note names the count and
+    # the first line, trimmed to one sentence; a result of zero length is
+    # named as that.
+    if [ -z "$wdreason" ]; then
+      if [ "${errbytes:-0}" -gt 0 ]; then
+        wdreason="STDERR: the CLI wrote $(wc -l < "$logfile.err" 2>/dev/null | tr -d ' ') line(s) on stderr and the run went on, e.g. $(head -c 300 "$logfile.err" 2>/dev/null | head -1 | sed 's/^[[:space:]]*//' | cut -c1-220)"
+      else
+        wdreason="EMPTY RESULT: the run ended without a final message"
+      fi
+    fi
+  else
+    status="success"
+  fi
+
+  # WHY the run failed, not just that it did. `error` covered everything from a
+  # 529 the API returned to an agent that got its tools denied, and the failure
+  # backoff counted them the same — so the fleet punished a job by slowing it
+  # down for an outage that had nothing to do with it, and the operator read one
+  # word for causes whose next actions are completely different. The cause is
+  # recorded on the run and, for the two that are nobody's fault here, kept out
+  # of the backoff.
+  cause=""
+  if [ "$status" = "error" ]; then
+    if [ "$("$JQ" -r '.api_error_status // "" | tostring' "$logfile" 2>/dev/null)" != "" ] \
+       && [ "$("$JQ" -r '.api_error_status // "" | tostring' "$logfile" 2>/dev/null)" != "null" ]; then
+      case "$("$JQ" -r '.api_error_status' "$logfile" 2>/dev/null)" in
+        429) cause="rate_limited" ;;
+        *)   cause="api_error" ;;
+      esac
+    elif [ "${denials:-0}" -gt 0 ]; then
+      cause="tools_denied"
+    elif [ "$subtype" = "no_result_event" ]; then
+      # Killed, crashed, or stalled out. wdreason carries which, when we know.
+      cause="killed"
+    elif [ -n "$wdreason" ]; then
+      cause="killed"
+    else
+      cause="agent_error"
+    fi
+  fi
+
+  # A run the OPERATOR ended is not a failure, whatever the exit code says. A
+  # TERM'd agent exits non-zero and lands in the branch above as `error`, so a
+  # deliberate stop was counted in the error tile and drove the failure backoff,
+  # slowing the job down as punishment for a decision its owner made on purpose.
+  # This overrides every branch above precisely because those all read the exit
+  # code, and the exit code is the one thing a kill guarantees.
+  # The work itself is untouched: the stream, the log and the turns already
+  # written stay exactly where they are — only the verdict changes.
+  if [ -f "$slot/stopped" ]; then
+    status="stopped"
+    wdreason="STOPPED: you ended this run from the dashboard. Anything it had already done is in the log below and on disk; it was interrupted, not undone."
+  fi
+
+  # "Ran fine, but there was nothing to do" — a resumed task already finished, or
+  # its ticket is gone. The agent answers `NOTHING TO DO: <reason>` (see the
+  # resume prompt). The run did not FAIL, but calling it a plain success hides
+  # that a session was spent doing nothing, so it is a WARNING: worth a look,
+  # never a blocker. The reason rides in the run's note, which the dashboard
+  # shows behind the "?" beside the status.
+  local nothing_line
+  nothing_line="$("$JQ" -r '.result // ""' "$logfile" 2>/dev/null | grep -m1 -oE 'NOTHING TO DO:.*' || true)"
+  if [ -n "$nothing_line" ] && [ "$status" = "success" ]; then
+    wdreason="${nothing_line}"
+    status="warning"
+  fi
+
+  # "The agent stopped talking" is NOT "the agent finished the job".
+  #
+  # A headless run ends the instant the model returns text without a tool call.
+  # An agent that says "I'll wait for the background suite and then commit" gets
+  # exactly what it asked for in an interactive session and nothing at all here:
+  # the process exits, its children die with it, and the work is abandoned
+  # mid-task. That produces a textbook-clean record — rc 0, subtype success, a
+  # non-empty result — so it was filed as SUCCESS, which is how a ticket with no
+  # commit, no push and no PR came to be reported as done. The one fact the
+  # operator needed was the one fact the status did not carry.
+  #
+  # So a clean exit now has to be CLAIMED, not inferred. The agent declares how
+  # its run ended (see the job prompt's "Declare how your run ended"); an
+  # undeclared ending is the signature of a run that stopped mid-task, and it is
+  # a warning — never a silent success. A warning that is occasionally
+  # unnecessary costs a glance; a success that is occasionally false costs a day.
+  #
+  # Computed UNCONDITIONALLY, not just while status is still success: this is
+  # also the fact `.ended` is decided on below, and a run this classifier calls
+  # `warning` (stray stderr, an empty result on an otherwise clean exit) can
+  # still have declared how it ended. Gating the computation itself on status
+  # would silently answer "false" for exactly the runs where it matters most.
+  declared_ending=false
+  if "$JQ" -r '.result // ""' "$logfile" 2>/dev/null \
+       | grep -qE '(RUN COMPLETE|NOTHING TO DO|BLOCKED):'; then
+    declared_ending=true
+  fi
+  if [ "$status" = "success" ] && [ "$declared_ending" = "false" ]; then
+    wdreason="UNDECLARED ENDING: the agent stopped without saying its run was finished (no 'RUN COMPLETE:', 'NOTHING TO DO:' or 'BLOCKED:' line), which is what a run cut off mid-task looks like. Do NOT assume the ticket is done — check the branch, the PR and the ticket, and resume this run to continue with its context."
+    status="warning"
+  fi
+
+  # "Ran out of money mid-task" looks EXACTLY like "finished the job": the agent
+  # sees the budget running down, wraps up cleanly and returns a result, so the
+  # subtype is `success` and nothing in the record says the work was cut short.
+  # A 75-minute run that stopped at 97% of its cap read as a clean success while
+  # its ticket sat unfinished — the one thing the operator needed to know was the
+  # one thing not shown. Spending the whole cap is not proof of truncation, but it
+  # is the only signal available here, and a warning that is occasionally
+  # unnecessary is far cheaper than silence that is occasionally very expensive.
+  local cap
+  cap="$(job_get "$id" '.max_budget_usd' '')"
+  case "$cap" in ''|null|0) cap="" ;; esac
+  if [ -n "$cap" ] && [ "$cost_basis" = "none" ] && [ "$_no_result" = false ]; then
+    # Unknown is not zero. The comparison below reads ${cost:-0}, so a run
+    # whose cost nobody knows (no price for its model, on any platform)
+    # would never reach 90% of anything and the cap would stay silent -- the
+    # worst shape a cap can take. Say it, on the run and in tick.log, and
+    # leave the status alone: the run itself did nothing wrong.
+    # `_no_result` guards this: a run that ended without a final event
+    # (killed, stopped, crashed at launch) also has cost_basis "none", but
+    # its cost is unknown because it died, not because the model has no
+    # price -- telling it "not applied" there is false on every platform,
+    # anthropic included, where the cap IS applied via --max-budget-usd.
+    # And WHY it is unknown: a priced model whose run died before its first
+    # step (a 401, an UnknownError) has null tokens and no price to blame;
+    # "no price for" is kept for the model the catalog does not price.
+    local _capwhy
+    if [ "$tokens_json" = "null" ]; then _capwhy="no step reported a cost"; else _capwhy="no price for ${model_id:-$model}"; fi
+    log_tick "$id: max_budget_usd $cap not applied: the cost of this run is unknown ($_capwhy)"
+    wdreason="${wdreason:+$wdreason; }max_budget_usd \$$cap not applied: the cost of this run is unknown ($_capwhy)"
+  elif [ -n "$cap" ] && [ "$status" = "success" ] \
+     && awk "BEGIN{exit !(${cost:-0} >= $cap * 0.9)}" 2>/dev/null; then
+    wdreason="BUDGET LIMITED: spent \$${cost:-0} of a \$$cap cap — the agent wrapped up early, so the task may be unfinished. Check the ticket and the branch before assuming it is done; resume this run to continue with its context."
+    status="warning"
+  fi
+
+  # A run that produced commits or changes no remote knows about handed nothing
+  # over. It used to be answered by keeping the run directory on disk for ever,
+  # which preserved the work for nobody: a resume cuts a fresh worktree, so the
+  # only thing that folder ever did was fill the disk and wait for a human. Push
+  # is the delivery channel; failing to use it is a failed run, and it belongs on
+  # the card. A warning, not an error: the agent may have been cut off mid-task,
+  # and a resume is the right next move rather than a backoff.
+  #
+  # Checked for EVERY status, unconditionally — not gated on success/warning —
+  # because the `.ended` gate below reads it for every status too. Gating the
+  # CHECK itself (rather than just the note) would leave undelivered empty by
+  # default for an error or a stopped run, which reads to that gate as "nothing
+  # undelivered" without ever having asked: an agent run that trips a denied
+  # tool (status=error) but still finishes and says `RUN COMPLETE:` would then
+  # satisfy declared_ending=true, undelivered="" (never checked), and mark
+  # `.ended=done` — force-removing a tree that may hold exactly the uncommitted
+  # work this whole mechanism exists to protect, unreported. Caught in this
+  # task's own self-review, not by the brief: the brief's corrected `.ended`
+  # snippet was right, but the upstream `undelivered` computation it depends on
+  # was still the pre-9.3 shape.
+  if [ -n "$run_dir" ]; then
+    undelivered="$(wt_undelivered_work "$run_dir")" || true
+  fi
+  # The NOTE and the STATUS BUMP stay scoped to success/warning, appended LAST
+  # among this classifier's rules and appending rather than replacing. Last
+  # because every rule above fires only while the status is still `success` —
+  # setting `warning` here first would silence UNDECLARED ENDING and BUDGET
+  # LIMITED entirely. Appending because "spent the whole cap" and "pushed
+  # nothing" are two different things the operator needs in one glance, not a
+  # choice between them.
+  #
+  # `stopped` is excluded deliberately: an operator who ended the run already
+  # knows it did not finish, and replacing their STOPPED record with a generic
+  # "you did not push" is less information, not more. `error` is excluded
+  # because a run that failed has a cause worth more than its symptom. Neither
+  # exclusion touches whether `undelivered` was CHECKED (it always is, above)
+  # — only whether it gets to overwrite what the card already says.
+  case "$status" in
+    success|warning)
+      if [ -n "$undelivered" ]; then
+        wdreason="${wdreason:-}${wdreason:+ · }$(undelivered_note "$undelivered")"
+        status="warning"
+      fi
+      ;;
+  esac
+
+  # A SESSION IS DONE WHEN IT SAID SO AND LEFT NOTHING BEHIND — not when the
+  # run looks good. Deriving this from the status made every `warning` keep its
+  # worktrees and, worse, keep its services running; and `warning` fires for
+  # stderr noise, an empty result, a budget cap, and for NOTHING TO DO, which
+  # is the commonest thing a quiet loop ever reports. On a real install that
+  # was about a quarter of all runs holding a full multi-repo checkout and a
+  # live stack for a day each — and alloc_port_base skips only blocks held by
+  # LIVE SLOTS, so the next run was handed the port block of a stack still
+  # listening on it.
+  #
+  # Exit code, stderr and the budget cap say how WELL a run went, not whether
+  # the session still has work to do — so none of the three feed this. Only
+  # the two facts that answer "is there anything left to pick back up" do:
+  # did the agent say it was finished, and did it leave anything undelivered.
+  if [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
+    if [ "$declared_ending" = "true" ] && [ -z "${undelivered:-}" ]; then
+      printf 'done\n' > "$run_dir/.ended" 2>/dev/null || true
+    else
+      printf 'open\n' > "$run_dir/.ended" 2>/dev/null || true
+    fi
+    # Alongside the write, not just at a resume's claim (9.4): overwriting
+    # .ended's CONTENT does not touch the directory ENTRY the way creating it
+    # the FIRST time does, so a second ending -- this same run dir, resumed
+    # and ending again -- would otherwise leave the ttl clock exactly where
+    # the reattach's own claim-time touch left it: ttl minus however long
+    # this cycle ran, not a fresh window. A resume that runs longer than the
+    # ttl on its own would then read as already-expired the instant it stops.
+    # The first ending gets this for free; this is what makes every later one
+    # measure the same event.
+    touch "$run_dir" 2>/dev/null || true
+  fi
+  # What goes back to run_job, and nothing else does. (The selftest lifts the
+  # block above by anchor, from `declared_ending=false` to this comment, and
+  # evals it against a real run dir.)
+  RJ_STATUS="$status"; RJ_REASON="$wdreason"; RJ_CAUSE="$cause"; RJ_DENIALS="${denials:-0}"
+  return 0
+}
+
+run_job() { # run_job <id> [--force] [resume-session-id]
+  # A RESUME picks the failed run's own session back up (`claude --resume <sid>`)
+  # instead of starting the job afresh: same task, same conversation, continuing
+  # where it stopped. It is always forced (the precheck describes the board now,
+  # not the work this session was already doing) and it produces a normal run —
+  # its own log, stream, timeline and journal record, nothing lost.
+  local id="$1" force="${2:-}" resume_sid="${3:-}"
+  [ -n "$resume_sid" ] && force="--force"
+  local cwd prompt model effort budget timeout stall permission allowed disallowed precheck project proj_desc interactive fifo
+  local run_cwd worktree run_dir run_env run_cfgdir _envln slot max_par
   # Loop variables for replaying a reattached run's manifest through `up` again
   # (see the isolation branch below). Declared here, not just inside the loop,
   # because `read` happily creates GLOBALS for anything not already local, and
@@ -4271,94 +4876,13 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   local _inert; _inert="$(permission_inert_warning "$platform" "$permission" "$allowed")"
   [ -z "$_inert" ] || log_tick "$id: $_inert"
 
-  # A run that cannot start is refused HERE, before a slot, a precheck or a
-  # turn is spent, with the reason in tick.log -- the treatment `cwd missing`
-  # gets. Each of these would otherwise fail at launch with nothing saying why.
-  local not_ready
-  # The operator's own gates, before the CLI's: a planned platform, a
-  # platform switched off in Settings, nothing switched on to run it with.
-  # Each is one line before a slot is spent, the treatment `cwd missing` gets.
-  if platform_planned "$platform"; then
-    log_tick "$id: $platform is listed but does not run yet (planned), skipped"; return 1
-  fi
-  platform_known "$platform" || { log_tick "$id: unknown platform '$platform', skipped"; return 1; }
-  platform_enabled "$platform" || { log_tick "$id: $platform is disabled in Settings (agentloop platform enable $platform), skipped"; return 1; }
-  # Still an operator gate, ahead of the CLI's own readiness check right below
-  # and the OpenAI block's catalog check further down: with nothing enabled,
-  # $model is empty, and the catalog check would otherwise refuse it with a
-  # misleading "not in the OpenAI catalog" message instead of naming the real
-  # cause.
-  if [ -z "$(platform_models_enabled "$platform" | head -1)" ]; then
-    log_tick "$id: no model is enabled for $platform in Settings, skipped"; return 1
-  fi
-  if ! not_ready="$(platform_ready "$platform")"; then
-    log_tick "$id: $platform is not ready ($not_ready), skipped"; return 1
-  fi
+  run_refusals "$id" "$platform" "$model" "$effort" "$permission" "$allowed" "$disallowed" "$interactive" || return 1
+  effort="$RJ_EFFORT"
+  local _occ1; _occ1="$RJ_OPENCODE_CONFIG"
   # Resolved once, after the gate, so the binary that was checked is the
   # binary that launches -- the env override, the file's own bin, or
   # detection, in that order.
   local cli_bin; cli_bin="$(platform_bin "$platform")"
-  if [ "$platform" = "openai" ]; then
-    [ "$interactive" != "true" ] \
-      || { log_tick "$id: interactive is not available on openai (codex exec has no stdin protocol), skipped"; return 1; }
-    platform_model_ok openai "$model" \
-      || { log_tick "$id: model '$model' is not in the OpenAI catalog (run: agentloop resolve-models openai), skipped"; return 1; }
-    platform_permission_ok openai "$permission" \
-      || { log_tick "$id: permission_mode '$permission' is not an OpenAI mode (read-only, workspace-write, full-access), skipped"; return 1; }
-    local successor; successor="$(openai_catalog_successor "$model")"
-    [ -z "$successor" ] || log_tick "$id: model '$model' is deprecated — its successor is $successor"
-    # Codex has no tool allow/deny list and cannot close a tool by flag
-    # (measured: --disable multi_agent leaves spawn_agent in the roster), so
-    # the two fields are ignored here, and said to be.
-    [ -z "$allowed" ] || [ "$allowed" = "null" ] \
-      || log_tick "$id: allowed_tools is ignored on openai (codex has no tool allowlist)"
-    [ -z "$disallowed" ] || [ "$disallowed" = "null" ] \
-      || log_tick "$id: disallowed_tools is ignored on openai (codex cannot close a tool by flag)"
-  fi
-  if [ "$platform" = "opencode" ]; then
-    # The CLI reads stdin as part of the PROMPT (measured 13b): there is no
-    # protocol for a human to talk to a live run.
-    [ "$interactive" != "true" ] \
-      || { log_tick "$id: interactive is not available on opencode (opencode run has no stdin protocol: it reads stdin as part of the prompt), skipped"; return 1; }
-    platform_model_ok opencode "$model" \
-      || { log_tick "$id: model '$model' is not in the OpenCode catalog (run: agentloop resolve-models opencode), skipped"; return 1; }
-    platform_permission_ok opencode "$permission" \
-      || { log_tick "$id: permission_mode '$permission' is not an OpenCode mode (full-access, read-only), skipped"; return 1; }
-    # The CLI accepts any --variant in silence (measured 11b): an effort the
-    # catalog does not list for this model is dropped here, and said to be,
-    # rather than passed to change nothing.
-    if [ -n "$effort" ] && ! platform_effort_ok opencode "$model" "$effort"; then
-      log_tick "$id: effort '$effort' is not a variant of $model — launched without an effort"
-      effort=""
-    fi
-    # A model that makes no tool calls (the catalog says so) still runs -- a
-    # prompt that needs no tool is legitimate -- but the operator is told.
-    opencode_catalog_tools "$model" \
-      || log_tick "$id: model '$model' makes no tool calls (catalog) — the agent can only answer in text"
-    # The permission block this run launches with, built and validated HERE --
-    # before a slot, a precheck or a log dir is spent -- so the one way this
-    # ever fails (a broken $PYTHON: opencode_config_content always prints a
-    # JSON first line otherwise) costs the run nothing to refuse. `_occ1`
-    # (its first line, the JSON) is kept in a `local` that outlives this
-    # block, for the run_env section further down to read; every note on the
-    # later lines goes to tick.log now.
-    local _occ _oc_rc _occ1 _ocnote
-    _occ="$(opencode_config_content "$permission" "$allowed" "$disallowed")"; _oc_rc=$?
-    _occ1="$(printf '%s\n' "$_occ" | head -1)"
-    if [ "$_oc_rc" -ne 0 ] || [ -z "$_occ1" ]; then
-      log_tick "$id: could not build the OpenCode permission block, skipped"
-      return 1
-    fi
-    printf '%s\n' "$_occ" | tail -n +2 | while IFS= read -r _ocnote; do
-      [ -n "$_ocnote" ] && log_tick "$id: $_ocnote"
-    done
-  fi
-  # After the catalog: a model the CLI knows, but not the one Settings
-  # enabled (the enabled list is never empty here -- the gate above already
-  # refused that case).
-  if ! platform_model_enabled "$platform" "$model"; then
-    log_tick "$id: model '$model' is not enabled in Settings — $platform enables: $(platform_models_enabled_line "$platform"), skipped"; return 1
-  fi
 
   # A resume continues the session of the run that was cut short, on the
   # platform that run used -- read from the journal, not from the job as it
@@ -4914,219 +5438,9 @@ If the work turns out to be already finished, or it can no longer be done at all
     fi
   fi
 
-  fifo=""
-  local cli_pid="" normalizer="" rawfifo="" nrc=0
-  local normalizer_py; normalizer_py="$(platform_normalizer "$platform")"
-  if [ -n "$normalizer_py" ]; then
-    # A platform with a normalizer: the CLI writes its own dialect; every
-    # reader here wants stream-json. The CLI's stdout goes down a FIFO into
-    # the normalizer, which writes the canonical stream to $streamfile and a
-    # verbatim copy to $streamfile.raw. `exec` makes the subshell BECOME the
-    # CLI, so $child below is the CLI's own pid: stop (TERM), the watchdog's
-    # tree_cpu_seconds and wait all keep working unchanged. `< /dev/null` is
-    # what keeps both CLIs from waiting on stdin for ever (measured on each).
-    #
-    # The launch line first, the FIFO after it: the `*)` arm is unreachable
-    # by construction (platform_normalizer names exactly these two), and the
-    # day a platform gains a normalizer without a launch line, the refusal
-    # must come before anything of the run exists on disk, with the state
-    # saying error rather than the `running` set above.
-    local -a normargs=()
-    case "$platform" in
-      openai)
-        platform_argv_openai "$resume_sid" "$run_cwd" "$model" "$effort" "$permission" "$prompt" \
-          "$(openai_writable_roots "$run_cwd" "$run_dir")"
-        normargs=(--model "$model" --permission "$permission" --cwd "$run_cwd" \
-                  --pricing "$PRICING_FILE" --raw-out "$streamfile.raw") ;;
-      opencode)
-        platform_argv_opencode "$resume_sid" "$run_cwd" "$model" "$effort" "$prompt" "agentloop $id $stamp"
-        normargs=(--model "$model" --permission "$permission" --cwd "$run_cwd" \
-                  --catalog "$MODELS_FILE" --pricing "$PRICING_FILE" --raw-out "$streamfile.raw") ;;
-      *)
-        log_tick "$id: no launch line for platform $platform"
-        state_set "$id" last_status '"error"'
-        run_cleanup "$id" "$slot"; trap - EXIT
-        return 1 ;;
-    esac
-    rawfifo="$logfile.raw.fifo"
-    rm -f "$rawfifo"; mkfifo "$rawfifo" 2>/dev/null
-    (
-      cd "$run_cwd" || exit 1
-      exec env ${run_env[@]+"${run_env[@]}"} "$cli_bin" ${PLATFORM_ARGV[@]+"${PLATFORM_ARGV[@]}"} \
-        > "$rawfifo" 2> "$logfile.err" < /dev/null
-    ) &
-    cli_pid=$!
-    "$PYTHON" -u "$normalizer_py" ${normargs[@]+"${normargs[@]}"} < "$rawfifo" > "$streamfile" 2>> "$logfile.err" &
-    normalizer=$!
-  elif [ "$interactive" = "true" ]; then
-    # `--input-format stream-json` accepts further user messages on stdin while
-    # the run is going, which is what makes the dashboard's terminal two-way.
-    # The prompt is sent as the first message instead of as an argument.
-    fifo="$logfile.stdin"
-    rm -f "$fifo"; mkfifo "$fifo" 2>/dev/null
-    args="$args --input-format stream-json --replay-user-messages"
-    (
-      cd "$run_cwd" || exit 1
-      # A bare trailing `--`, and yes it is deliberate. THIS branch has no
-      # positional for a variadic flag to swallow -- the prompt goes down the
-      # fifo -- so nothing here is broken today. It is written the same as the
-      # branch below so the two launches cannot drift apart, and so that the
-      # day someone hands this one a positional argument the guard is already
-      # there. Confirmed harmless on CLI 2.1.258: a `--` with nothing after it
-      # parses to no operands at all, and the run starts normally.
-      env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
-        ${toolargs[@]+"${toolargs[@]}"} -- < "$fifo" > "$streamfile" 2> "$logfile.err"
-    ) &
-  else
-    (
-      cd "$run_cwd" || exit 1
-      # `--` before the prompt, ALWAYS -- not only when a tool flag is set. It
-      # costs nothing when there is no option to terminate, and it is what
-      # keeps the prompt a positional of its own rather than the tail of a
-      # variadic option's value list. See the toolargs note above.
-      env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
-        ${toolargs[@]+"${toolargs[@]}"} -- "$prompt" > "$streamfile" 2> "$logfile.err"
-    ) &
-  fi
-  local child=$!
-  [ -z "$normalizer" ] || child="$cli_pid"   # a platform with a normalizer: $! was the normalizer
-
-  if [ "$interactive" = "true" ]; then
-    exec 9> "$fifo"                       # hold it open: EOF would end the turn loop
-    "$JQ" -nc --arg t "$prompt" \
-      '{type:"user",message:{role:"user",content:[{type:"text",text:$t}]}}' >&9
-    state_set "$id" last_fifo "$("$JQ" -nc --arg p "$fifo" '$p')"
-  fi
-  # Publish the agent's PID so `agentloop stop` can end this run cleanly.
-  echo "$child" > "$slot/child" 2>/dev/null || true
-
-  # An interactive run does not end on its own: stdin is held open, so after each
-  # answer the agent simply waits for more. This ends it once the conversation is
-  # over — after a `result` event, give the human a short window to type; any new
-  # output (their replayed message, or the agent working again) cancels it.
-  if [ "$interactive" = "true" ]; then
-    (
-      # The decision is a POSITIVE ASSERTION about the transcript's current
-      # state — "the conversation is finished and quiet" — never an inference
-      # from a counter. turn_is_over() has to say yes twice, INTERACTIVE_GRACE
-      # apart, with the file unchanged in between, before anything is killed.
-      while kill -0 "$child" 2>/dev/null; do
-        sleep 2
-        turn_is_over "$streamfile" || continue
-        size="$(num "$(wc -c < "$streamfile" 2>/dev/null)")"
-        waited=0
-        while [ "$waited" -lt "$INTERACTIVE_GRACE" ]; do
-          sleep 2
-          waited="$(num "$(( waited + 2 ))")"
-          kill -0 "$child" 2>/dev/null || exit 0
-          [ "$(num "$(wc -c < "$streamfile" 2>/dev/null)")" != "$size" ] && break
-        done
-        # Re-assert after the wait: anything new, or a transcript that no longer
-        # ends on a result, means the agent is working again — leave it alone.
-        [ "$(num "$(wc -c < "$streamfile" 2>/dev/null)")" != "$size" ] && continue
-        turn_is_over "$streamfile" || continue
-        [ "$waited" -ge "$INTERACTIVE_GRACE" ] || continue
-        printf 'interactive: conversation idle for %ss after the last answer\n' \
-          "$INTERACTIVE_GRACE" > "$logfile.turnend"
-        kill -TERM "$child" 2>/dev/null
-        exit 0
-      done
-    ) & local turnloop=$!
-  fi
-
-  # Liveness watchdog. It asks "is this run still doing anything?", not "has it
-  # taken too long" — the stream file grows with every agent event, so while it
-  # grows the agent is alive and we leave it alone however many hours it needs.
-  # We kill only when it has been silent for $stall seconds (a genuine hang), or
-  # when an explicit absolute cap $timeout is set and exceeded. The reason is
-  # written to the watchdog file so the run can explain itself afterwards.
-  #
-  # "Silent" means BOTH signals are quiet. The stream alone is not enough: it
-  # stops for the entire duration of a single tool call, so a long test suite
-  # reads as a hang and gets killed at $stall for doing exactly what it was
-  # asked to do. CPU burnt by the run's process tree covers that gap — while a
-  # child is computing, the run is working, and only a run that is neither
-  # emitting events nor burning CPU is genuinely hung.
-  local wdfile="$logfile.watchdog"
-  : > "$wdfile"
-  (
-    local last_size=-1 last_cpu=-1 last_change now size cpu began poll="$WATCHDOG_POLL"
-    began="$(now_epoch)"; last_change="$began"
-    while kill -0 "$child" 2>/dev/null; do
-      # Bind this run dir to its session the moment the transcript names one,
-      # so a machine that goes down mid-run still leaves the directory findable.
-      bind_session "$run_dir" "$streamfile"
-      sleep "$poll"
-      kill -0 "$child" 2>/dev/null || break
-      now="$(now_epoch)"
-      size="$(wc -c < "$streamfile" 2>/dev/null | tr -d ' ')"; size="${size:-0}"
-      cpu="$(num "$(tree_cpu_seconds "$child")")"
-      if [ "$size" != "$last_size" ] || [ "$cpu" != "$last_cpu" ]; then
-        last_size="$size"; last_cpu="$cpu"; last_change="$now"
-      fi
-      # A stream still EMPTY this long after the launch is a dead run,
-      # whatever the CPU says. Measured on OpenCode (evidence 35): a CLI
-      # whose provider never answers, or a resume the CLI took to another
-      # directory, hangs with no output for ever and still gains a CPU
-      # second every minute or so of idling -- which the test below reads as
-      # life, so the stall never fired and timeout_seconds has no default.
-      # Every healthy run of every platform writes its first event within
-      # seconds (Claude's init, Codex's thread.started, OpenCode's
-      # step_start when the model starts answering), so this rule changes
-      # the fate of no run that ever wrote a byte. A CPU floor was weighed
-      # and rejected: the slowest legitimate work here (docker builds, trivy
-      # pulling its policies, a clone on a bad link) burns its CPU outside
-      # the run's process tree and survives today by the same tick.
-      if [ "$stall" -gt 0 ] && [ "${size:-0}" -eq 0 ] && [ "$((now - began))" -ge "$stall" ]; then
-        printf 'stalled: no output at all for %ss (the CLI never started answering; killed by watchdog)\n' "$stall" > "$wdfile"
-        kill -TERM "$child" 2>/dev/null; break
-      fi
-      if [ "$stall" -gt 0 ] && [ "$((now - last_change))" -ge "$stall" ]; then
-        printf 'stalled: no output and no CPU for %ss (killed by watchdog)\n' "$stall" > "$wdfile"
-        kill -TERM "$child" 2>/dev/null; break
-      fi
-      if [ "$timeout" -gt 0 ] && [ "$((now - began))" -ge "$timeout" ]; then
-        printf 'absolute timeout: reached the %ss cap (killed by watchdog)\n' "$timeout" > "$wdfile"
-        kill -TERM "$child" 2>/dev/null; break
-      fi
-    done
-  ) & local watchdog=$!
-  wait "$child"; rc=$?
-  if [ -n "$normalizer" ]; then
-    # The normalizer ends at EOF on the FIFO. A process the CLI left behind
-    # can hold the FIFO's write end open after the CLI itself is gone (a
-    # backgrounded tool, a server it started), so the wait is bounded: what is
-    # on disk by then is the transcript, and the note says what happened.
-    local _nw=0
-    while kill -0 "$normalizer" 2>/dev/null && [ "$_nw" -lt 100 ]; do sleep 0.1; _nw=$((_nw + 1)); done
-    if kill -0 "$normalizer" 2>/dev/null; then
-      kill "$normalizer" 2>/dev/null; wait "$normalizer" 2>/dev/null; nrc=-1
-    else
-      wait "$normalizer"; nrc=$?
-    fi
-    rm -f "$rawfifo"
-  fi
-  # Again, now that the transcript is final. The watchdog polls every 30s and
-  # its first pass runs before the child has even exec'd, so a run that dies
-  # inside that first window would otherwise never be bound — and a run that
-  # dies early is exactly the one a resume is for. Here the file is static and
-  # complete, so this pass cannot miss what the polling one raced.
-  bind_session "$run_dir" "$streamfile"
-  kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
-  if [ "$interactive" = "true" ]; then
-    kill "${turnloop:-0}" 2>/dev/null; wait "${turnloop:-0}" 2>/dev/null
-    exec 9>&- 2>/dev/null || true
-    rm -f "$fifo"
-    state_set "$id" last_fifo '""'
-  fi
-  local wdreason=""
-  [ -s "$wdfile" ] && wdreason="$(cat "$wdfile")"
-  rm -f "$wdfile"
-  case "$nrc" in
-    0) ;;
-    -1) wdreason="${wdreason:+$wdreason · }normalizer killed: the CLI's stdout stayed open 10s after it exited" ;;
-    *)  wdreason="${wdreason:+$wdreason · }normalizer exited $nrc" ;;
-  esac
+  run_launch_and_watch || return 1
+  rc="$RJ_CHILD_RC"
+  local wdreason; wdreason="$RJ_WATCHDOG_NOTE"
   platform_stderr_filter "$platform" "$logfile.err" "$id"
 
   # Extract the final result event; synthesize an error object if the stream
@@ -5214,242 +5528,9 @@ If the work turns out to be already finished, or it can no longer be done at all
   platform_finish "$platform" "$streamfile" "$session" "$id" "$run_cwd"
   [ -z "$PF_MODEL_ID" ] || model_id="$PF_MODEL_ID"
 
-  # Classify the run: error / warning / success.
-  #   error   — the process failed, the CLI reported an error, or the agent had
-  #             tools denied (a blocked agent silently doing nothing is a failure,
-  #             not a success — it must surface loudly);
-  #   warning — the run completed but something smells: stderr output, or an
-  #             empty agent result;
-  #   success — clean run, agent produced a result, nothing denied.
-  # An interactive run is ENDED BY US once the conversation goes quiet, so its
-  # exit status is a signal, not a failure. Treat that as a clean exit.
-  if [ -f "$logfile.turnend" ]; then rc=0; rm -f "$logfile.turnend"; fi
-  local denials subtype result_len errbytes cause
-  denials="$("$JQ" -r '.permission_denials // [] | length' "$logfile" 2>/dev/null || echo 0)"
-  subtype="$("$JQ" -r '.subtype // "success"' "$logfile" 2>/dev/null || echo success)"
-  result_len="$("$JQ" -r '.result // "" | length' "$logfile" 2>/dev/null || echo 0)"
-  errbytes="$(wc -c < "$logfile.err" 2>/dev/null | tr -d ' ')"
-  if [ "$rc" -ne 0 ] || [ "$subtype" != "success" ] \
-     || ! "$JQ" -e '.is_error != true' "$logfile" >/dev/null 2>&1; then
-    status="error"
-  elif [ "${denials:-0}" -gt 0 ]; then
-    status="error"
-  elif [ "${errbytes:-0}" -gt 0 ] || [ "${result_len:-0}" -eq 0 ]; then
-    status="warning"
-    # SAY WHY. A warning with an empty note read as "something is wrong and
-    # nobody will tell you what": on a real run the CLI had logged five
-    # "stream error" lines (the provider dropped the connection, the CLI
-    # went on) and the record said nothing. The note names the count and
-    # the first line, trimmed to one sentence; a result of zero length is
-    # named as that.
-    if [ -z "$wdreason" ]; then
-      if [ "${errbytes:-0}" -gt 0 ]; then
-        wdreason="STDERR: the CLI wrote $(wc -l < "$logfile.err" 2>/dev/null | tr -d ' ') line(s) on stderr and the run went on, e.g. $(head -c 300 "$logfile.err" 2>/dev/null | head -1 | sed 's/^[[:space:]]*//' | cut -c1-220)"
-      else
-        wdreason="EMPTY RESULT: the run ended without a final message"
-      fi
-    fi
-  else
-    status="success"
-  fi
-
-  # WHY the run failed, not just that it did. `error` covered everything from a
-  # 529 the API returned to an agent that got its tools denied, and the failure
-  # backoff counted them the same — so the fleet punished a job by slowing it
-  # down for an outage that had nothing to do with it, and the operator read one
-  # word for causes whose next actions are completely different. The cause is
-  # recorded on the run and, for the two that are nobody's fault here, kept out
-  # of the backoff.
-  cause=""
-  if [ "$status" = "error" ]; then
-    if [ "$("$JQ" -r '.api_error_status // "" | tostring' "$logfile" 2>/dev/null)" != "" ] \
-       && [ "$("$JQ" -r '.api_error_status // "" | tostring' "$logfile" 2>/dev/null)" != "null" ]; then
-      case "$("$JQ" -r '.api_error_status' "$logfile" 2>/dev/null)" in
-        429) cause="rate_limited" ;;
-        *)   cause="api_error" ;;
-      esac
-    elif [ "${denials:-0}" -gt 0 ]; then
-      cause="tools_denied"
-    elif [ "$subtype" = "no_result_event" ]; then
-      # Killed, crashed, or stalled out. wdreason carries which, when we know.
-      cause="killed"
-    elif [ -n "$wdreason" ]; then
-      cause="killed"
-    else
-      cause="agent_error"
-    fi
-  fi
-
-  # A run the OPERATOR ended is not a failure, whatever the exit code says. A
-  # TERM'd agent exits non-zero and lands in the branch above as `error`, so a
-  # deliberate stop was counted in the error tile and drove the failure backoff,
-  # slowing the job down as punishment for a decision its owner made on purpose.
-  # This overrides every branch above precisely because those all read the exit
-  # code, and the exit code is the one thing a kill guarantees.
-  # The work itself is untouched: the stream, the log and the turns already
-  # written stay exactly where they are — only the verdict changes.
-  if [ -f "$slot/stopped" ]; then
-    status="stopped"
-    wdreason="STOPPED: you ended this run from the dashboard. Anything it had already done is in the log below and on disk; it was interrupted, not undone."
-  fi
-
-  # "Ran fine, but there was nothing to do" — a resumed task already finished, or
-  # its ticket is gone. The agent answers `NOTHING TO DO: <reason>` (see the
-  # resume prompt). The run did not FAIL, but calling it a plain success hides
-  # that a session was spent doing nothing, so it is a WARNING: worth a look,
-  # never a blocker. The reason rides in the run's note, which the dashboard
-  # shows behind the "?" beside the status.
-  local nothing_line
-  nothing_line="$("$JQ" -r '.result // ""' "$logfile" 2>/dev/null | grep -m1 -oE 'NOTHING TO DO:.*' || true)"
-  if [ -n "$nothing_line" ] && [ "$status" = "success" ]; then
-    wdreason="${nothing_line}"
-    status="warning"
-  fi
-
-  # "The agent stopped talking" is NOT "the agent finished the job".
-  #
-  # A headless run ends the instant the model returns text without a tool call.
-  # An agent that says "I'll wait for the background suite and then commit" gets
-  # exactly what it asked for in an interactive session and nothing at all here:
-  # the process exits, its children die with it, and the work is abandoned
-  # mid-task. That produces a textbook-clean record — rc 0, subtype success, a
-  # non-empty result — so it was filed as SUCCESS, which is how a ticket with no
-  # commit, no push and no PR came to be reported as done. The one fact the
-  # operator needed was the one fact the status did not carry.
-  #
-  # So a clean exit now has to be CLAIMED, not inferred. The agent declares how
-  # its run ended (see the job prompt's "Declare how your run ended"); an
-  # undeclared ending is the signature of a run that stopped mid-task, and it is
-  # a warning — never a silent success. A warning that is occasionally
-  # unnecessary costs a glance; a success that is occasionally false costs a day.
-  #
-  # Computed UNCONDITIONALLY, not just while status is still success: this is
-  # also the fact `.ended` is decided on below, and a run this classifier calls
-  # `warning` (stray stderr, an empty result on an otherwise clean exit) can
-  # still have declared how it ended. Gating the computation itself on status
-  # would silently answer "false" for exactly the runs where it matters most.
-  declared_ending=false
-  if "$JQ" -r '.result // ""' "$logfile" 2>/dev/null \
-       | grep -qE '(RUN COMPLETE|NOTHING TO DO|BLOCKED):'; then
-    declared_ending=true
-  fi
-  if [ "$status" = "success" ] && [ "$declared_ending" = "false" ]; then
-    wdreason="UNDECLARED ENDING: the agent stopped without saying its run was finished (no 'RUN COMPLETE:', 'NOTHING TO DO:' or 'BLOCKED:' line), which is what a run cut off mid-task looks like. Do NOT assume the ticket is done — check the branch, the PR and the ticket, and resume this run to continue with its context."
-    status="warning"
-  fi
-
-  # "Ran out of money mid-task" looks EXACTLY like "finished the job": the agent
-  # sees the budget running down, wraps up cleanly and returns a result, so the
-  # subtype is `success` and nothing in the record says the work was cut short.
-  # A 75-minute run that stopped at 97% of its cap read as a clean success while
-  # its ticket sat unfinished — the one thing the operator needed to know was the
-  # one thing not shown. Spending the whole cap is not proof of truncation, but it
-  # is the only signal available here, and a warning that is occasionally
-  # unnecessary is far cheaper than silence that is occasionally very expensive.
-  local cap
-  cap="$(job_get "$id" '.max_budget_usd' '')"
-  case "$cap" in ''|null|0) cap="" ;; esac
-  if [ -n "$cap" ] && [ "$cost_basis" = "none" ] && [ "$_no_result" = false ]; then
-    # Unknown is not zero. The comparison below reads ${cost:-0}, so a run
-    # whose cost nobody knows (no price for its model, on any platform)
-    # would never reach 90% of anything and the cap would stay silent -- the
-    # worst shape a cap can take. Say it, on the run and in tick.log, and
-    # leave the status alone: the run itself did nothing wrong.
-    # `_no_result` guards this: a run that ended without a final event
-    # (killed, stopped, crashed at launch) also has cost_basis "none", but
-    # its cost is unknown because it died, not because the model has no
-    # price -- telling it "not applied" there is false on every platform,
-    # anthropic included, where the cap IS applied via --max-budget-usd.
-    # And WHY it is unknown: a priced model whose run died before its first
-    # step (a 401, an UnknownError) has null tokens and no price to blame;
-    # "no price for" is kept for the model the catalog does not price.
-    local _capwhy
-    if [ "$tokens_json" = "null" ]; then _capwhy="no step reported a cost"; else _capwhy="no price for ${model_id:-$model}"; fi
-    log_tick "$id: max_budget_usd $cap not applied: the cost of this run is unknown ($_capwhy)"
-    wdreason="${wdreason:+$wdreason; }max_budget_usd \$$cap not applied: the cost of this run is unknown ($_capwhy)"
-  elif [ -n "$cap" ] && [ "$status" = "success" ] \
-     && awk "BEGIN{exit !(${cost:-0} >= $cap * 0.9)}" 2>/dev/null; then
-    wdreason="BUDGET LIMITED: spent \$${cost:-0} of a \$$cap cap — the agent wrapped up early, so the task may be unfinished. Check the ticket and the branch before assuming it is done; resume this run to continue with its context."
-    status="warning"
-  fi
-
-  # A run that produced commits or changes no remote knows about handed nothing
-  # over. It used to be answered by keeping the run directory on disk for ever,
-  # which preserved the work for nobody: a resume cuts a fresh worktree, so the
-  # only thing that folder ever did was fill the disk and wait for a human. Push
-  # is the delivery channel; failing to use it is a failed run, and it belongs on
-  # the card. A warning, not an error: the agent may have been cut off mid-task,
-  # and a resume is the right next move rather than a backoff.
-  #
-  # Checked for EVERY status, unconditionally — not gated on success/warning —
-  # because the `.ended` gate below reads it for every status too. Gating the
-  # CHECK itself (rather than just the note) would leave undelivered empty by
-  # default for an error or a stopped run, which reads to that gate as "nothing
-  # undelivered" without ever having asked: an agent run that trips a denied
-  # tool (status=error) but still finishes and says `RUN COMPLETE:` would then
-  # satisfy declared_ending=true, undelivered="" (never checked), and mark
-  # `.ended=done` — force-removing a tree that may hold exactly the uncommitted
-  # work this whole mechanism exists to protect, unreported. Caught in this
-  # task's own self-review, not by the brief: the brief's corrected `.ended`
-  # snippet was right, but the upstream `undelivered` computation it depends on
-  # was still the pre-9.3 shape.
-  if [ -n "$run_dir" ]; then
-    undelivered="$(wt_undelivered_work "$run_dir")" || true
-  fi
-  # The NOTE and the STATUS BUMP stay scoped to success/warning, appended LAST
-  # among this classifier's rules and appending rather than replacing. Last
-  # because every rule above fires only while the status is still `success` —
-  # setting `warning` here first would silence UNDECLARED ENDING and BUDGET
-  # LIMITED entirely. Appending because "spent the whole cap" and "pushed
-  # nothing" are two different things the operator needs in one glance, not a
-  # choice between them.
-  #
-  # `stopped` is excluded deliberately: an operator who ended the run already
-  # knows it did not finish, and replacing their STOPPED record with a generic
-  # "you did not push" is less information, not more. `error` is excluded
-  # because a run that failed has a cause worth more than its symptom. Neither
-  # exclusion touches whether `undelivered` was CHECKED (it always is, above)
-  # — only whether it gets to overwrite what the card already says.
-  case "$status" in
-    success|warning)
-      if [ -n "$undelivered" ]; then
-        wdreason="${wdreason:-}${wdreason:+ · }$(undelivered_note "$undelivered")"
-        status="warning"
-      fi
-      ;;
-  esac
-
-  # A SESSION IS DONE WHEN IT SAID SO AND LEFT NOTHING BEHIND — not when the
-  # run looks good. Deriving this from the status made every `warning` keep its
-  # worktrees and, worse, keep its services running; and `warning` fires for
-  # stderr noise, an empty result, a budget cap, and for NOTHING TO DO, which
-  # is the commonest thing a quiet loop ever reports. On a real install that
-  # was about a quarter of all runs holding a full multi-repo checkout and a
-  # live stack for a day each — and alloc_port_base skips only blocks held by
-  # LIVE SLOTS, so the next run was handed the port block of a stack still
-  # listening on it.
-  #
-  # Exit code, stderr and the budget cap say how WELL a run went, not whether
-  # the session still has work to do — so none of the three feed this. Only
-  # the two facts that answer "is there anything left to pick back up" do:
-  # did the agent say it was finished, and did it leave anything undelivered.
-  if [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
-    if [ "$declared_ending" = "true" ] && [ -z "${undelivered:-}" ]; then
-      printf 'done\n' > "$run_dir/.ended" 2>/dev/null || true
-    else
-      printf 'open\n' > "$run_dir/.ended" 2>/dev/null || true
-    fi
-    # Alongside the write, not just at a resume's claim (9.4): overwriting
-    # .ended's CONTENT does not touch the directory ENTRY the way creating it
-    # the FIRST time does, so a second ending -- this same run dir, resumed
-    # and ending again -- would otherwise leave the ttl clock exactly where
-    # the reattach's own claim-time touch left it: ttl minus however long
-    # this cycle ran, not a fresh window. A resume that runs longer than the
-    # ttl on its own would then read as already-expired the instant it stops.
-    # The first ending gets this for free; this is what makes every later one
-    # measure the same event.
-    touch "$run_dir" 2>/dev/null || true
-  fi
+  run_classify
+  status="$RJ_STATUS"; wdreason="$RJ_REASON"
+  local cause denials; cause="$RJ_CAUSE"; denials="$RJ_DENIALS"
 
   # Consecutive failures drive the backoff (see backoff_multiplier). A warning
   # is NOT a failure: the run worked, it just wants a look — slowing those down
