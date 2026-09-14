@@ -1615,7 +1615,10 @@ def active_runs_for(jid):
                     # you need to follow or resume the run.
                     "session": _session_from_log(logf),
                     # set when this run is continuing another run's session
-                    "resume_of": _read("resume_of")})
+                    "resume_of": _read("resume_of"),
+                    # what launched it, as the engine wrote it: "true",
+                    # "false", or "" for a slot from before the breadcrumb
+                    "forced": _read("forced")})
     return out
 
 
@@ -2269,9 +2272,19 @@ def load_live_detail(jid, start_i):
     except Exception:  # noqa: BLE001
         phase = phase or ""
         phase_detail = ""
+    # What launched the run, from the slot's own breadcrumb -- three answers,
+    # not two: true, false, and None for a slot that has no breadcrumb (a run
+    # in flight from an engine older than it), which the page shows as a
+    # dash. This was a hard-coded False, and the page read False as
+    # "scheduled — precheck passed": every live run, a Run now and a security
+    # analysis included, was described as something nobody had done.
+    forced = {"true": True, "false": False}.get((slot or {}).get("forced") or "")
     rec = {"id": jid, "start": start_i, "status": "running",
            "duration": max(0, int(time.time()) - start_i), "cost": None, "session": sess,
-           "log": logp, "forced": False, "precheck": (pc.get("output") if isinstance(pc, dict) else "") or "",
+           "log": logp, "forced": forced, "precheck": (pc.get("output") if isinstance(pc, dict) else "") or "",
+           # the finished record's name for the slot's resume_of, so the
+           # dialog can call a live resume a resume
+           "resumed_from": (slot or {}).get("resume_of") or "",
            "project": job.get("project") or "", "model": job.get("model") or "",
            "model_id": _model_id_from_stream(stream),
            "platform": _platform_from_stream(stream, job_platform),

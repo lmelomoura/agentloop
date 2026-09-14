@@ -186,6 +186,11 @@ grep -q "resumed sess-cut in its own tree" "$ROOT/data/tick.log" 2>/dev/null \
   && ok "the tick log says it reattached" || bad "no reattach line in tick.log"
 [ -z "$(dirs j2)" ] && ok "and the finished session took its directory with it" \
   || bad "left $(dirs j2)"
+# The Precheck tab's note used to call this "RUN FORCED (Run now)": forced it
+# is, but nobody pressed Run now -- see scenario 44 for the rest of the rule.
+pc3="$(lastrun | jq -r .log)"; pc3="${pc3%.json}.precheck.txt"
+grep -q '^RUN FORCED (resume of session sess-cut)' "$pc3" 2>/dev/null \
+  && ok "and its precheck note names the session it resumed, not Run now" || bad "note: $(cat "$pc3" 2>/dev/null)"
 
 echo
 }
@@ -269,6 +274,14 @@ while [ "$w" -lt 20 ] && [ "$(secstate sandbox "$aid8")" = "running" ]; do sleep
 [ "$(secstate sandbox "$aid8")" = "done" ] \
   && ok "and the row closes done once the detached run actually finishes (waited ${w}s)" \
   || bad "left '$(secstate sandbox "$aid8")' after ${w}s"
+# The Precheck tab's note used to read "RUN FORCED (Run now)" over "(no
+# precheck configured — every due tick runs the agent)" for this run: both
+# false for a derived job, which no tick ever launches and nobody pressed
+# Run now for -- see scenario 44 for the rest of the rule.
+pc8="$(run_of security-sandbox | jq -r .log)"; pc8="${pc8%.json}.precheck.txt"
+grep -q "^SECURITY ANALYSIS $aid8 — launched by" "$pc8" 2>/dev/null && ! grep -q 'every due tick' "$pc8" 2>/dev/null \
+  && ok "and the run's precheck note names analysis $aid8 and the command that launched it, never a tick" \
+  || bad "note: $(cat "$pc8" 2>/dev/null)"
 sleep 1   # let run_job's own teardown release the derived job's slot before the next scenario
 
 echo
@@ -1120,6 +1133,50 @@ sleep 2
 echo
 }
 
+scenario_44() {
+echo "44. what launched a run is on its slot from the first second, and on its precheck note after"
+# The dialog's Trigger row read every live run as "scheduled — precheck
+# passed": the record says `forced` only once the run has ended, and until
+# then the server had nothing to read and answered false (2026-09-14: a
+# security analysis launched from a terminal, shown as scheduled for its
+# whole nineteen minutes). The slot says it now, from the first second. The
+# precheck note -- the Precheck tab's text -- names the launch for what it
+# was: Run now here, the resumed session in scenario 3, the analysis and the
+# command in scenario 8, and nothing at all for a tick.
+mkjob j44 hang
+FAKE_MODE=hang FAKE_SESSION=sess-44-now "$AL" run j44 >/dev/null 2>&1 &
+w=0; while [ "$w" -lt 20 ] && ! ls "$ROOT"/data/locks/j44/*/child >/dev/null 2>&1; do sleep 1; w=$((w + 1)); done
+[ "$(cat "$ROOT"/data/locks/j44/*/forced 2>/dev/null)" = "true" ] \
+  && ok "Run now, still going: the slot says forced (waited ${w}s for the slot)" \
+  || bad "slot forced='$(cat "$ROOT"/data/locks/j44/*/forced 2>/dev/null)'"
+"$AL" stop j44 >/dev/null 2>&1
+wait
+pc44="$(lastrun | jq -r .log)"; pc44="${pc44%.json}.precheck.txt"
+grep -q '^RUN FORCED (Run now)' "$pc44" 2>/dev/null && ok "and its precheck note says Run now" || bad "note: $(cat "$pc44" 2>/dev/null)"
+# The same job the way a tick launches it: `_exec` is what cmd_tick hands a
+# due job to, and the one launch that is NOT forced -- driven here directly
+# rather than through the tick's own due/window logic, which is not what
+# this scenario is about. With a precheck this time, so the note has a
+# verdict to carry.
+jq '.jobs[0].enabled = true | .jobs[0].precheck = "exit 0"' \
+  "$ROOT/config/jobs.json" > "$ROOT/config/jobs.next" && mv "$ROOT/config/jobs.next" "$ROOT/config/jobs.json"
+FAKE_MODE=hang FAKE_SESSION=sess-44-tick "$AL" _exec j44 >/dev/null 2>&1 &
+w=0; while [ "$w" -lt 20 ] && ! ls "$ROOT"/data/locks/j44/*/child >/dev/null 2>&1; do sleep 1; w=$((w + 1)); done
+[ "$(cat "$ROOT"/data/locks/j44/*/forced 2>/dev/null)" = "false" ] \
+  && ok "a tick's launch, still going: the slot says not forced (waited ${w}s for the slot)" \
+  || bad "slot forced='$(cat "$ROOT"/data/locks/j44/*/forced 2>/dev/null)'"
+"$AL" stop j44 >/dev/null 2>&1
+wait
+[ "$(lastrun | jq -r .session)" = "sess-44-tick" ] && [ "$(lastrun | jq -r .forced)" = "false" ] \
+  && ok "and its record says so too" || bad "record: $(lastrun | jq -c '{session,forced,status}')"
+pc44="$(lastrun | jq -r .log)"; pc44="${pc44%.json}.precheck.txt"
+! grep -q 'RUN FORCED' "$pc44" 2>/dev/null && grep -q 'pass → work found' "$pc44" 2>/dev/null \
+  && ok "and its precheck note is the precheck's own verdict, with no launch line" || bad "note: $(cat "$pc44" 2>/dev/null)"
+[ -z "$(ls "$ROOT/data/locks/j44" 2>/dev/null)" ] && ok "and no slot outlived either run" || bad "slots left: $(ls "$ROOT/data/locks/j44")"
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1141,11 +1198,11 @@ echo
 # scenario goes at the END of the file and into the LAST list, or, if it is
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # and the count assertion below fails if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26"
 E2E_LIST_3="27 28 29 30 31 32 33 33b 34 35 35b 36 37"
-E2E_LIST_4="38 39 40 41 41b 41c 42 43"
+E2E_LIST_4="38 39 40 41 41b 41c 42 43 44"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

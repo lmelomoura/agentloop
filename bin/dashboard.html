@@ -4267,12 +4267,35 @@ function retryNote(d){
               : " The run gave up at the retry ceiling, which is why there is no transcript.");
 }
 
+/* What launched the run, from what the record actually holds. `forced` has
+   three values, not two: true, false, and -- for a run still going that an
+   engine from before the slot breadcrumb started -- null. This row used to
+   be `rec.forced ? "Run now (forced)" : "scheduled — precheck passed"`, so
+   every record that did not SAY forced (every live run, until the server
+   read the slot) was described as scheduled, a Run now and a security
+   analysis included: 2026-09-14, analysis 15 of a project, launched by
+   `security analyze` from a terminal, sat "scheduled — precheck passed" for
+   its whole nineteen minutes on a job that has no precheck. A derived
+   security job is forced by construction and is never on a tick, so it is
+   named for what it is whatever `forced` says; a resume is a resume, not
+   Run now; and "precheck passed" is claimed only over the precheck's own
+   output, which a scheduled run of a job without one does not have. */
+function triggerText(rec){
+  if(String(rec.id||"").startsWith("security-"))
+    return "security analysis — launched by security analyze, never by a tick";
+  if(rec.forced===true)
+    return rec.resumed_from ? "Resume (forced — precheck not gating this run)" : "Run now (forced)";
+  if(rec.forced===false)
+    return rec.precheck ? "scheduled — precheck passed" : "scheduled";
+  return "—";
+}
+
 function renderLog(d){
   const rec=d.record||{}, a=d.agent||{};
   const rows=[
     ["When", esc(fmtWhen(rec.start))],
     ["Status", statusPill(rec.status)],
-    ["Trigger", rec.forced ? "Run now (forced)" : "scheduled — precheck passed"],
+    ["Trigger", triggerText(rec)],
     ["Duration", esc(fmtDur(rec.duration||0))],
     ["Cost", costHtml(rec)],
     // The job may store an alias ("opus"); model_id is what it actually resolved
