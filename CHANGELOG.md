@@ -52,6 +52,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A downloaded analysis report lists its findings most severe first.** The
+  Reports-tab download (JSON, Markdown, HTML) walked the checklist in ledger
+  insertion order, which is engine order: the ATDCore report opened on three
+  highs and an info before the first of its five criticals, and a reader had
+  to scan all 46 entries to learn which ones could not wait. The three
+  formats now share the consolidated export's order — critical, high,
+  medium, low, info, then fingerprint, so two reports of one state still
+  diff cleanly — and the consolidated export reads that one definition
+  instead of keeping its own copy.
+
 - **A gitleaks that answers neither pass no longer takes the secret phase
   down with it.** The history-in-ranges change gave `gitleaks_scan` a fifth
   value, the cursor, on the path where a pass ran -- and left the early
