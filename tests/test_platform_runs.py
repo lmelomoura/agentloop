@@ -254,3 +254,41 @@ def test_a_live_run_says_when_its_deterministic_phase_is_still_running(srv, clea
     (logdir / "20231114T221820Z-4244.stream.ndjson").write_text("")
     d = srv.load_run_detail("jprep", start)
     assert d["phase"] == "", "a stream file, even empty, means the agent was launched"
+
+
+def test_a_live_run_says_what_launched_it_or_says_nothing(srv, clean_data):
+    """The record carries `forced` only once the run has ended, and until then
+    this answered `forced: False` for every live run -- and the dialog read
+    False as "scheduled — precheck passed". Seen on a real install
+    (2026-09-14): a security analysis launched by `security analyze` from a
+    terminal, on a derived job that has no precheck and is never on a tick,
+    sat described as scheduled for its whole nineteen minutes. The slot's
+    own `forced` breadcrumb is the source now, and a slot without one (a run
+    in flight from an engine older than the breadcrumb) answers null, never
+    a guess; `resume_of` travels the same way, so a live resume is a resume."""
+    srv.JOBS_FILE.write_text(json.dumps({"jobs": [{"id": "jtrig", "project": "P"}]}))
+    srv.PROJECTS_FILE.write_text(json.dumps({"projects": [{"name": "P"}]}))
+
+    def slot(pid, start, forced=None, resume_of=None):
+        s = srv.DATA_DIR / "locks" / "jtrig" / str(pid)
+        s.mkdir(parents=True, exist_ok=True)
+        (s / "pid").write_text(str(os.getpid()))
+        (s / "start").write_text(str(start))
+        (s / "boot").write_text(srv.boot_id())
+        if forced is not None:
+            (s / "forced").write_text(forced + "\n")   # the engine's echo, newline and all
+        if resume_of is not None:
+            (s / "resume_of").write_text(resume_of + "\n")
+
+    slot(5001, 1700000801, forced="true")
+    slot(5002, 1700000802, forced="false")
+    slot(5003, 1700000803)
+    slot(5004, 1700000804, forced="true", resume_of="sess-old")
+    assert srv.load_run_detail("jtrig", 1700000801)["record"]["forced"] is True
+    assert srv.load_run_detail("jtrig", 1700000802)["record"]["forced"] is False
+    assert srv.load_run_detail("jtrig", 1700000803)["record"]["forced"] is None, \
+        "a slot with no breadcrumb must not be read as a scheduled run"
+    d = srv.load_run_detail("jtrig", 1700000804)["record"]
+    assert d["forced"] is True and d["resumed_from"] == "sess-old"
+    assert [s["forced"] for s in srv.active_runs_for("jtrig")] == ["true", "false", "", "true"], \
+        "the slot listing carries the breadcrumb as the engine wrote it"

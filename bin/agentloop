@@ -5302,13 +5302,24 @@ ${prompt}"
     done < <(wt_env_line "$project" "$cwd" "$run_cwd")
   fi
 
-  # Persist what the precheck saw, next to the run log.
+  # Persist what launched the run, and what the precheck saw, next to the
+  # run log. Three launches are forced and only one of them is Run now: a
+  # derived security job runs once per `security analyze` and never on a
+  # tick, and a resume continues a session the precheck has no say over.
+  # Filed as "Run now" over "every due tick runs the agent", both were read
+  # back off the dialog's Precheck tab as what had happened.
   {
-    if [ "$forced" = "true" ]; then echo "RUN FORCED (Run now) — precheck not gating this run."; fi
+    if [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ]; then
+      echo "SECURITY ANALYSIS $AL_SECURITY_ANALYSIS_ID — launched by \`agentloop security analyze\` (the Security page's Analyse, or the command line), never by a tick; a derived job has no precheck."
+    elif [ -n "$resume_sid" ]; then
+      echo "RUN FORCED (resume of session $resume_sid) — precheck not gating this run."
+    elif [ "$forced" = "true" ]; then
+      echo "RUN FORCED (Run now) — precheck not gating this run."
+    fi
     if [ -n "$precheck" ]; then
       printf 'precheck: %s\nexit: %s%s\n\n--- output ---\n%s\n' \
         "$precheck" "$pc_rc" "$([ "$pc_rc" -eq 0 ] && echo '  (pass → work found)' || echo '  (fail → would be idle)')" "$pc_out"
-    else
+    elif [ -z "${AL_SECURITY_ANALYSIS_ID:-}" ]; then
       echo "(no precheck configured — every due tick runs the agent)"
     fi
   } > "$precheckfile"
@@ -5323,6 +5334,13 @@ ${prompt}"
   # several run at once it is the slot that says when each began — without it
   # the dashboard can only ever show the most recent one.
   echo "$start" > "$slot/start" 2>/dev/null || true
+  # What launched this run, for the dialog while it is still going. The
+  # record carries `forced` only once the run has ended; until then the
+  # server had nothing to read and answered false for every live run, which
+  # the page showed as "scheduled — precheck passed" -- on a Run now, and on
+  # a security analysis nobody scheduled. The slot says it from the first
+  # second; a slot without this file is a run from before it, not a guess.
+  echo "$forced" > "$slot/forced" 2>/dev/null || true
   # A resume is in flight for that session: recorded here so nothing offers to
   # resume it a second time while this one is still working.
   [ -n "$resume_sid" ] && echo "$resume_sid" > "$slot/resume_of" 2>/dev/null || true

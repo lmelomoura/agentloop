@@ -52,6 +52,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The run dialog's Trigger row says what launched the run, and says
+  nothing when the record does not.** A run still going was answered
+  `forced: false` by the server whatever had launched it -- the record only
+  carries `forced` once the run has ended -- and the page turned false into
+  "scheduled — precheck passed": every live run read as scheduled, a Run now
+  and a security analysis included. Seen 2026-09-14: analysis 15 of a
+  project, launched by `security analyze` from a terminal, sat described as
+  "scheduled — precheck passed" for its whole nineteen minutes, on a derived
+  job that has no precheck and is never on a tick. The engine now writes
+  `forced` into the run's slot from the first second, the server reads it
+  there (true, false, or null for a slot from before the breadcrumb, which
+  the row shows as a dash), and the row has four answers instead of two: a
+  derived security run is "security analysis — launched by security analyze,
+  never by a tick" whatever `forced` says; a resume is named as one, not as
+  Run now; and a scheduled run claims "precheck passed" only when the
+  record holds the precheck's output. The Precheck tab's note follows the
+  same rule: a security analysis names its analysis and the command that
+  launched it, where it read "RUN FORCED (Run now)" over "(no precheck
+  configured — every due tick runs the agent)", both false for a job no tick
+  ever launches; a resume names the session it continues. Live and after
+  in the e2e (scenario 44, with the resume and the analysis held to the
+  note in 3 and 8), the slot breadcrumb in `tests/test_platform_runs.py`,
+  the four answers in `tests/test_page_contract.py`.
+
 - **A downloaded analysis report lists its findings most severe first.** The
   Reports-tab download (JSON, Markdown, HTML) walked the checklist in ledger
   insertion order, which is engine order: the ATDCore report opened on three

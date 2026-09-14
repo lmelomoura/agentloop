@@ -1032,6 +1032,52 @@ def _reason_harness(js):
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_trigger_row_says_what_the_record_says_and_never_guesses(srv, tmp_path):
+    """The row used to be `rec.forced ? "Run now (forced)" : "scheduled —
+    precheck passed"`: two answers for a field that has three values (true,
+    false, and not-in-the-record -- every live run, until this change), and
+    a wrong one for a security analysis, which is forced by construction but
+    was never "Run now" and is never on a tick. Seen 2026-09-14: analysis 15
+    of a project, launched by `security analyze` from a terminal, shown as
+    "scheduled — precheck passed" for its whole nineteen minutes on a job
+    that has no precheck. Four answers now, each only what the record holds:
+    a dash when it does not say, the analysis for a derived security run
+    whatever `forced` says, a resume named as one, and "precheck passed"
+    only when the precheck's own output is on the record."""
+    js = _js(srv)
+    render = _plainfn(js, "renderLog")
+    assert "triggerText(rec)" in render, "the Trigger row does not go through triggerText"
+    assert "precheck passed" not in render, "the two-way guess is still shipping in renderLog"
+    script = tmp_path / "trigger.js"
+    script.write_text(_plainfn(js, "triggerText") + """
+    console.log(JSON.stringify({
+      unknown: triggerText({id:"j", forced:null}),
+      absent:  triggerText({id:"j"}),
+      sec:     triggerText({id:"security-minerva", forced:true}),
+      secLive: triggerText({id:"security-minerva", forced:null}),
+      now:     triggerText({id:"j", forced:true}),
+      resumed: triggerText({id:"j", forced:true, resumed_from:"sess-1"}),
+      sched:   triggerText({id:"j", forced:false, precheck:"work found"}),
+      bare:    triggerText({id:"j", forced:false, precheck:""}),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    for key in ("unknown", "absent"):
+        assert out[key] == "—", f"{key}: a record that does not say was read as something"
+    for key in ("sec", "secLive"):
+        assert "security analysis" in out[key], f"{key}: a derived run is not named as one"
+        assert "Run now" not in out[key] and "scheduled" not in out[key], \
+            f"{key}: still describing an analysis as something nobody did"
+    assert out["now"] == "Run now (forced)"
+    assert "esume" in out["resumed"] and "Run now" not in out["resumed"], \
+        "a resume is a resume, not Run now"
+    assert out["sched"] == "scheduled — precheck passed"
+    assert out["bare"] == "scheduled", \
+        "a record with no precheck output must not claim a precheck passed"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_an_api_failure_outranks_the_protocol_stop_reason(srv, tmp_path):
     """A 529 ended a 100-minute run, and the CLI reported it as
     `stop_reason: "stop_sequence"`, `subtype: "success"`, `terminal_reason:
