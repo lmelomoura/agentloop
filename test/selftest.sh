@@ -3753,6 +3753,36 @@ NASTY
   # 08:00 written as 08 must not be read as octal — the classic bash trap.
   in_window_vals "" "08:00-09:00" 3 510 ; want "a leading zero is decimal, not octal" 0 $?
 
+  echo "tick_plan() — a job with no schedule window keeps its seven columns"
+  # The plan was joined with tabs and read back with IFS=tab. A tab is IFS
+  # whitespace, and bash folds a run of it into ONE delimiter -- so a job with
+  # no active_days and no active_hours came through as days=interval,
+  # hours=last_start, interval=0, and in_window_vals refused it on every tick,
+  # silently. The shape with active_hours "" alone is config/jobs.example.json's
+  # own. Read here exactly the way cmd_tick reads, column by column.
+  mkdir -p "$tmp/tp"
+  printf '%s' '{"jobs":[{"id":"nowin","interval_seconds":600},
+                        {"id":"hoursblank","active_days":[1,2,3,4,5,6,7],"active_hours":"","interval_seconds":900},
+                        {"id":"windowed","active_days":[1,2],"active_hours":"08:00-20:00","interval_seconds":1200,"max_parallel":2},
+                        {"id":"off","enabled":false}]}' > "$tmp/tp/jobs.json"
+  printf '%s' '{"windowed":{"last_start":1700000000,"fail_streak":2}}' > "$tmp/tp/state.json"
+  ( JOBS_FILE="$tmp/tp/jobs.json"; STATE_FILE="$tmp/tp/state.json"; tick_plan ) > "$tmp/tp/plan" 2>/dev/null
+  tp_cols() { # tp_cols <job-id> -> the columns after the id, |-joined, read the way cmd_tick reads
+    local id days hours interval last streak max_par
+    while IFS="$TICK_SEP" read -r id days hours interval last streak max_par; do
+      [ "$id" = "$1" ] || continue
+      printf '%s|%s|%s|%s|%s|%s\n' "$days" "$hours" "$interval" "$last" "$streak" "$max_par"
+    done < "$tmp/tp/plan"
+  }
+  got="$(tp_cols nowin)"
+  [ "$got" = "||600|0|0|3" ] && ok "no days, no hours: both columns empty, the interval where the interval goes" || bad "nowin -> '$got'"
+  got="$(tp_cols hoursblank)"
+  [ "$got" = "1,2,3,4,5,6,7||900|0|0|3" ] && ok "days set and hours blank (the example file's shape): the hours column stays empty" || bad "hoursblank -> '$got'"
+  got="$(tp_cols windowed)"
+  [ "$got" = "1,2|08:00-20:00|1200|1700000000|2|2" ] && ok "a fully windowed job reads as before, state included" || bad "windowed -> '$got'"
+  [ -z "$(tp_cols off)" ] && ok "a disabled job is not in the plan" || bad "off is planned: '$(tp_cols off)'"
+  [ "$(grep -c "$(printf '\t')" "$tmp/tp/plan")" -eq 0 ] && ok "and no tab is left in the plan for IFS to fold" || bad "a tab survives in the plan"
+
   echo "is_due_vals() — due-ness accounts for the failure backoff"
   is_due_vals 300 "$(( $(now_epoch) - 400 ))" 0 ; want "past its interval is due"     0 $?
   is_due_vals 300 "$(( $(now_epoch) - 100 ))" 0 ; want "inside its interval is not"   1 $?
