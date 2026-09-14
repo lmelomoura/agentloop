@@ -763,7 +763,10 @@ interactive turn is over, token recovery from a transcript with no result event,
 the disabled-job guard, the schedule window (including one that wraps midnight),
 the failure backoff curve, lock ownership, worktree setup/teardown/provisioning,
 and log rotation. It runs entirely inside a scratch directory — it will not
-touch `data/`.
+touch `data/`. The suite itself is `test/selftest.sh`: a white-box suite that
+calls the engine's own functions, so the `selftest` verb **sources** it into
+the engine's shell at the moment it runs (the way `bin/worktree-lib.sh` is
+sourced) — it is not a script to run on its own, and a tick never parses it.
 
 `pytest tests/` covers the server: journal ingest and resync, the 24h activity
 counters, retained worktrees, the journal lock, the operator profile (what the
@@ -2213,6 +2216,7 @@ agentloop/
 │                              #   security.db (the analysis ledger), journal, logs
 ├── skills/                    # the skills the agent loop requires, linked into ~/.claude/skills
 │   └── security-analysis/     # the contract every security analysis run follows
+├── test/selftest.sh           # the offline suite, SOURCED by `agentloop selftest`
 ├── test/round-cap.test.sh     # behavioural suite, run by `agentloop selftest`
 ├── install.sh · uninstall.sh
 ├── CHANGELOG.md

@@ -18,6 +18,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The selftest lives in `test/selftest.sh`; `bin/agentloop` is the engine
+  again.** `cmd_selftest` had grown to 6,445 lines — 48% of the engine — so
+  whoever opened the file to change how a run is launched read six thousand
+  lines that never run in a run. The suite is a white-box one (it calls
+  `job_get`, `platform_check`, `resolve` and the rest in the engine's own
+  shell), so it is SOURCED by the `selftest` verb at the moment it runs, the
+  way `bin/worktree-lib.sh` already is, never executed on its own; a tick
+  never parses it. Moved verbatim, with the two artifact checkers that only
+  it can call: the suite prints the same 1,103 lines, byte for byte, and
+  counts the same 858 checks. A binary copied away from its checkout says
+  what is missing instead of `No such file or directory`.
+
 ### Fixed
 
 - **A gitleaks that answers neither pass no longer takes the secret phase

@@ -8007,11 +8007,12 @@ def test_the_selftest_reads_both_stamps_and_refuses_an_ambiguous_one():
     """Structural: the engine's own check has to ask BOTH questions and read
     each stamp with an exactly-one rule. `tail -1` on a stamp line is the
     exact shape of reproduction two above and must not come back."""
-    engine = ENGINE.read_text()
+    suite = (REPO / "test" / "selftest.sh").read_text()
     # check_ui_artifact() is the one place both questions get asked -- lifted
     # above cmd_selftest so a second and third artifact call it rather than
-    # copying the block.
-    block = engine[engine.index("check_ui_artifact() {"):]
+    # copying the block. It lives with the suite, in test/selftest.sh, which
+    # bin/agentloop sources when the verb runs.
+    block = suite[suite.index("check_ui_artifact() {"):]
     block = block[:block.index("\ncmd_selftest()")]
     # Comment lines stripped: this block EXPLAINS the `tail -1` it replaced,
     # and a guard that cannot tell an explanation from the thing it warns
