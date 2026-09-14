@@ -525,3 +525,35 @@ def test_merge_replaces_a_phase_rather_than_appending_a_second_one():
     again = coverage.merge(first, [coverage.phase(coverage.TRIAGE, coverage.RAN,
                                                   "agent", "all read")])
     assert len(again) == 1 and again[0]["note"] == "all read"
+
+
+def _in_ledger_order(*severities):
+    """Findings as `checklist()` hands them over: insertion order, which is
+    engine order, which is no order a reader can use."""
+    return [dict(FINDINGS[0], severity=sev, fingerprint=chr(ord("a") + i) * 64,
+                 title=f"T {sev}", state="open")
+            for i, sev in enumerate(severities)]
+
+
+def test_every_format_lists_findings_most_severe_first_whatever_order_they_arrive_in():
+    arrived = _in_ledger_order("low", "info", "critical", "medium", "high")
+    worst_first = ["critical", "high", "medium", "low", "info"]
+    doc = json.loads(report.as_json(ANALYSIS, arrived, ""))
+    assert [f["severity"] for f in doc["findings"]] == worst_first
+    for text in (report.as_markdown(ANALYSIS, arrived, ""),
+                 report.as_html(ANALYSIS, arrived, "")):
+        positions = [text.index(f"[{sev}] T {sev}") for sev in worst_first]
+        assert positions == sorted(positions), text
+
+
+def test_equally_severe_findings_are_ordered_by_fingerprint_so_two_reports_diff_cleanly():
+    rows = [dict(FINDINGS[0], fingerprint=c * 64, title=f"T {c}") for c in "dcba"]
+    md = report.as_markdown(ANALYSIS, rows, "")
+    headings = [ln for ln in md.splitlines() if ln.startswith("### ")]
+    assert headings == [f"### [critical] T {c} — `new`" for c in "abcd"]
+
+
+def test_ordering_the_document_does_not_reorder_the_caller_s_list():
+    arrived = _in_ledger_order("low", "critical")
+    report.as_markdown(ANALYSIS, arrived, "")
+    assert [f["severity"] for f in arrived] == ["low", "critical"]

@@ -22,6 +22,22 @@ STATES = ("new", "regressed", "open", "partial", "pending", "fixed", "accepted",
 # min_severity floor, so an informational finding is recorded and stays out of
 # the way until somebody lowers the floor to look for it.
 SEVERITIES = ("critical", "high", "medium", "low", "info")
+_SEV_RANK = {s: i for i, s in enumerate(SEVERITIES)}
+
+
+def _severity_key(f):
+    """Worst first, then fingerprint. A severity this module does not know
+    sorts last rather than raising: it is still a finding the ledger holds."""
+    return (_SEV_RANK.get(f["severity"], len(SEVERITIES)), f["fingerprint"])
+
+
+def _worst_first(findings):
+    """`checklist()` hands findings over in ledger insertion order, which is
+    engine order, which tells a reader nothing about where to start. The
+    document is where "start here" has to be visible, so every renderer
+    orders here rather than trusting its caller to. `sorted`, not `.sort()`:
+    the caller's list is not this module's to reorder."""
+    return sorted(findings, key=_severity_key)
 
 
 def _summary(findings):
@@ -131,7 +147,7 @@ def as_json(analysis, findings, coverage_note):
     the `setdefault` is for a caller assembling findings some other way.
     """
     rows = []
-    for f in findings:
+    for f in _worst_first(findings):
         row = dict(f)
         row.setdefault("scope", "")
         rows.append(row)
@@ -189,7 +205,7 @@ def as_markdown(analysis, findings, coverage_note):
         n = s["accepted_in_severity"]
         out += ["", f"_(includes {n} accepted risk{'s' if n != 1 else ''})_"]
     out += ["", "## Findings", ""]
-    for f in findings:
+    for f in _worst_first(findings):
         out += [f"### [{f['severity']}] {f['title']} — `{f['state']}`", "",
                 f"**Rule:** `{f['rule']}` ({f['category']})"]
         if f.get("cwe"):
@@ -271,7 +287,7 @@ def as_html(analysis, findings, coverage_note):
         n = s["accepted_in_severity"]
         parts.append(f'<p class="note">Includes {n} accepted risk{"s" if n != 1 else ""}.</p>')
     parts.append("<h2>Findings</h2>")
-    for f in findings:
+    for f in _worst_first(findings):
         locs = "".join(
             f"<li><code>{e(o['file'])}{':' + e(str(o['line'])) if o['line'] else ''}</code></li>"
             for o in f["occurrences"])
@@ -363,15 +379,12 @@ def _consolidated_groups(rows, branch_meta):
     equally severe findings, and the first thing anyone does with two of these
     files is diff them.
     """
-    sev_rank = {s: i for i, s in enumerate(SEVERITIES)}
     by_branch = {}
     for r in rows:
         by_branch.setdefault(r["branch"], []).append(r)
     groups = []
     for br in sorted(set(list(by_branch) + list(branch_meta))):
-        items = sorted(by_branch.get(br, []),
-                       key=lambda r: (sev_rank.get(r["severity"], len(SEVERITIES)),
-                                      r["fingerprint"]))
+        items = _worst_first(by_branch.get(br, []))
         m = branch_meta.get(br, {})
         groups.append({"branch": br, "analysis": m,
                        "open": [r for r in items if r["state"] not in RESOLVED_STATES],
