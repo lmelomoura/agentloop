@@ -198,6 +198,15 @@ sobrevivem a um recorte distraído:
 (que exercita o watchdog) — os dois casos em que este bloco falha de maneiras
 que um run feliz não mostra.
 
+**Como ficou (2026-09-13).** O `stop` lê `$slot/child`, o ficheiro, não uma
+variável — é escrito dentro do bloco no mesmo instante de sempre, portanto
+`RJ_CHILD_PID` é publicado no fim, com os outros três, sem janela nenhuma. A
+linha `if [ -f "$logfile.turnend" ]; then rc=0; …` (uma corrida interactiva
+que nós próprios terminámos sai limpa) vivia no classificador e passou para o
+fim desta função, com as duas frases de comentário que a explicam: é o `rc`
+que se publica, e entre o `wait` e o classificador nada lê o `rc` nem o
+ficheiro `.turnend`. Foi a única linha que mudou de bloco.
+
 ---
 
 ## Tarefa 4: `run_classify`, e o guarda do estado partilhado
@@ -207,7 +216,10 @@ da classificação — o `platform_finish`, o classificador, o tecto
 BUDGET LIMITED, a regra do trabalho não entregue e o contrato de fim.
 
 **Entra:** `id`, `run_dir`, `streamfile`, `logfile`, `platform`, `session`,
-`rc`. **Sai:** `RJ_STATUS`, `RJ_REASON`.
+`rc`. **Sai:** `RJ_STATUS`, `RJ_REASON`. (Como ficou: começa no
+classificador — a leitura do resultado fica no `run_job` — e sai também
+`RJ_CAUSE` e `RJ_DENIALS`, que o registo e a linha de log precisam; ver a
+spec.)
 
 **A ordem é lei.** A suite já tem uma asserção estrutural que exige que a
 regra do trabalho não entregue venha **depois** do BUDGET LIMITED, com um
@@ -238,11 +250,22 @@ jobs no mesmo processo. Duas defesas, ambas nesta tarefa:
    ```
 
 3. **Um cenário e2e com duas corridas seguidas no mesmo processo**, a segunda
-   a herdar o que a primeira deixou: um `tick` com dois jobs elegíveis, o
-   primeiro a acabar em `warning` (o modo `dirty` do stand-in) e o segundo em
-   `success`. Se uma `RJ_*` vazar, o segundo herda o estado do primeiro e o
-   cenário apanha-o. **Sem este cenário a tarefa não está feita** — é o único
-   teste que distingue esta refactorização de uma que parece funcionar.
+   a herdar o que a primeira deixou: o primeiro a acabar em `warning` (o modo
+   `dirty` do stand-in) e o segundo em `success`. Se uma `RJ_*` vazar, o
+   segundo herda o estado do primeiro e o cenário apanha-o. **Sem este
+   cenário a tarefa não está feita** — é o único teste que distingue esta
+   refactorização de uma que parece funcionar.
+
+   **Como ficou (2026-09-13).** Um `tick` com dois jobs **não** serve: o
+   `cmd_tick` lança cada corrida num processo à parte (`_exec`), e hoje
+   nenhum comando corre `run_job` duas vezes no mesmo shell (ver a correcção
+   na spec). O cenário 43 carrega o motor num shell (`bash -c '. "$0"
+   --help; run_job j43a --force; run_job j43b --force' "$AL"` — o motor
+   descobre o `worktree-lib.sh` a partir de `$0`, por isso o caminho entra
+   como nome do comando e não como argumento) e corre as duas lá dentro.
+   Provado a ir ao vermelho: com a inicialização de `RJ_REASON` retirada e
+   a atribuição a acumular, a segunda corrida sai com o `UNDELIVERED` da
+   primeira na nota.
 
 ---
 
