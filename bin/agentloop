@@ -5645,10 +5645,20 @@ run_end_hook() { # <id> <status> <cost> <note> <project> <session> <log> <start>
 # roughly 150 forks a minute at 21 jobs, for ever, almost always to conclude
 # that nothing is due. Disabled jobs are filtered here rather than in the loop:
 # `// true` would be wrong (it treats false as absent), hence the explicit test.
-tick_plan() { # id \t days \t hours \t interval \t last_start \t fail_streak \t max_parallel
+# One line per enabled job, its seven columns joined by \037 (the unit
+# separator) -- NOT a tab. A tab is IFS whitespace, and bash folds a run of
+# IFS whitespace into ONE delimiter when it splits a line: a job with no
+# active_days and no active_hours came out as `id<TAB><TAB><TAB>interval…`
+# and was read back with days=interval, hours=last_start, interval=0 -- and
+# was "outside active_hours (3600)" for ever, on every tick, silently. The
+# same with active_hours left "" alone, which is the shape of every job in
+# config/jobs.example.json. A separator that is not whitespace delimits once
+# per character, so an empty column stays an empty column.
+TICK_SEP="$(printf '\037')"
+tick_plan() { # id ␟ days ␟ hours ␟ interval ␟ last_start ␟ fail_streak ␟ max_parallel
   [ -f "$JOBS_FILE" ] || return 0
   "$JQ" -e . "$JOBS_FILE" >/dev/null 2>&1 || { log_tick "tick: malformed $JOBS_FILE — no job examined"; return 0; }
-  "$JQ" -r --slurpfile st "$STATE_FILE" '
+  "$JQ" -r --slurpfile st "$STATE_FILE" --arg sep "$TICK_SEP" '
     (($st[0]) // {}) as $S
     | .jobs[]
     | select(.enabled != false)
@@ -5659,7 +5669,7 @@ tick_plan() { # id \t days \t hours \t interval \t last_start \t fail_streak \t 
         (($j.interval_seconds // 300) | tostring),
         (($s.last_start // 0) | tostring),
         (($s.fail_streak // 0) | tostring),
-        (($j.max_parallel // 3) | tostring) ] | @tsv' "$JOBS_FILE" 2>/dev/null
+        (($j.max_parallel // 3) | tostring) ] | join($sep)' "$JOBS_FILE" 2>/dev/null
 }
 
 # The tick only DECIDES and LAUNCHES — it never waits for a run. Each due job is
@@ -5731,7 +5741,9 @@ cmd_tick() {
     log_tick "models: refreshing family→id resolutions (cache older than ${MODELS_TTL}s)"
   fi
   local days hours interval last streak max_par
-  while IFS="$(printf '\t')" read -r id days hours interval last streak max_par; do
+  # IFS is tick_plan's own separator, never a tab: see the note on TICK_SEP
+  # for the job that a folded tab run kept off the schedule.
+  while IFS="$TICK_SEP" read -r id days hours interval last streak max_par; do
     [ -n "$id" ] || continue
     in_window_vals "$days" "$hours" >/dev/null || continue
     is_due_vals "$interval" "$last" "$streak" || continue

@@ -1177,6 +1177,37 @@ pc44="$(lastrun | jq -r .log)"; pc44="${pc44%.json}.precheck.txt"
 echo
 }
 
+scenario_45() {
+echo "45. a tick launches a job that has no schedule window"
+# Every scenario above starts its run with `run` or `_exec`; nothing had ever
+# driven cmd_tick's own due-job loop, and that loop read tick_plan's tabs with
+# IFS=tab -- which bash folds, so a job with no active_days and no
+# active_hours came through with its columns shifted (days=interval,
+# hours=last_start) and was "outside active_hours" on every tick, silently.
+# j45b is config/jobs.example.json's own shape: days set, hours "".
+cat > "$ROOT/config/jobs.json" <<JSON
+{"jobs":[{"id":"j45a","project":"sandbox","enabled":true,"prompt":"do the thing",
+          "interval_seconds":3600,"permission_mode":"bypassPermissions","max_parallel":1},
+         {"id":"j45b","project":"sandbox","enabled":true,"prompt":"do the thing",
+          "interval_seconds":3600,"permission_mode":"bypassPermissions","max_parallel":1,
+          "active_days":[1,2,3,4,5,6,7],"active_hours":""}]}
+JSON
+FAKE_MODE=complete FAKE_SESSION=sess-45 "$AL" tick >/dev/null 2>&1
+grep -q 'j45a: launched detached run' "$ROOT/data/tick.log" && ok "a job with no window at all is launched by the tick" \
+  || bad "no launch line for j45a: $(grep 'j45' "$ROOT/data/tick.log" | tail -2)"
+grep -q 'j45b: launched detached run' "$ROOT/data/tick.log" && ok "and so is one with days set and hours blank (the example file's shape)" \
+  || bad "no launch line for j45b: $(grep 'j45' "$ROOT/data/tick.log" | tail -2)"
+# The tick detaches both runs; wait for their records rather than for a child.
+w=0; while [ "$w" -lt 20 ] && { [ -z "$(run_of j45a)" ] || [ -z "$(run_of j45b)" ]; }; do sleep 1; w=$((w + 1)); done
+[ "$(run_of j45a | jq -r .status)" = "success" ] && [ "$(run_of j45a | jq -r .forced)" = "false" ] \
+  && ok "j45a ran to a clean success, not forced (waited ${w}s for the records)" || bad "j45a: $(run_of j45a | jq -c '{status,forced}')"
+[ "$(run_of j45b | jq -r .status)" = "success" ] && [ "$(run_of j45b | jq -r .forced)" = "false" ] \
+  && ok "and so did j45b" || bad "j45b: $(run_of j45b | jq -c '{status,forced}')"
+sleep 1   # let both detached runs finish their own teardown before the next scenario
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1198,11 +1229,11 @@ echo
 # scenario goes at the END of the file and into the LAST list, or, if it is
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # and the count assertion below fails if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26"
 E2E_LIST_3="27 28 29 30 31 32 33 33b 34 35 35b 36 37"
-E2E_LIST_4="38 39 40 41 41b 41c 42 43 44"
+E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to
