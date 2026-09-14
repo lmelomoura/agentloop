@@ -52,6 +52,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A job with no schedule window is launched by the tick again.** The
+  tick's plan was one tab-separated line per enabled job, read back with
+  `IFS=tab` -- and a tab is IFS whitespace, which bash folds: a run of it
+  splits as ONE delimiter. A job with no `active_days` and no `active_hours`
+  came through with its columns shifted (days=interval, hours=last_start,
+  interval=0), `in_window_vals` answered "outside active_hours (3600)", and
+  the job was skipped on every tick, silently -- no tick.log line, no status,
+  nothing to see but a job that never ran on its own. `active_hours: ""` on
+  its own did the same, and that is the shape of every job in
+  `config/jobs.example.json`. It went unseen only because every job on the
+  install that found it carries both windows, and because no e2e scenario had
+  ever driven the tick's own due-job loop (every run started with `run`).
+  The plan's columns are now joined with the unit separator (`\037`), which
+  is not whitespace and so delimits once per character: an empty column stays
+  an empty column. `tick_plan()` is held to its seven columns for a job with
+  no window, one with blank hours and one fully windowed in the selftest, and
+  e2e scenario 45 runs a real tick over both windowless shapes and sees both
+  launched and both succeed.
+
 - **The run dialog's Trigger row says what launched the run, and says
   nothing when the record does not.** A run still going was answered
   `forced: false` by the server whatever had launched it -- the record only
