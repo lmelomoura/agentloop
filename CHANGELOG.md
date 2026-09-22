@@ -204,6 +204,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `sort=confidence` with unmeasured rows last whichever way you sort, and the
   free-text search reads the candidate's prose too.
 
+- **Cloudflare's hunting guides, vendored and chosen per repository.**
+  `skills/security-analysis/references/` carries ATTACK-CLASSES and the ten
+  domain guides of cloudflare/security-audit-skill (MIT, pinned to a commit in
+  UPSTREAM.md); `prepare` recommends the ones the stack calls for — from the
+  dependency inventory and the tree's paths, under the same ignore globs —
+  capped by the profile (quick: one; standard: what matched; deep: all), and
+  prints and stores the list. Read whole, the eleven cost ~30k tokens per
+  run, which is a `quick` profile's whole budget.
+
 - **The e2e suite runs four scenarios at a time, one sandbox each:
   `E2E_WORKERS=4 bash test/e2e.test.sh`.** Measured, it is 65% of the
   selftest — 312 s for 47 scenarios, the two security analyses 37 s each —

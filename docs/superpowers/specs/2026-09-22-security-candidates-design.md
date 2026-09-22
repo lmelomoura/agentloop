@@ -234,12 +234,12 @@ efeito, sem acoplar a selecção ao que o Trivy devolve.
 | WEB-PROTOCOL-AND-AUTH | deps: `express`, `koa`, `fastify`, `hapi`, `@nestjs/core`, `next`, `nuxt`, `flask`, `django`, `fastapi`, `starlette`, `tornado`, `rails`, `sinatra`, `laravel/framework`, `symfony/symfony`, `slim/slim`, `spring-boot`, `github.com/gin-gonic/gin`, `github.com/labstack/echo`, `github.com/go-chi/chi`, `github.com/gofiber/fiber`, `actix-web`, `axum`, `rocket` |
 | CLIENT-SIDE | caminhos `*.html`, `*.jsx`, `*.tsx`, `*.vue`, `*.svelte`; deps `react`, `vue`, `svelte`, `@angular/core`, `jquery` |
 | CLOUD-AND-DEPLOYMENT | caminhos `Dockerfile*`, `*/Dockerfile*`, `*.Dockerfile`, `docker-compose*.yml`, `docker-compose*.yaml`, `*.tf`, `Chart.yaml`, `*/Chart.yaml`, `k8s/*`, `kubernetes/*`, `manifests/*`, `*cloudformation*`, `.github/workflows/*`, `serverless.yml`, `wrangler.toml`, `fly.toml`, `Procfile` |
-| SUPPLY-CHAIN-AND-RELEASE | inventário não vazio, **ou** caminhos `.github/workflows/*`, `.gitlab-ci.yml`, `bitbucket-pipelines.yml`, `Jenkinsfile`, `.circleci/*` |
 | AI-AND-LLM | deps `openai`, `anthropic`, `@anthropic-ai/sdk`, `langchain*`, `@langchain/*`, `llamaindex`, `llama-index*`, `mcp`, `@modelcontextprotocol/*`, `ai`, `transformers`; caminhos `CLAUDE.md`, `AGENTS.md`, `.claude/*`, `SKILL.md`, `*/SKILL.md`, `.mcp.json`, `mcp.json`, `.cursorrules` |
 | MEMORY-SAFETY-AND-BINARY | caminhos `*.c`, `*.cc`, `*.cpp`, `*.h`, `*.hpp`, `*.rs`, `*.zig`, `Cargo.lock` |
 | PROTOCOLS-RPC-AND-MESSAGING | caminhos `*.proto`; deps `grpc*`, `@grpc/*`, `grpcio`, `amqplib`, `pika`, `kafkajs`, `kafka-python`, `confluent-kafka`, `paho-mqtt`, `mqtt`, `ws`, `socket.io`, `websockets`, `nats` |
 | DATA-ISOLATION-AND-LIFECYCLE | deps `sqlalchemy`, `prisma`, `@prisma/client`, `sequelize`, `typeorm`, `knex`, `drizzle-orm`, `gorm.io/gorm`, `diesel`, `mongoose`, `pg`, `mysql2`, `psycopg2*`, `psycopg`, `asyncpg`, `pymongo`; caminhos `*migrations/*`, `*db/migrate/*`, `*alembic/*` |
 | DESKTOP-MOBILE-AND-LOCAL-IPC | deps `electron`, `@tauri-apps/api`, `react-native`, `expo`; caminhos `*.swift`, `*.kt`, `*.m`, `android/*`, `ios/*`, `*.xcodeproj/*` |
+| SUPPLY-CHAIN-AND-RELEASE | inventário não vazio, **ou** caminhos `.github/workflows/*`, `.gitlab-ci.yml`, `bitbucket-pipelines.yml`, `Jenkinsfile`, `.circleci/*` |
 | RESOURCE-EXHAUSTION-AND-AVAILABILITY | sempre que WEB-PROTOCOL-AND-AUTH ou PROTOCOLS-RPC-AND-MESSAGING casa |
 
 Nomes de dependência comparam-se em minúsculas, exactos ou por prefixo onde a
@@ -248,7 +248,9 @@ tabela diz `*`; os caminhos por `fnmatch` sobre o caminho relativo — e em
 `.claude/agents/x.md` e `*migrations/*` apanha `app/migrations/0001.py`, e é
 por isso que a tabela escreve os padrões assim e não com `**`. Um guia
 "casa" com ≥1 sinal; os casados ordenam-se por **número de sinais** (desempate
-pela ordem da tabela). **O perfil põe o tecto:**
+pela ordem da tabela — e é por isso que SUPPLY-CHAIN-AND-RELEASE está no fim:
+o seu sinal de inventário dispara em quase todos os projectos e não deve ganhar
+o lugar único do `quick` ao guia que descreve a stack). **O perfil põe o tecto:**
 
 | perfil | lê |
 |---|---|

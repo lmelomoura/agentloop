@@ -5944,3 +5944,44 @@ def test_the_phases_run_at_once_and_the_progress_says_so(tmp_path, monkeypatch, 
     _, phases = _coverage_phases(db, aid)
     assert [p["name"] for p in phases] == [
         "scope", "secrets", "hygiene", "dependencies", "sbom", "iac", "sast-prepass"]
+
+
+# ------------------------------------------------ the hunting guides
+
+def test_prepare_recommends_guides_by_the_profile_and_checklist_prints_them(tmp_path):
+    root = tmp_path / "repo"
+    (root / ".github" / "workflows").mkdir(parents=True)
+    (root / ".github" / "workflows" / "ci.yml").write_text("on: push\n")
+    # Two AI signals against one for CLOUD-AND-DEPLOYMENT and one for
+    # SUPPLY-CHAIN: `quick` keeps the single best match, ties by table order.
+    (root / "CLAUDE.md").write_text("# rules\n")
+    (root / "AGENTS.md").write_text("# agents\n")
+    db = tmp_path / "security.db"
+    aid = open_analysis(db, profile="quick")
+    out = run(db, "prepare", "--analysis", str(aid), "--root", str(root), "--offline")
+    assert out["guides"] == {"recommended": ["ATTACK-CLASSES", "AI-AND-LLM"]}
+    listed = run(db, "checklist", "--analysis", str(aid))
+    assert listed["analysis"]["guides"] == {"recommended": ["ATTACK-CLASSES", "AI-AND-LLM"]}
+    aid = open_analysis(db, profile="deep", commit="b", run_id="r2")
+    out = run(db, "prepare", "--analysis", str(aid), "--root", str(root), "--offline")
+    assert len(out["guides"]["recommended"]) == 11
+
+
+def test_a_failing_guide_selection_does_not_fail_prepare(tmp_path, monkeypatch):
+    """Advice never costs the deterministic phase. Exercised in-process, the
+    way the ledger-write-failure tests near the bottom of this file are,
+    because a subprocess cannot be monkeypatched."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    db = tmp_path / "security.db"
+    aid = open_analysis(db)
+    from security import guides as security_guides
+
+    def boom(*a, **k):
+        raise RuntimeError("no")
+    monkeypatch.setattr(security_guides, "signals", boom)
+    security_cli.main(["prepare", "--analysis", str(aid), "--root", str(root),
+                       "--offline", "--db", str(db)])
+    listed = run(db, "checklist", "--analysis", str(aid))
+    assert listed["analysis"]["guides"] == {"recommended": ["ATTACK-CLASSES"]}
+    assert "hunting-guide selection did not run" in listed["analysis"]["coverage_note"]

@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, hygiene, ignores, ledger, osv, queries, report, secrets, taxonomy  # noqa: E402
+from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, ledger, osv, queries, report, secrets, taxonomy  # noqa: E402
 
 REQUIRED_FINDING_KEYS = ("fingerprint", "category", "rule", "severity", "title")
 
@@ -1429,6 +1429,17 @@ def cmd_prepare(args):
         # have to open a report to find out the edit did nothing.
         print(f"prepare: {unknown_switch}", file=sys.stderr)
 
+    # THE HUNTING GUIDES, chosen here and not by the agent -- see
+    # security/guides.py. Filed under `scope` when the selection failed, since
+    # that is the row about what this analysis was set up to read; the list
+    # itself goes onto the analysis row (`ledger.set_guides`) below and out
+    # on stdout, where the skill tells the agent to read it.
+    recommended, guides_note = guides.recommend(root, ignore, components, row["profile"])
+    if guides_note:
+        notes.append(guides_note)
+        scope_notes.append(guides_note)
+        print(f"prepare: {guides_note}", file=sys.stderr)
+
     findings += _produced_by(dep_findings, dep_producer, produced)
 
     if sbom_document is None:
@@ -1589,8 +1600,10 @@ def cmd_prepare(args):
     # any of these findings' absence can ever be proven, and an analysis
     # marked prepared with an empty `produced` would report its whole
     # deterministic baseline `pending` for ever.
+    ledger.set_guides(conn, aid, recommended=recommended)
     ledger.mark_prepared(conn, aid, produced)
-    print(json.dumps({"coverage_note": note, "findings": len(findings)}))
+    print(json.dumps({"coverage_note": note, "findings": len(findings),
+                      "guides": {"recommended": recommended}}))
 
 
 def cmd_findings(args):
