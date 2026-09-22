@@ -194,6 +194,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   object (or `None`) and a derived `confidence`, so no screen or report ever
   parses the column itself.
 
+- **Reports render the candidate** — trace, intended control, conditions and
+  the three scored fields — under a finding that carries one, in Markdown,
+  HTML and the consolidated document, and as an object in JSON; a finding
+  without one renders byte for byte as before.
+
 - **The e2e suite runs four scenarios at a time, one sandbox each:
   `E2E_WORKERS=4 bash test/e2e.test.sh`.** Measured, it is 65% of the
   selftest — 312 s for 47 scenarios, the two security analyses 37 s each —

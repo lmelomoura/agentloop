@@ -86,6 +86,65 @@ def _scope_label(scope: str) -> str:
     return _SCOPE_LABELS.get(scope, scope)
 
 
+# The candidate document (security/candidate.py) under a finding: the chain,
+# the control, the conditions, and the three scored fields. Drawn ONLY when
+# the finding carries one -- every deterministic row and every row from
+# before the column carries None, and for those the report is byte-identical
+# to what it was, the same contract `_phase_rows` keeps for `coverage`. All
+# of it is the agent's text: escaped for HTML, `|` escaped in Markdown.
+_SCORED_LABELS = (("confidence", "Confidence"), ("likelihood", "Likelihood"), ("impact", "Impact"))
+
+
+def _md_cell(text) -> str:
+    return str(text).replace("|", "\\|")
+
+
+def _candidate_md(f) -> list:
+    c = f.get("candidate")
+    if not isinstance(c, dict):
+        return []
+    out = []
+    if c.get("trace"):
+        out.append("**Trace:**")
+        out += [f"- {s['kind']} · `{s['file']}:{s['line']}` · {_md_cell(s['scope'])}"
+                f" — {_md_cell(s['description'])}" for s in c["trace"]]
+    if c.get("intended_control"):
+        out.append(f"**Intended control:** {_md_cell(c['intended_control'])}")
+    if c.get("conditions"):
+        out.append("**Conditions:**")
+        out += [f"- {x['kind']}: {_md_cell(x['description'])}" for x in c["conditions"]]
+    scored = [f"**{label}:** {c[key]['score']} — {_md_cell(c[key]['reason'])}"
+              for key, label in _SCORED_LABELS if isinstance(c.get(key), dict)]
+    if scored:
+        out.append(" · ".join(scored))
+    return out
+
+
+def _candidate_html(f) -> str:
+    c = f.get("candidate")
+    if not isinstance(c, dict):
+        return ""
+    e = html.escape
+    parts = ['<div class="cand">']
+    if c.get("trace"):
+        parts.append("<p><strong>Trace:</strong></p><ol>")
+        parts += [f"<li>{e(s['kind'])} · <code>{e(s['file'])}:{int(s['line'])}</code> · "
+                  f"{e(s['scope'])} — {e(s['description'])}</li>" for s in c["trace"]]
+        parts.append("</ol>")
+    if c.get("intended_control"):
+        parts.append(f"<p><strong>Intended control:</strong> {e(c['intended_control'])}</p>")
+    if c.get("conditions"):
+        parts.append("<p><strong>Conditions:</strong></p><ul>")
+        parts += [f"<li>{e(x['kind'])}: {e(x['description'])}</li>" for x in c["conditions"]]
+        parts.append("</ul>")
+    scored = [f"<strong>{label}:</strong> {e(c[key]['score'])} — {e(c[key]['reason'])}"
+              for key, label in _SCORED_LABELS if isinstance(c.get(key), dict)]
+    if scored:
+        parts.append("<p>" + " · ".join(scored) + "</p>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def _coverage(analysis, coverage_note):
     """What this report did NOT look at. Printed before anything else.
 
@@ -150,6 +209,10 @@ def as_json(analysis, findings, coverage_note):
     for f in _worst_first(findings):
         row = dict(f)
         row.setdefault("scope", "")
+        # Same rule as `scope`: always a key, `None` when the finding carries
+        # no document, so a consumer can tell "no candidate" from "an older
+        # report format" without special-casing a missing key.
+        row.setdefault("candidate", None)
         rows.append(row)
     return json.dumps({
         "analysis": dict(analysis),
@@ -216,7 +279,11 @@ def as_markdown(analysis, findings, coverage_note):
         out.append("")
         for occ in f["occurrences"]:
             out.append(f"- `{occ['file']}`" + (f":{occ['line']}" if occ["line"] else ""))
-        out += ["", f["rationale"], "", f"**Remediation:** {f['remediation']}", ""]
+        out += ["", f["rationale"], ""]
+        block = _candidate_md(f)
+        if block:
+            out += block + [""]
+        out += [f"**Remediation:** {f['remediation']}", ""]
     return "\n".join(out)
 
 
@@ -233,7 +300,9 @@ border-radius:3px}@media print{.f{break-inside:avoid}}
 .cov{border-collapse:collapse;margin:1rem 0}
 .cov th,.cov td{border:1px solid #e5e5e5;padding:.3rem .6rem;text-align:left}
 .cov th{background:#f4f4f5;font-weight:600}
-.cov .cov-ok{color:#15803d}.cov .cov-warn{color:#b45309}.cov .cov-gap{color:#b91c1c}"""
+.cov .cov-ok{color:#15803d}.cov .cov-warn{color:#b45309}.cov .cov-gap{color:#b91c1c}
+.cand{margin:.5rem 0;padding:.5rem .75rem;border-left:3px solid #d4d4d8;background:#fafafa}
+.cand ol,.cand ul{margin:.25rem 0 .5rem 1.25rem}"""
 
 # The CSS class a status cell carries, DELIBERATELY NOT SPELLED LIKE THE
 # STATUS. The class used to be the status word itself, and the test that
@@ -304,7 +373,7 @@ def as_html(analysis, findings, coverage_note):
             f"<h3>[{e(f['severity'])}] {e(f['title'])} — {e(f['state'])}</h3>"
             f"<p>Rule <code>{e(f['rule'])}</code> ({e(f['category'])})</p>"
             f"{cls}{scope}"
-            f"<ul>{locs}</ul><p>{e(f['rationale'])}</p>"
+            f"<ul>{locs}</ul><p>{e(f['rationale'])}</p>{_candidate_html(f)}"
             f"<p><strong>Remediation:</strong> {e(f['remediation'])}</p></div>")
     return "".join(parts)
 
@@ -415,6 +484,9 @@ def _consolidated_finding_md(f, branch):
                 for o in f["occurrences"]]
     if f.get("rationale"):
         out += ["", f["rationale"]]
+    block = _candidate_md(f)
+    if block:
+        out += [""] + block
     if f.get("remediation"):
         out += ["", f"**Remediation:** {f['remediation']}"]
     out.append("")
@@ -505,6 +577,7 @@ def _consolidated_finding_json(f, branch):
                             for o in f.get("occurrences", [])],
             "rationale": f.get("rationale", ""),
             "remediation": f.get("remediation", ""),
+            "candidate": f.get("candidate"),
             "first_seen": f.get("first_seen", 0),
             "analysis_id": f.get("analysis_id"),
             "fixed_elsewhere": f.get("fixed_elsewhere")}
@@ -557,6 +630,7 @@ def consolidated_as_html(project, groups, meta):
                     f"{cls}{scope}{fe}"
                     + (f"<ul>{locs}</ul>" if locs else "")
                     + (f"<p>{e(f['rationale'])}</p>" if f.get("rationale") else "")
+                    + _candidate_html(f)
                     + (f"<p><strong>Remediation:</strong> {e(f['remediation'])}</p>"
                        if f.get("remediation") else "")
                     + "</div>")

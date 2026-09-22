@@ -557,3 +557,64 @@ def test_ordering_the_document_does_not_reorder_the_caller_s_list():
     arrived = _in_ledger_order("low", "critical")
     report.as_markdown(ANALYSIS, arrived, "")
     assert [f["severity"] for f in arrived] == ["low", "critical"]
+
+
+# ------------------------------------------------- the candidate block
+
+CANDIDATE = {
+    "trace": [
+        {"kind": "entrypoint", "file": "app/api.py", "line": 42, "scope": "handle_upload",
+         "description": "filename read | from the request <b>"},
+        {"kind": "sink", "file": "app/storage.py", "line": 19, "scope": "save",
+         "description": "open() on the joined path"}],
+    "intended_control": "uploads stay under the upload root",
+    "confidence": {"score": "high", "reason": "the join is unconditional"},
+    "likelihood": {"score": "high", "reason": "any tenant can upload"},
+    "impact": {"score": "high", "reason": "arbitrary file write"},
+    "conditions": [{"kind": "authentication_level", "description": "a tenant session"}],
+}
+
+WITH_CANDIDATE = [dict(FINDINGS[1], candidate=CANDIDATE, confidence="high", state="new")]
+WITHOUT = [dict(FINDINGS[1], candidate=None, confidence="", state="new")]
+
+
+def test_the_candidate_block_is_rendered_in_every_format_and_only_when_present():
+    md = report.as_markdown(ANALYSIS, WITH_CANDIDATE, "")
+    assert "**Trace:**" in md
+    assert "entrypoint · `app/api.py:42` · handle_upload — filename read \\| from the request <b>" in md
+    assert "**Intended control:** uploads stay under the upload root" in md
+    assert "authentication_level: a tenant session" in md
+    assert "**Confidence:** high — the join is unconditional" in md
+    assert "**Likelihood:** high — any tenant can upload" in md
+    assert "**Impact:** high — arbitrary file write" in md
+    html_out = report.as_html(ANALYSIS, WITH_CANDIDATE, "")
+    assert "<b>" not in html_out and "&lt;b&gt;" in html_out
+    assert 'class="cand"' in html_out
+    doc = json.loads(report.as_json(ANALYSIS, WITH_CANDIDATE, ""))
+    assert doc["findings"][0]["candidate"]["confidence"]["score"] == "high"
+    for text in (report.as_markdown(ANALYSIS, WITHOUT, ""), report.as_html(ANALYSIS, WITHOUT, "")):
+        assert "Trace" not in text and "Confidence" not in text
+    assert json.loads(report.as_json(ANALYSIS, WITHOUT, ""))["findings"][0]["candidate"] is None
+
+
+def test_a_report_without_candidates_is_byte_identical_to_before():
+    """The golden: a finding that carries no document -- every row from
+    before the column, every deterministic row -- renders exactly as it did.
+    `FINDINGS` has no `candidate` key at all (a caller assembling findings
+    some other way) and must render the same as one carrying None."""
+    plain = [dict(f) for f in FINDINGS]
+    with_none = [dict(f, candidate=None) for f in FINDINGS]
+    assert report.as_markdown(ANALYSIS, plain, "") == report.as_markdown(ANALYSIS, with_none, "")
+    assert report.as_html(ANALYSIS, plain, "") == report.as_html(ANALYSIS, with_none, "")
+    assert "Trace" not in report.as_markdown(ANALYSIS, plain, "")
+
+
+def test_the_consolidated_report_carries_the_block_too():
+    groups = [{"branch": "main", "analysis": dict(ANALYSIS),
+               "open": [dict(WITH_CANDIDATE[0], first_seen=1)], "resolved": []}]
+    md = report.consolidated_as_markdown("web", groups, {"at": 1})
+    assert "**Trace:**" in md and "**Confidence:** high" in md
+    html_out = report.consolidated_as_html("web", groups, {"at": 1})
+    assert 'class="cand"' in html_out and "&lt;b&gt;" in html_out
+    doc = json.loads(report.consolidated_as_json("web", groups, {"at": 1}))
+    assert doc["branches"][0]["open"][0]["candidate"]["impact"]["score"] == "high"
