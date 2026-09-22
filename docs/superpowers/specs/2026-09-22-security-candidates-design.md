@@ -223,15 +223,17 @@ fala de reportar ou validar, este ficheiro ganha".
 uma tabela `GUIDES` (nome → sinais) e uma função
 `select(signals, profile) -> list[str]`. Os sinais vêm do que o `prepare` já
 tem em mãos: os nomes normalizados do inventário de dependências, os caminhos
-relativos que o scan de segredos percorre (sujeitos aos mesmos `ignore_paths`),
-e o que a fase IaC encontrou.
+relativos que o scan de segredos percorre (sujeitos aos mesmos `ignore_paths`
+e ao mesmo `SKIP_DIRS`). Os sinais de infraestrutura são padrões de caminho
+(Dockerfile, `*.tf`, `Chart.yaml`, …) e não o resultado da fase IaC — o mesmo
+efeito, sem acoplar a selecção ao que o Trivy devolve.
 
 | guia | sinais |
 |---|---|
 | ATTACK-CLASSES | sempre |
 | WEB-PROTOCOL-AND-AUTH | deps: `express`, `koa`, `fastify`, `hapi`, `@nestjs/core`, `next`, `nuxt`, `flask`, `django`, `fastapi`, `starlette`, `tornado`, `rails`, `sinatra`, `laravel/framework`, `symfony/symfony`, `slim/slim`, `spring-boot`, `github.com/gin-gonic/gin`, `github.com/labstack/echo`, `github.com/go-chi/chi`, `github.com/gofiber/fiber`, `actix-web`, `axum`, `rocket` |
 | CLIENT-SIDE | caminhos `*.html`, `*.jsx`, `*.tsx`, `*.vue`, `*.svelte`; deps `react`, `vue`, `svelte`, `@angular/core`, `jquery` |
-| CLOUD-AND-DEPLOYMENT | a fase IaC encontrou Dockerfile/Terraform/Kubernetes/Helm/CloudFormation; caminhos `.github/workflows/*`, `serverless.yml`, `wrangler.toml`, `fly.toml`, `Procfile` |
+| CLOUD-AND-DEPLOYMENT | caminhos `Dockerfile*`, `*/Dockerfile*`, `*.Dockerfile`, `docker-compose*.yml`, `docker-compose*.yaml`, `*.tf`, `Chart.yaml`, `*/Chart.yaml`, `k8s/*`, `kubernetes/*`, `manifests/*`, `*cloudformation*`, `.github/workflows/*`, `serverless.yml`, `wrangler.toml`, `fly.toml`, `Procfile` |
 | SUPPLY-CHAIN-AND-RELEASE | inventário não vazio, **ou** caminhos `.github/workflows/*`, `.gitlab-ci.yml`, `bitbucket-pipelines.yml`, `Jenkinsfile`, `.circleci/*` |
 | AI-AND-LLM | deps `openai`, `anthropic`, `@anthropic-ai/sdk`, `langchain*`, `@langchain/*`, `llamaindex`, `llama-index*`, `mcp`, `@modelcontextprotocol/*`, `ai`, `transformers`; caminhos `CLAUDE.md`, `AGENTS.md`, `.claude/*`, `SKILL.md`, `*/SKILL.md`, `.mcp.json`, `mcp.json`, `.cursorrules` |
 | MEMORY-SAFETY-AND-BINARY | caminhos `*.c`, `*.cc`, `*.cpp`, `*.h`, `*.hpp`, `*.rs`, `*.zig`, `Cargo.lock` |
@@ -314,20 +316,23 @@ pode ser um sink novo.
   ordenável;
 - um filtro multi-selecção `confidence` ao lado do de severidade; os filtros
   guardados ganham a chave (uma chave ausente num filtro antigo é "sem filtro");
-- o `q` de texto livre passa a cobrir o texto do documento — um `LIKE` sobre a
-  coluna, sem parser.
+- o `q` de texto livre passa a cobrir o texto do documento — a prosa do
+  documento (`candidate.search_text`) junta-se ao que o `q` já lê.
 
-Onde quer que um achado se mostre por inteiro — hoje `findings-screen.js`,
-`analysis.js` e `index-screen.js` são os módulos que desenham `rationale` — o
-bloco acima aparece sob o rationale, desenhado por **um módulo só**,
-`ui/security/candidate.js`, montado nos três sítios, pela mesma regra que já
-impede o Findings de existir como duas tabelas. Os números de postura (índice,
-donut, Branches, Overview) não mexem: confiança não é exposição.
+Onde um achado se mostra por inteiro — hoje só `analysis.js` (`secFindingRow`,
+o detalhe da análise que o Findings e o Overview abrem) desenha um achado
+completo; o Findings mostra o rationale truncado a uma linha — o bloco acima
+aparece sob o rationale, e o chip de confiança ao lado do estado, ambos
+desenhados por **um módulo só**, `ui/security/candidate.js`, pela mesma regra
+que já impede o Findings de existir como duas tabelas. Os números de postura
+(índice, donut, Branches, Overview) não mexem: confiança não é exposição.
 
 **API/CLI.** `/api/security/findings` e `findings-page` aceitam
-`confidence=<lista>`; em `queries.py` é um ramo do `WHERE` com
-`json_extract(candidate, '$.confidence.score')` — o único sítio que lê dentro
-do JSON; `sort=confidence` ordena pela mesma expressão, com `''` no fim.
+`confidence=<lista>`; em `queries.py` é mais um ramo do filtro em Python que
+`finding_rows` já aplica depois do `checklist()` — a chave `confidence` é
+derivada por `ledger.findings_of` do documento descodificado, e nenhum ecrã
+nem query lê dentro do JSON; `sort=confidence` ordena por essa chave, com as
+linhas sem documento no fim, seja qual for a direcção.
 
 **Cobertura.** A frase dos guias vive na nota da linha `sast` da tabela de
 cobertura, que os três relatórios e o ecrã da análise já desenham — nada novo
@@ -347,9 +352,9 @@ desactualizado.
 | `bin/security/ledger.py` | colunas `finding.candidate`, `analysis.guides`; `record_finding` grava o documento canónico |
 | `bin/security/queries.py` | filtro e ordenação por `confidence`; `q` sobre a coluna |
 | `bin/security/report.py` | o bloco nos três formatos e no consolidado |
-| `bin/agentloop` | `security_close_analysis` lê o stream e passa `--guides-read`; `security_prompt` nomeia `references/` nas plataformas que nomeiam a skill por caminho; `selftest` verifica que o SQLite do `python3` responde a `json_extract` |
+| `bin/agentloop` | `security_close_analysis` lê o stream e passa `--guides-read`; `security_prompt` nomeia `references/` em todas as plataformas |
 | `bin/agentloop-server` | `confidence` em `/api/security/findings` |
-| `ui/security/candidate.js` (novo), `findings-screen.js`, `analysis.js`, `index-screen.js`, `vocabulary.js` | o bloco, a coluna, o filtro |
+| `ui/security/candidate.js` (novo), `findings-screen.js`, `analysis.js`, `ui/css/pages.css` | o bloco, o chip, a coluna, o filtro |
 | `bin/static/security.js` | reconstruído |
 | `README.md` | a secção *Security analysis* ganha o documento, os guias e a frase de cobertura |
 | `CHANGELOG.md` | por commit, como sempre |
@@ -442,12 +447,10 @@ Na disposição que `tests/security/` já tem:
 2. **A tabela de sinais é um palpite informado.** Um projecto em Elixir ou PHP
    sem Laravel casa pouco. A tabela é dados, cresce por PR, e a nota de
    cobertura diz sempre o que foi recomendado.
-3. **`json_extract` exige SQLite com JSON1** (incluído de série desde o
-   3.38; antes disso só se compilado com a extensão). O `python3` das
-   instalações que temos traz um SQLite recente, mas isso não é garantido em
-   todo o lado: o `selftest` passa a executar `json_extract('{}', '$.a')` e a
-   dizer a versão do SQLite se falhar, para que a falha seja um erro nomeado
-   no arranque e não uma página Findings que rebenta ao filtrar.
+3. **Os sinais de infraestrutura são padrões de caminho**, não o resultado da
+   fase IaC — um Dockerfile num caminho ignorado não recomenda o guia, o que
+   é coerente com a regra do scope ("o que foi ignorado não foi olhado") mas
+   pode surpreender quem ignorou `infra/**` e esperava o guia na mesma.
 4. **Os guias envelhecem.** `UPSTREAM.md` com SHA é o que permite re-vendorizar
    com diff legível; sem disciplina, divergem em silêncio.
 
