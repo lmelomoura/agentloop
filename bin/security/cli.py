@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from security import adapters, coverage, deps, diff, engines, fingerprint, hygiene, ignores, ledger, osv, queries, report, secrets, taxonomy  # noqa: E402
+from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, hygiene, ignores, ledger, osv, queries, report, secrets, taxonomy  # noqa: E402
 
 REQUIRED_FINDING_KEYS = ("fingerprint", "category", "rule", "severity", "title")
 
@@ -1647,6 +1647,38 @@ def cmd_fingerprint(args):
                                       args.snippet or ""))
 
 
+def _candidate_requirements(conn, analysis_id, payload):
+    """(required keys, trace_allowed) for THIS finding -- decided from data
+    the ledger already has, never from a flag the agent sends.
+
+    A row of this fingerprint already in this analysis and minted by a
+    SCANNER means the re-report is a triage (Job 2): somebody is judging a
+    scanner's finding, and a judgement carries a confidence. No such row means
+    a new finding (Job 3) or the verbatim echo of a row nobody re-found (Job
+    1), which carries nothing -- a confidence there would be the verification
+    Job 1 says did not happen. `sast` is held by severity alone, whoever
+    minted it: at medium or above the writer asserts a real weakness and has
+    to show the chain and the control; at high and critical, both halves of
+    the severity as well. A trace is allowed on `sast` and on `dependency`
+    (the CVE's reachability) and refused on the three categories that have
+    no data flow.
+    """
+    category, severity = payload["category"], payload["severity"]
+    existing = conn.execute(
+        "SELECT producer FROM finding WHERE analysis_id=? AND fingerprint=?",
+        (analysis_id, payload["fingerprint"])).fetchone()
+    triage = existing is not None and (existing["producer"] or "") not in ("", diff.AGENT)
+    if category == "sast":
+        if severity in TRIAGE_BLOCKING:
+            required = ["trace", "intended_control", "confidence"]
+            if severity in ("high", "critical"):
+                required += ["likelihood", "impact"]
+        else:
+            required = ["confidence"]
+        return required, True
+    return (["confidence"] if triage else []), category == "dependency"
+
+
 def cmd_report_finding(args):
     try:
         stdin_text = sys.stdin.read()
@@ -1798,6 +1830,42 @@ def cmd_report_finding(args):
                  "reader of the report opens; an object with no `file` is not "
                  "one, and a row carrying only such objects has no location "
                  "at all")
+    conn = _conn(args)
+    _running(conn, args.analysis)
+    # THE CANDIDATE, after every text field above has been through the same
+    # gates -- so a rationale that quotes a key is still refused as
+    # `rationale`, never as a missing candidate -- and before the producer is
+    # stamped, because the requirements read the row the ledger already holds.
+    required, trace_allowed = _candidate_requirements(conn, args.analysis, payload)
+    doc = payload.pop("candidate", None)
+    if doc is None:
+        if required:
+            sys.exit("report-finding: candidate is required here — a "
+                     f"{payload['category']} finding at {payload['severity']} "
+                     f"has to carry: {', '.join(required)}. A medium+ weakness "
+                     "without a trace is one you have not read; go read it rather "
+                     "than lowering the severity. Nothing was recorded")
+        payload["candidate"] = ""
+    else:
+        if not isinstance(doc, dict):
+            sys.exit("report-finding: candidate must be an object. Nothing was recorded")
+        try:
+            doc = candidate.validate(doc, required=required, trace_allowed=trace_allowed)
+        except candidate.CandidateError as exc:
+            where = f"candidate.{exc.path}" if exc.path else "candidate"
+            sys.exit(f"report-finding: {where} {exc.message}. Nothing was recorded")
+        if not candidate.within_ceiling(payload["severity"], doc):
+            sys.exit(f"report-finding: severity {payload['severity']} is above the "
+                     "candidate's impact — the ceiling of a severity is its impact; "
+                     "lower the severity or raise the impact with a reason. Nothing "
+                     "was recorded")
+        # The same scanner every other free-text field went through, over
+        # every free-text field of the document, by path. See
+        # `_refuse_if_secret` for why the message names the field and never
+        # the text.
+        for path, text in candidate.texts(doc):
+            _refuse_if_secret(f"report-finding: candidate.{path}", text)
+        payload["candidate"] = candidate.encode(doc)
     # NEVER read from the payload -- `producer` is not an agent-writable
     # field, it is this door's own record of who arrived through it. An agent
     # able to send its own would be able to claim a deterministic producer for
@@ -1808,8 +1876,6 @@ def cmd_report_finding(args):
     # minted -- which is exactly what `diff.AGENT` is proven by: the analysis
     # closing `done`.
     payload["producer"] = diff.AGENT
-    conn = _conn(args)
-    _running(conn, args.analysis)
     try:
         ledger.record_finding(conn, args.analysis, payload)
     # OverflowError is here for the same reason ValueError is: it comes out of

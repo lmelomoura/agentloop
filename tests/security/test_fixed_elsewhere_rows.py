@@ -18,6 +18,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "bin"))
 from security import queries  # noqa: E402
 
 CLI = Path(__file__).resolve().parents[2] / "bin" / "security" / "cli.py"
+
+# A complete, valid candidate -- what every `sast` finding at medium or above
+# has to carry through the door since block 4.1 (see cli._candidate_requirements).
+SAST_CANDIDATE = {
+    "trace": [
+        {"kind": "entrypoint", "file": "app/x.py", "line": 1, "scope": "handle",
+         "description": "the parameter comes from the request"},
+        {"kind": "sink", "file": "app/x.py", "line": 1, "scope": "query",
+         "description": "the string reaches execute()"}],
+    "intended_control": "queries are parameterised",
+    "confidence": {"score": "high", "reason": "the concatenation is unconditional"},
+    "likelihood": {"score": "high", "reason": "the endpoint is unauthenticated"},
+    "impact": {"score": "critical", "reason": "full read of the database"},
+}
 FP = "a" * 64
 
 
@@ -64,6 +78,7 @@ def _analysis(db, tmp_path, branch, commit, fps, project="web", repo="web"):
         _run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
             "fingerprint": fp, "category": "sast", "rule": "sql-injection",
             "severity": "high", "title": "t", "rationale": "r", "remediation": "m",
+            "candidate": SAST_CANDIDATE,
             "occurrences": [{"file": "a", "line": 1}]}))
     _run(db, "finish", "--analysis", str(aid), "--state", "done")
     return aid

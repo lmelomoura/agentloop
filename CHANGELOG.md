@@ -20,6 +20,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`report-finding` holds a `sast` finding to its severity.** At medium or
+  above it has to carry a trace, the control that should have held and a
+  confidence; at high and critical, likelihood and impact with reasons too;
+  the severity may never exceed the impact; a re-report onto a scanner's row
+  carries a confidence; a trace is refused on a secret, a hygiene or an
+  infrastructure finding; every free-text field of the document goes through
+  the same credential scan as `rationale`, and a refusal names the field by
+  path and never the text. A finding that fails any of this is refused whole
+  — nothing recorded — which is what stops a paragraph from standing in for a
+  chain of code nobody read.
+
 - **The selftest lives in `test/selftest.sh`; `bin/agentloop` is the engine
   again.** `cmd_selftest` had grown to 6,445 lines — 48% of the engine — so
   whoever opened the file to change how a run is launched read six thousand

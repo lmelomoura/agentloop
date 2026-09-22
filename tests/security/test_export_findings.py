@@ -12,6 +12,20 @@ from pathlib import Path
 
 CLI = Path(__file__).resolve().parents[2] / "bin" / "security" / "cli.py"
 
+# A complete, valid candidate -- what every `sast` finding at medium or above
+# has to carry through the door since block 4.1 (see cli._candidate_requirements).
+SAST_CANDIDATE = {
+    "trace": [
+        {"kind": "entrypoint", "file": "app/x.py", "line": 1, "scope": "handle",
+         "description": "the parameter comes from the request"},
+        {"kind": "sink", "file": "app/x.py", "line": 1, "scope": "query",
+         "description": "the string reaches execute()"}],
+    "intended_control": "queries are parameterised",
+    "confidence": {"score": "high", "reason": "the concatenation is unconditional"},
+    "likelihood": {"score": "high", "reason": "the endpoint is unauthenticated"},
+    "impact": {"score": "critical", "reason": "full read of the database"},
+}
+
 
 def _run(db, *args, check=True):
     out = subprocess.run([sys.executable, str(CLI), *args, "--db", str(db)],
@@ -34,6 +48,8 @@ def _finding(db, aid, fingerprint, severity="high", title="a finding",
                "severity": severity, "title": title,
                "rationale": "because", "remediation": "fix it",
                "occurrences": [{"file": path, "line": line}]}
+    if category == "sast":
+        payload["candidate"] = SAST_CANDIDATE
     out = subprocess.run([sys.executable, str(CLI), "report-finding", "--analysis",
                           str(aid), "--db", str(db)],
                          input=json.dumps(payload), capture_output=True,

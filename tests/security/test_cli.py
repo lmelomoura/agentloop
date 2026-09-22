@@ -28,6 +28,7 @@ from security.fingerprint import fingerprint as compute_fingerprint, secret_fing
 from security import cli as security_cli
 from security import ledger as security_ledger
 from security import taxonomy as security_taxonomy
+from security import candidate as security_candidate
 
 REPO = Path(__file__).resolve().parent.parent.parent
 CLI = REPO / "bin" / "security" / "cli.py"
@@ -35,6 +36,25 @@ CLI = REPO / "bin" / "security" / "cli.py"
 # What `cmd_security_analyze` exports into the analysis run, and therefore what
 # every command the agent types from its own tool shell arrives with.
 AS_AGENT = {**os.environ, "AL_SECURITY_AGENT": "1"}
+
+# A complete, valid candidate -- what every `sast` finding at medium or above
+# has to carry through the door since block 4.1. Tests about OTHER rules of
+# the door attach it so they keep testing the rule they name.
+SAST_CANDIDATE = {
+    "trace": [
+        {"kind": "entrypoint", "file": "app/api.py", "line": 42, "scope": "handle",
+         "description": "the filename comes from the request"},
+        {"kind": "sink", "file": "app/db.py", "line": 12, "scope": "query",
+         "description": "the string reaches execute()"}],
+    "intended_control": "queries are parameterised",
+    "confidence": {"score": "high", "reason": "the concatenation is unconditional"},
+    "likelihood": {"score": "high", "reason": "the endpoint is unauthenticated"},
+    "impact": {"score": "critical", "reason": "full read of the database"},
+}
+# What a triage of a scanner's row carries: the agent's confidence in what it
+# read. `_triage` below attaches it, and so does every inline re-report of a
+# dependency, iac, hygiene or secret row a scanner minted in the analysis.
+TRIAGE_CANDIDATE = {"confidence": {"score": "medium", "reason": "read at the call site"}}
 
 
 def run(db, *args, stdin=None, env=None):
@@ -109,7 +129,7 @@ def test_prepare_then_report_then_finish(tmp_path):
     assert prepared["findings"] >= 1
 
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
-        "fingerprint": "b" * 64, "category": "sast", "rule": "sql-injection",
+        "fingerprint": "b" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "sql-injection",
         "severity": "high", "title": "t", "rationale": "r", "remediation": "m",
         "occurrences": [{"file": "app.py", "line": 1, "snippet_hash": "h"}]}))
     run(db, "finish", "--analysis", str(aid), "--state", "done", "--spend", "0.5")
@@ -196,7 +216,7 @@ def test_report_finding_accepts_other_as_the_escape_hatch(tmp_path):
     db = tmp_path / "security.db"
     aid = open_analysis(db)
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
-        "fingerprint": "4" * 64, "category": "sast", "rule": "other",
+        "fingerprint": "4" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "other",
         "severity": "high", "title": "t",
         "rationale": "Nothing in the vocabulary fits: it is a logic flaw in "
                      "the refund path."}))
@@ -277,7 +297,7 @@ def test_report_finding_derives_the_classification_from_the_rule(tmp_path):
     db = tmp_path / "security.db"
     aid = open_analysis(db)
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
-        "fingerprint": "e" * 64, "category": "sast", "rule": "sql-injection",
+        "fingerprint": "e" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "sql-injection",
         "severity": "high", "title": "t"}))
     row = _finding_row(db, aid)
     assert row["cwe"] == "CWE-89"
@@ -291,7 +311,7 @@ def test_report_finding_ignores_a_classification_sent_by_the_agent(tmp_path):
     db = tmp_path / "security.db"
     aid = open_analysis(db)
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
-        "fingerprint": "f" * 64, "category": "sast", "rule": "sql-injection",
+        "fingerprint": "f" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "sql-injection",
         "severity": "high", "title": "t",
         "cwe": "CWE-79", "owasp": "A01:2021"}))
     row = _finding_row(db, aid)
@@ -393,7 +413,7 @@ def test_a_finding_that_describes_a_credential_instead_of_quoting_it_is_accepted
     db = tmp_path / "security.db"
     aid = open_analysis(db)
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
-        "fingerprint": "2" * 64, "category": "sast", "rule": "hardcoded-credentials",
+        "fingerprint": "2" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "hardcoded-credentials",
         "severity": "high", "title": "Hardcoded AWS key",
         "rationale": "An AWS access key is hardcoded in config/prod.env at line 12."}))
 
@@ -402,7 +422,7 @@ def test_a_finding_whose_rationale_names_an_obvious_placeholder_is_accepted(tmp_
     db = tmp_path / "security.db"
     aid = open_analysis(db)
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
-        "fingerprint": "3" * 64, "category": "sast", "rule": "hardcoded-credentials",
+        "fingerprint": "3" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "hardcoded-credentials",
         "severity": "high", "title": "t",
         "rationale": 'Default credential left in place: '
                      'password = "changeme12345678901234"'}))
@@ -414,6 +434,160 @@ def test_the_agent_cannot_send_something_that_is_not_json(tmp_path):
     out = fails(db, "report-finding", "--analysis", str(aid), stdin="not json")
     assert out.returncode != 0
     assert "JSON" in out.stderr
+
+
+# ------------------------------------------------ the candidate at the door
+
+def _scanner_row(db, aid, fp, category, rule, severity="high"):
+    """A row a SCANNER minted in this analysis -- what makes an agent's
+    re-report of it a triage. Written through the ledger, as `prepare` does,
+    because no scanner mints on demand."""
+    conn = security_ledger.connect(db)
+    security_ledger.record_finding(conn, aid, {
+        "fingerprint": fp, "category": category, "rule": rule, "severity": severity,
+        "title": "scanner's title", "rationale": "scanner's sentence",
+        "remediation": "scanner's fix", "producer": "semgrep" if category == "sast" else "trivy",
+        "occurrences": [{"file": "app/db.py", "line": 12}]})
+    conn.close()
+
+
+def _payload(fp, category="sast", rule="sql-injection", severity="high", **over):
+    p = {"fingerprint": fp, "category": category, "rule": rule, "severity": severity,
+         "title": "t", "rationale": "my own reading", "remediation": "m",
+         "occurrences": [{"file": "app/db.py", "line": 12, "snippet_hash": "h"}]}
+    p.update(over)
+    return p
+
+
+def _without(*keys):
+    return {k: v for k, v in SAST_CANDIDATE.items() if k not in keys}
+
+
+@pytest.mark.parametrize("severity, candidate, refused", [
+    ("high", SAST_CANDIDATE, ""),
+    ("medium", _without("likelihood", "impact"), ""),
+    ("low", {"confidence": SAST_CANDIDATE["confidence"]}, ""),
+    ("info", {"confidence": SAST_CANDIDATE["confidence"]}, ""),
+    ("high", None, "candidate is required"),
+    ("high", _without("trace"), "missing required key(s): trace"),
+    ("high", _without("intended_control"), "intended_control"),
+    ("high", _without("confidence"), "confidence"),
+    ("high", _without("likelihood", "impact"), "likelihood, impact"),
+    ("critical", _without("likelihood", "impact"), "likelihood, impact"),
+    ("medium", _without("trace", "likelihood", "impact"), "trace"),
+    ("low", None, "candidate is required"),
+    ("low", {}, "confidence"),
+])
+def test_what_a_sast_finding_has_to_carry_depends_on_its_severity(tmp_path, severity, candidate, refused):
+    db = tmp_path / "security.db"
+    aid = open_analysis(db)
+    payload = _payload("b" * 64, severity=severity)
+    if candidate is not None:
+        payload["candidate"] = candidate
+    out = fails(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
+    if refused:
+        assert out.returncode != 0, out.stderr
+        assert refused in out.stderr
+        assert "Nothing was recorded" in out.stderr
+        assert _finding_row(db, aid) is None
+    else:
+        assert out.returncode == 0, out.stderr
+
+
+def test_a_triage_of_a_scanner_row_needs_a_confidence_and_a_secret_takes_no_trace(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    fp = secret_fingerprint("aws-access-token", "prod.env")
+    _scanner_row(db, aid, fp, "secret", "aws-access-token")
+    base = _payload(fp, category="secret", rule="aws-access-token",
+                    occurrences=[{"file": "prod.env", "line": 3}])
+    out = fails(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(base))
+    assert out.returncode != 0 and "confidence" in out.stderr
+    out = fails(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(
+        dict(base, candidate={"confidence": SAST_CANDIDATE["confidence"],
+                              "trace": SAST_CANDIDATE["trace"]})))
+    assert out.returncode != 0 and "candidate.trace" in out.stderr and "not accepted" in out.stderr
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(
+        dict(base, candidate={"confidence": SAST_CANDIDATE["confidence"]})))
+
+
+def test_a_dependency_triage_may_carry_a_trace_for_reachability(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _scanner_row(db, aid, "d" * 64, "dependency", "CVE-2024-1")
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(_payload(
+        "d" * 64, category="dependency", rule="CVE-2024-1",
+        candidate={"confidence": SAST_CANDIDATE["confidence"], "trace": SAST_CANDIDATE["trace"]})))
+    assert _finding_row(db, aid)["candidate"] != ""
+
+
+def test_a_verbatim_echo_of_a_pending_deterministic_row_needs_no_candidate(tmp_path):
+    """Job 1: the row is NOT in this analysis (nobody re-found it), so the
+    door sees no scanner row and asks for nothing -- echoing it with a
+    confidence would claim a verification that did not happen."""
+    db = tmp_path / "security.db"
+    aid = open_analysis(db)
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(_payload(
+        "c" * 64, category="dependency", rule="CVE-2024-1")))
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(_payload(
+        "e" * 64, category="hygiene", rule="committed_env_file")))
+
+
+def test_severity_above_the_candidates_impact_is_refused(tmp_path):
+    db = tmp_path / "security.db"
+    aid = open_analysis(db)
+    doc = dict(SAST_CANDIDATE, impact={"score": "medium", "reason": "one row of one table"})
+    out = fails(db, "report-finding", "--analysis", str(aid),
+                stdin=json.dumps(_payload("b" * 64, severity="high", candidate=doc)))
+    assert out.returncode != 0
+    assert "above the candidate's impact" in out.stderr
+    assert _finding_row(db, aid) is None
+
+
+def test_a_candidate_that_is_not_an_object_or_has_unknown_keys_is_refused(tmp_path):
+    db = tmp_path / "security.db"
+    aid = open_analysis(db)
+    out = fails(db, "report-finding", "--analysis", str(aid),
+                stdin=json.dumps(_payload("b" * 64, candidate="high")))
+    assert out.returncode != 0 and "candidate must be an object" in out.stderr
+    out = fails(db, "report-finding", "--analysis", str(aid),
+                stdin=json.dumps(_payload("b" * 64, candidate=dict(SAST_CANDIDATE, payloads=["x"]))))
+    assert out.returncode != 0 and "does not know: payloads" in out.stderr
+
+
+def test_a_credential_inside_the_candidate_is_refused_by_path_and_never_echoed(tmp_path):
+    """The adversarial test, extended to the document: the same shaped
+    patterns `rationale` goes through, applied to every free-text field of
+    the candidate; the refusal names the FIELD by its path and the rule, and
+    the key's text appears nowhere -- not on stdout, not on stderr, not in
+    the ledger."""
+    db = tmp_path / "security.db"
+    aid = open_analysis(db)
+    doc = json.loads(json.dumps(SAST_CANDIDATE))
+    doc["trace"][1]["description"] = f"execute() is reached with {AWS} in the query"
+    out = fails(db, "report-finding", "--analysis", str(aid),
+                stdin=json.dumps(_payload("b" * 64, candidate=doc)))
+    assert out.returncode != 0
+    assert "candidate.trace[1].description" in out.stderr
+    assert "aws_access_key" in out.stderr
+    assert AWS not in out.stdout and AWS not in out.stderr
+    assert _finding_row(db, aid) is None
+    conn = sqlite3.connect(str(db))
+    assert AWS not in "".join(str(tuple(r)) for r in conn.execute("SELECT * FROM finding"))
+
+
+def test_the_stored_candidate_is_canonical_and_comes_back_decoded(tmp_path):
+    db = tmp_path / "security.db"
+    aid = open_analysis(db)
+    run(db, "report-finding", "--analysis", str(aid),
+        stdin=json.dumps(_payload("b" * 64, candidate=SAST_CANDIDATE)))
+    row = _finding_row(db, aid)
+    assert row["candidate"] == security_candidate.encode(security_candidate.validate(SAST_CANDIDATE))
+    found = run(db, "findings", "--analysis", str(aid))[0]
+    assert found["candidate"]["confidence"]["score"] == "high"
+    assert found["confidence"] == "high"
+    listed = run(db, "checklist", "--analysis", str(aid))["findings"][0]
+    assert listed["candidate"]["intended_control"] == "queries are parameterised"
 
 
 def test_offline_mode_declares_the_gap(tmp_path):
@@ -1928,7 +2102,7 @@ def test_an_agents_re_report_does_not_steal_a_deterministic_producer(
                        "--db", str(db)])
 
     run(db, "report-finding", "--analysis", str(aid),
-        stdin=json.dumps({**_iac_finding(), "fingerprint": _IAC_FP,
+        stdin=json.dumps({**_iac_finding(), "candidate": TRIAGE_CANDIDATE, "fingerprint": _IAC_FP,
                           "severity": "low",
                           "rationale": "the base image is pinned"}))
 
@@ -2141,7 +2315,7 @@ def _triage(db, aid, fp, *, rule, category="dependency", severity="low",
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
         "fingerprint": fp, "category": category, "rule": rule,
         "severity": severity, "title": f"{rule}, read in context",
-        "rationale": rationale,
+        "rationale": rationale, "candidate": TRIAGE_CANDIDATE,
         "occurrences": [{"file": file, "line": 0, "snippet_hash": ""}]}),
         env=AS_AGENT)
 
@@ -2250,7 +2424,7 @@ def test_the_agents_own_findings_are_never_counted_as_untriaged(tmp_path):
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path)
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
-        "fingerprint": "c" * 64, "category": "sast", "rule": "sql-injection",
+        "fingerprint": "c" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "sql-injection",
         "severity": "critical", "title": "String-built SQL",
         "occurrences": [{"file": "app/db.py", "line": 12}]}), env=AS_AGENT)
 
@@ -2302,7 +2476,7 @@ def test_a_rubber_stamp_through_the_real_door_neither_marks_nor_strips(tmp_path)
 
     stamp = fails(db, "report-finding", "--analysis", str(aid),
                   stdin=json.dumps({
-                      "fingerprint": fp, "category": "dependency",
+                      "fingerprint": fp, "category": "dependency", "candidate": TRIAGE_CANDIDATE,
                       "rule": "CVE-1", "severity": "high",
                       "title": "CVE-1 in yarn.lock"}), env=AS_AGENT)
     assert stamp.returncode != 0, stamp.stdout
@@ -2353,7 +2527,7 @@ def test_an_occurrence_at_line_zero_that_names_a_file_is_accepted_at_the_door(tm
     fp = _scanner_finding(db, aid, rule="CVE-1", severity="high")
 
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
-        "fingerprint": fp, "category": "dependency", "rule": "CVE-1",
+        "fingerprint": fp, "category": "dependency", "candidate": TRIAGE_CANDIDATE, "rule": "CVE-1",
         "severity": "high", "title": "CVE-1 in yarn.lock",
         "rationale": "read the call site: it is not reachable from a request",
         "occurrences": [{"file": "a.py", "line": 0}]}), env=AS_AGENT)
@@ -2434,14 +2608,14 @@ def test_a_text_field_that_is_not_a_string_is_refused_on_a_marked_row_too(
     aid = prepared_analysis(db, tmp_path)
     fp = _scanner_finding(db, aid, rule="CVE-1", severity="high")
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
-        "fingerprint": fp, "category": "dependency", "rule": "CVE-1",
+        "fingerprint": fp, "category": "dependency", "candidate": TRIAGE_CANDIDATE, "rule": "CVE-1",
         "severity": "low", "title": "CVE-1, read in context",
         "rationale": "read the call site: it is not reachable from a request",
         "remediation": "pin the transitive and move on",
         "partial_note": "only the api package still pulls it",
         "occurrences": [{"file": "yarn.lock", "line": 0}]}), env=AS_AGENT)
 
-    payload = {"fingerprint": fp, "category": "dependency", "rule": "CVE-1",
+    payload = {"fingerprint": fp, "category": "dependency", "candidate": TRIAGE_CANDIDATE, "rule": "CVE-1",
                "severity": "medium", "title": "CVE-1, read again",
                "rationale": "read it again: still not reachable",
                "remediation": "or drop the package altogether",
@@ -4367,9 +4541,13 @@ def finished_analysis(db, tmp_path, project, branch, severity="high", rule="r",
     downgraded to `capped` (see `cmd_finish`) -- a test about current posture
     has to start from a row the close actually accepted as done."""
     aid = prepared_analysis(db, tmp_path, project=project, repo=project, branch=branch)
-    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
-        "fingerprint": fingerprint_for(project, branch, rule), "category": category,
-        "rule": rule, "severity": severity, "title": "t", "rationale": "r"}))
+    payload = {"fingerprint": fingerprint_for(project, branch, rule), "category": category,
+               "rule": rule, "severity": severity, "title": "t", "rationale": "r"}
+    # A `sast` finding at medium or above has to carry its candidate through
+    # the door (block 4.1); a deterministic placeholder does not.
+    if category == "sast":
+        payload["candidate"] = SAST_CANDIDATE
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
     run(db, "finish", "--analysis", str(aid), "--state", "done", "--spend", "0.5")
     return aid
 
@@ -4385,9 +4563,11 @@ def capped_analysis(db, tmp_path, project, branch, severity="high", rule="r",
     test about how the index screen treats this state has to start from a
     row that really carries it."""
     aid = prepared_analysis(db, tmp_path, project=project, repo=project, branch=branch)
-    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
-        "fingerprint": fingerprint_for(project, branch, rule), "category": category,
-        "rule": rule, "severity": severity, "title": "t", "rationale": "r"}))
+    payload = {"fingerprint": fingerprint_for(project, branch, rule), "category": category,
+               "rule": rule, "severity": severity, "title": "t", "rationale": "r"}
+    if category == "sast":
+        payload["candidate"] = SAST_CANDIDATE
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
     run(db, "finish", "--analysis", str(aid), "--state", "capped", "--spend", "0.3")
     return aid
 
@@ -4718,7 +4898,7 @@ def test_project_data_serves_the_overview_cards_beyond_the_posture(tmp_path):
         "rationale": "r",
         "occurrences": [{"file": "conf/id_rsa", "line": 1, "snippet_hash": "h"}]}))
     run(db, "report-finding", "--analysis", str(aid2), stdin=json.dumps({
-        "fingerprint": fingerprint_for("web", "main", "sqli"), "category": "sast",
+        "fingerprint": fingerprint_for("web", "main", "sqli"), "category": "sast", "candidate": SAST_CANDIDATE,
         "rule": "sql-injection", "severity": "critical", "title": "SQL injection",
         "rationale": "r",
         "occurrences": [{"file": "app/db.py", "line": 40, "snippet_hash": "h"},
