@@ -10,7 +10,7 @@
 
 ## Restrições globais
 
-- **Trabalhar num worktree**, nunca no checkout `/Users/lfmoura/Projects/agentloop` em que o launchd corre o tick e o servidor (o `bin/agentloop` é lido a cada invocação). Branch: `feat/security-candidates` (já existe, com a spec). Todos os comandos abaixo assumem `cd <WT>` onde `<WT>` é o caminho do worktree.
+- **Trabalhar num worktree**, nunca no checkout `~/Projects/agentloop` em que o launchd corre o tick e o servidor (o `bin/agentloop` é lido a cada invocação). Branch: `feat/security-candidates` (já existe, com a spec). Todos os comandos abaixo assumem `cd <WT>` onde `<WT>` é o caminho do worktree.
 - **Testes em primeiro plano**, `timeout` 600000, nunca em background. `pytest` só existe em `python3.13`: `python3.13 -m pytest … -p no:cacheprovider`. O `tests/security` precisa de `TRIVY_SKIP_DB_UPDATE=true TRIVY_SKIP_JAVA_DB_UPDATE=true TRIVY_SKIP_CHECK_UPDATE=true` e, para caber em 10 min, `--deselect tests/security/test_both_configurations.py::test_the_security_suite_is_green_with_the_engines_on`.
 - **Ler ficheiros com `Read`, correr comandos exactos com `rtk proxy …`** — o hook rtk trunca `cat`/`grep` sem aviso.
 - **`agentloop selftest` só no checkout real** (um worktree não tem `config/jobs.json`); no worktree, copiar `config/jobs.json` do checkout antes de o correr, ou aceitar exactamente essa falha.
@@ -52,10 +52,10 @@
 - [ ] **Step 1: criar o worktree sobre a branch existente**
 
 ```bash
-cd /Users/lfmoura/Projects/agentloop && git worktree add /Users/lfmoura/Projects/agentloop-wt-candidates feat/security-candidates
+cd ~/Projects/agentloop && git worktree add ~/Projects/agentloop-wt-candidates feat/security-candidates
 ```
 
-Expected: `Preparing worktree (checking out 'feat/security-candidates')`. Daqui em diante `<WT>` = `/Users/lfmoura/Projects/agentloop-wt-candidates`.
+Expected: `Preparing worktree (checking out 'feat/security-candidates')`. Daqui em diante `<WT>` = `~/Projects/agentloop-wt-candidates`.
 
 - [ ] **Step 2: portar as três correcções para a spec**
 
@@ -2027,9 +2027,9 @@ No `test/selftest.sh`, a seguir ao bloco `security_close_analysis must ignore ev
   mkdir -p "$tmp/guides"
   cat > "$tmp/guides/stream.ndjson" <<'JSON'
 {"type":"system","subtype":"init"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/Users/x/.claude/skills/security-analysis/references/ATTACK-CLASSES.md"}}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"2","name":"Read","input":{"filePath":"/Users/x/.claude/skills/security-analysis/references/AI-AND-LLM.md"}}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"3","name":"Bash","input":{"command":"cat /Users/x/.claude/skills/security-analysis/references/AI-AND-LLM.md | head"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/Users/me/.claude/skills/security-analysis/references/ATTACK-CLASSES.md"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"2","name":"Read","input":{"filePath":"/Users/me/.claude/skills/security-analysis/references/AI-AND-LLM.md"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"3","name":"Bash","input":{"command":"cat /Users/me/.claude/skills/security-analysis/references/AI-AND-LLM.md | head"}}]}}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"reading references/CLIENT-SIDE.md is not a tool call"}]}}
 {"type":"result","subtype":"success"}
 JSON
@@ -2069,7 +2069,7 @@ E no bloco de `security_prompt()` (linha `echo "security_prompt() — ..."`), ac
 - [ ] **Step 2: correr o selftest no worktree e ver as falhas novas**
 
 ```bash
-cd <WT> && cp /Users/lfmoura/Projects/agentloop/config/jobs.json config/jobs.json 2>/dev/null; bin/agentloop selftest 2>&1 | tail -15
+cd <WT> && cp ~/Projects/agentloop/config/jobs.json config/jobs.json 2>/dev/null; bin/agentloop selftest 2>&1 | tail -15
 ```
 
 Expected: `security_guides_read: command not found` nos blocos novos (e nada mais a vermelho — se o `config/jobs.json` faltar, uma falha conhecida sobre ele).
@@ -2491,10 +2491,10 @@ Expected: `failed=0` (com `config/jobs.json` copiado). Depois `bash test/suites.
 Pré-condições: nenhuma análise `running` no ledger real (`bin/agentloop security list --project <p>` para cada projecto, ou `sqlite3 data/security.db "select id,state from analysis where state='running'"` — vazio) e nenhum run vivo (`pgrep -fl 'bin/agentloop'` só mostra o servidor). Então:
 
 1. Config de rascunho: `SCRATCH=<scratchpad>/accept`; `mkdir -p $SCRATCH/config $SCRATCH/data`; `projects.json` com um projecto `agentloop-wt` (`cwd` = `<WT>`, `security.enabled=true`, `platform=anthropic`, `model=opus`, `max_budget_usd=3`, `default_profile=quick`); `jobs.json` = `{"jobs":[]}`; copiar `config/platforms.json` e `config/pricing.json` do checkout real.
-2. **Apontar temporariamente a skill para o worktree**: `ln -sfn <WT>/skills/security-analysis ~/.claude/skills/security-analysis` — e anotar que tem de ser reposto para `/Users/lfmoura/Projects/agentloop/skills/security-analysis` no fim, aconteça o que acontecer.
+2. **Apontar temporariamente a skill para o worktree**: `ln -sfn <WT>/skills/security-analysis ~/.claude/skills/security-analysis` — e anotar que tem de ser reposto para `~/Projects/agentloop/skills/security-analysis` no fim, aconteça o que acontecer.
 3. `AGENTLOOP_CONFIG=$SCRATCH/config AGENTLOOP_DATA=$SCRATCH/data AGENTLOOP_SECURITY_DB=$SCRATCH/data/security.db <WT>/bin/agentloop security analyze --detach agentloop-wt agentloop-wt feat/security-candidates quick` e esperar pelo fecho com um script de polling (`security list` + jq, `run_in_background`, dispara quando a linha deixa `running`).
 4. Verificar: `security checklist --analysis <id>` → `analysis.guides.recommended` inclui `AI-AND-LLM`, `SUPPLY-CHAIN-AND-RELEASE` e `CLIENT-SIDE` (para `quick`, só o primeiro casado — anotar qual); `analysis.guides.read` não vazio e a frase `Guides read:` na linha `sast`; pelo menos um achado `sast` com `candidate.trace`; `security render --format md|html|json` com o bloco; o ecrã do dashboard do worktree (`<WT>/bin/agentloop-server` numa porta ≠ 8787, com as mesmas variáveis de ambiente) a mostrar o chip e o bloco. Registar o custo real do run.
-5. **Repor a skill**: `ln -sfn /Users/lfmoura/Projects/agentloop/skills/security-analysis ~/.claude/skills/security-analysis` e confirmar com `ls -l ~/.claude/skills/security-analysis`.
+5. **Repor a skill**: `ln -sfn ~/Projects/agentloop/skills/security-analysis ~/.claude/skills/security-analysis` e confirmar com `ls -l ~/.claude/skills/security-analysis`.
 
 Se um passo da aceitação revelar um defeito, corrigir com o seu teste, no commit que lhe pertence (ver Task correspondente), e repetir.
 

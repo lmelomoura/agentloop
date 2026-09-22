@@ -219,6 +219,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   agent's own close writes none of them, because the run's stream is the
   engine's to read, never the agent's word.
 
+- **The engine's close reads the run's stream for the guides the agent
+  opened** (`security_guides_read`) and hands them to `finish --guides-read`;
+  every platform's prompt now says where the guides are. A stream that cannot
+  be read answers `unknown`, never "none".
+
 - **The e2e suite runs four scenarios at a time, one sandbox each:
   `E2E_WORKERS=4 bash test/e2e.test.sh`.** Measured, it is 65% of the
   selftest — 312 s for 47 scenarios, the two security analyses 37 s each —

@@ -1688,6 +1688,11 @@ JSON
     && bad "openai prompt still speaks of the Agent tool" || ok "security_prompt openai: never speaks of the Agent tool"
   printf '%s\n' "$_pa" | grep -qF 'security prepare --analysis 7' && printf '%s\n' "$_pa" | grep -qF 'YOUR FIRST COMMAND' \
     && ok "security_prompt anthropic: prepare is still the agent's first command, with the analysis id filled in" || bad "the anthropic prompt lost its prepare line"
+  printf '%s\n' "$_pa" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
+    && printf '%s\n' "$_po" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
+    && printf '%s\n' "$_pc" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
+    && ok "security_prompt: every platform is told where the hunting guides are" \
+    || bad "security_prompt: a platform's prompt does not name references/"
   printf '%s\n' "$_pc" | grep -qF 'Invoke the `security-analysis` skill' \
     && ok "security_prompt opencode: invokes the skill by name" || bad "opencode head: $(printf '%s\n' "$_pc" | head -1)"
   printf '%s\n' "$_pc" | grep -qF "is \`$SKILLS_DIR/security-analysis/SKILL.md\`" \
@@ -5494,6 +5499,41 @@ JSON
   ( DATA_DIR="$tmp/derived/data"; security_close_analysis "real-job" "error" "0" ) \
     && ok "closing an analysis is a no-op for a job that is not derived" \
     || bad "closing an analysis is a no-op for a job that is not derived"
+
+  # What a run read, off its own stream: `Read` on Claude Code (file_path),
+  # `read` on OpenCode (filePath, already canonicalised to Read by the
+  # normaliser) and a `cat` through Bash on Codex all land in `input`, so the
+  # input is matched as ONE string, with no per-platform key map.
+  mkdir -p "$tmp/guides"
+  cat > "$tmp/guides/stream.ndjson" <<'JSON'
+{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/Users/me/.claude/skills/security-analysis/references/ATTACK-CLASSES.md"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"2","name":"Read","input":{"filePath":"/Users/me/.claude/skills/security-analysis/references/AI-AND-LLM.md"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"3","name":"Bash","input":{"command":"cat /Users/me/.claude/skills/security-analysis/references/AI-AND-LLM.md | head"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"reading references/CLIENT-SIDE.md is not a tool call"}]}}
+{"type":"result","subtype":"success"}
+JSON
+  [ "$(security_guides_read "$tmp/guides/stream.ndjson")" = "AI-AND-LLM,ATTACK-CLASSES" ] \
+    && ok "security_guides_read: the guides a run opened, once each, off Read/read/Bash alike" \
+    || bad "security_guides_read: got '$(security_guides_read "$tmp/guides/stream.ndjson")'"
+  printf '{"type":"result"}\n' > "$tmp/guides/none.ndjson"
+  [ -z "$(security_guides_read "$tmp/guides/none.ndjson")" ] \
+    && ok "security_guides_read: a run that opened no guide answers an empty list, not unknown" \
+    || bad "security_guides_read on a guide-less stream: '$(security_guides_read "$tmp/guides/none.ndjson")'"
+  [ "$(security_guides_read "$tmp/guides/missing.ndjson")" = "unknown" ] \
+    && [ "$(security_guides_read "")" = "unknown" ] \
+    && ok "security_guides_read: a missing or unnamed stream answers unknown, never none" \
+    || bad "security_guides_read on a missing stream: '$(security_guides_read "$tmp/guides/missing.ndjson")'"
+  # The close hands the answer to `finish` as --guides-read, and `unknown`
+  # when it has no stream to read.
+  ( DATA_DIR="$tmp/derived/data"; AL_SECURITY_ANALYSIS_ID=7
+    security_py() { printf '%s\n' "$*" >> "$tmp/guides/calls"; }
+    security_close_analysis "security-x" success 1 "" "$tmp/guides/stream.ndjson"
+    security_close_analysis "security-x" success 1 "" )
+  grep -q -- '--guides-read AI-AND-LLM,ATTACK-CLASSES' "$tmp/guides/calls" \
+    && grep -q -- '--guides-read unknown' "$tmp/guides/calls" \
+    && ok "security_close_analysis passes what was read to finish, and unknown without a stream" \
+    || bad "security_close_analysis calls: $(cat "$tmp/guides/calls")"
 
   # A project name that slugs to nothing (e.g. "!!!") would derive the bare
   # prefix -- not a usable id, and not any project's job. It must be skipped,
