@@ -5985,3 +5985,44 @@ def test_a_failing_guide_selection_does_not_fail_prepare(tmp_path, monkeypatch):
     listed = run(db, "checklist", "--analysis", str(aid))
     assert listed["analysis"]["guides"] == {"recommended": ["ATTACK-CLASSES"]}
     assert "hunting-guide selection did not run" in listed["analysis"]["coverage_note"]
+
+
+def _sast_note(db, aid):
+    analysis = run(db, "checklist", "--analysis", str(aid))["analysis"]
+    phases = json.loads(analysis["coverage"])["phases"]
+    return next(p["note"] for p in phases if p["name"] == "sast"), analysis
+
+
+@pytest.mark.parametrize("flag, sentence, read", [
+    ("AI-AND-LLM,ATTACK-CLASSES",
+     "Guides read: ATTACK-CLASSES, AI-AND-LLM. Recommended but not read: CLIENT-SIDE.",
+     ["ATTACK-CLASSES", "AI-AND-LLM"]),
+    ("", "Guides read: none of the 3 recommended.", []),
+    ("unknown", "Guides read: unknown (run stream unavailable).", None),
+])
+def test_the_engines_close_records_what_was_read_off_the_stream(tmp_path, flag, sentence, read):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    conn = security_ledger.connect(db)
+    security_ledger.set_guides(conn, aid, recommended=["ATTACK-CLASSES", "AI-AND-LLM", "CLIENT-SIDE"])
+    conn.close()
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
+    note, analysis = _sast_note(db, aid)
+    assert "Guides read" not in note, "the agent's own close knows nothing about the stream"
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--guides-read", flag)
+    note, analysis = _sast_note(db, aid)
+    assert sentence in note
+    assert sentence in analysis["coverage_note"]
+    assert analysis["guides"].get("read") == read
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--guides-read", flag)
+    assert _sast_note(db, aid)[1]["coverage_note"].count("Guides read") == 1
+
+
+def test_guides_read_that_were_never_recommended_are_still_listed(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--guides-read",
+        "WEB-PROTOCOL-AND-AUTH,bogus")
+    note, analysis = _sast_note(db, aid)
+    assert "Guides read: WEB-PROTOCOL-AND-AUTH. Recommended but not read: ATTACK-CLASSES." in note
+    assert "bogus" not in note

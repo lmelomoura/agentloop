@@ -213,6 +213,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prints and stores the list. Read whole, the eleven cost ~30k tokens per
   run, which is a `quick` profile's whole budget.
 
+- **`finish --guides-read` records which guides the run opened** — a list,
+  none, or `unknown` when the stream could not be read — in the `sast` row of
+  the coverage table and in the paragraph, as one of three sentences; the
+  agent's own close writes none of them, because the run's stream is the
+  engine's to read, never the agent's word.
+
 - **The e2e suite runs four scenarios at a time, one sandbox each:
   `E2E_WORKERS=4 bash test/e2e.test.sh`.** Measured, it is 65% of the
   selftest — 312 s for 47 scenarios, the two security analyses 37 s each —

@@ -2072,6 +2072,26 @@ def _triage_phase(conn, analysis_id, untriaged, untriaged_note, decided_note):
          decided_note])
 
 
+GUIDES_UNKNOWN = "unknown"
+
+
+def _guides_sentence(recommended, read) -> str:
+    """One of three forms; `read` is None when the stream could not be read.
+    Names in the table's order, so the sentence reads the same whatever order
+    the stream produced them in."""
+    if read is None:
+        return "Guides read: unknown (run stream unavailable)."
+    if not read:
+        return (f"Guides read: none of the {len(recommended)} recommended."
+                if recommended else "Guides read: none.")
+    ordered = [g for g in guides.NAMES if g in read]
+    missed = [g for g in recommended if g not in read]
+    out = "Guides read: " + ", ".join(ordered) + "."
+    if missed:
+        out += " Recommended but not read: " + ", ".join(missed) + "."
+    return out
+
+
 def cmd_finish(args):
     """Close the analysis. The verdict can be lowered, never raised.
 
@@ -2112,6 +2132,24 @@ def cmd_finish(args):
     if args.if_running and row["state"] != "running":
         return
     state = args.state
+    # WHAT THE AGENT READ, from the ENGINE's close only -- the flag is absent
+    # on the agent's own close, which knows nothing about its stream, so no
+    # sentence is written then; the engine's close writes the one true
+    # sentence and `guides.read`. `unknown` is a value, not an absence: the
+    # stream could not be read, and the report says so rather than "none".
+    # Names outside the vendored set are dropped, never echoed: a name is
+    # matched off the stream by a regex, and this is the one place that knows
+    # the closed set.
+    guides_note = ""
+    if args.guides_read is not None:
+        recommended = ledger.guides_of(row).get("recommended", [])
+        if args.guides_read.strip() == GUIDES_UNKNOWN:
+            read = None
+        else:
+            given = set(args.guides_read.split(","))
+            read = [g for g in guides.NAMES if g in given]
+            ledger.set_guides(conn, args.analysis, read=read)
+        guides_note = _guides_sentence(recommended, read)
     if state == "done" and row["state"] in ("capped", "failed"):
         print(f"finish: analysis {args.analysis} is already {row['state']} — a "
               "close never upgrades a truncated or failed analysis to done",
@@ -2245,7 +2283,7 @@ def cmd_finish(args):
     stored = row["coverage_note"] or ""
     note = ""
     for part in (stored, args.note or "", unprepared_note, untriaged_note,
-                 decided_note):
+                 decided_note, guides_note):
         part = part.strip()
         # `not in`, not `!=`: a row is closed twice (the agent, then the
         # engine) and each close re-reads the note it already wrote. Without
@@ -2312,10 +2350,16 @@ def cmd_finish(args):
                 coverage.TRIAGE, coverage.SKIPPED,
                 note=unprepared_note or TRIAGE_UNVERIFIED_NOTE)
     else:
+        # The guides sentence joins whatever the row already says -- the
+        # agent's `--note`, or the sentence a previous close stored -- once:
+        # the same `not in` guard the paragraph uses above.
+        sast_note = (args.note or "").strip() or prior_sast
+        if guides_note and guides_note not in sast_note:
+            sast_note = f"{sast_note} {guides_note}".strip()
         sast_phase = coverage.phase(
             coverage.SAST_AGENT,
             coverage.RAN if state == "done" else coverage.WARNING,
-            diff.AGENT, (args.note or "").strip() or prior_sast)
+            diff.AGENT, sast_note)
         if triage_phase is None and no_triage_row:
             triage_phase = coverage.phase(coverage.TRIAGE, coverage.SKIPPED,
                                           note=TRIAGE_UNVERIFIED_NOTE)
@@ -3340,6 +3384,9 @@ def main(argv=None):
     fn.add_argument("--spend", default="0")
     fn.add_argument("--note", default="")
     fn.add_argument("--if-running", action="store_true", dest="if_running")
+    # The ENGINE's close only: a comma list of guide names, '' for none, or
+    # `unknown` when the run's stream could not be read. See `cmd_finish`.
+    fn.add_argument("--guides-read", default=None, dest="guides_read")
 
     ck = sub.add_parser("checklist", parents=[dbflag]); ck.set_defaults(fn=cmd_checklist)
     ck.add_argument("--analysis", type=int, required=True)
