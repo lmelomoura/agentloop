@@ -2,6 +2,7 @@ import sqlite3
 
 import pytest
 from security import fingerprint as fp_mod
+from security import candidate as candidate_mod
 from security import ledger
 
 
@@ -1454,3 +1455,80 @@ def test_the_history_sweep_table_is_created_in_a_database_that_predates_it(tmp_p
     c = ledger.connect(path)
     assert c.execute("SELECT name FROM sqlite_master WHERE name='history_sweep'").fetchone()
     assert ledger.history_sweep(c, "web", "web", "main", "secrets") == (None, [])
+
+
+# ------------------------------------- the candidate document and the guides
+
+def _sast(fp, **over):
+    row = {"fingerprint": fp, "category": "sast", "rule": "path-traversal",
+           "severity": "high", "title": "t", "rationale": "r", "producer": "agent",
+           "occurrences": [{"file": "app.py", "line": 1}]}
+    row.update(over)
+    return row
+
+
+def test_the_candidate_and_guides_columns_are_added_to_tables_that_predate_them(tmp_path):
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(str(path))
+    raw.executescript(
+        "CREATE TABLE analysis (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,"
+        " repo TEXT NOT NULL, branch TEXT NOT NULL, commit_sha TEXT NOT NULL,"
+        " profile TEXT NOT NULL, started INTEGER NOT NULL, ended INTEGER,"
+        " state TEXT NOT NULL, spend_usd REAL NOT NULL DEFAULT 0);"
+        "INSERT INTO analysis (project, repo, branch, commit_sha, profile, started, state)"
+        " VALUES ('p', 'r', 'main', 'abc', 'quick', 1, 'done');"
+        "CREATE TABLE finding (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " analysis_id INTEGER NOT NULL, fingerprint TEXT NOT NULL,"
+        " category TEXT NOT NULL, rule TEXT NOT NULL, severity TEXT NOT NULL,"
+        " title TEXT NOT NULL, UNIQUE(analysis_id, fingerprint));"
+        "INSERT INTO finding (analysis_id, fingerprint, category, rule, severity, title)"
+        " VALUES (1, 'old', 'sast', 'xss', 'high', 't');")
+    raw.commit()
+    raw.close()
+
+    c = ledger.connect(path)
+    assert "candidate" in {r["name"] for r in c.execute("PRAGMA table_info(finding)")}
+    assert "guides" in {r["name"] for r in c.execute("PRAGMA table_info(analysis)")}
+    old = ledger.findings_of(c, 1)[0]
+    assert old["candidate"] is None
+    assert old["confidence"] == ""
+    assert ledger.guides_of(c.execute("SELECT * FROM analysis WHERE id=1").fetchone()) == {}
+
+
+def test_a_candidate_is_stored_canonical_and_read_back_decoded(tmp_path):
+    c = ledger.connect(tmp_path / "s.db")
+    aid = ledger.start_analysis(c, "p", "r", "main", "abc", "quick", "run")
+    doc = {"confidence": {"score": "medium", "reason": "r"},
+           "trace": [{"kind": "sink", "file": "app.py", "line": 3, "scope": "f", "description": "d"}]}
+    ledger.record_finding(c, aid, _sast("a" * 64, candidate=candidate_mod.encode(doc)))
+    row = ledger.findings_of(c, aid)[0]
+    assert row["candidate"] == doc
+    assert row["confidence"] == "medium"
+    stored = c.execute("SELECT candidate FROM finding WHERE fingerprint=?", ("a" * 64,)).fetchone()
+    assert stored["candidate"] == candidate_mod.encode(doc)
+
+
+def test_a_re_report_replaces_the_document_and_an_absent_one_clears_it(tmp_path):
+    c = ledger.connect(tmp_path / "s.db")
+    aid = ledger.start_analysis(c, "p", "r", "main", "abc", "quick", "run")
+    first = candidate_mod.encode({"confidence": {"score": "low", "reason": "a"}})
+    second = candidate_mod.encode({"confidence": {"score": "high", "reason": "b"}})
+    ledger.record_finding(c, aid, _sast("a" * 64, candidate=first))
+    ledger.record_finding(c, aid, _sast("a" * 64, candidate=second))
+    assert ledger.findings_of(c, aid)[0]["confidence"] == "high"
+    ledger.record_finding(c, aid, _sast("a" * 64))
+    assert ledger.findings_of(c, aid)[0]["candidate"] is None
+
+
+def test_set_guides_merges_the_two_halves(tmp_path):
+    c = ledger.connect(tmp_path / "s.db")
+    aid = ledger.start_analysis(c, "p", "r", "main", "abc", "quick", "run")
+    row = lambda: c.execute("SELECT * FROM analysis WHERE id=?", (aid,)).fetchone()
+    assert ledger.guides_of(row()) == {}
+    ledger.set_guides(c, aid, recommended=["ATTACK-CLASSES", "AI-AND-LLM"])
+    assert ledger.guides_of(row()) == {"recommended": ["ATTACK-CLASSES", "AI-AND-LLM"]}
+    ledger.set_guides(c, aid, read=["AI-AND-LLM"])
+    assert ledger.guides_of(row()) == {"recommended": ["ATTACK-CLASSES", "AI-AND-LLM"],
+                                       "read": ["AI-AND-LLM"]}
+    ledger.set_guides(c, aid, read=[])
+    assert ledger.guides_of(row())["read"] == []

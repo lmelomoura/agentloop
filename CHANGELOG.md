@@ -178,6 +178,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   "why" and "where" was a claim anybody could hold the agent to, and the
   verifier the next block adds would have had to parse prose.
 
+- **`finding.candidate` and `analysis.guides` columns**, additive, '' on every
+  row from before them; `findings_of` hands every reader the candidate as an
+  object (or `None`) and a derived `confidence`, so no screen or report ever
+  parses the column itself.
+
 - **The e2e suite runs four scenarios at a time, one sandbox each:
   `E2E_WORKERS=4 bash test/e2e.test.sh`.** Measured, it is 65% of the
   selftest — 312 s for 47 scenarios, the two security analyses 37 s each —

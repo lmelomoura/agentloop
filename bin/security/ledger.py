@@ -22,6 +22,10 @@ from .fingerprint import fingerprint as compute_fingerprint, secret_fingerprint
 # other. It lives in diff.py because that is where the rule that READS the
 # column lives; diff.py imports nothing at all, so there is no cycle here.
 from .diff import AGENT
+# The candidate document's codec (security/candidate.py): `findings_of` hands
+# every reader the document decoded and a derived `confidence`, so no screen
+# or report parses the column itself. candidate.py imports only json.
+from . import candidate
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS analysis (
@@ -215,6 +219,11 @@ _ANALYSIS_COLUMNS = (
     # already treat as "print the prose and no table", so an unmigrated row is
     # not merely tolerated, it renders exactly as it did yesterday.
     ("coverage", "TEXT NOT NULL DEFAULT ''"),
+    # The hunting guides `prepare` recommended and, once the engine has read
+    # the run's stream, the ones the agent opened -- `{"recommended": [...],
+    # "read": [...]}`, see `set_guides`/`guides_of`. '' for every analysis
+    # from before the column; nothing derives a state from it.
+    ("guides", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -237,6 +246,11 @@ _FINDING_COLUMNS = (
     # honest reading for every row written before the column existed: nothing
     # recorded that anybody looked.
     ("triaged", "INTEGER NOT NULL DEFAULT 0"),
+    # The `candidate` document (security/candidate.py), canonical JSON or ''.
+    # Additive as the columns above are: never a fingerprint input, never read
+    # by `diff`, and '' -- what every row from before the column carries --
+    # decodes to None, which every renderer draws as nothing.
+    ("candidate", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -506,6 +520,13 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
     make the stored row differ from what the agent last said. A row that never
     carried a location can still be re-worded without one -- the rule is about
     what the row has (`_erases`), not about what every payload must carry.
+
+    `candidate` IS THE THIRD COLUMN A RE-REPORT WRITES WHOLE. A payload with no
+    `candidate` -- where the door allows one to be absent -- writes '': the
+    agent said nothing under it, and a stored document that outlived the claim
+    it described would be the stale-row failure `occurrences` already avoids.
+    The door (cli.cmd_report_finding) decides what the document must carry;
+    this function only stores what arrives, canonical string or ''.
     """
     # A finding and its occurrences are one unit: without this transaction
     # boundary, an occurrence that fails to insert midway (a non-numeric
@@ -631,24 +652,25 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
             conn.execute(
                 "UPDATE finding SET category=?, rule=?, severity=?, title=?,"
                 " rationale=?, remediation=?, partial_note=?, cwe=?, owasp=?,"
-                " triaged=MAX(triaged, ?)"
+                " candidate=?, triaged=MAX(triaged, ?)"
                 " WHERE id=?",
                 (finding["category"], finding["rule"], finding["severity"], finding["title"],
                  finding.get("rationale", ""), finding.get("remediation", ""),
                  finding.get("partial_note", ""), finding.get("cwe", ""),
-                 finding.get("owasp", ""), triaged, fid))
+                 finding.get("owasp", ""), finding.get("candidate", ""), triaged, fid))
             conn.execute("DELETE FROM occurrence WHERE finding_id=?", (fid,))
         else:
             cur = conn.execute(
                 "INSERT INTO finding (analysis_id, fingerprint, category, rule, severity,"
                 " title, rationale, remediation, partial_note, cwe, owasp, producer,"
-                " scope)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " scope, candidate)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (analysis_id, finding["fingerprint"], finding["category"], finding["rule"],
                  finding["severity"], finding["title"], finding.get("rationale", ""),
                  finding.get("remediation", ""), finding.get("partial_note", ""),
                  finding.get("cwe", ""), finding.get("owasp", ""),
-                 finding.get("producer", ""), finding.get("scope", "")))
+                 finding.get("producer", ""), finding.get("scope", ""),
+                 finding.get("candidate", "")))
             fid = cur.lastrowid
         # An occurrence that names no file is not stored, whoever wrote it.
         # The door refuses such an object outright (`names_a_file` on every
@@ -855,8 +877,51 @@ def findings_of(conn, analysis_id) -> list:
             (r["id"],)).fetchall()
         d = dict(r)
         d["occurrences"] = [dict(o) for o in occ]
+        # DECODED HERE, ONCE, for every reader -- the checklist, the reports,
+        # the findings browser and the verifier all get an object or None,
+        # never the column's text; `confidence` is the one value screens
+        # filter and sort on, derived so none of them reads inside.
+        d["candidate"] = candidate.decode(d.get("candidate"))
+        d["confidence"] = candidate.confidence_of(d["candidate"])
         out.append(d)
     return out
+
+
+def set_guides(conn, analysis_id, recommended=None, read=None) -> None:
+    """Merge into the `guides` document. A half not passed keeps what is
+    stored: `prepare` writes `recommended` before the agent starts and the
+    engine's close writes `read` after it ends, and neither knows the other's
+    half."""
+    row = conn.execute("SELECT guides FROM analysis WHERE id=?", (analysis_id,)).fetchone()
+    doc = guides_of(row) if row is not None else {}
+    if recommended is not None:
+        doc["recommended"] = [str(g) for g in recommended]
+    if read is not None:
+        doc["read"] = [str(g) for g in read]
+    with conn:
+        conn.execute("UPDATE analysis SET guides=? WHERE id=?",
+                     (json.dumps(doc, sort_keys=True), analysis_id))
+
+
+def guides_of(row) -> dict:
+    """`{"recommended": [...], "read": [...]}` -- `read` absent while nothing
+    has said what was read, `{}` for a row from before the column or a
+    document this module cannot read. Never raises, for the reason
+    `coverage.decode` never does."""
+    try:
+        stored = row["guides"]
+    except (KeyError, IndexError, TypeError):
+        return {}
+    if not stored:
+        return {}
+    try:
+        doc = json.loads(stored)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    return {k: [str(g) for g in doc[k]] for k in ("recommended", "read")
+            if isinstance(doc.get(k), list)}
 
 
 def set_decision(conn, project, fingerprint, state, reason, decided_by) -> None:
