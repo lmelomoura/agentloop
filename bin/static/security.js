@@ -333,6 +333,52 @@
     };
   }
 
+  // ui/security/candidate.js
+  var SEC_CONFIDENCE = ["high", "medium", "low"];
+  var SCORED = [["confidence", "Confidence"], ["likelihood", "Likelihood"], ["impact", "Impact"]];
+  function _doc(f) {
+    const c = f && f.candidate;
+    return c && typeof c === "object" ? c : null;
+  }
+  function secConfidenceChip(f) {
+    const c = f && f.candidate && typeof f.candidate === "object" ? f.candidate : null;
+    const score = f && f.confidence || c && c.confidence && c.confidence.score || "";
+    if (!score) return null;
+    const chip = secEl("span", "secconf " + score, score);
+    if (c && c.confidence && c.confidence.reason) chip.title = c.confidence.reason;
+    return chip;
+  }
+  function secCandidateBlock(f) {
+    const c = _doc(f);
+    if (!c) return null;
+    const box = secEl("div", "seccand");
+    if (Array.isArray(c.trace) && c.trace.length) {
+      box.appendChild(secEl("div", "seccand-label", "Trace"));
+      const ol = document.createElement("ol");
+      c.trace.forEach((s) => {
+        const li = document.createElement("li");
+        li.appendChild(secEl("span", "seccand-kind", s.kind || ""));
+        li.appendChild(secEl("code", null, (s.file || "") + (s.line ? ":" + s.line : "")));
+        li.appendChild(secEl("span", "seccand-scope", s.scope || ""));
+        li.appendChild(secEl("span", null, s.description || ""));
+        ol.appendChild(li);
+      });
+      box.appendChild(ol);
+    }
+    if (c.intended_control) {
+      box.appendChild(secEl("p", null, "Intended control: " + c.intended_control));
+    }
+    if (Array.isArray(c.conditions) && c.conditions.length) {
+      box.appendChild(secEl("div", "seccand-label", "Conditions"));
+      const ul = document.createElement("ul");
+      c.conditions.forEach((x) => ul.appendChild(secEl("li", null, (x.kind || "") + ": " + (x.description || ""))));
+      box.appendChild(ul);
+    }
+    const scored = SCORED.filter(([k]) => c[k] && typeof c[k] === "object").map(([k, label]) => label + ": " + (c[k].score || "") + " \u2014 " + (c[k].reason || ""));
+    if (scored.length) box.appendChild(secEl("p", "seccand-scored", scored.join(" \xB7 ")));
+    return box;
+  }
+
   // ui/security/history.js
   function secRunFor(a) {
     if (!a || !a.run_id) return null;
@@ -926,6 +972,8 @@
     st.title = SEC_STATE_HELP[f.state] || "";
     st.textContent = SEC_STATE_LABEL[f.state] || f.state;
     h.appendChild(st);
+    const chip = secConfidenceChip(f);
+    if (chip) h.appendChild(chip);
     row.appendChild(h);
     const where = document.createElement("ul");
     where.className = "secwhere";
@@ -936,6 +984,8 @@
     });
     if (where.childNodes.length) row.appendChild(where);
     if ((f.rationale || "").trim()) row.appendChild(secEl("p", "secwhy", f.rationale));
+    const cand = secCandidateBlock(f);
+    if (cand) row.appendChild(cand);
     if ((f.remediation || "").trim()) row.appendChild(secEl("p", "secfix", "Remediation: " + f.remediation));
     if ((f.partial_note || "").trim()) row.appendChild(secEl("p", "secwhy", "Partial: " + f.partial_note));
     if ((f.decision_reason || "").trim()) {
@@ -2095,6 +2145,7 @@
     ["severity", "Severity"],
     ["title", "Title"],
     ["category", "Category"],
+    ["confidence", "Confidence"],
     ["branch", "Branch"],
     ["state", "Status"],
     ["first_seen", "First seen"]
@@ -2107,6 +2158,7 @@
       severity: [],
       state: [],
       category: [],
+      confidence: [],
       branch: "",
       path: "",
       q: "",
@@ -2155,6 +2207,7 @@
     if (f.severity.length) p.set("severity", f.severity.join(","));
     if (f.state.length) p.set("state", f.state.join(","));
     if (f.category.length) p.set("category", f.category.join(","));
+    if (f.confidence.length) p.set("confidence", f.confidence.join(","));
     if (f.branch.trim()) p.set("branch", f.branch.trim());
     if (f.path.trim()) p.set("path", f.path.trim());
     if (f.q.trim()) p.set("q", f.q.trim());
@@ -2468,6 +2521,7 @@
     if (f.severity.length) n++;
     if (f.state.length) n++;
     if (f.category.length) n++;
+    if (f.confidence.length) n++;
     if (f.branch.trim()) n++;
     if (f.path.trim()) n++;
     if (f.analysis.trim()) n++;
@@ -2493,6 +2547,7 @@
       severity: f.severity,
       state: f.state,
       category: f.category,
+      confidence: f.confidence,
       branch: f.branch,
       path: f.path,
       q: f.q,
@@ -2509,6 +2564,9 @@
       severity: Array.isArray(query.severity) ? query.severity.slice() : [],
       state: Array.isArray(query.state) ? query.state.slice() : [],
       category: Array.isArray(query.category) ? query.category.slice() : [],
+      // Absent from a filter saved before block 4.1: "no filter", as every
+      // other absent key reads.
+      confidence: Array.isArray(query.confidence) ? query.confidence.slice() : [],
       branch: typeof query.branch === "string" ? query.branch : "",
       path: typeof query.path === "string" ? query.path : "",
       q: typeof query.q === "string" ? query.q : "",
@@ -2628,7 +2686,7 @@
     searchInput.spellcheck = false;
     searchInput.autocomplete = "off";
     searchInput.value = fs.filters.q;
-    searchInput.title = "Search title / rule / rationale / file";
+    searchInput.title = "Search title / rule / rationale / file / candidate";
     searchInput.onchange = () => {
       fs.filters.q = searchInput.value;
       fs.page = 1;
@@ -2707,6 +2765,16 @@
         secFindRefresh(fs);
       }
     ));
+    row2.appendChild(secFindMultiPicker(
+      "Confidence",
+      SEC_CONFIDENCE.map((c) => ({ v: c, label: _secCap(c) })),
+      fs.filters.confidence,
+      (v) => {
+        secFindToggleIn(fs.filters.confidence, v);
+        fs.page = 1;
+        secFindRefresh(fs);
+      }
+    ));
     const toggleField = secEl("label", "secfind-toggle-field");
     toggleField.title = "Fixed, accepted and false-positive rows are excluded unless this is on.";
     const sw = secEl("span", "switch");
@@ -2772,6 +2840,10 @@
     if (f.rule) catWrap.title = f.rule;
     tdCat.appendChild(catWrap);
     tr.appendChild(tdCat);
+    const tdConf = document.createElement("td");
+    const chip = secConfidenceChip(f);
+    if (chip) tdConf.appendChild(chip);
+    tr.appendChild(tdConf);
     const tdRun = document.createElement("td");
     const runWrap = secEl("div", "secfind-run");
     const runInfo = ((fs.data || {}).analyses || []).find((a) => a.id === f.analysis_id);
@@ -2911,7 +2983,7 @@
     table.className = "secfind-table";
     const thead = document.createElement("thead");
     const htr = document.createElement("tr");
-    const INSERT_AFTER = { title: "Location", category: "Analysis run" };
+    const INSERT_AFTER = { title: "Location", confidence: "Analysis run" };
     function sortableHeader(key, label) {
       const th = document.createElement("th");
       const btn = secEl("button", "btn ghost");
@@ -5274,5 +5346,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: bc1a2d671fc7b5d39c0e346f1be44d5d660562bb1691cbaba3bf45783efe233e */
-/* ui-sources: 58979b37f9c9b6d7d9710f6e29c83e6964cc1e4cc453a8df3db7e36561cc957f */
+/* ui-bundle: 9f313868c9da7836a352576e6139f3a4cab19b147e1f8e8e1fcae38a02100ff0 */
+/* ui-sources: b7a8fd3a260b7239f6e3980e8467fa5beed7d61e93c6fb1f5fccfe7d40aedcd1 */
