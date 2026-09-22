@@ -2,6 +2,7 @@
 import { $, AL, api, toast, projById, fmtDur, fmtWhen, money, createCombo,
          makePicker, pushNav, markPending, clearPending, isPending } from "./page.js";
 import { secIcon, secIconHTML, secEl, secFetch, secPlaceMenu } from "./dom.js";
+import { secConfidenceChip, secCandidateBlock } from "./candidate.js";
 import { SEC_POLL_MS, SEC_PROFILES, SEC_STATES, SEC_STATE_HELP, SEC_STATE_LABEL,
          SEC_NEVER, secCategoryMeta, secCfg, secDefaultProfile, secMinSeverity,
          secPlatformLabel, secRepos, secSevKey, secSevRank, secStateKey, secVisible } from "./vocabulary.js";
@@ -826,6 +827,10 @@ function secFindingRow(f){
   st.title = SEC_STATE_HELP[f.state] || "";
   st.textContent = SEC_STATE_LABEL[f.state] || f.state;
   h.appendChild(st);
+  // The candidate's own confidence, beside the state -- it qualifies the
+  // finding, it does not classify it (see candidate.js).
+  const chip = secConfidenceChip(f);
+  if(chip) h.appendChild(chip);
   row.appendChild(h);
   const where = document.createElement("ul");
   where.className = "secwhere";
@@ -836,6 +841,11 @@ function secFindingRow(f){
   });
   if(where.childNodes.length) row.appendChild(where);
   if((f.rationale || "").trim()) row.appendChild(secEl("p", "secwhy", f.rationale));
+  // The candidate block under the rationale: trace, intended control,
+  // conditions, the scored fields -- nothing at all for a finding that
+  // carries no document, which is every deterministic row.
+  const cand = secCandidateBlock(f);
+  if(cand) row.appendChild(cand);
   if((f.remediation || "").trim()) row.appendChild(secEl("p", "secfix", "Remediation: " + f.remediation));
   if((f.partial_note || "").trim()) row.appendChild(secEl("p", "secwhy", "Partial: " + f.partial_note));
   if((f.decision_reason || "").trim()){

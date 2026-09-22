@@ -6071,7 +6071,7 @@ def test_findings_row_renders_analysed_strings_as_text_never_markup(srv, tmp_pat
     arrows = (re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secFindRow",
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
                       "secFindDecisionControls", "secFindActionsCell"))
     script = tmp_path / "find-row.js"
     script.write_text(_INDEX_DOM_HARNESS + """
@@ -6118,7 +6118,7 @@ def test_a_fixed_finding_gets_no_decision_controls(srv, tmp_path):
     arrows = (re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secFindRow",
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
                       "secFindDecisionControls", "secFindActionsCell"))
     script = tmp_path / "find-row-fixed.js"
     script.write_text(_INDEX_DOM_HARNESS + """
@@ -6206,7 +6206,7 @@ def test_the_table_excludes_rows_below_the_floor_on_this_page(srv, tmp_path):
              + re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secFindRow",
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
                       "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible"))
     script = tmp_path / "find-table-floor.js"
     script.write_text(_INDEX_DOM_HARNESS + """
@@ -6261,7 +6261,7 @@ def test_a_fixed_finding_stays_visible_and_uncounted_below_the_floor(srv, tmp_pa
               + _const(block, "SEV_KPI_ICON") + _const(block, "SEV_KPI_TONE"))
     deps = "\n".join(_plainfn(block, n) for n in
                      ("secEl", "secIcon", "_secCap", "secCategoryMeta",
-                      "secFindHiddenByFloor", "secFindStrip", "secFindRow", "secFindDecisionControls", "secFindActionsCell",
+                      "secFindHiddenByFloor", "secFindStrip", "secConfidenceChip", "secFindRow", "secFindDecisionControls", "secFindActionsCell",
                       "secFindTableSection", "secVisible"))
     script = tmp_path / "find-fixed-floor.js"
     script.write_text(_INDEX_DOM_HARNESS + _KPI_CARD_STUB + """
@@ -6318,7 +6318,7 @@ def test_clicking_a_sort_header_toggles_direction_then_switching_column_resets_i
              + re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secFindRow",
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
                       "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible"))
     script = tmp_path / "find-sort-click.js"
     script.write_text(_INDEX_DOM_HARNESS + """
@@ -11025,3 +11025,27 @@ def test_the_fixed_elsewhere_badge_qualifies_the_state_and_never_replaces_it(srv
     assert "fe.in_this_branch === true" in row and "fe.in_this_branch === false" in row
     # nothing is drawn when nobody anywhere fixed it
     assert "if(fe && fe.branch)" in row
+
+
+# ---- Block 4.1: the confidence column and filter on the findings browser.
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_findings_browser_declares_the_confidence_column_and_filter(srv, tmp_path):
+    """`confidence` is a sortable column (FIND_SORT_COLUMNS, and the width
+    table's tenth entry in SEC_FIND_TABLE_COLS) and a multi-select filter
+    (`_defaultFilters` carries the key, empty), mirroring `queries.SORTABLE`
+    and the `--confidence` flag of `findings-page`. Pinned here so a server
+    that offers the filter and a page that cannot send it never coexist."""
+    block = _security_js(srv)
+    script = tmp_path / "find-confidence.js"
+    script.write_text(_const(block, "FIND_SORT_COLUMNS") + _const(block, "SEC_FIND_TABLE_COLS")
+                      + _const(block, "SEC_CONFIDENCE") + _plainfn(block, "_defaultFilters") + """
+    console.log(JSON.stringify({sort: FIND_SORT_COLUMNS, table: SEC_FIND_TABLE_COLS,
+                                picker: SEC_CONFIDENCE, filters: _defaultFilters()}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert ["confidence", "Confidence"] in out["sort"]
+    assert ["confidence", "Confidence"] in out["table"] and len(out["table"]) == 10
+    assert out["picker"] == ["high", "medium", "low"]
+    assert out["filters"]["confidence"] == []

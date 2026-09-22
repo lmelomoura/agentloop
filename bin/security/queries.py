@@ -15,7 +15,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from . import diff, ledger
+from . import candidate, diff, ledger
 
 # Everything that is not resolved. `pending` is open: a finding nobody has
 # re-checked is exposure nobody has closed, and filing it with the resolved
@@ -111,6 +111,10 @@ def checklist(conn, analysis_id):
 
     row = _analysis_row(conn, analysis_id)
     analysis = dict(row)
+    # Decoded here for every caller of the checklist -- the agent reads the
+    # recommended guides off this object on the platforms where `prepare`
+    # ran engine-side, and the screens read what was recommended and read.
+    analysis["guides"] = ledger.guides_of(row)
     current = ledger.findings_of(conn, analysis_id)
     prev = ledger.latest_analysis(conn, analysis["project"], analysis["repo"],
                                   analysis["branch"], before=analysis_id)
@@ -994,8 +998,11 @@ def capped_branch_count(conn, project):
     return n
 
 
-SORTABLE = ("severity", "title", "category", "branch", "first_seen", "state")
+SORTABLE = ("severity", "title", "category", "branch", "first_seen", "state", "confidence")
 MAX_PER_PAGE = 100
+# Most confident first, the same rank-order trick `_SEV_RANK` plays for
+# severity. A row with no candidate has no rank at all -- see `finding_rows`.
+_CONF_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
 def first_seen_map(conn, project):
@@ -1148,7 +1155,7 @@ def finding_rows(conn, project, filters=None, sort="severity",
     asked_for = set(f.get("state") or ())
     if not f.get("show_resolved"):
         rows = [r for r in rows if is_open(r["state"]) or r["state"] in asked_for]
-    for key in ("severity", "state", "category", "branch"):
+    for key in ("severity", "state", "category", "branch", "confidence"):
         if f.get(key):
             rows = [r for r in rows if r.get(key) in f[key]]
     if f.get("fingerprint"):
@@ -1169,7 +1176,10 @@ def finding_rows(conn, project, filters=None, sort="severity",
         needle = f["q"].lower()
         rows = [r for r in rows if needle in " ".join([
             r.get("title", ""), r.get("rule", ""), r.get("rationale", ""),
-            " ".join(o["file"] for o in r.get("occurrences", []))]).lower()]
+            " ".join(o["file"] for o in r.get("occurrences", [])),
+            # The candidate's own prose -- a trace step's sentence, the
+            # intended control, a reason -- is searchable text too.
+            candidate.search_text(r.get("candidate"))]).lower()]
 
     by_severity = {s: 0 for s in _SEV_RANK}
     # A FIXED finding below the floor is exempted from being hidden by
@@ -1196,6 +1206,13 @@ def finding_rows(conn, project, filters=None, sort="severity",
         # first) means for this column. So `desc` maps to reverse=False
         # here, the opposite of every other sortable column below.
         reverse = direction != "desc"
+    elif sort == "confidence":
+        # The same rank-order trick as severity: `desc` is "most confident
+        # first". A row with no document has no rank at all -- it is not
+        # "less confident than low", it is unmeasured -- so those rows are
+        # PARTITIONED to the end below, whichever direction was asked for.
+        keyf = lambda r: _CONF_RANK.get(r.get("confidence", ""), 9)
+        reverse = direction != "desc"
     else:
         # `.get(sort, "")`, not `.get(sort) or ""`: every SORTABLE column
         # except `first_seen` is a NOT NULL string, but `first_seen` is an
@@ -1206,6 +1223,9 @@ def finding_rows(conn, project, filters=None, sort="severity",
         keyf = lambda r: r.get(sort, "")
         reverse = direction == "desc"
     rows.sort(key=keyf, reverse=reverse)
+    if sort == "confidence":
+        rows = ([r for r in rows if r.get("confidence")]
+                + [r for r in rows if not r.get("confidence")])
 
     _annotate_fixed_elsewhere(conn, project, rows, repo_paths or {})
 

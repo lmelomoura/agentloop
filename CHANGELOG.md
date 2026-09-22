@@ -20,6 +20,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The security-analysis skill has a criterion for what qualifies as a
+  finding** — Cloudflare's boundary requirement and five severity anchors —
+  and tells the agent to read the recommended hunting guides before its own
+  SAST pass; the README's *Security analysis* section documents the
+  candidate document and the guides.
+
+- **`report-finding` holds a `sast` finding to its severity.** At medium or
+  above it has to carry a trace, the control that should have held and a
+  confidence; at high and critical, likelihood and impact with reasons too;
+  the severity may never exceed the impact; a re-report onto a scanner's row
+  carries a confidence; a trace is refused on a secret, a hygiene or an
+  infrastructure finding; every free-text field of the document goes through
+  the same credential scan as `rationale`, and a refusal names the field by
+  path and never the text. A finding that fails any of this is refused whole
+  — nothing recorded — which is what stops a paragraph from standing in for a
+  chain of code nobody read.
+
 - **The selftest lives in `test/selftest.sh`; `bin/agentloop` is the engine
   again.** `cmd_selftest` had grown to 6,445 lines — 48% of the engine — so
   whoever opened the file to change how a run is launched read six thousand
@@ -169,6 +186,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   resize, the way a native select does.
 
 ### Added
+
+- **A `sast` finding can carry a `candidate` document** — trace (entrypoint →
+  propagation → sink), the control that should have held, confidence,
+  likelihood and impact each with a reason, and the conditions the hole
+  depends on — validated by `bin/security/candidate.py` in plain Python and
+  stored canonical. Until now a finding was a paragraph: nothing between
+  "why" and "where" was a claim anybody could hold the agent to, and the
+  verifier the next block adds would have had to parse prose.
+
+- **`finding.candidate` and `analysis.guides` columns**, additive, '' on every
+  row from before them; `findings_of` hands every reader the candidate as an
+  object (or `None`) and a derived `confidence`, so no screen or report ever
+  parses the column itself.
+
+- **Reports render the candidate** — trace, intended control, conditions and
+  the three scored fields — under a finding that carries one, in Markdown,
+  HTML and the consolidated document, and as an object in JSON; a finding
+  without one renders byte for byte as before.
+
+- **The findings browser filters, sorts and searches by confidence** —
+  `findings-page --confidence`, `/api/security/findings?confidence=`,
+  `sort=confidence` with unmeasured rows last whichever way you sort, and the
+  free-text search reads the candidate's prose too.
+
+- **Cloudflare's hunting guides, vendored and chosen per repository.**
+  `skills/security-analysis/references/` carries ATTACK-CLASSES and the ten
+  domain guides of cloudflare/security-audit-skill (MIT, pinned to a commit in
+  UPSTREAM.md); `prepare` recommends the ones the stack calls for — from the
+  dependency inventory and the tree's paths, under the same ignore globs —
+  capped by the profile (quick: one; standard: what matched; deep: all), and
+  prints and stores the list. Read whole, the eleven cost ~30k tokens per
+  run, which is a `quick` profile's whole budget.
+
+- **`finish --guides-read` records which guides the run opened** — a list,
+  none, or `unknown` when the stream could not be read — in the `sast` row of
+  the coverage table and in the paragraph, as one of three sentences; the
+  agent's own close writes none of them, because the run's stream is the
+  engine's to read, never the agent's word.
+
+- **The engine's close reads the run's stream for the guides the agent
+  opened** (`security_guides_read`) and hands them to `finish --guides-read`;
+  every platform's prompt now says where the guides are. A stream that cannot
+  be read answers `unknown`, never "none".
+
+- **The dashboard shows the candidate**: a confidence chip on every finding
+  row and in the analysis drill-down, the full block (trace, intended control,
+  conditions, the scored fields) under a finding's rationale, and a
+  Confidence column, filter and sort on the findings browser — saved filters
+  keep the new key, and an old one without it means "no filter".
 
 - **The e2e suite runs four scenarios at a time, one sandbox each:
   `E2E_WORKERS=4 bash test/e2e.test.sh`.** Measured, it is 65% of the

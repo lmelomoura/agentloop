@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from security import adapters, coverage, deps, diff, engines, fingerprint, hygiene, ignores, ledger, osv, queries, report, secrets, taxonomy  # noqa: E402
+from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, ledger, osv, queries, report, secrets, taxonomy  # noqa: E402
 
 REQUIRED_FINDING_KEYS = ("fingerprint", "category", "rule", "severity", "title")
 
@@ -1429,6 +1429,17 @@ def cmd_prepare(args):
         # have to open a report to find out the edit did nothing.
         print(f"prepare: {unknown_switch}", file=sys.stderr)
 
+    # THE HUNTING GUIDES, chosen here and not by the agent -- see
+    # security/guides.py. Filed under `scope` when the selection failed, since
+    # that is the row about what this analysis was set up to read; the list
+    # itself goes onto the analysis row (`ledger.set_guides`) below and out
+    # on stdout, where the skill tells the agent to read it.
+    recommended, guides_note = guides.recommend(root, ignore, components, row["profile"])
+    if guides_note:
+        notes.append(guides_note)
+        scope_notes.append(guides_note)
+        print(f"prepare: {guides_note}", file=sys.stderr)
+
     findings += _produced_by(dep_findings, dep_producer, produced)
 
     if sbom_document is None:
@@ -1589,8 +1600,10 @@ def cmd_prepare(args):
     # any of these findings' absence can ever be proven, and an analysis
     # marked prepared with an empty `produced` would report its whole
     # deterministic baseline `pending` for ever.
+    ledger.set_guides(conn, aid, recommended=recommended)
     ledger.mark_prepared(conn, aid, produced)
-    print(json.dumps({"coverage_note": note, "findings": len(findings)}))
+    print(json.dumps({"coverage_note": note, "findings": len(findings),
+                      "guides": {"recommended": recommended}}))
 
 
 def cmd_findings(args):
@@ -1645,6 +1658,38 @@ def cmd_fingerprint(args):
     else:
         print(fingerprint.fingerprint(args.category, args.rule, args.path,
                                       args.snippet or ""))
+
+
+def _candidate_requirements(conn, analysis_id, payload):
+    """(required keys, trace_allowed) for THIS finding -- decided from data
+    the ledger already has, never from a flag the agent sends.
+
+    A row of this fingerprint already in this analysis and minted by a
+    SCANNER means the re-report is a triage (Job 2): somebody is judging a
+    scanner's finding, and a judgement carries a confidence. No such row means
+    a new finding (Job 3) or the verbatim echo of a row nobody re-found (Job
+    1), which carries nothing -- a confidence there would be the verification
+    Job 1 says did not happen. `sast` is held by severity alone, whoever
+    minted it: at medium or above the writer asserts a real weakness and has
+    to show the chain and the control; at high and critical, both halves of
+    the severity as well. A trace is allowed on `sast` and on `dependency`
+    (the CVE's reachability) and refused on the three categories that have
+    no data flow.
+    """
+    category, severity = payload["category"], payload["severity"]
+    existing = conn.execute(
+        "SELECT producer FROM finding WHERE analysis_id=? AND fingerprint=?",
+        (analysis_id, payload["fingerprint"])).fetchone()
+    triage = existing is not None and (existing["producer"] or "") not in ("", diff.AGENT)
+    if category == "sast":
+        if severity in TRIAGE_BLOCKING:
+            required = ["trace", "intended_control", "confidence"]
+            if severity in ("high", "critical"):
+                required += ["likelihood", "impact"]
+        else:
+            required = ["confidence"]
+        return required, True
+    return (["confidence"] if triage else []), category == "dependency"
 
 
 def cmd_report_finding(args):
@@ -1798,6 +1843,42 @@ def cmd_report_finding(args):
                  "reader of the report opens; an object with no `file` is not "
                  "one, and a row carrying only such objects has no location "
                  "at all")
+    conn = _conn(args)
+    _running(conn, args.analysis)
+    # THE CANDIDATE, after every text field above has been through the same
+    # gates -- so a rationale that quotes a key is still refused as
+    # `rationale`, never as a missing candidate -- and before the producer is
+    # stamped, because the requirements read the row the ledger already holds.
+    required, trace_allowed = _candidate_requirements(conn, args.analysis, payload)
+    doc = payload.pop("candidate", None)
+    if doc is None:
+        if required:
+            sys.exit("report-finding: candidate is required here — a "
+                     f"{payload['category']} finding at {payload['severity']} "
+                     f"has to carry: {', '.join(required)}. A medium+ weakness "
+                     "without a trace is one you have not read; go read it rather "
+                     "than lowering the severity. Nothing was recorded")
+        payload["candidate"] = ""
+    else:
+        if not isinstance(doc, dict):
+            sys.exit("report-finding: candidate must be an object. Nothing was recorded")
+        try:
+            doc = candidate.validate(doc, required=required, trace_allowed=trace_allowed)
+        except candidate.CandidateError as exc:
+            where = f"candidate.{exc.path}" if exc.path else "candidate"
+            sys.exit(f"report-finding: {where} {exc.message}. Nothing was recorded")
+        if not candidate.within_ceiling(payload["severity"], doc):
+            sys.exit(f"report-finding: severity {payload['severity']} is above the "
+                     "candidate's impact — the ceiling of a severity is its impact; "
+                     "lower the severity or raise the impact with a reason. Nothing "
+                     "was recorded")
+        # The same scanner every other free-text field went through, over
+        # every free-text field of the document, by path. See
+        # `_refuse_if_secret` for why the message names the field and never
+        # the text.
+        for path, text in candidate.texts(doc):
+            _refuse_if_secret(f"report-finding: candidate.{path}", text)
+        payload["candidate"] = candidate.encode(doc)
     # NEVER read from the payload -- `producer` is not an agent-writable
     # field, it is this door's own record of who arrived through it. An agent
     # able to send its own would be able to claim a deterministic producer for
@@ -1808,8 +1889,6 @@ def cmd_report_finding(args):
     # minted -- which is exactly what `diff.AGENT` is proven by: the analysis
     # closing `done`.
     payload["producer"] = diff.AGENT
-    conn = _conn(args)
-    _running(conn, args.analysis)
     try:
         ledger.record_finding(conn, args.analysis, payload)
     # OverflowError is here for the same reason ValueError is: it comes out of
@@ -1993,6 +2072,26 @@ def _triage_phase(conn, analysis_id, untriaged, untriaged_note, decided_note):
          decided_note])
 
 
+GUIDES_UNKNOWN = "unknown"
+
+
+def _guides_sentence(recommended, read) -> str:
+    """One of three forms; `read` is None when the stream could not be read.
+    Names in the table's order, so the sentence reads the same whatever order
+    the stream produced them in."""
+    if read is None:
+        return "Guides read: unknown (run stream unavailable)."
+    if not read:
+        return (f"Guides read: none of the {len(recommended)} recommended."
+                if recommended else "Guides read: none.")
+    ordered = [g for g in guides.NAMES if g in read]
+    missed = [g for g in recommended if g not in read]
+    out = "Guides read: " + ", ".join(ordered) + "."
+    if missed:
+        out += " Recommended but not read: " + ", ".join(missed) + "."
+    return out
+
+
 def cmd_finish(args):
     """Close the analysis. The verdict can be lowered, never raised.
 
@@ -2033,6 +2132,24 @@ def cmd_finish(args):
     if args.if_running and row["state"] != "running":
         return
     state = args.state
+    # WHAT THE AGENT READ, from the ENGINE's close only -- the flag is absent
+    # on the agent's own close, which knows nothing about its stream, so no
+    # sentence is written then; the engine's close writes the one true
+    # sentence and `guides.read`. `unknown` is a value, not an absence: the
+    # stream could not be read, and the report says so rather than "none".
+    # Names outside the vendored set are dropped, never echoed: a name is
+    # matched off the stream by a regex, and this is the one place that knows
+    # the closed set.
+    guides_note = ""
+    if args.guides_read is not None:
+        recommended = ledger.guides_of(row).get("recommended", [])
+        if args.guides_read.strip() == GUIDES_UNKNOWN:
+            read = None
+        else:
+            given = set(args.guides_read.split(","))
+            read = [g for g in guides.NAMES if g in given]
+            ledger.set_guides(conn, args.analysis, read=read)
+        guides_note = _guides_sentence(recommended, read)
     if state == "done" and row["state"] in ("capped", "failed"):
         print(f"finish: analysis {args.analysis} is already {row['state']} — a "
               "close never upgrades a truncated or failed analysis to done",
@@ -2166,7 +2283,7 @@ def cmd_finish(args):
     stored = row["coverage_note"] or ""
     note = ""
     for part in (stored, args.note or "", unprepared_note, untriaged_note,
-                 decided_note):
+                 decided_note, guides_note):
         part = part.strip()
         # `not in`, not `!=`: a row is closed twice (the agent, then the
         # engine) and each close re-reads the note it already wrote. Without
@@ -2233,10 +2350,16 @@ def cmd_finish(args):
                 coverage.TRIAGE, coverage.SKIPPED,
                 note=unprepared_note or TRIAGE_UNVERIFIED_NOTE)
     else:
+        # The guides sentence joins whatever the row already says -- the
+        # agent's `--note`, or the sentence a previous close stored -- once:
+        # the same `not in` guard the paragraph uses above.
+        sast_note = (args.note or "").strip() or prior_sast
+        if guides_note and guides_note not in sast_note:
+            sast_note = f"{sast_note} {guides_note}".strip()
         sast_phase = coverage.phase(
             coverage.SAST_AGENT,
             coverage.RAN if state == "done" else coverage.WARNING,
-            diff.AGENT, (args.note or "").strip() or prior_sast)
+            diff.AGENT, sast_note)
         if triage_phase is None and no_triage_row:
             triage_phase = coverage.phase(coverage.TRIAGE, coverage.SKIPPED,
                                           note=TRIAGE_UNVERIFIED_NOTE)
@@ -2993,7 +3116,8 @@ def cmd_findings_page(args):
 
     Filters travel as repeated flags, not a JSON body: `queries.finding_rows`'s
     own `filters` dict has a small, fixed set of keys (show_resolved,
-    severity, state, category, branch, analysis, path, q, fingerprint) --
+    severity, state, category, confidence, branch, analysis, path, q,
+    fingerprint) --
     unlike a SAVED
     filter (see `cmd_filters`'s own docstring), which is arbitrary,
     human-curated criteria this door must not have to keep in step with by
@@ -3047,6 +3171,7 @@ def cmd_findings_page(args):
         "severity": args.severity or [],
         "state": args.state or [],
         "category": args.category or [],
+        "confidence": args.confidence or [],
         "branch": args.branch or [],
         "analysis": args.analysis or [],
         "path": args.path,
@@ -3259,6 +3384,9 @@ def main(argv=None):
     fn.add_argument("--spend", default="0")
     fn.add_argument("--note", default="")
     fn.add_argument("--if-running", action="store_true", dest="if_running")
+    # The ENGINE's close only: a comma list of guide names, '' for none, or
+    # `unknown` when the run's stream could not be read. See `cmd_finish`.
+    fn.add_argument("--guides-read", default=None, dest="guides_read")
 
     ck = sub.add_parser("checklist", parents=[dbflag]); ck.set_defaults(fn=cmd_checklist)
     ck.add_argument("--analysis", type=int, required=True)
@@ -3348,6 +3476,8 @@ def main(argv=None):
                      choices=diff.DERIVED_STATES + ledger.DECISION_STATES)
     fpg.add_argument("--category", action="append", default=None,
                      choices=FINDING_CATEGORIES)
+    fpg.add_argument("--confidence", action="append", default=None,
+                     choices=candidate.CONFIDENCE_SCORES)
     fpg.add_argument("--branch", action="append", default=None)
     fpg.add_argument("--repo-path", action="append", default=None, dest="repo_path")
     fpg.add_argument("--analysis", action="append", type=int, default=None)

@@ -906,14 +906,15 @@ footer{margin-top:30px;color:var(--muted);font-size:11px;text-align:center}
    itself walks. */
 .secfind-table{min-width:1180px}
 .secfind-table th:nth-child(1){width:8%}    /* Severity     */
-.secfind-table th:nth-child(2){width:18%}   /* Title        */
-.secfind-table th:nth-child(3){width:16%}   /* Location     */
-.secfind-table th:nth-child(4){width:9%}    /* Category     */
-.secfind-table th:nth-child(5){width:11%}   /* Analysis run */
-.secfind-table th:nth-child(6){width:8%}    /* Branch       */
-.secfind-table th:nth-child(7){width:8%}    /* Status       */
-.secfind-table th:nth-child(8){width:11%}   /* First seen   */
-.secfind-table th:nth-child(9){width:11%}   /* Actions      */
+.secfind-table th:nth-child(2){width:17%}   /* Title        */
+.secfind-table th:nth-child(3){width:15%}   /* Location     */
+.secfind-table th:nth-child(4){width:8%}    /* Category     */
+.secfind-table th:nth-child(5){width:7%}    /* Confidence   */
+.secfind-table th:nth-child(6){width:11%}   /* Analysis run */
+.secfind-table th:nth-child(7){width:8%}    /* Branch       */
+.secfind-table th:nth-child(8){width:8%}    /* Status       */
+.secfind-table th:nth-child(9){width:9%}    /* First seen   */
+.secfind-table th:nth-child(10){width:9%}   /* Actions      */
 /* The coloured left edge (AllFindings.png's own per-row bar) -- on the
    ROW's first cell, not on `tr` itself: `table{border-collapse:collapse}`
    (ui/css/components.css) makes a `<tr>`'s own border inconsistent across
@@ -2017,6 +2018,26 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
   font-size:10px;white-space:normal;line-height:1.3}
 .secstate.fixed-elsewhere.merged{background:var(--ok-soft);color:var(--ok);border-color:transparent}
 .secstate.fixed-elsewhere.pending{background:var(--warn-soft);color:var(--warn);border-color:transparent}
+/* The confidence chip: the candidate's own score (ui/security/candidate.js).
+   Quieter than a state pill -- it qualifies a finding, it does not classify
+   it; high borrows the ok tone, low the warn tone, medium stays neutral. */
+.secconf{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;
+  border-radius:20px;padding:1px 8px;background:var(--panel2);color:var(--muted);
+  border:1px solid var(--line);white-space:nowrap}
+.secconf.high{background:var(--ok-soft);color:var(--ok);border-color:transparent}
+.secconf.low{background:var(--warn-soft);color:var(--warn);border-color:transparent}
+/* The candidate block under a finding's rationale: the trace as a numbered
+   chain, the control, the conditions, the scored fields in one muted line. */
+.seccand{margin:9px 0 0;padding:8px 10px;border-left:3px solid var(--line);background:var(--panel2);
+  font-size:12px;line-height:1.55}
+.seccand-label{font-weight:700;text-transform:uppercase;font-size:10.5px;letter-spacing:.04em;color:var(--muted)}
+.seccand ol,.seccand ul{margin:4px 0 6px 18px;padding:0}
+.seccand li{margin:2px 0}
+.seccand li>*{margin-right:6px}
+.seccand-kind{font-weight:700;color:var(--muted)}
+.seccand-scope{font-style:italic;color:var(--muted)}
+.seccand p{margin:6px 0 0}
+.seccand-scored{color:var(--muted)}
 .secwhere{margin:9px 0 0;padding-left:18px;font:11.5px/1.65 ui-monospace,"SF Mono",Menlo,monospace;
   color:var(--muted);word-break:break-all}
 .secfinding p{margin:8px 0 0;font-size:12.5px;line-height:1.6}
@@ -2911,5 +2932,5 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 /* cover, not fill: a photo that is not square is cropped rather than stretched */
 .pf-face img{width:100%;height:100%;object-fit:cover;display:block}
 .pf-photo-a{display:flex;gap:8px;flex-wrap:wrap}
-/* ui-bundle: 7d473f3544cbb9653f6f32c9ae68ea10abc5b68353b513976f60ef86469e5bf1 */
-/* ui-sources: 58979b37f9c9b6d7d9710f6e29c83e6964cc1e4cc453a8df3db7e36561cc957f */
+/* ui-bundle: 5122898a1214092eee13feee60b7c8623681d4a41251ed2ac5610b46ab690775 */
+/* ui-sources: b7a8fd3a260b7239f6e3980e8467fa5beed7d61e93c6fb1f5fccfe7d40aedcd1 */

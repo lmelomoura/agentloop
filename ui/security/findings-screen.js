@@ -90,6 +90,7 @@
    contract. */
 import { api, toast, fmtWhen, tableFooter, closeMenus, kpiCard } from "./page.js";
 import { secEl, secIcon, secFetch, secPlaceMenu } from "./dom.js";
+import { SEC_CONFIDENCE, secConfidenceChip } from "./candidate.js";
 import { SEC_STATES, SEC_STATE_LABEL, SEC_STATE_HELP, SEV_ORDER, SEC_NEVER,
          secMinSeverity, secSevKey, secStateKey, secVisible, secCategoryMeta } from "./vocabulary.js";
 import { SEV_KPI_ICON, SEV_KPI_TONE } from "./overview-tab.js";
@@ -119,7 +120,8 @@ import { secDownloadFindings } from "./actions.js";
 // SEC_STATE_LABEL exactly as before.
 const FIND_SORT_COLUMNS = [
   ["severity", "Severity"], ["title", "Title"], ["category", "Category"],
-  ["branch", "Branch"], ["state", "Status"], ["first_seen", "First seen"],
+  ["confidence", "Confidence"], ["branch", "Branch"], ["state", "Status"],
+  ["first_seen", "First seen"],
 ];
 // The full nine-column order AllFindings.png draws (Location and Analysis
 // run are new; see secFindTableSection's own header-building code for why
@@ -134,8 +136,8 @@ const FIND_SORT_COLUMNS = [
 // server's own FINDING_CATEGORIES.
 const SEC_FIND_TABLE_COLS = [
   ["severity", "Severity"], ["title", "Title"], [null, "Location"],
-  ["category", "Category"], [null, "Analysis run"], ["branch", "Branch"],
-  ["state", "Status"], ["first_seen", "First seen"], [null, "Actions"],
+  ["category", "Category"], ["confidence", "Confidence"], [null, "Analysis run"],
+  ["branch", "Branch"], ["state", "Status"], ["first_seen", "First seen"], [null, "Actions"],
 ];
 const FIND_CATEGORIES = ["secret", "dependency", "sast", "hygiene", "iac"];
 // AllFindings.png's own default per-page selection and picker options.
@@ -145,7 +147,7 @@ const FIND_PER_PAGE = 25;
 const FIND_PER_PAGE_OPTIONS = [10, 25, 50];
 
 function _defaultFilters(){
-  return {severity: [], state: [], category: [], branch: "", path: "", q: "",
+  return {severity: [], state: [], category: [], confidence: [], branch: "", path: "", q: "",
           analysis: "", show_resolved: false, fingerprint: ""};
 }
 
@@ -193,6 +195,7 @@ function secFindQuery(fs){
   if(f.severity.length) p.set("severity", f.severity.join(","));
   if(f.state.length) p.set("state", f.state.join(","));
   if(f.category.length) p.set("category", f.category.join(","));
+  if(f.confidence.length) p.set("confidence", f.confidence.join(","));
   if(f.branch.trim()) p.set("branch", f.branch.trim());
   if(f.path.trim()) p.set("path", f.path.trim());
   if(f.q.trim()) p.set("q", f.q.trim());
@@ -688,6 +691,7 @@ function secFindActiveFilterCount(fs){
   if(f.severity.length) n++;
   if(f.state.length) n++;
   if(f.category.length) n++;
+  if(f.confidence.length) n++;
   if(f.branch.trim()) n++;
   if(f.path.trim()) n++;
   if(f.analysis.trim()) n++;
@@ -708,6 +712,7 @@ function secFindClearButton(fs){
 function secFindCurrentQuery(fs){
   const f = fs.filters;
   return {severity: f.severity, state: f.state, category: f.category,
+          confidence: f.confidence,
           branch: f.branch, path: f.path, q: f.q, analysis: f.analysis,
           show_resolved: f.show_resolved, fingerprint: f.fingerprint,
           sort: fs.sort, dir: fs.dir};
@@ -719,6 +724,9 @@ function secFindApplyQuery(fs, q){
     severity: Array.isArray(query.severity) ? query.severity.slice() : [],
     state: Array.isArray(query.state) ? query.state.slice() : [],
     category: Array.isArray(query.category) ? query.category.slice() : [],
+    // Absent from a filter saved before block 4.1: "no filter", as every
+    // other absent key reads.
+    confidence: Array.isArray(query.confidence) ? query.confidence.slice() : [],
     branch: typeof query.branch === "string" ? query.branch : "",
     path: typeof query.path === "string" ? query.path : "",
     q: typeof query.q === "string" ? query.q : "",
@@ -872,7 +880,7 @@ function secFindFilterBar(fs, data){
   // naming `rule` here (in the tooltip -- the mockup's own placeholder
   // above is the friendly gloss) is what makes that searchable text
   // discoverable at all, rather than implying a fifth, nonexistent column.
-  searchInput.title = "Search title / rule / rationale / file";
+  searchInput.title = "Search title / rule / rationale / file / candidate";
   searchInput.onchange = () => { fs.filters.q = searchInput.value; fs.page = 1; secFindRefresh(fs); };
   search.appendChild(searchInput);
   row1.appendChild(search);
@@ -915,6 +923,11 @@ function secFindFilterBar(fs, data){
     FIND_CATEGORIES.map(c => ({v: c, label: secCategoryMeta(c).label})),
     fs.filters.category,
     (v) => { secFindToggleIn(fs.filters.category, v); fs.page = 1; secFindRefresh(fs); }));
+
+  row2.appendChild(secFindMultiPicker("Confidence",
+    SEC_CONFIDENCE.map(c => ({v: c, label: _secCap(c)})),
+    fs.filters.confidence,
+    (v) => { secFindToggleIn(fs.filters.confidence, v); fs.page = 1; secFindRefresh(fs); }));
 
   const toggleField = secEl("label", "secfind-toggle-field");
   // Fixed, accepted and false-positive rows are excluded unless this is on
@@ -1026,6 +1039,13 @@ function secFindRow(fs, f){
   if(f.rule) catWrap.title = f.rule;
   tdCat.appendChild(catWrap);
   tr.appendChild(tdCat);
+
+  // CONFIDENCE: the candidate's own score, a chip; empty for a finding that
+  // carries no document -- unmeasured, not "low".
+  const tdConf = document.createElement("td");
+  const chip = secConfidenceChip(f);
+  if(chip) tdConf.appendChild(chip);
+  tr.appendChild(tdConf);
 
   // ANALYSIS RUN: "#<id> (<Profile>)", the date beneath -- links to that
   // analysis exactly where the Runs tab's own "#N" button already does
@@ -1242,7 +1262,8 @@ function secFindTableSection(fs, data){
   const thead = document.createElement("thead");
   const htr = document.createElement("tr");
 
-  // Nine header cells, AllFindings.png's own order. Six are sortable
+  // Ten header cells, AllFindings.png's own order plus Confidence (block
+  // 4.1) after Category. Seven are sortable
   // (FIND_SORT_COLUMNS, this file's own top); Location, Analysis run and
   // Actions are not -- every one of the nine still gets the SAME inert
   // `<button class="btn ghost">` shape (no `onclick` on the three that are
@@ -1259,7 +1280,7 @@ function secFindTableSection(fs, data){
   // each one follows in the mockup, rather than a second nine-entry array
   // naming the same nine columns FIND_SORT_COLUMNS plus SEC_FIND_TABLE_COLS
   // already do between them.
-  const INSERT_AFTER = {title: "Location", category: "Analysis run"};
+  const INSERT_AFTER = {title: "Location", confidence: "Analysis run"};
   function sortableHeader(key, label){
     const th = document.createElement("th");
     const btn = secEl("button", "btn ghost");

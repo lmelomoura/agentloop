@@ -25,7 +25,7 @@ On the Codex CLI the engine has already run this command for you before you star
 
 That is also why a `pending` row survives the close of the run in which nothing could re-check it, instead of flipping to `fixed` the moment you finish. On a machine without Semgrep, a pre-pass row stays `pending` rather than quietly reading `fixed` — the check id in its identity is one only Semgrep mints, so your run finishing proves nothing about it. Treat it exactly as the rule below says: open the code at its occurrences and decide. Findings **you** reported are unaffected — the analysis closing `done` is what proves those, and it always has been.
 
-**A `pending` row is one you re-report, under the fingerprint `checklist` printed for it, copied exactly.** It is `pending` because the producer that minted it did not run — no Trivy for a `yarn.lock` CVE or a Dockerfile misconfiguration, no gitleaks for a credential only its rule set names, no Semgrep for a pre-pass row — so `prepare` wrote nothing for it and **this analysis holds no row for it at all**. For a deterministic row (`secret`, `dependency`, `hygiene`, `iac`) that is the whole instruction: echo the row back as `checklist` gave it to you — same fingerprint, category, rule, severity, title, rationale, remediation and occurrences. You are not claiming to have re-checked it; you are keeping a finding nobody re-checked in the report, which is exactly what `pending` says. For a `sast` row you can do better, because you can read the code — the three bullets below say how, including the one case where staying silent is right, which is a judgement only reading the code entitles you to.
+**A `pending` row is one you re-report, under the fingerprint `checklist` printed for it, copied exactly.** It is `pending` because the producer that minted it did not run — no Trivy for a `yarn.lock` CVE or a Dockerfile misconfiguration, no gitleaks for a credential only its rule set names, no Semgrep for a pre-pass row — so `prepare` wrote nothing for it and **this analysis holds no row for it at all**. For a deterministic row (`secret`, `dependency`, `hygiene`, `iac`) that is the whole instruction: echo the row back as `checklist` gave it to you — same fingerprint, category, rule, severity, title, rationale, remediation and occurrences, and **no `candidate`**: a confidence on a row nobody re-checked would be the verification this job says did not happen. You are not claiming to have re-checked it; you are keeping a finding nobody re-checked in the report, which is exactly what `pending` says. For a `sast` row you can do better, because you can read the code — the three bullets below say how, including the one case where staying silent is right, which is a judgement only reading the code entitles you to.
 
 **Why your silence loses it.** `pending` is DERIVED, never stored, and the next analysis's baseline is the set of rows THIS analysis recorded. A `pending` row you leave unreported is in no analysis's findings: the run after this one has nothing to carry it from, so it is not `pending` there, or `fixed`, or anything — it is gone from the report while the CVE is still in the lockfile and the checkout has not been touched. When the engine comes back it reads `regressed`, "fixed and came back", about a finding that was never fixed and never left. Measured over four analyses of one branch with Trivy present, absent, absent, present: the `yarn.lock` CVE reads `open`, `pending`, absent entirely, `regressed`, while the `package-lock.json` CVE beside it — which the OSV.dev fallback also reads — stays `open` throughout.
 
@@ -39,7 +39,7 @@ Three things not to do with a carried-over row:
 
 For each carried-over row whose category is `sast`, open the code at its occurrences and decide:
 
-- **Still present, as reported** — re-report it under **the fingerprint `checklist` printed for it, copied exactly**, with `occurrences` for every location still affected. Re-reporting under the same fingerprint is what keeps it `open` (or `partial`) instead of `fixed` on this checklist and the next.
+- **Still present, as reported** — re-report it under **the fingerprint `checklist` printed for it, copied exactly**, with `occurrences` for every location still affected and the full `candidate` (you read the code to say so; see *What qualifies as a finding*). Re-reporting under the same fingerprint is what keeps it `open` (or `partial`) instead of `fixed` on this checklist and the next.
 - **Genuinely gone, and the checklist agrees** — do nothing. **Read the state before you read the code: if `checklist` shows the row `open` or `partial` in THIS analysis, Semgrep re-found it this run and it is not gone whatever the file looks like to you.** Silence over a row that is `open` here is not a "fixed"; it is the state the close counts as never triaged, and it goes to Job 2. Only a row the checklist still shows `pending` — no producer re-found it — is one your reading of the code can settle. There is no "mark fixed" verb; its absence from what you re-report this run IS how it becomes `fixed` — for a finding *you* reported. A Semgrep pre-pass row needs Semgrep to have run this analysis as well, so on a machine without it your silence leaves the row `pending` on this report, which is the honest answer and not something for you to work around. This is the one place silence is right, and it costs what the paragraph above describes: an unreported row is not in this analysis's findings either, so it leaves the next baseline too, and Semgrep re-finding it on a later run reads `regressed`. That is the correct signal — it says your reading of the code was wrong. Stay silent only when you actually read the code and it is gone, never as the default for a row you could not check.
 - **Partially closed** — re-report the same fingerprint with ONLY the occurrences still affected, plus a `partial_note` saying what remains — "3 of 5 call sites" is not a partial note, the occurrence count already says that; "the escaping helper is applied on the read path but not the write path" is.
 
@@ -57,7 +57,7 @@ This is the cheapest of the three jobs and the most valuable. Do it first.
 
 **2. Triage the deterministic findings.** They were found by pattern, not by understanding. For each one ask what a pattern cannot: is this "secret" an example in documentation? Is this CVE on a code path anything actually reaches? Is this hygiene finding about a file that ships?
 
-**A finding you agree with is re-reported too.** Agreeing with a scanner used to mean writing nothing at all onto its row; a row nobody wrote onto is precisely what nothing downstream can tell apart from a row nobody ever opened. The ledger marks a finding triaged when a re-report of yours lands on a row a scanner minted — that event is the ONLY evidence anywhere that somebody read it, and there is no field you can send that says "I looked", because a claim is exactly what the close is checking. So a row whose severity you would not change is still re-reported, under its own fingerprint, at its own severity, with a rationale recording what you read and why it stands. Raised, lowered, or unchanged: the re-report happens either way.
+**A finding you agree with is re-reported too.** Agreeing with a scanner used to mean writing nothing at all onto its row; a row nobody wrote onto is precisely what nothing downstream can tell apart from a row nobody ever opened. The ledger marks a finding triaged when a re-report of yours lands on a row a scanner minted — that event is the ONLY evidence anywhere that somebody read it, and there is no field you can send that says "I looked", because a claim is exactly what the close is checking. So a row whose severity you would not change is still re-reported, under its own fingerprint, at its own severity, with a rationale recording what you read and why it stands. Raised, lowered, or unchanged: the re-report happens either way. Every such re-report carries a `candidate.confidence` with its reason — the field that says how sure you are — and the door requires it on a triage.
 
 Work through it in this order:
 
@@ -75,10 +75,32 @@ Work through it in this order:
 
 If you believe one is a false positive, say so in its `rationale` — you do not get to dismiss it yourself. `decide` is a human's permanent, project-wide call, and it is refused for the whole duration of your run: by the marker your run carries, and again by the ledger itself, which refuses any decision on a project with any analysis still `running` — not only the newest one, so opening a second analysis and closing it does not make the door look shut while yours is still live. That second check is protection against a mistake, not a lock nothing can pick: it does not look at the marker at all, so unsetting it does not touch this refusal on its own. Trying to find a way around it is itself a finding somebody would report about you.
 
+## What qualifies as a finding
+
+A `sast` candidate at `medium` or above has to name **the lower-trust principal, the input or action it controls, the control that should have held, the boundary crossed, the resource or principal affected, and the observable result**. A generic crash, a missing best practice or an absent defence in depth is not a vulnerability: it is a *hardening note*, and it is filed at `info` — the severity this ledger already keeps for advice rather than exposure.
+
+Severity anchors, replacing whatever you would otherwise reach for:
+
+- `critical` — unauthenticated code execution, full data access, or account takeover
+- `high` — an explicit control fully defeated, with a real consequence
+- `medium` — a real boundary crossed, with a limited blast radius
+- `low` — disclosure or minimal gain
+- `info` — confirmed, no impact
+
+An unsure finding is still a finding, at the severity it would have if it were real — but the doubt now has a field, `confidence`, and the door requires it.
+
+**The `candidate` document is how the door holds you to this.** Every `sast` finding at `medium` or above carries `trace` (the chain `entrypoint → propagation → sink`, each step a file, a line, a scope and a sentence), `intended_control` and `confidence`; at `high` and `critical`, `likelihood` and `impact` with reasons as well, and the severity may never exceed the impact. Every re-report of a scanner's row (Job 2) carries `confidence`. A `dependency` re-report may carry a `trace` — the path from an entry point to the vulnerable call is the CVE's reachability. A `secret`, `hygiene` or `iac` row takes no trace. `conditions` (what has to be true for the hole to be reachable: `authentication_level`, `authorization_role`, `user_interaction`, `system_configuration`, `network_routing`, `environmental_dependency`, `data_state`, `timing_dependency`, `third_party_dependency`) is always optional. The same rule that governs `rationale` governs every text in the document: **never a credential's value**, and the door refuses by field path if one appears.
+
+**Do not lower a severity to get past the door.** A medium+ weakness without a trace is one you have not read; go read it. The next block's verifier re-checks `low` findings whose impact reads high.
+
+The same ruler applies to Job 2: Semgrep's MD5-in-a-cache-key fails the boundary requirement and goes to `info` with the reason written — which is what already happens in practice, now with a criterion by name.
+
 **3. The SAST pass**, scoped by the profile:
 - `quick` — only code that touches external input: HTTP handlers, CLI entry points, queue consumers, deserialisation, SQL, `exec`/`eval`.
 - `standard` — that, plus the code those reachable paths call, following the calls in depth.
 - `deep` — all versioned code, including paths nothing currently invokes.
+
+**Read the hunting guides first.** `prepare` printed `guides.recommended` (on the Codex CLI and OpenCode read it off `checklist`, which prints the same object); the files are under `references/` beside this file. Read `ATTACK-CLASSES.md` and then each recommended guide, in that order, before you open the repository's code. The guides are hunting material, not process: where a guide talks about reporting, validating, hunters or a findings file, this file wins. What you read is recorded off the run's stream at the close, never off your word.
 
 **Before you report a weakness, check whether a row you already have lists it — and fold your finding into that row instead of minting a new one.** The pre-pass and your own pass identify their findings differently: the pre-pass by Semgrep's own check id (the code is deliberately never recorded), yours by the code. So one weakness found by both is listed TWICE, under two identities, and a decision taken on one never reaches the other. The report *declares* this, but the declaration reaches the reader and **you** are the only one who can prevent it — and on a Python-heavy repository the doubling is otherwise guaranteed on every run, for every weakness both passes see.
 
@@ -93,11 +115,25 @@ Fold in only what is genuinely the same weakness in the same place. Two differen
 ```bash
 fp="$(agentloop security fingerprint --category sast --rule sql-injection \
         --path app/db.py --snippet "cursor.execute(query)")"
-echo "{\"fingerprint\":\"$fp\",\"category\":\"sast\",\"rule\":\"sql-injection\",
-       \"severity\":\"high\",\"title\":\"…\",\"rationale\":\"…\",\"remediation\":\"…\",
-       \"occurrences\":[{\"file\":\"app/db.py\",\"line\":12,\"snippet_hash\":\"…\"}]}" \
-  | agentloop security report-finding --analysis <id>
+cat <<'JSON' | agentloop security report-finding --analysis <id>
+{"fingerprint": "<the fp above>", "category": "sast", "rule": "sql-injection",
+ "severity": "high", "title": "…", "rationale": "…", "remediation": "…",
+ "occurrences": [{"file": "app/db.py", "line": 12, "snippet_hash": "…"}],
+ "candidate": {
+   "trace": [
+     {"kind": "entrypoint", "file": "app/api.py", "line": 42, "scope": "search",
+      "description": "the `q` query parameter, unvalidated"},
+     {"kind": "sink", "file": "app/db.py", "line": 12, "scope": "find",
+      "description": "concatenated into the SQL string handed to execute()"}],
+   "intended_control": "queries are parameterised",
+   "confidence": {"score": "high", "reason": "the concatenation is unconditional"},
+   "likelihood": {"score": "high", "reason": "the endpoint is unauthenticated"},
+   "impact": {"score": "high", "reason": "read of every row the app user can see"},
+   "conditions": [{"kind": "network_routing", "description": "the search endpoint is exposed"}]}}
+JSON
 ```
+
+`candidate` is what *What qualifies as a finding* above describes; at `low` and `info` only `confidence` is required, and a triage re-report of a scanner's row carries `confidence` alone unless you have more to say.
 
 Each text field — `title`, `rationale`, `remediation`, `partial_note` — is capped at 10,000 characters; longer is refused at the door, not truncated. A finding is a paragraph the report page renders, not a file to paste into the ledger.
 

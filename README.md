@@ -1402,6 +1402,47 @@ report-finding`, which validates before it stores. The agent is
 non-deterministic, and the history that produces the checklist cannot be only as
 trustworthy as the last JSON it happened to type.
 
+### What a finding has to carry
+
+A `sast` finding at `medium` or above is not a paragraph any more. It carries a
+**`candidate` document**: the `trace` from entry point to sink, each step a
+file, a line, a scope and a sentence; the `intended_control` that should have
+held; a `confidence` with its reason; at `high` and `critical`, `likelihood`
+and `impact` with their reasons — and the severity may never exceed the
+impact, which is the one coherence rule the door enforces. `conditions` say
+what has to be true for the hole to be reachable. A re-report of a scanner's
+row carries a `confidence`; a `dependency` one may carry a `trace` (the CVE's
+reachability); a secret, hygiene or infrastructure row takes no trace. Every
+text in the document goes through the same credential scan as `rationale`,
+and a refusal names the field by path and never the text. None of this
+enters the fingerprint or the checklist's states: a candidate describes a
+finding, it does not identify it, and a re-report replaces it whole.
+
+The reports render it under the finding; the findings browser filters,
+sorts and searches by confidence, with unmeasured rows last whichever way
+you sort. A finding without a document — every deterministic row, every row
+from before the column — renders exactly as it did.
+
+The criterion behind it is the boundary requirement of
+[cloudflare/security-audit-skill](https://github.com/cloudflare/security-audit-skill):
+a finding names the lower-trust principal, the input, the control that should
+have held, the boundary crossed, what is affected and the observable result;
+a missing best practice is a hardening note at `info`, not a vulnerability.
+
+### Hunting guides
+
+`skills/security-analysis/references/` carries `ATTACK-CLASSES.md` and ten
+domain guides from the same project (MIT; `UPSTREAM.md` names the commit).
+Read whole they cost ~30k tokens per run, so `prepare` chooses: from the
+dependency inventory's names and the tree's paths — under the same
+`ignore_paths` every phase obeys — it recommends the guides the stack calls
+for, capped by the profile (`quick` reads ATTACK-CLASSES and the best match,
+`standard` all that matched, `deep` all eleven), and prints and stores the
+list. **What was read is taken off the run's stream at the close**, never
+off the agent's word, and the `sast` row of the coverage table says
+`Guides read: …`, `none of the N recommended`, or `unknown (run stream
+unavailable)`. It is a note, not a gate.
+
 ### The checklist: eight states, six of them derived
 
 | state | what it says |
