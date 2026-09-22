@@ -3059,7 +3059,8 @@ def cmd_findings_page(args):
 
     Filters travel as repeated flags, not a JSON body: `queries.finding_rows`'s
     own `filters` dict has a small, fixed set of keys (show_resolved,
-    severity, state, category, branch, analysis, path, q, fingerprint) --
+    severity, state, category, confidence, branch, analysis, path, q,
+    fingerprint) --
     unlike a SAVED
     filter (see `cmd_filters`'s own docstring), which is arbitrary,
     human-curated criteria this door must not have to keep in step with by
@@ -3113,6 +3114,7 @@ def cmd_findings_page(args):
         "severity": args.severity or [],
         "state": args.state or [],
         "category": args.category or [],
+        "confidence": args.confidence or [],
         "branch": args.branch or [],
         "analysis": args.analysis or [],
         "path": args.path,
@@ -3414,6 +3416,8 @@ def main(argv=None):
                      choices=diff.DERIVED_STATES + ledger.DECISION_STATES)
     fpg.add_argument("--category", action="append", default=None,
                      choices=FINDING_CATEGORIES)
+    fpg.add_argument("--confidence", action="append", default=None,
+                     choices=candidate.CONFIDENCE_SCORES)
     fpg.add_argument("--branch", action="append", default=None)
     fpg.add_argument("--repo-path", action="append", default=None, dest="repo_path")
     fpg.add_argument("--analysis", action="append", type=int, default=None)

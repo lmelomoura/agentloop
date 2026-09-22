@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 
 import pytest
-from security import diff, ledger, queries
+from security import candidate, diff, ledger, queries
 
 REPO = Path(__file__).resolve().parent.parent.parent
 SKILL = REPO / "skills" / "security-analysis" / "SKILL.md"
@@ -1692,3 +1692,45 @@ def test_the_skill_tells_the_agent_to_re_report_a_pending_row():
         f"deterministic category {list(diff.DETERMINISTIC_CATEGORIES)} -- a "
         "category the instruction does not name is one the agent will let "
         "silently disappear from the report")
+
+
+# ------------------------------------------- confidence and the guides
+
+def test_findings_can_be_filtered_sorted_and_searched_by_confidence(tmp_path):
+    db = tmp_path / "s.db"
+    conn = ledger.connect(db)
+    aid = ledger.start_analysis(conn, "web", "web", "main", "abc", "quick", "r1")
+    ledger.mark_prepared(conn, aid, ["hygiene"])
+    for fp, conf, text in (("a" * 64, "high", "the join is unconditional"),
+                           ("b" * 64, "low", "maybe guarded upstream"),
+                           ("c" * 64, "", "")):
+        doc = {"confidence": {"score": conf, "reason": text}} if conf else None
+        ledger.record_finding(conn, aid, {
+            "fingerprint": fp, "category": "sast", "rule": "xss", "severity": "medium",
+            "title": "t", "rationale": "r", "producer": "agent",
+            "occurrences": [{"file": "a.py", "line": 1}],
+            "candidate": candidate.encode(doc) if doc else ""})
+    ledger.finish_analysis(conn, aid, "done")
+    ro = queries.read_only(db)
+
+    rows = queries.finding_rows(ro, "web", {"confidence": ["high"]})["rows"]
+    assert [r["fingerprint"][0] for r in rows] == ["a"]
+    rows = queries.finding_rows(ro, "web", {"confidence": ["high", "low"]})["rows"]
+    assert {r["fingerprint"][0] for r in rows} == {"a", "b"}
+
+    rows = queries.finding_rows(ro, "web", {}, sort="confidence", direction="desc")["rows"]
+    assert [r["fingerprint"][0] for r in rows] == ["a", "b", "c"]
+    rows = queries.finding_rows(ro, "web", {}, sort="confidence", direction="asc")["rows"]
+    assert [r["fingerprint"][0] for r in rows] == ["b", "a", "c"]
+
+    rows = queries.finding_rows(ro, "web", {"q": "guarded upstream"})["rows"]
+    assert [r["fingerprint"][0] for r in rows] == ["b"]
+
+
+def test_checklist_hands_the_guides_over_decoded(tmp_path):
+    db = tmp_path / "s.db"
+    conn = ledger.connect(db)
+    aid = ledger.start_analysis(conn, "web", "web", "main", "abc", "quick", "r1")
+    ledger.set_guides(conn, aid, recommended=["ATTACK-CLASSES"])
+    analysis, _ = queries.checklist(conn, aid)
+    assert analysis["guides"] == {"recommended": ["ATTACK-CLASSES"]}

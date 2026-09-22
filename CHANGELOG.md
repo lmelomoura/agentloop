@@ -199,6 +199,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   HTML and the consolidated document, and as an object in JSON; a finding
   without one renders byte for byte as before.
 
+- **The findings browser filters, sorts and searches by confidence** —
+  `findings-page --confidence`, `/api/security/findings?confidence=`,
+  `sort=confidence` with unmeasured rows last whichever way you sort, and the
+  free-text search reads the candidate's prose too.
+
 - **The e2e suite runs four scenarios at a time, one sandbox each:
   `E2E_WORKERS=4 bash test/e2e.test.sh`.** Measured, it is 65% of the
   selftest — 312 s for 47 scenarios, the two security analyses 37 s each —

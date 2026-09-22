@@ -1336,3 +1336,29 @@ def test_activity_reports_a_cli_failure_as_500(srv, monkeypatch):
     code, payload = srv.security_activity({})
     assert code == 500
     assert "boom" in payload["error"]
+
+
+def test_the_findings_route_forwards_confidence_and_refuses_a_value_outside_the_set(srv, monkeypatch):
+    """`confidence` is the fourth closed vocabulary this route checks at the
+    edge (block 4.1), beside severity/state/category, and `sort=confidence`
+    is in FINDINGS_SORT for the same reason the CLI's SORTABLE has it."""
+    seen = {}
+
+    def fake(args, stdin=None):
+        seen["args"] = args
+        return True, json.dumps({"rows": [], "total": 0, "unique": 0,
+                                 "by_severity": {}, "page": 1, "per_page": 25})
+    monkeypatch.setattr(srv, "al", fake)
+    code, _ = srv.security_findings({"project": "web", "confidence": "high,low",
+                                     "sort": "confidence"})
+    assert code == 200
+    args = seen["args"]
+    assert [args[i + 1] for i, a in enumerate(args) if a == "--confidence"] == ["high", "low"]
+    assert args[args.index("--sort") + 1] == "confidence"
+
+    def must_not_run(args, stdin=None):
+        raise AssertionError("the CLI must not be reached")
+    monkeypatch.setattr(srv, "al", must_not_run)
+    code, payload = srv.security_findings({"project": "web", "confidence": "maybe"})
+    assert code == 400
+    assert "confidence" in payload["error"]

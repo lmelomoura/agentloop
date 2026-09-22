@@ -3403,7 +3403,8 @@ def security_analyze(body):
     return (200, {"ok": True, "output": out}) if ok else (500, {"error": out})
 
 
-FINDINGS_SORT = ("severity", "title", "category", "branch", "first_seen", "state")
+FINDINGS_SORT = ("severity", "title", "category", "branch", "first_seen", "state",
+                 "confidence")
 # Every value below mirrors a closed set defined in bin/security/ — duplicated
 # here, not imported, for the same reason PROFILES/BRANCH_OK/the literal
 # state list in security_decide already are: this file shells out to the CLI
@@ -3417,6 +3418,8 @@ FINDING_SEVERITIES = ("critical", "high", "medium", "low", "info")
 FINDING_STATES = ("new", "open", "partial", "pending", "fixed", "regressed",
                   "accepted", "false_positive")
 FINDING_CATEGORIES = ("secret", "dependency", "sast", "hygiene", "iac")
+# `candidate.CONFIDENCE_SCORES`, duplicated for the reason the three above are.
+FINDING_CONFIDENCE = ("low", "medium", "high")
 MAX_FINDINGS_PER_PAGE = 100
 
 
@@ -3516,6 +3519,9 @@ def security_findings(params):
     category, err = _checked_list(params, "category", FINDING_CATEGORIES)
     if err:
         return 400, err
+    confidence, err = _checked_list(params, "confidence", FINDING_CONFIDENCE)
+    if err:
+        return 400, err
 
     branch = str(_param(params, "branch")).strip()
     path = str(_param(params, "path")).strip()
@@ -3556,6 +3562,8 @@ def security_findings(params):
         args += ["--state", s]
     for s in category:
         args += ["--category", s]
+    for s in confidence:
+        args += ["--confidence", s]
     if branch:
         args += ["--branch", branch]
     for a in analysis_ids:
