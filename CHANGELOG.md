@@ -20,6 +20,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The security-analysis skill has a criterion for what qualifies as a
+  finding** — Cloudflare's boundary requirement and five severity anchors —
+  and tells the agent to read the recommended hunting guides before its own
+  SAST pass; the README's *Security analysis* section documents the
+  candidate document and the guides.
+
 - **`report-finding` holds a `sast` finding to its severity.** At medium or
   above it has to carry a trace, the control that should have held and a
   confidence; at high and critical, likelihood and impact with reasons too;
