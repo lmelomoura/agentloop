@@ -170,6 +170,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A `sast` finding can carry a `candidate` document** — trace (entrypoint →
+  propagation → sink), the control that should have held, confidence,
+  likelihood and impact each with a reason, and the conditions the hole
+  depends on — validated by `bin/security/candidate.py` in plain Python and
+  stored canonical. Until now a finding was a paragraph: nothing between
+  "why" and "where" was a claim anybody could hold the agent to, and the
+  verifier the next block adds would have had to parse prose.
+
 - **The e2e suite runs four scenarios at a time, one sandbox each:
   `E2E_WORKERS=4 bash test/e2e.test.sh`.** Measured, it is 65% of the
   selftest — 312 s for 47 scenarios, the two security analyses 37 s each —
