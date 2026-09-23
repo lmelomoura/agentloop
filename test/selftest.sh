@@ -1139,13 +1139,16 @@ JSON
 
   echo "claude_config_dir — install turns what is left of it into accounts"
   local ccd="$tmp/ccd" _mig
-  mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/home/.claude" "$ccd/old-acct"
+  mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/home/.claude" "$ccd/home/old-elsewhere" "$ccd/old-acct" "$ccd/orphan-p" "$ccd/orphan-s"
   cat > "$ccd/cfg/projects.json" <<JSON
 {"projects":[{"name":"Old1","cwd":"$ccd","claude_config_dir":"$ccd/old-acct/"},
              {"name":"Old2","cwd":"$ccd","security":{"enabled":false,"claude_config_dir":"$ccd/old-acct"}},
              {"name":"Old3","cwd":"$ccd","claude_config_dir":"~/.claude"},
              {"name":"Old4","cwd":"$ccd","platform":"openai","claude_config_dir":"$ccd/old-acct"},
-             {"name":"Old5","cwd":"$ccd","claude_config_dir":"$ccd/missing"}]}
+             {"name":"Old5","cwd":"$ccd","claude_config_dir":"$ccd/missing"},
+             {"name":"Old6","cwd":"$ccd","claude_config_dir":"~/old-elsewhere"},
+             {"name":"Old7","cwd":"$ccd","account":"already-p","claude_config_dir":"$ccd/orphan-p",
+              "security":{"enabled":false,"account":"already-s","claude_config_dir":"$ccd/orphan-s"}}]}
 JSON
   printf '{"jobs":[]}\n' > "$ccd/cfg/jobs.json"
   printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},"openai":{"enabled":true,"bin":"","models":["gpt-a"]}}}\n' > "$ccd/cfg/platforms.json"
@@ -1157,19 +1160,43 @@ JSON
   _mig="$( ( ccd_env; accounts_migrate_legacy ) 2>&1 )"
   case "$_mig" in *"registered the Claude account 'old-acct' ($ccd/old-acct) from projects.json"*) ok "a directory no account has becomes one, named after the directory" ;; *) bad "migration: $_mig" ;; esac
   [ "$("$JQ" -c '[.projects[] | {n: .name, a: (.account // null), s: ((.security // {}).account // null), c: (has("claude_config_dir") or ((.security // {}) | has("claude_config_dir")))}]' "$ccd/cfg/projects.json")" \
-      = '[{"n":"Old1","a":"old-acct","s":null,"c":false},{"n":"Old2","a":null,"s":"old-acct","c":false},{"n":"Old3","a":null,"s":null,"c":false},{"n":"Old4","a":null,"s":null,"c":true},{"n":"Old5","a":null,"s":null,"c":true}]' ] \
+      = '[{"n":"Old1","a":"old-acct","s":null,"c":false},{"n":"Old2","a":null,"s":"old-acct","c":false},{"n":"Old3","a":null,"s":null,"c":false},{"n":"Old4","a":null,"s":null,"c":true},{"n":"Old5","a":null,"s":null,"c":true},{"n":"Old6","a":"old-elsewhere","s":null,"c":false},{"n":"Old7","a":"already-p","s":"already-s","c":false}]' ] \
     && ok "each level takes the account (the Default's own directory takes nothing), and the old field goes" \
     || bad "migrated: $("$JQ" -c '.projects' "$ccd/cfg/projects.json")"
   case "$_mig" in *"claude_config_dir on Old4 (project) left in place — that level runs on openai"*) ok "a level that does not run on Anthropic keeps the field, and says why" ;; *) bad "Old4: $_mig" ;; esac
   case "$_mig" in *"claude_config_dir on Old5 (project) left in place — $ccd/missing does not exist"*) ok "and so does a directory that is gone" ;; *) bad "Old5: $_mig" ;; esac
+  case "$_mig" in *"registered the Claude account 'old-elsewhere' ($ccd/home/old-elsewhere) from projects.json"*) ok "a directory written with ~ is registered too, named after it" ;; *) bad "Old6: $_mig" ;; esac
+  [ "$("$JQ" -r '.platforms.anthropic.accounts[] | select(.name=="old-elsewhere") | .dir' "$ccd/cfg/platforms.json")" = "~/old-elsewhere" ] \
+    && ok "and the stored directory is what projects.json had (~ kept, not expanded; account_add trims the trailing slash)" \
+    || bad "old-elsewhere dir: $("$JQ" -c '.platforms.anthropic.accounts' "$ccd/cfg/platforms.json")"
+  case "$_mig" in *"claude_config_dir on Old7 (project) dropped — it already runs on the account 'already-p'"*) ok "a level that already has an account drops the field instead of registering a new one" ;; *) bad "Old7 project: $_mig" ;; esac
+  case "$_mig" in *"claude_config_dir on Old7 (security) dropped — it already runs on the account 'already-s'"*) ok "and the same for a security block" ;; *) bad "Old7 security: $_mig" ;; esac
+  [ "$("$JQ" '[.platforms.anthropic.accounts[]? | select(.name=="orphan-p" or .name=="orphan-s")] | length' "$ccd/cfg/platforms.json")" = "0" ] \
+    && ok "and no account is registered for a directory that level never runs on" \
+    || bad "orphan accounts leaked into platforms.json: $("$JQ" -c '.platforms.anthropic.accounts' "$ccd/cfg/platforms.json")"
   got="$( ( ccd_env; legacy_config_dir_warning ) )"
   case "$got" in
-    *"WARNING: projects.json: claude_config_dir on Old4 is not read — accounts live in Settings › Platforms; pick one in the project editor"*)
+    *"WARNING: projects.json: claude_config_dir on Old4 is not read — accounts live in Settings › Platforms; pick one in the project editor (saving the project drops the field)"*)
       ok "status and install still name what the migration could not convert" ;;
     *) bad "warning: '$got'" ;;
   esac
   [ -z "$( ( ccd_env; accounts_migrate_legacy ) 2>&1 | grep -v 'left in place' )" ] \
     && ok "a second pass converts nothing twice" || bad "second pass: $( ( ccd_env; accounts_migrate_legacy ) 2>&1 )"
+  # project-set is the only cleanup a level the migration left in place ever
+  # gets afterwards -- it has to drop the field at both levels on every save,
+  # not just leave it alone, or the warning above never clears.
+  "$JQ" --arg d "$ccd/old-acct" '(.projects[] | select(.name=="Old4")) |= (.security = {enabled:false, claude_config_dir:$d})' \
+      "$ccd/cfg/projects.json" > "$ccd/cfg/projects.json.next" && mv "$ccd/cfg/projects.json.next" "$ccd/cfg/projects.json"
+  out="$( ( ccd_env; printf '{"name":"Old4"}' | cmd_project_set ) 2>&1 )"; rc=$?
+  case "$out" in
+    *"claude_config_dir on Old4 dropped — it is not read; pick the account in the project editor"*)
+      [ "$rc" -eq 0 ] && ok "project-set drops a claude_config_dir the migration left in place, and says so" || bad "project-set Old4: rc=$rc $out" ;;
+    *) bad "project-set Old4: rc=$rc $out" ;;
+  esac
+  [ "$("$JQ" -c '.projects[] | select(.name=="Old4") | {p: .platform, c: has("claude_config_dir"), sc: ((.security|objects)//{} | has("claude_config_dir")), se: ((.security|objects)//{}).enabled}' "$ccd/cfg/projects.json")" \
+      = '{"p":"openai","c":false,"sc":false,"se":false}' ] \
+    && ok "and the field is gone at both levels, the rest of the project kept" \
+    || bad "Old4 after project-set: $("$JQ" -c '.projects[] | select(.name=="Old4")' "$ccd/cfg/projects.json")"
 
   echo "job_account() — its own, else its project's on the same platform, else the Default"
   local ja="$tmp/jacct"; mkdir -p "$ja/a" "$ja/b" "$ja/c" "$ja/prechecks"
@@ -1183,7 +1210,9 @@ JSON
              {"name":"PO","platform":"openai","account":"c"},
              {"name":"PS","account":"a","security":{"enabled":true,"model":"claude-opus-5"}},
              {"name":"PX","account":"a","security":{"enabled":true,"platform":"openai","model":"gpt-5.6-sol"}},
-             {"name":"PZ","security":{"enabled":true,"model":"claude-opus-5","account":"zz"}}]}
+             {"name":"PZ","account":"a","security":{"enabled":true,"model":"claude-opus-5","account":"zz"}},
+             {"name":"PB","account":"a","security":{"enabled":true,"model":"claude-opus-5","account":"b"}},
+             {"name":"PD","account":"a","security":{"enabled":true,"model":"claude-opus-5","account":"default"}}]}
 JSON
   cat > "$ja/jobs.json" <<'JSON'
 {"jobs":[{"id":"own","project":"PA","account":"b","prompt":"x"},
@@ -1192,7 +1221,8 @@ JSON
          {"id":"other-platform","project":"PA","platform":"openai","prompt":"x"},
          {"id":"none","project":"PN","prompt":"x"},
          {"id":"loose","prompt":"x"},
-         {"id":"codex-inherits","project":"PO","prompt":"x"}]}
+         {"id":"codex-inherits","project":"PO","prompt":"x"},
+         {"id":"reproject","project":"PA","account":"b","prompt":"x"}]}
 JSON
   printf '{"resolved":{},"openai":{"at":1,"source":"fixture","models":[{"slug":"gpt-5.6-sol","visibility":"list","priority":1,"efforts":["low"],"default_effort":"low","deprecated_by":"","retires_at":""}]}}\n' > "$ja/models.json"
   ja_env() { PLATFORMS_FILE="$ja/platforms.json"; PROJECTS_FILE="$ja/projects.json"; JOBS_FILE="$ja/jobs.json"
@@ -1202,16 +1232,27 @@ JSON
     && ok "job_account: its own; the project's on the same platform, whether or not the job names it; else default" || bad "job_account: $got"
   # PX's own platform is unset (anthropic) and its account is a; PS's block
   # inherits a (same platform); PX's block runs on openai, so it does not.
-  [ "$( ja_env; account_users anthropic a | tr '\n' ' ' )" = "inherits explicit-same project:PA project:PS project:PX security:PS " ] \
+  # PZ/PB/PD each now have their OWN project account ('a') too, distinct from
+  # what their block names -- proving the derived job reads the BLOCK's
+  # account, not the project's, whenever the block has one of its own.
+  [ "$( ja_env; account_users anthropic a | tr '\n' ' ' )" = "inherits explicit-same project:PA project:PS project:PX project:PZ project:PB project:PD security:PS " ] \
     && ok "account_users follows the same rule: the jobs, then the projects, then the blocks" || bad "users of a: $( ja_env; account_users anthropic a | tr '\n' ' ' )"
-  [ "$( ja_env; account_users anthropic b | tr '\n' ' ' )" = "own security:PA " ] \
+  [ "$( ja_env; account_users anthropic b | tr '\n' ' ' )" = "own reproject security:PA security:PB " ] \
     && ok "and counts a security block by the account it resolves to" || bad "users of b: $( ja_env; account_users anthropic b | tr '\n' ' ' )"
   [ "$( ja_env; job_get "$(security_job_id PS)" '.account' '' )" = "a" ] \
     && ok "an analysis on the project's platform inherits the project's account" || bad "derived PS: $( ja_env; job_get "$(security_job_id PS)" '.account' '' )"
   [ "$( ja_env; job_get "$(security_job_id PX)" '.account' '' )" = "default" ] \
     && ok "one on another platform runs on that platform's Default" || bad "derived PX: $( ja_env; job_get "$(security_job_id PX)" '.account' '' )"
+  # PZ's project carries account 'a' (a REAL, known account) -- so 'default'
+  # below can only come from REJECTING the block's own 'zz'; a bug that read
+  # the block as empty and fell through to the project's would answer 'a'
+  # here instead, wrongly, and this is the assertion that would catch it.
   [ "$( ja_env; job_get "$(security_job_id PZ)" '.account' '' 2>/dev/null )" = "default" ] \
     && ok "an account the platform does not have falls back to the Default" || bad "derived PZ: $( ja_env; job_get "$(security_job_id PZ)" '.account' '' 2>&1 )"
+  [ "$( ja_env; job_get "$(security_job_id PB)" '.account' '' )" = "b" ] \
+    && ok "a block's own account reaches the derived job even though its project has a different one" || bad "derived PB: $( ja_env; job_get "$(security_job_id PB)" '.account' '' )"
+  [ "$( ja_env; job_get "$(security_job_id PD)" '.account' '' )" = "default" ] \
+    && ok "and a block naming default is still WRITTEN on the derived job, not left absent to re-inherit the project's" || bad "derived PD: $( ja_env; job_get "$(security_job_id PD)" '.account' '' )"
 
   echo "set-field, create and project-set — the account is one of the level's own platform"
   out="$( (ja_env; printf 'b' | cmd_set_field inherits account) 2>&1 )"; rc=$?
@@ -1226,6 +1267,16 @@ JSON
   case "$out" in *"account 'b' is not an account of openai — cleared, the job inherits"*)
       [ -z "$( ja_env; job_get own '.account' '' )" ] && ok "a platform change clears an account the new platform does not have, and says so" || bad "account survived" ;;
     *) bad "platform change: rc=$rc $out" ;; esac
+  # reproject has no platform of its own (job_platform inherits its
+  # project's) -- moving it from PA (anthropic) to PO (openai) changes its
+  # EFFECTIVE platform exactly like the platform arm's own move does above,
+  # and its own account 'b' is left stranded the same way.
+  out="$( (ja_env; printf 'PO' | cmd_set_field reproject project) 2>&1 )"; rc=$?
+  case "$out" in *"account 'b' is not an account of openai — cleared, the job inherits"*)
+      [ "$rc" -eq 0 ] && [ -z "$( ja_env; job_get reproject '.account' '' )" ] \
+        && ok "changing a job's project clears an account its new effective platform does not have too" \
+        || bad "account survived a project change: rc=$rc $out" ;;
+    *) bad "project change: rc=$rc $out" ;; esac
   out="$( (ja_env; printf '{"id":"made","project":"PA","account":"c","prompt":"x"}' | cmd_create) 2>&1 )"; rc=$?
   [ "$rc" -ne 0 ] && [ "$out" = "create: account 'c' is not an account of anthropic — anthropic has: default, a, b" ] \
     && ok "create refuses an account of another platform" || bad "create c: rc=$rc $out"
@@ -1238,10 +1289,16 @@ JSON
   out="$( (ja_env; printf '{"name":"PA","security":{"account":"c"}}' | cmd_project_set) 2>&1 )"; rc=$?
   [ "$rc" -ne 0 ] && [ "$out" = "project-set: security.account 'c' is not an account of anthropic — anthropic has: default, a, b" ] \
     && ok "and a block account the block's platform does not have" || bad "project-set sec c: rc=$rc $out"
+  # made (created just above) has no platform of its own either, and its
+  # account 'b' is only valid while PA runs on anthropic -- the project's
+  # platform change below has to strand it exactly as own's own move did,
+  # even though nothing here names made's job directly.
   out="$( (ja_env; printf '{"name":"PA","platform":"openai"}' | cmd_project_set) 2>&1 )"; rc=$?
-  case "$out" in *"account 'a' is not an account of openai — cleared, the project runs on the Default account"*"security.account 'b' is not an account of openai — cleared, the analysis inherits"*)
+  case "$out" in *"account 'a' is not an account of openai — cleared, the project runs on the Default account"*"security.account 'b' is not an account of openai — cleared, the analysis inherits"*"job made: account 'b' is not an account of openai — cleared, the job inherits"*)
       "$JQ" -e '.projects[] | select(.name == "PA") | (has("account") | not) and ((.security | has("account")) | not)' "$ja/projects.json" >/dev/null 2>&1 \
-        && ok "a platform change clears the stored accounts it leaves behind, at both levels, and says so" || bad "stale accounts kept: $("$JQ" -c '.projects[0]' "$ja/projects.json")" ;;
+        && [ -z "$( ja_env; job_get made '.account' '' )" ] \
+        && ok "a platform change clears the stored accounts it leaves behind, at both levels and every job of it, and says so" \
+        || bad "stale accounts kept: $("$JQ" -c '.projects[0]' "$ja/projects.json") made=$( ja_env; job_get made '.account' '' )" ;;
     *) bad "project platform change: rc=$rc $out" ;; esac
   out="$( (ja_env; printf '{"name":"PO","security":{"account":"c"}}' | cmd_project_set) 2>&1 )"; rc=$?
   [ "$rc" -eq 0 ] && [ "$( ja_env; security_get PO '.account' '' )" = "c" ] \
@@ -5587,7 +5644,7 @@ NASTY
   local _instout
   _instout="$(
     mkdir -p "$tmp/inst/fakehome/Library/LaunchAgents" "$tmp/inst/fakebin" \
-             "$tmp/inst/data" "$tmp/inst/config" "$tmp/inst/codexhome" "$tmp/inst/al-pinned"
+             "$tmp/inst/data" "$tmp/inst/config" "$tmp/inst/codexhome" "$tmp/inst/al-pinned" "$tmp/inst/old-acct"
     printf '%s\n' '#!/bin/sh' 'exit 0' > "$tmp/inst/fakebin/launchctl"
     chmod +x "$tmp/inst/fakebin/launchctl"
     printf '%s\n' '#!/bin/sh' 'echo 0.0.0' > "$tmp/inst/fakebin/claude"
@@ -5599,8 +5656,13 @@ NASTY
     MODELS_FILE="$tmp/inst/config/models.json"; PRICING_FILE="$tmp/inst/config/pricing.json"
     TICK_LOG="$tmp/inst/data/tick.log"
     # install now converts the claude_config_dir left in projects.json: never the real file.
+    # PLATFORMS_FILE is shadowed too: accounts_migrate_legacy (below) now
+    # registers an account as a side effect, and that must never land on
+    # whatever platforms.json the rest of this suite happens to share.
     PROJECTS_FILE="$tmp/inst/config/projects.json"; JOBS_FILE="$tmp/inst/config/jobs.json"
-    printf '{"projects":[]}\n' > "$PROJECTS_FILE"; printf '{"jobs":[]}\n' > "$JOBS_FILE"
+    PLATFORMS_FILE="$tmp/inst/config/platforms.json"
+    printf '{"projects":[{"name":"InstP","cwd":"%s","claude_config_dir":"%s"}]}\n' "$tmp/inst" "$tmp/inst/old-acct" > "$PROJECTS_FILE"
+    printf '{"jobs":[]}\n' > "$JOBS_FILE"
     USER_SKILLS="$tmp/inst/fakehome/.claude/skills"
     CODEX_HOME_DIR="$tmp/inst/codexhome"; CODEX_SKILLS="$CODEX_HOME_DIR/skills"
     CLAUDE_BIN="$tmp/inst/fakebin/claude"; CODEX_BIN="$BASE_DIR/test/fake-codex"
@@ -5646,11 +5708,17 @@ PY
     got="$( AGENTLOOP_CLAUDE_CONFIG_DIR="" installed_config_dir )"
     [ "$got" = "$tmp/inst/al-pinned" ] && ok "and off an older plist that carries only CLAUDE_CONFIG_DIR" \
       || bad "older plist -> '$got'"
+    # install calls accounts_migrate_legacy itself now, in cmd_install --
+    # the leftover claude_config_dir seeded onto InstP above proves that
+    # wiring actually runs, not just that the function exists.
+    [ "$("$JQ" -c '.projects[0] | {a: .account, c: has("claude_config_dir")}' "$PROJECTS_FILE")" = '{"a":"old-acct","c":false}' ] \
+      && ok "install itself converts a leftover claude_config_dir into an account" \
+      || bad "InstP after install: $("$JQ" -c '.projects[0]' "$PROJECTS_FILE")"
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_instout" | grep -v '^RESULT '
-  printf '%s\n' "$_instout" | grep -qx 'RESULT ok=6 bad=0' \
-    && ok "cmd_install over a shadowed home: all 6 assertions reach the gate" \
+  printf '%s\n' "$_instout" | grep -qx 'RESULT ok=7 bad=0' \
+    && ok "cmd_install over a shadowed home: all 7 assertions reach the gate" \
     || bad "cmd_install over a shadowed home did not: $(printf '%s\n' "$_instout" | tail -1)"
 
   echo "spent_today() — today's spend is summed without reading all of history"

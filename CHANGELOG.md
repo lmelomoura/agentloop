@@ -36,7 +36,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   project's on the same terms, and `set-field`, `create` and `project-set`
   refuse an account the platform does not have — a platform change clears
   one it leaves behind, and says so. `install` turns a `claude_config_dir`
-  still in `projects.json` into an account.
+  still in `projects.json` into an account. Saving a project drops a
+  leftover `claude_config_dir` too, and a job whose effective platform
+  changes by any route — not only `set-field platform` — loses an account
+  that platform does not have.
 
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate

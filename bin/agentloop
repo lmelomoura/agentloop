@@ -84,7 +84,7 @@ legacy_config_dir_warning() { # one line per project or security block still car
     | (.claude_config_dir // "") as $a | (((.security | objects) // {}).claude_config_dir // "") as $b
     | select($a != "" or $b != "") | .name' "$PROJECTS_FILE" 2>/dev/null \
   | while IFS= read -r n; do
-      printf "WARNING: projects.json: claude_config_dir on %s is not read — accounts live in Settings › Platforms; pick one in the project editor\n" "$n"
+      printf "WARNING: projects.json: claude_config_dir on %s is not read — accounts live in Settings › Platforms; pick one in the project editor (saving the project drops the field)\n" "$n"
     done
 }
 
@@ -97,7 +97,7 @@ legacy_config_dir_warning() { # one line per project or security block still car
 # field, said here and warned about by status.
 accounts_migrate_legacy() { # accounts_migrate_legacy -> one line per level converted or left
   [ -f "$PROJECTS_FILE" ] || return 0
-  local rows name level dir plat nd aid nm
+  local rows name level dir plat nd aid nm existing
   rows="$("$JQ" -r '.projects[]? | select(type == "object") | .name as $n
       | ( ((.claude_config_dir // "") | select(type == "string" and . != "") | [$n, "project", .]),
           ((((.security | objects) // {}).claude_config_dir // "") | select(type == "string" and . != "") | [$n, "security", .]) )
@@ -105,6 +105,22 @@ accounts_migrate_legacy() { # accounts_migrate_legacy -> one line per level conv
   [ -n "$rows" ] || return 0
   while IFS="$(printf '\t')" read -r name level dir; do
     [ -n "$name" ] || continue
+    # A level that already picked an account (in Settings, or by hand) never
+    # needed this directory turned into one -- registering it anyway would
+    # leave an orphan account nobody points at, and claiming it "is now" that
+    # account would be false: the level still runs on the one it already had.
+    if [ "$level" = "project" ]; then existing="$(project_get "$name" '.account' '')"
+    else existing="$(security_get "$name" '.account' '')"
+    fi
+    if [ -n "$existing" ]; then
+      if [ "$level" = "project" ]; then
+        write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n then del(.claude_config_dir) else . end]'
+      else
+        write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n and (.security | type) == "object" then .security |= del(.claude_config_dir) else . end]'
+      fi
+      echo "projects.json: claude_config_dir on $name ($level) dropped — it already runs on the account '$existing'"
+      continue
+    fi
     if [ "$level" = "project" ]; then plat="$(project_get "$name" '.platform' 'anthropic')"
     else
       plat="$(security_get "$name" '.platform' '')"
@@ -130,8 +146,12 @@ accounts_migrate_legacy() { # accounts_migrate_legacy -> one line per level conv
           echo "projects.json: claude_config_dir on $name ($level) left in place — $nd does not exist"; continue
         fi
         nm="$(basename "$nd" | sed 's/^\.//')"
-        if ! aid="$(account_add anthropic "$nm" "$nd")"; then
-          if ! aid="$(account_add anthropic "$nd" "$nd")"; then
+        # The directory is registered as projects.json WROTE it (the operator's
+        # own ~-relative or absolute spelling) -- account_add trims trailing
+        # slashes itself, but never expands it. $nd stays the normalized form
+        # for comparing and for the messages, per account_norm_dir's contract.
+        if ! aid="$(account_add anthropic "$nm" "$dir")"; then
+          if ! aid="$(account_add anthropic "$nd" "$dir")"; then
             echo "projects.json: claude_config_dir on $name ($level) left in place — $aid"; continue
           fi
         fi
@@ -485,19 +505,35 @@ security_derived_jobs() {
     # never re-inherits the project's when the block said Default. One the
     # platform does not have falls back to the Default, with the warning the
     # other fallbacks give.
-    local sacct pplat
-    sacct="$(security_get "$project" '.account' '')"
-    if [ -z "$sacct" ]; then
-      pplat="$(project_get "$project" '.platform' 'anthropic')"
-      case "$pplat" in ''|null) pplat="anthropic" ;; esac
-      platform_known "$pplat" || pplat="anthropic"
-      if [ "$splat" = "$pplat" ]; then
-        sacct="$(project_get "$project" '.account' '')"
-        case "$sacct" in null) sacct="" ;; esac
-      fi
+    #
+    # One jq reads all three fields this needs (the block's own account, the
+    # project's platform, the project's own account) -- this runs once per
+    # security-enabled project on every jobs_json call, and used to fork a jq
+    # per field, up to three of them, through security_get/project_get.
+    # $PROJECTS_FILE is read directly, not through projects_json: the gate
+    # above already proved it exists and parses. Joined on a comma, not a
+    # tab: sacct is empty on most projects (no block of its own sets one),
+    # and bash 3.2's `read` -- with IFS holding only ONE separator, tab or
+    # not -- still drops a field that is empty AND adjacent to another
+    # separator, so a real field like pacct can land in sacct instead. A
+    # comma does not have that failure mode (an account id is
+    # account_slug's own alphabet, a platform one of three fixed words --
+    # neither can ever contain one).
+    local sacct pplat pacct row
+    row="$("$JQ" -r --arg n "$project" '
+        (.projects[] | select(.name == $n)) as $p
+        | (($p.security | objects) // {}) as $s
+        | [ ($s.account // ""), ($p.platform // ""), ($p.account // "") ] | join(",")' "$PROJECTS_FILE" 2>/dev/null)"
+    IFS=',' read -r sacct pplat pacct <<EOF
+$row
+EOF
+    case "$pplat" in ''|null) pplat="anthropic" ;; esac
+    platform_known "$pplat" || pplat="anthropic"
+    if [ -z "$sacct" ] && [ "$splat" = "$pplat" ]; then
+      sacct="$pacct"
     fi
     [ -n "$sacct" ] || sacct="default"
-    if ! account_known "$splat" "$sacct"; then
+    if [ "$sacct" != "default" ] && ! account_known "$splat" "$sacct"; then
       security_warn "security: project '$project' names an account $splat does not have ('$sacct') -- using the Default account"
       sacct="default"
     fi
@@ -7502,6 +7538,17 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
       else
         write_jobs --arg id "$id" --arg v "$value" \
           '.jobs = [.jobs[] | if .id == $id then .project = $v else . end]'
+      fi
+      # A job with no platform of its own inherits its project's (job_platform)
+      # -- so moving it to another project can change what it effectively
+      # runs on, exactly like the `platform)` arm's own move does, and an own
+      # account only the OLD platform had is left stranded the same way.
+      local eff cur
+      eff="$(job_platform "$id")"
+      cur="$(job_get "$id" '.account' '')"
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! account_known "$eff" "$cur"; then
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+        echo "account '$cur' is not an account of $eff — cleared, the job inherits"
       fi ;;
     permission_mode)
       local p
@@ -7750,8 +7797,10 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
   # platform -- judged on the project as it will be once this save merges
   # (jq `. * $p`). A value SENT that is not one is refused; one only STORED
   # that a platform change leaves behind is cleared after the save, and said.
-  local merged mp msp ma msa drop=""
+  local merged mp msp ma msa drop="" had_ccd=false
   merged="$(projects_json | "$JQ" -c --arg n "$name" --argjson p "$partial" '([.projects[] | select(.name == $n)] | first // {}) * $p')"
+  echo "$merged" | "$JQ" -e 'has("claude_config_dir") or (((.security | objects) // {}) | has("claude_config_dir"))' >/dev/null 2>&1 \
+    && had_ccd=true
   mp="$(echo "$merged" | "$JQ" -r '.platform // ""')"; [ -n "$mp" ] || mp="anthropic"; platform_known "$mp" || mp="anthropic"
   msp="$(echo "$merged" | "$JQ" -r '((.security | objects) // {}).platform // ""')"; [ -n "$msp" ] || msp="$mp"; platform_known "$msp" || msp="anthropic"
   ma="$(echo "$merged" | "$JQ" -r '.account // ""')"
@@ -7768,11 +7817,18 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
     fi
     drop="$drop security"
   fi
+  # claude_config_dir is never read (accounts live in Settings; see
+  # accounts_migrate_legacy, install's one-time conversion of it) -- dropped
+  # at both levels on every save, sent or not, since the project editor is
+  # the only cleanup a level the migration left in place ever gets afterwards.
   if projects_json | "$JQ" -e --arg n "$name" 'any(.projects[]; .name==$n)' >/dev/null 2>&1; then
     write_projects --arg n "$name" --argjson p "$partial" \
-      '.projects = [.projects[] | if .name==$n then (. * $p) else . end]'
+      '.projects = [.projects[] | if .name==$n
+          then ((. * $p) | del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end)
+          else . end]'
   else
-    write_projects --argjson p "$partial" '.projects += [$p]'
+    write_projects --argjson p "$partial" \
+      '.projects += [($p | del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end)]'
   fi
   case "$drop" in *project*)
     write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n then del(.account) else . end]'
@@ -7782,6 +7838,24 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
     write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n and (.security | type) == "object" then .security |= del(.account) else . end]'
     echo "security.account '$msa' is not an account of $msp — cleared, the analysis inherits" ;;
   esac
+  [ "$had_ccd" = true ] \
+    && echo "claude_config_dir on $name dropped — it is not read; pick the account in the project editor"
+  # A job's own account can be orphaned by a route other than `set-field
+  # <job> platform` too: this save may have just moved the project (or its
+  # security block) onto a platform that leaves a job's own account behind --
+  # job_platform inherits the project's for a job that names no platform of
+  # its own. One line per job actually cleared.
+  local jid jacct jeff
+  "$JQ" -r --arg n "$name" '.jobs[]? | select(.project == $n) | .id' "$JOBS_FILE" 2>/dev/null \
+  | while IFS= read -r jid; do
+      [ -n "$jid" ] || continue
+      jacct="$(job_get "$jid" '.account' '')"
+      [ -n "$jacct" ] && [ "$jacct" != "null" ] || continue
+      jeff="$(job_platform "$jid")"
+      account_known "$jeff" "$jacct" && continue
+      write_jobs --arg id "$jid" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+      echo "job $jid: account '$jacct' is not an account of $jeff — cleared, the job inherits"
+    done
   # Best effort, and never the reason a save fails: the event is a record of
   # what happened, not a gate on whether it is allowed to happen.
   if security_enabled "$name"; then
