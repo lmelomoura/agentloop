@@ -187,8 +187,12 @@ def decided_sast(conn, analysis_id, listed=None):
     most recent record -- in the finished (`done`/`capped`) analysis of this
     project and repository with the highest id, whatever its branch -- is a
     `sast` the AGENT minted. Semgrep's rows are left out: their identity is
-    built from its own check id and does not drift. Another repository is
-    left out: there the same fingerprint is another thing with the same name
+    built from its own check id and does not drift. The test is on the most
+    recent record's producer: a decided pre-pass identity last written by the
+    agent's own Job 1 re-report of it (producer `agent`) is handed over like
+    any other -- harmless, since that identity is stable and folding into it
+    is what Job 3's first rule asks. Another repository is left out: there
+    the same fingerprint is another thing with the same name
     (the rule `fixed_elsewhere` keeps). And what the checklist of this
     analysis already lists -- this analysis and its baseline -- is left out,
     because the agent already sees those, with the decision's state.
@@ -863,13 +867,12 @@ def _open_findings_by_fingerprint(conn, project, since=None):
 
     A fingerprint never includes the branch, so the same committed secret
     reachable on `main` and `develop` is ONE problem needing one rotation,
-    not two -- `finding_rows` already draws exactly this line between
-    `total` (rows) and `unique` (fingerprints), in the spec's own words 189
-    findings can be 93 problems. Summing per-branch postures, which is what
-    this repository's own two callers used to do, counted that one problem
-    twice -- on the donut AND the category rollup fed from the same numbers
-    -- so the index screen's "critical" meant something different from
-    `finding_rows`'s `unique`, one screen away, using the same word.
+    not two -- the same line `finding_rows` draws, one row per fingerprint.
+    Summing per-branch postures, which is what this repository's own two
+    callers used to do, counted that one problem twice -- on the donut AND
+    the category rollup fed from the same numbers -- so the index screen's
+    "critical" meant something different from the findings browser one
+    screen away, using the same word.
 
     Only OPEN occurrences are collected. A finding resolved (fixed, accepted,
     false_positive) on one branch but still open on another is exposure that
@@ -1135,6 +1138,9 @@ def _group_by_fingerprint(rows, started):
     `_members` rides along for the `path` and `q` filters, which keep a group
     when ANY member matches -- a file can move on one branch and not on the
     other -- and is dropped before a row leaves `finding_rows`.
+
+    Grouping spans the project's repositories, as the donut and the decision
+    key do: one fingerprint in two repositories of one project is one row.
     """
     rank = {s: i for i, s in enumerate(GROUP_STATE_ORDER)}
     by_fp = {}

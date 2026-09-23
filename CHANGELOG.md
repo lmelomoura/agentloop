@@ -108,7 +108,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   that does not memoise one. A fold is held to the entry's rule —
   `report-finding` refuses one that changes it — and the agent's final
   summary lists every fold, with where it was found and whether the reading
-  agrees with the decision's reason.
+  agrees with the decision's reason. The checklist prints `decided_sast`
+  ahead of the findings, so an output cut for length keeps it.
 
 - **A job with no schedule window is launched by the tick again.** The
   tick's plan was one tab-separated line per enabled job, read back with

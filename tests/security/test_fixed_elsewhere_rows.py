@@ -186,3 +186,23 @@ def test_git_is_asked_per_branch_pair_not_per_finding(tmp_path, repo, monkeypatc
     rows = _rows(db, {"web": str(repo["path"])}, branch=["develop"])
     assert len(rows) == 40 and all("fixed_elsewhere" in r for r in rows)
     assert calls == {"head_of": 1, "contains": 1}, calls
+
+
+def test_an_unfiltered_group_still_carries_the_open_branchs_fixed_elsewhere(tmp_path, repo):
+    # Every test above filters to one branch before grouping, where
+    # `_group_by_fingerprint` has nothing to do. Unfiltered, develop's open
+    # row and main's fixed row collapse into one group whose representative
+    # is develop (open outranks fixed in GROUP_STATE_ORDER) -- the annotation
+    # must still be read off THAT row's own branch and repo, not lost to the
+    # grouping.
+    db = tmp_path / "l.db"
+    _analysis(db, tmp_path, "develop", repo["dev"], [FP])      # open on develop
+    _analysis(db, tmp_path, "main", repo["c1"], [FP])          # seen on main
+    _analysis(db, tmp_path, "main", repo["c2"], [])            # gone on main at c2
+    (r,) = _rows(db, {"web": str(repo["path"])})                # no branch filter: grouped
+    assert r["state"] in ("new", "open")
+    assert r["branch"] == "develop"
+    assert [b["branch"] for b in r["branches"]] == ["develop", "main"]
+    fe = r["fixed_elsewhere"]
+    assert fe["branch"] == "main" and fe["commit"] == repo["c2"]
+    assert fe["in_this_branch"] is False

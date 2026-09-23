@@ -920,11 +920,11 @@ def test_severity_totals_with_no_project_argument_stays_fleet_wide(conn):
 def test_severity_totals_and_top_categories_count_one_fingerprint_once_across_branches(conn):
     """The reviewer's exact reproduction. A fingerprint never includes the
     branch, so the same committed secret open on `main` AND `develop` is ONE
-    problem needing one rotation -- exactly what `finding_rows`'s own
-    total/unique split already says elsewhere on this same screen (189
-    findings can be 93 problems). Summing each branch's posture -- what both
-    functions used to do -- counted it twice, on both the donut and the
-    category rollup that feeds off the same numbers."""
+    problem needing one rotation -- `finding_rows` groups by fingerprint, one
+    row per finding, the same line this test holds the donut to. Summing
+    each branch's posture -- what both functions used to do -- counted it
+    twice, on both the donut and the category rollup that feeds off the same
+    numbers."""
     fp = "e" * 64
     for br in ("main", "develop"):
         aid = ledger.start_analysis(conn, "web", "web", br, "s", "quick", "r")
@@ -1369,6 +1369,14 @@ def test_the_grouping_state_never_leaves_the_function(conn):
     assert "_members" not in row
     assert all("_members" not in r
                for r in queries.finding_rows(conn, "web", group=False)["rows"])
+
+
+def test_every_state_has_a_place_in_the_grouping_order():
+    """A state missing from GROUP_STATE_ORDER ranks after `fixed`, so `fixed`
+    on one branch would hide it open on another -- the one thing the order
+    exists to prevent. A state added to either vocabulary has to be placed."""
+    assert set(queries.GROUP_STATE_ORDER) == \
+        set(diff.DERIVED_STATES) | set(ledger.DECISION_STATES)
 
 
 def test_finding_rows_carries_a_findings_cwe_and_owasp_class(conn):

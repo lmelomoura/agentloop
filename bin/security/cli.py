@@ -2436,9 +2436,13 @@ def cmd_checklist(args):
     # `decided_sast` rides BESIDE the checklist, never inside it: `findings`
     # is this analysis and its baseline, which every screen and report reads,
     # while the list describes no state of this analysis at all -- it is for
-    # the agent's fold-before-you-mint rule (SKILL.md, Job 3).
-    print(json.dumps({"analysis": analysis, "findings": findings,
-                      "decided_sast": queries.decided_sast(conn, args.analysis, listed=findings)},
+    # the agent's fold-before-you-mint rule (SKILL.md, Job 3). Printed ahead
+    # of `findings`, which carries every row's rationale and candidate: a
+    # shell tool that truncates a long output keeps its head, and the short
+    # list the skill's fold rule depends on must not be the part that is cut.
+    print(json.dumps({"analysis": analysis,
+                      "decided_sast": queries.decided_sast(conn, args.analysis, listed=findings),
+                      "findings": findings},
                      indent=2))
 
 

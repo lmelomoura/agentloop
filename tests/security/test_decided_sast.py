@@ -87,14 +87,38 @@ def test_a_sast_nobody_ruled_on_is_not_handed_over(conn):
     assert queries.decided_sast(conn, main) == []
 
 
-def test_another_project_or_repository_is_another_thing(conn):
-    other = "7" * 64
-    _analysis(conn, "develop", [{"fingerprint": FP}], project="api", repo="api")
-    ledger.set_decision(conn, "api", FP, "accepted", "theirs", "me")
-    _analysis(conn, "develop", [{"fingerprint": other}], repo="web-admin")
-    ledger.set_decision(conn, "web", other, "accepted", "another repository", "me")
+def test_another_project_is_another_thing(conn):
+    """The decision is against project `web`, but the fingerprint's ONLY
+    finished record is in project `api`, repo `web` -- same repo name, so
+    only the `a.project=?` predicate can be the one excluding it."""
+    _analysis(conn, "develop", [{"fingerprint": FP}], project="api", repo="web")
+    ledger.set_decision(conn, "web", FP, "accepted", "theirs", "me")
     main = _analysis(conn, "main", state="running")
     assert queries.decided_sast(conn, main) == []
+
+
+def test_another_repository_is_another_thing(conn):
+    """Project `web` on both sides; the fingerprint's ONLY finished record is
+    in repo `web-admin`, so only the `a.repo=?` predicate can be the one
+    excluding it -- the same fingerprint in another repository is another
+    thing with the same name (the rule `fixed_elsewhere` keeps)."""
+    _analysis(conn, "develop", [{"fingerprint": FP}], repo="web-admin")
+    ledger.set_decision(conn, "web", FP, "accepted", "another repository", "me")
+    main = _analysis(conn, "main", state="running")
+    assert queries.decided_sast(conn, main) == []
+
+
+def test_a_capped_analysis_is_a_finished_record(conn):
+    """`capped` is a finished analysis -- the operator stopped it early, but
+    it closed -- same as `done`. Its finding is the newest one on record and
+    must be the one handed over, title and all."""
+    _analysis(conn, "develop", [{"fingerprint": FP, "title": "the done run's words"}])
+    _analysis(conn, "develop", [{"fingerprint": FP, "title": "the capped run's words"}],
+              state="capped")
+    ledger.set_decision(conn, "web", FP, "accepted", "why", "me")
+    main = _analysis(conn, "main", state="running")
+    (entry,) = queries.decided_sast(conn, main)
+    assert entry["title"] == "the capped run's words"
 
 
 def test_the_newest_finished_record_describes_the_entry(conn):
