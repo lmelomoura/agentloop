@@ -849,7 +849,8 @@ def test_api_models_lists_the_registered_accounts(srv):
     _write_platforms(srv, {
         "anthropic": {"enabled": True, "bin": "", "models": ["claude-opus-5"],
                       "accounts": [{"id": "a", "name": "A", "dir": "~/.claude-a"}, {"id": "", "name": "x", "dir": "/y"},
-                                   "junk", {"id": "default", "name": "D", "dir": "/z"}]},
+                                   "junk", {"id": "default", "name": "D", "dir": "/z"},
+                                   {"id": "Al_pha", "name": "B", "dir": "/b"}]},
         "openai": {"enabled": True, "bin": "", "models": [], "accounts": "oops"},
         "opencode": {"enabled": False, "bin": "", "models": []}})
     p = srv.list_models()["platforms"]
