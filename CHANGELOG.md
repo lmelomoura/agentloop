@@ -63,6 +63,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   five hours no longer holds another's runs back. The statusline feeds the
   account its session runs as, and `agentloop usage` and `status` list every
   account.
+  The dashboard's server relays the account actions and carries the account
+  on every run — finished, from the journal, and live, from the run's slot.
 
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate

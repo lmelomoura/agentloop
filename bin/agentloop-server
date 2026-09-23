@@ -639,7 +639,7 @@ def db_conn():
     return conn
 
 
-SCHEMA_VERSION = "6"   # platform, cost_basis and tokens columns; backfill from result_json.usage
+SCHEMA_VERSION = "7"   # account and account_dir columns: the account each run signed in as
 STREAM_CAP = 2_000_000
 
 
@@ -658,7 +658,7 @@ def db_init(conn):
         precheck_note TEXT, result_json TEXT, stream TEXT, precheck_txt TEXT,
         stderr TEXT, doc TEXT, project TEXT, model TEXT, model_id TEXT,
         note TEXT, resumed_from TEXT, cause TEXT, platform TEXT, cost_basis TEXT,
-        tokens TEXT, pruned INTEGER DEFAULT 0)""")
+        tokens TEXT, account TEXT, account_dir TEXT, pruned INTEGER DEFAULT 0)""")
     try:
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS runs_fts USING fts5(key UNINDEXED, content)")
         return True
@@ -936,13 +936,14 @@ def _upsert(conn, fts, rec, preserve=None):
     conn.execute(
         "INSERT OR REPLACE INTO runs (key, job, start, status, duration, cost, session,"
         " log, forced, precheck_note, result_json, stream, precheck_txt, stderr, doc, project,"
-        " model, model_id, note, resumed_from, cause, platform, cost_basis, tokens, pruned)"
-        # 25 columns, 25 placeholders. This line shipped with 21 once (the
+        " model, model_id, note, resumed_from, cause, platform, cost_basis, tokens, account,"
+        " account_dir, pruned)"
+        # 27 columns, 27 placeholders. This line shipped with 21 once (the
         # `cause` column arrived without its `?`), and the failure mode was
         # vicious: nothing broke until the FIRST new journal line reached this
         # code, then every ingest raised, load_data's except swallowed it, and
         # the dashboard said "No runs recorded yet" over an intact journal.
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (key, rec.get("id", ""), rec.get("start", 0), rec.get("status", ""),
          rec.get("duration", 0), rec.get("cost", 0), rec.get("session", ""),
          rec.get("log", ""), 1 if rec.get("forced") else 0,
@@ -957,6 +958,8 @@ def _upsert(conn, fts, rec, preserve=None):
          # straight from the CLI, which is what "reported" means.
          rec.get("cost_basis") or "reported",
          _tokens_json(rec, art),
+         rec.get("account") or "",
+         rec.get("account_dir") or "",
          pruned))
     if fts:
         conn.execute("DELETE FROM runs_fts WHERE key=?", (key,))
@@ -1017,6 +1020,8 @@ def ingest():
                 # Which CLI ran it, how its cost is known, and its token
                 # counts as JSON. Additive, like `cause` before them.
                 ("platform", "TEXT"), ("cost_basis", "TEXT"), ("tokens", "TEXT"),
+                # The account a run signed in as, and the directory its variable carried.
+                ("account", "TEXT"), ("account_dir", "TEXT"),
                 ("pruned", "INTEGER DEFAULT 0"),
             ]
             for name, decl in canon:
@@ -1669,7 +1674,9 @@ def active_runs_for(jid):
                     "resume_of": _read("resume_of"),
                     # what launched it, as the engine wrote it: "true",
                     # "false", or "" for a slot from before the breadcrumb
-                    "forced": _read("forced")})
+                    "forced": _read("forced"),
+                    # the account the run signs in as, and the directory its variable carries
+                    "account": _read("account"), "account_dir": _read("account_dir")})
     return out
 
 
@@ -2339,6 +2346,7 @@ def load_live_detail(jid, start_i):
            "project": job.get("project") or "", "model": job.get("model") or "",
            "model_id": _model_id_from_stream(stream),
            "platform": _platform_from_stream(stream, job_platform),
+           "account": (slot or {}).get("account") or "", "account_dir": (slot or {}).get("account_dir") or "",
            "cost_basis": "", "live": True}
     interactive = bool(job.get("interactive"))
     return {"record": rec, "live": True, "interactive": interactive, "phase": phase,
@@ -2388,7 +2396,8 @@ def load_run_detail(jid, start):
            "cause": row["cause"] or "",
            "model": row["model"] or "", "model_id": row["model_id"] or "",
            "platform": row["platform"] or "anthropic",
-           "cost_basis": row["cost_basis"] or "reported"}
+           "cost_basis": row["cost_basis"] or "reported",
+           "account": row["account"] or "", "account_dir": row["account_dir"] or ""}
     detail = {"record": rec, "agent": {}, "precheck": row["precheck_txt"] or "",
               "stderr": (row["stderr"] or "")[:8000], "turns": []}
     try:
@@ -2600,6 +2609,30 @@ PLATFORM_PERMISSIONS = {
         {"v": "read-only", "label": "read-only — no edit, write, bash or subagents"},
     ],
 }
+
+# The two platforms whose CLI keeps one signed-in account per directory
+# (CLAUDE_CONFIG_DIR, CODEX_HOME). OpenCode's credentials are its providers.
+ACCOUNT_PLATFORMS = ("anthropic", "openai")
+
+
+def _accounts_of(entry):
+    """The accounts Settings registered on one platform, exactly as the
+    engine's accounts_json keeps them: well-formed {id, name, dir} only, never
+    one called default (the Default is the install's own and never stored)."""
+    raw = entry.get("accounts") if isinstance(entry, dict) else None
+    out = []
+    for a in raw if isinstance(raw, list) else []:
+        if not isinstance(a, dict):
+            continue
+        aid, name, d = a.get("id"), a.get("name"), a.get("dir")
+        if not all(isinstance(x, str) and x for x in (aid, name, d)) or aid == "default":
+            continue
+        if not re.fullmatch(r"[a-z0-9-]+", aid):
+            continue
+        out.append({"id": aid, "name": name, "dir": d})
+    return out
+
+
 ANTHROPIC_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
 MODEL_FAMILIES = [
@@ -2944,16 +2977,21 @@ def platform_entry(p, cfg, jobs, projects, resolved, catalog_slugs):
     b, src = platform_bin(p, entry)
     default = models[0] if models else ""
     using, using_on, n_jobs, n_enabled = jobs_using(p, jobs, projects, resolved, default, catalog_slugs)
-    return {"supported": p not in PLATFORMS_PLANNED, "enabled": enabled,
-            "usable": enabled and bool(models), "bin": b, "bin_source": src,
-            # The engine's own test (`-f && -x`): a directory is executable
-            # to os.access and is not a binary.
-            "bin_found": os.path.isfile(b) and os.access(b, os.X_OK), "models_enabled": models,
-            # jobs_on_platform/jobs_using: everything CONFIGURED here, parked
-            # jobs included -- the count the page shows. The *_enabled twins:
-            # only what would run right now.
-            "jobs_on_platform": n_jobs, "jobs_on_platform_enabled": n_enabled,
-            "jobs_using": using, "jobs_using_enabled": using_on}
+    out = {"supported": p not in PLATFORMS_PLANNED, "enabled": enabled,
+           "usable": enabled and bool(models), "bin": b, "bin_source": src,
+           # The engine's own test (`-f && -x`): a directory is executable
+           # to os.access and is not a binary.
+           "bin_found": os.path.isfile(b) and os.access(b, os.X_OK), "models_enabled": models,
+           # jobs_on_platform/jobs_using: everything CONFIGURED here, parked
+           # jobs included -- the count the page shows. The *_enabled twins:
+           # only what would run right now.
+           "jobs_on_platform": n_jobs, "jobs_on_platform_enabled": n_enabled,
+           "jobs_using": using, "jobs_using_enabled": using_on}
+    # Only the two platforms whose CLI keeps an account per directory; the
+    # editors read the list to offer an account after the platform.
+    if p in ACCOUNT_PLATFORMS:
+        out["accounts"] = _accounts_of(entry)
+    return out
 
 
 def list_models():
@@ -3816,14 +3854,20 @@ def security_decide(body):
 
 
 def platform_action(op, body):
-    """The six Settings ops, each one `agentloop platform <verb> <platform>` -- the
+    """The Settings ops, each one `agentloop platform <verb> <platform>` -- the
     engine validates and refuses; this only shapes the request and relays the answer."""
     platform = str(body.get("platform", "") or "").strip()
     if platform not in PLATFORM_REGISTRY:
         return 400, {"error": "unknown platform"}
-    verb = op[len("platform_"):].replace("_", "-")     # check enable disable set-bin models set-models
+    # check enable disable set-bin models set-models accounts account-add account-edit account-remove
+    verb = op[len("platform_"):].replace("_", "-")
     args = ["platform", verb, platform]
     stdin = None
+
+    def text(key):
+        v = body.get(key, "")
+        return v if isinstance(v, str) else None
+
     if op == "platform_set_bin":
         args.append(str(body.get("bin", "") or ""))
     elif op == "platform_set_models":
@@ -3831,13 +3875,35 @@ def platform_action(op, body):
         if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
             return 400, {"error": "models must be a list of ids"}
         stdin = json.dumps(models)
+    elif op == "platform_check":
+        acct = body.get("account")
+        if acct not in (None, ""):
+            if not isinstance(acct, str):
+                return 400, {"error": "account must be an id"}
+            args.append(acct)
+    elif op == "platform_account_add":
+        name, d = text("name"), text("dir")
+        if name is None or d is None:
+            return 400, {"error": "name and dir must be text"}
+        args += [name, d]
+    elif op == "platform_account_edit":
+        aid, name, d = text("id"), text("name"), text("dir")
+        if not aid or name is None or d is None:
+            return 400, {"error": "id, name and dir must be text"}
+        args += [aid, name, d]
+    elif op == "platform_account_remove":
+        aid = text("id")
+        if not aid:
+            return 400, {"error": "missing account id"}
+        args.append(aid)
     ok, out = al(args, stdin=stdin)
-    if ok and op in ("platform_check", "platform_models"):
+    if ok and op in ("platform_check", "platform_models", "platform_accounts"):
         try:
             payload = json.loads(out)
         except ValueError:
             return 500, {"ok": False, "output": out}
-        return 200, {"ok": True, ("check" if op == "platform_check" else "catalog"): payload}
+        key = {"platform_check": "check", "platform_models": "catalog", "platform_accounts": "accounts"}[op]
+        return 200, {"ok": True, key: payload}
     return (200 if ok else 500), {"ok": ok, "output": out}
 
 
@@ -4137,7 +4203,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(code, payload)
 
         if op in ("platform_check", "platform_enable", "platform_disable",
-                  "platform_set_bin", "platform_models", "platform_set_models"):
+                  "platform_set_bin", "platform_models", "platform_set_models",
+                  "platform_accounts", "platform_account_add", "platform_account_edit",
+                  "platform_account_remove"):
             code, payload = platform_action(op, body)
             return self._send(code, payload)
 
@@ -4402,7 +4470,8 @@ class Handler(BaseHTTPRequestHandler):
             if field not in ("interval_seconds", "active_hours", "active_days",
                              "max_budget_usd", "daily_budget_usd", "model", "timeout_seconds",
                              "stall_timeout_seconds", "effort", "interactive", "max_parallel",
-                             "description", "cwd", "permission_mode", "project", "platform"):
+                             "description", "cwd", "permission_mode", "project", "platform",
+                             "account"):
                 return self._send(400, {"error": "bad field"})
             ok, out = al(["set-field", jid, field], stdin=value)
         else:

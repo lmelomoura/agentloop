@@ -805,3 +805,60 @@ def test_price_of_falls_back_to_defaults_row_by_row(srv):
     assert by["gpt-5.6-sol"]["price"]["cache_write"] == 0
     assert by["gpt-5.6-terra"]["price"]["at"] is None
     assert by["gpt-5.4-mini"]["price"] is None
+
+
+def test_account_actions_relay_to_the_engine(srv, monkeypatch):
+    seen = []
+
+    def fake(args, stdin=None):
+        seen.append(args)
+        if args[1] == "accounts":
+            return True, '[{"id":"default","name":"Default","dir":"~/.claude","account_dir":"","builtin":true,"check":{"ready":true,"account":"a","reason":""},"used_by":{"jobs":[],"projects":[],"security":[]}}]'
+        if args[1] == "account-remove":
+            return False, "platform account-remove: 'A' is used by j1 — move them to another account first"
+        return True, "account 'A' added on anthropic (id a) — signed in as a@example.org · max plan"
+    monkeypatch.setattr(srv, "al", fake)
+    code, payload = srv.platform_action("platform_accounts", {"platform": "anthropic"})
+    assert code == 200 and payload["accounts"][0]["id"] == "default"
+    assert srv.platform_action("platform_account_add", {"platform": "anthropic", "name": "A", "dir": "~/.claude-a"})[0] == 200
+    srv.platform_action("platform_account_edit", {"platform": "anthropic", "id": "a", "name": "A2", "dir": "~/.claude-a"})
+    code, payload = srv.platform_action("platform_account_remove", {"platform": "anthropic", "id": "a"})
+    assert code == 500 and "is used by j1" in payload["output"]
+    srv.platform_action("platform_check", {"platform": "anthropic", "account": "a"})
+    srv.platform_action("platform_check", {"platform": "anthropic"})
+    assert seen == [["platform", "accounts", "anthropic"],
+                    ["platform", "account-add", "anthropic", "A", "~/.claude-a"],
+                    ["platform", "account-edit", "anthropic", "a", "A2", "~/.claude-a"],
+                    ["platform", "account-remove", "anthropic", "a"],
+                    ["platform", "check", "anthropic", "a"],
+                    ["platform", "check", "anthropic"]]
+    assert srv.platform_action("platform_account_add", {"platform": "anthropic", "name": 3, "dir": "/x"})[0] == 400
+    assert srv.platform_action("platform_account_remove", {"platform": "anthropic"})[0] == 400
+    assert srv.platform_action("platform_account_edit", {"platform": "anthropic", "name": "A", "dir": "/x"})[0] == 400
+    assert srv.platform_action("platform_check", {"platform": "anthropic", "account": ["a"]})[0] == 400
+
+
+def test_the_account_actions_are_routed(srv):
+    src = (REPO / "bin" / "agentloop-server").read_text()
+    route = src[src.index('if op in ("platform_check"'):][:400]
+    for op in ("platform_accounts", "platform_account_add", "platform_account_edit", "platform_account_remove"):
+        assert f'"{op}"' in route, f"{op} is not routed to platform_action"
+
+
+def test_api_models_lists_the_registered_accounts(srv):
+    _write_platforms(srv, {
+        "anthropic": {"enabled": True, "bin": "", "models": ["claude-opus-5"],
+                      "accounts": [{"id": "a", "name": "A", "dir": "~/.claude-a"}, {"id": "", "name": "x", "dir": "/y"},
+                                   "junk", {"id": "default", "name": "D", "dir": "/z"}]},
+        "openai": {"enabled": True, "bin": "", "models": [], "accounts": "oops"},
+        "opencode": {"enabled": False, "bin": "", "models": []}})
+    p = srv.list_models()["platforms"]
+    assert p["anthropic"]["accounts"] == [{"id": "a", "name": "A", "dir": "~/.claude-a"}]
+    assert p["openai"]["accounts"] == []
+    assert "accounts" not in p["opencode"]
+
+
+def test_the_server_lets_account_through_set_field():
+    src = (REPO / "bin" / "agentloop-server").read_text()
+    allow = src[src.index('elif op == "set_field"'):][:900]
+    assert '"account"' in allow
