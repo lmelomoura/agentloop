@@ -46,7 +46,7 @@ import { changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, e
          platformOptions, hiddenModelCount, modelEnabled, DISABLED_SUFFIX,
          costParts, tokensText,
          dayNumbers, shapeRepoRows, projectStepError } from "./editor-domain.js";
-import { renderSettingsPage, settingsSummary, platformStatus, setupBanner } from "./settings.js";
+import { renderSettingsPage, settingsSummary, platformStatus, setupBanner, newerModelNotes } from "./settings.js";
 
 function init(cc){
   bindPage(cc);
@@ -249,4 +249,9 @@ window.ALApp = { init, visibleJobs, jobFilters, bulkOn,
                  // tests pin standing alone; setupBanner is the strip a
                  // later task mounts on Overview and Jobs while nothing is
                  // configured, reached from the page the same way.
-                 renderSettingsPage, settingsSummary, platformStatus, setupBanner };
+                 renderSettingsPage, settingsSummary, platformStatus, setupBanner,
+                 // newerModelNotes: the releases waiting for `claude update`,
+                 // one sentence each -- the Anthropic card draws them, and the
+                 // job editor's model help line (applyPlatformToJobEditor in
+                 // bin/dashboard.html) reaches them through here.
+                 newerModelNotes };

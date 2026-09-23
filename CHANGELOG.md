@@ -83,7 +83,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   launch in between runs on the kept id without probing. `resolve-models`
   exits 1 when a family's pass was cut short. `test/fake-claude` answers
   from the real capture, committed as
-  `test/fixtures/claude-probe-not-logged-in.*`.
+  `test/fixtures/claude-probe-not-logged-in.*`. A family entry that is not
+  an object no longer takes `/api/models` down.
 
 - **A family resolves to the newest model the API serves the installed CLI,
   even one that CLI has never heard of.** Two defects sat on the probe's
@@ -255,9 +256,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   version it needs and the one installed) and no verdict — and the pass
   writes the newest such release down next to the family in
   `config/models.json` (`resolved.<family>.newer`). It is said once per pass
-  in `tick.log`: *claude-opus-5-5 is out and needs Claude Code 2.1.280
-  (installed 2.1.258): run claude update*. It goes by itself: while a
-  release waits, the tick asks the
+  in `tick.log` and on the dashboard, on the Anthropic card in Settings ›
+  Platforms and in the job editor's model help: *claude-opus-5-5 is out and
+  needs Claude Code 2.1.280 (installed 2.1.258): run claude update*.
+  `/api/models` carries it as `platforms.anthropic.newer`, never as a model a
+  job can pick. It goes by itself: while a release waits, the tick asks the
   CLI its version (only then — it runs every minute), probes again as soon
   as the version changes, and a pass that meets no such release drops the
   note. `resolve-models` prints it next to the family.

@@ -3758,6 +3758,56 @@ def test_note_from_output_keeps_only_the_lines_after_the_first(srv, tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_release_kept_for_a_newer_cli_is_one_sentence_that_says_what_to_run(srv, tmp_path):
+    """/api/models carries each release the API keeps for a newer Claude
+    Code -- the engine records it off the probe's 400 -- and the page says it
+    in the words tick.log gets. On 2026-09-22 Opus 5.5 was out, needed
+    2.1.280, and nothing said "run claude update". With the live check at
+    hand (the Settings card), a CLI that is no longer the one the release
+    was recorded against says so: the tick probes again on its own."""
+    js = _app_js(srv)
+    script = tmp_path / "newer-notes.js"
+    script.write_text(_plainfn(js, "newerModelNotes") + """
+    const A = {newer: [{family: "opus", id: "claude-opus-5-5", needs: "2.1.280", installed: "2.1.258", at: 1},
+                       {family: "fable", id: "claude-fable-5-1", needs: "2.1.251", installed: "", at: 1}]};
+    console.log(JSON.stringify({
+      plain: newerModelNotes(A, null),
+      same: newerModelNotes(A, {version: "2.1.258 (Claude Code)"}),
+      updated: newerModelNotes({newer: [A.newer[0]]}, {version: "2.1.280 (Claude Code)"}),
+      none: newerModelNotes({newer: []}, null),
+      old: newerModelNotes({}, null),
+      missing: newerModelNotes(undefined, undefined),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["plain"] == [
+        "claude-opus-5-5 is out and needs Claude Code 2.1.280 (installed 2.1.258): run claude update",
+        "claude-fable-5-1 is out and needs Claude Code 2.1.251 (installed version unknown): run claude update"]
+    assert out["same"] == out["plain"], "the CLI the release was recorded against adds nothing"
+    assert out["updated"] == [
+        "claude-opus-5-5 is out and needs Claude Code 2.1.280 (installed 2.1.258): run claude update"
+        " — Claude Code is 2.1.280 now: the next tick probes again"]
+    assert out["none"] == [] and out["old"] == [] and out["missing"] == []
+
+
+def test_the_anthropic_card_and_the_job_editor_say_which_release_waits(srv):
+    """Where the operator looks for a model: the Anthropic card in Settings,
+    one warn note per release right under the header, and the job editor's
+    model help line, on Anthropic only."""
+    app = _app_js(srv)
+    card = _plainfn(app, "platformCard")
+    assert "newerModelNotes(entry, check)" in card, "platformCard must say which release waits"
+    assert '"platnote warn"' in card, "each one as a warn note"
+    assert "newerModelNotes" in app.split("window.ALApp = {", 1)[1], "newerModelNotes is not on window.ALApp"
+    css, _ = srv.static_asset("app.css")
+    assert ".platnote.warn{" in css, "the warn note has a style of its own"
+    fn = _plainfn(_js(srv), "applyPlatformToJobEditor")
+    assert 'p==="anthropic" ? ALApp.newerModelNotes(PLATFORMS.anthropic, null) : []' in fn, \
+        "the job editor's help line must name a release that waits for claude update"
+    assert fn.index("newerModelNotes") < fn.index('$("ed-model-help").textContent='), "and read it before the line is written"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_the_session_line_only_prefixes_an_anthropic_account(srv, tmp_path):
     """The engine already phrases Codex's ("Logged in using ChatGPT") and
     OpenCode's ("N credentials -- providers: ...") own checks; only

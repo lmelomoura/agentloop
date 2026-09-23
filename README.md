@@ -874,7 +874,23 @@ probes a day, and real turns only on the ids that are served — two at most. A
 release the API serves only to a newer CLI cannot be found this way: it refuses
 the probe with a 400 naming the version required (Opus 5.5 needed Claude Code
 2.1.280), a run on it would fail the same way, and the family stays on the alias
-until you run `claude update`.
+until you run `claude update`. The pass writes that release down next to the
+family in `config/models.json` and says so — one line in `tick.log`, a note on
+the Anthropic card in Settings › Platforms and in the job editor's model help:
+*claude-opus-5-5 is out and needs Claude Code 2.1.280 (installed 2.1.258): run
+claude update*. The tick notices the update by itself: while such a release
+waits it asks the CLI its version each minute (and never otherwise), probes
+again as soon as the version changes, and the note goes once a pass meets no
+release it cannot run.
+
+A probe that gets no verdict at all — *Not logged in*, an API that is down —
+says nothing about the id. The family's search stops there, its id stays what
+the last finished pass found, the CLI's answer goes to `tick.log`, and the pass
+is tried again ten minutes later instead of being trusted for a day;
+`resolve-models` exits 1. Run by hand, keep `USER` in the environment: without
+it the CLI cannot find its login in the keychain and answers *Not logged in* to
+every probe (launchd sets `USER` for the tick, though `launchctl print` does not
+list it).
 
 On the OpenAI platform a model is a catalog slug used verbatim (`gpt-5.6-sol`);
 `agentloop resolve-models openai` reads the catalog from `codex debug models`
