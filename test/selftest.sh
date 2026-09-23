@@ -5554,15 +5554,15 @@ JSON
     && ok "security_close_analysis passes what was read to finish, and unknown without a stream" \
     || bad "security_close_analysis calls: $(cat "$tmp/guides/calls")"
 
-  # The Task calls a run made, off its own stream. `Task` is the roster's name
-  # for the tool `--disallowedTools Agent` used to close; on OpenCode the
-  # normaliser already canonicalises `task` to `Task` (bin/platforms/
-  # opencode_stream.py), so one name is enough here.
+  # The subagents a run launched, off its own stream. BOTH NAMES: a `tool_use`
+  # block carries `Agent` on Claude Code (measured on the block 4.2 acceptance
+  # run) while the init roster and OpenCode's normaliser say `Task`. The
+  # fixture below holds one of each, and the count is 2.
   cat > "$tmp/guides/tasks.ndjson" <<'JSON'
 {"type":"system","subtype":"init"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"1","name":"Task","input":{"description":"verify b1b1","prompt":"You are verifying one security finding"}}]}}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"2","name":"Read","input":{"file_path":"/Users/me/x.py"}}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"3","name":"Task","input":{"description":"verify c2c2","prompt":"You are verifying one security finding"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"3","name":"Agent","input":{"description":"verify c2c2","prompt":"You are verifying one security finding","subagent_type":"general-purpose"}}]}}
 {"type":"result","subtype":"success"}
 JSON
   [ "$(security_task_count "$tmp/guides/tasks.ndjson")" = "2" ] \
