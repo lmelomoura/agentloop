@@ -147,6 +147,116 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   not refuse a re-report made exactly as shown. The checklist prints
   `decided_sast` ahead of the findings, so an output cut for length keeps it.
 
+- **Two writers of `config/models.json` at once no longer lose an update.**
+  Every writer rewrites the file whole — jq into a temporary file, then
+  `mv` — and two do run at once: the tick's detached pass, and a launch
+  whose family has expired, which resolves inline outside that pass. When
+  both read before either wrote, the second `mv` dropped the first one's
+  update — a family's fresh resolution, a release waiting for `claude
+  update`, a failed probe's `failed_at` — until the next pass. Every write
+  of the file now takes one lock, `data/locks/.models.lock`: the families'
+  records, both catalogs and their `stale_at` stamps, and the seed of a
+  missing or unreadable file. It is held for the read-modify-write alone,
+  never for a probe or a catalog command, so a launch waits milliseconds
+  for it, not the minute the pass holds `_models` for. The wait is bounded
+  (`MODELS_LOCK_WAIT`, 10 s at least): a writer that cannot have the lock by
+  then writes nothing and says in `tick.log` what it gave up on and which
+  pid held the lock. A pass cut short then still keeps the newer of the id
+  the file holds and the one it reached, and says it was not recorded
+  rather than promise a retry it never stamped; `resolve-models` exits 1
+  for a family it resolved but could not record. A dead holder's lock is
+  taken at once, as everywhere here, and so is any lock older than the
+  grace (`AGENTLOOP_LOCK_GRACE`, 30 s) and twice the wait, whoever it names,
+  with a line in `tick.log` — no write holds it that long, and a writer that
+  stopped, died under a parent that lives on, or was killed before writing
+  its pid would otherwise turn every later writer away for good and keep
+  the whole pass due. A writer that stalled that long and comes back finds
+  its lock gone: it writes nothing, says so, and never drops the lock the
+  next writer holds. `lock_take` takes the bound as an optional second
+  argument, and a stale lock it cannot remove no longer spins it on `rm`
+  past the bound; its other callers wait as before. The selftest races two
+  real writers through a jq that answers a second late, holds every write
+  path — the seed of a missing or unreadable file too — to a lock held by a
+  live process, and covers a dead holder, an old lock, a lock with no pid,
+  a writer robbed of its lock, a grace set to 1 and a lock that cannot be
+  removed.
+
+- **A model probe that gets no verdict no longer reads as "this model does
+  not exist", and its pass is no longer trusted for a day.** A CLI with no
+  session answers every probe with `Not logged in · Please run /login`
+  (measured: run with no `USER` in its environment, Claude Code cannot find
+  its keychain login), and every one of them read as a refusal: each family
+  silently stayed on its alias, and the pass was cached as fresh for 24
+  hours. Such an answer — or an API error, or no result event at all — now
+  ends that family's search at once and is never written as fresh (`.at` is
+  left alone; `failed_at`, the count in a row and the CLI's answer are
+  added). The family keeps the newer of the id its last finished pass found
+  and the best this pass reached, so never below the CLI's own alias; the
+  probe and the CLI's words go to `tick.log`; and the tick probes again only
+  the families whose pass failed, ten minutes later (`MODELS_RETRY`), twice
+  as long after each failure in a row, never more than a day apart — folded
+  into the whole pass when that is due within those ten minutes, and only
+  daily while Settings keeps Anthropic off, when a launch spends no probe
+  either (it is refused next). The other catalogs and the price table keep
+  their daily pace, and a launch in between runs on the kept id without
+  probing. The tick's line says why a pass runs (*cache older than 86400s*,
+  *retrying opus after a failed probe*, *Claude Code went from 2.1.258 to
+  2.1.280 while a release waited for it*). `resolve-models` exits 1 when a
+  family's pass was cut short, and `resolve-models anthropic opus` probes
+  one family. The probe reads the CLI's result event, whatever other JSON
+  surrounds it, and keeps what the CLI printed when there is none.
+  `test/fake-claude` answers from the real capture, committed as
+  `test/fixtures/claude-probe-not-logged-in.*`. Hand edits no longer wedge
+  the pass: a stamp written as text reads as 0 (it read as an unreadable
+  file, due on every tick, and a cut pass kept the text, so the whole pass
+  ran every minute), an entry under `.resolved` that is no Claude family
+  used to keep it due every minute, a `.resolved` that is not an object
+  could never be written again, and a family entry that is not an object
+  took `/api/models` down.
+
+- **A family resolves to the newest model the API serves the installed CLI,
+  even one that CLI has never heard of.** Two defects sat on the probe's
+  path. The minor probe asked only for 3, 2 and 1, and releases skip minors
+  (5 went straight to 5.5). And for every request that goes out for an id it
+  does not recognise, the CLI writes `[claude-code:unrecognized_model] {...}`
+  to stderr, which `model_probe_ok` parsed together with the JSON: jq
+  failed, and a served id the CLI did not know — a whole new major included
+  — read as refused, though finding exactly those ids is the resolver's job.
+  The probe now reads stdout alone and asks for every minor from 9 down,
+  stopping at the first one served. Opus 5.5 itself was beyond any probe on
+  2026-09-22: the API serves it only to Claude Code 2.1.280 or newer and
+  answers an older CLI with a 400 naming that version (fable 5.1 likewise
+  needs 2.1.251), so a run on it would have failed too, and `claude update`
+  was the one way to it. The probe reads that 400 as the refusal it is, and
+  the README now says a release like that waits for the update. What the
+  probe costs is written above the loop and in the README: a refused id is
+  turned away before any turn runs (measured: $0, no tokens, about five
+  seconds), so a family is at most eleven probes and two turns a day.
+  `test/fake-claude` answers these probes from real captures — the 404, the
+  400 and the CLI's stderr line are committed under `test/fixtures/` — and
+  the selftest holds the search to the order it probes in and to where it
+  stops.
+
+- **A family never resolves to a model older than the CLI's own alias.**
+  When the alias already carried a minor (CLI 2.1.280's `opus` is
+  `claude-opus-5-5`), the minor probe took the first of 5-3, 5-2 and 5-1 the
+  API still served — a silent downgrade on the next daily refresh. Probes now
+  start above the baseline's own minor. A dated alias's 8-digit suffix is a
+  snapshot date, not a minor: today's `claude-haiku-4-5-20251001` is 4.5 and
+  comes back unchanged, and `claude-opus-4-20250514` is 4.0, so the 4.1
+  above it is still found.
+
+- **Every Anthropic model list is newest first — the dashboard's picker and
+  Settings › Platforms.** Both compared version numbers as raw lists, where
+  the shorter list wins: the day Opus 5.5 shipped, `claude-opus-5` was
+  listed above `claude-opus-5-5`, `claude-fable-5` above `claude-fable-5-1`,
+  and `claude-opus-4-20250514` above `claude-opus-4-8`, its date read as a
+  minor. A missing minor now counts as 0 and a date only orders the
+  snapshots of one version — the undated alias first, then the newest date —
+  in the server's `list_models` and the engine's `anthropic_catalog_ids`
+  alike. Both are held to one fixture: every id the scan finds in the real
+  CLI 2.1.280 binary, in the order the lists must show.
+
 - **A job with no schedule window is launched by the tick again.** The
   tick's plan was one tab-separated line per enabled job, read back with
   `IFS=tab` -- and a tab is IFS whitespace, which bash folds: a run of it
@@ -264,6 +374,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   resize, the way a native select does.
 
 ### Added
+
+- **A model the API keeps for a newer Claude Code is named, with the command
+  that gets it.** On 2026-09-22 Opus 5.5 was out, the API served it only to
+  Claude Code 2.1.280 or newer, 2.1.258 was installed, and nothing in
+  agentloop said "run `claude update`": the family pass read the API's 400
+  as "no such id" and moved on. `model_probe_ok` now tells four answers
+  apart — served, refused (the 404), kept for a newer CLI (the 400, with the
+  version it needs and the one installed) and no verdict — and the pass
+  writes the newest such release down next to the family in
+  `config/models.json` (`resolved.<family>.newer`). It is said once per pass
+  in `tick.log` and on the dashboard, on the Anthropic card in Settings ›
+  Platforms and in the job editor's model help: *claude-opus-5-5 is out and
+  needs Claude Code 2.1.280 (installed 2.1.258): run claude update*.
+  `/api/models` carries it as `platforms.anthropic.newer`, never as a model a
+  job can pick. It goes by itself: while a release waits, the tick asks the
+  CLI its version (only then — it runs every minute), probes the Claude
+  families again as soon as `claude --version` differs from what it said
+  when the release was recorded — never from the 400's own text, which the
+  CLI need not repeat — and a pass that meets no such release drops the
+  note. `resolve-models` prints it next to the family.
 
 - **A `sast` finding can carry a `candidate` document** — trace (entrypoint →
   propagation → sink), the control that should have held, confidence,

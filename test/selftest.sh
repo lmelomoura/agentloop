@@ -735,6 +735,20 @@ JSON
   if [ -s "$_gcpid" ] && ! kill -0 "$(cat "$_gcpid")" 2>/dev/null; then ok "and the grandchild that ignored the TERM went with its group on the KILL"
   else bad "the TERM-proof grandchild (pid $(cat "$_gcpid" 2>/dev/null)) outlived the deadline"; kill -9 "$(cat "$_gcpid" 2>/dev/null)" 2>/dev/null; fi
 
+  echo "anthropic_catalog_ids() — the Settings list, every family newest first"
+  # The fixture is every id the scan finds in the real CLI 2.1.280 binary,
+  # laid out in the order the list must show; tests/test_platforms_api.py
+  # holds the dashboard's picker to the same file. The stand-in binary
+  # carries them alphabetically, NUL between, so the order can only come
+  # from the sort. Compared as raw number lists, the shorter list won:
+  # claude-opus-5 listed above claude-opus-5-5, and a date sorted as a minor.
+  LC_ALL=C sort "$BASE_DIR/test/fixtures/claude-cli-model-ids-newest-first.txt" | tr '\n' '\000' > "$tmp/idblob"
+  got="$( CLAUDE_BIN="$tmp/idblob"; MODELS_FILE="$tmp/no-models.json"; JOBS_FILE="$tmp/no-jobs.json"; PROJECTS_FILE="$tmp/no-projects.json"
+          anthropic_catalog_ids | tr '\n' ' ' )"
+  [ "$got" = "$(tr '\n' ' ' < "$BASE_DIR/test/fixtures/claude-cli-model-ids-newest-first.txt")" ] \
+    && ok "newest first: a missing minor is 0, and a date only orders the snapshots of one version" \
+    || bad "anthropic_catalog_ids: $got"
+
   echo "agentloop platform … — the commands the Settings page is made of"
   local pc="$tmp/pc" out rc _pm _pl; mkdir -p "$pc/config" "$pc/data"
   printf '{"jobs":[{"id":"u1","model":"claude-opus-5","prompt":"x"},{"id":"u2","platform":"openai","model":"gpt-a","prompt":"x"}]}\n' > "$pc/config/jobs.json"
@@ -1842,6 +1856,698 @@ EOF
   got="$(CLAUDE_BIN="$tmp/no-such-claude"; model_alias_baseline opus)"
   [ -z "$got" ] && ok "a CLI that cannot run reports nothing, so resolve_family can give up" \
     || bad "a missing CLI invented '$got'"
+
+  echo "resolve_family() — the newest id the API serves this CLI, never one older than its alias"
+  # Each scenario is one world for test/fake-claude's probe mode: what the
+  # family alias points at in that CLI build, the ids the build recognises,
+  # the ids the API serves it, and the ids the API serves only to a newer
+  # build. Every probed id lands in $tmp/rf.log in order, so the order and
+  # the stop are held too, not just the answer.
+  rf() { # rf <family> <alias's id> <ids the CLI knows> <ids the API serves it> [ids gated to a newer CLI] -> the resolution
+    : > "$tmp/rf.log"
+    ( CLAUDE_BIN="$BASE_DIR/test/fake-claude"
+      FAKE_ALIASES="$1=$2" FAKE_CLI_MODELS="$3" FAKE_API_MODELS="$4" FAKE_GATED_MODELS="${5:-}" FAKE_PROBE_LOG="$tmp/rf.log"
+      export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS FAKE_GATED_MODELS FAKE_PROBE_LOG
+      resolve_family "$1" )
+  }
+  # A release that skips minors (5 went straight to 5.5) and that the API
+  # serves to this CLI build although the build does not know it yet -- the
+  # case the resolver exists for. The probe used to ask for 3, 2 and 1 only,
+  # and the stderr line the CLI writes for an id it does not recognise made
+  # even a served one read as refused.
+  got="$(rf opus claude-opus-5 "claude-opus-5 claude-opus-4-8" "claude-opus-5 claude-opus-5-5 claude-opus-4-8")"
+  [ "$got" = "claude-opus-5-5" ] && ok "minors skipped on the way up: claude-opus-5 resolves to claude-opus-5-5" \
+    || bad "claude-opus-5 with 5.5 served resolved to '$got', wanted claude-opus-5-5"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-opus-7 claude-opus-6 claude-opus-5-9 claude-opus-5-8 claude-opus-5-7 claude-opus-5-6 claude-opus-5-5 " ] \
+    && ok "minors are probed highest first, and the first one served ends the search" \
+    || bad "probes: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # 2026-09-22 as it really was: the API served claude-opus-5-5 only to CLI
+  # 2.1.280 or newer, and answered 2.1.258's probe with a 400 naming that
+  # version. A model the installed CLI cannot run is no answer -- a launch on
+  # it fails the same way -- so the family stays on the alias until
+  # `claude update`.
+  got="$(rf opus claude-opus-5 "claude-opus-5 claude-opus-4-8" "claude-opus-5 claude-opus-4-8" "claude-opus-5-5")"
+  [ "$got" = "claude-opus-5" ] && ok "a release gated to a newer CLI (the API's real 400) is never resolved to" \
+    || bad "claude-opus-5 with 5.5 gated to a newer CLI resolved to '$got', wanted claude-opus-5"
+  grep -qx 'claude-opus-5-5' "$tmp/rf.log" && ok "though it was asked for, and kept out as a release for a newer CLI" \
+    || bad "claude-opus-5-5 was never probed: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # The alias already carries a minor (2.1.280: claude-opus-5-5). A lower
+  # minor the API still serves must never win, so the probe starts above the
+  # baseline's own minor and never even asks for it.
+  got="$(rf opus claude-opus-5-5 "claude-opus-5 claude-opus-5-3 claude-opus-5-5" "claude-opus-5 claude-opus-5-3 claude-opus-5-5")"
+  [ "$got" = "claude-opus-5-5" ] && ok "a baseline with a minor is never resolved below itself (5-3 served, 5-5 stays)" \
+    || bad "claude-opus-5-5 resolved to '$got', wanted claude-opus-5-5"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-opus-7 claude-opus-6 claude-opus-5-9 claude-opus-5-8 claude-opus-5-7 claude-opus-5-6 " ] \
+    && ok "and nothing at or below the baseline's minor is probed" || bad "probes: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # Today's haiku alias is a dated snapshot. The 8-digit date is not a minor:
+  # the baseline is 4.5, so 4-9..4-6 are asked, claude-haiku-4-5 (served,
+  # the same model) is not, and the answer stays the id the CLI named.
+  local _h="claude-haiku-4-5-20251001 claude-haiku-4-5 claude-haiku-4 claude-haiku-3-5"
+  got="$(rf haiku claude-haiku-4-5-20251001 "$_h" "$_h")"
+  [ "$got" = "claude-haiku-4-5-20251001" ] && ok "a dated baseline (claude-haiku-4-5-20251001) comes back unchanged" \
+    || bad "claude-haiku-4-5-20251001 resolved to '$got'"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-haiku-6 claude-haiku-5 claude-haiku-4-9 claude-haiku-4-8 claude-haiku-4-7 claude-haiku-4-6 " ] \
+    && ok "and its date is not read as a minor: 4-9..4-6 are probed, nothing built from the date" \
+    || bad "probes: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # A dated alias with no minor at all -- `opus` meant claude-opus-4-20250514
+  # until claude-opus-4-1 shipped. That baseline is 4.0: read as minor
+  # 20250514 it would have probed nothing, and 4.1 would never be found.
+  got="$(rf opus claude-opus-4-20250514 "claude-opus-4-20250514" "claude-opus-4-20250514 claude-opus-4-1")"
+  [ "$got" = "claude-opus-4-1" ] && ok "a dated baseline with no minor is 4.0: claude-opus-4-20250514 resolves to claude-opus-4-1" \
+    || bad "claude-opus-4-20250514 with 4.1 served resolved to '$got', wanted claude-opus-4-1"
+  # A CLI a whole major behind (2026-07-24: `opus` still meant
+  # claude-opus-4-8). The bare major is found first, then its minors from the
+  # top: the baseline's minor 8 belongs to the old major and caps nothing.
+  got="$(rf opus claude-opus-4-8 "claude-opus-4-8" "claude-opus-4-8 claude-opus-5 claude-opus-5-5")"
+  [ "$got" = "claude-opus-5-5" ] && ok "a new major and its minor are found in one pass (4-8 -> 5-5)" \
+    || bad "claude-opus-4-8 with 5 and 5.5 served resolved to '$got', wanted claude-opus-5-5"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-opus-6 claude-opus-5 claude-opus-5-9 claude-opus-5-8 claude-opus-5-7 claude-opus-5-6 claude-opus-5-5 " ] \
+    && ok "and the new major's minors are probed from the top" || bad "probes: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # What the search leaves for whoever records it, besides the id: RF_ID,
+  # the newest release the API keeps for a newer CLI (RF_NEWER, RF_NEEDS,
+  # RF_INSTALLED) and, when a probe had no verdict, which one and why
+  # (RF_PROBE, RF_FAILED, exit 3). One line per world: rc|id|newer|needs|
+  # installed|probe|failed.
+  rfx() { # rfx <family> <alias's id> <ids the CLI knows> <ids the API serves it> [gated ids] [ids with no verdict]
+    : > "$tmp/rf.log"
+    ( CLAUDE_BIN="$BASE_DIR/test/fake-claude"
+      FAKE_ALIASES="$1=$2" FAKE_CLI_MODELS="$3" FAKE_API_MODELS="$4" FAKE_GATED_MODELS="${5:-}" FAKE_FAILED_MODELS="${6:-}" FAKE_PROBE_LOG="$tmp/rf.log"
+      export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS FAKE_GATED_MODELS FAKE_FAILED_MODELS FAKE_PROBE_LOG
+      resolve_family "$1" >/dev/null 2>&1
+      echo "$?|${RF_ID-}|${RF_NEWER-}|${RF_NEEDS-}|${RF_INSTALLED-}|${RF_PROBE-}|${RF_FAILED-}" )
+  }
+  # 2026-09-22 again, now with what the operator lacked that day: the family
+  # stays on the alias, and the search says which release waits for
+  # `claude update`, which version it needs and which one is installed.
+  got="$(rfx opus claude-opus-5 "claude-opus-5 claude-opus-4-8" "claude-opus-5 claude-opus-4-8" "claude-opus-5-5")"
+  [ "$got" = "0|claude-opus-5|claude-opus-5-5|2.1.280|2.1.258||" ] \
+    && ok "a release kept for a newer CLI is named, with the version it needs and the one installed" \
+    || bad "the 2026-09-22 world left '$got'"
+  # Probes run newest first, so the first such release met is the newest.
+  got="$(rfx opus claude-opus-5 "claude-opus-5" "claude-opus-5" "claude-opus-6 claude-opus-5-5")"
+  [ "$got" = "0|claude-opus-5|claude-opus-6|2.1.280|2.1.258||" ] \
+    && ok "of two such releases the newer is named (claude-opus-6 over claude-opus-5-5)" \
+    || bad "two gated releases left '$got'"
+  # No session: the first probe has no verdict, and neither would the next
+  # ten. The search stops there, keeps the best id it has (the alias's), and
+  # exits 3 with the CLI's own words.
+  : > "$tmp/rf.log"
+  got="$( CLAUDE_BIN="$BASE_DIR/test/fake-claude"
+          FAKE_ALIASES="opus=claude-opus-5-5" FAKE_CLI_MODELS="claude-opus-5-5" FAKE_API_MODELS="claude-opus-5-5" FAKE_CLAUDE_LOGGED_OUT=1 FAKE_PROBE_LOG="$tmp/rf.log"
+          export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS FAKE_CLAUDE_LOGGED_OUT FAKE_PROBE_LOG
+          resolve_family opus >/dev/null 2>&1
+          echo "$?|${RF_ID-}|${RF_NEWER-}|${RF_NEEDS-}|${RF_INSTALLED-}|${RF_PROBE-}|${RF_FAILED-}" )"
+  [ "$got" = "3|claude-opus-5-5||||claude-opus-7|Not logged in · Please run /login" ] \
+    && ok "a probe with no verdict ends the family's search: exit 3, the alias's id, which probe and why" \
+    || bad "a logged-out search left '$got'"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-opus-7 " ] && ok "and nothing is probed after it" \
+    || bad "probes after a failed one: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # A session that goes mid-pass, after a newer CLI's release was met: the
+  # release is still reported -- the 400 was a real answer -- and the
+  # search stops at the probe that had none.
+  got="$(rfx opus claude-opus-5 "claude-opus-5" "claude-opus-5" "claude-opus-6" "claude-opus-5-8")"
+  [ "$got" = "3|claude-opus-5|claude-opus-6|2.1.280|2.1.258|claude-opus-5-8|Not logged in · Please run /login" ] \
+    && ok "a release met before the pass was cut short is still named" || bad "a mid-pass failure left '$got'"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-opus-7 claude-opus-6 claude-opus-5-9 claude-opus-5-8 " ] \
+    && ok "and the search stopped at the probe with no verdict" || bad "probes: $(tr '\n' ' ' < "$tmp/rf.log")"
+
+  echo "model_probe_ok() — the JSON answer alone decides, whatever the CLI adds on stderr"
+  # For every request that goes out for an id it does not recognise, the CLI
+  # writes `[claude-code:unrecognized_model] {...}` to stderr -- its own
+  # changelog says so, and both refusals captured here carry it -- and an id
+  # newer than the CLI is what a probe asks for. Parsed together with the
+  # JSON on stdout, that line made jq fail, so a served id the CLI did not
+  # know would have read as refused. The answers are the stand-in's captures.
+  ( CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_CLI_MODELS=""; FAKE_API_MODELS="claude-opus-5-5"
+    export FAKE_CLI_MODELS FAKE_API_MODELS; model_probe_ok claude-opus-5-5 ) 2>/dev/null
+  want "a served id the CLI flags as unrecognized on stderr is accepted" 0 $?
+  ( CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_CLI_MODELS=""; FAKE_API_MODELS="claude-opus-5-5"
+    export FAKE_CLI_MODELS FAKE_API_MODELS; model_probe_ok claude-opus-5-3 ) 2>/dev/null
+  want "an id the API does not serve (the real 404) is refused" 1 $?
+  # Three answers used to read as that same "no such id". The 400 of a
+  # release the API keeps for a newer CLI is an id that exists, and the one
+  # thing that reaches it is `claude update` -- so it is its own answer, with
+  # both versions kept. The 400 names the build that asked; the stand-in
+  # plays 2.1.270 here so the installed version is read, not assumed.
+  got="$( CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_CLI_MODELS=""; FAKE_API_MODELS="claude-opus-5"; FAKE_GATED_MODELS="claude-opus-5-5"; FAKE_CLAUDE_VERSION=2.1.270
+          export FAKE_CLI_MODELS FAKE_API_MODELS FAKE_GATED_MODELS FAKE_CLAUDE_VERSION
+          model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_NEEDS-}|${PROBE_INSTALLED-}|${PROBE_ANSWER-}" )"
+  [ "$got" = "2|2.1.280|2.1.270|" ] \
+    && ok "an id the API serves only to a newer CLI (the real 400) is its own answer, 2, naming the version required and the one installed" \
+    || bad "the 400 of a newer CLI's release read as '$got', wanted '2|2.1.280|2.1.270|'"
+  # A 400 that names the version required but not the build that asked: the
+  # installed one comes from the CLI itself. The real capture with the build
+  # taken out of its sentence, and a stand-in whose --version says 2.1.270.
+  "$JQ" -c '.result = "API Error: 400 This model is not supported; version 2.1.280 or newer is required."' \
+    "$BASE_DIR/test/fixtures/claude-probe-version-gated.json" > "$tmp/probe-400-nobuild.json"
+  printf '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "2.1.270 (Claude Code)"; exit 0; fi\ncat "%s"\nexit 1\n' \
+    "$tmp/probe-400-nobuild.json" > "$tmp/claude-400-nobuild"; chmod +x "$tmp/claude-400-nobuild"
+  got="$( CLAUDE_BIN="$tmp/claude-400-nobuild"; model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_NEEDS-}|${PROBE_INSTALLED-}" )"
+  [ "$got" = "2|2.1.280|2.1.270" ] && ok "a 400 that does not name the build asking is read with the version the CLI itself reports" \
+    || bad "a 400 with no build in it read as '$got', wanted '2|2.1.280|2.1.270'"
+  # The answer is the CLI's result event. More JSON around it -- a notice a
+  # later CLI might print, before or after -- must neither blind every probe
+  # nor stand in for the answer: the real 404 between two such lines is
+  # still a refusal, not "no verdict" and not "served".
+  { printf '%s\n' '{"type":"system","subtype":"notice","message":"something new"}'
+    cat "$BASE_DIR/test/fixtures/claude-probe-unknown-model.json"
+    printf '%s\n' '{"type":"system","subtype":"notice","message":"and something after"}'; } > "$tmp/probe-3objects.json"
+  printf '#!/bin/sh\ncat "%s"\nexit 1\n' "$tmp/probe-3objects.json" > "$tmp/claude-3objects"; chmod +x "$tmp/claude-3objects"
+  ( CLAUDE_BIN="$tmp/claude-3objects"; model_probe_ok claude-opus-5-3 ) 2>/dev/null
+  want "an answer with other JSON objects around it is read by its result event" 1 $?
+  # A CLI with no session answers every id alike -- the real capture, taken
+  # with no USER in the environment -- so the probe learned nothing about
+  # the id. Read as a refusal, every family quietly stayed on its alias and
+  # the pass was cached as fresh for a day. The CLI's own words are kept.
+  got="$( CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_CLI_MODELS=""; FAKE_API_MODELS="claude-opus-5-5"; FAKE_CLAUDE_LOGGED_OUT=1
+          export FAKE_CLI_MODELS FAKE_API_MODELS FAKE_CLAUDE_LOGGED_OUT
+          model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_NEEDS-}|${PROBE_ANSWER-}" )"
+  [ "$got" = "3||Not logged in · Please run /login" ] \
+    && ok "no session is no verdict (3), even for a served id, and the CLI's answer is kept to say why" \
+    || bad "a logged-out probe read as '$got'"
+  # The version is what makes a 400 a newer CLI's release. The real capture
+  # with its sentence swapped: a 400 that names no version says nothing
+  # about the id either.
+  "$JQ" -c '.result = "API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"something else\"}}"' \
+    "$BASE_DIR/test/fixtures/claude-probe-version-gated.json" > "$tmp/probe-400.json"
+  printf '#!/bin/sh\ncat "%s"\nexit 1\n' "$tmp/probe-400.json" > "$tmp/claude-400"; chmod +x "$tmp/claude-400"
+  got="$( CLAUDE_BIN="$tmp/claude-400"; model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_NEEDS-}" )"
+  [ "$got" = "3|" ] && ok "a 400 that names no version is no verdict either, never a newer CLI's release" \
+    || bad "a 400 with no version read as '$got'"
+  # And a CLI that dies without a word: nothing on stdout, exit 1.
+  printf '#!/bin/sh\nexit 1\n' > "$tmp/claude-mute"; chmod +x "$tmp/claude-mute"
+  got="$( CLAUDE_BIN="$tmp/claude-mute"; model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_ANSWER-}" )"
+  [ "$got" = "3|no answer from claude (exit 1)" ] && ok "a CLI that answers nothing is no verdict, and says so with its exit code" \
+    || bad "a mute CLI read as '$got'"
+  # And one that prints something other than a result event: what it printed
+  # is what tick.log gets, not a guess.
+  printf '#!/bin/sh\necho "Segmentation fault: 11"\nexit 139\n' > "$tmp/claude-crash"; chmod +x "$tmp/claude-crash"
+  got="$( CLAUDE_BIN="$tmp/claude-crash"; model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_ANSWER-}" )"
+  [ "$got" = "3|Segmentation fault: 11" ] && ok "a CLI that prints no result event is no verdict, and its own words are kept" \
+    || bad "a CLI with no result event read as '$got'"
+
+  echo "family_refresh() — a pass written down: a newer CLI's release noted and cleared, a pass cut short never fresh"
+  # The recorder around resolve_family, for the tick's pass (cmd_resolve_models)
+  # and for a launch whose family has expired (effective_model). One scratch
+  # config throughout, in a subshell so MODELS_FILE cannot leak: ok/bad count
+  # into _upass/_ufail and the RESULT line carries the count out, as in the
+  # catalog blocks above. Inside the $( ) below there is no case and no
+  # apostrophe in a comment or a message: bash 3.2 reads a case pattern's
+  # paren, and a quote in a comment, while it looks for the end of the
+  # substitution -- and a pair that cancels out only hides it.
+  local _frout
+  _frout="$(
+    mkdir -p "$tmp/fr"
+    CONFIG_DIR="$tmp/fr"; MODELS_FILE="$tmp/fr/models.json"; TICK_LOG="$tmp/fr/tick.log"
+    CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_PROBE_LOG="$tmp/fr/probes.log"; export FAKE_PROBE_LOG
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+    ticklines() { grep -c . "$TICK_LOG"; }
+    setopus() { "$JQ" --argjson e "$1" '.resolved.opus = $e' "$MODELS_FILE" > "$MODELS_FILE.t" && mv "$MODELS_FILE.t" "$MODELS_FILE"; }
+    # The other two catalogs fresh, so only the Claude families decide models_stale here.
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{}, openai:{at:$now, models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    : > "$TICK_LOG"
+
+    # 2026-09-22 on 2.1.258: the API keeps claude-opus-5-5 for 2.1.280 or newer.
+    FAKE_ALIASES="opus=claude-opus-5 sonnet=claude-sonnet-5" FAKE_CLI_MODELS="claude-opus-5 claude-sonnet-5"
+    FAKE_API_MODELS="claude-opus-5 claude-sonnet-5" FAKE_GATED_MODELS="claude-opus-5-5"
+    export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS FAKE_GATED_MODELS
+    got="$(family_refresh opus)"; rc=$?
+    [ "$rc:$got" = "0:claude-opus-5" ] && ok "family_refresh: the family stays on the id this CLI can run" || bad "family_refresh opus: rc=$rc [$got]"
+    "$JQ" -e '.resolved.opus | .id == "claude-opus-5" and .at > 0 and .newer.id == "claude-opus-5-5" and .newer.needs == "2.1.280"
+              and .newer.installed == "2.1.258" and .newer.cli == "2.1.258" and .newer.at > 0 and (has("failed_at") | not)' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "family_refresh: the release is written next to the resolution -- the id, the version it needs, the one installed as the 400 and --version say, when" \
+      || bad "models.json after the pass that met it: $(cat "$MODELS_FILE")"
+    [ "$(ticklines)" = 1 ] && grep -qF 'models: opus — claude-opus-5-5 is out and needs Claude Code 2.1.280 (installed 2.1.258): run claude update' "$TICK_LOG" \
+      && ok "family_refresh: and tick.log gets one line that says what to run" || bad "tick.log: $(cat "$TICK_LOG")"
+    [ "$(models_cache_get opus)" = "claude-opus-5" ] && ok "models_cache_get: that pass finished, so its id is fresh" \
+      || bad "cache after the pass: [$(models_cache_get opus)]"
+
+    # The update: 2.1.280, whose alias is claude-opus-5-5, which the API serves it.
+    FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION
+    FAKE_ALIASES="opus=claude-opus-5-5 sonnet=claude-sonnet-5" FAKE_CLI_MODELS="claude-opus-5 claude-opus-5-5 claude-sonnet-5"
+    FAKE_API_MODELS="claude-opus-5 claude-opus-5-5 claude-sonnet-5" FAKE_GATED_MODELS=""
+    got="$(family_refresh opus)"; rc=$?
+    [ "$rc:$got" = "0:claude-opus-5-5" ] && ok "family_refresh: after the update the family moves to the release" || bad "after the update: rc=$rc [$got]"
+    "$JQ" -e '.resolved.opus | .id == "claude-opus-5-5" and (has("newer") | not)' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "family_refresh: and the notice is gone once the CLI is new enough" || bad "models.json after the update: $(cat "$MODELS_FILE")"
+    [ "$(ticklines)" = 1 ] && ok "family_refresh: a pass with nothing to act on logs nothing" || bad "tick.log: $(cat "$TICK_LOG")"
+
+    # No session -- the environment of the tick without USER -- once opus has expired.
+    "$JQ" --argjson old "$(( $(now_epoch) - MODELS_TTL - 60 ))" '.resolved.opus.at = $old' "$MODELS_FILE" > "$MODELS_FILE.t" && mv "$MODELS_FILE.t" "$MODELS_FILE"
+    _old="$("$JQ" -r '.resolved.opus.at' "$MODELS_FILE")"
+    FAKE_CLAUDE_LOGGED_OUT=1; export FAKE_CLAUDE_LOGGED_OUT
+    got="$(family_refresh opus)"; rc=$?
+    [ "$rc:$got" = "3:claude-opus-5-5" ] && ok "family_refresh: a pass cut short keeps the id the family had, and exits 3" || bad "logged out: rc=$rc [$got]"
+    "$JQ" -e --argjson old "$_old" '.resolved.opus | .id == "claude-opus-5-5" and .at == $old and .failed_at > 0 and .failures == 1
+              and .failed == "Not logged in · Please run /login"' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "family_refresh: and is never written as fresh -- .at stays; when, how many in a row and the answer of the CLI are added" \
+      || bad "models.json after a failed pass: $(cat "$MODELS_FILE")"
+    [ "$(ticklines)" = 2 ] \
+      && grep -qF "models: opus — the probe of claude-opus-7 failed (Not logged in · Please run /login); kept claude-opus-5-5, trying again in 10 min" "$TICK_LOG" \
+      && ok "family_refresh: tick.log gets the probe, the answer of the CLI, and when it is tried again" || bad "tick.log: $(cat "$TICK_LOG")"
+    [ "$(models_cache_get opus)" = "claude-opus-5-5" ] && ok "models_cache_get: the kept id serves a launch until the retry, with no probe of its own" \
+      || bad "cache after a failed pass: [$(models_cache_get opus)]"
+    got="$(family_refresh opus)"
+    "$JQ" -e '.resolved.opus.failures == 2' "$MODELS_FILE" >/dev/null 2>&1 \
+      && grep -qF "kept claude-opus-5-5, trying again in 20 min" "$TICK_LOG" \
+      && ok "family_refresh: a second cut pass in a row is counted, and its retry waits twice as long" || bad "second failure: $(cat "$MODELS_FILE"; tail -1 "$TICK_LOG")"
+    "$JQ" --argjson t "$(( $(now_epoch) - 2 * MODELS_RETRY - 1 ))" '.resolved.opus.failed_at = $t' "$MODELS_FILE" > "$MODELS_FILE.t" && mv "$MODELS_FILE.t" "$MODELS_FILE"
+    [ -z "$(models_cache_get opus)" ] && ok "models_cache_get: once the retry is due, a launch probes again" || bad "cache past the retry: [$(models_cache_get opus)]"
+    got="$(effective_model opus)"
+    [ "$got" = "claude-opus-5-5" ] && "$JQ" -e --argjson old "$_old" '.resolved.opus | .at == $old and .failures == 3' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "effective_model: a launch whose probe failed runs on the kept id, and caches nothing as fresh" \
+      || bad "effective_model logged out: [$got], $(cat "$MODELS_FILE")"
+
+    # A family never resolved before, no session: the id of the alias, and nothing fresh.
+    got="$(family_refresh sonnet)"; rc=$?
+    [ "$rc:$got" = "3:claude-sonnet-5" ] && "$JQ" -e '.resolved.sonnet | .id == "claude-sonnet-5" and .at == 0 and .failed_at > 0' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "family_refresh: with nothing cached the id of the alias is kept, and .at is 0" || bad "sonnet logged out: rc=$rc [$got], $(cat "$MODELS_FILE")"
+
+    # Of the id the last finished pass found and the best one this pass reached,
+    # the newer is kept: never below the alias the CLI names -- the pass an
+    # update brings back is often the one that fails -- and never below what a
+    # finished pass had already found.
+    setopus '{"id":"claude-opus-5","at":1}'
+    got="$(family_refresh opus)"
+    [ "$got" = "claude-opus-5-5" ] && ok "family_refresh: a pass cut short never leaves the family below the alias the CLI names" \
+      || bad "kept [$got] under the alias claude-opus-5-5"
+    setopus '{"id":"claude-opus-6","at":1}'
+    got="$(family_refresh opus)"
+    [ "$got" = "claude-opus-6" ] && ok "family_refresh: nor below the id the last finished pass found" || bad "kept [$got] over claude-opus-6"
+
+    # A session that goes mid-pass after a release for a newer CLI was met:
+    # both are written, and both are said.
+    unset FAKE_CLAUDE_LOGGED_OUT
+    FAKE_CLAUDE_VERSION=2.1.258 FAKE_ALIASES="opus=claude-opus-5" FAKE_CLI_MODELS="claude-opus-5" FAKE_API_MODELS="claude-opus-5"
+    FAKE_GATED_MODELS="claude-opus-6" FAKE_FAILED_MODELS="claude-opus-5-8"; export FAKE_FAILED_MODELS
+    setopus '{"id":"claude-opus-5","at":1}'
+    : > "$TICK_LOG"
+    got="$(family_refresh opus)"; rc=$?
+    [ "$rc:$got" = "3:claude-opus-5" ] && "$JQ" -e '.resolved.opus | .at == 1 and .failed_at > 0 and .newer.id == "claude-opus-6"
+              and .newer.needs == "2.1.280" and .newer.installed == "2.1.258" and .newer.cli == "2.1.258"' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "family_refresh: a release met before the cut is written with the failure" || bad "gate then cut: rc=$rc [$got], $(cat "$MODELS_FILE")"
+    [ "$(ticklines)" = 2 ] && grep -qF "models: opus — claude-opus-6 is out and needs Claude Code 2.1.280 (installed 2.1.258): run claude update" "$TICK_LOG" \
+      && grep -qF "models: opus — the probe of claude-opus-5-8 failed (Not logged in · Please run /login); kept claude-opus-5, trying again in 10 min" "$TICK_LOG" \
+      && ok "family_refresh: and tick.log gets both lines" || bad "tick.log: $(cat "$TICK_LOG")"
+    unset FAKE_FAILED_MODELS
+
+    # What agentloop resolve-models prints, and its exit code.
+    FAKE_CLAUDE_LOGGED_OUT=1; export FAKE_CLAUDE_LOGGED_OUT
+    FAKE_ALIASES="opus=claude-opus-5-5" FAKE_GATED_MODELS=""
+    setopus '{"id":"claude-opus-5","at":1}'
+    out="$(cmd_resolve_models anthropic 2>&1)"; rc=$?
+    [ "$rc" = 1 ] && grep -qF "opus -> claude-opus-5-5 — the probe of claude-opus-7 failed (Not logged in · Please run /login); kept claude-opus-5-5, trying again in 10 min" <<< "$out" \
+      && ok "resolve-models: a pass cut short is printed as such, and the command exits 1" || bad "resolve-models logged out: rc=$rc $out"
+    unset FAKE_CLAUDE_LOGGED_OUT
+    FAKE_ALIASES="opus=claude-opus-5" FAKE_CLI_MODELS="claude-opus-5" FAKE_API_MODELS="claude-opus-5" FAKE_GATED_MODELS="claude-opus-5-5"
+    out="$(cmd_resolve_models anthropic 2>&1)"; rc=$?
+    [ "$rc" = 0 ] && grep -qF "opus -> claude-opus-5 — claude-opus-5-5 is out and needs Claude Code 2.1.280 (installed 2.1.258): run claude update" <<< "$out" \
+      && ok "resolve-models: the release is printed next to the family, and the pass that met it exits 0" || bad "resolve-models gated: rc=$rc $out"
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_frout" | grep -v '^RESULT '
+  printf '%s\n' "$_frout" | grep -qx 'RESULT ok=21 bad=0' \
+    && ok "family_refresh over the probe stand-in: all 21 assertions reach the gate" \
+    || bad "family_refresh over the probe stand-in did not: $(printf '%s\n' "$_frout" | tail -1)"
+
+  echo "models_stale() — when the tick runs the pass again, and how much of it"
+  # The tick asks this every minute. A catalog past MODELS_TTL is due for the
+  # whole pass. A family whose pass a probe cut short is due for the Claude
+  # families alone, MODELS_RETRY after the cut and twice as long after each
+  # one in a row, never longer than MODELS_TTL -- or a whole MODELS_TTL while
+  # Settings keeps Anthropic off. A CLI that changed under a release waiting
+  # for it is due at once. MODELS_DUE_SCOPE and MODELS_DUE_WHY say which, for
+  # the tick and its log line. Same subshell rules as the block above.
+  local _msout
+  _msout="$(
+    mkdir -p "$tmp/ms/sc/config" "$tmp/ms/sc/data"
+    CONFIG_DIR="$tmp/ms"; MODELS_FILE="$tmp/ms/models.json"; PLATFORMS_FILE="$tmp/ms/platforms.json"
+    CLAUDE_BIN="$BASE_DIR/test/fake-claude"
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+    printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["opus"]}}}\n' > "$PLATFORMS_FILE"
+    now="$(now_epoch)"
+    # mf <jq for .resolved>: the file, with both other catalogs fresh; $now and $ttl are bound.
+    mf() { "$JQ" -n --argjson now "$now" --argjson ttl "$MODELS_TTL" "{resolved:($1), openai:{at:\$now, models:[]}, opencode:{at:\$now, models:[]}}" > "$MODELS_FILE"; }
+    due() { models_stale; echo "$?|${MODELS_DUE_SCOPE-unset}|${MODELS_DUE_WHY-unset}"; }
+    retrying="retrying opus after a failed probe"
+    # A CLI that writes down every call it gets, and answers only --version.
+    printf '#!/bin/sh\necho "$*" >> "%s"\necho "2.1.280 (Claude Code)"\n' "$tmp/ms/asked.log" > "$tmp/ms/claude-v"; chmod +x "$tmp/ms/claude-v"
+
+    mf '{opus:{id:"claude-opus-5-5", at:$now}}'
+    [ "$(due)" = "1||" ] && ok "models_stale: not due while every block is fresh" || bad "all fresh: $(due)"
+    mf '{opus:{id:"claude-opus-5-5", at:($now - $ttl - 1)}}'
+    [ "$(due)" = "0||cache older than ${MODELS_TTL}s" ] && ok "models_stale: a family past MODELS_TTL is due for the whole pass" || bad "family past the TTL: $(due)"
+    "$JQ" -n --argjson now "$now" '{resolved:{opus:{id:"x", at:$now}}, openai:{at:1, models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    [ "$(due)" = "0||cache older than ${MODELS_TTL}s" ] && ok "models_stale: so is an openai catalog past it" || bad "openai past the TTL: $(due)"
+
+    mf '{opus:{id:"claude-opus-5-5", at:1, failed_at:$now, failures:1}}'
+    [ "$(due)" = "1||" ] && ok "models_stale: a cut family is not due inside MODELS_RETRY" || bad "inside the retry: $(due)"
+    mf "{opus:{id:\"claude-opus-5-5\", at:1, failed_at:(\$now - $MODELS_RETRY - 1), failures:1}}"
+    [ "$(due)" = "0|anthropic|$retrying" ] && ok "models_stale: past it, due for the Claude families alone, and the reason says so" || bad "past the retry: $(due)"
+    mf "{opus:{id:\"claude-opus-5-5\", at:1, failed_at:(\$now - $MODELS_RETRY - 1), failures:2}}"
+    [ "$(due)" = "1||" ] && ok "models_stale: after a second cut pass in a row, twice as long" || bad "second failure, one wait later: $(due)"
+    mf "{opus:{id:\"claude-opus-5-5\", at:1, failed_at:(\$now - 2 * $MODELS_RETRY - 1), failures:2}}"
+    [ "$(due)" = "0|anthropic|$retrying" ] && ok "models_stale: and due once that has passed" || bad "second failure, two waits later: $(due)"
+    mf '{opus:{id:"claude-opus-5-5", at:1, failed_at:($now - $ttl + 60), failures:30}}'
+    [ "$(due)" = "1||" ] && ok "models_stale: the wait grows up to MODELS_TTL" || bad "thirty failures, under a day: $(due)"
+    mf '{opus:{id:"claude-opus-5-5", at:1, failed_at:($now - $ttl - 1), failures:30}}'
+    [ "$(due)" = "0|anthropic|$retrying" ] && ok "models_stale: and never past it" || bad "thirty failures, over a day: $(due)"
+    mf '{opus:{id:"claude-opus-5-5", at:($now - 60), failed_at:($now - 700), failures:1}}'
+    [ "$(due)" = "1||" ] && ok "models_stale: a cut pass over a family still fresh waits for its MODELS_TTL" || bad "cut over a fresh family: $(due)"
+    # The retry names the families it is for: one that failed, not the three
+    # whose passes finished.
+    mf "{opus:{id:\"claude-opus-5-5\", at:1, failed_at:(\$now - $MODELS_RETRY - 1), failures:1}, sonnet:{id:\"claude-sonnet-5\", at:1, failed_at:\$now, failures:1}}"
+    [ "$(models_stale; echo "${MODELS_DUE_FAMILIES-unset}")" = "opus" ] && ok "models_stale: a retry is for the families it is due for, and only those" \
+      || bad "families of a retry: [$(models_stale; echo "${MODELS_DUE_FAMILIES-unset}")]"
+    # A retry due minutes before the whole pass is folded into it: one round
+    # of probes, not two a minute apart.
+    "$JQ" -n --argjson now "$now" --argjson ttl "$MODELS_TTL" --argjson r "$MODELS_RETRY" \
+      '{resolved:{opus:{id:"claude-opus-5-5", at:1, failed_at:($now - $r - 1), failures:1}}, openai:{at:($now - $ttl + 300), models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    [ "$(due)" = "0||$retrying, the rest of the cache due within 10 min" ] && ok "models_stale: a retry due just before the whole pass is folded into it" \
+      || bad "retry just before the whole pass: $(due)"
+    "$JQ" -n --argjson now "$now" --argjson ttl "$MODELS_TTL" --argjson r "$MODELS_RETRY" \
+      '{resolved:{opus:{id:"claude-opus-5-5", at:1, failed_at:($now - $r - 1), failures:1}}, openai:{at:($now - $ttl + 3 * $r), models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    [ "$(due)" = "0|anthropic|$retrying" ] && ok "models_stale: and one due further ahead of it is not" || bad "retry well before the whole pass: $(due)"
+
+    printf '{"platforms":{"anthropic":{"enabled":false,"bin":"","models":["opus"]}}}\n' > "$PLATFORMS_FILE"
+    mf "{opus:{id:\"claude-opus-5-5\", at:1, failed_at:(\$now - $MODELS_RETRY - 1), failures:1}}"
+    [ "$(due)" = "1||" ] && ok "models_stale: with Anthropic off in Settings, a cut family waits a whole MODELS_TTL" || bad "Anthropic off, one retry later: $(due)"
+    mf '{opus:{id:"claude-opus-5-5", at:1, failed_at:($now - $ttl - 1), failures:1}}'
+    [ "$(due)" = "0|anthropic|$retrying" ] && ok "models_stale: and is due after it" || bad "Anthropic off, a day later: $(due)"
+    # A launch goes through effective_model before the gate that refuses it:
+    # with Anthropic off, no probe -- not even the alias -- is spent on a run
+    # Settings will turn away next.
+    : > "$tmp/ms/asked.log"
+    got="$( CLAUDE_BIN="$tmp/ms/claude-v"; effective_model opus )"
+    [ "$got" = "claude-opus-5-5" ] && [ ! -s "$tmp/ms/asked.log" ] \
+      && ok "effective_model: with Anthropic off a launch runs no probe, and names the id the cache holds" \
+      || bad "effective_model with Anthropic off: [$got], the CLI got: $(cat "$tmp/ms/asked.log")"
+    mf '{opus:{id:"claude-opus-5", at:$now, newer:{id:"claude-opus-5-5", needs:"2.1.280", installed:"2.1.258", cli:"2.1.258", at:$now}}}'
+    [ "$( FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due )" = "1||" ] \
+      && ok "models_stale: and a changed CLI brings nothing back while Anthropic is off" || bad "Anthropic off, CLI changed: $(FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due)"
+    printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["opus"]}}}\n' > "$PLATFORMS_FILE"
+
+    [ "$(due)" = "1||" ] && ok "models_stale: a release waiting on the CLI it was recorded against is not due" || bad "same CLI: $(due)"
+    [ "$( FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due )" = "0|anthropic|Claude Code went from 2.1.258 to 2.1.280 while a release waited for it" ] \
+      && ok "models_stale: a changed CLI is due at once, for the Claude families, and the reason names both versions" \
+      || bad "CLI changed: $(FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due)"
+    [ "$( FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; models_stale; echo "[${MODELS_DUE_FAMILIES-unset}]" )" = "[]" ] \
+      && ok "models_stale: and for every family, not only the one the release belongs to" \
+      || bad "families of a changed CLI: $(FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; models_stale; echo "[${MODELS_DUE_FAMILIES-unset}]")"
+    mf '{opus:{id:"claude-opus-5", at:$now, newer:{id:"claude-opus-5-5", needs:"2.1.280", installed:"9.9.9", cli:"2.1.258", at:$now}}}'
+    [ "$(due)" = "1||" ] && ok "models_stale: the CLI is compared with what --version said, never with the text of the 400" || bad "400 text unlike --version: $(due)"
+    mf '{opus:{id:"claude-opus-5", at:$now, newer:{id:"claude-opus-5-5", needs:"2.1.280", installed:"2.1.258", cli:"", at:$now}}}'
+    [ "$( FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due )" = "1||" ] && ok "models_stale: a release recorded with no --version to compare waits for the daily pass" \
+      || bad "no cli recorded: $(FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due)"
+    mf '{opus:{id:"claude-opus-5", at:$now, failed_at:$now, failures:1, failed:"x", newer:{id:"claude-opus-5-5", needs:"2.1.280", installed:"2.1.258", cli:"2.1.258", at:$now}}}'
+    [ "$( FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due )" = "1||" ] \
+      && ok "models_stale: a changed CLI waits for the retry after a failed pass, or one that lost its session would relaunch every minute" \
+      || bad "changed CLI inside a retry: $(FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due)"
+
+    # The CLI is asked its version only while a release waits for it.
+    : > "$tmp/ms/asked.log"
+    mf '{opus:{id:"claude-opus-5-5", at:$now}}'
+    [ "$( CLAUDE_BIN="$tmp/ms/claude-v"; due )" = "1||" ] && [ ! -s "$tmp/ms/asked.log" ] \
+      && ok "models_stale: with nothing waiting the CLI is not run at all" || bad "the CLI was asked: $(cat "$tmp/ms/asked.log")"
+
+    # Hand edits: a family the pass never writes cannot keep it due, and a
+    # .resolved that is not an object is due, so the pass rewrites it.
+    mf '{opus:{id:"claude-opus-5-5", at:$now}, gpt:{id:"x", at:1}}'
+    [ "$(due)" = "1||" ] && ok "models_stale: an entry that is no Claude family is not counted" || bad "a foreign entry: $(due)"
+    mf '[]'
+    [ "$(due)" = "0||cache older than ${MODELS_TTL}s" ] && ok "models_stale: a .resolved that is not an object is due" || bad "resolved as a list: $(due)"
+    models_cache_set opus claude-opus-5-5
+    "$JQ" -e '.resolved.opus.id == "claude-opus-5-5"' "$MODELS_FILE" >/dev/null 2>&1 && ok "models_cache_set: and the pass writes it back as one" \
+      || bad "resolved after a write over a list: $(cat "$MODELS_FILE")"
+    printf 'not json' > "$MODELS_FILE"
+    [ "$(due)" = "0||models.json could not be read" ] && ok "models_stale: an unreadable file is due, and says so" || bad "unreadable: $(due)"
+    rm -f "$MODELS_FILE"
+    [ "$(due)" = "0||no models.json yet" ] && ok "models_stale: so is a missing one" || bad "missing: $(due)"
+    # A number written as text reads as 0: the cache is due, never taken for
+    # an unreadable file -- that answer came back on every tick, a pass cut
+    # short kept the text, and the whole pass ran every minute.
+    mf '{opus:{id:"claude-opus-5-5", at:"yesterday", failed_at:"now", failures:"3"}}'
+    [ "$(due)" = "0||cache older than ${MODELS_TTL}s" ] && ok "models_stale: a number written as text reads as 0, never as an unreadable file" \
+      || bad "numbers as text: $(due)"
+    models_cache_fail opus claude-opus-5-5 x "$MODELS_RETRY" >/dev/null
+    "$JQ" -e '.resolved.opus | .at == 0 and .failures == 1 and (.failed_at | type) == "number"' "$MODELS_FILE" >/dev/null 2>&1 && [ "$(due)" = "1||" ] \
+      && ok "models_cache_fail: writes them back as numbers, and the retry holds" || bad "after a cut pass over text: $(cat "$MODELS_FILE"); $(due)"
+    mf "{opus:{id:\"claude-opus-5-5\", at:\"yesterday\", failed_at:(\$now - $MODELS_RETRY - 1), failures:\"3\"}}"
+    [ "$(due)" = "0|anthropic|$retrying" ] && ok "models_stale: a cut family with its other stamps as text is retried, never taken for an unreadable file" \
+      || bad "cut family, stamps as text: $(due)"
+    "$JQ" -n --argjson now "$now" '{resolved:{opus:{id:"x", at:$now}}, openai:{at:"x", models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    [ "$(due)" = "0||cache older than ${MODELS_TTL}s" ] && ok "models_stale: so does an openai stamp written as text" || bad "openai stamp as text: $(due)"
+
+    # The launch the tick makes: the scope and the families reach the detached
+    # pass as its arguments, and tick.log says why it runs.
+    printf '#!/bin/sh\necho "$*" > "%s"\n' "$tmp/ms/launched" > "$tmp/ms/self"; chmod +x "$tmp/ms/self"
+    : > "$tmp/ms/tick.log"
+    ( SELF="$tmp/ms/self"; DATA_DIR="$tmp/ms/sc/data"; TICK_LOG="$tmp/ms/tick.log"
+      MODELS_DUE_SCOPE="anthropic"; MODELS_DUE_FAMILIES="opus sonnet"; MODELS_DUE_WHY="retrying opus sonnet after a failed probe"
+      models_refresh_launch ) >/dev/null 2>&1
+    i=0; while [ ! -s "$tmp/ms/launched" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    [ "$(cat "$tmp/ms/launched" 2>/dev/null)" = "_resolve_models anthropic opus sonnet" ] \
+      && grep -qF 'models: refreshing family→id resolutions (retrying opus sonnet after a failed probe)' "$tmp/ms/tick.log" \
+      && ok "models_refresh_launch: the scope and the families reach the detached pass, and tick.log says why" \
+      || bad "launched [$(cat "$tmp/ms/launched" 2>/dev/null)], tick.log: $(cat "$tmp/ms/tick.log")"
+    rm -f "$tmp/ms/launched"
+    ( SELF="$tmp/ms/self"; DATA_DIR="$tmp/ms/sc/data"; TICK_LOG="$tmp/ms/tick.log"
+      MODELS_DUE_SCOPE=""; MODELS_DUE_FAMILIES=""; MODELS_DUE_WHY="cache older than ${MODELS_TTL}s"
+      models_refresh_launch ) >/dev/null 2>&1
+    i=0; while [ ! -s "$tmp/ms/launched" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    [ "$(cat "$tmp/ms/launched" 2>/dev/null)" = "_resolve_models" ] && ok "models_refresh_launch: the whole pass takes no argument" \
+      || bad "launched [$(cat "$tmp/ms/launched" 2>/dev/null)]"
+
+    # And the pass itself, run as the tick runs it over a scratch install
+    # whose codex stand-in would write an openai catalog and whose price
+    # source is the real fixture: the families it was handed, and nothing else.
+    AGENTLOOP_CONFIG="$tmp/ms/sc/config" AGENTLOOP_DATA="$tmp/ms/sc/data" AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" \
+      AGENTLOOP_CODEX_BIN="$BASE_DIR/test/fake-codex" AGENTLOOP_OPENCODE_BIN=/nonexistent/opencode AGENTLOOP_CLAUDE_CONFIG_DIR="" \
+      AGENTLOOP_PRICING_URL="file://$BASE_DIR/test/fixtures/pricing/litellm-sample.json" CODEX_HOME="$tmp/ms/sc/codex-home" \
+      FAKE_ALIASES="opus=claude-opus-5-5 sonnet=claude-sonnet-5" FAKE_CLI_MODELS="claude-opus-5-5" FAKE_API_MODELS="claude-opus-5-5" \
+      /bin/bash "$BIN_DIR/agentloop" _resolve_models anthropic opus >/dev/null 2>&1
+    "$JQ" -e '(.resolved | keys) == ["opus"] and .resolved.opus.id == "claude-opus-5-5" and (has("openai") | not) and (has("opencode") | not)' \
+      "$tmp/ms/sc/config/models.json" >/dev/null 2>&1 && [ ! -e "$tmp/ms/sc/config/pricing.json" ] \
+      && ok "_resolve_models anthropic opus: that family alone -- no other family, no other catalog, no price table" \
+      || bad "_resolve_models anthropic opus wrote: $(cat "$tmp/ms/sc/config/models.json" 2>/dev/null); config: $(ls "$tmp/ms/sc/config")"
+    ( cmd_resolve_models anthropic gpt ) >/dev/null 2>&1
+    want "resolve-models anthropic refuses a family it does not know" 1 $?
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_msout" | grep -v '^RESULT '
+  printf '%s\n' "$_msout" | grep -qx 'RESULT ok=37 bad=0' \
+    && ok "models_stale over scratch caches: all 37 assertions reach the gate" \
+    || bad "models_stale over scratch caches did not: $(printf '%s\n' "$_msout" | tail -1)"
+
+  echo "models_lock() — one writer of models.json at a time: two at once both land, a holder that stopped is given up on"
+  # Every writer rewrites config/models.json whole -- jq into a temporary
+  # file, then mv over it -- and two of them do run at once: the detached pass
+  # the tick starts, and a launch whose family expired, which resolves inline
+  # (effective_model, family_refresh) outside that pass. Both read the same
+  # file and the second mv drops the first update: a resolution, a release
+  # waiting for claude update, a failed_at stamp. The jq stand-in below
+  # answers one second late whenever its answer goes to a file -- the window
+  # between reading models.json and replacing it -- so both writers read
+  # before either writes. Same subshell rules as the blocks above.
+  local _mwout
+  _mwout="$(
+    mkdir -p "$tmp/mw/locks"
+    CONFIG_DIR="$tmp/mw"; MODELS_FILE="$tmp/mw/models.json"; TICK_LOG="$tmp/mw/tick.log"; LOCK_DIR="$tmp/mw/locks"
+    CODEX_BIN="$BASE_DIR/test/fake-codex"; OPENCODE_BIN="$BASE_DIR/test/fake-opencode"
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+    printf '#!/bin/sh\n"%s" "$@"; rc=$?\n[ -f /dev/fd/1 ] && sleep 1\nexit $rc\n' "$JQ" > "$tmp/mw/slowjq"; chmod +x "$tmp/mw/slowjq"
+    # No family yet, both other catalogs present and fresh, an empty tick.log.
+    seed() { "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{}, openai:{at:$now, models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"; : > "$TICK_LOG"; }
+    lines() { sed 's/^[^ ]* //' "$TICK_LOG"; }
+
+    # The pass of the tick finishing opus while a launch writes down the cut pass of sonnet.
+    seed
+    ( JQ="$tmp/mw/slowjq"; models_cache_set opus claude-opus-5-5 ) & _w1=$!
+    ( JQ="$tmp/mw/slowjq"; models_cache_fail sonnet claude-sonnet-5 "Not logged in" "$MODELS_RETRY" >/dev/null ) & _w2=$!
+    wait "$_w1" "$_w2"
+    "$JQ" -e '.resolved.opus.id == "claude-opus-5-5" and .resolved.sonnet.id == "claude-sonnet-5" and .resolved.sonnet.failed_at > 0
+              and (.openai.models | type) == "array" and (.opencode.models | type) == "array"' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "two writers at once both land: the finished pass of opus, the cut pass of sonnet, and the rest of the file" \
+      || bad "two writers at once, an update lost: $(cat "$MODELS_FILE")"
+    [ ! -e "$LOCK_DIR/.models.lock" ] && [ ! -s "$TICK_LOG" ] && [ -z "$(ls -A "$CONFIG_DIR" | grep '^[.]models[.]')" ] \
+      && ok "each write drops the lock after it, gives nothing up, and leaves no temporary file" \
+      || bad "after the race: locks [$(ls -A "$LOCK_DIR")] tick.log [$(cat "$TICK_LOG")] config [$(ls -A "$CONFIG_DIR")]"
+    # A catalog refresh that failed -- no codex -- stamps the catalog it keeps while a launch writes opus.
+    seed
+    ( JQ="$tmp/mw/slowjq"; CODEX_BIN=/nonexistent; resolve_models_openai >/dev/null ) & _w1=$!
+    ( JQ="$tmp/mw/slowjq"; models_cache_set opus claude-opus-5-5 ) & _w2=$!
+    wait "$_w1" "$_w2"
+    "$JQ" -e '.openai.stale_reason == "codex not installed" and .openai.stale_at > 0 and .resolved.opus.id == "claude-opus-5-5"' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "a catalog kept after a failed refresh is stamped, and the family written at the same time lands too" \
+      || bad "a stamp and a family at once, an update lost: $(cat "$MODELS_FILE")"
+
+    # A writer that stopped while it held the lock: a live pid, from this boot.
+    # Every write waits MODELS_LOCK_WAIT for it and then gives up -- nothing
+    # written, one line in tick.log naming what was not -- so neither a launch
+    # nor the pass hangs behind it. Every path that writes is asked, all at
+    # once in the background: both family records, both catalogs replaced and
+    # stamped, and a whole family pass, cut short and finished. Opus, sonnet
+    # and fable already hold an id: a cut pass that wrote nothing prints none
+    # of its own, and runs on the newer of the id the file holds and the one
+    # it reached -- never below either.
+    LOCK_GRACE_SECONDS=30; MODELS_LOCK_WAIT=1
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{opus:{id:"claude-opus-5-5", at:1}, sonnet:{id:"claude-sonnet-4-6", at:1}, fable:{id:"claude-fable-5", at:1}},
+      openai:{at:$now, models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    : > "$TICK_LOG"
+    sleep 60 >/dev/null 2>&1 & _holder=$!
+    mkdir "$LOCK_DIR/.models.lock"; echo "$_holder" > "$LOCK_DIR/.models.lock/pid"; boot_id > "$LOCK_DIR/.models.lock/boot"
+    _before="$(cksum < "$MODELS_FILE")"
+    gone="pid $_holder held the lock on models.json for more than 1 s"
+    # gives NAME COMMAND...: in the background; its output lands in NAME.out, its exit and seconds in NAME.rc.
+    gives() { local n="$1"; shift; ( t0="$(now_epoch)"; "$@" > "$tmp/mw/$n.out" 2>&1; r=$?; echo "$r $(( $(now_epoch) - t0 ))" > "$tmp/mw/$n.rc" ) & _pids="$_pids $!"; }
+    # gave NAME: its exit, then bounded -- well short of the minute the holder lives -- or how long it waited.
+    gave() { local r e; read -r r e < "$tmp/mw/$1.rc"; [ "$e" -le 20 ] && e=bounded || e="waited ${e}s"; printf '%s|%s' "$r" "$e"; }
+    seen() { lines | grep -cxF "$1"; }
+    openai_gone()    { local CODEX_BIN=/nonexistent; resolve_models_openai; }
+    opencode_empty() { local FAKE_OPENCODE_NO_MODELS=1; export FAKE_OPENCODE_NO_MODELS; resolve_models_opencode; }
+    # pass_cut FAMILY ALIAS: a pass with no session, cut at its first probe, having reached the alias.
+    pass_cut() {
+      local CLAUDE_BIN="$BASE_DIR/test/fake-claude" FAKE_ALIASES="$1=$2" FAKE_CLI_MODELS="$2" FAKE_API_MODELS="$2" FAKE_CLAUDE_LOGGED_OUT=1
+      export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS FAKE_CLAUDE_LOGGED_OUT; family_refresh "$1"
+    }
+    pass_done() {
+      local CLAUDE_BIN="$BASE_DIR/test/fake-claude" FAKE_ALIASES="sonnet=claude-sonnet-5" FAKE_CLI_MODELS="claude-sonnet-5" FAKE_API_MODELS="claude-sonnet-5 claude-sonnet-5-5"
+      export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS; cmd_resolve_models anthropic sonnet
+    }
+    _pids=""
+    gives cset   models_cache_set haiku claude-haiku-4-5
+    gives cfail  models_cache_fail fable claude-fable-5-1 x "$MODELS_RETRY"
+    gives oa     resolve_models_openai
+    gives oakept openai_gone
+    gives oc     resolve_models_opencode
+    gives ockept opencode_empty
+    gives cut    pass_cut opus claude-opus-5
+    gives cutup  pass_cut sonnet claude-sonnet-5
+    gives fin    pass_done
+    wait $_pids
+    [ "$(gave cset)" = "1|bounded" ] && [ "$(seen "models: haiku — gave up writing claude-haiku-4-5: $gone")" = 1 ] \
+      && ok "models_cache_set: a live holder is waited for MODELS_LOCK_WAIT, then given up on, and tick.log says what was not written" \
+      || bad "models_cache_set under a held lock: $(gave cset), tick.log [$(lines)]"
+    [ "$(gave cfail)" = "1|bounded" ] && [ ! -s "$tmp/mw/cfail.out" ] && [ "$(seen "models: fable — gave up writing the failed probe: $gone")" = 1 ] \
+      && ok "models_cache_fail: the same, and it prints no id -- not even the one the file holds" \
+      || bad "models_cache_fail under a held lock: $(gave cfail), printed [$(cat "$tmp/mw/cfail.out")]"
+    [ "$(gave oa) $(gave oakept)" = "1|bounded 1|bounded" ] && [ "$(seen "models: openai — gave up writing the catalog: $gone")" = 2 ] \
+      && [ "$(cat "$tmp/mw/oa.out" "$tmp/mw/oakept.out" | sort -u)" = "openai -> could not write $MODELS_FILE" ] \
+      && ok "resolve_models_openai: the same for a catalog it would replace and one it would stamp, and the refresh says it could not write" \
+      || bad "openai under a held lock: $(gave oa) $(gave oakept), printed [$(cat "$tmp/mw/oa.out" "$tmp/mw/oakept.out")]"
+    [ "$(gave oc) $(gave ockept)" = "1|bounded 1|bounded" ] && [ "$(seen "models: opencode — gave up writing the catalog: $gone")" = 2 ] \
+      && [ "$(cat "$tmp/mw/oc.out" "$tmp/mw/ockept.out" | sort -u)" = "opencode -> could not write $MODELS_FILE" ] \
+      && ok "resolve_models_opencode: the same, replaced and stamped" \
+      || bad "opencode under a held lock: $(gave oc) $(gave ockept), printed [$(cat "$tmp/mw/oc.out" "$tmp/mw/ockept.out")]"
+    [ "$(gave cut)" = "3|bounded" ] && [ "$(cat "$tmp/mw/cut.out")" = "claude-opus-5-5" ] \
+      && [ "$(seen "models: opus — gave up writing the failed probe: $gone")" = 1 ] \
+      && [ "$(seen "models: opus — the probe of claude-opus-7 failed (Not logged in · Please run /login); kept claude-opus-5-5, not recorded in models.json")" = 1 ] \
+      && ok "family_refresh: a cut pass that could not write keeps the newer id the file holds, and promises no retry it did not stamp" \
+      || bad "a cut pass under a held lock: $(gave cut), printed [$(cat "$tmp/mw/cut.out")], tick.log [$(lines)]"
+    [ "$(gave cutup)" = "3|bounded" ] && [ "$(cat "$tmp/mw/cutup.out")" = "claude-sonnet-5" ] \
+      && [ "$(seen "models: sonnet — the probe of claude-sonnet-7 failed (Not logged in · Please run /login); kept claude-sonnet-5, not recorded in models.json")" = 1 ] \
+      && ok "family_refresh: and the newer id the pass reached, over an older one in the file" \
+      || bad "a cut pass above the file under a held lock: $(gave cutup), printed [$(cat "$tmp/mw/cutup.out")], tick.log [$(lines)]"
+    [ "$(gave fin)" = "1|bounded" ] && [ "$(cat "$tmp/mw/fin.out")" = "sonnet -> claude-sonnet-5-5 — not recorded in models.json" ] \
+      && [ "$(seen "models: sonnet — gave up writing claude-sonnet-5-5: $gone")" = 1 ] \
+      && ok "resolve-models: a finished pass that could not write names what it found, says it was not recorded, and exits 1" \
+      || bad "a finished pass under a held lock: $(gave fin), printed [$(cat "$tmp/mw/fin.out")]"
+    [ "$(cksum < "$MODELS_FILE")" = "$_before" ] && [ "$(lines | grep -c .)" = 11 ] \
+      && ok "and the file is untouched by all nine, with nothing else in tick.log" \
+      || bad "after nine writers under a held lock: $(cat "$MODELS_FILE"); tick.log [$(lines)]"
+    # Behind the same lock a missing models.json is not created, nor an unreadable one reseeded.
+    rm -f "$MODELS_FILE"; : > "$TICK_LOG"; _pids=""
+    gives mset models_cache_set haiku claude-haiku-4-5
+    gives moa  resolve_models_openai
+    gives moc  resolve_models_opencode
+    wait $_pids
+    [ ! -e "$MODELS_FILE" ] && [ "$(gave mset) $(gave moa) $(gave moc)" = "1|bounded 1|bounded 1|bounded" ] \
+      && ok "a missing models.json is not seeded behind the lock, by a family write or by either catalog" \
+      || bad "a missing file under a held lock: $(gave mset) $(gave moa) $(gave moc), config [$(ls -A "$CONFIG_DIR")]"
+    printf 'not json' > "$MODELS_FILE"; : > "$TICK_LOG"; _pids=""
+    gives ioa resolve_models_openai
+    gives ioc resolve_models_opencode
+    wait $_pids
+    [ "$(cat "$MODELS_FILE")" = "not json" ] && [ "$(gave ioa) $(gave ioc)" = "1|bounded 1|bounded" ] \
+      && ! grep -q reseeded "$tmp/mw/ioa.out" "$tmp/mw/ioc.out" \
+      && ok "nor an unreadable one reseeded" \
+      || bad "an unreadable file under a held lock: $(gave ioa) $(gave ioc), now [$(cat "$MODELS_FILE")], printed [$(cat "$tmp/mw/ioa.out" "$tmp/mw/ioc.out")]"
+
+    # A write holds the lock a moment, so one older than LOCK_GRACE_SECONDS is
+    # no write, whoever it names -- stopped, a subshell gone under a parent
+    # whose pid it recorded, a pid reissued. It is taken, and tick.log says
+    # from whom, or every writer after it would give up for good and the
+    # whole pass would stay due.
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{}, openai:{at:$now, models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    : > "$TICK_LOG"; touch -t 202001010000 "$LOCK_DIR/.models.lock"; t0="$(now_epoch)"
+    models_cache_set haiku claude-haiku-4-5; rc=$?; el=$(( $(now_epoch) - t0 ))
+    [ "$rc" = 0 ] && [ "$el" -le 1 ] && "$JQ" -e '.resolved.haiku.id == "claude-haiku-4-5"' "$MODELS_FILE" >/dev/null 2>&1 \
+      && [ ! -e "$LOCK_DIR/.models.lock" ] && [ "$(lines | grep -c .)" = 1 ] \
+      && lines | grep -q "^models: haiku — took over the lock on models.json from pid $_holder, held for [0-9]* s$" \
+      && ok "a lock older than LOCK_GRACE_SECONDS is taken at once, even from a live pid, with a line in tick.log, and dropped after the write" \
+      || bad "an old lock with a live holder: rc=$rc in ${el}s, locks [$(ls -A "$LOCK_DIR")] tick.log [$(lines)]"
+    kill "$_holder" 2>/dev/null; wait "$_holder" 2>/dev/null
+    mkdir "$LOCK_DIR/.models.lock"; echo "$_holder" > "$LOCK_DIR/.models.lock/pid"; boot_id > "$LOCK_DIR/.models.lock/boot"
+    : > "$TICK_LOG"; t0="$(now_epoch)"
+    models_cache_set opus claude-opus-5-5; rc=$?; el=$(( $(now_epoch) - t0 ))
+    [ "$rc" = 0 ] && [ "$el" -le 1 ] && "$JQ" -e '.resolved.opus.id == "claude-opus-5-5"' "$MODELS_FILE" >/dev/null 2>&1 \
+      && [ ! -e "$LOCK_DIR/.models.lock" ] && [ ! -s "$TICK_LOG" ] \
+      && ok "a young lock whose holder is gone is taken at once too" \
+      || bad "after the holder died: rc=$rc in ${el}s, locks [$(ls -A "$LOCK_DIR")] tick.log [$(lines)] $(cat "$MODELS_FILE")"
+
+    # A writer killed between taking the lock and writing its pid leaves a lock
+    # with no owner to ask: older than LOCK_GRACE_SECONDS it goes like any old
+    # one, while a younger one may be a writer inside that very gap, and is
+    # waited for and given up on like a live one.
+    mkdir "$LOCK_DIR/.models.lock"; touch -t 202001010000 "$LOCK_DIR/.models.lock"
+    : > "$TICK_LOG"; t0="$(now_epoch)"
+    models_cache_set fable claude-fable-5-1; rc=$?; el=$(( $(now_epoch) - t0 ))
+    [ "$rc" = 0 ] && [ "$el" -le 1 ] && "$JQ" -e '.resolved.fable.id == "claude-fable-5-1"' "$MODELS_FILE" >/dev/null 2>&1 \
+      && [ ! -e "$LOCK_DIR/.models.lock" ] && [ "$(lines | grep -c .)" = 1 ] \
+      && lines | grep -q "^models: fable — took over the lock on models.json from a writer that never wrote its pid, held for [0-9]* s$" \
+      && ok "an old lock left with no pid is taken at once" \
+      || bad "an abandoned lock with no pid: rc=$rc in ${el}s, locks [$(ls -A "$LOCK_DIR")] tick.log [$(lines)] $(cat "$MODELS_FILE")"
+    mkdir "$LOCK_DIR/.models.lock"; _before="$(cksum < "$MODELS_FILE")"; : > "$TICK_LOG"; _pids=""
+    gives young models_cache_set fable claude-fable-5-2
+    wait $_pids
+    [ "$(gave young)" = "1|bounded" ] && [ "$(cksum < "$MODELS_FILE")" = "$_before" ] \
+      && [ "$(lines)" = "models: fable — gave up writing claude-fable-5-2: another writer held the lock on models.json for more than 1 s" ] \
+      && ok "a young one is given up on, never taken from a writer that has yet to write its pid" \
+      || bad "a fresh lock with no pid: $(gave young), tick.log [$(lines)]"
+
+    # A writer that stalls past the grace loses the lock to the next one, as
+    # above. When it comes back it must neither move its file over the one
+    # written since, nor drop a lock that another writer holds by then.
+    rm -rf "$LOCK_DIR/.models.lock"; : > "$TICK_LOG"
+    sleep 60 >/dev/null 2>&1 & _holder=$!
+    got="$(
+      models_lock opus claude-opus-9 || exit 9
+      touch -t 202001010000 "$LOCK_DIR/.models.lock"
+      ( models_cache_set haiku claude-haiku-4-6 )
+      mkdir "$LOCK_DIR/.models.lock"; echo "$_holder" > "$LOCK_DIR/.models.lock/pid"; boot_id > "$LOCK_DIR/.models.lock/boot"
+      _models_rmw --arg id claude-opus-9 '.resolved.opus = {id:$id, at:1}'; echo "rmw=$?"
+      models_unlock
+      echo "lock=$(cat "$LOCK_DIR/.models.lock/pid" 2>/dev/null)"
+    )"
+    [ "$got" = "$(printf 'rmw=1\nlock=%s' "$_holder")" ] \
+      && "$JQ" -e '.resolved.haiku.id == "claude-haiku-4-6" and .resolved.opus.id != "claude-opus-9"' "$MODELS_FILE" >/dev/null 2>&1 \
+      && [ "$(seen "models: opus — gave up writing claude-opus-9: its lock went to another writer while it held it")" = 1 ] \
+      && ok "a writer that lost its lock that way writes nothing when it comes back, and leaves the new holder its lock" \
+      || bad "a writer robbed of its lock: [$got], $(cat "$MODELS_FILE"), tick.log [$(lines)]"
+    kill "$_holder" 2>/dev/null; wait "$_holder" 2>/dev/null
+    rm -rf "$LOCK_DIR/.models.lock"
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_mwout" | grep -v '^RESULT '
+  printf '%s\n' "$_mwout" | grep -qx 'RESULT ok=18 bad=0' \
+    && ok "models_lock over scratch writers: all 18 assertions reach the gate" \
+    || bad "models_lock over scratch writers did not: $(printf '%s\n' "$_mwout" | tail -1)"
 
   echo "bind_session() — one shot, atomic, and a no-op without a run dir"
   mkdir -p "$tmp/rd1"
@@ -3704,15 +4410,74 @@ NASTY
   lock_drop "$tmp/oldboot"
 
   # The control: swapping kill -0 for slot_alive must not turn every lock into
-  # an instant steal -- a live holder from THIS boot is still waited for.
-  mkdir -p "$tmp/thisboot"; echo $$ > "$tmp/thisboot/pid"; boot_id > "$tmp/thisboot/boot"
+  # an instant steal -- a live holder from THIS boot is still waited for, and
+  # by an unbounded wait however old its lock is: only a bounded wait (the
+  # models.json lock) takes a lock for its age.
+  mkdir -p "$tmp/thisboot"; echo $$ > "$tmp/thisboot/pid"; boot_id > "$tmp/thisboot/boot"; touch -t 202001010000 "$tmp/thisboot"
   ( lock_take "$tmp/thisboot" && : > "$tmp/thisboot-was-stolen" ) >/dev/null 2>&1 & local waiter2=$!
   sleep 3
   [ ! -f "$tmp/thisboot-was-stolen" ] \
-    && ok "a live holder from THIS boot is still held after 3s" \
+    && ok "a live holder from THIS boot is still held after 3s, however old its lock" \
     || bad "a live same-boot holder was stolen from"
   kill "$waiter2" 2>/dev/null; wait "$waiter2" 2>/dev/null
   rm -rf "$tmp/thisboot" "$tmp/thisboot-was-stolen"
+
+  # Bounded, as the models.json lock takes it: a live holder is given up on
+  # once the time is up, and never a moment before it -- exit 1, and the lock
+  # stays with its owner -- while a dead one is still taken at once. Timed in
+  # milliseconds, since the bound counts whole seconds, and started in the
+  # middle of one on the shell's clock: a bound that counted only the whole
+  # seconds would give up half a second early there. Beside it, the grace an
+  # operator can set (AGENTLOOP_LOCK_GRACE) set as low as 1 must not turn the
+  # bounded lock into none: a lock is taken for its age only once it is older
+  # than twice the wait as well, which no live write ever is. Both in the
+  # background, so that a bound that never fires fails here instead of
+  # hanging the suite; the grace is pinned, as the operator may have set it.
+  local LOCK_GRACE_SECONDS=30
+  now_ms() { "$PYTHON" -c 'import time; print(int(time.time() * 1000))'; }
+  mkdir -p "$tmp/bounded" "$tmp/floor"
+  echo $$ > "$tmp/bounded/pid"; boot_id > "$tmp/bounded/boot"; echo $$ > "$tmp/floor/pid"; boot_id > "$tmp/floor/boot"
+  ( LOCK_GRACE_SECONDS=1; lock_take "$tmp/floor" 2; echo "$?" > "$tmp/floor.rc" ) >/dev/null 2>&1 & local fwaiter=$!
+  ( s=$SECONDS; while [ "$SECONDS" = "$s" ]; do sleep 0.01; done; sleep 0.4
+    t0="$(now_ms)"; lock_take "$tmp/bounded" 2; r=$?; echo "$r $(( $(now_ms) - t0 ))" > "$tmp/bounded.rc" ) >/dev/null 2>&1 & local bwaiter=$!
+  i=0; while { [ ! -s "$tmp/bounded.rc" ] || [ ! -s "$tmp/floor.rc" ]; } && [ "$i" -lt 80 ]; do sleep 0.1; i=$(( i + 1 )); done
+  kill "$bwaiter" "$fwaiter" 2>/dev/null; wait "$bwaiter" "$fwaiter" 2>/dev/null
+  got="$(cat "$tmp/bounded.rc" 2>/dev/null)"; elapsed="$(num "${got#* }" 99999)"
+  [ "${got%% *}" = 1 ] && [ "$elapsed" -ge 2000 ] && [ "$elapsed" -lt 4000 ] && [ "$(cat "$tmp/bounded/pid")" = "$$" ] \
+    && ok "a bounded wait gives up on a live holder once its time is up, never before (${elapsed} ms of 2 s), and leaves the lock to it" \
+    || bad "a bounded wait on a live holder: [$got] (exit, milliseconds), the lock now names pid $(cat "$tmp/bounded/pid" 2>/dev/null)"
+  [ "$(cat "$tmp/floor.rc" 2>/dev/null)" = 1 ] && [ "$(cat "$tmp/floor/pid")" = "$$" ] \
+    && ok "with a grace of 1 s, a bounded wait still gives up on a live holder rather than take its lock" \
+    || bad "a bounded wait with a grace of 1 s: exit [$(cat "$tmp/floor.rc" 2>/dev/null)], the lock now names pid $(cat "$tmp/floor/pid" 2>/dev/null)"
+  rm -rf "$tmp/floor" "$tmp/floor.rc"
+  echo "$dead" > "$tmp/bounded/pid"
+  t0="$(now_epoch)"; lock_take "$tmp/bounded" 2; got=$?; elapsed=$(( $(now_epoch) - t0 ))
+  [ "$got" = 0 ] && [ "$elapsed" -lt 2 ] && [ "$(cat "$tmp/bounded/pid")" = "$$" ] \
+    && ok "and a dead holder's lock is still taken at once by a bounded wait (${elapsed}s)" \
+    || bad "a bounded wait on a dead holder: exit $got after ${elapsed}s"
+  lock_drop "$tmp/bounded"; rm -f "$tmp/bounded.rc"
+  # A stale lock that cannot be removed (its directory read-only) still ends
+  # a bounded wait on time -- a dead owner's, and an old one with no pid: the
+  # break used to go straight back to mkdir, and spun on rm for ever without
+  # once reaching the bound. Root removes them whatever the mode, so there is
+  # nothing to check as root.
+  if [ "$(id -u)" = 0 ]; then
+    ok "a stale lock that cannot be removed: not checkable as root, who removes it anyway"
+  else
+    mkdir -p "$tmp/unremovable" "$tmp/unremovable2"; echo "$dead" > "$tmp/unremovable/pid"; : > "$tmp/unremovable2/boot"
+    touch -t 202001010000 "$tmp/unremovable2"; chmod 555 "$tmp/unremovable" "$tmp/unremovable2"
+    ( t0="$(now_epoch)"; lock_take "$tmp/unremovable" 1; r=$?; echo "$r $(( $(now_epoch) - t0 ))" > "$tmp/unremovable.rc" ) >/dev/null 2>&1 & local uwaiter=$!
+    ( t0="$(now_epoch)"; lock_take "$tmp/unremovable2" 1; r=$?; echo "$r $(( $(now_epoch) - t0 ))" > "$tmp/unremovable2.rc" ) >/dev/null 2>&1 & local uwaiter2=$!
+    i=0; while { [ ! -s "$tmp/unremovable.rc" ] || [ ! -s "$tmp/unremovable2.rc" ]; } && [ "$i" -lt 60 ]; do sleep 0.1; i=$(( i + 1 )); done
+    kill "$uwaiter" "$uwaiter2" 2>/dev/null; wait "$uwaiter" "$uwaiter2" 2>/dev/null
+    chmod 755 "$tmp/unremovable" "$tmp/unremovable2"
+    local ua ub
+    ua="$(cat "$tmp/unremovable.rc" 2>/dev/null)"; ub="$(cat "$tmp/unremovable2.rc" 2>/dev/null)"
+    [ "${ua%% *}" = 1 ] && [ "$(num "${ua#* }" 99)" -le 4 ] && [ "${ub%% *}" = 1 ] && [ "$(num "${ub#* }" 99)" -le 4 ] \
+      && ok "a stale lock that cannot be removed ends a bounded wait on time all the same, a dead owner's or an old one with no pid" \
+      || bad "a bounded wait on a stale lock it cannot remove: dead owner [$ua], old with no pid [$ub] (exit, seconds), within 6 s"
+    rm -rf "$tmp/unremovable" "$tmp/unremovable2" "$tmp/unremovable.rc" "$tmp/unremovable2.rc"
+  fi
 
   echo "backoff_multiplier() — a job that only ever fails must stop costing full price"
   # Nothing slowed a failing job down: it relaunched every interval, at full

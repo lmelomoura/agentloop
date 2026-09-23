@@ -24,20 +24,95 @@
 #                      (CLAUDE_CONFIG_DIR, empty line when it has none) — the
 #                      one fact the argv cannot show, since it travels in the
 #                      environment
-#   FAKE_CLAUDE_LOGGED_OUT  set to play a CLI with no session: `auth status` exits 1
+#   FAKE_CLAUDE_LOGGED_OUT  set to play a CLI with no session: `auth status` exits 1,
+#                      and in the probe world below every model probe gets the
+#                      CLI's not-logged-in answer
+#   FAKE_CLAUDE_VERSION  the build this stand-in plays (default 2.1.258): what
+#                      `--version` prints and the build the 400 below names
+#
+# The model probes resolve_family makes (a world of its own, off unless
+# FAKE_API_MODELS is set, so every other suite keeps the launch path below):
+#   FAKE_API_MODELS    the ids the API serves to this CLI build, space-separated
+#   FAKE_GATED_MODELS  the ids it serves only to a newer build: the answer is
+#                      the API's 400, naming the version required
+#   FAKE_FAILED_MODELS the ids whose probe gets no verdict at all: the answer is
+#                      the CLI's not-logged-in one, as if the session went
+#                      mid-pass
+#   FAKE_CLI_MODELS    the ids this CLI build recognises; a request for any
+#                      other id also writes the CLI's unrecognized-model line
+#                      to stderr, whatever the answer, as the real one does
+#   FAKE_ALIASES       what each family alias points at in this build, as
+#                      family=id pairs (read by model_alias_baseline)
+#   FAKE_PROBE_LOG     a path to append every probed id to, one per line
 set -u
 
 # The two probes platform_check makes BEFORE a launch. Answered here, before
 # any recording below, so a FAKE_ARGV_OUT/FAKE_ACCOUNT_OUT set for the launch
 # never captures the probe instead of the run.
 case "${1:-}" in
-  --version) echo "2.1.258 (Claude Code)"; exit 0 ;;
+  --version) echo "${FAKE_CLAUDE_VERSION:-2.1.258} (Claude Code)"; exit 0 ;;
   auth)
     if [ -n "${FAKE_CLAUDE_LOGGED_OUT:-}" ]; then
       printf '{"loggedIn":false,"authMethod":"none"}\n'; exit 1
     fi
     printf '{"loggedIn":true,"authMethod":"claude.ai","email":"fake@example.org","subscriptionType":"max"}\n'; exit 0 ;;
 esac
+
+# THE MODEL PROBES, answered from real captures: the 404 and its stderr line
+# are CLI 2.1.280's answer to an id the API does not serve
+# (fixtures/claude-probe-unknown-model.*), the 400 is 2.1.258's answer to
+# Opus 5.5, which the API served only to 2.1.280 or newer
+# (fixtures/claude-probe-version-gated.*), the not-logged-in answer is
+# 2.1.280's with no USER in its environment, when it cannot find its
+# keychain credential (fixtures/claude-probe-not-logged-in.*: exit 1, $0, and
+# the same stderr line for an id it does not know), and the accepted result
+# and the alias's init event come from the 2.1.258 probe in
+# fixtures/stream-json-hooked-probe.ndjson. A CLI with no session still names
+# its alias's model in that init event (measured), so the baseline below is
+# the same logged in or not. Arguments are read in place, not shifted, so
+# anything this branch does not answer falls through untouched.
+if [ -n "${FAKE_API_MODELS:-}" ]; then
+  fx="$(cd "$(dirname "$0")" && pwd)/fixtures"
+  fmt="" model="" prev=""
+  for a in "$@"; do
+    case "$prev" in --output-format) fmt="$a" ;; --model) model="$a" ;; esac
+    prev="$a"
+  done
+  case "$fmt" in
+    stream-json)            # model_alias_baseline: the init event names the alias's id
+      target=""
+      for pair in ${FAKE_ALIASES:-}; do
+        [ "${pair%%=*}" = "$model" ] && target="${pair#*=}"
+      done
+      sed "s/\"model\":\"[^\"]*\"/\"model\":\"$target\"/" "$fx/stream-json-hooked-probe.ndjson"
+      exit 0 ;;
+    json)                   # model_probe_ok
+      [ -n "${FAKE_PROBE_LOG:-}" ] && printf '%s\n' "$model" >> "$FAKE_PROBE_LOG"
+      # Which answer this id gets, when it is not served: no verdict at all
+      # without a session (served or not, the id is never asked about), the
+      # 400 of a newer build's model, or the 404 of an unknown one.
+      refusal=claude-probe-unknown-model
+      case " ${FAKE_GATED_MODELS:-} " in *" $model "*) refusal=claude-probe-version-gated ;; esac
+      case " ${FAKE_FAILED_MODELS:-} " in *" $model "*) refusal=claude-probe-not-logged-in ;; esac
+      [ -z "${FAKE_CLAUDE_LOGGED_OUT:-}" ] || refusal=claude-probe-not-logged-in
+      # The id each capture was taken for, swapped for the one probed here.
+      # Read from the capture rather than written out: the server and the
+      # engine scan the CLI binary for ids, and this file stands in for it.
+      was="$(sed -n 's/.*"model":"\([^"]*\)".*/\1/p' "$fx/$refusal.stderr")"
+      case " ${FAKE_CLI_MODELS:-} " in
+        *" $model "*) ;;
+        *) sed "s/$was/$model/" "$fx/$refusal.stderr" >&2 ;;
+      esac
+      if [ "$refusal" != claude-probe-not-logged-in ]; then
+        case " $FAKE_API_MODELS " in
+          *" $model "*) grep '"type":"result"' "$fx/stream-json-hooked-probe.ndjson"; exit 0 ;;
+        esac
+      fi
+      # The 400 names the build that asked: 2.1.258 in the capture.
+      sed -e "s/$was/$model/" -e "s/Claude Code 2\.1\.258 does not/Claude Code ${FAKE_CLAUDE_VERSION:-2.1.258} does not/" "$fx/$refusal.json"
+      exit 1 ;;
+  esac
+fi
 
 if [ -n "${FAKE_ACCOUNT_OUT:-}" ]; then
   printf '%s\n' "${CLAUDE_CONFIG_DIR:-}" > "$FAKE_ACCOUNT_OUT"

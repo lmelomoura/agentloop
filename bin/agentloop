@@ -99,6 +99,13 @@ INTERACTIVE_GRACE=20        # seconds to wait for a human reply before ending
                             # an interactive run that has finished its turn
 MODELS_TTL=86400            # 24h — how long a family→id resolution is trusted,
                             # and how often the tick refreshes it on its own
+MODELS_RETRY=600            # 10 min — how soon a family's pass is tried again
+                            # when a probe had no verdict (no session, an API
+                            # error), doubling with each such pass in a row,
+                            # never longer than MODELS_TTL
+MODELS_LOCK_WAIT=10         # s — how long a write of models.json waits for
+                            # the one writer it lets in at a time before it
+                            # gives up, and says so in tick.log (models_lock)
 STATE_FILE="$DATA_DIR/state.json"
 RUNS_FILE="$DATA_DIR/runs.ndjson"
 LOG_DIR="$DATA_DIR/logs"
@@ -1131,9 +1138,21 @@ state_get() { # state_get <id> <field> [default]
 # only break the lock when that pid is gone); this generalises it to the rest.
 LOCK_GRACE_SECONDS="${AGENTLOOP_LOCK_GRACE:-30}"
 
-lock_take() { # lock_take <lockdir> — blocks until held; always succeeds
-  local d="${1:-}" hold i=0
+lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with <seconds>, for a lock only ever held a moment: gives up (1) once they have passed
+  local d="${1:-}" hold i=0 deadline="" stale="" aged="" now born
+  # A bound counts on the shell's own clock, in whole seconds and with no
+  # fork; the extra second makes the wait at least <seconds>, never less. A
+  # lock is old enough to take once it is older than the grace AND twice the
+  # wait: a grace set as low as 1 must not turn the lock into none. What an
+  # age-based take took over is left in LOCK_TAKEN_OVER and LOCK_TAKEN_AGE,
+  # for the caller to say.
+  LOCK_TAKEN_OVER="" LOCK_TAKEN_AGE=""
+  if [ -n "${2:-}" ]; then
+    deadline=$(( SECONDS + $2 + 1 ))
+    stale=$(( LOCK_GRACE_SECONDS > 2 * $2 ? LOCK_GRACE_SECONDS : 2 * $2 ))
+  fi
   while ! mkdir "$d" 2>/dev/null; do
+    LOCK_TAKEN_OVER="" LOCK_TAKEN_AGE=""    # a break another writer won the mkdir after
     hold="$(cat "$d/pid" 2>/dev/null || true)"
     # slot_alive, not a bare `kill -0`: this is the identical defect Task 1
     # exists to remove, on a different kind of directory. .state.lock,
@@ -1143,16 +1162,40 @@ lock_take() { # lock_take <lockdir> — blocks until held; always succeeds
     # pid that only LOOKS like the same process, wedging every write these
     # locks serialize (state, the journal, port allocation, a resume) behind
     # a holder that is actually gone. slot_alive also refuses a pid from an
-    # earlier boot, which a bare kill -0 cannot express at all.
+    # earlier boot, which a bare kill -0 cannot express at all. A lock that
+    # will not go (a read-only directory) falls through to the wait below
+    # rather than straight back to mkdir, so a bound still ends it: it used
+    # to spin on rm for ever.
     if [ -n "$hold" ] && ! slot_alive "$d"; then
-      rm -rf "$d"; continue          # the owner is gone: genuinely stale
+      rm -rf "$d" 2>/dev/null; [ -e "$d" ] || continue   # the owner is gone: genuinely stale
     fi
-    # A live owner is WAITED for, however long it takes. An unreadable owner is
-    # the narrow race between mkdir and writing the pid — give that, and only
-    # that, a time-based escape.
-    i=$(( i + 1 ))
-    if [ -z "$hold" ] && [ "$i" -ge $(( LOCK_GRACE_SECONDS * 100 )) ]; then
-      rm -rf "$d"; i=0; continue
+    if [ -z "$deadline" ]; then
+      # A live owner is WAITED for, however long it takes. An unreadable owner
+      # is the narrow race between mkdir and writing the pid — give that, and
+      # only that, a time-based escape.
+      i=$(( i + 1 ))
+      if [ -z "$hold" ] && [ "$i" -ge $(( LOCK_GRACE_SECONDS * 100 )) ]; then
+        rm -rf "$d"; i=0; continue
+      fi
+    else
+      # Bounded: the models.json lock (models_lock), held for a few jq calls
+      # and an mv, never longer -- so a lock that old is no write, whoever it
+      # names: a writer killed between mkdir and its pid, one stopped
+      # mid-write, a subshell gone under a parent whose $$ it recorded, a pid
+      # reissued. Taken, or every later writer would give up for good; a
+      # holder that comes back finds its lock gone (models_lock_mine). A
+      # younger one is waited for until the time is up, and a writer inside
+      # the gap before its pid is never robbed. The age is read once a
+      # second, not on every poll: it costs two forks.
+      if [ "$SECONDS" != "$aged" ]; then
+        aged=$SECONDS; now="$(now_epoch)"; born="$(num "$(stat -f %m "$d" 2>/dev/null)" "$now")"
+        if [ $(( now - born )) -ge "$stale" ]; then
+          LOCK_TAKEN_OVER="${hold:+pid $hold}"; LOCK_TAKEN_OVER="${LOCK_TAKEN_OVER:-a writer that never wrote its pid}"
+          LOCK_TAKEN_AGE=$(( now - born ))
+          rm -rf "$d" 2>/dev/null; [ -e "$d" ] || continue
+        fi
+      fi
+      [ "$SECONDS" -lt "$deadline" ] || return 1
     fi
     sleep 0.01
   done
@@ -1652,6 +1695,24 @@ platform_ready() { # platform_ready <platform> -> 0; or 1 with the reason on std
 }
 
 # --- the catalogs a platform can enable from --------------------------------------
+# How a claude-* id sorts newest first within its family, for jq: the Settings
+# list (anthropic_catalog_ids) and a family pass cut short, which keeps the
+# newer of two ids (models_cache_fail), read one order.
+CLAUDE_ID_JQ='
+  # Every number in the id. An 8-digit last one is a snapshot date, not a
+  # version: claude-opus-4-20250514 is 4.0, dated 20250514.
+  def nums: [scan("[0-9]+")];
+  def dated: nums | length > 1 and (.[-1] | length) == 8;
+  # (major, minor), a missing minor read as 0. Compared raw, the shorter
+  # list won: [5] sorted ahead of [5,5], so claude-opus-5 was listed above
+  # claude-opus-5-5, and a date sorted as if it were a minor.
+  def ver: (if dated then (nums | .[:-1]) else nums end) | map(tonumber) | . + [range(2 - length) | 0];
+  def date: if dated then (nums | .[-1] | tonumber) else 0 end;
+  # Within one version the undated alias comes first -- it always names the
+  # newest snapshot -- then the snapshots, newest date first; the id itself
+  # settles the rest (claude-opus-4 before claude-opus-4-0).
+  def newest_first: [(ver | map(-.)), (if dated then 1 else 0 end), (date | -.), .];'
+
 anthropic_catalog_ids() { # every claude-* id this install can name, most capable family and newest generation first
   local bin real
   bin="$(platform_bin anthropic)"
@@ -1662,14 +1723,13 @@ anthropic_catalog_ids() { # every claude-* id this install can name, most capabl
     [ -f "$MODELS_FILE" ] && "$JQ" -r '.resolved[]?.id // empty' "$MODELS_FILE" 2>/dev/null
     [ -f "$JOBS_FILE" ] && "$JQ" -r '.jobs[]? | .model // empty | select(startswith("claude-"))' "$JOBS_FILE" 2>/dev/null
     [ -f "$PROJECTS_FILE" ] && "$JQ" -r '.projects[]? | ((.security | objects) // {}).model // empty | select(startswith("claude-"))' "$PROJECTS_FILE" 2>/dev/null
-  } | "$JQ" -R . | "$JQ" -rs '
+  } | "$JQ" -R . | "$JQ" -rs "$CLAUDE_ID_JQ"'
     def fam: (capture("^claude-(?<f>[a-z]+)") | .f) // "";
-    def nums: [scan("[0-9]+") | tonumber | -.];
     # fam is bound to $f BEFORE the array | index(...) pipe below, because that pipe
     # changes "." to the priority array itself -- calling fam(.) after it would feed
     # capture() an array instead of the id string (jq: "cannot be matched, as it is
-    # not a string"). Binding first keeps "." on the id for both sort keys.
-    unique | sort_by(fam as $f | [((["opus","sonnet","haiku","fable"] | index($f)) // 9), nums]) | .[]' 2>/dev/null
+    # not a string"). Binding first keeps "." on the id for every sort key.
+    unique | sort_by(fam as $f | [((["opus","sonnet","haiku","fable"] | index($f)) // 9)] + newest_first) | .[]' 2>/dev/null
 }
 platform_catalog_ids() { # platform_catalog_ids <platform> -> what set-models may enable, one id per line: the VISIBLE catalog, what the Settings page lists
   case "$1" in anthropic) anthropic_catalog_ids ;; openai) openai_catalog_visible ;; opencode) opencode_catalog_visible ;; *) : ;; esac
@@ -2332,16 +2392,79 @@ openai_catalog_all_efforts() { # the union of every VISIBLE model's efforts, fir
     | .[]' "$MODELS_FILE" 2>/dev/null
 }
 
+# --- config/models.json, one writer at a time ---------------------------------
+# Every writer rewrites config/models.json whole -- jq into a temporary file,
+# then mv over it -- and two of them do run at once: the detached pass the tick
+# starts (_resolve_models, which holds the "_models" lock for the whole of its
+# probing, a minute on the usual day) and a launch whose family expired, which
+# resolves inline (effective_model -> family_refresh) outside that pass. Both
+# read the same file and the second mv dropped the first one's update: a
+# family's fresh resolution, a release waiting for claude update, a failed_at
+# stamp, lost until the next pass. This lock is held for the read-modify-write
+# alone -- a few jq calls and one mv, never a probe or a catalog command, and
+# nothing is ever taken under it -- so a writer waits milliseconds for another,
+# not the minute a pass holds "_models" for. It is bounded all the same
+# (lock_take's <seconds>): a writer that cannot have it within
+# MODELS_LOCK_WAIT seconds gives up and says in tick.log what it did not
+# write, rather than hang a launch behind a holder that stopped. A lock older
+# than the grace (AGENTLOOP_LOCK_GRACE) and twice that wait is taken whoever it
+# names, with a line in tick.log -- no write holds it that long -- and a
+# holder that stalled that long finds on its return that the lock is gone
+# (models_lock_mine), and writes nothing.
+MODELS_LOCK_MARK="" MODELS_LOCK_WHO="" MODELS_LOCK_WHAT=""   # the hold models_lock took, for set -u
+models_lock() { # models_lock <who> <what> -- 0 held; 1 gave up, and tick.log names what was not written
+  local d="$LOCK_DIR/.models.lock" p holder="another writer"
+  MODELS_LOCK_WHO="$1" MODELS_LOCK_WHAT="$2" MODELS_LOCK_MARK=""
+  if lock_take "$d" "$MODELS_LOCK_WAIT"; then
+    # This hold's own mark, a file only it created: taken over (above), the
+    # directory goes, and the mark with it.
+    MODELS_LOCK_MARK="$(mktemp "$d/mark.XXXXXX" 2>/dev/null)" || MODELS_LOCK_MARK="unmarked"
+    [ -z "$LOCK_TAKEN_OVER" ] || log_tick "models: $1 — took over the lock on models.json from $LOCK_TAKEN_OVER, held for $LOCK_TAKEN_AGE s"
+    return 0
+  fi
+  p="$(cat "$d/pid" 2>/dev/null || true)"
+  [ -z "$p" ] || holder="pid $p"
+  log_tick "models: $1 — gave up writing $2: $holder held the lock on models.json for more than $MODELS_LOCK_WAIT s"
+  return 1
+}
+models_lock_mine() { # 0 while the lock models_lock took is still this hold's
+  [ "$MODELS_LOCK_MARK" = "unmarked" ] || { [ -n "$MODELS_LOCK_MARK" ] && [ -e "$MODELS_LOCK_MARK" ]; }
+}
+models_unlock() { # drops the lock only while it is still this hold's, never a lock another writer took over
+  if models_lock_mine; then lock_drop "$LOCK_DIR/.models.lock"; fi
+  MODELS_LOCK_MARK=""
+  return 0
+}
+
+_models_rmw() { # _models_rmw <jq args…> -- one read-modify-write of config/models.json; the caller holds models_lock
+  local tmp
+  tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
+  if "$JQ" "$@" "$MODELS_FILE" > "$tmp"; then
+    # Moved into place only while the lock is still this hold's: one that
+    # stalled past the grace has lost it, and would drop the update written since.
+    if models_lock_mine; then
+      mv "$tmp" "$MODELS_FILE" && return 0
+    else
+      log_tick "models: $MODELS_LOCK_WHO — gave up writing $MODELS_LOCK_WHAT: its lock went to another writer while it held it"
+    fi
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+models_write() { # models_write <who> <what> <jq args…> -- _models_rmw under models_lock, over a seeded file; 1 = not written
+  local rc
+  models_lock "$1" "$2" || return 1
+  shift 2
+  [ -f "$MODELS_FILE" ] || echo '{"resolved":{}}' > "$MODELS_FILE"
+  _models_rmw "$@"; rc=$?
+  models_unlock
+  return "$rc"
+}
+
 # --- the OpenAI catalog, write side ------------------------------------------
 resolve_models_openai() { # refresh config/models.json's `openai` block from `codex debug models`
-  local raw source block tmp kept
-  tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
-  if [ ! -f "$MODELS_FILE" ]; then
-    echo '{"resolved":{}}' > "$MODELS_FILE"
-  elif ! "$JQ" -e . "$MODELS_FILE" >/dev/null 2>&1; then
-    echo "models.json was not valid JSON — reseeded"
-    echo '{"resolved":{}}' > "$MODELS_FILE"
-  fi
+  local raw source block kept="" rc=0
   if [ ! -x "$(platform_bin openai)" ]; then
     block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"codex not installed"}')"
   else
@@ -2365,6 +2488,16 @@ resolve_models_openai() { # refresh config/models.json's `openai` block from `co
           deprecated_by:(.upgrade.model // ""), retires_at:(.upgrade.retirement_at // "")}]}')"
     fi
   fi
+  # From here to the write, one writer at a time (models_lock): the seed, the
+  # choice between keeping the catalog and replacing it -- read from the file
+  # as it is now, not as it was before codex answered -- and the write itself.
+  models_lock openai "the catalog" || { echo "openai -> could not write $MODELS_FILE"; return 1; }
+  if [ ! -f "$MODELS_FILE" ]; then
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  elif ! "$JQ" -e . "$MODELS_FILE" >/dev/null 2>&1; then
+    echo "models.json was not valid JSON — reseeded"
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  fi
   # A refresh that failed -- no codex, an empty answer -- must not replace a
   # catalog that still resolves real jobs: the launch gate reads
   # .openai.models and would refuse every openai run until the next
@@ -2377,21 +2510,13 @@ resolve_models_openai() { # refresh config/models.json's `openai` block from `co
   # {available:false} stub is written only when there is nothing to keep.
   if openai_catalog_available && printf '%s' "$block" | "$JQ" -e '.available == false' >/dev/null 2>&1; then
     kept="$(printf '%s' "$block" | "$JQ" -r .reason)"
-    if ! { "$JQ" --argjson at "$(now_epoch)" --arg r "$kept" '.openai.stale_at = $at | .openai.stale_reason = $r' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
-      rm -f "$tmp"
-      echo "openai -> could not write $MODELS_FILE"
-      return 1
-    fi
-    rm -f "$tmp"
-    echo "openai -> kept the previous catalog ($kept)"
-    return 0
+    _models_rmw --argjson at "$(now_epoch)" --arg r "$kept" '.openai.stale_at = $at | .openai.stale_reason = $r' || rc=1
+  else
+    _models_rmw --argjson b "$block" '.openai = $b' || rc=1
   fi
-  if ! { "$JQ" --argjson b "$block" '.openai = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
-    rm -f "$tmp"
-    echo "openai -> could not write $MODELS_FILE"
-    return 1
-  fi
-  rm -f "$tmp"
+  models_unlock
+  if [ "$rc" -ne 0 ]; then echo "openai -> could not write $MODELS_FILE"; return 1; fi
+  if [ -n "$kept" ]; then echo "openai -> kept the previous catalog ($kept)"; return 0; fi
   if openai_catalog_available; then
     echo "openai -> $(openai_catalog_visible | tr '\n' ' ')($(printf '%s' "$block" | "$JQ" -r .source))"
   else
@@ -2458,14 +2583,7 @@ opencode_catalog_tools() { # opencode_catalog_tools <id> -> 0 unless the catalog
 }
 
 resolve_models_opencode() { # refresh config/models.json's `opencode` block from `opencode models --verbose`
-  local block tmp kept version rc raw_tmp
-  tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
-  if [ ! -f "$MODELS_FILE" ]; then
-    echo '{"resolved":{}}' > "$MODELS_FILE"
-  elif ! "$JQ" -e . "$MODELS_FILE" >/dev/null 2>&1; then
-    echo "models.json was not valid JSON — reseeded"
-    echo '{"resolved":{}}' > "$MODELS_FILE"
-  fi
+  local block kept="" version rc raw_tmp wrc=0
   if [ ! -x "$(platform_bin opencode)" ]; then
     block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"opencode not installed"}')"
   else
@@ -2486,7 +2604,7 @@ resolve_models_opencode() { # refresh config/models.json's `opencode` block from
     # bytes for 13 models is safe, but a catalog of 55+ models crosses it), so
     # this capture goes through a file too, the same fix as
     # opencode_export_model above, never `$( )`.
-    raw_tmp="$(mktemp "$CONFIG_DIR/.models-verbose.XXXXXX")" || { rm -f "$tmp"; return 1; }
+    raw_tmp="$(mktemp "$CONFIG_DIR/.models-verbose.XXXXXX")" || return 1
     run_bounded "$((OPENCODE_DEADLINE * 2))" "$(platform_bin opencode)" models --verbose --pure > "$raw_tmp" 2>/dev/null; rc=$?
     if [ "$rc" -eq 124 ]; then
       # Past its deadline, the CLI hung (measured 34b): report a timeout, not
@@ -2558,6 +2676,14 @@ PY
     fi
     rm -f "$raw_tmp"
   fi
+  # One writer at a time from here, as in resolve_models_openai.
+  models_lock opencode "the catalog" || { echo "opencode -> could not write $MODELS_FILE"; return 1; }
+  if [ ! -f "$MODELS_FILE" ]; then
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  elif ! "$JQ" -e . "$MODELS_FILE" >/dev/null 2>&1; then
+    echo "models.json was not valid JSON — reseeded"
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  fi
   # A refresh that failed -- no opencode, an empty list -- must not replace a
   # catalog that still resolves real jobs: keep the block it had, stamped
   # with when and why, exactly as resolve_models_openai does; `platform
@@ -2566,21 +2692,13 @@ PY
   # nothing to keep.
   if opencode_catalog_available && printf '%s' "$block" | "$JQ" -e '.available == false' >/dev/null 2>&1; then
     kept="$(printf '%s' "$block" | "$JQ" -r .reason)"
-    if ! { "$JQ" --argjson at "$(now_epoch)" --arg r "$kept" '.opencode.stale_at = $at | .opencode.stale_reason = $r' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
-      rm -f "$tmp"
-      echo "opencode -> could not write $MODELS_FILE"
-      return 1
-    fi
-    rm -f "$tmp"
-    echo "opencode -> kept the previous catalog ($kept)"
-    return 0
+    _models_rmw --argjson at "$(now_epoch)" --arg r "$kept" '.opencode.stale_at = $at | .opencode.stale_reason = $r' || wrc=1
+  else
+    _models_rmw --argjson b "$block" '.opencode = $b' || wrc=1
   fi
-  if ! { "$JQ" --argjson b "$block" '.opencode = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
-    rm -f "$tmp"
-    echo "opencode -> could not write $MODELS_FILE"
-    return 1
-  fi
-  rm -f "$tmp"
+  models_unlock
+  if [ "$wrc" -ne 0 ]; then echo "opencode -> could not write $MODELS_FILE"; return 1; fi
+  if [ -n "$kept" ]; then echo "opencode -> kept the previous catalog ($kept)"; return 0; fi
   if opencode_catalog_available; then
     echo "opencode -> $(opencode_catalog_visible | tr '\n' ' ')(opencode models --verbose)"
   else
@@ -3774,13 +3892,64 @@ global_daily_cap() { # -> dollars, or empty for "no cap"
 # probe the next versions up. An unknown id is rejected by the API with
 # "issue with the selected model", which is how a probe fails. Results are
 # cached in config/models.json for MODELS_TTL so this costs almost nothing.
+# What no probe can reach is a release the API serves only to a newer CLI:
+# it refuses an older one with a 400 naming the version required (measured:
+# claude-opus-5-5 needs 2.1.280, claude-fable-5-1 needs 2.1.251). That model
+# could not run on the installed CLI anyway -- only `claude update` gets it,
+# so the pass writes it down and tick.log and the dashboard say so.
+#
+# Four answers, and only two are about the id. All but the first exit 1, so
+# the JSON decides, never the exit code:
+#   0 served
+#   1 refused: the API's 404, "issue with the selected model"
+#   2 kept for a newer CLI: the 400 above. The id exists; PROBE_NEEDS and
+#     PROBE_INSTALLED carry the two versions.
+#   3 no verdict: anything else, and it says nothing about the id. A CLI with
+#     no session answers every id alike -- "Not logged in · Please run
+#     /login", measured with no USER in the environment, where the CLI cannot
+#     find its keychain credential -- and so does an API that is down.
+#     PROBE_ANSWER keeps the CLI's own words. Read as a refusal, every family
+#     quietly stayed on its alias and the pass was cached as fresh for a day.
+model_probe_ok() { # model_probe_ok <id> -> 0 served, 1 refused, 2 kept for a newer CLI, 3 no verdict
+  PROBE_NEEDS="" PROBE_INSTALLED="" PROBE_ANSWER=""
+  local out rc res kind
+  # stdout alone: it is the JSON answer. For every request that goes out for
+  # an id it does not recognise, the CLI also writes a
+  # `[claude-code:unrecognized_model] {...}` line to stderr -- and an id newer
+  # than the CLI is exactly what this probes for. Read together with the
+  # JSON, that line made jq fail, so a served id the CLI did not know read
+  # as refused.
+  out="$("$(platform_bin anthropic)" -p --output-format json --model "$1" "ok" 2>/dev/null)"; rc=$?
+  # The result event alone, the last one: another JSON line a later CLI may
+  # print around it must not blind every probe. No result event is no verdict.
+  res="$(printf '%s' "$out" | "$JQ" -cs '[.[] | objects | select(.type == "result")] | last // empty' 2>/dev/null)"
+  kind="$(printf '%s' "$res" | "$JQ" -r '
+    (.result // "" | tostring) as $r
+    | if .is_error != true and ($r | test("issue with the selected model"; "i") | not) then "served"
+      elif .api_error_status == 404 or ($r | test("issue with the selected model"; "i")) then "refused"
+      elif $r | test("version [0-9]+(\\.[0-9]+)+ or newer is required") then "gated"
+      else "none" end' 2>/dev/null)"
+  if [ "$kind" = "served" ]; then return 0; fi
+  if [ "$kind" = "refused" ]; then return 1; fi
+  if [ "$kind" = "gated" ]; then
+    PROBE_NEEDS="$(printf '%s' "$res" | "$JQ" -r '.result | capture("version (?<v>[0-9]+(\\.[0-9]+)+) or newer is required") | .v' 2>/dev/null)"
+    # The 400 names the build that asked; the CLI is asked only when it does not.
+    PROBE_INSTALLED="$(printf '%s' "$res" | "$JQ" -r '.result | capture("Claude Code (?<v>[0-9]+(\\.[0-9]+)+)") | .v' 2>/dev/null)"
+    [ -n "$PROBE_INSTALLED" ] || PROBE_INSTALLED="$(claude_cli_version)"
+    return 2
+  fi
+  # One line for tick.log: -j leaves no newline of its own to turn into a space.
+  PROBE_ANSWER="$(printf '%s' "$res" | "$JQ" -j '.result // empty | tostring' 2>/dev/null \
+                  | tr '\t\n' '  ' | cut -c1-300)"
+  # No result event at all: what the CLI printed instead, when it printed something.
+  [ -n "$PROBE_ANSWER" ] || [ -n "$res" ] \
+    || PROBE_ANSWER="$(printf '%s' "$out" | tr '\t\n' '  ' | sed 's/  *$//' | cut -c1-300)"
+  [ -n "$PROBE_ANSWER" ] || PROBE_ANSWER="no answer from $(platform_cli_name anthropic) (exit $rc)"
+  return 3
+}
 
-model_probe_ok() { # model_probe_ok <id> -> 0 when the API accepts it
-  local out
-  out="$("$(platform_bin anthropic)" -p --output-format json --model "$1" "ok" 2>&1)" || return 1
-  printf '%s' "$out" | "$JQ" -e '
-    (.is_error != true) and (((.result // "") | test("issue with the selected model"; "i")) | not)
-  ' >/dev/null 2>&1
+claude_cli_version() { # the installed CLI's version, digits only ("2.1.280"); empty when it does not say
+  run_bounded "$OPENCODE_DEADLINE" "$(platform_bin anthropic)" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1
 }
 
 model_alias_baseline() { # what the CLI's own alias points at (no API call)
@@ -3791,41 +3960,201 @@ model_alias_baseline() { # what the CLI's own alias points at (no API call)
     | head -1
 }
 
-resolve_family() { # resolve_family <family> -> newest id (prints, and caches)
-  local fam="$1" base major minor cand best=""
-  base="$(model_alias_baseline "$fam")"
-  [ -n "$base" ] || { echo "$fam"; return; }
-  major="$(printf '%s' "$base" | sed -E "s/^claude-${fam}-([0-9]+).*/\1/")"
-  case "$major" in ''|*[!0-9]*) echo "$base"; return ;; esac
+# One probe of resolve_family's search, and what it leaves for the record:
+# the first release kept for a newer CLI is noted (probes run newest first,
+# so it is the newest), and a probe with no verdict names itself and why.
+family_probe() { # family_probe <id> -> 0 served, 1 not served (the search goes on), 3 no verdict (the search stops)
+  local rc
+  model_probe_ok "$1"; rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) if [ -z "$RF_NEWER" ]; then RF_NEWER="$1"; RF_NEEDS="$PROBE_NEEDS"; RF_INSTALLED="$PROBE_INSTALLED"; fi ;;
+    3) RF_PROBE="$1"; RF_FAILED="$PROBE_ANSWER"; return 3 ;;
+  esac
+  return 1
+}
 
-  # newer bare majors first (e.g. claude-opus-6, claude-opus-5)
+# The search alone -- family_refresh writes down what it found. Prints the id
+# and leaves it in RF_ID; RF_NEWER/RF_NEEDS/RF_INSTALLED name the newest
+# release the API keeps for a newer CLI, and RF_PROBE/RF_FAILED the probe
+# that had no verdict, when one did (exit 3: the search stopped there, and
+# RF_ID is only the best id found before it). Every RF_* is assigned on the
+# first line, so nothing carries over from an earlier family.
+resolve_family() { # resolve_family <family> -> newest id the API serves this CLI; exit 3 when a probe had no verdict
+  RF_ID="" RF_NEWER="" RF_NEEDS="" RF_INSTALLED="" RF_PROBE="" RF_FAILED=""
+  local fam="$1" base major minor floor cand best="" rc=1
+  base="$(model_alias_baseline "$fam")"
+  [ -n "$base" ] || { RF_ID="$fam"; echo "$fam"; return 0; }
+  major="$(printf '%s' "$base" | sed -E "s/^claude-${fam}-([0-9]+).*/\1/")"
+  case "$major" in ''|*[!0-9]*) RF_ID="$base"; echo "$base"; return 0 ;; esac
+  # The baseline's own minor. Every probe below asks for something above it,
+  # so the answer is never older than the id the CLI already names. A bare
+  # major is minor 0, and an 8-digit snapshot date is not a minor:
+  # claude-haiku-4-5-20251001 is 4.5, claude-opus-4-20250514 is 4.0.
+  floor="$(printf '%s' "$base" | sed -nE "s/^claude-${fam}-[0-9]+-([0-9]{1,2})(-[0-9]{8})?$/\1/p")"
+  [ -n "$floor" ] || floor=0
+
+  # newer bare majors first (e.g. claude-opus-7, claude-opus-6). All of a
+  # new major's minors sit above the baseline, so its floor is 0.
   local m
   for m in $(( major + 2 )) $(( major + 1 )); do
     cand="claude-${fam}-${m}"
-    if model_probe_ok "$cand"; then best="$cand"; major="$m"; break; fi
+    family_probe "$cand"; rc=$?
+    [ "$rc" -ne 0 ] || { best="$cand"; major="$m"; floor=0; }
+    [ "$rc" -eq 1 ] || break
   done
   [ -n "$best" ] || best="$base"
 
-  # then the newest minor of that major (claude-opus-5-2, -1 …)
-  for minor in 3 2 1; do
-    cand="claude-${fam}-${major}-${minor}"
-    if model_probe_ok "$cand"; then best="$cand"; break; fi
-  done
+  # Then the newest minor of that major, highest first, down to the floor.
+  # Every minor is asked, not just the next few: releases skip minors
+  # (claude-opus-5 went straight to claude-opus-5-5), so neither "the next
+  # three" nor "upward until the first miss" reaches the newest one.
+  # What it costs: one `claude -p` per probe. An id the API does not serve
+  # this CLI is refused before any turn runs (exit 1 with a 404, or the 400
+  # of a newer CLI's model; $0, no tokens, ~5 s of wall time, nearly all of
+  # it CLI start-up); only an id that is served costs a turn, and the search
+  # stops at the first. So a family costs at most 11 probes (2 majors + 9
+  # minors) and 2 turns -- about a minute on the usual day, when nothing
+  # newer exists. It runs once per family per MODELS_TTL: in the tick's
+  # detached _resolve_models, or inline in effective_model when a family's
+  # cached id has expired. A probe with no verdict ends the search at once:
+  # the next ten would have none either.
+  if [ "$rc" -ne 3 ]; then
+    for minor in 9 8 7 6 5 4 3 2 1; do
+      [ "$minor" -gt "$floor" ] || break
+      cand="claude-${fam}-${major}-${minor}"
+      family_probe "$cand"; rc=$?
+      [ "$rc" -ne 0 ] || best="$cand"
+      [ "$rc" -eq 1 ] || break
+    done
+  fi
+  RF_ID="$best"
   echo "$best"
+  [ "$rc" -ne 3 ] || return 3
+  return 0
 }
 
-models_cache_get() { # models_cache_get <family> -> cached id if still fresh
+# config/models.json, one entry per family under .resolved:
+#   {id, at}               the last pass that finished, fresh for MODELS_TTL
+#   newer: {id, needs, installed, cli, at}
+#                          the newest release that pass met which the API
+#                          keeps for a newer CLI -- installed as its 400 said,
+#                          cli as `claude --version` said, the one models_stale
+#                          compares with later; gone once a pass meets none
+#   failed_at, failures, failed
+#                          the last pass a probe cut short, how many in a row,
+#                          and the CLI's answer; id/at stay, and it is tried
+#                          again after its retry (MODELS_FRESH_JQ)
+#
+# The freshness rules, for jq. A family is fresh MODELS_TTL after its last
+# finished pass or, after a pass a probe cut short, until its retry --
+# whichever ends later. The retry waits MODELS_RETRY, twice as long after each
+# cut pass in a row, never longer than MODELS_TTL: a session that is gone for
+# a weekend costs a handful of passes, not one every ten minutes. Every stamp
+# is read as a number or as 0 (`stamp`): one written as text by hand used to
+# make jq fail, which read as an unreadable file -- due on every tick -- and
+# a pass cut short kept the text, so the whole pass ran every minute.
+MODELS_FRESH_JQ='
+  def stamp: if type == "number" then . else 0 end;
+  def cut: (.failed_at | stamp) > 0;
+  def retry_at($ttl; $retry):
+    if cut then .failed_at + ([$retry * pow(2; ([(.failures | if type == "number" then . else 1 end), 1] | max) - 1), $ttl] | min)
+    else 0 end;
+  def fresh_until($ttl; $retry): [(.at | stamp) + $ttl, retry_at($ttl; $retry)] | max;'
+
+models_cache_get() { # models_cache_get <family> -> cached id while fresh (MODELS_FRESH_JQ)
   [ -f "$MODELS_FILE" ] || return 1
-  "$JQ" -er --arg f "$1" --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" \
-    '.resolved[$f] | select(.id != null and (($now - (.at // 0)) < $ttl)) | .id' \
-    "$MODELS_FILE" 2>/dev/null
+  "$JQ" -er --arg f "$1" --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" --argjson retry "$MODELS_RETRY" "$MODELS_FRESH_JQ"'
+    .resolved[$f] | select(.id != null and fresh_until($ttl; $retry) > $now) | .id' "$MODELS_FILE" 2>/dev/null
 }
 
-models_cache_set() { # models_cache_set <family> <id>
-  local tmp; tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")"
-  [ -f "$MODELS_FILE" ] || echo '{"resolved":{}}' > "$MODELS_FILE"
-  "$JQ" --arg f "$1" --arg id "$2" --argjson at "$(now_epoch)" \
-    '.resolved[$f] = {id:$id, at:$at}' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"
+models_cache_set() { # models_cache_set <family> <id> [<newer id> <needs> <installed> <cli>] -- a finished pass: the family's whole entry is replaced
+  # A .resolved that is not an object (a hand edit) is started over: nothing
+  # could be written into it, and it would keep models_stale due for ever.
+  models_write "$1" "$2" --arg f "$1" --arg id "$2" --arg nid "${3:-}" --arg needs "${4:-}" --arg inst "${5:-}" --arg cli "${6:-}" --argjson at "$(now_epoch)" '
+    .resolved |= (if type == "object" then . else {} end)
+    | .resolved[$f] = ({id:$id, at:$at} + (if $nid == "" then {} else {newer:{id:$nid, needs:$needs, installed:$inst, cli:$cli, at:$at}} end))'
+}
+
+# A pass cut short is never written as fresh: .at stays what the last finished
+# pass wrote, and failed_at, the count in a row and the CLI's answer are added.
+# The id to run on is the newer of the family's own and the best this pass
+# reached -- never below the alias the CLI names (the pass a `claude update`
+# brings back is often the one that fails), never below what a finished pass
+# already found. A release met before the cut is noted too: the 400 was a real
+# answer. Prints "<id> <seconds until the retry>", <retry> being the one the
+# tick applies (models_stale) -- and nothing, exit 1, when nothing was written
+# (family_refresh then picks the newer id itself, and promises no retry).
+models_cache_fail() { # models_cache_fail <family> <best id found> <why> <retry> [<newer id> <needs> <installed> <cli>] -> "<id> <seconds>"
+  models_write "$1" "the failed probe" --arg f "$1" --arg id "$2" --arg why "$3" --arg nid "${5:-}" --arg needs "${6:-}" --arg inst "${7:-}" --arg cli "${8:-}" \
+        --argjson now "$(now_epoch)" "$CLAUDE_ID_JQ"'
+    .resolved |= (if type == "object" then . else {} end)
+    | .resolved[$f] = ((.resolved[$f] | if type == "object" then . else {} end)
+        | .id = ([.id, $id] | map(select(type == "string" and . != "")) | sort_by(newest_first) | .[0] // $id)
+        | .at = (.at | if type == "number" then . else 0 end) | .failed_at = $now | .failed = $why
+        | .failures = ((.failures | if type == "number" then . else 0 end) + 1)
+        | if $nid == "" then . else .newer = {id:$nid, needs:$needs, installed:$inst, cli:$cli, at:$now} end)' || return 1
+  "$JQ" -r --arg f "$1" --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" --argjson retry "$4" "$MODELS_FRESH_JQ"'
+    .resolved[$f] | objects | select(.id | type == "string") | "\(.id) \(fresh_until($ttl; $retry) - $now | floor)"' "$MODELS_FILE" 2>/dev/null
+}
+
+models_wait_text() { # models_wait_text <seconds> -> "10 min", "22 h"
+  local s; s="$(num "$1")"
+  if [ "$s" -lt 7200 ]; then printf '%s min' "$(( (s + 59) / 60 ))"
+  else printf '%s h' "$(( (s + 3599) / 3600 ))"; fi
+}
+
+newer_cli_note() { # newer_cli_note <id> <needs> <installed> -> the sentence tick.log and resolve-models print
+  printf '%s is out and needs Claude Code %s (installed %s): run claude update' "$1" "$2" "${3:-version unknown}"
+}
+
+# One family's pass, written down: resolve_family's search, what it found in
+# config/models.json, and in tick.log the two things the operator has to act
+# on -- a release that waits for `claude update`, and a probe that had no
+# verdict (both, when a release was met before the cut). Prints the id to run
+# the family on; FR_ID and FR_NOTE carry it and those notes for resolve-models'
+# own line. Exit 3 when the pass was cut short, 1 when a finished one could not
+# be written down (models_lock gave up, or the file is unreadable).
+family_refresh() { # family_refresh <family> -> the id to run the family on
+  FR_ID="" FR_NOTE=""
+  local fam="$1" rc cli="" gate="" retry="$MODELS_RETRY" out
+  resolve_family "$fam" >/dev/null; rc=$?
+  if [ -n "$RF_NEWER" ]; then
+    # What --version says now is what models_stale compares with later:
+    # like with like, never with the text of the 400.
+    cli="$(claude_cli_version)"
+    gate="$(newer_cli_note "$RF_NEWER" "$RF_NEEDS" "$RF_INSTALLED")"
+    log_tick "models: $fam — $gate"
+  fi
+  if [ "$rc" -eq 3 ]; then
+    # While Settings keeps Anthropic off, a cut family waits for the daily
+    # pass (models_stale), and the note says so.
+    platform_enabled anthropic || retry="$MODELS_TTL"
+    out="$(models_cache_fail "$fam" "$RF_ID" "$RF_FAILED" "$retry" "$RF_NEWER" "$RF_NEEDS" "$RF_INSTALLED" "$cli")"
+    if [ "${out% *}" != "$out" ]; then
+      FR_ID="${out% *}"
+      FR_NOTE="the probe of $RF_PROBE failed ($RF_FAILED); kept $FR_ID, trying again in $(models_wait_text "${out##* }")"
+    else
+      # Nothing was written: still the newer of the id the file holds and the
+      # best this pass reached, read exactly as models_cache_fail reads them
+      # -- a launch never runs below either -- and no retry is promised,
+      # since none was stamped.
+      FR_ID="$("$JQ" -r --arg f "$fam" --arg id "$RF_ID" "$CLAUDE_ID_JQ"'
+        [((.resolved | objects | .[$f] | objects | .id) // empty), $id]
+        | map(select(type == "string" and . != "")) | sort_by(newest_first) | .[0] // empty' "$MODELS_FILE" 2>/dev/null)"
+      [ -n "$FR_ID" ] || FR_ID="$RF_ID"
+      FR_NOTE="the probe of $RF_PROBE failed ($RF_FAILED); kept $FR_ID, not recorded in models.json"
+    fi
+    log_tick "models: $fam — $FR_NOTE"
+  else
+    # A finished pass still runs on what it found when it could not be
+    # written down; resolve-models says so, and exits 1.
+    FR_ID="$RF_ID"
+    models_cache_set "$fam" "$FR_ID" "$RF_NEWER" "$RF_NEEDS" "$RF_INSTALLED" "$cli" || { FR_NOTE="not recorded in models.json"; rc=1; }
+  fi
+  [ -z "$gate" ] || FR_NOTE="${FR_NOTE:+$FR_NOTE — }$gate"
+  printf '%s\n' "$FR_ID"
+  return "$rc"
 }
 
 effective_model() { # effective_model <model> -> concrete id (families resolved)
@@ -3835,30 +4164,105 @@ effective_model() { # effective_model <model> -> concrete id (families resolved)
     *) echo "$m"; return ;;          # already an explicit id — use it verbatim
   esac
   if hit="$(models_cache_get "$m")"; then echo "$hit"; return; fi
-  hit="$(resolve_family "$m")"
+  # A launch resolves its family before the gate that refuses a run on a
+  # platform Settings keeps off (run_refusals): with Anthropic off, no probe
+  # is spent on a run turned away next -- the id the cache holds, stale or
+  # not, or the family itself.
+  if ! platform_enabled anthropic; then
+    hit="$(family_cached_id "$m")"
+    echo "${hit:-$m}"; return
+  fi
+  hit="$(family_refresh "$m")"
   [ -n "$hit" ] || hit="$m"
-  models_cache_set "$m" "$hit"
   echo "$hit"
 }
 
-models_stale() { # 0 = either cache is missing or older than MODELS_TTL
-  local oldest oa
-  [ -f "$MODELS_FILE" ] || return 0
-  oldest="$("$JQ" -r '[.resolved[]?.at // 0] | min // 0' "$MODELS_FILE" 2>/dev/null)"
-  case "$oldest" in ''|null|*[!0-9]*) oldest=0 ;; esac
-  # The openai block ages the same way. Absent, it is stale by definition --
-  # which is what gets it written on the first tick after this upgrade. It
-  # ages from the last ATTEMPT: a failed refresh keeps the catalog and stamps
-  # `stale_at` (resolve_models_openai) instead of moving `.at`, so the stamp
-  # is what keeps a missing codex from re-running the whole pass every tick.
-  oa="$("$JQ" -r '[.openai.at // 0, .openai.stale_at // 0] | max' "$MODELS_FILE" 2>/dev/null)"
-  case "$oa" in ''|null|*[!0-9]*) oa=0 ;; esac
-  [ "$oa" -lt "$oldest" ] && oldest="$oa"
-  local oc
-  oc="$("$JQ" -r '[.opencode.at // 0, .opencode.stale_at // 0] | max' "$MODELS_FILE" 2>/dev/null)"
-  case "$oc" in ''|null|*[!0-9]*) oc=0 ;; esac
-  [ "$oc" -lt "$oldest" ] && oldest="$oc"
-  [ "$(( $(now_epoch) - oldest ))" -ge "$MODELS_TTL" ]
+# Asked by the tick every minute. MODELS_DUE_SCOPE says how much of the pass
+# is due -- "" every platform, "anthropic" the Claude families alone --
+# MODELS_DUE_FAMILIES which families when a retry is for some of them only
+# ("" all four), and MODELS_DUE_WHY why, for the tick's log line
+# (models_refresh_launch hands all three on).
+models_stale() { # 0 = due: a catalog past MODELS_TTL, a cut-short family past its retry, a CLI changed under a waiting release
+  MODELS_DUE_SCOPE="" MODELS_DUE_FAMILIES="" MODELS_DUE_WHY=""
+  local due retry="$MODELS_RETRY" on=true waiting cur v
+  [ -f "$MODELS_FILE" ] || { MODELS_DUE_WHY="no models.json yet"; return 0; }
+  # While Settings keeps Anthropic off, nothing runs on it: a cut family
+  # waits for the daily pass, and a changed CLI brings nothing back.
+  platform_enabled anthropic || { on=false; retry="$MODELS_TTL"; }
+  # When each block is due, the earliest deciding. A family whose last pass
+  # finished is due MODELS_TTL later, for the whole pass. One a probe cut
+  # short is due at its retry (MODELS_FRESH_JQ), for the Claude families
+  # alone: a retry has no business refreshing the other catalogs and the
+  # price table, and a failure that does not clear would otherwise run them
+  # all again every time. Only the four families count -- an entry the pass
+  # never writes would keep this due for ever -- and none at all is due at
+  # once. The openai block ages the same way. Absent, it is stale by
+  # definition -- which is what gets it written on the first tick after this
+  # upgrade. It ages from the last ATTEMPT: a failed refresh keeps the
+  # catalog and stamps `stale_at` (resolve_models_openai) instead of moving
+  # `.at`, so the stamp is what keeps a missing codex from re-running the
+  # whole pass every tick. The opencode block likewise. A retry that comes
+  # due less than MODELS_RETRY before the whole pass is folded into it: one
+  # round of probes, not two a minute apart. An unreadable file answers
+  # nothing, which is due: the pass reseeds it.
+  due="$("$JQ" -r --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" --argjson retry "$retry" --argjson soon "$MODELS_RETRY" "$MODELS_FRESH_JQ"'
+    ((.resolved | if type == "object" then . else {} end)
+     | with_entries(select(.key == "opus" or .key == "sonnet" or .key == "haiku" or .key == "fable"))) as $fam
+    | ([$fam[] | if type == "object" then select(cut | not) | (.at | stamp) + $ttl else 0 end]
+       + (if ($fam | length) == 0 then [0] else [] end)
+       + [([(.openai | objects | .at | stamp) // 0, (.openai | objects | .stale_at | stamp) // 0] | max) + $ttl,
+          ([(.opencode | objects | .at | stamp) // 0, (.opencode | objects | .stale_at | stamp) // 0] | max) + $ttl]) as $whole
+    | [$fam | to_entries[] | select(.value | type == "object" and cut)
+       | select((.value | fresh_until($ttl; $retry)) <= $now) | .key] as $retrying
+    | if ($whole | min) <= $now then "all"
+      elif ($retrying | length) > 0 then
+        (if ($whole | min) - $now <= $soon then "fold|" else "anthropic|" end) + ($retrying | join(" "))
+      else "fresh" end' "$MODELS_FILE" 2>/dev/null)"
+  if [ "$due" = "all" ]; then MODELS_DUE_WHY="cache older than ${MODELS_TTL}s"; return 0; fi
+  if [ "${due#fold|}" != "$due" ]; then
+    MODELS_DUE_WHY="retrying ${due#fold|} after a failed probe, the rest of the cache due within $(models_wait_text "$MODELS_RETRY")"
+    return 0
+  fi
+  if [ "${due#anthropic|}" != "$due" ]; then
+    MODELS_DUE_SCOPE="anthropic"; MODELS_DUE_FAMILIES="${due#anthropic|}"
+    MODELS_DUE_WHY="retrying $MODELS_DUE_FAMILIES after a failed probe"; return 0
+  fi
+  if [ "$due" != "fresh" ]; then MODELS_DUE_WHY="models.json could not be read"; return 0; fi
+  # A release that waits for `claude update` is probed again as soon as the
+  # CLI is not the one it was recorded against, so the notice goes -- and the
+  # family moves to the release -- within a tick of the update, not a day
+  # later. The CLI is asked its version only while such a release waits, the
+  # answer is compared with what --version said when it was recorded (like
+  # with like: a 400 whose text the CLI does not repeat must not bring the
+  # pass back every minute), and a family inside its retry is left alone: a
+  # CLI that changed and lost its session would relaunch the pass every
+  # minute.
+  [ "$on" = true ] || return 1
+  waiting="$("$JQ" -r --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" --argjson retry "$retry" "$MODELS_FRESH_JQ"'
+    [.resolved | objects | to_entries[] | select(.key == "opus" or .key == "sonnet" or .key == "haiku" or .key == "fable")
+     | .value | objects | select(retry_at($ttl; $retry) <= $now) | .newer | objects | .cli | strings | select(. != "")]
+    | unique | join(" ")' "$MODELS_FILE" 2>/dev/null)"
+  [ -n "$waiting" ] || return 1
+  cur="$(claude_cli_version)"
+  [ -n "$cur" ] || return 1
+  for v in $waiting; do
+    if [ "$v" != "$cur" ]; then
+      MODELS_DUE_SCOPE="anthropic"; MODELS_DUE_WHY="Claude Code went from $v to $cur while a release waited for it"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The detached pass the tick starts when models_stale says one is due: the
+# whole pass, or the Claude families alone -- every one of them, or only
+# those a retry is due for. Its own function so the selftest can hold the
+# hand-off: without the scope, every retry was a whole pass again.
+models_refresh_launch() { # models_refresh_launch -- reads MODELS_DUE_SCOPE, MODELS_DUE_FAMILIES and MODELS_DUE_WHY
+  # The families are plain words (opus sonnet haiku fable): split on purpose.
+  nohup /bin/bash "$SELF" _resolve_models ${MODELS_DUE_SCOPE:+"$MODELS_DUE_SCOPE"} ${MODELS_DUE_FAMILIES:-} \
+    </dev/null >> "$DATA_DIR/exec.log" 2>&1 &
+  log_tick "models: refreshing family→id resolutions ($MODELS_DUE_WHY)"
 }
 
 cmd_say() { # cmd_say <id> — message on stdin, delivered to the live run
@@ -4094,20 +4498,34 @@ cmd_precheck() { # <id> — run the job's precheck once and RECORD it, without t
   printf '%s\n(exit %s)\n' "$pc_out" "$pc_rc"
 }
 
-cmd_resolve_models() { # cmd_resolve_models [anthropic|openai|opencode] -- no argument does all three
+cmd_resolve_models() { # cmd_resolve_models [anthropic [family…]|openai|opencode] -- no argument does all three; anthropic alone does all four families
   # `rc` carries resolve_models_openai's status past the validation case below,
   # whose own 0 used to be the function's answer -- so a catalog that could not
   # be written exited 0 and the failure was invisible to the operator and to
   # install.sh. An UNAVAILABLE codex is not a failure: that is a written
   # {available:false} block, and resolve_models_openai already returns 0 for it.
-  local which="${1:-}" fam id rc=0
+  # A family whose pass a probe cut short makes it exit 1 as well, and so does
+  # one whose pass could not be recorded (models.json busy or unreadable):
+  # family_refresh already kept its id and logged why, and the line says so. Families named
+  # after `anthropic` are the only ones probed -- a retry the tick runs for
+  # the families whose pass failed (models_stale), not the ones that finished.
+  local which="${1:-}" fam id rc=0 fams="opus sonnet haiku fable"
+  if [ "$which" = "anthropic" ] && [ $# -gt 1 ]; then
+    shift; fams=""
+    for fam in "$@"; do
+      case "$fam" in
+        opus|sonnet|haiku|fable) fams="$fams $fam" ;;
+        *) die "resolve-models: unknown family '$fam' (opus, sonnet, haiku or fable)" ;;
+      esac
+    done
+  fi
   case "$which" in
     ""|anthropic)
-      for fam in opus sonnet haiku fable; do
-        id="$(resolve_family "$fam")"
+      for fam in $fams; do
+        family_refresh "$fam" >/dev/null || rc=1
+        id="$FR_ID"
         [ -n "$id" ] || id="$fam"
-        models_cache_set "$fam" "$id"
-        echo "$fam -> $id"
+        echo "$fam -> $id${FR_NOTE:+ — $FR_NOTE}"
       done ;;
   esac
   case "$which" in
@@ -5738,7 +6156,9 @@ cmd_tick() {
   # is always the first thing this function does, before anything that could
   # hold one of the others — keep it that way, or the reverse nesting (one
   # of those held first, then a path into cmd_tick reaching for .tick) is
-  # how two of these locks deadlock against each other.
+  # how two of these locks deadlock against each other. .models.lock
+  # (models_lock) is a leaf: it may be taken under any of them, and nothing
+  # is ever taken under it -- a few jq calls and an mv, then it is dropped.
   lock_take "$LOCK_DIR/.tick"
   # Cap the two append-only logs before anything else writes to them. Once a
   # minute is the right cadence: the tick is the only thing guaranteed to run,
@@ -5763,10 +6183,11 @@ cmd_tick() {
   # tick this package already installs — deliberately NOT a second launchd job or
   # a crontab entry, so nothing lives outside the project folder and the whole
   # thing still works when the package is handed to someone else. Detached, so a
-  # ~1min probing pass never delays the jobs.
+  # ~1min probing pass never delays the jobs. A retry after a failed probe, or
+  # a CLI updated under a release that waited for it, re-runs the Claude
+  # families alone (models_stale says which, and why).
   if models_stale && ! lock_active "_models"; then
-    nohup /bin/bash "$SELF" _resolve_models </dev/null >> "$DATA_DIR/exec.log" 2>&1 &
-    log_tick "models: refreshing family→id resolutions (cache older than ${MODELS_TTL}s)"
+    models_refresh_launch
   fi
   local days hours interval last streak max_par
   # IFS is tick_plan's own separator, never a tab: see the note on TICK_SEP
@@ -6895,9 +7316,10 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop security-branches <project> <repo>
                               list the branches of a project's canonical
                               checkout, local and origin's, for a branch picker
-  agentloop resolve-models [anthropic|openai]
-                              refresh the model catalogues (both, without an
-                              argument)
+  agentloop resolve-models [anthropic [family…]|openai|opencode]
+                              refresh the model catalogues (all three, without
+                              an argument; one Claude family, or several,
+                              after anthropic)
   agentloop resolve-pricing
                               refresh config/pricing.json from the price
                               source (daily on its own)
@@ -6933,11 +7355,16 @@ case "${1:-}" in
   dashboard) cmd_dashboard ;;
   tick)      cmd_tick ;;
   _exec)     [ $# -ge 2 ] || die "usage: agentloop _exec <job-id>"; run_job "$2" ;;  # internal: detached runner
-  _resolve_models)   # internal: detached daily refresh, guarded by its own lock
+  _resolve_models)   # internal: detached refresh, guarded by its own lock; `anthropic [family…]` is the Claude families alone (models_stale's scope)
     acquire_lock "_models" || exit 0
     trap 'release_lock "_models"' EXIT
-    cmd_resolve_models
-    resolve_pricing_openai   # not cmd_resolve_pricing: this branch already holds the _models lock
+    if [ "${2:-}" = "anthropic" ]; then
+      shift 2
+      cmd_resolve_models anthropic "$@"
+    else
+      cmd_resolve_models
+      resolve_pricing_openai   # not cmd_resolve_pricing: this branch already holds the _models lock
+    fi
     ;;
   run)       [ $# -ge 2 ] || die "usage: agentloop run <job-id>"; run_job "$2" --force ;;
   resume)    [ $# -ge 3 ] || die "usage: agentloop resume <job-id> <session-id>"; run_job "$2" --force "$3" ;;
@@ -6986,7 +7413,7 @@ case "${1:-}" in
              esac ;;
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"
                      cmd_security_branches "$2" "$3" ;;
-  resolve-models) cmd_resolve_models "${2:-}" ;;
+  resolve-models) shift; cmd_resolve_models "$@" ;;
   resolve-pricing) cmd_resolve_pricing ;;
   platforms) cmd_platforms ;;
   platform)  shift; cmd_platform "$@" ;;

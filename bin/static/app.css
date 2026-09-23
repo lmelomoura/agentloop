@@ -2865,6 +2865,7 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 .swlabel{display:flex;flex-direction:column;align-items:flex-end;gap:3px;font-size:11.5px;color:var(--muted);text-align:right}
 .swrow{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--ink)}
 .platnote{display:flex;align-items:flex-start;gap:8px;padding:10px 20px;font-size:12.5px;color:var(--muted);border-bottom:1px solid var(--line2)} .platnote .ic{width:14px;height:14px;margin-top:2px;flex:none} .platnote.err{color:var(--err);background:var(--err-soft)}
+.platnote.warn{color:var(--ink);background:var(--warn-soft)} .platnote.warn .ic{color:var(--warn)}
 .platcard-g{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:0}
 .platcard-g > div{padding:14px 20px 16px}
 .platcard-g > div + div{border-left:1px solid var(--line2)}
@@ -2933,5 +2934,5 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 /* cover, not fill: a photo that is not square is cropped rather than stretched */
 .pf-face img{width:100%;height:100%;object-fit:cover;display:block}
 .pf-photo-a{display:flex;gap:8px;flex-wrap:wrap}
-/* ui-bundle: 71772e02a97217cef88981a8f2eabc05d1ae8e1ef06cb11bb6c7a5c76f6f63f0 */
-/* ui-sources: 41b43adda1f075f2ac34d1632f8996e2735d4da4a9419b231938250ca8a1e1b6 */
+/* ui-bundle: 091a91bd70bec93176656a10696317413a5d164a487619b17fa8a913b72219a2 */
+/* ui-sources: e46293d001f0aed6615592aad0b95e2715763c4108f2c8daa924ae5e1ff68173 */
