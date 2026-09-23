@@ -5673,6 +5673,16 @@ PY
   [ ! -d "$tmp/locks/sm/222" ] && ok "and one left with no pid past the grace is pruned" \
     || bad "an abandoned slot with no pid survived the count"
   rm -rf "$tmp/locks/sm"
+  # agentloop runs walks the same slots and pruned them the same way. A slot
+  # mid-claim is left alone, and not listed -- it has nothing to list yet --
+  # while an abandoned one goes and a live one is listed.
+  mkdir -p "$tmp/locks/rn/111" "$tmp/locks/rn/222" "$tmp/locks/rn/$$"; touch -t 202001010000 "$tmp/locks/rn/222"
+  echo $$ > "$tmp/locks/rn/$$/pid"; boot_id > "$tmp/locks/rn/$$/boot"
+  got="$( LOCK_DIR="$tmp/locks"; LOCK_GRACE_SECONDS=30; cmd_runs rn | cut -f1 )"
+  [ "$got" = "$$" ] && [ -d "$tmp/locks/rn/111" ] && [ ! -d "$tmp/locks/rn/222" ] \
+    && ok "agentloop runs lists the live run, leaves one mid-claim alone and prunes one abandoned" \
+    || bad "agentloop runs listed [$got], kept mid-claim [$([ -d "$tmp/locks/rn/111" ] && echo yes || echo no)], kept abandoned [$([ -d "$tmp/locks/rn/222" ] && echo yes || echo no)]"
+  rm -rf "$tmp/locks/rn"
 
   echo "alloc_port_base() — two live runs never get the same ports"
   # Isolation settles the filesystem and says nothing about ports: two runs of

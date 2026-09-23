@@ -4408,8 +4408,15 @@ cmd_runs() { # <id> — one active run per line: <run-pid>\t<agent-pid>\t<logfil
   [ -d "$base" ] || return 0
   for d in "$base"/*/; do
     [ -d "$d" ] || continue
-    slot_alive "${d%/}" || { rm -rf "$d"; continue; }
+    # Its pid, read once. A slot with none is a run still claiming it, as in
+    # slots_active: nothing to list yet, and not pruned from under that run
+    # unless it is older than the grace (lock_abandoned).
     pid="$(cat "$d/pid" 2>/dev/null || true)"
+    if [ -z "$pid" ]; then
+      lock_abandoned "${d%/}" && rm -rf "$d"
+      continue
+    fi
+    slot_alive "${d%/}" || { rm -rf "$d"; continue; }
     child="$(cat "$d/child" 2>/dev/null || true)"
     logf="$(cat "$d/logfile" 2>/dev/null || true)"
     printf '%s\t%s\t%s\n' "$pid" "$child" "$logf"
