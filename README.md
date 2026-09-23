@@ -879,15 +879,22 @@ family in `config/models.json` and says so — one line in `tick.log`, a note on
 the Anthropic card in Settings › Platforms and in the job editor's model help:
 *claude-opus-5-5 is out and needs Claude Code 2.1.280 (installed 2.1.258): run
 claude update*. The tick notices the update by itself: while such a release
-waits it asks the CLI its version each minute (and never otherwise), probes
-again as soon as the version changes, and the note goes once a pass meets no
-release it cannot run.
+waits it asks the CLI its version each minute (and never otherwise), probes the
+Claude families again as soon as `claude --version` differs from what it said
+when the release was recorded, and the note goes once a pass meets no release
+it cannot run.
 
 A probe that gets no verdict at all — *Not logged in*, an API that is down —
-says nothing about the id. The family's search stops there, its id stays what
-the last finished pass found, the CLI's answer goes to `tick.log`, and the pass
-is tried again ten minutes later instead of being trusted for a day;
-`resolve-models` exits 1. Run by hand, keep `USER` in the environment: without
+says nothing about the id. The family's search stops there and nothing is
+trusted as fresh: the family keeps the newer of the id its last finished pass
+found and the best this pass reached (never below the CLI's own alias), the
+CLI's answer goes to `tick.log`, and the tick probes the Claude families alone
+again ten minutes later — twenty after a second failure in a row, forty after a
+third, never more than a day apart, and only daily while Settings keeps
+Anthropic off. `resolve-models` exits 1. The tick's line says why a pass runs:
+*cache older than 86400s*, *retrying opus after a failed probe*, or *Claude Code
+went from 2.1.258 to 2.1.280 while a release waited for it*. Run by hand, keep
+`USER` in the environment: without
 it the CLI cannot find its login in the keychain and answers *Not logged in* to
 every probe (launchd sets `USER` for the tick, though `launchctl print` does not
 list it).

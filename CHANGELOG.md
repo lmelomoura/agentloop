@@ -75,16 +75,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (measured: run with no `USER` in its environment, Claude Code cannot find
   its keychain login), and every one of them read as a refusal: each family
   silently stayed on its alias, and the pass was cached as fresh for 24
-  hours. Such an answer — or an API error, or no JSON at all — now ends
-  that family's search at once, keeps the id its last finished pass found
-  (`.at` is left alone; `failed_at` and the CLI's answer are added), puts
-  the probe and the CLI's words in `tick.log`, and is tried again ten
-  minutes later (`MODELS_RETRY`), neither a day later nor on every tick; a
-  launch in between runs on the kept id without probing. `resolve-models`
-  exits 1 when a family's pass was cut short. `test/fake-claude` answers
-  from the real capture, committed as
-  `test/fixtures/claude-probe-not-logged-in.*`. A family entry that is not
-  an object no longer takes `/api/models` down.
+  hours. Such an answer — or an API error, or no result event at all — now
+  ends that family's search at once and is never written as fresh (`.at` is
+  left alone; `failed_at`, the count in a row and the CLI's answer are
+  added). The family keeps the newer of the id its last finished pass found
+  and the best this pass reached, so never below the CLI's own alias; the
+  probe and the CLI's words go to `tick.log`; and the tick probes the Claude
+  families alone again ten minutes later (`MODELS_RETRY`), twice as long
+  after each failure in a row, never more than a day apart — and only daily
+  while Settings keeps Anthropic off. The other catalogs and the price table
+  keep their daily pace, and a launch in between runs on the kept id without
+  probing. The tick's line says why a pass runs (*cache older than 86400s*,
+  *retrying opus after a failed probe*, *Claude Code went from 2.1.258 to
+  2.1.280 while a release waited for it*). `resolve-models` exits 1 when a
+  family's pass was cut short. The probe reads the CLI's result event,
+  whatever other JSON surrounds it. `test/fake-claude` answers from the
+  real capture, committed as `test/fixtures/claude-probe-not-logged-in.*`.
+  Hand edits no longer wedge the pass: an entry under `.resolved` that is no
+  Claude family used to keep it due every minute, a `.resolved` that is not
+  an object could never be written again, and a family entry that is not an
+  object took `/api/models` down.
 
 - **A family resolves to the newest model the API serves the installed CLI,
   even one that CLI has never heard of.** Two defects sat on the probe's
@@ -261,8 +271,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   needs Claude Code 2.1.280 (installed 2.1.258): run claude update*.
   `/api/models` carries it as `platforms.anthropic.newer`, never as a model a
   job can pick. It goes by itself: while a release waits, the tick asks the
-  CLI its version (only then — it runs every minute), probes again as soon
-  as the version changes, and a pass that meets no such release drops the
+  CLI its version (only then — it runs every minute), probes the Claude
+  families again as soon as `claude --version` differs from what it said
+  when the release was recorded — never from the 400's own text, which the
+  CLI need not repeat — and a pass that meets no such release drops the
   note. `resolve-models` prints it next to the family.
 
 - **A `sast` finding can carry a `candidate` document** — trace (entrypoint →
