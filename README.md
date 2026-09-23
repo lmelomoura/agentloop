@@ -920,15 +920,18 @@ two. The catalog is what the CLI itself resolves at launch: a provider added to
 and no `--refresh` is passed — refreshing the CLI's own models.dev cache is
 the CLI's business (`opencode models --refresh`, by hand).
 
-The families and all three catalogs share `config/models.json`, and more than
-one writer reaches it at once: the tick's pass, and a launch whose family has
+The families and both catalogs share `config/models.json`, and more than one
+writer reaches it at once: the tick's pass, and a launch whose family has
 expired and resolves on the spot. Every write takes one short lock
 (`data/locks/.models.lock`) for its read-modify-write alone, never for a probe,
 so neither drops the other's update and a launch waits milliseconds, not the
 minute a pass takes. A write that cannot have the lock within ten seconds
 gives up rather than hold a launch back, and says so in `tick.log` — *models:
 opus — gave up writing claude-opus-5-5: pid 4242 held the lock on models.json
-for more than 10 s* — and the next pass or launch writes it again.
+for more than 10 s* — and the next pass or launch writes it again;
+`resolve-models` exits 1 when that happens to a family it resolved. A lock
+older than thirty seconds (`AGENTLOOP_LOCK_GRACE`) belongs to no write, and is
+taken whoever it names.
 
 ### Effort
 

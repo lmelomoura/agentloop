@@ -2388,83 +2388,134 @@ EOF
       || bad "a stamp and a family at once, an update lost: $(cat "$MODELS_FILE")"
 
     # A writer that stopped while it held the lock: a live pid, from this boot.
-    # Every write waits MODELS_LOCK_WAIT for it and then gives up -- the file
-    # untouched, one line in tick.log naming what was not written -- so neither
-    # a launch nor the pass hangs behind it. Every path that writes is asked:
-    # both catalogs, replaced and stamped, and both family records. Sonnet
-    # has an older entry, which a cut pass that wrote nothing must not print.
-    seed
-    "$JQ" '.resolved.sonnet = {id:"claude-sonnet-4-6", at:1}' "$MODELS_FILE" > "$MODELS_FILE.t" && mv "$MODELS_FILE.t" "$MODELS_FILE"
+    # Every write waits MODELS_LOCK_WAIT for it and then gives up -- nothing
+    # written, one line in tick.log naming what was not -- so neither a launch
+    # nor the pass hangs behind it. Every path that writes is asked, all at
+    # once in the background: both family records, both catalogs replaced and
+    # stamped, and a whole family pass, cut short and finished. Opus and
+    # sonnet already hold an id: a cut pass that wrote nothing prints none of
+    # its own, and still never runs below the id the file holds.
+    LOCK_GRACE_SECONDS=30; MODELS_LOCK_WAIT=1
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{opus:{id:"claude-opus-5-5", at:1}, sonnet:{id:"claude-sonnet-4-6", at:1}},
+      openai:{at:$now, models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    : > "$TICK_LOG"
     sleep 60 >/dev/null 2>&1 & _holder=$!
     mkdir "$LOCK_DIR/.models.lock"; echo "$_holder" > "$LOCK_DIR/.models.lock/pid"; boot_id > "$LOCK_DIR/.models.lock/boot"
-    MODELS_LOCK_WAIT=1
     _before="$(cksum < "$MODELS_FILE")"
-    # held <command...> prints: its exit, bounded or how long it took, the file same or changed, the last tick.log line.
-    held() {
-      local t0 rc el same=same
-      : > "$TICK_LOG"; t0="$(now_epoch)"
-      "$@" > "$tmp/mw/out" 2>&1; rc=$?; el=$(( $(now_epoch) - t0 ))
-      [ "$(cksum < "$MODELS_FILE")" = "$_before" ] || same=changed
-      [ "$el" -le 3 ] && el=bounded || el="waited ${el}s"
-      printf '%s|%s|%s|%s' "$rc" "$el" "$same" "$(lines | tail -1)"
-    }
+    gone="pid $_holder held the lock on models.json for more than 1 s"
+    # gives NAME COMMAND...: in the background; its output lands in NAME.out, its exit and seconds in NAME.rc.
+    gives() { local n="$1"; shift; ( t0="$(now_epoch)"; "$@" > "$tmp/mw/$n.out" 2>&1; r=$?; echo "$r $(( $(now_epoch) - t0 ))" > "$tmp/mw/$n.rc" ) & _pids="$_pids $!"; }
+    # gave NAME: its exit, then bounded or how long it waited.
+    gave() { local r e; read -r r e < "$tmp/mw/$1.rc"; [ "$e" -le 5 ] && e=bounded || e="waited ${e}s"; printf '%s|%s' "$r" "$e"; }
+    seen() { lines | grep -cxF "$1"; }
     openai_gone()    { local CODEX_BIN=/nonexistent; resolve_models_openai; }
     opencode_empty() { local FAKE_OPENCODE_NO_MODELS=1; export FAKE_OPENCODE_NO_MODELS; resolve_models_opencode; }
-    gone="pid $_holder held the lock on models.json for more than 1 s"
-    got="$(held models_cache_set opus claude-opus-5-5)"
-    [ "$got" = "1|bounded|same|models: opus — gave up writing claude-opus-5-5: $gone" ] \
-      && ok "models_cache_set: a live holder is waited for MODELS_LOCK_WAIT, then given up on -- nothing written, and tick.log says what" \
-      || bad "models_cache_set under a held lock: $got"
-    got="$(held models_cache_fail sonnet claude-sonnet-5 x "$MODELS_RETRY")"
-    [ "$got" = "1|bounded|same|models: sonnet — gave up writing the failed probe: $gone" ] && [ ! -s "$tmp/mw/out" ] \
-      && ok "models_cache_fail: the same, and it prints no id it did not write" \
-      || bad "models_cache_fail under a held lock: $got, printed [$(cat "$tmp/mw/out")]"
-    got="$(held resolve_models_openai)"
-    [ "$got" = "1|bounded|same|models: openai — gave up writing the catalog: $gone" ] && grep -qxF "openai -> could not write $MODELS_FILE" "$tmp/mw/out" \
-      && ok "resolve_models_openai: the same, and the refresh says it could not write" \
-      || bad "resolve_models_openai under a held lock: $got, printed [$(cat "$tmp/mw/out")]"
-    got="$(held openai_gone)"
-    [ "$got" = "1|bounded|same|models: openai — gave up writing the catalog: $gone" ] \
-      && ok "resolve_models_openai: and so does the stamp on a catalog kept after a failed refresh" \
-      || bad "openai stamp under a held lock: $got, printed [$(cat "$tmp/mw/out")]"
-    got="$(held resolve_models_opencode)"
-    [ "$got" = "1|bounded|same|models: opencode — gave up writing the catalog: $gone" ] && grep -qxF "opencode -> could not write $MODELS_FILE" "$tmp/mw/out" \
-      && ok "resolve_models_opencode: the same" \
-      || bad "resolve_models_opencode under a held lock: $got, printed [$(cat "$tmp/mw/out")]"
-    got="$(held opencode_empty)"
-    [ "$got" = "1|bounded|same|models: opencode — gave up writing the catalog: $gone" ] \
-      && ok "resolve_models_opencode: and its stamp too" \
-      || bad "opencode stamp under a held lock: $got, printed [$(cat "$tmp/mw/out")]"
+    pass_cut() {
+      local CLAUDE_BIN="$BASE_DIR/test/fake-claude" FAKE_ALIASES="opus=claude-opus-5" FAKE_CLI_MODELS="claude-opus-5" FAKE_API_MODELS="claude-opus-5 claude-opus-5-5" FAKE_CLAUDE_LOGGED_OUT=1
+      export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS FAKE_CLAUDE_LOGGED_OUT; family_refresh opus
+    }
+    pass_done() {
+      local CLAUDE_BIN="$BASE_DIR/test/fake-claude" FAKE_ALIASES="sonnet=claude-sonnet-5" FAKE_CLI_MODELS="claude-sonnet-5" FAKE_API_MODELS="claude-sonnet-5 claude-sonnet-5-5"
+      export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS; cmd_resolve_models anthropic sonnet
+    }
+    _pids=""
+    gives cset   models_cache_set haiku claude-haiku-4-5
+    gives cfail  models_cache_fail sonnet claude-sonnet-5 x "$MODELS_RETRY"
+    gives oa     resolve_models_openai
+    gives oakept openai_gone
+    gives oc     resolve_models_opencode
+    gives ockept opencode_empty
+    gives cut    pass_cut
+    gives fin    pass_done
+    wait $_pids
+    [ "$(gave cset)" = "1|bounded" ] && [ "$(seen "models: haiku — gave up writing claude-haiku-4-5: $gone")" = 1 ] \
+      && ok "models_cache_set: a live holder is waited for MODELS_LOCK_WAIT, then given up on, and tick.log says what was not written" \
+      || bad "models_cache_set under a held lock: $(gave cset), tick.log [$(lines)]"
+    [ "$(gave cfail)" = "1|bounded" ] && [ ! -s "$tmp/mw/cfail.out" ] && [ "$(seen "models: sonnet — gave up writing the failed probe: $gone")" = 1 ] \
+      && ok "models_cache_fail: the same, and it prints no id -- not even the one the file holds" \
+      || bad "models_cache_fail under a held lock: $(gave cfail), printed [$(cat "$tmp/mw/cfail.out")]"
+    [ "$(gave oa) $(gave oakept)" = "1|bounded 1|bounded" ] && [ "$(seen "models: openai — gave up writing the catalog: $gone")" = 2 ] \
+      && [ "$(cat "$tmp/mw/oa.out" "$tmp/mw/oakept.out" | sort -u)" = "openai -> could not write $MODELS_FILE" ] \
+      && ok "resolve_models_openai: the same for a catalog it would replace and one it would stamp, and the refresh says it could not write" \
+      || bad "openai under a held lock: $(gave oa) $(gave oakept), printed [$(cat "$tmp/mw/oa.out" "$tmp/mw/oakept.out")]"
+    [ "$(gave oc) $(gave ockept)" = "1|bounded 1|bounded" ] && [ "$(seen "models: opencode — gave up writing the catalog: $gone")" = 2 ] \
+      && [ "$(cat "$tmp/mw/oc.out" "$tmp/mw/ockept.out" | sort -u)" = "opencode -> could not write $MODELS_FILE" ] \
+      && ok "resolve_models_opencode: the same, replaced and stamped" \
+      || bad "opencode under a held lock: $(gave oc) $(gave ockept), printed [$(cat "$tmp/mw/oc.out" "$tmp/mw/ockept.out")]"
+    [ "$(gave cut)" = "3|bounded" ] && [ "$(cat "$tmp/mw/cut.out")" = "claude-opus-5-5" ] \
+      && [ "$(seen "models: opus — gave up writing the failed probe: $gone")" = 1 ] \
+      && [ "$(seen "models: opus — the probe of claude-opus-7 failed (Not logged in · Please run /login); kept claude-opus-5-5, not recorded in models.json")" = 1 ] \
+      && ok "family_refresh: a cut pass that could not write keeps the newer id the file holds, and promises no retry it did not stamp" \
+      || bad "a cut pass under a held lock: $(gave cut), printed [$(cat "$tmp/mw/cut.out")], tick.log [$(lines)]"
+    [ "$(gave fin)" = "1|bounded" ] && [ "$(cat "$tmp/mw/fin.out")" = "sonnet -> claude-sonnet-5-5 — not recorded in models.json" ] \
+      && [ "$(seen "models: sonnet — gave up writing claude-sonnet-5-5: $gone")" = 1 ] \
+      && ok "resolve-models: a finished pass that could not write names what it found, says it was not recorded, and exits 1" \
+      || bad "a finished pass under a held lock: $(gave fin), printed [$(cat "$tmp/mw/fin.out")]"
+    [ "$(cksum < "$MODELS_FILE")" = "$_before" ] && [ "$(lines | grep -c .)" = 9 ] \
+      && ok "and the file is untouched by all eight, with nothing else in tick.log" \
+      || bad "after eight writers under a held lock: $(cat "$MODELS_FILE"); tick.log [$(lines)]"
+    # Behind the same lock a missing models.json is not created, nor an unreadable one reseeded.
+    rm -f "$MODELS_FILE"; : > "$TICK_LOG"; _pids=""
+    gives mset models_cache_set haiku claude-haiku-4-5
+    gives moa  resolve_models_openai
+    gives moc  resolve_models_opencode
+    wait $_pids
+    [ ! -e "$MODELS_FILE" ] && [ "$(gave mset) $(gave moa) $(gave moc)" = "1|bounded 1|bounded 1|bounded" ] \
+      && ok "a missing models.json is not seeded behind the lock, by a family write or by either catalog" \
+      || bad "a missing file under a held lock: $(gave mset) $(gave moa) $(gave moc), config [$(ls -A "$CONFIG_DIR")]"
+    printf 'not json' > "$MODELS_FILE"; : > "$TICK_LOG"; _pids=""
+    gives ioa resolve_models_openai
+    gives ioc resolve_models_opencode
+    wait $_pids
+    [ "$(cat "$MODELS_FILE")" = "not json" ] && [ "$(gave ioa) $(gave ioc)" = "1|bounded 1|bounded" ] \
+      && ! grep -q reseeded "$tmp/mw/ioa.out" "$tmp/mw/ioc.out" \
+      && ok "nor an unreadable one reseeded" \
+      || bad "an unreadable file under a held lock: $(gave ioa) $(gave ioc), now [$(cat "$MODELS_FILE")], printed [$(cat "$tmp/mw/ioa.out" "$tmp/mw/ioc.out")]"
+
+    # A write holds the lock a moment, so one older than LOCK_GRACE_SECONDS is
+    # no write, whoever it names -- stopped, a subshell gone under a parent
+    # whose pid it recorded, a pid reissued. It is taken, or every writer
+    # after it would give up for good and the whole pass would stay due.
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{}, openai:{at:$now, models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    : > "$TICK_LOG"; touch -t 202001010000 "$LOCK_DIR/.models.lock"; t0="$(now_epoch)"
+    models_cache_set haiku claude-haiku-4-5; rc=$?; el=$(( $(now_epoch) - t0 ))
+    [ "$rc" = 0 ] && [ "$el" -le 1 ] && "$JQ" -e '.resolved.haiku.id == "claude-haiku-4-5"' "$MODELS_FILE" >/dev/null 2>&1 \
+      && [ ! -e "$LOCK_DIR/.models.lock" ] && [ ! -s "$TICK_LOG" ] \
+      && ok "a lock older than LOCK_GRACE_SECONDS is taken at once, even from a live pid, and dropped after the write" \
+      || bad "an old lock with a live holder: rc=$rc in ${el}s, locks [$(ls -A "$LOCK_DIR")] tick.log [$(lines)]"
     kill "$_holder" 2>/dev/null; wait "$_holder" 2>/dev/null
+    mkdir "$LOCK_DIR/.models.lock"; echo "$_holder" > "$LOCK_DIR/.models.lock/pid"; boot_id > "$LOCK_DIR/.models.lock/boot"
     : > "$TICK_LOG"; t0="$(now_epoch)"
     models_cache_set opus claude-opus-5-5; rc=$?; el=$(( $(now_epoch) - t0 ))
     [ "$rc" = 0 ] && [ "$el" -le 1 ] && "$JQ" -e '.resolved.opus.id == "claude-opus-5-5"' "$MODELS_FILE" >/dev/null 2>&1 \
       && [ ! -e "$LOCK_DIR/.models.lock" ] && [ ! -s "$TICK_LOG" ] \
-      && ok "once the holder is gone its lock is taken at once, and dropped after the write" \
-      || bad "after the holder died: rc=$rc in ${el}s, locks [$(ls -A "$LOCK_DIR")] tick.log [$(cat "$TICK_LOG")] $(cat "$MODELS_FILE")"
+      && ok "a young lock whose holder is gone is taken at once too" \
+      || bad "after the holder died: rc=$rc in ${el}s, locks [$(ls -A "$LOCK_DIR")] tick.log [$(lines)] $(cat "$MODELS_FILE")"
 
     # A writer killed between taking the lock and writing its pid leaves a lock
-    # with no owner to ask. Older than LOCK_GRACE_SECONDS it is taken; a younger
-    # one may be a writer inside that very gap, and is given up on like a live one.
-    rm -rf "$LOCK_DIR/.models.lock"; mkdir "$LOCK_DIR/.models.lock"; touch -t 202001010000 "$LOCK_DIR/.models.lock"
-    : > "$TICK_LOG"
-    models_cache_set haiku claude-haiku-4-5; rc=$?
-    [ "$rc" = 0 ] && "$JQ" -e '.resolved.haiku.id == "claude-haiku-4-5"' "$MODELS_FILE" >/dev/null 2>&1 \
+    # with no owner to ask: older than LOCK_GRACE_SECONDS it goes like any old
+    # one, while a younger one may be a writer inside that very gap, and is
+    # waited for and given up on like a live one.
+    mkdir "$LOCK_DIR/.models.lock"; touch -t 202001010000 "$LOCK_DIR/.models.lock"
+    : > "$TICK_LOG"; t0="$(now_epoch)"
+    models_cache_set fable claude-fable-5-1; rc=$?; el=$(( $(now_epoch) - t0 ))
+    [ "$rc" = 0 ] && [ "$el" -le 1 ] && "$JQ" -e '.resolved.fable.id == "claude-fable-5-1"' "$MODELS_FILE" >/dev/null 2>&1 \
       && [ ! -e "$LOCK_DIR/.models.lock" ] && [ ! -s "$TICK_LOG" ] \
-      && ok "a lock left with no pid and older than LOCK_GRACE_SECONDS is taken" \
-      || bad "an abandoned lock with no pid: rc=$rc, locks [$(ls -A "$LOCK_DIR")] tick.log [$(cat "$TICK_LOG")] $(cat "$MODELS_FILE")"
-    rm -rf "$LOCK_DIR/.models.lock"; mkdir "$LOCK_DIR/.models.lock"
-    _before="$(cksum < "$MODELS_FILE")"
-    got="$(held models_cache_set fable claude-fable-5-1)"
-    [ "$got" = "1|bounded|same|models: fable — gave up writing claude-fable-5-1: another writer held the lock on models.json for more than 1 s" ] \
-      && ok "a younger one is given up on, never taken from a writer that has yet to write its pid" \
-      || bad "a fresh lock with no pid: $got"
+      && ok "an old lock left with no pid is taken at once" \
+      || bad "an abandoned lock with no pid: rc=$rc in ${el}s, locks [$(ls -A "$LOCK_DIR")] tick.log [$(lines)] $(cat "$MODELS_FILE")"
+    mkdir "$LOCK_DIR/.models.lock"; _before="$(cksum < "$MODELS_FILE")"; : > "$TICK_LOG"; _pids=""
+    gives young models_cache_set fable claude-fable-5-2
+    wait $_pids
+    [ "$(gave young)" = "1|bounded" ] && [ "$(cksum < "$MODELS_FILE")" = "$_before" ] \
+      && [ "$(lines)" = "models: fable — gave up writing claude-fable-5-2: another writer held the lock on models.json for more than 1 s" ] \
+      && ok "a young one is given up on, never taken from a writer that has yet to write its pid" \
+      || bad "a fresh lock with no pid: $(gave young), tick.log [$(lines)]"
     rm -rf "$LOCK_DIR/.models.lock"
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_mwout" | grep -v '^RESULT '
-  printf '%s\n' "$_mwout" | grep -qx 'RESULT ok=12 bad=0' \
-    && ok "models_lock over scratch writers: all 12 assertions reach the gate" \
+  printf '%s\n' "$_mwout" | grep -qx 'RESULT ok=16 bad=0' \
+    && ok "models_lock over scratch writers: all 16 assertions reach the gate" \
     || bad "models_lock over scratch writers did not: $(printf '%s\n' "$_mwout" | tail -1)"
 
   echo "bind_session() — one shot, atomic, and a no-op without a run dir"
@@ -4339,23 +4390,41 @@ NASTY
   rm -rf "$tmp/thisboot" "$tmp/thisboot-was-stolen"
 
   # Bounded, as the models.json lock takes it: a live holder is given up on
-  # once the time is up -- exit 1, and the lock stays with its owner -- while
-  # a dead one is still taken at once. In the background, so that a bound
-  # that never fires fails here instead of hanging the suite.
+  # once the time is up, and never a moment before it -- exit 1, and the lock
+  # stays with its owner -- while a dead one is still taken at once. Timed in
+  # milliseconds, since the bound counts whole seconds, and started late in
+  # one of them on the shell's clock: a bound that counted only the whole
+  # seconds would give up most of a second early there. In the background,
+  # so that a bound that never fires fails here instead of hanging the suite.
+  now_ms() { "$PYTHON" -c 'import time; print(int(time.time() * 1000))'; }
   mkdir -p "$tmp/bounded"; echo $$ > "$tmp/bounded/pid"; boot_id > "$tmp/bounded/boot"
-  ( t0="$(now_epoch)"; lock_take "$tmp/bounded" 2; echo "$? $(( $(now_epoch) - t0 ))" > "$tmp/bounded.rc" ) >/dev/null 2>&1 & local bwaiter=$!
-  i=0; while [ ! -s "$tmp/bounded.rc" ] && [ "$i" -lt 60 ]; do sleep 0.1; i=$(( i + 1 )); done
+  ( s=$SECONDS; while [ "$SECONDS" = "$s" ]; do sleep 0.01; done; sleep 0.8
+    t0="$(now_ms)"; lock_take "$tmp/bounded" 2; r=$?; echo "$r $(( $(now_ms) - t0 ))" > "$tmp/bounded.rc" ) >/dev/null 2>&1 & local bwaiter=$!
+  i=0; while [ ! -s "$tmp/bounded.rc" ] && [ "$i" -lt 80 ]; do sleep 0.1; i=$(( i + 1 )); done
   kill "$bwaiter" 2>/dev/null; wait "$bwaiter" 2>/dev/null
-  got="$(cat "$tmp/bounded.rc" 2>/dev/null)"; elapsed="$(num "${got#* }" 99)"
-  [ "${got%% *}" = 1 ] && [ "$elapsed" -ge 1 ] && [ "$elapsed" -le 3 ] && [ "$(cat "$tmp/bounded/pid")" = "$$" ] \
-    && ok "a bounded wait gives up on a live holder once its time is up (${elapsed}s), and leaves the lock to it" \
-    || bad "a bounded wait on a live holder: [$got] (exit, seconds), the lock now names pid $(cat "$tmp/bounded/pid" 2>/dev/null)"
+  got="$(cat "$tmp/bounded.rc" 2>/dev/null)"; elapsed="$(num "${got#* }" 99999)"
+  [ "${got%% *}" = 1 ] && [ "$elapsed" -ge 2000 ] && [ "$elapsed" -lt 4000 ] && [ "$(cat "$tmp/bounded/pid")" = "$$" ] \
+    && ok "a bounded wait gives up on a live holder once its time is up, never before (${elapsed} ms of 2 s), and leaves the lock to it" \
+    || bad "a bounded wait on a live holder: [$got] (exit, milliseconds), the lock now names pid $(cat "$tmp/bounded/pid" 2>/dev/null)"
   echo "$dead" > "$tmp/bounded/pid"
   t0="$(now_epoch)"; lock_take "$tmp/bounded" 2; got=$?; elapsed=$(( $(now_epoch) - t0 ))
   [ "$got" = 0 ] && [ "$elapsed" -lt 2 ] && [ "$(cat "$tmp/bounded/pid")" = "$$" ] \
     && ok "and a dead holder's lock is still taken at once by a bounded wait (${elapsed}s)" \
     || bad "a bounded wait on a dead holder: exit $got after ${elapsed}s"
   lock_drop "$tmp/bounded"; rm -f "$tmp/bounded.rc"
+  # A stale lock that cannot be removed (its directory read-only) still ends
+  # a bounded wait on time: the break used to go straight back to mkdir, and
+  # spun on rm for ever without once reaching the bound.
+  mkdir -p "$tmp/unremovable"; echo "$dead" > "$tmp/unremovable/pid"; chmod 555 "$tmp/unremovable"
+  ( t0="$(now_epoch)"; lock_take "$tmp/unremovable" 1; r=$?; echo "$r $(( $(now_epoch) - t0 ))" > "$tmp/unremovable.rc" ) >/dev/null 2>&1 & local uwaiter=$!
+  i=0; while [ ! -s "$tmp/unremovable.rc" ] && [ "$i" -lt 60 ]; do sleep 0.1; i=$(( i + 1 )); done
+  kill "$uwaiter" 2>/dev/null; wait "$uwaiter" 2>/dev/null
+  chmod 755 "$tmp/unremovable"
+  got="$(cat "$tmp/unremovable.rc" 2>/dev/null)"; elapsed="$(num "${got#* }" 99)"
+  [ "${got%% *}" = 1 ] && [ "$elapsed" -le 4 ] \
+    && ok "a stale lock that cannot be removed ends a bounded wait on time all the same (${elapsed}s)" \
+    || bad "a bounded wait on a stale lock it cannot remove: [$got] (exit, seconds) -- it never came back within 6 s"
+  rm -rf "$tmp/unremovable" "$tmp/unremovable.rc"
 
   echo "backoff_multiplier() — a job that only ever fails must stop costing full price"
   # Nothing slowed a failing job down: it relaunched every interval, at full

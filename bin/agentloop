@@ -1138,10 +1138,11 @@ state_get() { # state_get <id> <field> [default]
 # only break the lock when that pid is gone); this generalises it to the rest.
 LOCK_GRACE_SECONDS="${AGENTLOOP_LOCK_GRACE:-30}"
 
-lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with <seconds>, gives up (1) once they have passed
-  local d="${1:-}" hold i=0 deadline="" born
-  # A bound is counted on the shell's own clock, whole seconds, no fork.
-  [ -z "${2:-}" ] || deadline=$(( SECONDS + $2 ))
+lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with <seconds>, for a lock only ever held a moment: gives up (1) once they have passed
+  local d="${1:-}" hold i=0 deadline="" now born
+  # A bound counts on the shell's own clock, in whole seconds and with no
+  # fork; the extra second makes the wait at least <seconds>, never less.
+  [ -z "${2:-}" ] || deadline=$(( SECONDS + $2 + 1 ))
   while ! mkdir "$d" 2>/dev/null; do
     hold="$(cat "$d/pid" 2>/dev/null || true)"
     # slot_alive, not a bare `kill -0`: this is the identical defect Task 1
@@ -1152,30 +1153,34 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
     # pid that only LOOKS like the same process, wedging every write these
     # locks serialize (state, the journal, port allocation, a resume) behind
     # a holder that is actually gone. slot_alive also refuses a pid from an
-    # earlier boot, which a bare kill -0 cannot express at all.
+    # earlier boot, which a bare kill -0 cannot express at all. A lock that
+    # will not go (a read-only directory) falls through to the wait below
+    # rather than straight back to mkdir, so a bound still ends it: it used
+    # to spin on rm for ever.
     if [ -n "$hold" ] && ! slot_alive "$d"; then
-      rm -rf "$d"; continue          # the owner is gone: genuinely stale
+      rm -rf "$d"; [ -e "$d" ] || continue   # the owner is gone: genuinely stale
     fi
-    # A live owner is WAITED for, however long it takes -- unless the caller
-    # bounded the wait (below). An unreadable owner is the narrow race between
-    # mkdir and writing the pid — give that, and only that, a time-based escape.
-    i=$(( i + 1 ))
-    if [ -z "$hold" ] && [ "$i" -ge $(( LOCK_GRACE_SECONDS * 100 )) ]; then
-      rm -rf "$d"; i=0; continue
-    fi
-    # A bounded wait (the models.json lock, models_lock) gives up on a live
-    # owner once its time is up -- and never waits long enough for the grace
-    # above, so an owner that has still not written its pid is judged by the
-    # lock itself: a directory older than the grace was left by a writer
-    # killed between mkdir and its pid, and would otherwise turn away every
-    # bounded writer for good; a younger one may be a writer inside that very
-    # gap, and is given up on like a live one.
-    if [ -n "$deadline" ] && [ "$SECONDS" -ge "$deadline" ]; then
-      if [ -z "$hold" ]; then
-        born="$(num "$(stat -f %m "$d" 2>/dev/null)" "$(now_epoch)")"
-        if [ $(( $(now_epoch) - born )) -ge "$LOCK_GRACE_SECONDS" ]; then rm -rf "$d"; continue; fi
+    if [ -z "$deadline" ]; then
+      # A live owner is WAITED for, however long it takes. An unreadable owner
+      # is the narrow race between mkdir and writing the pid — give that, and
+      # only that, a time-based escape.
+      i=$(( i + 1 ))
+      if [ -z "$hold" ] && [ "$i" -ge $(( LOCK_GRACE_SECONDS * 100 )) ]; then
+        rm -rf "$d"; i=0; continue
       fi
-      return 1
+    else
+      # Bounded: the models.json lock (models_lock), held for a few jq calls
+      # and an mv, never longer -- so a lock older than the grace is no write,
+      # whoever it names: a writer killed between mkdir and its pid, one
+      # stopped mid-write, a subshell gone under a parent whose $$ it
+      # recorded, a pid reissued. Taken, or every later writer would give up
+      # for good. A younger one is waited for until the time is up; a writer
+      # inside that very gap before its pid is never robbed.
+      now="$(now_epoch)"; born="$(num "$(stat -f %m "$d" 2>/dev/null)" "$now")"
+      if [ $(( now - born )) -ge "$LOCK_GRACE_SECONDS" ]; then
+        rm -rf "$d"; [ -e "$d" ] || continue
+      fi
+      [ "$SECONDS" -lt "$deadline" ] || return 1
     fi
     sleep 0.01
   done
@@ -2381,11 +2386,14 @@ openai_catalog_all_efforts() { # the union of every VISIBLE model's efforts, fir
 # read the same file and the second mv dropped the first one's update: a
 # family's fresh resolution, a release waiting for claude update, a failed_at
 # stamp, lost until the next pass. This lock is held for the read-modify-write
-# alone -- one jq and one mv, never a probe or a catalog command -- so a writer
-# waits milliseconds for another, not the minute a pass holds "_models" for.
-# It is bounded all the same: a writer that cannot have it within
+# alone -- a few jq calls and one mv, never a probe or a catalog command, and
+# nothing is ever taken under it -- so a writer waits milliseconds for another,
+# not the minute a pass holds "_models" for. It is bounded all the same
+# (lock_take's <seconds>): a writer that cannot have it within
 # MODELS_LOCK_WAIT seconds gives up and says in tick.log what it did not
-# write, rather than hang a launch behind a holder that stopped.
+# write, rather than hang a launch behind a holder that stopped; and a lock
+# older than LOCK_GRACE_SECONDS is taken whoever it names, since no write
+# holds it that long.
 models_lock() { # models_lock <who> <what> -- 0 held; 1 gave up, and tick.log names what was not written
   local p holder="another writer"
   lock_take "$LOCK_DIR/.models.lock" "$MODELS_LOCK_WAIT" && return 0
@@ -4035,8 +4043,8 @@ models_cache_set() { # models_cache_set <family> <id> [<newer id> <needs> <insta
 # brings back is often the one that fails), never below what a finished pass
 # already found. A release met before the cut is noted too: the 400 was a real
 # answer. Prints "<id> <seconds until the retry>", <retry> being the one the
-# tick applies (models_stale) -- and nothing when nothing was written, so the
-# caller runs on the id its own pass found.
+# tick applies (models_stale) -- and nothing, exit 1, when nothing was written
+# (family_refresh then picks the newer id itself, and promises no retry).
 models_cache_fail() { # models_cache_fail <family> <best id found> <why> <retry> [<newer id> <needs> <installed> <cli>] -> "<id> <seconds>"
   models_write "$1" "the failed probe" --arg f "$1" --arg id "$2" --arg why "$3" --arg nid "${5:-}" --arg needs "${6:-}" --arg inst "${7:-}" --arg cli "${8:-}" \
         --argjson now "$(now_epoch)" "$CLAUDE_ID_JQ"'
@@ -4065,10 +4073,11 @@ newer_cli_note() { # newer_cli_note <id> <needs> <installed> -> the sentence tic
 # on -- a release that waits for `claude update`, and a probe that had no
 # verdict (both, when a release was met before the cut). Prints the id to run
 # the family on; FR_ID and FR_NOTE carry it and those notes for resolve-models'
-# own line. Exit 3 when the pass was cut short.
+# own line. Exit 3 when the pass was cut short, 1 when a finished one could not
+# be written down (models_lock gave up, or the file is unreadable).
 family_refresh() { # family_refresh <family> -> the id to run the family on
   FR_ID="" FR_NOTE=""
-  local fam="$1" rc cli="" gate="" retry="$MODELS_RETRY" out next
+  local fam="$1" rc cli="" gate="" retry="$MODELS_RETRY" out
   resolve_family "$fam" >/dev/null; rc=$?
   if [ -n "$RF_NEWER" ]; then
     # What --version says now is what models_stale compares with later:
@@ -4082,18 +4091,28 @@ family_refresh() { # family_refresh <family> -> the id to run the family on
     # pass (models_stale), and the note says so.
     platform_enabled anthropic || retry="$MODELS_TTL"
     out="$(models_cache_fail "$fam" "$RF_ID" "$RF_FAILED" "$retry" "$RF_NEWER" "$RF_NEEDS" "$RF_INSTALLED" "$cli")"
-    FR_ID="${out% *}"; next="${out##* }"
-    if [ -z "$out" ] || [ "$FR_ID" = "$out" ]; then FR_ID="$RF_ID"; next="$retry"; fi
-    FR_NOTE="the probe of $RF_PROBE failed ($RF_FAILED); kept $FR_ID, trying again in $(models_wait_text "$next")"
+    if [ "${out% *}" != "$out" ]; then
+      FR_ID="${out% *}"
+      FR_NOTE="the probe of $RF_PROBE failed ($RF_FAILED); kept $FR_ID, trying again in $(models_wait_text "${out##* }")"
+    else
+      # Nothing was written: still the newer of the id the file holds and the
+      # best this pass reached, as the write would have kept -- a launch never
+      # runs below either -- and no retry is promised, since none was stamped.
+      FR_ID="$( { family_cached_id "$fam"; printf '%s\n' "$RF_ID"; } \
+        | "$JQ" -R . | "$JQ" -rs "$CLAUDE_ID_JQ"'map(select(. != "")) | sort_by(newest_first) | .[0] // empty' 2>/dev/null)"
+      [ -n "$FR_ID" ] || FR_ID="$RF_ID"
+      FR_NOTE="the probe of $RF_PROBE failed ($RF_FAILED); kept $FR_ID, not recorded in models.json"
+    fi
     log_tick "models: $fam — $FR_NOTE"
   else
+    # A finished pass still runs on what it found when it could not be
+    # written down; resolve-models says so, and exits 1.
     FR_ID="$RF_ID"
-    models_cache_set "$fam" "$FR_ID" "$RF_NEWER" "$RF_NEEDS" "$RF_INSTALLED" "$cli"
+    models_cache_set "$fam" "$FR_ID" "$RF_NEWER" "$RF_NEEDS" "$RF_INSTALLED" "$cli" || { FR_NOTE="not recorded in models.json"; rc=1; }
   fi
   [ -z "$gate" ] || FR_NOTE="${FR_NOTE:+$FR_NOTE — }$gate"
   printf '%s\n' "$FR_ID"
-  [ "$rc" -ne 3 ] || return 3
-  return 0
+  return "$rc"
 }
 
 effective_model() { # effective_model <model> -> concrete id (families resolved)
@@ -6094,7 +6113,9 @@ cmd_tick() {
   # is always the first thing this function does, before anything that could
   # hold one of the others — keep it that way, or the reverse nesting (one
   # of those held first, then a path into cmd_tick reaching for .tick) is
-  # how two of these locks deadlock against each other.
+  # how two of these locks deadlock against each other. .models.lock
+  # (models_lock) is a leaf: it may be taken under any of them, and nothing
+  # is ever taken under it -- a few jq calls and an mv, then it is dropped.
   lock_take "$LOCK_DIR/.tick"
   # Cap the two append-only logs before anything else writes to them. Once a
   # minute is the right cadence: the tick is the only thing guaranteed to run,

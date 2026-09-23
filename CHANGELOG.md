@@ -81,15 +81,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   missing or unreadable file. It is held for the read-modify-write alone,
   never for a probe or a catalog command, so a launch waits milliseconds
   for it, not the minute the pass holds `_models` for. The wait is bounded
-  (`MODELS_LOCK_WAIT`, 10 s): a writer that cannot have the lock by then
-  writes nothing and says in `tick.log` what it gave up on and which pid
-  held the lock. A dead holder's lock is taken at once, as everywhere here,
-  and a bounded wait also takes a lock left with no pid once it is older
-  than `LOCK_GRACE_SECONDS` — a writer killed between creating the lock and
-  writing its pid would otherwise turn every later writer away for good.
-  `lock_take` takes the bound as an optional second argument; its other
-  callers are unchanged. The selftest races two real writers through a jq
-  that answers a second late, and holds every write path to the lock.
+  (`MODELS_LOCK_WAIT`, 10 s at least): a writer that cannot have the lock by
+  then writes nothing and says in `tick.log` what it gave up on and which
+  pid held the lock. A pass cut short then still keeps the newer of the id
+  the file holds and the one it reached, and says it was not recorded
+  rather than promise a retry it never stamped; `resolve-models` exits 1
+  for a family it resolved but could not record. A dead holder's lock is
+  taken at once, as everywhere here, and so is any lock older than
+  `LOCK_GRACE_SECONDS`, whoever it names — no write holds it that long, and
+  a writer that stopped, died under a parent that lives on, or was killed
+  before writing its pid would otherwise turn every later writer away for
+  good and keep the whole pass due. `lock_take` takes the bound as an
+  optional second argument, and a stale lock it cannot remove no longer
+  spins it on `rm` past the bound; its other callers wait as before. The
+  selftest races two real writers through a jq that answers a second late,
+  holds every write path — the seed of a missing or unreadable file too — to
+  a lock held by a live process, and covers a dead holder, an old lock and
+  a lock with no pid.
 
 - **A model probe that gets no verdict no longer reads as "this model does
   not exist", and its pass is no longer trusted for a day.** A CLI with no
