@@ -557,7 +557,8 @@ Em `CHANGELOG.md`, sob `## [Unreleased]` → `### Fixed`, como primeira entrada:
 ### Task 2: a lista no ecrã — Branch, "+N", o badge e a faixa
 
 **Files:**
-- Modify: `ui/security/findings-screen.js` (comentário de topo, comentário da faixa, `ROW_PILL_TITLE`, `secFindStrip`, comentário da tabela, `secFindRow`)
+- Modify: `ui/security/findings-screen.js` (comentário de topo, comentário da faixa, `ROW_PILL_TITLE`, comentário e corpo de `secFindStrip`, comentário da tabela, `secFindRow`)
+- Modify: `ui/security/index-screen.js` (só o comentário de `DONUT_PILL_TITLE`)
 - Test: `tests/test_page_contract.py`
 - Regenerate: `bin/static/security.js`, `bin/static/app.js`, `bin/static/app.css`
 - Modify: `README.md`, `CHANGELOG.md`
@@ -896,6 +897,38 @@ por:
         : "Fixed on " + where + "; whether that fix is in " + here + " could not be determined (" + (fe.unknown_reason || "unknown") + ").";
 ```
 
+(i) Substituir o comentário por cima de `function secFindStrip(fs, data){` (o que começa por `/* AllFindings.png's own stat strip: Total findings (a doc icon), the five`) por:
+
+```js
+/* AllFindings.png's own stat strip: Total findings (a doc icon) and the five
+   severities (a coloured dot, the count, the share of `total` beneath). Its
+   own shape now, not `.sevpills`/`.sevpill` (the pill this file draws
+   everywhere else, including the table's own Severity column below) -- the
+   mockup draws a plain dot beside each label here, a large number under it
+   and a percentage under THAT, closer to a KPI card's own anatomy than to a
+   pill. `secfind-stat total` carries its own distinguishing class for
+   exactly the same reason every severity stat carries its own
+   (`.critical`/`.high`/… below) -- so the one number that counts findings
+   stays independently findable, never just "the Nth number in the row". */
+```
+
+(j) Em `ui/security/index-screen.js`, substituir o comentário por cima de `const DONUT_PILL_TITLE` (o que começa por `/* What a donut segment COUNTS, on every pill in its legend.`) por:
+
+```js
+/* What a donut segment COUNTS, on every pill in its legend.
+
+   These are distinct fingerprints -- `severity_totals`, which collapses the
+   same finding open on two branches into the one problem it is. The findings
+   browser's strip, in identical markup and (on the project screen) four
+   inches away on the same page, counts one row per finding too, but only the
+   findings its current filters match, resolved ones included when asked for.
+   The per-severity pills on both sides used to say only "3 critical" and
+   left the reader to assume the two agreed. They can legitimately differ,
+   so each side says which question it is answering. */
+```
+
+(o valor de `DONUT_PILL_TITLE` não muda.)
+
 - [ ] **Step 4: correr e ver passar**
 
 Run: `rtk proxy python3.13 -m pytest tests/test_page_contract.py tests/test_security_api.py -p no:cacheprovider -q`
@@ -940,7 +973,7 @@ Em `CHANGELOG.md`, acrescentar ao fim da entrada da Task 1 (a que começa por **
 - [ ] **Step 7: commit**
 
 ```bash
-/usr/bin/git add ui/security/findings-screen.js tests/test_page_contract.py bin/static/security.js bin/static/app.js bin/static/app.css README.md CHANGELOG.md
+/usr/bin/git add ui/security/findings-screen.js ui/security/index-screen.js tests/test_page_contract.py bin/static/security.js bin/static/app.js bin/static/app.css README.md CHANGELOG.md
 ```
 
 ```bash
