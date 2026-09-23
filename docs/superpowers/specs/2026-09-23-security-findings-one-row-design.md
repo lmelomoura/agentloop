@@ -79,8 +79,11 @@ Pela ordem:
 
 1. **Linhas por branch**, como hoje: o checklist do último run terminado de
    cada branch, com `branch`, `analysis_id`, `repo` e `first_seen`.
-2. **A anotação `fixed_elsewhere`**, como hoje, mas antes de agrupar. O custo
-   continua O(branches) chamadas ao git, memoizadas por pedido.
+2. **A anotação `fixed_elsewhere`** fica onde está hoje, sobre as linhas
+   finais, antes da paginação. Numa linha agrupada, a `branch` e o `repo` são
+   os do representante, por isso a anotação é a do representante: "corrigido
+   noutra branch, e esse commit está (ou não) na branch deste representante".
+   O custo continua O(branches) chamadas ao git, memoizadas por pedido.
 3. **Filtros de âmbito sobre os membros:** `branch` e `analysis` escolhem de
    que branches se lê. *Branch: main* mostra o finding tal como o `main` o vê
    (uma branch tem no máximo uma linha por fingerprint, portanto aqui o
@@ -213,7 +216,11 @@ falha no mesmo sítio" — e o motivo da decisão na entrada para comparar.
   regra de `diff._proven`. A máquina de estados de `diff.classify` fica
   intacta.
 - **O export consolidado não muda** (`group=False`): continua uma linha por
-  finding por branch.
+  finding por branch. Só o cabeçalho acompanha a mudança de unidade do ecrã:
+  o `shown` que o ecrã manda passa a contar findings, por isso o cabeçalho
+  compara-o com os fingerprints abertos distintos (e diz esse número ao lado
+  das linhas quando diferem), para não afirmar que o ecrã escondia um finding
+  que só aparece duas vezes no documento por estar em duas branches.
 
 ## Convivência com o 4.2 (`feat/security-verdicts`)
 
