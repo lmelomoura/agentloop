@@ -398,6 +398,8 @@ The agent finds everything through `$AL_RUN_MANIFEST`. The canonical checkouts
 are never modified: they are read to cut worktrees from, nothing more.
 
 `enabled` is `"auto"` (isolate when the cwd is a git repo), `true` or `false`.
+A security analysis is isolated whatever it says, in a worktree of the one
+repository it names — see [The branch is chosen per analysis](#the-branch-is-chosen-per-analysis-and-the-worktree-is-cut-clean).
 
 A run dir is removed when the run ends. A run that was cut short keeps its dir
 until it is resumed or expires — see [Sessions that are still open](#sessions-that-are-still-open).
@@ -1413,6 +1415,16 @@ code needs no `.env`, no `vendor/`, no containers, so an analysis neither pays
 for a project's `up` hook nor is stopped by one that fails. The canonical
 checkout is read to cut from and never modified, as in every other run, and the
 tree is removed when the analysis ends.
+
+**On a project that spans several repositories, an analysis is about one of
+them.** It runs in a worktree of the repository it names, cut from the branch
+it names, and nothing else is checked out: the other repositories are not what
+the report describes, and a branch of one repository need not exist in the
+next. An analysis is also cut into a worktree on a project whose
+`worktree.enabled` is `false` — a worktree is the only way to read a branch
+without moving the canonical checkout, and an analysis run in the checkout
+itself would read whatever happened to be checked out there under the name of
+the branch you asked for.
 
 The profile decides how far the **agent** reads. The deterministic half below
 runs in full in all three:

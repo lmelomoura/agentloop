@@ -1218,6 +1218,61 @@ sleep 1   # let both detached runs finish their own teardown before the next sce
 echo
 }
 
+scenario_46() {
+echo "46. an analysis of the second repo of a project runs in that repo alone, at its branch"
+# The project's cwd is `app`; the analysis names `api`, at a branch only `api`
+# has. Every declared repo used to be cut from the analysed branch, so this was
+# refused at `app` ("no base ref resolvable") -- and at a branch both repos
+# have, the run was in `app` whatever repo was named: `prepare` and the agent
+# read app's code into a report filed under api.
+# No job of its own, but a jobs file all the same: a derived job is read
+# through it, and an earlier scenario's is not this one's to lean on.
+printf '{"jobs":[]}\n' > "$ROOT/config/jobs.json"
+git init -q --bare "$ROOT/remote/api.git"
+git init -q "$ROOT/work/api"
+git -C "$ROOT/work/api" remote add origin "$ROOT/remote/api.git"
+printf 'api\n' > "$ROOT/work/api/API"
+git -C "$ROOT/work/api" add -A
+git -C "$ROOT/work/api" -c user.email=e2e@local -c user.name=e2e commit -qm api
+git -C "$ROOT/work/api" push -q origin HEAD:refs/heads/main
+git -C "$ROOT/work/api" checkout -q -b feat/api-only
+printf 'only here\n' > "$ROOT/work/api/ONLY"
+git -C "$ROOT/work/api" add -A
+git -C "$ROOT/work/api" -c user.email=e2e@local -c user.name=e2e commit -qm only
+git -C "$ROOT/work/api" push -q origin HEAD:refs/heads/feat/api-only
+git -C "$ROOT/work/api" fetch -q origin
+sha46="$(git -C "$ROOT/work/api" rev-parse feat/api-only)"
+jq --arg app "$ROOT/work/app" --arg api "$ROOT/work/api" \
+  '.projects += [{name:"multi", cwd:$app, worktree:{enabled:true},
+                  repos:[{name:"app", path:$app, base:"main"}, {name:"api", path:$api, base:"main"}],
+                  security:{enabled:true, model:"claude-opus-5", max_budget_usd:5}}]' \
+  "$ROOT/config/projects.json" > "$ROOT/config/projects.next" \
+  && mv "$ROOT/config/projects.next" "$ROOT/config/projects.json"
+cwd46="$ROOT/cwd46"
+rm -f "$cwd46"
+out46="$(FAKE_CWD_OUT="$cwd46" FAKE_MODE=complete FAKE_SESSION=sess-sec-multi \
+  "$AL" security analyze multi api feat/api-only quick 2>&1)"
+aid46="$(secid "$out46")"
+at46() { awk -F'\t' -v k="$1" '$1==k {print $2; exit}' "$cwd46" 2>/dev/null; }
+case "$(at46 PWD)" in
+  */security-multi/*/api) ok "the agent is launched in a worktree of api, the repo the analysis named" ;;
+  *) bad "the agent ran in '$(at46 PWD)' -- $(printf '%s' "$out46" | head -1)" ;;
+esac
+[ "$(at46 HEAD)" = "$sha46" ] \
+  && ok "cut from feat/api-only, a branch app does not have" \
+  || bad "the worktree was at '$(at46 HEAD)', want $sha46"
+[ "$(at46 MANIFEST | jq -r '[.primary, (.repos | map(.name) | join(","))] | join(" ")' 2>/dev/null)" = "api api" ] \
+  && ok "and the run is api alone: nothing else was cut" \
+  || bad "manifest: $(at46 MANIFEST)"
+[ "$("$AL" security list --project multi 2>/dev/null \
+      | jq -r --argjson a "${aid46:-0}" '.[] | select(.id == $a) | [.state, .repo, .commit_sha] | join(" ")')" \
+    = "done api $sha46" ] \
+  && ok "and analysis $aid46 closes done, filed under api at that commit" \
+  || bad "analysis row: $("$AL" security list --project multi 2>/dev/null | jq -c --argjson a "${aid46:-0}" '.[] | select(.id == $a) | {state, repo, commit_sha}')"
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1239,11 +1294,11 @@ echo
 # scenario goes at the END of the file and into the LAST list, or, if it is
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # and the count assertion below fails if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26"
 E2E_LIST_3="27 28 29 30 31 32 33 33b 34 35 35b 36 37"
-E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45"
+E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

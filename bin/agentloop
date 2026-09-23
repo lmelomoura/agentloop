@@ -873,15 +873,20 @@ cmd_security_branches() { # cmd_security_branches <project> <repo> -> every
 # request file is shared and mutable -- the next analysis of this project
 # rewrites it -- so a close that reads it can land on another analysis's row.
 #
+# AL_SECURITY_REPO is the repo the analysis names, beside AL_BASE_OVERRIDE, its
+# branch, and for the same reason: run_job runs the analysis in THAT repo's
+# checkout, which on a project spanning several is not the project's cwd.
+# Empty (a caller from before it existed) inherits the project's cwd.
+#
 # A prefix assignment on a FUNCTION call, not an `export`: bash puts both in the
 # environment of everything the call reaches (run_job -> env -> claude -> the
 # agent's Bash tool) and takes them back out when it returns, so the sweep below
 # and everything after it run unmarked.
-security_run_analysis() { # security_run_analysis <job-id> <analysis-id> <branch>
-  local jid="$1" aid="$2" branch="$3" rc=0
+security_run_analysis() { # security_run_analysis <job-id> <analysis-id> <branch> [repo]
+  local jid="$1" aid="$2" branch="$3" repo="${4:-}" rc=0
   # --force because a derived job is disabled: it exists to be run on demand,
   # never on a tick.
-  AL_BASE_OVERRIDE="$branch" AL_SKIP_PROVISION=1 \
+  AL_BASE_OVERRIDE="$branch" AL_SKIP_PROVISION=1 AL_SECURITY_REPO="$repo" \
   AL_SECURITY_AGENT=1 CC_SECURITY_AGENT=1 \
   AL_SECURITY_ANALYSIS_ID="$aid" CC_SECURITY_ANALYSIS_ID="$aid" \
     run_job "$jid" --force || rc=$?
@@ -1027,7 +1032,7 @@ EOF
     # cannot group-kill it; `trap '' HUP` is what nohup(1) does.
     set -m
     ( trap '' HUP
-      exec "$SELF" __run-analysis "$jid" "$aid" "$branch"
+      exec "$SELF" __run-analysis "$jid" "$aid" "$branch" "$repo"
     ) </dev/null >> "$DATA_DIR/exec.log" 2>&1 &
     local dpid=$!
     disown "$dpid" 2>/dev/null || true
@@ -1038,7 +1043,7 @@ EOF
     printf '{"analysis_id":%s}\n' "$aid"
     return 0
   fi
-  security_run_analysis "$jid" "$aid" "$branch"
+  security_run_analysis "$jid" "$aid" "$branch" "$repo"
 }
 
 # Called from run_job at the same point run_end_hook already is, and BEFORE it:
@@ -5362,6 +5367,16 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   # cwd, model, permission, budget and timeout inherit from the project when the
   # job doesn't set them (see resolve()).
   cwd="$(resolve "$id" cwd "$HOME")"
+  # An analysis runs in the checkout of the repo it names. It used to inherit
+  # the project's cwd like any other run -- the PRIMARY repo, on a project that
+  # spans several -- so an analysis of any other repo ran `prepare` and the
+  # agent over the primary's code, and filed that report under the repo it
+  # named. The same lookup cmd_security_analyze resolved the branch and the
+  # commit against; only security_run_analysis sets AL_SECURITY_REPO.
+  if [ -n "${AL_SECURITY_REPO:-}" ]; then
+    cwd="$(project_repo_path "$project" "$AL_SECURITY_REPO")"
+    [ -n "$cwd" ] || { log_tick "$id: project '$project' declares no repo named '$AL_SECURITY_REPO' — the analysis cannot run"; return 1; }
+  fi
   prompt="$(jobs_json | "$JQ" -r --arg id "$id" '.jobs[] | select(.id==$id) | .prompt')"
   model="$(resolve "$id" model "$(platform_default_model "$platform")")"
   # A family (opus/sonnet/…) becomes the newest concrete id of that family --
@@ -5625,7 +5640,7 @@ ${prompt}"
   if [ "$platform" = "opencode" ]; then
     run_env+=("OPENCODE_CONFIG_CONTENT=$_occ1")
   fi
-  if wt_isolation_enabled "$project" "$cwd"; then
+  if wt_isolation_enabled "$project" "$cwd" "$id"; then
     local reattached=""
     [ -n "$resume_sid" ] && reattached="$(wt_find_by_session "$id" "$resume_sid")"
     if [ -n "$reattached" ]; then
@@ -7484,8 +7499,8 @@ case "${1:-}" in
   # detached analysis re-execs into. A real process, so its slot records a pid
   # that is actually alive for the run's duration.
   __run-analysis)
-             [ $# -ge 4 ] || die "usage: agentloop __run-analysis <job-id> <analysis-id> <branch>"
-             security_run_analysis "$2" "$3" "$4" ;;
+             [ $# -ge 4 ] || die "usage: agentloop __run-analysis <job-id> <analysis-id> <branch> [repo]"
+             security_run_analysis "$2" "$3" "$4" "${5:-}" ;;
   security)  shift
              case "${1:-}" in
                analyze) shift; [ $# -ge 3 ] || die "usage: agentloop security analyze [--detach] <project> <repo> <branch> [profile]"

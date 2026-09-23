@@ -2971,6 +2971,22 @@ EOF
   [ "$got" = "$(printf 'solo\t/x/solo\t')" ] && ok "no .repos[] synthesises one row from cwd" \
     || bad "solo row was '$got'"
 
+  echo "wt_repos() — an analysis gets the one repo it names, never the others"
+  # An analysis names ONE repository and a branch of it (AL_BASE_OVERRIDE), and
+  # runs in that repository's checkout. Every declared row used to come back
+  # here, so each repo was cut from the analysed branch -- a branch of one
+  # repository need not exist in another, and one that lacked it aborted the
+  # whole analysis -- and the report read whichever repo matched the PROJECT's
+  # cwd rather than the one it named.
+  got="$( PROJECTS_FILE="$tmp/proj/projects.json"; AL_BASE_OVERRIDE=feat/x wt_repos multi /x/back )"
+  [ "$got" = "$(printf 'back\t/x/back\trelease')" ] \
+    && ok "under an analysis's branch, only the repo the run is in" \
+    || bad "an analysis of back was handed '$(printf '%s\n' "$got" | cut -f1 | tr '\n' ' ')'"
+  got="$( PROJECTS_FILE="$tmp/proj/projects.json"; AL_BASE_OVERRIDE=feat/x wt_repos solo /x/solo )"
+  [ "$got" = "$(printf 'solo\t/x/solo\t')" ] \
+    && ok "and a single-repo project's synthesised row is that repo already" \
+    || bad "a single-repo analysis was handed '$got'"
+
   echo "wt_base_ref() — declared base wins, then local, then HEAD"
   local gitc="git -c user.name=cc -c user.email=cc@local -c commit.gpgsign=false"
   mkdir -p "$tmp/g"
@@ -3083,6 +3099,54 @@ EOF
     || bad "single-repo primary was '$prim'"
   got="$(wt_run_worktrees "$tmp/wtroot/j9/stampS" | wc -l | tr -d ' ')"
   [ "$got" = "1" ] && ok "exactly one worktree, named after the cwd" || bad "got $got worktrees"
+
+  echo "wt_setup() — an analysis of the second repo is cut from its branch, and alone"
+  # The run's cwd is the repo the analysis names (run_job, AL_SECURITY_REPO);
+  # from here on that repo is the whole of the run. Before, every declared repo
+  # was cut from the analysed branch, so a branch only the second repo has
+  # aborted the analysis on the first -- "no base ref resolvable".
+  ( cd "$tmp/g/repo2" && git checkout -q -b feat/only-two && echo two > g && git add g \
+      && $gitc commit -qm two && git checkout -q develop ) >/dev/null 2>&1
+  local rdN="$tmp/wtroot/jan/stampN"
+  prim="$( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+           AL_BASE_OVERRIDE=feat/only-two wt_setup jan two "$tmp/g/repo2" stampN 2>/dev/null )"
+  [ "$prim" = "$rdN/two" ] && ok "the run is in the repo the analysis named" \
+    || bad "an analysis of repo two ran in '$prim'"
+  [ -n "$prim" ] && [ "$(git -C "$rdN/two" rev-parse HEAD 2>/dev/null)" = "$(git -C "$tmp/g/repo2" rev-parse feat/only-two)" ] \
+    && ok "cut from the branch it named, which the other repo does not have" \
+    || bad "repo two's worktree is at '$(git -C "$rdN/two" rev-parse HEAD 2>/dev/null)'"
+  [ -n "$prim" ] && [ ! -e "$rdN/one" ] \
+    && [ "$("$JQ" -r '[.repos[].name] | join(",")' "$rdN/.run.json" 2>/dev/null)" = "two" ] \
+    && ok "and nothing else is cut: the manifest lists that repo alone" \
+    || bad "the manifest lists '$("$JQ" -r '[.repos[].name] | join(",")' "$rdN/.run.json" 2>/dev/null)'"
+  if [ -d "$rdN" ]; then
+    echo done > "$rdN/.ended"
+    ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+      wt_teardown jan two "$rdN" ) >/dev/null 2>&1
+  fi
+
+  echo "wt_isolation_enabled() — an analysis is isolated even where runs are not"
+  # An analysis reads the branch it names, and a worktree cut from that branch
+  # is the only way to read it without touching the canonical checkout. With a
+  # project's isolation off, the analysis ran in the checkout itself -- on
+  # whatever branch was checked out there -- and the report was filed under the
+  # commit of the branch it named. By job id, like every other rule about a
+  # derived security job: a resume carries the id, and none of the run's env.
+  printf '%s' '{"projects":[{"name":"flat","cwd":"'"$tmp"'/g/repo2","worktree":{"enabled":false}}]}' \
+    > "$tmp/proj/flat.json"
+  ( PROJECTS_FILE="$tmp/proj/flat.json"; wt_isolation_enabled flat "$tmp/g/repo2" j1 )
+  want "an ordinary run of a project with isolation off stays in its checkout" 1 $?
+  ( PROJECTS_FILE="$tmp/proj/flat.json"; wt_isolation_enabled flat "$tmp/g/repo2" security-flat )
+  want "an analysis of that same project is isolated all the same" 0 $?
+  # Structural: the rule is worth nothing if its one caller keeps asking the
+  # question without the id. Captured, then matched: `sed | grep -q` under
+  # pipefail fails on the SIGPIPE a match sends back up the pipe.
+  local rjbody
+  rjbody="$(sed -n '/^run_job() {/,/^}/p' "$SELF")"
+  case "$rjbody" in
+    *'wt_isolation_enabled "$project" "$cwd" "$id"'*) ok "and run_job asks it with the job's id" ;;
+    *) bad "run_job asks wt_isolation_enabled without the job's id" ;;
+  esac
 
   echo "wt_repos() — a single-repo project pins its base without declaring a repo"
   # The row it used to need was a copy of .cwd carrying one new field. Reading
@@ -6980,6 +7044,7 @@ JSON
     run_job() {
       printf '%s\n' "$*" > "$sec/runjob.args"
       printf '%s|%s\n' "${AL_BASE_OVERRIDE:-}" "${AL_SKIP_PROVISION:-}" > "$sec/runjob.env"
+      printf '%s\n' "${AL_SECURITY_REPO:-}" > "$sec/runjob.repo"
       # A CHILD PROCESS, not this shell: what matters is that the two markers
       # are EXPORTED all the way down to the agent's own tool shell, not that
       # run_job can see them as shell variables.
@@ -6989,8 +7054,8 @@ JSON
       return 0
     }
     cmd_security_analyze "Sec App" repo main quick
-    printf '%s|%s\n' "${AL_SECURITY_AGENT:-unset}" "${AL_SECURITY_ANALYSIS_ID:-unset}" \
-      > "$sec/after-analyze.env" ) > "$sec/analyze.out" 2>&1
+    printf '%s|%s|%s\n' "${AL_SECURITY_AGENT:-unset}" "${AL_SECURITY_ANALYSIS_ID:-unset}" \
+      "${AL_SECURITY_REPO:-unset}" > "$sec/after-analyze.env" ) > "$sec/analyze.out" 2>&1
   [ "$("$JQ" -r '.analysis_id' "$secreq" 2>/dev/null)" = "1" ] \
     && ok "the request file carries the analysis id the run has to report against" \
     || bad "request file: $(cat "$secreq" 2>/dev/null)"
@@ -7013,6 +7078,12 @@ JSON
   [ "$(cat "$sec/runjob.env" 2>/dev/null)" = "main|1" ] \
     && ok "with the branch as AL_BASE_OVERRIDE and provisioning skipped" \
     || bad "run_job saw '$(cat "$sec/runjob.env" 2>/dev/null)'"
+  # The repo travels beside the branch: run_job runs the analysis in the
+  # checkout of the repo it names, which on a multi-repo project is not the
+  # project's cwd. The spelling the ledger files it under, so the two agree.
+  [ "$(cat "$sec/runjob.repo" 2>/dev/null)" = "Sec App" ] \
+    && ok "and the repo it names as AL_SECURITY_REPO, spelt as the ledger files it" \
+    || bad "run_job saw AL_SECURITY_REPO='$(cat "$sec/runjob.repo" 2>/dev/null)'"
   # The agent reaches `security decide` and `security rename-project` through
   # the very same command the operator does; the marker is what tells the door
   # who is knocking, and it is worth nothing unless it reaches the agent's own
@@ -7020,7 +7091,7 @@ JSON
   [ "$(cat "$sec/runjob.childenv" 2>/dev/null)" = "1|1" ] \
     && ok "and AL_SECURITY_AGENT=1 plus the analysis id exported into every process the run starts" \
     || bad "a child of run_job saw '$(cat "$sec/runjob.childenv" 2>/dev/null)'"
-  [ "$(cat "$sec/after-analyze.env" 2>/dev/null)" = "unset|unset" ] \
+  [ "$(cat "$sec/after-analyze.env" 2>/dev/null)" = "unset|unset|unset" ] \
     && ok "and gone again the moment run_job returns, so the sweep after it is not marked as the agent" \
     || bad "the markers outlived the run: '$(cat "$sec/after-analyze.env" 2>/dev/null)'"
   # The stub never reached security_close_analysis, which is precisely the
@@ -7075,9 +7146,11 @@ FAKESELF
   [ -f "$sec/detached.ran" ] \
     && ok "the detached process really ran, after its parent had already exited" \
     || bad "the detached process never ran (waited ${detwait}s)"
+  # The repo last, after the branch: the new process is a fresh `agentloop`,
+  # and the repo the analysis names reaches run_job through nothing else.
   case "$(cat "$sec/detached.argv" 2>/dev/null)" in
-    "__run-analysis Sec-App-"*" main"|"__run-analysis "*" main")
-      ok "and it was re-execed as __run-analysis <job> <analysis> <branch>" ;;
+    "__run-analysis "*" main Sec App")
+      ok "and it was re-execed as __run-analysis <job> <analysis> <branch> <repo>" ;;
     *) bad "the detached process got '$(cat "$sec/detached.argv" 2>/dev/null)'" ;;
   esac
 

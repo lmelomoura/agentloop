@@ -140,6 +140,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **An analysis of one repository of a multi-repo project reads that
+  repository, at the branch it names.** Every analysis ran in the project's
+  `cwd` — the primary repository — so an analysis of any other repository
+  ran `prepare` and the agent over the primary's code, and filed that report
+  under the repository it named, at the commit of the branch it named: a
+  report correct about the wrong code. And every declared repository was cut
+  from the analysed branch, so a branch only the analysed repository has — a
+  feature branch, the ordinary case — aborted the run with "no base ref
+  resolvable" at a repository nobody had asked about. The analysis now runs
+  in the checkout of the repository it names, and that repository is the only
+  one cut (`AL_SECURITY_REPO`, beside the branch's `AL_BASE_OVERRIDE`; the
+  detached re-exec carries it as a fourth argument). A project whose
+  `worktree.enabled` is `false` no longer runs an analysis in its canonical
+  checkout, on whatever branch was checked out there: an analysis is always
+  isolated, decided by its job id, so its resume is too. The selftest covers
+  the repo rows an analysis is handed, a worktree cut from a branch only the
+  second repository has, the isolation rule and its one caller; e2e scenario
+  46 analyses the second repository of a two-repository project at such a
+  branch and reads where the agent was launched from the agent's own side
+  (`FAKE_CWD_OUT` in `test/fake-claude`).
+
 - **A waiter that has queued for a while no longer breaks the next holder's
   lock.** Every serialized write — the state file, the journal, port
   blocks, a resume, the tick — takes a mkdir lock and then writes its pid
