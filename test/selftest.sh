@@ -1080,21 +1080,21 @@ JSON
     && ok "and says whom that directory is signed in as" || bad "check client-a: $(ac_al platform check anthropic client-a 2>&1)"
   [ "$(ac_al platform check anthropic nope 2>/dev/null | "$JQ" -r '.ready, .account_dir, .reason' | tr '\n' '|')" = "false||account 'nope' is not an account of anthropic in Settings|" ] \
     && ok "an id Settings does not have is not ready, and says so, and exports nothing for account_dir" || bad "check nope: $(ac_al platform check anthropic nope 2>&1)"
-  out="$(ac_al platform account-edit anthropic client-a "Client Alfa" "~/.claude-a" 2>&1)"; rc=$?
-  [ "$rc" -eq 0 ] && [ "$out" = "account 'Client Alfa' saved on anthropic — signed in as a@example.org · max plan" ] \
-    && [ "$("$JQ" -r '.platforms.anthropic.accounts[0] | "\(.id) \(.name)"' "$ac/config/platforms.json")" = "client-a Client Alfa" ] \
+  out="$(ac_al platform account-edit anthropic client-a "Client Alpha" "~/.claude-a" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = "account 'Client Alpha' saved on anthropic — signed in as a@example.org · max plan" ] \
+    && [ "$("$JQ" -r '.platforms.anthropic.accounts[0] | "\(.id) \(.name)"' "$ac/config/platforms.json")" = "client-a Client Alpha" ] \
     && ok "account-edit renames it and keeps its id" || bad "edit: rc=$rc $out"
-  out="$(ac_al platform account-edit anthropic client-a "Client Alfa" "~/.claude-c" 2>&1)"; rc=$?
-  [ "$rc" -eq 0 ] && [ "$out" = "account 'Client Alfa' saved on anthropic — signed in as fake@example.org · max plan" ] \
+  out="$(ac_al platform account-edit anthropic client-a "Client Alpha" "~/.claude-c" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = "account 'Client Alpha' saved on anthropic — signed in as fake@example.org · max plan" ] \
     && [ "$(readlink "$ac/home/.claude-c/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
     && ok "account-edit moving an account to a new, existing directory relinks the skills there too" || bad "edit relink: rc=$rc $out $(ls "$ac/home/.claude-c" 2>&1)"
   ac_refused "the Default is not edited here" "the Default account is the install's own — it is not edited here" account-edit anthropic default "X" "~/.claude-b"
   ac_refused "an unknown id is not edited" "no account 'nope' on anthropic" account-edit anthropic nope "X" "~/.claude-b"
   "$JQ" '.jobs[0].account = "client-a"' "$ac/config/jobs.json" > "$ac/jobs.next" && mv "$ac/jobs.next" "$ac/config/jobs.json"
-  ac_refused "an account in use is not removed, and the refusal names who uses it" "'Client Alfa' is used by ja — move them to another account first" account-remove anthropic client-a
+  ac_refused "an account in use is not removed, and the refusal names who uses it" "'Client Alpha' is used by ja — move them to another account first" account-remove anthropic client-a
   "$JQ" 'del(.jobs[0].account)' "$ac/config/jobs.json" > "$ac/jobs.next" && mv "$ac/jobs.next" "$ac/config/jobs.json"
   printf '{oops' > "$ac/config/jobs.json"
-  ac_refused "account-remove refuses when jobs.json cannot be read, rather than assuming nobody uses it" "cannot tell who uses 'Client Alfa': $ac/config/jobs.json does not parse — fix it first" account-remove anthropic client-a
+  ac_refused "account-remove refuses when jobs.json cannot be read, rather than assuming nobody uses it" "cannot tell who uses 'Client Alpha': $ac/config/jobs.json does not parse — fix it first" account-remove anthropic client-a
   printf '{"jobs":[{"id":"ja","project":"P","prompt":"x","model":"claude-opus-5"},{"id":"jo","platform":"openai","model":"gpt-a","prompt":"x"}]}\n' > "$ac/config/jobs.json"
   out="$(ac_al platform account-remove anthropic client-a 2>&1)"; rc=$?
   [ "$rc" -eq 0 ] && [ "$out" = "account 'client-a' removed from anthropic" ] \
@@ -1688,11 +1688,20 @@ JSON
     _b="$(status_platforms_block)"
     printf '%s\n' "$_b" | grep -q '^anthropic : disabled — ' \
       && ok "status_platforms_block: a platform switched off says disabled" || bad "disabled line: $(printf '%s\n' "$_b" | sed -n 1p)"
+    mkdir -p "$tmp/sp/acct-a"
+    CLAUDE_BIN="$BASE_DIR/test/fake-claude"
+    write_platforms '.platforms.anthropic.enabled = true' >/dev/null 2>&1
+    write_platforms --arg d "$tmp/sp/acct-a" '.platforms.anthropic.accounts = [{id:"a", name:"Client A", dir:$d}]' >/dev/null 2>&1
+    printf 'a@example.org' > "$tmp/sp/acct-a/.fake-email"
+    _b="$(status_platforms_block)"
+    printf '%s\n' "$_b" | grep -qF "            account Client A ($tmp/sp/acct-a) — signed in as a@example.org · max plan; used by 0; $(skills_missing "$tmp/sp/acct-a/skills") skill(s) not linked there (agentloop skills install)" \
+      && ok "status_platforms_block: one line per registered account, under its platform" \
+      || bad "account line: $(printf '%s\n' "$_b" | grep account)"
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_spout" | grep -v '^RESULT '
-  printf '%s\n' "$_spout" | grep -qx 'RESULT ok=9 bad=0' \
-    && ok "status_platforms_block over the stand-ins: all 9 assertions reach the gate" \
+  printf '%s\n' "$_spout" | grep -qx 'RESULT ok=10 bad=0' \
+    && ok "status_platforms_block over the stand-ins: all 10 assertions reach the gate" \
     || bad "status_platforms_block did not: $(printf '%s\n' "$_spout" | tail -1)"
   got="$(age_label "$(( $(now_epoch) + 600 ))")"
   [ "$got" = "0m ago" ] \
@@ -5456,6 +5465,32 @@ NASTY
   got="$(rl_at openai five_hour 0.97 "$soon" openai)"
   case "$got" in *"the openai five_hour window is 97% used"*) ok "...while rl_gate openai on that same file still holds" ;; *) bad "openai gate on the same file: $got" ;; esac
 
+  # The windows are an ACCOUNT's: the platform's own key is the CLI's default
+  # directory, any other account directory reads and writes <platform>@<dir>.
+  [ "$(rl_key anthropic "")" = "anthropic" ] && [ "$(rl_key openai /x/.codex-a)" = "openai@/x/.codex-a" ] \
+    && ok "rl_key: the platform for the CLI's own directory, platform@dir for any other" || bad "rl_key"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/acct.json"
+    printf '%s' '{}' > "$RATE_LIMIT_FILE"
+    rl_capture "$tmp/rl/s.ndjson" "anthropic@/x/.claude-a"
+    "$JQ" -e '.["anthropic@/x/.claude-a"].seven_day.utilization == 0.98 and (has("anthropic") | not)' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "rl_capture writes a run's reading into its account's block" || bad "rl_capture per account: $(cat "$tmp/rl/acct.json")"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/acct-oa.json"
+    printf '%s' '{}' > "$RATE_LIMIT_FILE"
+    rl_capture_openai "$BASE_DIR/test/fixtures/codex/rollout-sample.stripped.jsonl" "" "openai@/x/.codex-a"
+    "$JQ" -e '.["openai@/x/.codex-a"].five_hour.utilization == 0.05 and (has("openai") | not)' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "and so does rl_capture_openai" || bad "rl_capture_openai per account: $(cat "$tmp/rl/acct-oa.json")"
+  got="$(rl_at "anthropic@/x/.claude-a" five_hour 0.97 "$soon" "anthropic@/x/.claude-a")"
+  case "$got" in *"the anthropic five_hour window is 97% used"*) ok "an account's spent window holds that account's runs back" ;; *) bad "account gate: '$got'" ;; esac
+  got="$(rl_at "anthropic@/x/.claude-a" five_hour 0.97 "$soon" anthropic)"
+  [ -z "$got" ] && ok "and not the Default's" || bad "cross-account gate: $got"
+  got="$(rl_at anthropic five_hour 0.97 "$soon" "anthropic@/x/.claude-a")"
+  [ -z "$got" ] && ok "nor does the Default's hold another account back" || bad "cross-account gate: $got"
+  got="$( DATA_DIR="$tmp/rl"; RATE_LIMIT_FILE="$tmp/rl/named.json"
+          "$JQ" -n --arg k "anthropic@/x/.claude-a" --argjson r "$soon" \
+            '{($k): {five_hour: {status:"allowed", utilization:0.97, resets_at:$r, overage:null, seen_at:0}}}' > "$RATE_LIMIT_FILE"
+          rl_gate "anthropic@/x/.claude-a" "Client A" 2>/dev/null )"
+  case "$got" in *"the anthropic five_hour window of Client A is 97% used"*) ok "and the hold names the account" ;; *) bad "named gate: '$got'" ;; esac
+
   echo "statusline-rate-limits.sh — the figure the run stream never carries"
   # The stream only reports utilisation once the CLI has decided to warn (0.75),
   # so below that the gate is armed and blind. The statusLine payload has the
@@ -5466,7 +5501,7 @@ NASTY
   sl="$BIN_DIR/statusline-rate-limits.sh"
   mkdir -p "$tmp/sl"
   sl_run() { # sl_run <payload-json> -> writes $tmp/sl/rate-limits.json
-    printf '%s' "$1" | AGENTLOOP_DATA="$tmp/sl" AGENTLOOP_STATUSLINE_MIN_SECONDS=0 sh "$sl" >/dev/null 2>&1
+    printf '%s' "$1" | env -u CLAUDE_CONFIG_DIR AGENTLOOP_DATA="$tmp/sl" AGENTLOOP_STATUSLINE_MIN_SECONDS=0 sh "$sl" >/dev/null 2>&1
   }
   sl_get() { "$JQ" -r "$1" "$tmp/sl/rate-limits.json" 2>/dev/null; }
 
@@ -5515,6 +5550,19 @@ NASTY
   [ "$(sl_get '.anthropic.five_hour.utilization')" = "0.4" ] && [ "$(sl_get 'has("five_hour")')" = "false" ] \
     && ok "the statusline migration keeps the fresher of the two shapes too" \
     || bad "statusline migration lost the fresher window: $(sl_get '.|tostring')"
+
+  # A session's account is its CLAUDE_CONFIG_DIR: the reading lands in that
+  # account's block, the one its runs read -- the CLI's own directory, with
+  # the variable set or not, is the platform's block.
+  rm -f "$tmp/sl/rate-limits.json"
+  printf '%s' '{"rate_limits":{"five_hour":{"used_percentage":40,"resets_at":333}}}' \
+    | CLAUDE_CONFIG_DIR="/x/.claude-a/" AGENTLOOP_DATA="$tmp/sl" AGENTLOOP_STATUSLINE_MIN_SECONDS=0 sh "$sl" >/dev/null 2>&1
+  [ "$(sl_get '.["anthropic@/x/.claude-a"].five_hour.utilization')" = "0.4" ] && [ "$(sl_get 'has("anthropic")')" = "false" ] \
+    && ok "a session with CLAUDE_CONFIG_DIR feeds that account's block, trailing slash or not" || bad "statusline per account: $(sl_get '.|tostring')"
+  printf '%s' '{"rate_limits":{"five_hour":{"used_percentage":41,"resets_at":333}}}' \
+    | CLAUDE_CONFIG_DIR="$HOME/.claude" AGENTLOOP_DATA="$tmp/sl" AGENTLOOP_STATUSLINE_MIN_SECONDS=0 sh "$sl" >/dev/null 2>&1
+  [ "$(sl_get '.anthropic.five_hour.utilization')" = "0.41" ] \
+    && ok "and one pointed at ~/.claude feeds the platform's own" || bad "statusline ~/.claude: $(sl_get '.|tostring')"
 
   echo "failure causes — an outage is not the job's fault, and must not slow it down"
   # `error` covered a 529 the API returned and an agent that got its tools taken
@@ -5698,6 +5746,7 @@ NASTY
     if [ -n "${2:-}" ]; then printf '%s' "$2" > "$tmp/usg/rate-limits.json"
     else rm -f "$tmp/usg/rate-limits.json"; fi
     ( HOME="$tmp/usg_home"; mkdir -p "$HOME/.claude"; cp "$tmp/usg/settings.json" "$HOME/.claude/settings.json"
+      PLIST_PATH=/nonexistent; AGENTLOOP_CLAUDE_CONFIG_DIR=""; PLATFORMS_FILE="${USG_PLATFORMS:-$PLATFORMS_FILE}"
       DATA_DIR="$tmp/usg"; RATE_LIMIT_FILE="$tmp/usg/rate-limits.json"; cmd_usage ) 2>/dev/null
   }
   soon2="$(( $(now_epoch) + 3600 ))"
@@ -5744,6 +5793,14 @@ NASTY
     *"anthropic five_hour: 30% used"*"openai five_hour: 5% used"*"rollout"*"opencode: no usage windows"*) ok "usage lists both platforms, each window named by its platform" ;;
     *) bad "usage output did not list both platforms" ;;
   esac
+  mkdir -p "$tmp/usg/acct-a"
+  printf '%s' "$wired" > "$tmp/usg/acct-a/settings.json"
+  printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":[],"accounts":[{"id":"a","name":"Client A","dir":"%s"}]}}}\n' "$tmp/usg/acct-a" > "$tmp/usg/platforms.json"
+  got="$(USG_PLATFORMS="$tmp/usg/platforms.json" usg '{}' '{"anthropic@'"$tmp/usg/acct-a"'":{"five_hour":{"status":"allowed","utilization":0.3,"resets_at":'"$soon2"',"seen_at":0,"source":"statusline"}},"anthropic@/gone/.claude-x":{"five_hour":{"status":"allowed","utilization":0.2,"resets_at":'"$soon2"',"seen_at":0}}}')"
+  case "$got" in *"anthropic (Client A) five_hour: 30% used"*"anthropic (/gone/.claude-x — no longer an account) five_hour: 20% used"*)
+      ok "usage names each account's block: a registered one by name, one Settings no longer has by its directory" ;;
+    *) bad "usage per account: $got" ;; esac
+  case "$got" in *"statusline (Client A): wired to"*"it has fed the gate"*) ok "and says whether each account's own settings feed its gate" ;; *) bad "statusline per account: $got" ;; esac
 
   echo "the Claude account comes from the setting, never from the environment"
   # cmd_install refuses an ambient CLAUDE_CONFIG_DIR, and for a while the runtime

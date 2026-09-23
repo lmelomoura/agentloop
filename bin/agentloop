@@ -2899,7 +2899,7 @@ platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-
   # failed; this says when the next one may start.
   local refused=""
   [ "$("$JQ" -r '.api_error_status // ""' "$2" 2>/dev/null | tail -1)" = "429" ] && refused="refused"
-  rl_capture_openai "$PF_ROLLOUT" $refused
+  rl_capture_openai "$PF_ROLLOUT" "$refused" "$(rl_key openai "$(account_env_value openai "$home")")"
   return 0
 }
 
@@ -4194,12 +4194,21 @@ rl_migrate() {
   return 0
 }
 
+# Which block of data/rate-limits.json a run's account reads and writes. The
+# windows are an ACCOUNT's, not a platform's: the platform's own key is the
+# CLI's default directory -- what every install had before accounts, and
+# what the statusline of a session with no CLAUDE_CONFIG_DIR writes -- and
+# any other account directory has a block of its own, <platform>@<dir>.
+rl_key() { # rl_key <platform> <account-dir> -> the block's key
+  if [ -z "${2:-}" ]; then printf '%s\n' "$1"; else printf '%s@%s\n' "$1" "$2"; fi
+}
+
 # Fold every rate_limit_event in a finished run's stream into the shared file,
 # newest per window wins. Never fails a run: this is bookkeeping, and a run that
 # worked must not be reported as broken because a status file could not be
 # written.
-rl_capture() { # rl_capture <streamfile>
-  local sf="${1:-}" tmp lock
+rl_capture() { # rl_capture <streamfile> [key] -- key: rl_key's block (anthropic when none)
+  local sf="${1:-}" key="${2:-anthropic}" tmp lock
   [ -s "$sf" ] || return 0
   grep -q rate_limit_event "$sf" 2>/dev/null || return 0
   lock="$LOCK_DIR/.ratelimit"
@@ -4210,12 +4219,12 @@ rl_capture() { # rl_capture <streamfile>
   # `-R` with `fromjson?` for the same reason every other reader of a stream
   # uses it: a killed run is cut off mid-write and one truncated line must not
   # cost us the other 300.
-  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" '
+  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg k "$key" '
     ($prev[0] // {}) as $was
     | [inputs | fromjson? | select(.type == "rate_limit_event") | .rate_limit_info // empty]
     | map(select(.rateLimitType != null))
     | reduce .[] as $e ($was;
-        .anthropic[$e.rateLimitType] = {
+        .[$k][$e.rateLimitType] = {
           status:      ($e.status // "unknown"),
           utilization: ($e.utilization // null),
           resets_at:   ($e.resetsAt // null),
@@ -4235,8 +4244,8 @@ rl_capture() { # rl_capture <streamfile>
 # run ended on a quota refusal (turn.failed, "hit your usage limit"): the
 # reset time is in the rollout but not which window tripped, so the FULLER
 # one is marked spent until its own reset -- the gate then lifts by itself.
-rl_capture_openai() { # rl_capture_openai <rollout-file> [refused]
-  local roll="${1:-}" refused="${2:-}" tmp lock
+rl_capture_openai() { # rl_capture_openai <rollout-file> [refused] [key] -- key: rl_key's block (openai when none)
+  local roll="${1:-}" refused="${2:-}" key="${3:-openai}" tmp lock
   [ -s "$roll" ] || return 0
   grep -q token_count "$roll" 2>/dev/null || return 0
   lock="$LOCK_DIR/.ratelimit"
@@ -4244,7 +4253,7 @@ rl_capture_openai() { # rl_capture_openai <rollout-file> [refused]
   rl_migrate
   [ -s "$RATE_LIMIT_FILE" ] || echo '{}' > "$RATE_LIMIT_FILE" 2>/dev/null || { lock_drop "$lock"; return 0; }
   tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX")" || { lock_drop "$lock"; return 0; }
-  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg refused "$refused" '
+  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg refused "$refused" --arg k "$key" '
     ($prev[0] // {}) as $was
     | [inputs | fromjson? | select(.type == "event_msg" and .payload.type == "token_count") | .payload.rate_limits // empty]
     | last // empty
@@ -4261,7 +4270,7 @@ rl_capture_openai() { # rl_capture_openai <rollout-file> [refused]
             plan_type: ($rl.plan_type // null) }
         end;
     $was
-    | .openai = ((.openai // {})
+    | .[$k] = ((.[$k] // {})
         + (if $rl.primary   != null then {five_hour: window($rl.primary; "five_hour")} else {} end)
         + (if $rl.secondary != null then {seven_day: window($rl.secondary; "seven_day")} else {} end))
   ' "$roll" > "$tmp" 2>/dev/null && [ -s "$tmp" ] && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
@@ -4278,12 +4287,14 @@ rl_capture_openai() { # rl_capture_openai <rollout-file> [refused]
 # about now. That is what keeps a single bad afternoon from wedging the fleet
 # for ever -- the gate expires by itself, with no operator action and no clock
 # of our own.
-rl_gate() { # rl_gate [platform] -> 0 = hold this run back (reason on stdout); anthropic when unnamed
-  local p="${1:-anthropic}"
+rl_gate() { # rl_gate [key] [account-name] -> 0 = hold this run back (reason on stdout); anthropic when unnamed. The name is said for an account that is not the Default
+  local k="${1:-anthropic}" p of=""
+  p="${k%%@*}"
+  [ -z "${2:-}" ] || of=" of ${2}"
   rl_migrate
   [ -s "$RATE_LIMIT_FILE" ] || return 1
-  "$JQ" -e -r --arg p "$p" --argjson now "$(now_epoch)" --argjson stop "$RL_STOP_AT" '
-    (.[$p] // {}) | to_entries
+  "$JQ" -e -r --arg k "$k" --arg p "$p" --arg of "$of" --argjson now "$(now_epoch)" --argjson stop "$RL_STOP_AT" '
+    (.[$k] // {}) | to_entries
     | map(select(.value.resets_at != null and .value.resets_at > $now))
     | map(. + {mins: (((.value.resets_at - $now) / 60) | floor)})
     # A refusal outranks a number: if the API has stopped saying `allowed`, the
@@ -4291,10 +4302,10 @@ rl_gate() { # rl_gate [platform] -> 0 = hold this run back (reason on stdout); a
     # NO status is not a refusal — the statusline reports utilisation without
     # one, and treating its silence as a refusal would gate every healthy run.
     | ( [ .[] | select(.value.status != null and ((.value.status | startswith("allowed")) | not)) ]
-        | map("the \($p) \(.key) window is spent (API says \(.value.status)) -- it resets in \(.mins) min")
+        | map("the \($p) \(.key) window\($of) is spent (API says \(.value.status)) -- it resets in \(.mins) min")
       ) + (
         [ .[] | select((.value.utilization // 0) >= $stop) ]
-        | map("the \($p) \(.key) window is \((.value.utilization * 100) | floor)% used"
+        | map("the \($p) \(.key) window\($of) is \((.value.utilization * 100) | floor)% used"
               + (if .value.overage == "rejected" then " and overage is off, so the ceiling is a dead stop" else "" end)
               + " -- it resets in \(.mins) min")
       )
@@ -4401,61 +4412,32 @@ fleet_stall_check() {
 # working?" was a hand-written one-liner over the JSON — which puts the burden of
 # verifying the product on the person using it. A feature that cannot say whether
 # it is on is a feature nobody can trust.
-cmd_usage() {
-  local now settings cmd
-  now="$(now_epoch)"
+usage_account_label() { # usage_account_label <platform> <account-dir> -> the name a usage block goes by: Default, a registered account, or the directory with a note
+  local aid
+  if [ "$(account_env_dir "$1" default)" = "$2" ]; then printf 'Default'; return 0; fi
+  for aid in $(accounts_json "$1" | "$JQ" -r '.[].id'); do
+    if [ "$(account_env_dir "$1" "$aid")" = "$2" ]; then account_field "$1" "$aid" name | tr -d '\n'; return 0; fi
+  done
+  printf '%s — no longer an account' "$2"
+}
 
-  rl_migrate
-  if [ ! -s "$RATE_LIMIT_FILE" ]; then
-    echo "No usage window has been recorded yet."
-  else
-    local p reason
-    for p in $PLATFORMS; do
-      if [ "$p" = "opencode" ]; then
-        echo "opencode: no usage windows — each provider has its own API, and nothing on the stream or in the export reports one"
-        continue
-      fi
-      "$JQ" -r --arg p "$p" --argjson now "$now" '
-        (.[$p] // {}) | to_entries[]
-        | .value as $v
-        | (if $v.utilization == null then "  ?" else (($v.utilization * 100) | floor | tostring) + "%" end) as $pct
-        | (if $v.resets_at == null then "reset time unknown"
-           elif $v.resets_at <= $now then "that window has already reset — this reading no longer counts"
-           else "resets in " + (((($v.resets_at - $now) / 60) | floor) | tostring) + " min" end) as $when
-        | (((($now - ($v.seen_at // 0)) / 60) | floor) | tostring) as $age
-        | "\($p) \(.key): \($pct) used, \($when)"
-          + "\n  read \($age) min ago from the \($v.source // "run stream")"
-          + (if $v.plan_type != null then " (\($v.plan_type) plan)" else "" end)
-          + (if $v.status != null then ", API said \($v.status)" else "" end)
-          + (if $v.overage == "rejected" then ", overage off (the ceiling is a dead stop)" else "" end)
-      ' "$RATE_LIMIT_FILE" 2>/dev/null
-      if reason="$(rl_gate "$p")" && [ -n "$reason" ]; then
-        echo
-        echo "SCHEDULED $p RUNS ARE BEING HELD BACK: $reason"
-        echo "  (\`agentloop run <job>\` still overrides this, as it does the budget.)"
-      fi
-    done
-  fi
-
-  # The other half: is the figure going to keep arriving? A window whose only
-  # reading came off a run stream is one the gate cannot see below 75%.
-  echo
-  settings="$HOME/.claude/settings.json"
-  cmd=""
+usage_statusline() { # usage_statusline <settings.json> <rate-limit key> <account name, or empty for the Default> -- whether that account's interactive sessions feed its gate
+  local settings="$1" key="$2" tag="" cmd=""
+  [ -z "${3:-}" ] || tag=" ($3)"
   [ -f "$settings" ] && cmd="$("$JQ" -r '.statusLine.command // ""' "$settings" 2>/dev/null)"
   if [ -z "$cmd" ]; then
-    echo "statusline: not configured — the gate is blind below 0.75 utilisation."
+    echo "statusline$tag: not configured — the gate is blind below 0.75 utilisation."
     echo "  Point statusLine at $BIN_DIR/statusline-rate-limits.sh in $settings."
   elif [ "${cmd%statusline-rate-limits.sh}" = "$cmd" ]; then
-    echo "statusline: configured, but not to this script — nothing feeds the gate."
+    echo "statusline$tag: configured, but not to this script — nothing feeds the gate."
     echo "  It runs: $cmd"
   elif [ ! -x "${cmd%% *}" ]; then
-    echo "statusline: configured but NOT RUNNABLE — every session's status line is failing."
+    echo "statusline$tag: configured but NOT RUNNABLE — every session's status line is failing."
     echo "  Missing or not executable: ${cmd%% *}"
   else
-    echo "statusline: wired to ${cmd%% *}"
+    echo "statusline$tag: wired to ${cmd%% *}"
     if [ -s "$RATE_LIMIT_FILE" ] \
-       && "$JQ" -e 'any(.anthropic[]?; .source == "statusline")' "$RATE_LIMIT_FILE" >/dev/null 2>&1; then
+       && "$JQ" -e --arg k "$key" 'any(.[$k][]?; .source == "statusline")' "$RATE_LIMIT_FILE" >/dev/null 2>&1; then
       echo "  and it has fed the gate — readings above are live."
     else
       echo "  but it has never fed the gate yet. The statusLine is read when a"
@@ -4463,6 +4445,65 @@ cmd_usage() {
       echo "  never call it. Open a new interactive session and re-run this."
     fi
   fi
+}
+
+cmd_usage() {
+  local now p key keys who reason aid adir
+  now="$(now_epoch)"
+
+  rl_migrate
+  if [ ! -s "$RATE_LIMIT_FILE" ]; then
+    echo "No usage window has been recorded yet."
+  else
+    for p in $PLATFORMS; do
+      if [ "$p" = "opencode" ]; then
+        echo "opencode: no usage windows — each provider has its own API, and nothing on the stream or in the export reports one"
+        continue
+      fi
+      # The platform's own block -- the account on the CLI's own directory --
+      # first, then one per other account directory the file holds.
+      keys="$("$JQ" -r --arg p "$p" '[keys_unsorted[] | select(. == $p or startswith($p + "@"))]
+          | (map(select(. == $p)) + map(select(. != $p)))[]' "$RATE_LIMIT_FILE" 2>/dev/null)"
+      while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        if [ "$key" = "$p" ]; then who="$p"; else who="$p ($(usage_account_label "$p" "${key#*@}"))"; fi
+        "$JQ" -r --arg k "$key" --arg who "$who" --argjson now "$now" '
+          (.[$k] // {}) | to_entries[]
+          | .value as $v
+          | (if $v.utilization == null then "  ?" else (($v.utilization * 100) | floor | tostring) + "%" end) as $pct
+          | (if $v.resets_at == null then "reset time unknown"
+             elif $v.resets_at <= $now then "that window has already reset — this reading no longer counts"
+             else "resets in " + (((($v.resets_at - $now) / 60) | floor) | tostring) + " min" end) as $when
+          | (((($now - ($v.seen_at // 0)) / 60) | floor) | tostring) as $age
+          | "\($who) \(.key): \($pct) used, \($when)"
+            + "\n  read \($age) min ago from the \($v.source // "run stream")"
+            + (if $v.plan_type != null then " (\($v.plan_type) plan)" else "" end)
+            + (if $v.status != null then ", API said \($v.status)" else "" end)
+            + (if $v.overage == "rejected" then ", overage off (the ceiling is a dead stop)" else "" end)
+        ' "$RATE_LIMIT_FILE" 2>/dev/null
+        if reason="$(rl_gate "$key")" && [ -n "$reason" ]; then
+          echo
+          echo "SCHEDULED $who RUNS ARE BEING HELD BACK: $reason"
+          echo "  (\`agentloop run <job>\` still overrides this, as it does the budget.)"
+        fi
+      done <<EOF
+$keys
+EOF
+    done
+  fi
+
+  # The other half: is the figure going to keep arriving? A window whose only
+  # reading came off a run stream is one the gate cannot see below 75%. The
+  # statusLine lives in each Claude account's own settings.json.
+  echo
+  for aid in default $(accounts_json anthropic | "$JQ" -r '.[].id'); do
+    adir="$(account_env_dir anthropic "$aid")"
+    if [ "$aid" = "default" ] && [ -z "$adir" ]; then
+      usage_statusline "$HOME/.claude/settings.json" anthropic ""
+    else
+      usage_statusline "${adir:-$HOME/.claude}/settings.json" "$(rl_key anthropic "$adir")" "$(account_field anthropic "$aid" name | tr -d '\n')"
+    fi
+  done
   echo "openai: fed by every run's own rollout (the Codex CLI reports both windows on every turn); nothing to wire."
 }
 
@@ -5146,10 +5187,15 @@ cmd_precheck() { # <id> — run the job's precheck once and RECORD it, without t
   # claimed with no session behind it.
   # The same account as the run it gates (run_job's precheck): a probe that
   # asks the CLI itself must answer for the account the job signs in as --
-  # and an id Settings no longer has must refuse HERE too, exactly as the
-  # launch gate does, rather than quietly asking the CLI's own default.
+  # and an id Settings no longer has, or an OpenCode job naming one at all,
+  # must refuse HERE too, exactly as the launch gate does, rather than
+  # quietly asking the CLI's own default.
   local plat acct adir
   plat="$(job_platform "$id")"; acct="$(job_account "$id")"
+  if [ "$plat" = "opencode" ] && [ "$acct" != "default" ]; then
+    echo "$id: OpenCode has no accounts (account '$acct')"
+    return 1
+  fi
   if ! account_known "$plat" "$acct"; then
     echo "$id: account '$acct' is not an account of $plat in Settings"
     return 1
@@ -6106,8 +6152,12 @@ $(run_ending_contract)" ;;
   # than summing a day of runs. Scheduled runs only — Run now is a deliberate
   # override, exactly as it is for the budget and the precheck.
   if [ "$forced" != "true" ]; then
-    local rl_reason
-    if rl_reason="$(rl_gate "$platform")" && [ -n "$rl_reason" ]; then
+    # The account's own windows (rl_key), named in the hold when it is not the Default.
+    local rl_reason _rl_of=""
+    if [ "$account" != "default" ]; then
+      _rl_of="$(account_field "$platform" "$account" name)"; [ -n "$_rl_of" ] || _rl_of="$account"
+    fi
+    if rl_reason="$(rl_gate "$(rl_key "$platform" "$account_dir")" "$_rl_of")" && [ -n "$rl_reason" ]; then
       state_set "$id" last_status '"rate_limited"'
       state_set "$id" last_rate_limit "$("$JQ" -nc --arg r "$rl_reason" '{reason:$r}')"
       log_tick "$id: usage limit reached — $rl_reason — skipping"
@@ -6677,7 +6727,7 @@ If the work turns out to be already finished, or it can no longer be done at all
   # here because the stream is open in front of us and this is the only place it
   # is ever parsed in full — and recorded even for a failed run, since a run
   # killed AT the ceiling is exactly the one whose reading matters most.
-  rl_capture "$streamfile"
+  rl_capture "$streamfile" "$(rl_key "$platform" "$account_dir")"
 
   end="$(now_epoch)"
   cost="$("$JQ" -r '.total_cost_usd // 0' "$logfile" 2>/dev/null || echo 0)"
@@ -7184,6 +7234,23 @@ age_label() { # age_label <epoch> [zero-label]
   else                          printf '%sd ago' "$(( d / 86400 ))"; fi
 }
 
+status_account_lines() { # status_account_lines <platform> -> one indented line per registered account: its directory, its session, how many run on it, skills not linked there
+  account_platform "$1" || return 0
+  local aid aname adir ach users miss extra
+  for aid in $(accounts_json "$1" | "$JQ" -r '.[].id'); do
+    aname="$(account_field "$1" "$aid" name)"
+    adir="$(account_env_dir "$1" "$aid")"
+    ach="$(account_check_sentence "$1" "$aid")"
+    users="$(num "$(account_users "$1" "$aid" | grep -c . 2>/dev/null)")"
+    extra=""
+    if [ -n "$adir" ] && [ -d "$adir" ]; then
+      miss="$(skills_missing "$adir/skills")"
+      [ "$miss" -eq 0 ] || extra="; $miss skill(s) not linked there (agentloop skills install)"
+    fi
+    printf '            account %s (%s) — %s; used by %s%s\n' "$aname" "${adir:-$(account_cli_default "$1")}" "$ach" "$users" "$extra"
+  done
+}
+
 # Every listed platform, one line each: whether Settings switched it on, the
 # CLI's version and readiness (platform_check's own sentence when not ready),
 # the account it signs in as, how many of its models are switched on -- and
@@ -7199,7 +7266,7 @@ status_platforms_block() { # one line per listed platform: enabled or not, versi
     acct="$(printf '%s' "$j" | "$JQ" -r .account)"; reason="$(printf '%s' "$j" | "$JQ" -r .reason)"
     if platform_planned "$p"; then printf '%-9s : planned — %s\n' "$p" "$reason"; continue; fi
     if platform_enabled "$p"; then state=enabled; else state=disabled; fi
-    if [ "$ready" != "true" ]; then printf '%-9s : %s — %s\n' "$p" "$state" "$reason"; continue; fi
+    if [ "$ready" != "true" ]; then printf '%-9s : %s — %s\n' "$p" "$state" "$reason"; status_account_lines "$p"; continue; fi
     n_on="$(num "$(platform_models_enabled "$p" | grep -c . 2>/dev/null)")"
     # A listed family (platforms.json can still carry a bare "opus", not yet
     # resolved to an id) is folded to the id the cache holds for it before the
@@ -7234,6 +7301,7 @@ status_platforms_block() { # one line per listed platform: enabled or not, versi
         "$(opencode_catalog_visible 2>/dev/null | grep -c . || true)" "${nu:-none}"
     fi
     printf '\n'
+    status_account_lines "$p"
   done
 }
 
@@ -8231,17 +8299,24 @@ cmd_check() {
   local id="$1" precheck cwd
   precheck="$(jobs_json | "$JQ" -r --arg id "$id" '.jobs[] | select(.id==$id) | .precheck // ""')"
   cwd="$(resolve "$id" cwd "$HOME")"   # inherit the project's cwd, like run_job
-  [ -n "$precheck" ] || { echo "$id has no precheck — every due tick spends a session."; return 0; }
   # Read-only, like every standalone probe (see AL_PRECHECK_DRY_RUN). The
-  # same account as the run it gates -- an id Settings no longer has must
-  # refuse HERE too, exactly as the launch gate does, rather than quietly
-  # asking the CLI's own default.
+  # same account as the run it gates -- an id Settings no longer has, or an
+  # OpenCode job naming one at all, must refuse HERE too, exactly as the
+  # launch gate does, rather than quietly asking the CLI's own default.
+  # Ahead of the "no precheck" return below: every due tick would be refused
+  # at this same gate regardless, and a job stuck on it deserves better than
+  # a blanket "nothing to do".
   local plat acct adir
   plat="$(job_platform "$id")"; acct="$(job_account "$id")"
+  if [ "$plat" = "opencode" ] && [ "$acct" != "default" ]; then
+    echo "$id: OpenCode has no accounts (account '$acct')"
+    return 1
+  fi
   if ! account_known "$plat" "$acct"; then
     echo "$id: account '$acct' is not an account of $plat in Settings"
     return 1
   fi
+  [ -n "$precheck" ] || { echo "$id has no precheck — every due tick spends a session."; return 0; }
   adir="$(account_env_dir "$plat" "$acct")"
   ( cd "$cwd" && account_export "$plat" "$adir" && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1 && eval "$precheck" ); local rc=$?
   case "$(precheck_verdict "$rc")" in

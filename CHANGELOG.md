@@ -57,6 +57,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   A resume after the job's platform changed is refused by the platform
   mismatch, never by asking the OTHER platform's own account whether it is
   signed in.
+  The usage-window gate is per account: a run reads and feeds its account's
+  own windows (`<platform>@<directory>` in `data/rate-limits.json`, the
+  platform's own key for the CLI's default directory), so one account's spent
+  five hours no longer holds another's runs back. The statusline feeds the
+  account its session runs as, and `agentloop usage` and `status` list every
+  account.
 
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate
@@ -175,6 +181,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   record, the same 858 checks green plus the ten new ones (seven structural,
   three in the e2e). Whoever changes how a run is launched now opens a
   function of 230 lines whose inputs are listed at the top.
+
+- **An install pinned to a Claude account keys that account's usage windows
+  by its directory.** `anthropic@<pin>` replaces the bare `anthropic` block
+  for pinned runs, so the gate is blind for them until the next reading lands
+  — one run, or the next interactive turn of a session wired to the
+  statusline in that account.
 
 ### Fixed
 

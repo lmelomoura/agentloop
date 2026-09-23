@@ -443,7 +443,9 @@ s13="$(ls "$ROOT"/data/logs/j13/*.stream.ndjson 2>/dev/null | head -1)"
 head -1 "$s13" | jq -e '.subtype=="init" and .platform=="openai"' >/dev/null 2>&1 \
   && ok "the normalized stream opens with the init event" || bad "first line: $(head -1 "$s13")"
 [ ! -e "$ROOT"/data/logs/j13/*.raw.fifo ] && ok "the FIFO was removed" || bad "FIFO left behind"
-jq -e '.openai.five_hour.utilization == 0.05 and .openai.five_hour.source == "rollout"' "$ROOT/data/rate-limits.json" >/dev/null 2>&1 \
+# The sandbox's CODEX_HOME is not ~/.codex: the Default's windows are keyed
+# by that home, like any other account's.
+jq -e --arg k "openai@$CODEX_HOME" '.[$k].five_hour.utilization == 0.05 and .[$k].five_hour.source == "rollout"' "$ROOT/data/rate-limits.json" >/dev/null 2>&1 \
   && ok "the run's rollout fed the openai usage windows" || bad "rate-limits.json: $(cat "$ROOT/data/rate-limits.json" 2>/dev/null)"
 
 echo
@@ -549,8 +551,8 @@ sleep 2
 [ "$(lastrun | jq -r .status)" = "error" ] && [ "$(lastrun | jq -r .cause)" = "rate_limited" ] \
   && ok "error / rate_limited" || bad "$(lastrun | jq -c '{status,cause}')"
 [ "$(jq -r '.j18.fail_streak' "$ROOT/data/state.json")" = "2" ] && ok "fail_streak untouched" || bad "streak $(jq -r '.j18.fail_streak' "$ROOT/data/state.json")"
-[ "$(jq -r '.openai.five_hour.status' "$ROOT/data/rate-limits.json")" = "usage_limit_reached" ] \
-  && ok "and the fuller openai window is marked spent until its reset" || bad "window status $(jq -c .openai "$ROOT/data/rate-limits.json")"
+[ "$(jq -r --arg k "openai@$CODEX_HOME" '.[$k].five_hour.status' "$ROOT/data/rate-limits.json")" = "usage_limit_reached" ] \
+  && ok "and the fuller openai window is marked spent until its reset" || bad "window status $(jq -c . "$ROOT/data/rate-limits.json")"
 
 echo
 }
@@ -1378,7 +1380,7 @@ grep -qF "j50: anthropic is not ready (claude is not signed in in $ROOT/accounts
 # worktree once a run finishes, so an empty tree also describes a run that
 # launched and was cleaned up. A log directory and a journal record are not
 # cleaned up that way -- their absence is what actually proves no slot ran.
-[ ! -d "$ROOT/data/logs/j50" ] && [ -z "$(run_of j50)" ] \
+[ ! -d "$ROOT/data/logs/j50" ] && [ -z "$(run_of j50)" ] && [ -z "$(dirs j50)" ] \
   && ok "and no run directory, log or journal record was left behind" \
   || bad "log dir: $(ls -d "$ROOT/data/logs/j50" 2>&1); record: $(run_of j50)"
 mkjob_acct j50c ghost
@@ -1414,6 +1416,21 @@ jq '.jobs[0].account = "nope"' "$ROOT/config/jobs.json" > "$ROOT/config/jobs.nex
 "$AL" run j50e >/dev/null 2>&1
 grep -qF "j50e: OpenCode has no accounts (account 'nope'), skipped" "$ROOT/data/tick.log" \
   && ok "an OpenCode job naming an account is refused: OpenCode has none" || bad "no opencode-account refusal: $(tail -3 "$ROOT/data/tick.log")"
+# check must refuse an OpenCode job's account with the launch gate's own
+# sentence, not the generic "is not an account of" one -- and before it even
+# asks whether the job has a precheck: j50e has none, and every due tick
+# would be refused just the same.
+out50e="$("$AL" check j50e 2>&1)"; rc50e=$?
+[ "$rc50e" -ne 0 ] && [ "$out50e" = "j50e: OpenCode has no accounts (account 'nope')" ] \
+  && ok "agentloop check refuses an OpenCode account with its own sentence, even with no precheck" \
+  || bad "check j50e: rc=$rc50e out='$out50e'"
+jq --arg pc "printf '%s' \"\${CLAUDE_CONFIG_DIR-<unset>}\" > $ROOT/pc-50e; exit 0" '.jobs[0].precheck = $pc' \
+  "$ROOT/config/jobs.json" > "$ROOT/config/jobs.next" && mv "$ROOT/config/jobs.next" "$ROOT/config/jobs.json"
+rm -f "$ROOT/pc-50e"
+out50ep="$("$AL" precheck j50e 2>&1)"; rc50ep=$?
+[ "$rc50ep" -ne 0 ] && [ "$out50ep" = "j50e: OpenCode has no accounts (account 'nope')" ] && [ ! -f "$ROOT/pc-50e" ] \
+  && ok "agentloop precheck refuses it with the same sentence, before running anything" \
+  || bad "precheck j50e: rc=$rc50ep out='$out50ep' pc50e='$(cat "$ROOT/pc-50e" 2>/dev/null)'"
 mkjob j50b
 FAKE_MODE=complete FAKE_SESSION=sess-50b "$AL" run j50b >/dev/null 2>&1
 sleep 1
@@ -1442,6 +1459,37 @@ sleep 2
 [ "$(cat "$acct51" 2>/dev/null)" = "$ROOT/accounts/claude-r1" ] \
   && ok "the resume ran on R1, where sess-51 lives, though the job now names R2" || bad "the resume saw '$(cat "$acct51" 2>/dev/null)'"
 [ "$(lastrun | jq -r .account)" = "r1" ] && ok "and its record names R1 too" || bad "resume record: $(lastrun | jq -c '{account, account_dir}')"
+# A pre-feature record -- no `account` key at all, as from before this
+# feature existed -- grants no exemption: run_job only skips the id gate
+# when it actually read an account off THIS session's own record, so a job
+# naming an id Settings does not have is still refused, exactly like a
+# plain run.
+mkjob_acct j51c ghost
+printf '{"id":"j51c","platform":"anthropic","session":"sess-51c"}\n' >> "$ROOT/data/runs.ndjson"
+"$AL" resume j51c sess-51c >/dev/null 2>&1
+grep -qF "j51c: account 'ghost' is not an account of anthropic in Settings, skipped" "$ROOT/data/tick.log" \
+  && ok "a resume of a record with no account key gets no exemption: an unregistered id is still refused" \
+  || bad "no refusal for the unexempted resume: $(tail -3 "$ROOT/data/tick.log")"
+
+echo
+}
+
+scenario_52() {
+echo "52. one account's spent window holds its own scheduled runs back, not another account's"
+mkdir -p "$ROOT/accounts/claude-rl"
+"$AL" platform account-add anthropic "Limited" "$ROOT/accounts/claude-rl" >/dev/null 2>&1 || bad "account-add failed"
+soon52="$(( $(date +%s) + 3600 ))"
+jq -n --arg k "anthropic@$ROOT/accounts/claude-rl" --argjson r "$soon52" \
+  '{($k): {five_hour: {status:"allowed", utilization:0.97, resets_at:$r, overage:null, seen_at:0}}}' > "$ROOT/data/rate-limits.json"
+mkjob_acct j52 limited
+"$AL" _exec j52 >/dev/null 2>&1
+grep -qF "j52: usage limit reached — the anthropic five_hour window of Limited is 97% used" "$ROOT/data/tick.log" \
+  && ok "a scheduled run on the spent account is held back, and the line names the account" || bad "no hold line: $(tail -3 "$ROOT/data/tick.log")"
+mkjob j52b
+FAKE_MODE=complete FAKE_SESSION=sess-52b "$AL" _exec j52b >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .session)" = "sess-52b" ] && ok "while a scheduled run on the Default account goes ahead" || bad "the Default run was held: $(tail -3 "$ROOT/data/tick.log")"
+rm -f "$ROOT/data/rate-limits.json"
 
 echo
 }
@@ -1467,11 +1515,11 @@ echo
 # scenario goes at the END of the file and into the LAST list, or, if it is
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # and the count assertion below fails if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26"
 E2E_LIST_3="27 28 29 30 31 32 33 33b 34 35 35b 36 37"
-E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51"
+E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to
