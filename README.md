@@ -888,10 +888,12 @@ A probe that gets no verdict at all — *Not logged in*, an API that is down —
 says nothing about the id. The family's search stops there and nothing is
 trusted as fresh: the family keeps the newer of the id its last finished pass
 found and the best this pass reached (never below the CLI's own alias), the
-CLI's answer goes to `tick.log`, and the tick probes the Claude families alone
-again ten minutes later — twenty after a second failure in a row, forty after a
-third, never more than a day apart, and only daily while Settings keeps
-Anthropic off. `resolve-models` exits 1. The tick's line says why a pass runs:
+CLI's answer goes to `tick.log`, and the tick probes again only the families
+whose pass failed — ten minutes later, twenty after a second failure in a row,
+forty after a third, never more than a day apart, and only daily while Settings
+keeps Anthropic off (a launch then spends no probe either: it is refused next).
+`resolve-models` exits 1; `resolve-models anthropic opus` probes one family. The
+tick's line says why a pass runs:
 *cache older than 86400s*, *retrying opus after a failed probe*, or *Claude Code
 went from 2.1.258 to 2.1.280 while a release waited for it*. Run by hand, keep
 `USER` in the environment: without
@@ -2118,7 +2120,7 @@ agentloop worktree-drop <id> <stamp>   # discard a preserved run dir for good
 agentloop security analyze [--detach] <project> <repo> <branch> [profile]
                                #   run an analysis (see Security analysis)
 agentloop security-branches <project> <repo>   # branches that checkout has
-agentloop resolve-models [anthropic|openai|opencode]  # refresh the model catalogs (all three, without an argument)
+agentloop resolve-models [anthropic [family…]|openai|opencode]  # refresh the model catalogs (all three, without an argument; `anthropic opus` probes one family)
 agentloop resolve-pricing    # refresh config/pricing.json's openai rows from the price source (daily on its own); the opencode rows are yours and are left alone
 agentloop platforms          # what each platform offers, whether it is ready, and what Settings switched on
 agentloop platform check|enable|disable|set-bin|models|set-models <platform> [path]

@@ -80,21 +80,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   left alone; `failed_at`, the count in a row and the CLI's answer are
   added). The family keeps the newer of the id its last finished pass found
   and the best this pass reached, so never below the CLI's own alias; the
-  probe and the CLI's words go to `tick.log`; and the tick probes the Claude
-  families alone again ten minutes later (`MODELS_RETRY`), twice as long
-  after each failure in a row, never more than a day apart — and only daily
-  while Settings keeps Anthropic off. The other catalogs and the price table
-  keep their daily pace, and a launch in between runs on the kept id without
+  probe and the CLI's words go to `tick.log`; and the tick probes again only
+  the families whose pass failed, ten minutes later (`MODELS_RETRY`), twice
+  as long after each failure in a row, never more than a day apart — folded
+  into the whole pass when that is due within those ten minutes, and only
+  daily while Settings keeps Anthropic off, when a launch spends no probe
+  either (it is refused next). The other catalogs and the price table keep
+  their daily pace, and a launch in between runs on the kept id without
   probing. The tick's line says why a pass runs (*cache older than 86400s*,
   *retrying opus after a failed probe*, *Claude Code went from 2.1.258 to
   2.1.280 while a release waited for it*). `resolve-models` exits 1 when a
-  family's pass was cut short. The probe reads the CLI's result event,
-  whatever other JSON surrounds it. `test/fake-claude` answers from the
-  real capture, committed as `test/fixtures/claude-probe-not-logged-in.*`.
-  Hand edits no longer wedge the pass: an entry under `.resolved` that is no
-  Claude family used to keep it due every minute, a `.resolved` that is not
-  an object could never be written again, and a family entry that is not an
-  object took `/api/models` down.
+  family's pass was cut short, and `resolve-models anthropic opus` probes
+  one family. The probe reads the CLI's result event, whatever other JSON
+  surrounds it, and keeps what the CLI printed when there is none.
+  `test/fake-claude` answers from the real capture, committed as
+  `test/fixtures/claude-probe-not-logged-in.*`. Hand edits no longer wedge
+  the pass: a stamp written as text reads as 0 (it read as an unreadable
+  file, due on every tick, and a cut pass kept the text, so the whole pass
+  ran every minute), an entry under `.resolved` that is no Claude family
+  used to keep it due every minute, a `.resolved` that is not an object
+  could never be written again, and a family entry that is not an object
+  took `/api/models` down.
 
 - **A family resolves to the newest model the API serves the installed CLI,
   even one that CLI has never heard of.** Two defects sat on the probe's

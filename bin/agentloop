@@ -3844,6 +3844,9 @@ model_probe_ok() { # model_probe_ok <id> -> 0 served, 1 refused, 2 kept for a ne
   # One line for tick.log: -j leaves no newline of its own to turn into a space.
   PROBE_ANSWER="$(printf '%s' "$res" | "$JQ" -j '.result // empty | tostring' 2>/dev/null \
                   | tr '\t\n' '  ' | cut -c1-300)"
+  # No result event at all: what the CLI printed instead, when it printed something.
+  [ -n "$PROBE_ANSWER" ] || [ -n "$res" ] \
+    || PROBE_ANSWER="$(printf '%s' "$out" | tr '\t\n' '  ' | sed 's/  *$//' | cut -c1-300)"
   [ -n "$PROBE_ANSWER" ] || PROBE_ANSWER="no answer from $(platform_cli_name anthropic) (exit $rc)"
   return 3
 }
@@ -3950,11 +3953,17 @@ resolve_family() { # resolve_family <family> -> newest id the API serves this CL
 # finished pass or, after a pass a probe cut short, until its retry --
 # whichever ends later. The retry waits MODELS_RETRY, twice as long after each
 # cut pass in a row, never longer than MODELS_TTL: a session that is gone for
-# a weekend costs a handful of passes, not one every ten minutes.
+# a weekend costs a handful of passes, not one every ten minutes. Every stamp
+# is read as a number or as 0 (`stamp`): one written as text by hand used to
+# make jq fail, which read as an unreadable file -- due on every tick -- and
+# a pass cut short kept the text, so the whole pass ran every minute.
 MODELS_FRESH_JQ='
+  def stamp: if type == "number" then . else 0 end;
+  def cut: (.failed_at | stamp) > 0;
   def retry_at($ttl; $retry):
-    if (.failed_at // 0) > 0 then .failed_at + ([$retry * pow(2; (.failures // 1) - 1), $ttl] | min) else 0 end;
-  def fresh_until($ttl; $retry): [(.at // 0) + $ttl, retry_at($ttl; $retry)] | max;'
+    if cut then .failed_at + ([$retry * pow(2; ([(.failures | if type == "number" then . else 1 end), 1] | max) - 1), $ttl] | min)
+    else 0 end;
+  def fresh_until($ttl; $retry): [(.at | stamp) + $ttl, retry_at($ttl; $retry)] | max;'
 
 models_cache_get() { # models_cache_get <family> -> cached id while fresh (MODELS_FRESH_JQ)
   [ -f "$MODELS_FILE" ] || return 1
@@ -3989,7 +3998,8 @@ models_cache_fail() { # models_cache_fail <family> <best id found> <why> <retry>
     .resolved |= (if type == "object" then . else {} end)
     | .resolved[$f] = ((.resolved[$f] | if type == "object" then . else {} end)
         | .id = ([.id, $id] | map(select(type == "string" and . != "")) | sort_by(newest_first) | .[0] // $id)
-        | .at = (.at // 0) | .failed_at = $now | .failed = $why | .failures = ((.failures // 0) + 1)
+        | .at = (.at | if type == "number" then . else 0 end) | .failed_at = $now | .failed = $why
+        | .failures = ((.failures | if type == "number" then . else 0 end) + 1)
         | if $nid == "" then . else .newer = {id:$nid, needs:$needs, installed:$inst, cli:$cli, at:$now} end)' \
     "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE" || rm -f "$tmp"
   "$JQ" -r --arg f "$1" --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" --argjson retry "$4" "$MODELS_FRESH_JQ"'
@@ -4049,16 +4059,26 @@ effective_model() { # effective_model <model> -> concrete id (families resolved)
     *) echo "$m"; return ;;          # already an explicit id — use it verbatim
   esac
   if hit="$(models_cache_get "$m")"; then echo "$hit"; return; fi
+  # A launch resolves its family before the gate that refuses a run on a
+  # platform Settings keeps off (run_refusals): with Anthropic off, no probe
+  # is spent on a run turned away next -- the id the cache holds, stale or
+  # not, or the family itself.
+  if ! platform_enabled anthropic; then
+    hit="$(family_cached_id "$m")"
+    echo "${hit:-$m}"; return
+  fi
   hit="$(family_refresh "$m")"
   [ -n "$hit" ] || hit="$m"
   echo "$hit"
 }
 
 # Asked by the tick every minute. MODELS_DUE_SCOPE says how much of the pass
-# is due -- "" every platform, "anthropic" the Claude families alone -- and
-# MODELS_DUE_WHY why, for the tick's log line.
+# is due -- "" every platform, "anthropic" the Claude families alone --
+# MODELS_DUE_FAMILIES which families when a retry is for some of them only
+# ("" all four), and MODELS_DUE_WHY why, for the tick's log line
+# (models_refresh_launch hands all three on).
 models_stale() { # 0 = due: a catalog past MODELS_TTL, a cut-short family past its retry, a CLI changed under a waiting release
-  MODELS_DUE_SCOPE="" MODELS_DUE_WHY=""
+  MODELS_DUE_SCOPE="" MODELS_DUE_FAMILIES="" MODELS_DUE_WHY=""
   local due retry="$MODELS_RETRY" on=true waiting cur v
   [ -f "$MODELS_FILE" ] || { MODELS_DUE_WHY="no models.json yet"; return 0; }
   # While Settings keeps Anthropic off, nothing runs on it: a cut family
@@ -4076,22 +4096,31 @@ models_stale() { # 0 = due: a catalog past MODELS_TTL, a cut-short family past i
   # upgrade. It ages from the last ATTEMPT: a failed refresh keeps the
   # catalog and stamps `stale_at` (resolve_models_openai) instead of moving
   # `.at`, so the stamp is what keeps a missing codex from re-running the
-  # whole pass every tick. The opencode block likewise. An unreadable file
-  # answers nothing, which is due: the pass reseeds it.
-  due="$("$JQ" -r --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" --argjson retry "$retry" "$MODELS_FRESH_JQ"'
+  # whole pass every tick. The opencode block likewise. A retry that comes
+  # due less than MODELS_RETRY before the whole pass is folded into it: one
+  # round of probes, not two a minute apart. An unreadable file answers
+  # nothing, which is due: the pass reseeds it.
+  due="$("$JQ" -r --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" --argjson retry "$retry" --argjson soon "$MODELS_RETRY" "$MODELS_FRESH_JQ"'
     ((.resolved | if type == "object" then . else {} end)
      | with_entries(select(.key == "opus" or .key == "sonnet" or .key == "haiku" or .key == "fable"))) as $fam
-    | ([$fam[] | if type == "object" then select(has("failed_at") | not) | (.at // 0) + $ttl else 0 end]
+    | ([$fam[] | if type == "object" then select(cut | not) | (.at | stamp) + $ttl else 0 end]
        + (if ($fam | length) == 0 then [0] else [] end)
-       + [([.openai.at // 0, .openai.stale_at // 0] | max) + $ttl, ([.opencode.at // 0, .opencode.stale_at // 0] | max) + $ttl]) as $whole
-    | [$fam | to_entries[] | select(.value | type == "object" and has("failed_at"))
+       + [([(.openai | objects | .at | stamp) // 0, (.openai | objects | .stale_at | stamp) // 0] | max) + $ttl,
+          ([(.opencode | objects | .at | stamp) // 0, (.opencode | objects | .stale_at | stamp) // 0] | max) + $ttl]) as $whole
+    | [$fam | to_entries[] | select(.value | type == "object" and cut)
        | select((.value | fresh_until($ttl; $retry)) <= $now) | .key] as $retrying
     | if ($whole | min) <= $now then "all"
-      elif ($retrying | length) > 0 then "anthropic|" + ($retrying | join(" "))
+      elif ($retrying | length) > 0 then
+        (if ($whole | min) - $now <= $soon then "fold|" else "anthropic|" end) + ($retrying | join(" "))
       else "fresh" end' "$MODELS_FILE" 2>/dev/null)"
   if [ "$due" = "all" ]; then MODELS_DUE_WHY="cache older than ${MODELS_TTL}s"; return 0; fi
+  if [ "${due#fold|}" != "$due" ]; then
+    MODELS_DUE_WHY="retrying ${due#fold|} after a failed probe, the rest of the cache due within $(models_wait_text "$MODELS_RETRY")"
+    return 0
+  fi
   if [ "${due#anthropic|}" != "$due" ]; then
-    MODELS_DUE_SCOPE="anthropic"; MODELS_DUE_WHY="retrying ${due#anthropic|} after a failed probe"; return 0
+    MODELS_DUE_SCOPE="anthropic"; MODELS_DUE_FAMILIES="${due#anthropic|}"
+    MODELS_DUE_WHY="retrying $MODELS_DUE_FAMILIES after a failed probe"; return 0
   fi
   if [ "$due" != "fresh" ]; then MODELS_DUE_WHY="models.json could not be read"; return 0; fi
   # A release that waits for `claude update` is probed again as soon as the
@@ -4118,6 +4147,17 @@ models_stale() { # 0 = due: a catalog past MODELS_TTL, a cut-short family past i
     fi
   done
   return 1
+}
+
+# The detached pass the tick starts when models_stale says one is due: the
+# whole pass, or the Claude families alone -- every one of them, or only
+# those a retry is due for. Its own function so the selftest can hold the
+# hand-off: without the scope, every retry was a whole pass again.
+models_refresh_launch() { # models_refresh_launch -- reads MODELS_DUE_SCOPE, MODELS_DUE_FAMILIES and MODELS_DUE_WHY
+  # The families are plain words (opus sonnet haiku fable): split on purpose.
+  nohup /bin/bash "$SELF" _resolve_models ${MODELS_DUE_SCOPE:+"$MODELS_DUE_SCOPE"} ${MODELS_DUE_FAMILIES:-} \
+    </dev/null >> "$DATA_DIR/exec.log" 2>&1 &
+  log_tick "models: refreshing family→id resolutions ($MODELS_DUE_WHY)"
 }
 
 cmd_say() { # cmd_say <id> — message on stdin, delivered to the live run
@@ -4353,18 +4393,29 @@ cmd_precheck() { # <id> — run the job's precheck once and RECORD it, without t
   printf '%s\n(exit %s)\n' "$pc_out" "$pc_rc"
 }
 
-cmd_resolve_models() { # cmd_resolve_models [anthropic|openai|opencode] -- no argument does all three
+cmd_resolve_models() { # cmd_resolve_models [anthropic [family…]|openai|opencode] -- no argument does all three; anthropic alone does all four families
   # `rc` carries resolve_models_openai's status past the validation case below,
   # whose own 0 used to be the function's answer -- so a catalog that could not
   # be written exited 0 and the failure was invisible to the operator and to
   # install.sh. An UNAVAILABLE codex is not a failure: that is a written
   # {available:false} block, and resolve_models_openai already returns 0 for it.
   # A family whose pass a probe cut short makes it exit 1 as well: family_refresh
-  # already kept its id and logged why, and the line says so.
-  local which="${1:-}" fam id rc=0
+  # already kept its id and logged why, and the line says so. Families named
+  # after `anthropic` are the only ones probed -- a retry the tick runs for
+  # the families whose pass failed (models_stale), not the ones that finished.
+  local which="${1:-}" fam id rc=0 fams="opus sonnet haiku fable"
+  if [ "$which" = "anthropic" ] && [ $# -gt 1 ]; then
+    shift; fams=""
+    for fam in "$@"; do
+      case "$fam" in
+        opus|sonnet|haiku|fable) fams="$fams $fam" ;;
+        *) die "resolve-models: unknown family '$fam' (opus, sonnet, haiku or fable)" ;;
+      esac
+    done
+  fi
   case "$which" in
     ""|anthropic)
-      for fam in opus sonnet haiku fable; do
+      for fam in $fams; do
         family_refresh "$fam" >/dev/null || rc=1
         id="$FR_ID"
         [ -n "$id" ] || id="$fam"
@@ -6028,8 +6079,7 @@ cmd_tick() {
   # a CLI updated under a release that waited for it, re-runs the Claude
   # families alone (models_stale says which, and why).
   if models_stale && ! lock_active "_models"; then
-    nohup /bin/bash "$SELF" _resolve_models ${MODELS_DUE_SCOPE:+"$MODELS_DUE_SCOPE"} </dev/null >> "$DATA_DIR/exec.log" 2>&1 &
-    log_tick "models: refreshing family→id resolutions ($MODELS_DUE_WHY)"
+    models_refresh_launch
   fi
   local days hours interval last streak max_par
   # IFS is tick_plan's own separator, never a tab: see the note on TICK_SEP
@@ -7158,9 +7208,10 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop security-branches <project> <repo>
                               list the branches of a project's canonical
                               checkout, local and origin's, for a branch picker
-  agentloop resolve-models [anthropic|openai]
-                              refresh the model catalogues (both, without an
-                              argument)
+  agentloop resolve-models [anthropic [family…]|openai|opencode]
+                              refresh the model catalogues (all three, without
+                              an argument; one Claude family, or several,
+                              after anthropic)
   agentloop resolve-pricing
                               refresh config/pricing.json from the price
                               source (daily on its own)
@@ -7196,11 +7247,12 @@ case "${1:-}" in
   dashboard) cmd_dashboard ;;
   tick)      cmd_tick ;;
   _exec)     [ $# -ge 2 ] || die "usage: agentloop _exec <job-id>"; run_job "$2" ;;  # internal: detached runner
-  _resolve_models)   # internal: detached refresh, guarded by its own lock; `anthropic` is the Claude families alone (models_stale's scope)
+  _resolve_models)   # internal: detached refresh, guarded by its own lock; `anthropic [family…]` is the Claude families alone (models_stale's scope)
     acquire_lock "_models" || exit 0
     trap 'release_lock "_models"' EXIT
     if [ "${2:-}" = "anthropic" ]; then
-      cmd_resolve_models anthropic
+      shift 2
+      cmd_resolve_models anthropic "$@"
     else
       cmd_resolve_models
       resolve_pricing_openai   # not cmd_resolve_pricing: this branch already holds the _models lock
@@ -7253,7 +7305,7 @@ case "${1:-}" in
              esac ;;
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"
                      cmd_security_branches "$2" "$3" ;;
-  resolve-models) cmd_resolve_models "${2:-}" ;;
+  resolve-models) shift; cmd_resolve_models "$@" ;;
   resolve-pricing) cmd_resolve_pricing ;;
   platforms) cmd_platforms ;;
   platform)  shift; cmd_platform "$@" ;;

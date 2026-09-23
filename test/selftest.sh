@@ -2039,6 +2039,12 @@ EOF
   got="$( CLAUDE_BIN="$tmp/claude-mute"; model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_ANSWER-}" )"
   [ "$got" = "3|no answer from claude (exit 1)" ] && ok "a CLI that answers nothing is no verdict, and says so with its exit code" \
     || bad "a mute CLI read as '$got'"
+  # And one that prints something other than a result event: what it printed
+  # is what tick.log gets, not a guess.
+  printf '#!/bin/sh\necho "Segmentation fault: 11"\nexit 139\n' > "$tmp/claude-crash"; chmod +x "$tmp/claude-crash"
+  got="$( CLAUDE_BIN="$tmp/claude-crash"; model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_ANSWER-}" )"
+  [ "$got" = "3|Segmentation fault: 11" ] && ok "a CLI that prints no result event is no verdict, and its own words are kept" \
+    || bad "a CLI with no result event read as '$got'"
 
   echo "family_refresh() — a pass written down: a newer CLI's release noted and cleared, a pass cut short never fresh"
   # The recorder around resolve_family, for the tick's pass (cmd_resolve_models)
@@ -2188,6 +2194,8 @@ EOF
     mf() { "$JQ" -n --argjson now "$now" --argjson ttl "$MODELS_TTL" "{resolved:($1), openai:{at:\$now, models:[]}, opencode:{at:\$now, models:[]}}" > "$MODELS_FILE"; }
     due() { models_stale; echo "$?|${MODELS_DUE_SCOPE-unset}|${MODELS_DUE_WHY-unset}"; }
     retrying="retrying opus after a failed probe"
+    # A CLI that writes down every call it gets, and answers only --version.
+    printf '#!/bin/sh\necho "$*" >> "%s"\necho "2.1.280 (Claude Code)"\n' "$tmp/ms/asked.log" > "$tmp/ms/claude-v"; chmod +x "$tmp/ms/claude-v"
 
     mf '{opus:{id:"claude-opus-5-5", at:$now}}'
     [ "$(due)" = "1||" ] && ok "models_stale: not due while every block is fresh" || bad "all fresh: $(due)"
@@ -2210,12 +2218,34 @@ EOF
     [ "$(due)" = "0|anthropic|$retrying" ] && ok "models_stale: and never past it" || bad "thirty failures, over a day: $(due)"
     mf '{opus:{id:"claude-opus-5-5", at:($now - 60), failed_at:($now - 700), failures:1}}'
     [ "$(due)" = "1||" ] && ok "models_stale: a cut pass over a family still fresh waits for its MODELS_TTL" || bad "cut over a fresh family: $(due)"
+    # The retry names the families it is for: one that failed, not the three
+    # whose passes finished.
+    mf "{opus:{id:\"claude-opus-5-5\", at:1, failed_at:(\$now - $MODELS_RETRY - 1), failures:1}, sonnet:{id:\"claude-sonnet-5\", at:1, failed_at:\$now, failures:1}}"
+    [ "$(models_stale; echo "${MODELS_DUE_FAMILIES-unset}")" = "opus" ] && ok "models_stale: a retry is for the families it is due for, and only those" \
+      || bad "families of a retry: [$(models_stale; echo "${MODELS_DUE_FAMILIES-unset}")]"
+    # A retry due minutes before the whole pass is folded into it: one round
+    # of probes, not two a minute apart.
+    "$JQ" -n --argjson now "$now" --argjson ttl "$MODELS_TTL" --argjson r "$MODELS_RETRY" \
+      '{resolved:{opus:{id:"claude-opus-5-5", at:1, failed_at:($now - $r - 1), failures:1}}, openai:{at:($now - $ttl + 300), models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    [ "$(due)" = "0||$retrying, the rest of the cache due within 10 min" ] && ok "models_stale: a retry due just before the whole pass is folded into it" \
+      || bad "retry just before the whole pass: $(due)"
+    "$JQ" -n --argjson now "$now" --argjson ttl "$MODELS_TTL" --argjson r "$MODELS_RETRY" \
+      '{resolved:{opus:{id:"claude-opus-5-5", at:1, failed_at:($now - $r - 1), failures:1}}, openai:{at:($now - $ttl + 3 * $r), models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    [ "$(due)" = "0|anthropic|$retrying" ] && ok "models_stale: and one due further ahead of it is not" || bad "retry well before the whole pass: $(due)"
 
     printf '{"platforms":{"anthropic":{"enabled":false,"bin":"","models":["opus"]}}}\n' > "$PLATFORMS_FILE"
     mf "{opus:{id:\"claude-opus-5-5\", at:1, failed_at:(\$now - $MODELS_RETRY - 1), failures:1}}"
     [ "$(due)" = "1||" ] && ok "models_stale: with Anthropic off in Settings, a cut family waits a whole MODELS_TTL" || bad "Anthropic off, one retry later: $(due)"
     mf '{opus:{id:"claude-opus-5-5", at:1, failed_at:($now - $ttl - 1), failures:1}}'
     [ "$(due)" = "0|anthropic|$retrying" ] && ok "models_stale: and is due after it" || bad "Anthropic off, a day later: $(due)"
+    # A launch goes through effective_model before the gate that refuses it:
+    # with Anthropic off, no probe -- not even the alias -- is spent on a run
+    # Settings will turn away next.
+    : > "$tmp/ms/asked.log"
+    got="$( CLAUDE_BIN="$tmp/ms/claude-v"; effective_model opus )"
+    [ "$got" = "claude-opus-5-5" ] && [ ! -s "$tmp/ms/asked.log" ] \
+      && ok "effective_model: with Anthropic off a launch runs no probe, and names the id the cache holds" \
+      || bad "effective_model with Anthropic off: [$got], the CLI got: $(cat "$tmp/ms/asked.log")"
     mf '{opus:{id:"claude-opus-5", at:$now, newer:{id:"claude-opus-5-5", needs:"2.1.280", installed:"2.1.258", cli:"2.1.258", at:$now}}}'
     [ "$( FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due )" = "1||" ] \
       && ok "models_stale: and a changed CLI brings nothing back while Anthropic is off" || bad "Anthropic off, CLI changed: $(FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due)"
@@ -2225,6 +2255,9 @@ EOF
     [ "$( FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due )" = "0|anthropic|Claude Code went from 2.1.258 to 2.1.280 while a release waited for it" ] \
       && ok "models_stale: a changed CLI is due at once, for the Claude families, and the reason names both versions" \
       || bad "CLI changed: $(FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due)"
+    [ "$( FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; models_stale; echo "[${MODELS_DUE_FAMILIES-unset}]" )" = "[]" ] \
+      && ok "models_stale: and for every family, not only the one the release belongs to" \
+      || bad "families of a changed CLI: $(FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; models_stale; echo "[${MODELS_DUE_FAMILIES-unset}]")"
     mf '{opus:{id:"claude-opus-5", at:$now, newer:{id:"claude-opus-5-5", needs:"2.1.280", installed:"9.9.9", cli:"2.1.258", at:$now}}}'
     [ "$(due)" = "1||" ] && ok "models_stale: the CLI is compared with what --version said, never with the text of the 400" || bad "400 text unlike --version: $(due)"
     mf '{opus:{id:"claude-opus-5", at:$now, newer:{id:"claude-opus-5-5", needs:"2.1.280", installed:"2.1.258", cli:"", at:$now}}}'
@@ -2236,7 +2269,6 @@ EOF
       || bad "changed CLI inside a retry: $(FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION; due)"
 
     # The CLI is asked its version only while a release waits for it.
-    printf '#!/bin/sh\necho "$*" >> "%s"\necho "2.1.280 (Claude Code)"\n' "$tmp/ms/asked.log" > "$tmp/ms/claude-v"; chmod +x "$tmp/ms/claude-v"
     : > "$tmp/ms/asked.log"
     mf '{opus:{id:"claude-opus-5-5", at:$now}}'
     [ "$( CLAUDE_BIN="$tmp/ms/claude-v"; due )" = "1||" ] && [ ! -s "$tmp/ms/asked.log" ] \
@@ -2255,24 +2287,60 @@ EOF
     [ "$(due)" = "0||models.json could not be read" ] && ok "models_stale: an unreadable file is due, and says so" || bad "unreadable: $(due)"
     rm -f "$MODELS_FILE"
     [ "$(due)" = "0||no models.json yet" ] && ok "models_stale: so is a missing one" || bad "missing: $(due)"
+    # A number written as text reads as 0: the cache is due, never taken for
+    # an unreadable file -- that answer came back on every tick, a pass cut
+    # short kept the text, and the whole pass ran every minute.
+    mf '{opus:{id:"claude-opus-5-5", at:"yesterday", failed_at:"now", failures:"3"}}'
+    [ "$(due)" = "0||cache older than ${MODELS_TTL}s" ] && ok "models_stale: a number written as text reads as 0, never as an unreadable file" \
+      || bad "numbers as text: $(due)"
+    models_cache_fail opus claude-opus-5-5 x "$MODELS_RETRY" >/dev/null
+    "$JQ" -e '.resolved.opus | .at == 0 and .failures == 1 and (.failed_at | type) == "number"' "$MODELS_FILE" >/dev/null 2>&1 && [ "$(due)" = "1||" ] \
+      && ok "models_cache_fail: writes them back as numbers, and the retry holds" || bad "after a cut pass over text: $(cat "$MODELS_FILE"); $(due)"
+    mf "{opus:{id:\"claude-opus-5-5\", at:\"yesterday\", failed_at:(\$now - $MODELS_RETRY - 1), failures:\"3\"}}"
+    [ "$(due)" = "0|anthropic|$retrying" ] && ok "models_stale: a cut family with its other stamps as text is retried, never taken for an unreadable file" \
+      || bad "cut family, stamps as text: $(due)"
+    "$JQ" -n --argjson now "$now" '{resolved:{opus:{id:"x", at:$now}}, openai:{at:"x", models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    [ "$(due)" = "0||cache older than ${MODELS_TTL}s" ] && ok "models_stale: so does an openai stamp written as text" || bad "openai stamp as text: $(due)"
 
-    # The scope the tick hands the detached pass: the Claude families alone,
-    # no other catalog and no price table. Run as the tick runs it, over a
-    # scratch install whose codex stand-in would write an openai catalog.
+    # The launch the tick makes: the scope and the families reach the detached
+    # pass as its arguments, and tick.log says why it runs.
+    printf '#!/bin/sh\necho "$*" > "%s"\n' "$tmp/ms/launched" > "$tmp/ms/self"; chmod +x "$tmp/ms/self"
+    : > "$tmp/ms/tick.log"
+    ( SELF="$tmp/ms/self"; DATA_DIR="$tmp/ms/sc/data"; TICK_LOG="$tmp/ms/tick.log"
+      MODELS_DUE_SCOPE="anthropic"; MODELS_DUE_FAMILIES="opus sonnet"; MODELS_DUE_WHY="retrying opus sonnet after a failed probe"
+      models_refresh_launch ) >/dev/null 2>&1
+    i=0; while [ ! -s "$tmp/ms/launched" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    [ "$(cat "$tmp/ms/launched" 2>/dev/null)" = "_resolve_models anthropic opus sonnet" ] \
+      && grep -qF 'models: refreshing family→id resolutions (retrying opus sonnet after a failed probe)' "$tmp/ms/tick.log" \
+      && ok "models_refresh_launch: the scope and the families reach the detached pass, and tick.log says why" \
+      || bad "launched [$(cat "$tmp/ms/launched" 2>/dev/null)], tick.log: $(cat "$tmp/ms/tick.log")"
+    rm -f "$tmp/ms/launched"
+    ( SELF="$tmp/ms/self"; DATA_DIR="$tmp/ms/sc/data"; TICK_LOG="$tmp/ms/tick.log"
+      MODELS_DUE_SCOPE=""; MODELS_DUE_FAMILIES=""; MODELS_DUE_WHY="cache older than ${MODELS_TTL}s"
+      models_refresh_launch ) >/dev/null 2>&1
+    i=0; while [ ! -s "$tmp/ms/launched" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    [ "$(cat "$tmp/ms/launched" 2>/dev/null)" = "_resolve_models" ] && ok "models_refresh_launch: the whole pass takes no argument" \
+      || bad "launched [$(cat "$tmp/ms/launched" 2>/dev/null)]"
+
+    # And the pass itself, run as the tick runs it over a scratch install
+    # whose codex stand-in would write an openai catalog and whose price
+    # source is the real fixture: the families it was handed, and nothing else.
     AGENTLOOP_CONFIG="$tmp/ms/sc/config" AGENTLOOP_DATA="$tmp/ms/sc/data" AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" \
       AGENTLOOP_CODEX_BIN="$BASE_DIR/test/fake-codex" AGENTLOOP_OPENCODE_BIN=/nonexistent/opencode AGENTLOOP_CLAUDE_CONFIG_DIR="" \
-      AGENTLOOP_PRICING_URL="file://$tmp/ms/sc/no-such-prices.json" CODEX_HOME="$tmp/ms/sc/codex-home" \
-      FAKE_ALIASES="opus=claude-opus-5-5" FAKE_CLI_MODELS="claude-opus-5-5" FAKE_API_MODELS="claude-opus-5-5" \
-      /bin/bash "$BIN_DIR/agentloop" _resolve_models anthropic >/dev/null 2>&1
-    "$JQ" -e '.resolved.opus.id == "claude-opus-5-5" and (has("openai") | not) and (has("opencode") | not)' "$tmp/ms/sc/config/models.json" >/dev/null 2>&1 \
-      && [ ! -e "$tmp/ms/sc/config/pricing.json" ] \
-      && ok "_resolve_models anthropic: the Claude families alone -- no other catalog, no price table" \
-      || bad "_resolve_models anthropic wrote: $(cat "$tmp/ms/sc/config/models.json" 2>/dev/null); pricing: $(ls "$tmp/ms/sc/config")"
+      AGENTLOOP_PRICING_URL="file://$BASE_DIR/test/fixtures/pricing/litellm-sample.json" CODEX_HOME="$tmp/ms/sc/codex-home" \
+      FAKE_ALIASES="opus=claude-opus-5-5 sonnet=claude-sonnet-5" FAKE_CLI_MODELS="claude-opus-5-5" FAKE_API_MODELS="claude-opus-5-5" \
+      /bin/bash "$BIN_DIR/agentloop" _resolve_models anthropic opus >/dev/null 2>&1
+    "$JQ" -e '(.resolved | keys) == ["opus"] and .resolved.opus.id == "claude-opus-5-5" and (has("openai") | not) and (has("opencode") | not)' \
+      "$tmp/ms/sc/config/models.json" >/dev/null 2>&1 && [ ! -e "$tmp/ms/sc/config/pricing.json" ] \
+      && ok "_resolve_models anthropic opus: that family alone -- no other family, no other catalog, no price table" \
+      || bad "_resolve_models anthropic opus wrote: $(cat "$tmp/ms/sc/config/models.json" 2>/dev/null); config: $(ls "$tmp/ms/sc/config")"
+    ( cmd_resolve_models anthropic gpt ) >/dev/null 2>&1
+    want "resolve-models anthropic refuses a family it does not know" 1 $?
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_msout" | grep -v '^RESULT '
-  printf '%s\n' "$_msout" | grep -qx 'RESULT ok=25 bad=0' \
-    && ok "models_stale over scratch caches: all 25 assertions reach the gate" \
+  printf '%s\n' "$_msout" | grep -qx 'RESULT ok=37 bad=0' \
+    && ok "models_stale over scratch caches: all 37 assertions reach the gate" \
     || bad "models_stale over scratch caches did not: $(printf '%s\n' "$_msout" | tail -1)"
 
   echo "bind_session() — one shot, atomic, and a no-op without a run dir"
