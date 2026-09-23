@@ -36,10 +36,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   project's on the same terms, and `set-field`, `create` and `project-set`
   refuse an account the platform does not have — a platform change clears
   one it leaves behind, and says so. `install` turns a `claude_config_dir`
-  still in `projects.json` into an account. Saving a project drops a
-  leftover `claude_config_dir` too, and a job whose effective platform
-  changes by any route — not only `set-field platform` — loses an account
-  that platform does not have.
+  still in `projects.json` into an account, and saving the project now runs
+  the same conversion first — the field can no longer be lost between
+  updating the code and running install — dropping only what neither can
+  place (a platform that is not Anthropic, or a directory that is gone). A
+  job whose effective platform changes by any route — `set-field platform`,
+  `set-field project`, a project's own platform change, or the project
+  being deleted — loses an account that platform does not have.
 
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate

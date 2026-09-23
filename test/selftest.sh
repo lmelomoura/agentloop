@@ -1139,7 +1139,7 @@ JSON
 
   echo "claude_config_dir — install turns what is left of it into accounts"
   local ccd="$tmp/ccd" _mig
-  mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/home/.claude" "$ccd/home/old-elsewhere" "$ccd/old-acct" "$ccd/orphan-p" "$ccd/orphan-s"
+  mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/home/.claude" "$ccd/home/old-elsewhere" "$ccd/old-acct" "$ccd/orphan-p" "$ccd/orphan-s" "$ccd/old-acct2"
   cat > "$ccd/cfg/projects.json" <<JSON
 {"projects":[{"name":"Old1","cwd":"$ccd","claude_config_dir":"$ccd/old-acct/"},
              {"name":"Old2","cwd":"$ccd","security":{"enabled":false,"claude_config_dir":"$ccd/old-acct"}},
@@ -1197,6 +1197,21 @@ JSON
       = '{"p":"openai","c":false,"sc":false,"se":false}' ] \
     && ok "and the field is gone at both levels, the rest of the project kept" \
     || bad "Old4 after project-set: $("$JQ" -c '.projects[] | select(.name=="Old4")' "$ccd/cfg/projects.json")"
+  # Old8 is added only NOW, after both explicit accounts_migrate_legacy calls
+  # above -- nothing has touched it yet, so only cmd_project_set's OWN
+  # internal call (not a prior migration pass) can be what converts it.
+  "$JQ" --arg c "$ccd" --arg d "$ccd/old-acct2" '.projects += [{"name":"Old8","cwd":$c,"claude_config_dir":$d}]' \
+      "$ccd/cfg/projects.json" > "$ccd/cfg/projects.json.next" && mv "$ccd/cfg/projects.json.next" "$ccd/cfg/projects.json"
+  out="$( ( ccd_env; printf '{"name":"Old8","description":"x"}' | cmd_project_set ) 2>&1 )"; rc=$?
+  case "$out" in
+    *"registered the Claude account 'old-acct2' ($ccd/old-acct2) from projects.json"*"claude_config_dir on Old8 (project) is now the account 'old-acct2'"*)
+      [ "$rc" -eq 0 ] && ok "a save converts a leftover claude_config_dir exactly as install would, before anything else it does" || bad "project-set Old8: rc=$rc $out" ;;
+    *) bad "project-set Old8: rc=$rc $out" ;;
+  esac
+  [ "$("$JQ" -c '.projects[] | select(.name=="Old8") | {a: .account, c: has("claude_config_dir"), d: .description}' "$ccd/cfg/projects.json")" \
+      = '{"a":"old-acct2","c":false,"d":"x"}' ] \
+    && ok "and the project ends with the account, no claude_config_dir, and the rest of the save still applied" \
+    || bad "Old8 after project-set: $("$JQ" -c '.projects[] | select(.name=="Old8")' "$ccd/cfg/projects.json")"
 
   echo "job_account() — its own, else its project's on the same platform, else the Default"
   local ja="$tmp/jacct"; mkdir -p "$ja/a" "$ja/b" "$ja/c" "$ja/prechecks"
@@ -1212,7 +1227,9 @@ JSON
              {"name":"PX","account":"a","security":{"enabled":true,"platform":"openai","model":"gpt-5.6-sol"}},
              {"name":"PZ","account":"a","security":{"enabled":true,"model":"claude-opus-5","account":"zz"}},
              {"name":"PB","account":"a","security":{"enabled":true,"model":"claude-opus-5","account":"b"}},
-             {"name":"PD","account":"a","security":{"enabled":true,"model":"claude-opus-5","account":"default"}}]}
+             {"name":"PD","account":"a","security":{"enabled":true,"model":"claude-opus-5","account":"default"}},
+             {"name":"PC","security":{"enabled":true,"model":"claude-opus-5","account":"b,a"}},
+             {"name":"PDel","platform":"openai"}]}
 JSON
   cat > "$ja/jobs.json" <<'JSON'
 {"jobs":[{"id":"own","project":"PA","account":"b","prompt":"x"},
@@ -1222,11 +1239,12 @@ JSON
          {"id":"none","project":"PN","prompt":"x"},
          {"id":"loose","prompt":"x"},
          {"id":"codex-inherits","project":"PO","prompt":"x"},
-         {"id":"reproject","project":"PA","account":"b","prompt":"x"}]}
+         {"id":"reproject","project":"PA","account":"b","prompt":"x"},
+         {"id":"deljob","project":"PDel","account":"c","prompt":"x"}]}
 JSON
   printf '{"resolved":{},"openai":{"at":1,"source":"fixture","models":[{"slug":"gpt-5.6-sol","visibility":"list","priority":1,"efforts":["low"],"default_effort":"low","deprecated_by":"","retires_at":""}]}}\n' > "$ja/models.json"
   ja_env() { PLATFORMS_FILE="$ja/platforms.json"; PROJECTS_FILE="$ja/projects.json"; JOBS_FILE="$ja/jobs.json"
-             MODELS_FILE="$ja/models.json"; CONFIG_DIR="$ja"; HOME="$ja"; PLIST_PATH=/nonexistent; AGENTLOOP_CLAUDE_CONFIG_DIR=""; }
+             MODELS_FILE="$ja/models.json"; CONFIG_DIR="$ja"; DATA_DIR="$ja/data"; HOME="$ja"; PLIST_PATH=/nonexistent; AGENTLOOP_CLAUDE_CONFIG_DIR=""; }
   got="$( ja_env; for j in own inherits explicit-same other-platform none loose codex-inherits; do printf '%s=%s ' "$j" "$(job_account "$j")"; done )"
   [ "$got" = "own=b inherits=a explicit-same=a other-platform=default none=default loose=default codex-inherits=c " ] \
     && ok "job_account: its own; the project's on the same platform, whether or not the job names it; else default" || bad "job_account: $got"
@@ -1253,6 +1271,16 @@ JSON
     && ok "a block's own account reaches the derived job even though its project has a different one" || bad "derived PB: $( ja_env; job_get "$(security_job_id PB)" '.account' '' )"
   [ "$( ja_env; job_get "$(security_job_id PD)" '.account' '' )" = "default" ] \
     && ok "and a block naming default is still WRITTEN on the derived job, not left absent to re-inherit the project's" || bad "derived PD: $( ja_env; job_get "$(security_job_id PD)" '.account' '' )"
+  # PC's block names 'b,a' -- a value no real account id can be, but one a
+  # hand edit of projects.json can still write. The row this reads used to be
+  # comma-joined: read back, a value that itself carries a comma shifts every
+  # field after it, and here it can land on 'b' -- a REAL, registered
+  # account -- so the bad value would pass account_known silently and the
+  # analysis would run on 'b' with no warning.
+  [ "$( ja_env; job_get "$(security_job_id PC)" '.account' '' 2>/dev/null )" = "default" ] \
+    && ok "a block account with a comma in it is rejected whole, not split into a real one" || bad "derived PC: $( ja_env; job_get "$(security_job_id PC)" '.account' '' 2>&1 )"
+  grep -q "security: project 'PC' names an account anthropic does not have ('b,a') -- using the Default account" "$ja/data/security/derivation-warnings.txt" 2>/dev/null \
+    && ok "and the derivation warning is issued for it, same as any other unknown account" || bad "no warning for PC: $(cat "$ja/data/security/derivation-warnings.txt" 2>/dev/null)"
 
   echo "set-field, create and project-set — the account is one of the level's own platform"
   out="$( (ja_env; printf 'b' | cmd_set_field inherits account) 2>&1 )"; rc=$?
@@ -1303,6 +1331,45 @@ JSON
   out="$( (ja_env; printf '{"name":"PO","security":{"account":"c"}}' | cmd_project_set) 2>&1 )"; rc=$?
   [ "$rc" -eq 0 ] && [ "$( ja_env; security_get PO '.account' '' )" = "c" ] \
     && ok "a block that inherits the project's openai takes an openai account" || bad "PO block: rc=$rc $out"
+
+  echo "cmd_project_delete() — a deleted project's jobs stop inheriting its platform too"
+  out="$( ( ja_env; cmd_project_delete PDel ) 2>&1 )"; rc=$?
+  case "$out" in *"job deljob: account 'c' is not an account of anthropic — cleared, the job inherits"*)
+      [ "$rc" -eq 0 ] && [ -z "$( ja_env; job_get deljob '.account' '' )" ] \
+        && ok "a deleted project's job falls back to anthropic and loses an account that platform does not have" \
+        || bad "deljob after delete: rc=$rc $out" ;;
+    *) bad "project-delete: rc=$rc $out" ;;
+  esac
+
+  echo "project-set, set-field project and set-field platform — a platforms.json that cannot be read clears no account"
+  local pv="$tmp/pv"; mkdir -p "$pv"
+  printf 'not json\n' > "$pv/platforms.json"
+  cat > "$pv/projects.json" <<'JSON'
+{"projects":[{"name":"BadP","account":"ghost","security":{"enabled":false,"account":"ghost2"}}]}
+JSON
+  cat > "$pv/jobs.json" <<'JSON'
+{"jobs":[{"id":"badjob","project":"BadP","account":"ghost3","prompt":"x"}]}
+JSON
+  pv_env() { PLATFORMS_FILE="$pv/platforms.json"; PROJECTS_FILE="$pv/projects.json"; JOBS_FILE="$pv/jobs.json"
+             CONFIG_DIR="$pv"; DATA_DIR="$pv/data"; HOME="$pv"; PLIST_PATH=/nonexistent; AGENTLOOP_CLAUDE_CONFIG_DIR=""; }
+  out="$( (pv_env; printf '{"name":"BadP","description":"kept"}' | cmd_project_set) 2>&1 )"; rc=$?
+  case "$out" in *"is not an account of"*) bad "project-set spoke about an account with a broken platforms.json: $out" ;;
+    *) [ "$rc" -eq 0 ] && [ "$("$JQ" -c '.projects[0] | {a: .account, sa: .security.account, d: .description}' "$pv/projects.json")" = '{"a":"ghost","sa":"ghost2","d":"kept"}' ] \
+         && ok "an unreadable platforms.json clears no stored account on project-set, and says nothing about it" \
+         || bad "project-set over broken platforms.json: rc=$rc out=$out state=$("$JQ" -c '.projects[0]' "$pv/projects.json")" ;;
+  esac
+  out="$( (pv_env; printf 'x' | cmd_set_field badjob project) 2>&1 )"; rc=$?
+  case "$out" in *"is not an account of"*) bad "set-field project spoke about an account with a broken platforms.json: $out" ;;
+    *) [ "$rc" -eq 0 ] && [ "$("$JQ" -r '.jobs[0].account' "$pv/jobs.json")" = "ghost3" ] \
+         && ok "and re-projecting a job over the same broken file leaves its own account alone too" \
+         || bad "set-field project over broken platforms.json: rc=$rc out=$out state=$("$JQ" -c '.jobs[0]' "$pv/jobs.json")" ;;
+  esac
+  out="$( (pv_env; printf '' | cmd_set_field badjob platform) 2>&1 )"; rc=$?
+  case "$out" in *"is not an account of"*) bad "set-field platform (empty) spoke about an account with a broken platforms.json: $out" ;;
+    *) [ "$rc" -eq 0 ] && [ "$("$JQ" -r '.jobs[0].account' "$pv/jobs.json")" = "ghost3" ] \
+         && ok "clearing a job's own platform to inherit, over the same broken file, leaves its account alone too" \
+         || bad "set-field platform (empty) over broken platforms.json: rc=$rc out=$out state=$("$JQ" -c '.jobs[0]' "$pv/jobs.json")" ;;
+  esac
 
   echo "resolve_pricing_openai() — the price table refreshes itself from the source, never inventing a number"
   local _prout

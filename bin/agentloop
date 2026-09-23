@@ -506,25 +506,34 @@ security_derived_jobs() {
     # platform does not have falls back to the Default, with the warning the
     # other fallbacks give.
     #
-    # One jq reads all three fields this needs (the block's own account, the
-    # project's platform, the project's own account) -- this runs once per
+    # One jq reads all three fields this needs (the block own account, the
+    # project platform, the project own account) -- this runs once per
     # security-enabled project on every jobs_json call, and used to fork a jq
     # per field, up to three of them, through security_get/project_get.
     # $PROJECTS_FILE is read directly, not through projects_json: the gate
-    # above already proved it exists and parses. Joined on a comma, not a
-    # tab: sacct is empty on most projects (no block of its own sets one),
-    # and bash 3.2's `read` -- with IFS holding only ONE separator, tab or
-    # not -- still drops a field that is empty AND adjacent to another
-    # separator, so a real field like pacct can land in sacct instead. A
-    # comma does not have that failure mode (an account id is
-    # account_slug's own alphabet, a platform one of three fixed words --
-    # neither can ever contain one).
+    # above already proved it exists and parses.
+    #
+    # Joined on U+001F (the ASCII Unit Separator), not a comma. Collapsing a
+    # field that is empty and adjacent to another separator is POSIX
+    # behaviour of IFS whitespace (space, tab, newline) in every shell, not a
+    # bash 3.2 quirk -- sacct is empty on most projects (no block of its own
+    # sets one), so with a whitespace separator a real field such as pacct
+    # could land in sacct instead. A comma avoids that particular failure,
+    # since an account id never leaves the alphabet account_slug builds it
+    # from and a platform is one of three fixed words -- neither should ever
+    # carry one. But a hand edit of projects.json can put anything in a
+    # value, including a comma, and that shifts every field after it right
+    # back into the same misreading (a block account of "b,a" read as the
+    # real, registered account "b", silently, no warning). U+001F is not
+    # IFS whitespace and is not a character any value here can hold, typed
+    # by account_slug or by hand, so the read lines up no matter what the
+    # file contains.
     local sacct pplat pacct row
     row="$("$JQ" -r --arg n "$project" '
         (.projects[] | select(.name == $n)) as $p
         | (($p.security | objects) // {}) as $s
-        | [ ($s.account // ""), ($p.platform // ""), ($p.account // "") ] | join(",")' "$PROJECTS_FILE" 2>/dev/null)"
-    IFS=',' read -r sacct pplat pacct <<EOF
+        | [ ($s.account // ""), ($p.platform // ""), ($p.account // "") ] | join("\u001f")' "$PROJECTS_FILE" 2>/dev/null)"
+    IFS="$(printf '\037')" read -r sacct pplat pacct <<EOF
 $row
 EOF
     case "$pplat" in ''|null) pplat="anthropic" ;; esac
@@ -7511,9 +7520,14 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
         echo "permission_mode '$cur' is not a $eff mode — rewritten to $dm"
       fi
       # The account is one of a platform's too: an own account the new
-      # platform does not have is cleared, and the job inherits.
+      # platform does not have is cleared, and the job inherits. Guarded by
+      # platforms_valid for the same reason the project) arm below is: an
+      # explicit anthropic/openai/opencode value already died above at
+      # platform_usable when platforms.json cannot be read, but the empty
+      # (inherit) case reaches here regardless, and account_known would
+      # then refuse every id.
       cur="$(job_get "$id" '.account' '')"
-      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! account_known "$eff" "$cur"; then
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && platforms_valid && ! account_known "$eff" "$cur"; then
         write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
         echo "account '$cur' is not an account of $eff — cleared, the job inherits"
       fi ;;
@@ -7542,13 +7556,20 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
       # A job with no platform of its own inherits its project's (job_platform)
       # -- so moving it to another project can change what it effectively
       # runs on, exactly like the `platform)` arm's own move does, and an own
-      # account only the OLD platform had is left stranded the same way.
+      # account only the OLD platform had is left stranded the same way. Read
+      # the account FIRST: job_platform re-derives the security jobs (see
+      # job_get), and most jobs carry no account of their own, so this only
+      # pays for that when there is one to check. platforms_valid guards the
+      # actual clearing, same reason as the platform) arm above: a
+      # platforms.json this cannot read makes account_known refuse every id.
       local eff cur
-      eff="$(job_platform "$id")"
       cur="$(job_get "$id" '.account' '')"
-      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! account_known "$eff" "$cur"; then
-        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
-        echo "account '$cur' is not an account of $eff — cleared, the job inherits"
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && platforms_valid; then
+        eff="$(job_platform "$id")"
+        if ! account_known "$eff" "$cur"; then
+          write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+          echo "account '$cur' is not an account of $eff — cleared, the job inherits"
+        fi
       fi ;;
     permission_mode)
       local p
@@ -7755,6 +7776,14 @@ cmd_create() { # reads a partial job object (JSON) from stdin
 
 cmd_project_set() { # reads a partial project object (JSON) from stdin; merges by name
   local partial name plat
+  # A leftover claude_config_dir this file still carries (from before the
+  # account lived in Settings) is converted to a real account first, exactly
+  # as install does -- an operator who saves a project between updating the
+  # code and running install must not lose it to the drop below. Only a
+  # level the migration itself leaves in place (a platform that is not
+  # Anthropic, or a directory that no longer exists) still reaches that
+  # drop. Its own output lines are project-set's output too.
+  accounts_migrate_legacy
   partial="$(cat)"
   echo "$partial" | "$JQ" -e 'type == "object"' >/dev/null 2>&1 || die "project-set: stdin must be a JSON object"
   name="$(echo "$partial" | "$JQ" -r '.name // ""')"
@@ -7809,18 +7838,22 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
     if echo "$partial" | "$JQ" -e 'has("account")' >/dev/null 2>&1; then
       die "project-set: account '$ma' is not an account of $mp — $mp has: $(account_ids_line "$mp")"
     fi
-    drop="$drop project"
+    # A platforms.json this cannot read makes account_known refuse every id --
+    # not a real platform change, so a value only STORED is left exactly as
+    # it was rather than cleared on a false alarm.
+    platforms_valid && drop="$drop project"
   fi
   if [ -n "$msa" ] && ! account_known "$msp" "$msa"; then
     if echo "$partial" | "$JQ" -e '((.security | objects) // {}) | has("account")' >/dev/null 2>&1; then
       die "project-set: security.account '$msa' is not an account of $msp — $msp has: $(account_ids_line "$msp")"
     fi
-    drop="$drop security"
+    platforms_valid && drop="$drop security"
   fi
-  # claude_config_dir is never read (accounts live in Settings; see
-  # accounts_migrate_legacy, install's one-time conversion of it) -- dropped
-  # at both levels on every save, sent or not, since the project editor is
-  # the only cleanup a level the migration left in place ever gets afterwards.
+  # claude_config_dir is never read (accounts live in Settings) -- the
+  # migration above already converted what it could; this still drops it
+  # unconditionally at both levels on every save, sent or not, so a level
+  # accounts_migrate_legacy left in place does not linger past the next
+  # time this project is saved.
   if projects_json | "$JQ" -e --arg n "$name" 'any(.projects[]; .name==$n)' >/dev/null 2>&1; then
     write_projects --arg n "$name" --argjson p "$partial" \
       '.projects = [.projects[] | if .name==$n
@@ -7844,18 +7877,24 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
   # <job> platform` too: this save may have just moved the project (or its
   # security block) onto a platform that leaves a job's own account behind --
   # job_platform inherits the project's for a job that names no platform of
-  # its own. One line per job actually cleared.
+  # its own. Read the id and the own account TOGETHER, straight off
+  # $JOBS_FILE (never job_get, which re-derives the security jobs on every
+  # call): only a job that actually carries one pays job_platform/
+  # account_known, instead of every job of the project. A platforms.json
+  # this cannot read makes account_known refuse every id, so the whole pass
+  # is skipped rather than clearing a valid account on a false alarm. One
+  # line per job actually cleared.
   local jid jacct jeff
-  "$JQ" -r --arg n "$name" '.jobs[]? | select(.project == $n) | .id' "$JOBS_FILE" 2>/dev/null \
-  | while IFS= read -r jid; do
-      [ -n "$jid" ] || continue
-      jacct="$(job_get "$jid" '.account' '')"
-      [ -n "$jacct" ] && [ "$jacct" != "null" ] || continue
-      jeff="$(job_platform "$jid")"
-      account_known "$jeff" "$jacct" && continue
-      write_jobs --arg id "$jid" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
-      echo "job $jid: account '$jacct' is not an account of $jeff — cleared, the job inherits"
-    done
+  if platforms_valid; then
+    "$JQ" -r --arg n "$name" '.jobs[]? | select(.project == $n) | select((.account // "") != "") | [.id, .account] | @tsv' "$JOBS_FILE" 2>/dev/null \
+    | while IFS="$(printf '\t')" read -r jid jacct; do
+        [ -n "$jid" ] || continue
+        jeff="$(job_platform "$jid")"
+        account_known "$jeff" "$jacct" && continue
+        write_jobs --arg id "$jid" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+        echo "job $jid: account '$jacct' is not an account of $jeff — cleared, the job inherits"
+      done
+  fi
   # Best effort, and never the reason a save fails: the event is a record of
   # what happened, not a gate on whether it is allowed to happen.
   if security_enabled "$name"; then
@@ -7961,6 +8000,24 @@ cmd_project_rename() { # <old-name> <new-name> — the project and every job poi
 cmd_project_delete() { # <name> — the project is removed; jobs keep .project (just stop inheriting)
   local name="$1"
   write_projects --arg n "$name" '.projects = [.projects[] | select(.name != $n)]'
+  # A job that named this project falls back to anthropic now (job_platform,
+  # with no project left to inherit a platform from) -- an own account only
+  # valid on the platform the project used to run on is left stranded, the
+  # same way a project-set platform change strands one (cmd_project_set's own
+  # save does the identical cleanup, above). Same read, same guard: skip the
+  # whole pass rather than clear a valid account on a platforms.json this
+  # cannot read.
+  local jid jacct jeff
+  if platforms_valid; then
+    "$JQ" -r --arg n "$name" '.jobs[]? | select(.project == $n) | select((.account // "") != "") | [.id, .account] | @tsv' "$JOBS_FILE" 2>/dev/null \
+    | while IFS="$(printf '\t')" read -r jid jacct; do
+        [ -n "$jid" ] || continue
+        jeff="$(job_platform "$jid")"
+        account_known "$jeff" "$jacct" && continue
+        write_jobs --arg id "$jid" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+        echo "job $jid: account '$jacct' is not an account of $jeff — cleared, the job inherits"
+      done
+  fi
   echo "project '$name' deleted"
 }
 
