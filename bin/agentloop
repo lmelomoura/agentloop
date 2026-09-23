@@ -3209,11 +3209,23 @@ slots_dir() { echo "$LOCK_DIR/$1"; }     # base dir holding a job's run slots
 
 slots_active() { # <id> -> prints count of live slots; prunes dead ones
   local id="$1"                           # separate stmt: $id must exist before...
-  local base="$LOCK_DIR/$id" d n=0        # ...it is expanded here (set -u)
+  local base="$LOCK_DIR/$id" d n=0 pid    # ...it is expanded here (set -u)
   [ -d "$base" ] || { echo 0; return 0; }
   for d in "$base"/*/; do                # glob skips the dotfile mutex (.acq)
+    d="${d%/}"
     [ -d "$d" ] || continue
-    if slot_alive "${d%/}"; then n=$((n + 1)); else rm -rf "$d"; fi
+    # Its pid, read once. A slot with none is a run between acquire_slot's
+    # mkdir and its pid, counted and kept like a live one unless it is older
+    # than the grace (lock_abandoned). This is asked from outside
+    # acquire_slot's mutex too -- the tick's max_parallel gate, running, the
+    # stall check -- and pruned on sight, such a run went on with no slot on
+    # disk: uncounted, unseen by the dashboard and by stop, its ports unrecorded.
+    pid="$(cat "$d/pid" 2>/dev/null || true)"
+    if { [ -n "$pid" ] && slot_alive "$d"; } || { [ -z "$pid" ] && [ -d "$d" ] && ! lock_abandoned "$d"; }; then
+      n=$((n + 1))
+    else
+      rm -rf "$d"
+    fi
   done
   echo "$n"
 }

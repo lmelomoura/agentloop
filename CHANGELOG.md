@@ -96,6 +96,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   grace of 1 s meeting the next holder before its pid, and `acquire_lock`
   on a young and an old lock with no pid.
 
+- **A run that is just starting no longer loses its slot to a count of its
+  job's runs.** A run claims a slot directory and then writes its pid into
+  it, and every count of a job's live runs pruned a slot with no pid on
+  sight — the tick's `max_parallel` gate, `running`, the stall check, a
+  security analysis, a rename, all of them outside the claim's own mutex.
+  A count in that instant deleted the new run's slot, and the run went on
+  with none on disk: not counted against `max_parallel`, missing from the
+  dashboard and from `stop`, its port block never recorded. A slot with no
+  pid is now counted and kept while it is younger than the lock grace, and
+  pruned once older, like the locks. The selftest covers a slot mid-claim
+  and one abandoned with no pid.
+
 - **A finding on several branches is one row in the findings browser, and a
   decision no longer seems to come undone when another branch is analysed.**
   `queries.finding_rows` united one checklist per branch, so a finding on

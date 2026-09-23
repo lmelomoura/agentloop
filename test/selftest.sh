@@ -5658,6 +5658,22 @@ PY
     || bad "slots_active pruned a live slot"
   rm -rf "$tmp/locks/sa"
 
+  # A slot with no pid is a run between acquire_slot's mkdir and its pid, and
+  # slots_active is asked from outside acquire_slot's mutex too: the tick's
+  # max_parallel gate, running, the stall check, a security analysis, a
+  # rename. Pruned on sight, that run went on with no slot on disk -- not
+  # counted against max_parallel, unseen by the dashboard and by stop, its
+  # ports never recorded. A young one is counted and kept, like a live slot;
+  # one left with no pid past the grace is abandoned, and pruned.
+  mkdir -p "$tmp/locks/sm/111" "$tmp/locks/sm/222"; touch -t 202001010000 "$tmp/locks/sm/222"
+  got="$( LOCK_DIR="$tmp/locks"; LOCK_GRACE_SECONDS=30; slots_active sm )"
+  [ "$got" = "1" ] && [ -d "$tmp/locks/sm/111" ] \
+    && ok "a slot not given its pid yet is counted and kept, not pruned from under its run" \
+    || bad "slots_active on a slot mid-claim: counted $got, wanted 1; kept [$([ -d "$tmp/locks/sm/111" ] && echo yes || echo no)]"
+  [ ! -d "$tmp/locks/sm/222" ] && ok "and one left with no pid past the grace is pruned" \
+    || bad "an abandoned slot with no pid survived the count"
+  rm -rf "$tmp/locks/sm"
+
   echo "alloc_port_base() — two live runs never get the same ports"
   # Isolation settles the filesystem and says nothing about ports: two runs of
   # one repo each publish 5432 and the second dies on "address already in use",
