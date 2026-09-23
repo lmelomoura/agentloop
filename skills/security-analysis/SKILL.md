@@ -19,7 +19,7 @@ That is the deterministic phase, and it prints a `coverage_note`. **If that note
 
 On the Codex CLI the engine has already run this command for you before you start, and the prompt says so — do not run it again; read the coverage note off `agentloop security checklist` instead.
 
-## The three jobs, in this order
+## The four jobs, in this order
 
 **1. Re-verify what was left open.** Run `agentloop security checklist --analysis <id>` right after `prepare` — not `findings`. `findings` returns only THIS analysis's own rows, and right after `prepare` that is just the fresh deterministic findings (secret/dependency/hygiene/iac); a previous analysis's SAST findings are never in it, so `findings` never shows them to you, you never re-report them, and a live vulnerability silently disappears from the report as `fixed`. `checklist` is the verb that surfaces the carried-over set: it diffs this analysis against the last finished baseline of the same branch. At this point in the run the carried-over set arrives with state `pending` (plus `partial`/`open` for what prepare already re-found) — the engine marks a baseline finding `fixed` only once its absence is PROVEN, and proof means **the producer that found it in the first place ran again in this analysis**: Trivy for a dependency CVE or an IaC misconfiguration, gitleaks or the built-in scanner for a secret, Semgrep for a pre-pass row, and you — the analysis closing `done` — for a `sast` finding you reported yourself. A phase whose engine is missing this run proves nothing, so its findings stay `pending` however cleanly the run ends. A `pending` row is a work item for you, never a fact about the code.
 
@@ -51,7 +51,7 @@ This rule is unconditional, and it is worth knowing why it used to be conditiona
 
 **A re-report REPLACES the stored occurrences list; it does not add to it.** Narrowing five files down to the two still affected is how the next analysis learns which three locations closed — that file-set difference is the objective half of `partial`. Echoing back a location you already confirmed closed keeps dead evidence alive in a finding that is not fully there any more.
 
-This is the cheapest of the three jobs and the most valuable. Do it first.
+This is the cheapest of the four jobs and the most valuable. Do it first.
 
 **A secret found in the git history is a special case, and you cannot close it.** `prepare` re-sweeps the whole history on every analysis, so a credential that was ever committed is reported again for as long as the commit exists — deleting the file does not remove it and never will, which is exactly what its remediation says. It stays `open`, run after run, and the only close is a human's: rotate the credential at the provider and *Accept risk*. Do not report it as fixed, do not suggest deleting the file as the fix, and do not treat its reappearance as a regression.
 
@@ -108,9 +108,29 @@ So: if `checklist` or this analysis's `findings` already carries a row for this 
 
 Fold in only what is genuinely the same weakness in the same place. Two different problems in one file are two findings — the pre-pass keeps them apart by check id — and collapsing them onto one row loses whichever one you did not describe.
 
+**`checklist` also prints `decided_sast`: the `sast` findings the operator has already ruled on — accepted or false positive — that this checklist does not list,** because they were recorded on another branch, or in an older analysis of this one. Your own pass mints a `sast` fingerprint from the rule, the path and the snippet you chose, so the same hole found from another branch comes out under a new identity that no decision reaches: the operator rules on it a second time, or watches a finding they already dismissed come back as `new`. One access-control hole was accepted twice on one project that way, once per branch.
+
+So before you mint a fingerprint with `--snippet`, read `decided_sast` too. If the weakness you are about to report is one of its entries — the same flaw, in the same place — re-report it under **that entry's fingerprint and its `rule`, both copied exactly** — the rule is part of the identity you are reusing, and the door refuses any report that lands on a decided fingerprint under another category or rule — with your own rationale, occurrences and `candidate`; the operator's decision then applies here as well, and the fold goes in your final summary (below): the ruling was taken on other code, possibly on another branch, and a fold nobody can see is a finding nobody will look at again. The list is for folding into and nothing else: an entry you did not find yourself in this run is not re-reported, because it is not work carried over — nobody asked you to check it — and an entry that only resembles what you found, another flaw in the same file, is not one to fold into.
+
+**4. Verification.** What you reported is a claim until somebody who did not make it has tried to disprove it — and on this platform you have subagents for exactly that, and for nothing else.
+
+`agentloop security verify-queue --analysis <id>` lists what needs a verifier, worst first: your own `sast` findings at `medium` or above, and any at `low`/`info` whose candidate declares a `high` or `critical` impact. The order is the worse of the two, so a `low` claiming a `critical` impact is verified early rather than last. For each row, in that order:
+
+1. `agentloop security verify-prompt --analysis <id> --fingerprint <fp>` prints the text. **Pass it as written** — it is built from the ledger, and a prompt you write yourself is "confirm what I found".
+2. Launch a subagent with it. It reads the code, decides, and writes its own verdict through `report-verdict`. You do not write the verdict and you do not summarise it.
+3. Move to the next row.
+
+**The close counts this.** Every subagent this run launched is compared with every verdict recorded: findings left unverified, subagents that produced no verdict, and verdicts with no subagent behind them each lower your `done` to `capped`, with the numbers in the report. Use subagents for nothing else — two earlier analyses spent their whole budget fanning the SAST pass out to six of them and triaged none of the deterministic findings, which is what the count exists to catch.
+
+A `rejected` finding stays in the ledger and stops being counted as exposure; the reason the verifier wrote is what a reader sees in its place. You do not need to do anything about it, and you must not delete it or report it again.
+
+The `checklist` shows you `previous_verdict` — what the LAST analysis concluded about the same finding. It is information, not an answer: this analysis verifies its own findings, and a verdict is never inherited.
+
+On the Codex CLI and on OpenCode this job does not exist: there are no verifiers there, the queue is not served, and the coverage table says so.
+
 ## Rules that are not negotiable
 
-**Report through the CLI, never by writing the database.** One finding at a time, as JSON on stdin. For a weakness nothing already lists, get the fingerprint from `agentloop security fingerprint`, never invent one — that is the whole next rule. For a row that is already on the checklist, copy the fingerprint it printed (all three jobs above do this — Job 2 does it for every deterministic row it reads):
+**Report through the CLI, never by writing the database.** One finding at a time, as JSON on stdin. For a weakness nothing already lists, get the fingerprint from `agentloop security fingerprint`, never invent one — that is the whole next rule. For a row that is already on the checklist, copy the fingerprint it printed (Jobs 1 to 3 all do this — Job 2 for every deterministic row it reads; Job 4 reports verdicts, not findings):
 
 ```bash
 fp="$(agentloop security fingerprint --category sast --rule sql-injection \
@@ -132,6 +152,8 @@ cat <<'JSON' | agentloop security report-finding --analysis <id>
    "conditions": [{"kind": "network_routing", "description": "the search endpoint is exposed"}]}}
 JSON
 ```
+
+**A decided finding keeps its category and rule.** Whatever route you re-report it by — Job 1's carry-over, Job 2's triage, a fold into a row the checklist lists or into a `decided_sast` entry — send the category and the rule the row was shown to you with. The operator's ruling was made about them, and the door refuses a report that lands on a decided fingerprint under others.
 
 `candidate` is what *What qualifies as a finding* above describes; at `low` and `info` only `confidence` is required, and a triage re-report of a scanner's row carries `confidence` alone unless you have more to say.
 
@@ -174,7 +196,7 @@ anything you send in those fields is ignored.
 
 The door enforces this now, not only this sentence. `report-finding` runs `title`, `rationale`, `remediation`, `partial_note`, `category` and `rule` through the same shaped patterns the secret scanner uses, and refuses the finding if any of them looks like a live credential — naming the field and the rule that matched, never echoing the text back. If a finding of yours is refused this way, the fix is not to reformat, truncate or mask the value: remove it and describe the credential instead — "an AWS access key is hardcoded here" passes; the key itself never will.
 
-**Do the whole analysis yourself, in this one session. There are no subagents.** On Claude Code the `Agent` tool — the CLI's own tool roster calls it `Task`, and it is the same tool under both names — is **closed at launch** for this run, on purpose: you will not find it, and its absence is not a fault to work around. On the Codex CLI nothing can close `spawn_agent` by flag, so the run's prompt forbids it and you do not call it. Analysis 9 cost **$51.44** running six subagents that split the repository between them for the SAST pass and triaged not one deterministic finding; the cheapest and most valuable work in the run went unread while the budget went on parallelism. Dividing the repository by area is not the answer to a budget that runs out — the answer is Job 2 first, then as much of the SAST pass as the budget reaches, and a `capped` that says plainly what was not looked at. A report that names its own blind spot is worth more than one produced by six agents that between them read no findings.
+**Subagents exist for Job 4 and for nothing else.** On Claude Code the `Agent` tool — the CLI's own tool roster calls it `Task`, and it is the same tool under both names — is open, because verification IS a subagent: a second reader, with fresh context, given a prompt the ledger minted. It is not open for anything else, and the close counts: every `Task` this run launched is compared with every verdict recorded, and a subagent that produced no verdict lowers your `done` to `capped` with both numbers in the report. On the Codex CLI nothing can close `spawn_agent` by flag, so the run's prompt forbids it and you do not call it; on OpenCode the same. Analysis 9 cost **$51.44** running six subagents that split the repository between them for the SAST pass and triaged not one deterministic finding; the cheapest and most valuable work in the run went unread while the budget went on parallelism. Dividing the repository by area is still not the answer to a budget that runs out — the answer is Job 2 first, then as much of the SAST pass as the budget reaches, then verification, and a `capped` that says plainly what was not looked at.
 
 **Never read dependency trees.** Nothing under `node_modules/`, `vendor/`, `.venv/`, or any other installed tree. It is noise, and it is the only code in the repository nobody here wrote.
 
@@ -200,4 +222,4 @@ Neither guard refuses the close — the analysis always ends up closed, because 
 
 `--note` goes through the same credential check `report-finding` applies to a finding's free text: describe what you could not scan, never quote a key you found while saying so.
 
-Then the run-ending contract line, and before it a one-paragraph summary: how many findings you added, how many carried-over findings you re-verified and what happened to each, the coverage note if there was one, and anything the analysis did not reach.
+Then the run-ending contract line, and before it a one-paragraph summary: how many findings you added, how many carried-over findings you re-verified and what happened to each, every finding you folded into a `decided_sast` entry — its fingerprint, the file:line where you found it, and whether what you read agrees with the decision's reason — the coverage note if there was one, and anything the analysis did not reach.

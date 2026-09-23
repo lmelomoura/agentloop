@@ -816,6 +816,293 @@ def test_a_decision_wins_over_the_derived_state(tmp_path):
     assert checklist["findings"][0]["state"] == "false_positive"
 
 
+def _decided_on_develop(db, tmp_path, fp, rule="broken-access-control"):
+    """An agent `sast` on develop, finished, accepted by the operator -- and a
+    prepared analysis of main, where it can be found again. Returns main's id."""
+    dev = prepared_analysis(db, tmp_path, branch="develop", run_id="r-dev")
+    run(db, "report-finding", "--analysis", str(dev), stdin=json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": rule,
+        "severity": "low", "title": "the drawer proxies any candidate",
+        "rationale": "any id reaches the upstream", "remediation": "scope the id",
+        "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 54}]}))
+    run(db, "finish", "--analysis", str(dev), "--state", "done")
+    run(db, "decide", "--project", "web", "--fingerprint", fp, "--state", "accepted",
+        "--reason", "product decision RP-217", "--by", "me")
+    return prepared_analysis(db, tmp_path, branch="main", run_id="r-main")
+
+
+def _fold(fp, rule):
+    return json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": rule, "severity": "low",
+        "title": "the review drawer proxies any candidate id",
+        "rationale": "read on main: the id is still unscoped",
+        "remediation": "scope the id", "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 60}]})
+
+
+def test_the_checklist_hands_the_agent_the_sast_decided_on_another_branch(tmp_path):
+    """`decided_sast` rides BESIDE the checklist: an agent-minted `sast` the
+    operator ruled on while another branch's analysis held it, which this
+    analysis's checklist cannot list -- see queries.decided_sast."""
+    db = tmp_path / "security.db"
+    fp = "c" * 64
+    main = _decided_on_develop(db, tmp_path, fp)
+    out = run(db, "checklist", "--analysis", str(main))
+    assert [e["fingerprint"] for e in out["decided_sast"]] == [fp]
+    assert out["decided_sast"][0]["decision"]["state"] == "accepted"
+    assert all(f["fingerprint"] != fp for f in out["findings"]), \
+        "beside the checklist, never inside it"
+
+
+def _decided_carried_over(db, tmp_path, fp, rule="broken-access-control"):
+    """An agent `sast` on main, finished, accepted by the operator -- and a
+    SECOND prepared analysis of the same branch, where nobody has re-reported
+    the fingerprint yet and the checklist carries the decided row over from
+    its baseline (`diff.classify`'s `previous`-only loop). Returns the second
+    analysis's id."""
+    first = prepared_analysis(db, tmp_path, branch="main", run_id="r1")
+    run(db, "report-finding", "--analysis", str(first), stdin=json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": rule,
+        "severity": "low", "title": "the drawer proxies any candidate",
+        "rationale": "any id reaches the upstream", "remediation": "scope the id",
+        "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 54}]}))
+    run(db, "finish", "--analysis", str(first), "--state", "done")
+    run(db, "decide", "--project", "web", "--fingerprint", fp, "--state", "accepted",
+        "--reason", "product decision RP-217", "--by", "me")
+    return prepared_analysis(db, tmp_path, branch="main", run_id="r2")
+
+
+def test_a_decided_fingerprint_is_refused_under_another_rule(tmp_path):
+    """A fold turns the agent's finding into the operator's ruling the moment
+    it lands. The rule is part of the identity being reused, so a fold that
+    changes it is a different flaw hidden under an old decision -- refused,
+    with nothing recorded."""
+    db = tmp_path / "security.db"
+    fp = "c" * 64
+    main = _decided_on_develop(db, tmp_path, fp)
+    out = fails(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "xss"))
+    assert out.returncode != 0
+    assert "carries an operator decision" in out.stderr
+    assert "broken-access-control" in out.stderr and "xss" in out.stderr
+    listed = run(db, "checklist", "--analysis", str(main))
+    assert all(f["fingerprint"] != fp for f in listed["findings"]), "nothing was recorded"
+
+
+def test_a_decided_fingerprint_is_refused_under_another_category(tmp_path):
+    """The old guard ran only for `category == "sast"`, so the same decided
+    fingerprint reported under a DIFFERENT CATEGORY altogether -- not merely
+    a different rule -- reached the ledger untouched and took the operator's
+    ruling (R2)."""
+    db = tmp_path / "security.db"
+    fp = "c" * 64
+    main = _decided_on_develop(db, tmp_path, fp)
+    out = fails(db, "report-finding", "--analysis", str(main), stdin=json.dumps({
+        "fingerprint": fp, "category": "hygiene", "rule": "xss",
+        "severity": "low", "title": "unrelated hygiene finding"}))
+    assert out.returncode != 0
+    assert "carries an operator decision" in out.stderr
+    listed = run(db, "checklist", "--analysis", str(main))
+    assert all(f["fingerprint"] != fp for f in listed["findings"]), "nothing was recorded"
+
+
+def test_a_fold_that_landed_cannot_be_relabelled_by_a_second_report(tmp_path):
+    """A fold takes the decision the moment it lands, so the fingerprint is
+    now on THIS analysis's own checklist and `decided_sast` stops listing
+    it -- which the old guard's `entry is None` branch read as nothing left
+    to check, letting a second report relabel the very row it had just
+    accepted (R3)."""
+    db = tmp_path / "security.db"
+    fp = "c" * 64
+    main = _decided_on_develop(db, tmp_path, fp)
+    run(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "broken-access-control"))
+    out = fails(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "xss"))
+    assert out.returncode != 0
+    assert "carries an operator decision" in out.stderr
+    listed = run(db, "checklist", "--analysis", str(main))
+    (row,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert row["rule"] == "broken-access-control"
+    assert row["state"] == "accepted"
+
+
+def test_a_carried_over_decided_row_cannot_be_relabelled(tmp_path):
+    """`decided_sast` excludes what the checklist already carries over from
+    its own baseline, exactly as it excludes a fold just landed -- so a
+    decided row surviving from a PRIOR analysis of the SAME branch was just
+    as invisible to the old guard, and just as reachable by a second report
+    under another rule (R4)."""
+    db = tmp_path / "security.db"
+    fp = "e" * 64
+    second = _decided_carried_over(db, tmp_path, fp)
+    out = fails(db, "report-finding", "--analysis", str(second), stdin=_fold(fp, "xss"))
+    assert out.returncode != 0
+    assert "carries an operator decision" in out.stderr
+    listed = run(db, "checklist", "--analysis", str(second))
+    (row,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert row["rule"] == "broken-access-control"
+    assert row["state"] == "accepted"
+
+
+def test_a_fold_under_the_entrys_own_rule_takes_the_decision(tmp_path):
+    db = tmp_path / "security.db"
+    fp = "c" * 64
+    main = _decided_on_develop(db, tmp_path, fp)
+    run(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "broken-access-control"))
+    listed = run(db, "checklist", "--analysis", str(main))
+    (row,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert row["state"] == "accepted"
+    assert listed["decided_sast"] == [], "folded: the checklist lists it now"
+
+
+def test_a_carried_over_decided_row_re_reported_under_its_own_rule_is_accepted(tmp_path):
+    """Job 1's "still present, as reported" path: re-finding a carried-over
+    decided row under its OWN rule, with a narrower occurrence list, is a
+    legitimate confirmation and must stay accepted -- the nearest case the
+    widened door must not swallow."""
+    db = tmp_path / "security.db"
+    fp = "e" * 64
+    second = _decided_carried_over(db, tmp_path, fp)
+    run(db, "report-finding", "--analysis", str(second), stdin=json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": "broken-access-control",
+        "severity": "low", "title": "the drawer proxies any candidate, still",
+        "rationale": "re-read on main: the id is still unscoped",
+        "remediation": "scope the id", "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 61}]}))
+    listed = run(db, "checklist", "--analysis", str(second))
+    (row,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert row["state"] == "accepted"
+    assert row["occurrences"] == [{"file": "app/queue.php", "line": 61, "snippet_hash": ""}]
+
+
+def test_a_decided_row_of_another_category_echoed_under_its_own_identity_is_accepted(tmp_path):
+    """The containment probe for widening the door to every category: a
+    decided `hygiene` finding, re-reported on another branch under its OWN
+    category and rule, must stay accepted -- the door compares identity, and
+    an unchanged identity is not a route it exists to close."""
+    db = tmp_path / "security.db"
+    fp = "f" * 64
+    hygiene_payload = {
+        "fingerprint": fp, "category": "hygiene", "rule": "missing_gitignore",
+        "severity": "info", "title": "no .gitignore",
+        "rationale": "nothing stops the first .env from being committed",
+        "remediation": "add a .gitignore covering .env files and key material",
+        "occurrences": [{"file": ".gitignore", "line": 0}]}
+    dev = prepared_analysis(db, tmp_path, branch="develop", run_id="r-dev")
+    run(db, "report-finding", "--analysis", str(dev), stdin=json.dumps(hygiene_payload))
+    run(db, "finish", "--analysis", str(dev), "--state", "done")
+    run(db, "decide", "--project", "web", "--fingerprint", fp, "--state", "false_positive",
+        "--reason", "the operator will add one before the next release", "--by", "me")
+    main = prepared_analysis(db, tmp_path, branch="main", run_id="r-main")
+    run(db, "report-finding", "--analysis", str(main), stdin=json.dumps(hygiene_payload))
+    listed = run(db, "checklist", "--analysis", str(main))
+    (row,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert row["state"] == "false_positive"
+
+
+def test_a_sast_nobody_ruled_on_is_held_to_no_rule(tmp_path):
+    """The guard is about decisions: an undecided fingerprint reported under
+    another rule is whatever it was before this door existed."""
+    db = tmp_path / "security.db"
+    fp = "d" * 64
+    dev = prepared_analysis(db, tmp_path, branch="develop", run_id="r-dev")
+    run(db, "report-finding", "--analysis", str(dev), stdin=_fold(fp, "broken-access-control"))
+    run(db, "finish", "--analysis", str(dev), "--state", "done")
+    main = prepared_analysis(db, tmp_path, branch="main", run_id="r-main")
+    run(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "xss"))
+
+
+def test_a_decided_row_re_reported_as_its_branch_shows_it_is_accepted_after_another_branch_relabelled_it(tmp_path):
+    """THE BUG THIS BRANCH FIXES. A re-report made exactly as THIS branch's
+    own checklist shows the fingerprint must be accepted, even when a NEWER
+    record on another branch relabelled it under a different rule. The old
+    `held` query compared with the project's newest record ANYWHERE -- any
+    branch, any repository, failed runs included -- so it read develop's
+    later relabelling instead of main's own accepted row and refused the
+    exact re-report the checklist told the agent to make."""
+    db = tmp_path / "security.db"
+    fp = "b" * 64
+    main1 = prepared_analysis(db, tmp_path, branch="main", run_id="r-main-1")
+    run(db, "report-finding", "--analysis", str(main1), stdin=json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": "broken-access-control",
+        "severity": "low", "title": "the drawer proxies any candidate",
+        "rationale": "any id reaches the upstream", "remediation": "scope the id",
+        "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 54}]}))
+    run(db, "finish", "--analysis", str(main1), "--state", "done")
+    dev = prepared_analysis(db, tmp_path, branch="develop", run_id="r-dev")
+    run(db, "report-finding", "--analysis", str(dev), stdin=json.dumps({
+        # Undecided at this point -- the door has nothing to compare with
+        # yet, so the same fingerprint lands here under a DIFFERENT rule.
+        "fingerprint": fp, "category": "sast", "rule": "xss",
+        "severity": "low", "title": "the drawer proxies any candidate",
+        "rationale": "read on develop: looks like a reflected value",
+        "remediation": "escape the output", "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 54}]}))
+    run(db, "finish", "--analysis", str(dev), "--state", "done")
+    run(db, "decide", "--project", "web", "--fingerprint", fp, "--state", "accepted",
+        "--reason", "product decision RP-217", "--by", "me")
+    # No analysis is running at this point: both main1 and dev are closed,
+    # and main2 (below) has not been opened yet.
+    main2 = prepared_analysis(db, tmp_path, branch="main", run_id="r-main-2")
+    shown = run(db, "checklist", "--analysis", str(main2))
+    (row,) = [f for f in shown["findings"] if f["fingerprint"] == fp]
+    assert row["rule"] == "broken-access-control", "what the agent was shown"
+    # Re-reported exactly as main2's own checklist showed it -- the rule read
+    # back off `row`, not a literal -- must be accepted, not refused.
+    run(db, "report-finding", "--analysis", str(main2), stdin=json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": row["rule"],
+        "severity": "low", "title": "the drawer proxies any candidate, still",
+        "rationale": "re-read on main: the id is still unscoped",
+        "remediation": "scope the id", "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 61}]}))
+    listed = run(db, "checklist", "--analysis", str(main2))
+    (after,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert after["rule"] == "broken-access-control"
+    assert after["state"] == "accepted"
+
+
+def test_a_triage_of_a_decided_scanner_row_under_its_own_identity_is_accepted(tmp_path):
+    """CONTROL for Job 2: a scanner-minted row the operator has already
+    decided, triaged again under its own identity once the scanner re-mints
+    it on a later analysis, must stay accepted -- the door's narrower
+    comparison must not swallow the ordinary scanner-row triage the
+    checklist and `decided_sast` both exist to serve."""
+    db = tmp_path / "security.db"
+    aid1 = open_analysis(db, branch="main", run_id="r1")
+    root1 = tmp_path / f"repo-{aid1}"
+    root1.mkdir(parents=True, exist_ok=True)
+    (root1 / ".env").write_text("DB_HOST=localhost\n")
+    run(db, "prepare", "--analysis", str(aid1), "--root", str(root1), "--offline")
+    listed1 = run(db, "checklist", "--analysis", str(aid1))
+    (scanner_row,) = [f for f in listed1["findings"] if f["rule"] == "committed_env_file"]
+    assert scanner_row["category"] == "hygiene"
+    fp = scanner_row["fingerprint"]
+    # Whatever the close gives -- `done` or `capped` -- both are finished,
+    # and either is a valid baseline for the second analysis below.
+    run(db, "finish", "--analysis", str(aid1), "--state", "done")
+    run(db, "decide", "--project", "web", "--fingerprint", fp, "--state", "false_positive",
+        "--reason", "fixture only, nothing to rotate", "--by", "me")
+
+    aid2 = open_analysis(db, branch="main", run_id="r2")
+    root2 = tmp_path / f"repo-{aid2}"
+    root2.mkdir(parents=True, exist_ok=True)
+    (root2 / ".env").write_text("DB_HOST=localhost\n")
+    run(db, "prepare", "--analysis", str(aid2), "--root", str(root2), "--offline")
+    listed2 = run(db, "checklist", "--analysis", str(aid2))
+    (rerecorded,) = [f for f in listed2["findings"] if f["fingerprint"] == fp]
+    assert rerecorded["state"] == "false_positive", "the scanner re-recorded the row"
+    run(db, "report-finding", "--analysis", str(aid2), stdin=json.dumps({
+        "fingerprint": fp, "category": rerecorded["category"], "rule": rerecorded["rule"],
+        "severity": rerecorded["severity"], "title": rerecorded["title"],
+        "remediation": rerecorded["remediation"],
+        "rationale": "confirmed at the call site: a local fixture, not a real secret",
+        "occurrences": rerecorded["occurrences"], "candidate": TRIAGE_CANDIDATE}))
+    final = run(db, "checklist", "--analysis", str(aid2))
+    (row,) = [f for f in final["findings"] if f["fingerprint"] == fp]
+    assert row["state"] == "false_positive"
+
+
 def test_findings_lists_what_the_deterministic_phase_left_for_the_agent(tmp_path):
     """PINNED to the built-in scanner, because the fixture is one only it
     reports: a PEM header and one body line, with no footer. Gitleaks is
@@ -2427,6 +2714,13 @@ def test_the_agents_own_findings_are_never_counted_as_untriaged(tmp_path):
         "fingerprint": "c" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "sql-injection",
         "severity": "critical", "title": "String-built SQL",
         "occurrences": [{"file": "app/db.py", "line": 12}]}), env=AS_AGENT)
+    # And verified, because since block 4.2 an agent finding at medium or
+    # above is a debt of its OWN kind: not to the triage gate (which is what
+    # this test is about) but to the verification one. Leaving it unverified
+    # would close `capped` for a reason this test does not name.
+    run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "c" * 64,
+        stdin=json.dumps({"verdict": "confirmed", "reason": "read app/db.py end to end"}),
+        env=AS_AGENT)
 
     run(db, "finish", "--analysis", str(aid), "--state", "done")
     row = run(db, "list", "--project", "web")[0]
@@ -2903,9 +3197,18 @@ def test_every_phases_prose_is_a_substring_of_the_paragraph(tmp_path):
     was not a substring of the paragraph, and the only test of the property
     put the lockfile at the root, where the sentence is never said at all.
     Asserted for every phase `prepare` files -- all of `PHASE_ORDER` but the
-    two the close adds -- and then again after the close, for the two it adds.
+    three the close adds -- and then again after the close, for the three it
+    adds.
 
-    THE DELIBERATE EXCEPTIONS are all on the triage row. Its two summary
+    THE DELIBERATE EXCEPTIONS are on the triage row and on the verification
+    row, for one reason: a summary of what was done is not a gap, and the
+    paragraph is the list of gaps. `VERIFY_NOTHING_NOTE` ("no finding was
+    waiting for a verifier") and `VERIFY_DONE_NOTE` ("N verified: ...") are
+    the verification row's two summaries; its gap sentences -- findings left
+    unverified, subagents that produced no verdict, verdicts with no subagent
+    -- are in the paragraph like every other gap.
+
+    THE REST OF THE EXCEPTIONS are on the triage row. Its two summary
     sentences (`TRIAGE_NOTHING_NOTE`, `TRIAGE_ALL_READ_NOTE`) describe what the
     agent did, not a gap, and the paragraph is the list of gaps. Its third,
     `TRIAGE_UNVERIFIED_NOTE` -- filed when a direct `capped` or `failed` close
@@ -2945,7 +3248,7 @@ def test_every_phases_prose_is_a_substring_of_the_paragraph(tmp_path):
         security_cli.adapters.SYFT_SBOM_NOTE)), by_name["sbom"]["note"]
     # Every phase `prepare` writes, and each one's whole prose.
     assert [p["name"] for p in phases] == \
-        list(security_cli.coverage.PHASE_ORDER[:-2])
+        list(security_cli.coverage.PHASE_ORDER[:-3])
     for p in phases:
         assert p["note"] in note, \
             f"{p['name']}'s note is not in the paragraph: {p['note']!r}"
@@ -2958,6 +3261,9 @@ def test_every_phases_prose_is_a_substring_of_the_paragraph(tmp_path):
         if p["name"] == "triage":
             assert p["note"] == security_cli.TRIAGE_NOTHING_NOTE.format(
                 floor=security_cli.TRIAGE_FLOOR)
+            continue
+        if p["name"] == "verification":
+            assert p["note"] == security_cli.VERIFY_NOTHING_NOTE
             continue
         assert p["note"] in row["coverage_note"], \
             f"{p['name']}'s note is not in the paragraph: {p['note']!r}"
@@ -2975,7 +3281,8 @@ def test_the_close_adds_a_triage_phase_carrying_the_count(tmp_path):
     run(db, "finish", "--analysis", str(aid), "--state", "done")
     row, phases = _coverage_phases(db, aid)
     triage = [p for p in phases if p["name"] == "triage"][0]
-    assert phases[-1]["name"] == "triage", "triage is the last row of the table"
+    assert [p["name"] for p in phases][-2:] == ["triage", "verification"], \
+        "triage and then verification close the table"
     assert triage["status"] == "warning"
     assert triage["by"] == "agent"
     assert "2 deterministic findings were never triaged" in triage["note"]
@@ -3160,10 +3467,12 @@ def test_the_downloaded_report_opens_with_the_phase_table(tmp_path):
     assert "| iac | skipped | — |" in md
     assert "| sast | ran | agent |" in md
     assert "| triage | ran | agent |" in md
+    assert "| verification | ran | agent |" in md
     assert md.index("| sast | ran | agent |") < md.index("| triage | ran | agent |")
+    assert md.index("| triage | ran | agent |") < md.index("| verification | ran | agent |")
     doc = json.loads(run_text(db, "render", "--analysis", str(aid),
                               "--format", "json"))
-    assert [p["name"] for p in doc["coverage"]["phases"]][-1] == "triage"
+    assert [p["name"] for p in doc["coverage"]["phases"]][-1] == "verification"
 
 
 # -------------------------------- the two rows the close writes, and when not
@@ -4548,6 +4857,13 @@ def finished_analysis(db, tmp_path, project, branch, severity="high", rule="r",
     if category == "sast":
         payload["candidate"] = SAST_CANDIDATE
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
+    # A `sast` finding at medium or above owes a verdict since block 4.2, and
+    # a close that leaves the queue unworked is lowered to `capped` -- which
+    # is not what a fixture for a DONE analysis is for.
+    if category == "sast":
+        run(db, "report-verdict", "--analysis", str(aid),
+            "--fingerprint", fingerprint_for(project, branch, rule),
+            stdin=json.dumps({"verdict": "confirmed", "reason": "read it end to end"}))
     run(db, "finish", "--analysis", str(aid), "--state", "done", "--spend", "0.5")
     return aid
 
@@ -4788,7 +5104,7 @@ def test_project_data_survives_a_ledger_that_does_not_exist_yet(tmp_path):
              "--default-profile", "deep")
     assert not db.exists()
     assert out["project"] == "web"
-    assert out["header"] == {"profile": "deep", "branch": "main",
+    assert out["header"] == {"profile": "deep", "branch": "main", "repos": [],
                              "branch_fell_back": False, "lines_of_code": 0,
                              "last_analysis": 0}
     assert out["tabs"]["overview"]["posture"] == {
@@ -4954,6 +5270,43 @@ def test_project_data_previous_is_none_not_zeros_without_a_prior_analysis(tmp_pa
              "--default-profile", "")
     assert out["tabs"]["overview"]["previous"] is None
     assert out["tabs"]["overview"]["trend"] != []
+
+
+def test_project_data_reads_every_repository_s_declared_branch(tmp_path):
+    """The Overview describes the declared branch of the PROJECT: every
+    repository's newest reading of it, one entry per fingerprint. Read off
+    the newest repository alone, `web-admin`'s three findings on main were
+    missing from the posture, the checklist counts and the top findings;
+    picked by branch name, "previous" and the trend mixed the two. Previous
+    is the branch as it read just before its newest analysis -- that one
+    swapped for its own repository's previous run -- and each trend point is
+    the branch as it read when that analysis finished."""
+    db = tmp_path / "security.db"
+
+    def run_of(repo, names):
+        aid = prepared_analysis(db, tmp_path, project="web", repo=repo, branch="main")
+        for name in names:
+            run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
+                "fingerprint": fingerprint_for(repo, name), "category": "hygiene",
+                "rule": "r", "severity": "high", "title": name, "rationale": "r"}))
+        run(db, "finish", "--analysis", str(aid), "--state", "done", "--spend", "0.1")
+        return aid
+
+    first = run_of("web", ["a"])
+    admin = run_of("web-admin", ["b", "c", "d"])
+    latest = run_of("web", ["a", "e"])
+    out = run(db, "project-data", "--project", "web", "--base", "main",
+              "--default-profile", "")
+    ov = out["tabs"]["overview"]
+    assert ov["posture"]["total"] == 5
+    assert (ov["checklist"]["new"], ov["checklist"]["open"]) == (4, 1)
+    assert {f["analysis_id"] for f in ov["top_findings"]} == {admin, latest}
+    assert ov["previous"]["total"] == 4, "web-admin's run and web's run before the newest"
+    assert [(p["analysis_id"], p["open"]) for p in ov["trend"]] == \
+        [(first, 1), (admin, 4), (latest, 5)]
+    assert (out["header"]["branch"], out["header"]["repos"]) == ("main", ["web", "web-admin"])
+    assert {(r["analysis_id"], r["repo"]) for r in out["tabs"]["reports"]} == \
+        {(first, "web"), (admin, "web-admin"), (latest, "web")}
 
 
 def test_project_data_overview_cards_follow_the_fallen_back_branch(tmp_path):
@@ -6026,3 +6379,177 @@ def test_guides_read_that_were_never_recommended_are_still_listed(tmp_path):
     note, analysis = _sast_note(db, aid)
     assert "Guides read: WEB-PROTOCOL-AND-AUTH. Recommended but not read: ATTACK-CLASSES." in note
     assert "bogus" not in note
+
+
+# ------------------------------------------------ the verifier's door
+
+def _agent_sast(db, aid, fp, severity="high"):
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(_payload(
+        fp, severity=severity, candidate=SAST_CANDIDATE)))
+
+
+def test_verify_queue_lists_the_scope_and_report_verdict_writes_it(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    queue = run(db, "verify-queue", "--analysis", str(aid))
+    assert [f["fingerprint"] for f in queue] == ["b" * 64]
+    assert queue[0]["candidate"]["trace"], "the prompt needs the chain"
+
+    run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+        stdin=json.dumps({"verdict": "rejected",
+                          "reason": "app/db.py:12 is parameterised; the concatenation is in a comment"}))
+    row = _finding_row(db, aid)
+    assert row["verdict"] == "rejected"
+    assert row["verified_by"] == "subagent"
+    assert run(db, "verify-queue", "--analysis", str(aid)) == []
+
+
+def test_a_verdict_on_something_outside_the_queue_is_refused(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "9" * 64,
+                stdin=json.dumps({"verdict": "confirmed", "reason": "r"}))
+    assert out.returncode != 0
+    assert "not in the verification queue" in out.stderr
+
+
+def test_a_second_verdict_on_one_finding_is_refused(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+        stdin=json.dumps({"verdict": "confirmed", "reason": "read it end to end"}))
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+                stdin=json.dumps({"verdict": "rejected", "reason": "on second thoughts"}))
+    assert out.returncode != 0
+    assert "not in the verification queue" in out.stderr
+    assert _finding_row(db, aid)["verdict"] == "confirmed"
+
+
+def test_a_verified_by_sent_by_the_payload_is_refused(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+                stdin=json.dumps({"verdict": "confirmed", "reason": "r", "verified_by": "me"}))
+    assert out.returncode != 0
+    assert "does not know: verified_by" in out.stderr
+
+
+def test_a_credential_in_a_verdict_reason_is_refused_and_never_echoed(tmp_path):
+    """The adversarial test, on the third door. A verifier reads the same
+    repository the hunter read, so its free text is exactly as likely to
+    quote a key -- and the ledger is exactly as unable to hold one."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+                stdin=json.dumps({"verdict": "rejected", "reason": f"it is the test key {AWS}"}))
+    assert out.returncode != 0
+    assert "reason" in out.stderr and "aws_access_key" in out.stderr
+    assert AWS not in out.stdout and AWS not in out.stderr
+    assert _finding_row(db, aid)["verdict"] == ""
+    conn = sqlite3.connect(str(db))
+    assert AWS not in "".join(str(tuple(r)) for r in conn.execute("SELECT * FROM finding"))
+
+
+def test_verify_prompt_is_minted_for_a_queued_finding_only(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    out = raw(db, "verify-prompt", "--analysis", str(aid), "--fingerprint", "b" * 64)
+    assert "your job is to disprove" in out.lower()
+    assert "report-verdict --analysis" in out
+    assert "my own reading" not in out, "the hunter's rationale must not travel"
+    bad = fails(db, "verify-prompt", "--analysis", str(aid), "--fingerprint", "9" * 64)
+    assert bad.returncode != 0 and "not in the verification queue" in bad.stderr
+
+
+# --------------------------------------------- the close counts the phase
+
+def _verification_note(db, aid):
+    analysis = run(db, "checklist", "--analysis", str(aid))["analysis"]
+    phases = json.loads(analysis["coverage"])["phases"]
+    row = next(p for p in phases if p["name"] == "verification")
+    return row, analysis
+
+
+def _verdict(db, aid, fp, value="confirmed", reason="read it end to end"):
+    run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", fp,
+        stdin=json.dumps({"verdict": value, "reason": reason}))
+
+
+def test_a_queue_nobody_worked_lowers_done_to_capped(tmp_path):
+    """The guard the N=V count cannot see: an agent that ignores the phase
+    launches no subagents and writes no verdicts, so the two numbers agree at
+    zero. What does not agree is the queue."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
+    row, analysis = _verification_note(db, aid)
+    assert run(db, "list", "--project", "web")[0]["state"] == "capped"
+    assert "1 finding left unverified" in row["note"]
+    assert "sql-injection" in row["note"]
+    assert row["note"] in analysis["coverage_note"]
+    assert row["status"] == "warning"
+
+
+def test_subagents_that_produced_no_verdict_lower_done_to_capped(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    _verdict(db, aid, "b" * 64)
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "5")
+    row, _ = _verification_note(db, aid)
+    assert run(db, "list", "--project", "web")[0]["state"] == "capped"
+    assert "5 subagents were launched and 1 verdict recorded" in row["note"]
+
+
+def test_verdicts_without_subagents_lower_done_to_capped(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    _verdict(db, aid, "b" * 64)
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
+    row, _ = _verification_note(db, aid)
+    assert run(db, "list", "--project", "web")[0]["state"] == "capped"
+    assert "1 verdict recorded and no subagent was launched" in row["note"]
+
+
+def test_a_worked_queue_closes_done_and_counts_the_verdicts(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    _agent_sast(db, aid, "c" * 64)
+    _verdict(db, aid, "b" * 64, "confirmed")
+    _verdict(db, aid, "c" * 64, "rejected", "the escaping helper at app/db.py:12")
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "2")
+    row, _ = _verification_note(db, aid)
+    assert run(db, "list", "--project", "web")[0]["state"] == "done"
+    assert row["status"] == "ran"
+    assert "2 verified: 1 confirmed, 1 rejected" in row["note"]
+
+
+def test_an_analysis_with_nothing_to_verify_closes_done(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
+    row, _ = _verification_note(db, aid)
+    assert run(db, "list", "--project", "web")[0]["state"] == "done"
+    assert row["status"] == "ran"
+    assert "No finding was waiting" in row["note"]
+
+
+def test_without_the_flag_the_counts_are_not_compared(tmp_path):
+    """The agent's own close does not know its stream. Only the engine's
+    close passes --tasks-launched, so only it can compare."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    _verdict(db, aid, "b" * 64)
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
+    assert run(db, "list", "--project", "web")[0]["state"] == "done"
+    row, _ = _verification_note(db, aid)
+    assert "subagent" not in row["note"]

@@ -13,8 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "bin"))
 from security import report  # noqa: E402
 
 
-def _f(fp, sev, state="open", branch="develop", **kw):
-    row = {"fingerprint": fp, "branch": branch, "severity": sev, "state": state,
+def _f(fp, sev, state="open", branch="develop", repo="P", **kw):
+    row = {"fingerprint": fp, "repo": repo, "branch": branch, "severity": sev,
+           "state": state,
            "category": "sast", "rule": "a-rule", "title": f"finding {fp[:4]}",
            "cwe": "", "owasp": "", "scope": "", "analysis_id": 1, "first_seen": 0,
            "occurrences": [], "rationale": "", "remediation": ""}
@@ -22,9 +23,11 @@ def _f(fp, sev, state="open", branch="develop", **kw):
     return row
 
 
-META = {"develop": {"id": 11, "commit_sha": "9f8e7d6c5b4a39281706", "profile": "deep"},
-        "main": {"id": 14, "commit_sha": "1122334455667788990a", "profile": "standard"},
-        "release": {"id": 15, "commit_sha": "aabbccddeeff00112233", "profile": "standard"}}
+# Keyed by (repository, branch): the unit a finding is read in. A project with
+# one checkout files it under the project's own name.
+META = {("P", "develop"): {"id": 11, "commit_sha": "9f8e7d6c5b4a39281706", "profile": "deep"},
+        ("P", "main"): {"id": 14, "commit_sha": "1122334455667788990a", "profile": "standard"},
+        ("P", "release"): {"id": 15, "commit_sha": "aabbccddeeff00112233", "profile": "standard"}}
 
 
 def test_a_branch_with_no_findings_is_named_as_clean():
@@ -116,7 +119,7 @@ def test_the_html_is_the_same_document_with_the_same_order_and_escapes_what_it_p
     rows = [_f("b" * 16, "high", title="<b>not markup</b>", branch="main"),
             _f("a" * 16, "critical", branch="main",
                occurrences=[{"file": "app/<x>.py", "line": 3}])]
-    meta = {"main": {"id": 1, "commit_sha": "0011223344556677", "profile": "deep"}}
+    meta = {("P", "main"): {"id": 1, "commit_sha": "0011223344556677", "profile": "deep"}}
     doc = report.consolidated_as_html("P & Q", report._consolidated_groups(rows, meta), {})
     # escaped, never rendered: a title comes from analysed code
     assert "&lt;b&gt;not markup&lt;/b&gt;" in doc and "<b>not markup</b>" not in doc
@@ -128,8 +131,10 @@ def test_the_html_is_the_same_document_with_the_same_order_and_escapes_what_it_p
 
 
 def test_the_sbom_bundle_lists_every_branch_and_says_it_is_not_a_merge():
-    entries = [{"branch": "main", "analysis_id": 1, "commit_sha": "c1", "sbom": {"bomFormat": "CycloneDX"}},
-               {"branch": "develop", "analysis_id": 2, "commit_sha": "c2", "sbom": None}]
+    entries = [{"repo": "P", "branch": "main", "analysis_id": 1, "commit_sha": "c1",
+                "sbom": {"bomFormat": "CycloneDX"}},
+               {"repo": "P", "branch": "develop", "analysis_id": 2, "commit_sha": "c2",
+                "sbom": None}]
     doc = json.loads(report.consolidated_sboms("P", entries, {"at": 5}))
     assert [b["branch"] for b in doc["branches"]] == ["develop", "main"]
     assert doc["branches"][0]["sbom"] is None          # said, not omitted
@@ -172,3 +177,54 @@ def test_the_json_and_html_carry_the_same_annotation():
     assert doc["branches"][0]["open"][0]["fixed_elsewhere"] == fe
     html_doc = report.consolidated_as_html("P", groups, {})
     assert "ALREADY in this branch" in html_doc
+
+
+def test_a_finding_open_on_two_branches_is_one_on_the_screen_and_the_header_says_so():
+    # The screen counts findings -- one row per fingerprint across branches --
+    # while this document lists a finding once per branch it is on. Measured
+    # against rows, a screen showing its one finding read as a screen that
+    # had hidden another.
+    rows = [_f("a" * 16, "high"), _f("a" * 16, "high", branch="main")]
+    md = report.consolidated_as_markdown("P", report._consolidated_groups(rows, META),
+                                         {"shown_on_screen": 1})
+    assert "**Findings:** 2 open (1 distinct across branches)" in md
+    assert "The screen was showing" not in md
+
+
+TWO_REPOS = {("web", "main"): {"id": 1, "commit_sha": "1111111111111111", "profile": "quick"},
+             ("web-admin", "main"): {"id": 2, "commit_sha": "2222222222222222", "profile": "deep"}}
+
+
+def test_two_repositories_on_one_branch_name_are_two_sections_each_at_its_own_commit():
+    # Grouped by branch name, the two `main`s were one section under one
+    # commit -- the one repository's sha printed over the other's findings.
+    rows = [_f("a" * 16, "high", repo="web", branch="main", title="in web"),
+            _f("b" * 16, "high", repo="web-admin", branch="main", title="in web-admin")]
+    groups = report._consolidated_groups(rows, TWO_REPOS)
+    assert [(g["repo"], g["branch"], g["analysis"]["id"], [f["title"] for f in g["open"]])
+            for g in groups] == [("web", "main", 1, ["in web"]),
+                                 ("web-admin", "main", 2, ["in web-admin"])]
+    md = report.consolidated_as_markdown("P", groups, {})
+    assert "## `web` › `main` at `111111111111`" in md
+    assert "## `web-admin` › `main` at `222222222222`" in md
+    # the repository on the finding itself, as the branch is: a finding
+    # copied out of the file keeps the checkout it has to be fixed in
+    assert md.count("- **Repository:** `web-admin`") == 1
+    assert "**Branches:** 2 (in 2 repositories)" in md
+    doc = json.loads(report.consolidated_as_json("P", groups, {}))
+    assert [(b["repo"], b["branch"], b["commit_sha"]) for b in doc["branches"]] == \
+        [("web", "main", "1111111111111111"), ("web-admin", "main", "2222222222222222")]
+    assert doc["branches"][1]["open"][0]["repo"] == "web-admin"
+    html_doc = report.consolidated_as_html("P", groups, {})
+    assert "<code>web-admin</code> › <code>main</code>" in html_doc
+
+
+def test_one_repository_s_document_reads_as_it_always_did():
+    # The control: the repository is said only when there is more than one.
+    rows = [_f("a" * 16, "high"), _f("b" * 16, "low", branch="main")]
+    groups = report._consolidated_groups(rows, META)
+    md = report.consolidated_as_markdown("P", groups, {})
+    assert "## `develop` at `9f8e7d6c5b4a`" in md
+    assert "›" not in md and "**Repository:**" not in md
+    assert "**Branches:** 3\n" in md
+    assert "›" not in report.consolidated_as_html("P", groups, {})

@@ -2,7 +2,7 @@
 import { $, AL, api, toast, projById, fmtDur, fmtWhen, money, createCombo,
          makePicker, pushNav, markPending, clearPending, isPending } from "./page.js";
 import { secIcon, secIconHTML, secEl, secFetch, secPlaceMenu } from "./dom.js";
-import { secConfidenceChip, secCandidateBlock } from "./candidate.js";
+import { secConfidenceChip, secVerdictChip, secCandidateBlock } from "./candidate.js";
 import { SEC_POLL_MS, SEC_PROFILES, SEC_STATES, SEC_STATE_HELP, SEC_STATE_LABEL,
          SEC_NEVER, secCategoryMeta, secCfg, secDefaultProfile, secMinSeverity,
          secPlatformLabel, secRepos, secSevKey, secSevRank, secStateKey, secVisible } from "./vocabulary.js";
@@ -181,9 +181,14 @@ export async function secOpen(project){
 // Branches tab's coverage card (secBranchesSidebar, branches-tab.js) can put
 // a real denominator under "X / Y analyzed" without a second git call. 0
 // until the list has ever answered for this project (the card falls back to
-// counting only the branches ever analysed, and says so).
+// counting only the branches ever analysed, and says so). The repository it
+// counts is kept beside it, from the same fetch: the card has to set it
+// against that repository's own rows, and the launcher's pick can move on
+// before anything else on the screen catches up.
 let secGitBranches = 0;
+let secGitBranchesRepo = "";
 export function secGitBranchCount(){ return secGitBranches; }
+export function secGitBranchRepo(){ return secGitBranchesRepo; }
 
 export async function secLoadBranches(want){
   // Same generation guard as secOpen and secShowAnalysis, for the same reason:
@@ -195,11 +200,13 @@ export async function secLoadBranches(want){
   // and this answer landing, the previous project's count must not pose as
   // the new one's.
   secGitBranches = 0;
+  const repo = $("sec-repo").value;
+  secGitBranchesRepo = repo;
   secBranchCombo.set("…", [{v: "…", label: "…"}]);
   let branches = [];
   try{
     const j = await secFetch("/api/security/branches?project="
-      + encodeURIComponent(secState.project) + "&repo=" + encodeURIComponent($("sec-repo").value));
+      + encodeURIComponent(secState.project) + "&repo=" + encodeURIComponent(repo));
     if(seq !== secState.seq) return;
     branches = j.branches || [];
     secGitBranches = branches.length;
@@ -831,6 +838,8 @@ function secFindingRow(f){
   // finding, it does not classify it (see candidate.js).
   const chip = secConfidenceChip(f);
   if(chip) h.appendChild(chip);
+  const vchip = secVerdictChip(f);
+  if(vchip) h.appendChild(vchip);
   row.appendChild(h);
   const where = document.createElement("ul");
   where.className = "secwhere";

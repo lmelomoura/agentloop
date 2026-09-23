@@ -76,8 +76,15 @@ wt_repos() { # <project> <canonical_cwd>
         '[.projects[] | select(.name==$n) | .repos // [] | .[]] | length' 2>/dev/null)"
   case "$n" in ''|null|*[!0-9]*) n=0 ;; esac
   if [ "$n" -gt 0 ]; then
-    projects_json | "$JQ" -r --arg n "$project" '
+    # An analysis (AL_BASE_OVERRIDE) reads ONE repository -- the one it names,
+    # whose checkout run_job made the run's cwd -- so that row is the whole of
+    # the run. Every row used to come back, each cut from the analysed branch:
+    # a branch of one repository need not exist in another, and a repo that
+    # lacked it aborted the analysis ("no base ref resolvable").
+    projects_json | "$JQ" -r --arg n "$project" --arg c "$cwd" \
+          --arg only "${AL_BASE_OVERRIDE:+1}" '
       .projects[] | select(.name==$n) | .repos[]
+      | select($only == "" or (.path // "") == $c)
       | [(.name // ""), (.path // ""), (.base // "")] | @tsv' 2>/dev/null
     return 0
   fi
@@ -85,8 +92,17 @@ wt_repos() { # <project> <canonical_cwd>
 }
 
 # Should this run be isolated in a worktree? 0 = yes.
-wt_isolation_enabled() { # <project> <canonical_cwd>
-  local project="${1:-}" cwd="${2:-}" mode
+#
+# An analysis always is, whatever the project says: it reads the branch it
+# names, and a worktree cut from that branch is the only way to read a branch
+# without touching the canonical checkout. With the project's isolation off, it
+# ran in the checkout itself -- on whatever branch was checked out there -- and
+# filed the report under the commit of the branch it named. By job id, as every
+# rule about a derived security job is: a resume carries the id, and none of
+# the env the analysis was launched with.
+wt_isolation_enabled() { # <project> <canonical_cwd> [job-id]
+  local project="${1:-}" cwd="${2:-}" id="${3:-}" mode
+  case "$id" in "${SECURITY_JOB_PREFIX:-security-}"*) return 0 ;; esac
   mode="$(project_get "$project" '.worktree.enabled' 'auto')"
   case "$mode" in
     false) return 1 ;;

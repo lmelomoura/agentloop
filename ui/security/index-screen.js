@@ -18,9 +18,10 @@
    when something that changed the numbers just happened (secBack(), after
    leaving a project screen where an analysis may have just finished). */
 import { $, fmtAgo, pageHeader, kpiCard, tableFooter, openProjectEditor, makePicker,
-         closeMenus } from "./page.js";
+         closeMenus, projById } from "./page.js";
 import { secIcon, secIconHTML, secEl, secFetch, secPlaceMenu } from "./dom.js";
-import { SEC_NEVER, SEC_FLOOR_SCOPE_NOTE, secRuleMeta } from "./vocabulary.js";
+import { SEC_NEVER, SEC_FLOOR_SCOPE_NOTE, secRuleMeta, secRepos,
+         secScopeName } from "./vocabulary.js";
 // secSwitchProjectTab: "View full report" (Phase 4 Task 4) opens a project
 // straight onto its own Reports tab -- see secViewFullReportButton, below.
 import { secOpenProject, secSwitchProjectTab } from "./project-screen.js";
@@ -1174,9 +1175,12 @@ function secIndexRecentRow(a){
 
   // textContent, never markup: a branch name may legally contain '<', '>'
   // and '&' (vocabulary.js's own opening comment) and a repository chooses
-  // it, not this page.
+  // it, not this page. The rows mix projects, so whether the repository is
+  // worth naming is the PROJECT's own fact: configured with more than one
+  // (secRepos), two of its runs of `main` are two different branches.
   const tdBranch = document.createElement("td");
-  tdBranch.textContent = a.branch || "—";
+  tdBranch.textContent = secScopeName(a,
+    secRepos(projById(a.project)).map(repo => ({repo}))) || "—";
   tr.appendChild(tdBranch);
 
   const tdFindings = document.createElement("td");
@@ -1393,11 +1397,11 @@ export function secIndexDonutSvg(donut){
    These are distinct fingerprints -- `severity_totals`, which collapses the
    same finding open on two branches into the one problem it is. The findings
    browser's strip, in identical markup and (on the project screen) four
-   inches away on the same page, shows per-severity pills that are ROWS. The
-   strip labels its own `total`/`unique` pair and the donut names its scope in
-   a caption, but the per-severity pills on both sides said only "3 critical"
-   and left the reader to assume the two agreed. They can legitimately
-   differ, so each side now says which question it is answering. */
+   inches away on the same page, counts one row per finding too, but only the
+   findings its current filters match, resolved ones included when asked for.
+   The per-severity pills on both sides used to say only "3 critical" and
+   left the reader to assume the two agreed. They can legitimately differ,
+   so each side says which question it is answering. */
 const DONUT_PILL_TITLE = "Distinct problems (fingerprints) — the same finding "
   + "open on two branches counts once here.";
 

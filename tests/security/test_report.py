@@ -437,10 +437,13 @@ def test_the_agents_own_sast_pass_has_a_row_between_the_pre_pass_and_the_triage(
     where the pass happens: after everything `prepare` filed, before the
     triage that closes the analysis."""
     order = coverage.PHASE_ORDER
-    assert len(order) == 9
+    assert len(order) == 10
     assert coverage.SAST_AGENT == "sast"
     assert order.index(coverage.SAST_AGENT) == order.index(coverage.SAST_PREPASS) + 1
-    assert order[-1] == coverage.TRIAGE
+    # The triage is no longer last: the verification row closes the table,
+    # because it is the last thing that happens -- the hunter reports, and
+    # only then is there anything to disprove.
+    assert order[-2:] == (coverage.TRIAGE, coverage.VERIFICATION)
 
 
 def test_an_analysis_with_no_structured_coverage_renders_exactly_as_before():
@@ -618,3 +621,51 @@ def test_the_consolidated_report_carries_the_block_too():
     assert 'class="cand"' in html_out and "&lt;b&gt;" in html_out
     doc = json.loads(report.consolidated_as_json("web", groups, {"at": 1}))
     assert doc["branches"][0]["open"][0]["candidate"]["impact"]["score"] == "high"
+
+
+# ------------------------------------------------- the verifier's verdict
+
+VERIFIED = dict(FINDINGS[1], state="new", verdict="confirmed",
+                verdict_reason="read app/db.py end to end: the concatenation is unconditional")
+DISPROVED = dict(FINDINGS[1], fingerprint="c" * 64, title="a claim that did not hold",
+                 state="new", verdict="rejected",
+                 verdict_reason="app/db.py:12 is parameterised; the string is a log line")
+
+
+def test_a_verdict_is_printed_under_the_finding():
+    md = report.as_markdown(ANALYSIS, [VERIFIED], "")
+    assert "**Verdict:** confirmed — read app/db.py end to end" in md
+    html_out = report.as_html(ANALYSIS, [VERIFIED], "")
+    assert "confirmed" in html_out and "read app/db.py end to end" in html_out
+
+
+def test_a_disproved_finding_leaves_the_list_and_gets_its_own_section():
+    md = report.as_markdown(ANALYSIS, [VERIFIED, DISPROVED], "")
+    body, _, disproved = md.partition("## Disproved in verification")
+    assert disproved, "the section must exist"
+    assert DISPROVED["title"] in disproved
+    assert "is parameterised" in disproved
+    # It appears once, in its own section: `partition` puts everything above
+    # the heading -- the checklist, the severities and the Findings list -- in
+    # `body`, and the disproved finding is in none of it.
+    assert DISPROVED["title"] not in body
+    doc = json.loads(report.as_json(ANALYSIS, [VERIFIED, DISPROVED], ""))
+    assert doc["summary"]["by_verdict"] == {"confirmed": 1, "needs_validation": 0, "rejected": 1}
+    assert doc["summary"]["by_severity"]["high"] == 1, "a rejected finding is not exposure"
+
+
+def test_a_report_without_verdicts_is_byte_identical_to_before():
+    plain = [dict(f) for f in FINDINGS]
+    empty = [dict(f, verdict="", verdict_reason="") for f in FINDINGS]
+    assert report.as_markdown(ANALYSIS, plain, "") == report.as_markdown(ANALYSIS, empty, "")
+    assert report.as_html(ANALYSIS, plain, "") == report.as_html(ANALYSIS, empty, "")
+    assert "Disproved in verification" not in report.as_markdown(ANALYSIS, plain, "")
+
+
+def test_the_consolidated_report_carries_the_verdict_too():
+    groups = [{"branch": "main", "analysis": dict(ANALYSIS),
+               "open": [dict(VERIFIED, first_seen=1)], "resolved": []}]
+    md = report.consolidated_as_markdown("web", groups, {"at": 1})
+    assert "**Verdict:** confirmed" in md
+    doc = json.loads(report.consolidated_as_json("web", groups, {"at": 1}))
+    assert doc["branches"][0]["open"][0]["verdict"] == "confirmed"

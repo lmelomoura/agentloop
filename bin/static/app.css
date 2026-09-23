@@ -1851,15 +1851,16 @@ button.secrow:hover{border-color:var(--accent);background:var(--panel2)}
    moved up into the page title row (SEC_TAB_TITLES) and the header kept
    only its actions -- see secFindHeader's own comment. */
 .secfind-head-actions{display:flex;gap:10px;flex:none}
-/* The stat strip -- total, five severities, unique issues, all in one card.
-   ProjectFindings.png redraws the old one-container stat strip as SEVEN
+/* The stat strip -- the total and five severities, all in one card.
+   ProjectFindings.png redraws the old one-container stat strip as SIX
    house KPI CARDS (the shared .kpi-grid/.kpi-card, built through the
    kpiCard bridge like the Overview tab's own row) -- the layout is all the
-   shared component's; ".secfind-stat"/"total"/"unique" survive only as
-   unstyled MARKER classes on two of the cards, the hooks the pinned
-   total-vs-unique test finds them by (see _UNSTYLED_CLASS_ALLOWLIST in
-   tests/test_page_contract.py). The severity cards' colour comes from
-   their .sev-* tone class; nothing here styles them any more. */
+   shared component's; ".secfind-stat"/"total" survive only as unstyled
+   MARKER classes on the Total card, the hook the pinned strip test finds
+   it by (see _UNSTYLED_CLASS_ALLOWLIST in tests/test_page_contract.py).
+   The Unique issues card went when the browser became one row per
+   finding: it could only repeat the total. The severity cards' colour
+   comes from their .sev-* tone class; nothing here styles them any more. */
 /* -------------------------------------------------------------- filter bar
    Two rows: wide search plus five "Label: value" pickers, then Category, the
    Show-resolved switch and, right-aligned, Clear filters + the Filters(N)
@@ -2038,6 +2039,17 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 .seccand-scope{font-style:italic;color:var(--muted)}
 .seccand p{margin:6px 0 0}
 .seccand-scored{color:var(--muted)}
+.seccand-verdict{color:var(--muted)}
+/* The verdict chip: what a second agent concluded (ui/security/candidate.js).
+   `confirmed` borrows the ok tone -- it survived an attempt to disprove it;
+   `needs_validation` the warn tone; `disproved` stays neutral and takes the
+   row's opacity with it, because it is a record and not work. */
+.secverdict{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;
+  border-radius:20px;padding:1px 8px;margin-left:5px;background:var(--panel2);
+  color:var(--muted);border:1px solid var(--line);white-space:nowrap}
+.secverdict.confirmed{background:var(--ok-soft);color:var(--ok);border-color:transparent}
+.secverdict.needs_validation{background:var(--warn-soft);color:var(--warn);border-color:transparent}
+.secfind-table tr.verdict-rejected td{opacity:.6}
 .secwhere{margin:9px 0 0;padding-left:18px;font:11.5px/1.65 ui-monospace,"SF Mono",Menlo,monospace;
   color:var(--muted);word-break:break-all}
 .secfinding p{margin:8px 0 0;font-size:12.5px;line-height:1.6}
@@ -2933,5 +2945,5 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 /* cover, not fill: a photo that is not square is cropped rather than stretched */
 .pf-face img{width:100%;height:100%;object-fit:cover;display:block}
 .pf-photo-a{display:flex;gap:8px;flex-wrap:wrap}
-/* ui-bundle: 0fcc61122038c9d9ea401796ba022e868990a6d370d3071e830bd3b9a96de355 */
-/* ui-sources: a427659a41818346d46a7603c9b048a4e82446b82b017c4d47cefed75ae37191 */
+/* ui-bundle: f23736f2dca0ef85e3926a673ce813361ea2ded7085ba3ed8469367a0d7ac85e */
+/* ui-sources: 921ad9161b3324699171abac8807904b91ef2844429ae5d73598058f5208dcd3 */

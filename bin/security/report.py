@@ -15,7 +15,7 @@ from . import coverage
 # a second copy is how the export and the screen would come to disagree
 # about which findings are still work. queries imports diff and ledger,
 # never report, so this cannot cycle.
-from .queries import RESOLVED_STATES
+from .queries import RESOLVED_STATES, counted
 
 STATES = ("new", "regressed", "open", "partial", "pending", "fixed", "accepted", "false_positive")
 # Ordered most severe first. `info` is last on purpose: it is below the default
@@ -43,15 +43,21 @@ def _worst_first(findings):
 def _summary(findings):
     by_state = {s: 0 for s in STATES}
     by_severity = {s: 0 for s in SEVERITIES}
+    # Always all three keys, whatever this analysis recorded: a consumer has to
+    # be able to tell "none were rejected" from "this report predates verdicts"
+    # without special-casing a missing key -- the rule `scope` already follows.
+    by_verdict = {"confirmed": 0, "needs_validation": 0, "rejected": 0}
     accepted_in_severity = 0
     for f in findings:
         by_state[f["state"]] = by_state.get(f["state"], 0) + 1
-        if f["state"] not in ("fixed", "false_positive"):
+        if f.get("verdict") in by_verdict:
+            by_verdict[f["verdict"]] += 1
+        if f["state"] not in ("fixed", "false_positive") and f.get("verdict") != "rejected":
             by_severity[f["severity"]] = by_severity.get(f["severity"], 0) + 1
             if f["state"] == "accepted":
                 accepted_in_severity += 1
-    return {"by_state": by_state, "by_severity": by_severity, "total": len(findings),
-            "accepted_in_severity": accepted_in_severity}
+    return {"by_state": by_state, "by_severity": by_severity, "by_verdict": by_verdict,
+            "total": len(findings), "accepted_in_severity": accepted_in_severity}
 
 
 def _unknown_states(by_state):
@@ -143,6 +149,36 @@ def _candidate_html(f) -> str:
         parts.append("<p>" + " · ".join(scored) + "</p>")
     parts.append("</div>")
     return "".join(parts)
+
+
+# A verdict under the finding, and nothing when there is none -- the same
+# contract `_candidate_md` keeps, so a report over a ledger nobody verified is
+# byte for byte what it was.
+def _verdict_md(f) -> list:
+    if not f.get("verdict"):
+        return []
+    return [f"**Verdict:** {f['verdict']} — {_md_cell(f.get('verdict_reason', ''))}"]
+
+
+def _verdict_html(f) -> str:
+    if not f.get("verdict"):
+        return ""
+    e = html.escape
+    return (f'<p class="verdict {e(f["verdict"])}"><strong>Verdict:</strong> '
+            f'{e(f["verdict"])} — {e(f.get("verdict_reason", ""))}</p>')
+
+
+def _split_disproved(findings):
+    """(what is still exposure, what a verifier disproved). Two lists in one
+    pass, so no renderer can put a finding in both or in neither."""
+    live = [f for f in findings if f.get("verdict") != "rejected"]
+    return live, [f for f in findings if f.get("verdict") == "rejected"]
+
+
+# Said above the disproved section, once: a reader who meets a list of
+# findings under a security report assumes they are work.
+DISPROVED_LEAD = ("A verifier read the code and disproved these. They are "
+                  "recorded, and they are not counted as exposure.")
 
 
 def _coverage(analysis, coverage_note):
@@ -267,8 +303,9 @@ def as_markdown(analysis, findings, coverage_note):
     if s["accepted_in_severity"]:
         n = s["accepted_in_severity"]
         out += ["", f"_(includes {n} accepted risk{'s' if n != 1 else ''})_"]
+    live, disproved = _split_disproved(findings)
     out += ["", "## Findings", ""]
-    for f in _worst_first(findings):
+    for f in _worst_first(live):
         out += [f"### [{f['severity']}] {f['title']} — `{f['state']}`", "",
                 f"**Rule:** `{f['rule']}` ({f['category']})"]
         if f.get("cwe"):
@@ -284,6 +321,16 @@ def as_markdown(analysis, findings, coverage_note):
         if block:
             out += block + [""]
         out += [f"**Remediation:** {f['remediation']}", ""]
+        out += _verdict_md(f) + ([""] if f.get("verdict") else [])
+    if disproved:
+        out += ["## Disproved in verification", "", DISPROVED_LEAD, ""]
+        for f in _worst_first(disproved):
+            out += [f"### [{f['severity']}] {f['title']}", "",
+                    f"**Rule:** `{f['rule']}` ({f['category']})", ""]
+            out += [f"- `{o['file']}`" + (f":{o['line']}" if o["line"] else "")
+                    for o in f["occurrences"]]
+            out += ["", f"**Why it was disproved:** "
+                    f"{_md_cell(f.get('verdict_reason', ''))}", ""]
     return "\n".join(out)
 
 
@@ -302,7 +349,9 @@ border-radius:3px}@media print{.f{break-inside:avoid}}
 .cov th{background:#f4f4f5;font-weight:600}
 .cov .cov-ok{color:#15803d}.cov .cov-warn{color:#b45309}.cov .cov-gap{color:#b91c1c}
 .cand{margin:.5rem 0;padding:.5rem .75rem;border-left:3px solid #d4d4d8;background:#fafafa}
-.cand ol,.cand ul{margin:.25rem 0 .5rem 1.25rem}"""
+.cand ol,.cand ul{margin:.25rem 0 .5rem 1.25rem}
+.verdict{margin:.35rem 0;font-size:.95em}
+.verdict.rejected{color:#6b7280}"""
 
 # The CSS class a status cell carries, DELIBERATELY NOT SPELLED LIKE THE
 # STATUS. The class used to be the status word itself, and the test that
@@ -355,8 +404,9 @@ def as_html(analysis, findings, coverage_note):
     if s["accepted_in_severity"]:
         n = s["accepted_in_severity"]
         parts.append(f'<p class="note">Includes {n} accepted risk{"s" if n != 1 else ""}.</p>')
+    live, disproved = _split_disproved(findings)
     parts.append("<h2>Findings</h2>")
-    for f in _worst_first(findings):
+    for f in _worst_first(live):
         locs = "".join(
             f"<li><code>{e(o['file'])}{':' + e(str(o['line'])) if o['line'] else ''}</code></li>"
             for o in f["occurrences"])
@@ -374,7 +424,20 @@ def as_html(analysis, findings, coverage_note):
             f"<p>Rule <code>{e(f['rule'])}</code> ({e(f['category'])})</p>"
             f"{cls}{scope}"
             f"<ul>{locs}</ul><p>{e(f['rationale'])}</p>{_candidate_html(f)}"
-            f"<p><strong>Remediation:</strong> {e(f['remediation'])}</p></div>")
+            f"<p><strong>Remediation:</strong> {e(f['remediation'])}</p>"
+            f"{_verdict_html(f)}</div>")
+    if disproved:
+        parts.append(f"<h2>Disproved in verification</h2><p>{e(DISPROVED_LEAD)}</p>")
+        for f in _worst_first(disproved):
+            locs = "".join(
+                f"<li><code>{e(o['file'])}{':' + e(str(o['line'])) if o['line'] else ''}</code></li>"
+                for o in f["occurrences"])
+            parts.append(
+                f'<div class="f {e(f["severity"])}">'
+                f"<h3>[{e(f['severity'])}] {e(f['title'])}</h3>"
+                f"<p>Rule <code>{e(f['rule'])}</code> ({e(f['category'])})</p>"
+                f"<ul>{locs}</ul><p><strong>Why it was disproved:</strong> "
+                f"{e(f.get('verdict_reason', ''))}</p></div>")
     return "".join(parts)
 
 
@@ -393,11 +456,23 @@ def _consolidated_meta_lines(project, groups, meta):
     whether to trust the list, before the list."""
     total = sum(len(g["open"]) + len(g["resolved"]) for g in groups)
     open_n = sum(len(g["open"]) for g in groups)
+    # THE SCREEN COUNTS FINDINGS, THIS DOCUMENT COUNTS ROWS. The browser shows
+    # one row per fingerprint across branches (queries.finding_rows, grouped);
+    # this document lists a finding once per branch it is on, because a fix is
+    # applied on a branch. Both numbers are said when they differ, and the
+    # screen's own count below is measured against the distinct one -- against
+    # rows, a screen showing its one finding read as a screen that had hidden
+    # another.
+    open_distinct = len({f["fingerprint"] for g in groups for f in g["open"]})
     res_n = total - open_n
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(meta.get("at") or time.time()))
+    repos = len({g.get("repo", "") for g in groups})
     out = [f"- **Exported:** {when}",
-           f"- **Branches:** {len(groups)}",
-           f"- **Findings:** {open_n} open" + (f", {res_n} resolved (listed last)" if res_n else "")]
+           f"- **Branches:** {len(groups)}"
+           + (f" (in {repos} repositories)" if _repos_named(groups) else ""),
+           f"- **Findings:** {open_n} open"
+           + (f" ({open_distinct} distinct across branches)" if open_distinct != open_n else "")
+           + (f", {res_n} resolved (listed last)" if res_n else "")]
     # THE FILTERS THE SCREEN HAD ON, SAID OUT LOUD. Someone who narrowed the
     # page to Critical and then exported gets every severity in the file; the
     # page already promises that ("Downloads always contain every recorded
@@ -428,7 +503,7 @@ def _consolidated_meta_lines(project, groups, meta):
             bits.append(f"{pending} fixed on another branch but not yet in this one")
         out.append("- **Fixed elsewhere:** " + "; ".join(bits))
     shown = meta.get("shown_on_screen")
-    if shown is not None and shown != open_n:
+    if shown is not None and shown != open_distinct:
         out.append(f"- **The screen was showing {shown} of these.** Filters and the"
                    " project's severity floor are NOT applied to this document:"
                    " it carries everything recorded.")
@@ -438,38 +513,61 @@ def _consolidated_meta_lines(project, groups, meta):
     return out
 
 
-def _consolidated_groups(rows, branch_meta):
-    """`rows` (queries.finding_rows, every page) grouped by branch, each group
-    split into open and resolved and each list ordered.
+def _consolidated_groups(rows, scope_meta):
+    """`rows` (queries.finding_rows, every page) grouped by the (repository,
+    branch) they were read in, each group split into open and resolved and
+    each list ordered. `scope_meta` -- the analysis each one was read by --
+    is keyed the same way.
 
-    ORDER IS PART OF THE CONTRACT: branch alphabetically, then severity worst
-    first, then fingerprint. The last key is not decoration -- without a total
-    order, two exports of an unchanged project differ in the order of two
-    equally severe findings, and the first thing anyone does with two of these
-    files is diff them.
+    BY REPOSITORY AND BRANCH, NOT BY BRANCH NAME. A fix is applied in a
+    checkout: `main` of one repository and `main` of another are two places,
+    read by two analyses at two commits. Grouped by name they were one
+    section, under one of the two commits.
+
+    ORDER IS PART OF THE CONTRACT: repository, then branch alphabetically,
+    then severity worst first, then fingerprint. The last key is not
+    decoration -- without a total order, two exports of an unchanged project
+    differ in the order of two equally severe findings, and the first thing
+    anyone does with two of these files is diff them.
     """
-    by_branch = {}
+    by_scope = {}
     for r in rows:
-        by_branch.setdefault(r["branch"], []).append(r)
+        by_scope.setdefault((r.get("repo", ""), r["branch"]), []).append(r)
     groups = []
-    for br in sorted(set(list(by_branch) + list(branch_meta))):
-        items = _worst_first(by_branch.get(br, []))
-        m = branch_meta.get(br, {})
-        groups.append({"branch": br, "analysis": m,
-                       "open": [r for r in items if r["state"] not in RESOLVED_STATES],
-                       "resolved": [r for r in items if r["state"] in RESOLVED_STATES]})
+    for repo, br in sorted(set(by_scope) | set(scope_meta)):
+        items = _worst_first(by_scope.get((repo, br), []))
+        m = scope_meta.get((repo, br), {})
+        groups.append({"repo": repo, "branch": br, "analysis": m,
+                       "open": [r for r in items if counted(r)],
+                       "resolved": [r for r in items if not counted(r)]})
     return groups
 
 
-def _consolidated_finding_md(f, branch):
+def _repos_named(groups) -> bool:
+    """Whether the document names repositories at all: only when it spans
+    more than one. A project with one checkout files every analysis under
+    that one repository, and naming it on every heading is noise -- the
+    document reads exactly as it did before repositories were told apart."""
+    return len({g.get("repo", "") for g in groups}) > 1
+
+
+def _scope_md(g, named) -> str:
+    return (f"`{g.get('repo', '')}` › " if named else "") + f"`{g['branch']}`"
+
+
+def _consolidated_finding_md(f, branch, repo=None):
     """One finding, with everything an agent needs to act and nothing it does
     not. The fingerprint leads because it is the identity that survives
     branches and analyses, and it is what the agent quotes back when it
-    reports what it fixed."""
+    reports what it fixed. `repo`, when the document names repositories,
+    rides beside the branch for the branch's own reason: a finding copied out
+    of the file keeps the checkout it has to be fixed in."""
     out = [f"#### [{f['severity']}] {f['title']}", "",
-           f"- **Fingerprint:** `{f['fingerprint']}`",
-           f"- **Branch:** `{branch}`",
-           f"- **State:** {f['state']} · **Rule:** `{f['rule']}` ({f['category']})"]
+           f"- **Fingerprint:** `{f['fingerprint']}`"]
+    if repo:
+        out.append(f"- **Repository:** `{repo}`")
+    out += [f"- **Branch:** `{branch}`",
+            f"- **State:** {f['state']} · **Rule:** `{f['rule']}` ({f['category']})"]
     if f.get("cwe"):
         out.append(f"- **Class:** {f['cwe']}"
                    + (f" · OWASP {f['owasp']}" if f.get("owasp") else ""))
@@ -487,6 +585,9 @@ def _consolidated_finding_md(f, branch):
     block = _candidate_md(f)
     if block:
         out += [""] + block
+    verdict_line = _verdict_md(f)
+    if verdict_line:
+        out += [""] + verdict_line
     if f.get("remediation"):
         out += ["", f"**Remediation:** {f['remediation']}"]
     out.append("")
@@ -522,11 +623,12 @@ def consolidated_as_markdown(project, groups, meta):
             " elsewhere is not recorded against this finding until that branch is"
             " analysed again.",
             ""]
+    named = _repos_named(groups)
     for g in groups:
         a = g["analysis"] or {}
         at = f" at `{a['commit_sha'][:12]}`" if a.get("commit_sha") else ""
         prof = f" · {a['profile']}" if a.get("profile") else ""
-        out += [f"## `{g['branch']}`{at}{prof}", ""]
+        out += [f"## {_scope_md(g, named)}{at}{prof}", ""]
         if not g["open"] and not g["resolved"]:
             # A CLEAN BRANCH IS SAID, NEVER OMITTED. An agent that does not see
             # a branch cannot tell "nothing to do here" from "nobody looked",
@@ -536,7 +638,8 @@ def consolidated_as_markdown(project, groups, meta):
         if g["open"]:
             out += [f"### Open — {len(g['open'])}", ""]
             for f in g["open"]:
-                out += _consolidated_finding_md(f, g["branch"])
+                out += _consolidated_finding_md(f, g["branch"],
+                                                g.get("repo") if named else None)
         if g["resolved"]:
             out += [f"### Resolved on this branch — {len(g['resolved'])} (no action needed)", ""]
             for f in g["resolved"]:
@@ -548,7 +651,9 @@ def consolidated_as_markdown(project, groups, meta):
 
 def consolidated_as_json(project, groups, meta):
     """The same document for a reader that parses. Same order, same content:
-    two renderers over one grouping, never two groupings."""
+    two renderers over one grouping, never two groupings. `repo` is on every
+    branch and every finding whether or not the other two name it -- a
+    parser reads one schema, not one per project shape."""
     doc = {"project": project,
            "exported_at": int(meta.get("at") or time.time()),
            "filters_applied": False,
@@ -557,18 +662,21 @@ def consolidated_as_json(project, groups, meta):
            "branches": []}
     for g in groups:
         a = g["analysis"] or {}
+        repo = g.get("repo", "")
         doc["branches"].append({
+            "repo": repo,
             "branch": g["branch"],
             "analysis_id": a.get("id"),
             "commit_sha": a.get("commit_sha", ""),
             "profile": a.get("profile", ""),
-            "open": [_consolidated_finding_json(f, g["branch"]) for f in g["open"]],
-            "resolved": [_consolidated_finding_json(f, g["branch"]) for f in g["resolved"]]})
+            "open": [_consolidated_finding_json(f, repo, g["branch"]) for f in g["open"]],
+            "resolved": [_consolidated_finding_json(f, repo, g["branch"])
+                         for f in g["resolved"]]})
     return json.dumps(doc, indent=2, sort_keys=False)
 
 
-def _consolidated_finding_json(f, branch):
-    return {"fingerprint": f["fingerprint"], "branch": branch,
+def _consolidated_finding_json(f, repo, branch):
+    return {"fingerprint": f["fingerprint"], "repo": repo, "branch": branch,
             "severity": f["severity"], "state": f["state"],
             "category": f["category"], "rule": f["rule"], "title": f["title"],
             "cwe": f.get("cwe", ""), "owasp": f.get("owasp", ""),
@@ -578,6 +686,8 @@ def _consolidated_finding_json(f, branch):
             "rationale": f.get("rationale", ""),
             "remediation": f.get("remediation", ""),
             "candidate": f.get("candidate"),
+            "verdict": f.get("verdict", ""),
+            "verdict_reason": f.get("verdict_reason", ""),
             "first_seen": f.get("first_seen", 0),
             "analysis_id": f.get("analysis_id"),
             "fixed_elsewhere": f.get("fixed_elsewhere")}
@@ -601,11 +711,15 @@ def consolidated_as_html(project, groups, meta):
               " that branch was analysed at. Apply a fix on that branch; a fix made"
               " elsewhere is not recorded against this finding until that branch is"
               " analysed again.</p>"]
+    named = _repos_named(groups)
     for g in groups:
         a = g["analysis"] or {}
         at = f" at <code>{e(a['commit_sha'][:12])}</code>" if a.get("commit_sha") else ""
         prof = f" · {e(a['profile'])}" if a.get("profile") else ""
-        parts.append(f"<h2><code>{e(g['branch'])}</code>{at}{prof}</h2>")
+        where = ((f"<code>{e(g.get('repo', ''))}</code> › " if named else "")
+                 + f"<code>{e(g['branch'])}</code>")
+        parts.append(f"<h2>{where}{at}{prof}</h2>")
+        in_repo = f" · Repository <code>{e(g.get('repo', ''))}</code>" if named else ""
         if not g["open"] and not g["resolved"]:
             parts.append('<p class="note">No findings recorded on this branch.</p>')
             continue
@@ -624,13 +738,13 @@ def consolidated_as_html(project, groups, meta):
                       if fe_lines else "")
                 parts.append(
                     f'<div class="f {e(f["severity"])}"><h4>[{e(f["severity"])}] {e(f["title"])}</h4>'
-                    f"<p>Fingerprint <code>{e(f['fingerprint'])}</code> · Branch"
+                    f"<p>Fingerprint <code>{e(f['fingerprint'])}</code>{in_repo} · Branch"
                     f" <code>{e(g['branch'])}</code> · {e(f['state'])}</p>"
                     f"<p>Rule <code>{e(f['rule'])}</code> ({e(f['category'])})</p>"
                     f"{cls}{scope}{fe}"
                     + (f"<ul>{locs}</ul>" if locs else "")
                     + (f"<p>{e(f['rationale'])}</p>" if f.get("rationale") else "")
-                    + _candidate_html(f)
+                    + _candidate_html(f) + _verdict_html(f)
                     + (f"<p><strong>Remediation:</strong> {e(f['remediation'])}</p>"
                        if f.get("remediation") else "")
                     + "</div>")
@@ -652,13 +766,17 @@ def consolidated_sboms(project, entries, meta):
     from, and says so in the envelope. A branch whose analysis stored no SBOM
     (no lockfile in the tree) is listed with `sbom: null` rather than left
     out, for the reason the Markdown lists a clean branch: absence has to be
-    said, or a reader cannot tell "no inventory" from "not looked at".
+    said, or a reader cannot tell "no inventory" from "not looked at". One
+    entry per branch OF A REPOSITORY, which each entry names: two
+    repositories' `main` are two inventories too.
     """
     doc = {"project": project,
            "exported_at": int(meta.get("at") or time.time()),
            "format": "one CycloneDX document per branch, side by side; not a merge",
-           "branches": [{"branch": en["branch"], "analysis_id": en.get("analysis_id"),
+           "branches": [{"repo": en.get("repo", ""), "branch": en["branch"],
+                         "analysis_id": en.get("analysis_id"),
                          "commit_sha": en.get("commit_sha", ""),
                          "sbom": en.get("sbom")}
-                        for en in sorted(entries, key=lambda x: x["branch"])]}
+                        for en in sorted(entries, key=lambda x: (x.get("repo", ""),
+                                                                 x["branch"]))]}
     return json.dumps(doc, indent=2)

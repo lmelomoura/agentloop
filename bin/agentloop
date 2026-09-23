@@ -557,10 +557,22 @@ SECURITY_FALLBACK_BUDGET_USD=2
 # CLI that ever dropped the flag would fail loudly at launch rather than run
 # the analysis with the tool quietly back open.
 #
-# Deliberately NOT a per-project setting the way model or budget are: a
-# `security.disallowed_tools` a project could set would be a way to re-open the
-# tool, and re-opening it is exactly the $51 the measurement above paid for.
-SECURITY_DISALLOWED_TOOLS="Agent"
+# WHAT CHANGED, AND WHY THE MEASUREMENT ABOVE STILL GOVERNS. The verification
+# phase (block 4.2) IS subagents: a second agent with fresh context that reads
+# the code, tries to disprove one finding and writes its own verdict through
+# `report-verdict`. Closing the tool would close the phase. So the door moved
+# from the flag to the CLOSE: `security_task_count` counts the `Task` calls in
+# the run's stream and `finish --tasks-launched` compares that number with the
+# verdicts recorded in the ledger. Subagents that produced no verdict -- six
+# hunters splitting the repository, which is what analysis 9 spent $51.44 on --
+# lower `done` to `capped` with both numbers in the report, and so do verdicts
+# with no subagent behind them and findings nobody verified. Asking is what
+# failed in the first place; counting does not.
+#
+# Deliberately NOT a per-project setting the way model or budget are, in
+# either direction: what a security analysis may launch is this file's
+# decision, not a field a project can widen.
+SECURITY_DISALLOWED_TOOLS=""
 
 # How long an analysis row that says `running` is given the benefit of the doubt
 # when the derived job holds no live slot (see the sweep in cmd_security_analyze).
@@ -720,12 +732,19 @@ It runs the deterministic phases inside this worktree -- secrets, dependency
 CVEs, SBOM, hygiene and infrastructure-as-code misconfigurations -- in seconds
 and at no token cost, and prints a coverage note you must repeat in your final
 message if it is not empty."
-    agents_para="You have no \`Agent\` tool in this run -- the CLI's own tool roster calls it
-\`Task\`, and it is the same tool under both names. It is closed at launch, on
-purpose. Two earlier analyses spent their whole budget fanning the SAST pass out
-to six subagents and triaged none of the deterministic findings -- which is the
-part that matters most. Do the work yourself, in this one session, and spend the
-budget on triage first."
+    agents_para="You HAVE subagents in this run, and they have one use: verification.
+After you have reported your findings, \`agentloop security verify-queue
+--analysis $5\` lists the ones a second agent has to try to disprove, worst
+first. For each, \`agentloop security verify-prompt --analysis $5 --fingerprint
+<fp>\` prints the text to launch a subagent with -- pass it as written; it is
+built from the ledger, not by you. The subagent reads the code and writes its
+own verdict; you do not write it and you do not summarise it.
+The close counts this: every subagent this run launched is compared with every
+verdict recorded, and findings left unverified, subagents that produced no
+verdict, and verdicts with no subagent each lower \`done\` to \`capped\` with the
+numbers in the report. Use subagents for nothing else -- two earlier analyses
+spent their whole budget fanning the SAST pass out to six of them and triaged
+none of the deterministic findings, which is what the count exists to catch."
   fi
   cat <<EOF
 $skill_para
@@ -854,15 +873,20 @@ cmd_security_branches() { # cmd_security_branches <project> <repo> -> every
 # request file is shared and mutable -- the next analysis of this project
 # rewrites it -- so a close that reads it can land on another analysis's row.
 #
+# AL_SECURITY_REPO is the repo the analysis names, beside AL_BASE_OVERRIDE, its
+# branch, and for the same reason: run_job runs the analysis in THAT repo's
+# checkout, which on a project spanning several is not the project's cwd.
+# Empty (a caller from before it existed) inherits the project's cwd.
+#
 # A prefix assignment on a FUNCTION call, not an `export`: bash puts both in the
 # environment of everything the call reaches (run_job -> env -> claude -> the
 # agent's Bash tool) and takes them back out when it returns, so the sweep below
 # and everything after it run unmarked.
-security_run_analysis() { # security_run_analysis <job-id> <analysis-id> <branch>
-  local jid="$1" aid="$2" branch="$3" rc=0
+security_run_analysis() { # security_run_analysis <job-id> <analysis-id> <branch> [repo]
+  local jid="$1" aid="$2" branch="$3" repo="${4:-}" rc=0
   # --force because a derived job is disabled: it exists to be run on demand,
   # never on a tick.
-  AL_BASE_OVERRIDE="$branch" AL_SKIP_PROVISION=1 \
+  AL_BASE_OVERRIDE="$branch" AL_SKIP_PROVISION=1 AL_SECURITY_REPO="$repo" \
   AL_SECURITY_AGENT=1 CC_SECURITY_AGENT=1 \
   AL_SECURITY_ANALYSIS_ID="$aid" CC_SECURITY_ANALYSIS_ID="$aid" \
     run_job "$jid" --force || rc=$?
@@ -1008,7 +1032,7 @@ EOF
     # cannot group-kill it; `trap '' HUP` is what nohup(1) does.
     set -m
     ( trap '' HUP
-      exec "$SELF" __run-analysis "$jid" "$aid" "$branch"
+      exec "$SELF" __run-analysis "$jid" "$aid" "$branch" "$repo"
     ) </dev/null >> "$DATA_DIR/exec.log" 2>&1 &
     local dpid=$!
     disown "$dpid" 2>/dev/null || true
@@ -1019,7 +1043,7 @@ EOF
     printf '{"analysis_id":%s}\n' "$aid"
     return 0
   fi
-  security_run_analysis "$jid" "$aid" "$branch"
+  security_run_analysis "$jid" "$aid" "$branch" "$repo"
 }
 
 # Called from run_job at the same point run_end_hook already is, and BEFORE it:
@@ -1054,6 +1078,33 @@ security_guides_read() { # security_guides_read <stream.ndjson> -> a,b | '' | un
       | match("security-analysis/references/([A-Z][A-Z-]*)\\.md"; "g")
       | .captures[0].string' "$f" 2>/dev/null)" || { printf 'unknown\n'; return 0; }
   printf '%s\n' "$out" | grep -v '^$' | sort -u | paste -s -d, -
+}
+
+# How many subagents a run launched, off its own stream.
+#
+# BOTH NAMES, AND THE MEASUREMENT IS THE REASON. The same tool answers to
+# `Agent` and to `Task`: `--disallowedTools Agent` is what the CLI accepts,
+# the roster in its `init` event calls it `Task`, and -- measured on the block
+# 4.2 acceptance run, 2026-09-23 -- what a `tool_use` block in the stream
+# actually carries is **`Agent`**. Counting one name found zero subagents in a
+# run that launched one, and the close then accused the analysis of writing a
+# verdict nobody earned. OpenCode's normaliser canonicalises its own `task` to
+# `Task`, so both spellings have to be counted wherever this runs.
+#
+# EMPTY, NOT 0, when there is no stream to read: the close omits the flag
+# entirely then, and `finish` makes no comparison at all. Answering 0 for a
+# stream nobody could read would accuse an analysis of writing verdicts out of
+# thin air on the strength of a missing file.
+security_task_count() { # security_task_count <stream.ndjson> -> <n> | ''
+  local f="${1:-}" n
+  [ -n "$f" ] && [ -r "$f" ] || return 0
+  # `grep -c` exits 1 on zero matches, so the count is taken with `|| true`:
+  # a run that launched no subagent must answer 0, which is a FACT the close
+  # compares, and not the empty "nothing to say" a missing stream gives.
+  n="$("$JQ" -R -r 'fromjson? | select(.type == "assistant") | .message.content[]?
+      | select(.type == "tool_use") | select(.name == "Task" or .name == "Agent") | 1' "$f" 2>/dev/null \
+      | { grep -c '^1$' || true; })"
+  printf '%s\n' "${n:-0}"
 }
 
 security_close_analysis() { # <job-id> <status> <cost> <wdreason> [stream]
@@ -1099,8 +1150,13 @@ security_close_analysis() { # <job-id> <status> <cost> <wdreason> [stream]
   # `--guides-read` is the engine's to pass, never the agent's: this close
   # has the run's stream (or knows it has not), and `finish` writes the
   # sentence only when the flag is present. See security_guides_read.
+  # `--tasks-launched` only when there IS a stream: an absent flag means "the
+  # engine has nothing to say about subagents", which is a different fact from
+  # "none were launched" and `finish` treats it as one.
+  local tasks; tasks="$(security_task_count "${5:-}")"
   security_py finish --analysis "$aid" --state "$state" --spend "${3:-0}" \
     --guides-read "$(security_guides_read "${5:-}")" \
+    ${tasks:+--tasks-launched "$tasks"} \
     >/dev/null 2>&1 || log_tick "$1: could not close analysis $aid"
 }
 
@@ -1136,10 +1192,63 @@ state_get() { # state_get <id> <field> [default]
 # record a run had just appended could be lost to the very mechanism meant to
 # protect it. `acquire_lock` already knew the right answer (write your pid, and
 # only break the lock when that pid is gone); this generalises it to the rest.
-LOCK_GRACE_SECONDS="${AGENTLOOP_LOCK_GRACE:-30}"
+# A plain decimal number, or the default: every lock below does arithmetic
+# with it, and a value such as abc (an unset variable, under set -u) or 08 (no
+# octal digit) killed the engine at the first lock found with no pid.
+LOCK_GRACE_SECONDS=$(( 10#$(num "${AGENTLOOP_LOCK_GRACE:-}" 30) ))
+
+# An owner with no pid to read is a taker between its mkdir and its pid, or
+# one killed there, and only the lock's own age tells them apart. A directory
+# changes only when an entry is added or removed, so a lock with no pid in it
+# is as old as its mkdir: older than the grace, it is nobody's; younger, it is
+# a taker on its way, and never broken, however long anyone has waited on it.
+# Both clocks count whole seconds, so a lock whose count reads the grace may
+# be up to a second younger than it: "older than" is -gt, never -ge. A lock
+# gone meanwhile reads as brand new.
+lock_abandoned() { # lock_abandoned <lockdir> — 0 = older than the grace; asked only of a lock with no pid
+  local now born
+  now="$(now_epoch)"; born="$(num "$(stat -f %m "$1" 2>/dev/null)" "$now")"
+  [ $(( now - born )) -gt "$LOCK_GRACE_SECONDS" ]
+}
+
+# The bounded wait's own measure: a lock at least <seconds> old, whoever it
+# names. LOCK_AGE carries the age read, for the caller to say.
+lock_older_than() { # lock_older_than <lockdir> <seconds> — 0 = at least that old
+  local now born
+  now="$(now_epoch)"; born="$(num "$(stat -f %m "$1" 2>/dev/null)" "$now")"
+  LOCK_AGE=$(( now - born ))
+  [ "$LOCK_AGE" -ge "$2" ]
+}
+
+# Breaking a lock is check-then-act. Two waiters that judged the same stale
+# lock each removed "it", and the slower one removed the lock the faster one
+# had just taken in its place: both then held it -- two rewrites of the
+# journal, two writers of models.json, two refreshes at once. So a lock is
+# judged as ONE directory: which one (lock_id) travels with the judgement, and
+# lock_break removes it only while it is still that directory naming the same
+# owner, under the lock's breaker -- a hidden sibling taken by mkdir, so no
+# other breaker looks between that check and the rm. The server's
+# journal_lock takes the same breaker by the same name. A breaker lives for a
+# stat, a cat and an rm; one older than LOCK_BREAKER_STALE seconds was left by
+# a breaker killed there, and goes.
+LOCK_BREAKER_STALE=5
+lock_id() { stat -f '%i:%B' "$1" 2>/dev/null; }   # inode and birth: a directory made again never reads the same
+lock_break() { # lock_break <lockdir> <lock_id> <pid it named, empty for none> — 0 = the lock is gone
+  local d="$1" b="${1%/*}/.${1##*/}.break" now born
+  if mkdir "$b" 2>/dev/null; then
+    if [ -n "$2" ] && [ "$(lock_id "$d")" = "$2" ] && [ "$(cat "$d/pid" 2>/dev/null || true)" = "$3" ]; then
+      rm -rf "$d" 2>/dev/null
+    fi
+    rmdir "$b" 2>/dev/null
+  else
+    now="$(now_epoch)"; born="$(num "$(stat -f %m "$b" 2>/dev/null)" "$now")"
+    [ $(( now - born )) -le "$LOCK_BREAKER_STALE" ] || rmdir "$b" 2>/dev/null
+  fi
+  [ ! -e "$d" ]
+}
 
 lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with <seconds>, for a lock only ever held a moment: gives up (1) once they have passed
-  local d="${1:-}" hold i=0 deadline="" stale="" aged="" now born
+  local d="${1:-}" hold deadline="" stale="" aged="" lid
   # A bound counts on the shell's own clock, in whole seconds and with no
   # fork; the extra second makes the wait at least <seconds>, never less. A
   # lock is old enough to take once it is older than the grace AND twice the
@@ -1165,17 +1274,24 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
     # earlier boot, which a bare kill -0 cannot express at all. A lock that
     # will not go (a read-only directory) falls through to the wait below
     # rather than straight back to mkdir, so a bound still ends it: it used
-    # to spin on rm for ever.
+    # to spin on rm for ever. The break goes through lock_break, which
+    # removes the lock only while it still names the owner judged gone: a
+    # lock another waiter has broken and taken meanwhile names somebody else,
+    # or nobody yet.
     if [ -n "$hold" ] && ! slot_alive "$d"; then
-      rm -rf "$d" 2>/dev/null; [ -e "$d" ] || continue   # the owner is gone: genuinely stale
+      lock_break "$d" "$(lock_id "$d")" "$hold" && continue   # the owner is gone: genuinely stale
     fi
     if [ -z "$deadline" ]; then
-      # A live owner is WAITED for, however long it takes. An unreadable owner
-      # is the narrow race between mkdir and writing the pid — give that, and
-      # only that, a time-based escape.
-      i=$(( i + 1 ))
-      if [ -z "$hold" ] && [ "$i" -ge $(( LOCK_GRACE_SECONDS * 100 )) ]; then
-        rm -rf "$d"; i=0; continue
+      # A live owner is WAITED for, however long it takes. An owner with no
+      # pid is judged by the lock's own age (lock_abandoned), read at most once
+      # a second, never by how long this wait has lasted: counting its own
+      # polls, a waiter that had queued past the grace behind live owners broke
+      # the NEXT owner's lock in the instant before its pid, and both held it.
+      # Which lock was judged is read before its age, so a lock broken and
+      # taken again after that reading is never the one removed.
+      if [ -z "$hold" ] && [ "$SECONDS" != "$aged" ]; then
+        aged=$SECONDS; lid="$(lock_id "$d")"
+        if lock_abandoned "$d"; then lock_break "$d" "$lid" "" && continue; fi
       fi
     else
       # Bounded: the models.json lock (models_lock), held for a few jq calls
@@ -1187,12 +1303,15 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
       # younger one is waited for until the time is up, and a writer inside
       # the gap before its pid is never robbed. The age is read once a
       # second, not on every poll: it costs two forks.
+      # Here the owner may well be alive and name this very pid, so which
+      # directory was judged (lock_id, read before its age) is all that tells
+      # a lock taken over already from the one this wait judged.
       if [ "$SECONDS" != "$aged" ]; then
-        aged=$SECONDS; now="$(now_epoch)"; born="$(num "$(stat -f %m "$d" 2>/dev/null)" "$now")"
-        if [ $(( now - born )) -ge "$stale" ]; then
+        aged=$SECONDS; lid="$(lock_id "$d")"
+        if lock_older_than "$d" "$stale"; then
           LOCK_TAKEN_OVER="${hold:+pid $hold}"; LOCK_TAKEN_OVER="${LOCK_TAKEN_OVER:-a writer that never wrote its pid}"
-          LOCK_TAKEN_AGE=$(( now - born ))
-          rm -rf "$d" 2>/dev/null; [ -e "$d" ] || continue
+          LOCK_TAKEN_AGE="$LOCK_AGE"
+          lock_break "$d" "$lid" "$hold" && continue
         fi
       fi
       [ "$SECONDS" -lt "$deadline" ] || return 1
@@ -3152,15 +3271,25 @@ acquire_lock() { # 0 = acquired
   # Two statements on purpose: `local a="$1" b="…$a"` expands every word BEFORE
   # assigning any of them, so under `set -u` the second one sees $a unset. It
   # only ever worked because callers happened to have their own `id` in scope.
-  local id="$1" pid
+  local id="$1" pid lid
   local lock="$LOCK_DIR/$id"
   if mkdir "$lock" 2>/dev/null; then
     echo $$ > "$lock/pid"; boot_id > "$lock/boot"; return 0
   fi
-  if slot_alive "$lock"; then
-    return 1                      # a previous run is still going
+  # Which lock, then its pid, read once. A lock without one is another taker
+  # between its mkdir and its pid, refused like a live one, unless it is older
+  # than the grace (lock_abandoned): it used to be broken on sight, and both
+  # takers then ran. One gone meanwhile falls through, to be taken again.
+  lid="$(lock_id "$lock")"
+  pid="$(cat "$lock/pid" 2>/dev/null || true)"
+  if [ -n "$pid" ]; then
+    slot_alive "$lock" && return 1   # a previous run is still going
+  elif [ -d "$lock" ]; then
+    lock_abandoned "$lock" || return 1
   fi
-  rm -rf "$lock"                  # stale lock from a killed run, or an old boot
+  # Stale: from a killed run, or an old boot. Removed only while it is still
+  # the lock judged here -- another taker may have broken and taken it since.
+  lock_break "$lock" "$lid" "$pid"
   mkdir "$lock" 2>/dev/null && { echo $$ > "$lock/pid"; boot_id > "$lock/boot"; return 0; }
   return 1
 }
@@ -3183,11 +3312,23 @@ slots_dir() { echo "$LOCK_DIR/$1"; }     # base dir holding a job's run slots
 
 slots_active() { # <id> -> prints count of live slots; prunes dead ones
   local id="$1"                           # separate stmt: $id must exist before...
-  local base="$LOCK_DIR/$id" d n=0        # ...it is expanded here (set -u)
+  local base="$LOCK_DIR/$id" d n=0 pid    # ...it is expanded here (set -u)
   [ -d "$base" ] || { echo 0; return 0; }
   for d in "$base"/*/; do                # glob skips the dotfile mutex (.acq)
+    d="${d%/}"
     [ -d "$d" ] || continue
-    if slot_alive "${d%/}"; then n=$((n + 1)); else rm -rf "$d"; fi
+    # Its pid, read once. A slot with none is a run between acquire_slot's
+    # mkdir and its pid, counted and kept like a live one unless it is older
+    # than the grace (lock_abandoned). This is asked from outside
+    # acquire_slot's mutex too -- the tick's max_parallel gate, running, the
+    # stall check -- and pruned on sight, such a run went on with no slot on
+    # disk: uncounted, unseen by the dashboard and by stop, its ports unrecorded.
+    pid="$(cat "$d/pid" 2>/dev/null || true)"
+    if { [ -n "$pid" ] && slot_alive "$d"; } || { [ -z "$pid" ] && [ -d "$d" ] && ! lock_abandoned "$d"; }; then
+      n=$((n + 1))
+    else
+      rm -rf "$d"
+    fi
   done
   echo "$n"
 }
@@ -3888,10 +4029,16 @@ global_daily_cap() { # -> dollars, or empty for "no cap"
 # that: it resolves to the newest model the INSTALLED CLI knows, which lags the
 # API after a release (2026-07-24: `opus` still meant claude-opus-4-8 while
 # claude-opus-5 was live and absent from the CLI binary). So we discover it:
-# the alias gives a free baseline (the init event needs no API call), then we
+# the alias gives the baseline (its init event names the model), then we
 # probe the next versions up. An unknown id is rejected by the API with
 # "issue with the selected model", which is how a probe fails. Results are
 # cached in config/models.json for MODELS_TTL so this costs almost nothing.
+# Not nothing: with a session, the baseline's "hi" and a served probe's "ok"
+# are real turns -- the init event comes first, the answer still follows. So
+# both run the smallest turn the CLI makes (PROBE_TURN): no tools, no MCP
+# server, no skill, a one-line system prompt. Measured on haiku, $0.0018
+# against $0.0226 with the operator's whole setup loaded; the model the init
+# event names is the same.
 # What no probe can reach is a release the API serves only to a newer CLI:
 # it refuses an older one with a 400 naming the version required (measured:
 # claude-opus-5-5 needs 2.1.280, claude-fable-5-1 needs 2.1.251). That model
@@ -3910,6 +4057,8 @@ global_daily_cap() { # -> dollars, or empty for "no cap"
 #     find its keychain credential -- and so does an API that is down.
 #     PROBE_ANSWER keeps the CLI's own words. Read as a refusal, every family
 #     quietly stayed on its alias and the pass was cached as fresh for a day.
+PROBE_TURN=(--tools "" --strict-mcp-config --disable-slash-commands --system-prompt "Reply with one word.")
+
 model_probe_ok() { # model_probe_ok <id> -> 0 served, 1 refused, 2 kept for a newer CLI, 3 no verdict
   PROBE_NEEDS="" PROBE_INSTALLED="" PROBE_ANSWER=""
   local out rc res kind
@@ -3919,7 +4068,7 @@ model_probe_ok() { # model_probe_ok <id> -> 0 served, 1 refused, 2 kept for a ne
   # than the CLI is exactly what this probes for. Read together with the
   # JSON, that line made jq fail, so a served id the CLI did not know read
   # as refused.
-  out="$("$(platform_bin anthropic)" -p --output-format json --model "$1" "ok" 2>/dev/null)"; rc=$?
+  out="$("$(platform_bin anthropic)" -p "${PROBE_TURN[@]}" --output-format json --model "$1" "ok" 2>/dev/null)"; rc=$?
   # The result event alone, the last one: another JSON line a later CLI may
   # print around it must not blind every probe. No result event is no verdict.
   res="$(printf '%s' "$out" | "$JQ" -cs '[.[] | objects | select(.type == "result")] | last // empty' 2>/dev/null)"
@@ -3952,10 +4101,10 @@ claude_cli_version() { # the installed CLI's version, digits only ("2.1.280"); e
   run_bounded "$OPENCODE_DEADLINE" "$(platform_bin anthropic)" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1
 }
 
-model_alias_baseline() { # what the CLI's own alias points at (no API call)
+model_alias_baseline() { # what the CLI's own alias points at (the init event; the turn after it is PROBE_TURN's)
   # The init event is selected, not assumed first: with any hook configured
   # the CLI emits hook_started/hook_response system events ahead of it.
-  "$(platform_bin anthropic)" -p --output-format stream-json --verbose --model "$1" "hi" 2>/dev/null \
+  "$(platform_bin anthropic)" -p "${PROBE_TURN[@]}" --output-format stream-json --verbose --model "$1" "hi" 2>/dev/null \
     | "$JQ" -r 'select(.type=="system" and .subtype=="init") | .model // empty' 2>/dev/null \
     | head -1
 }
@@ -4012,10 +4161,11 @@ resolve_family() { # resolve_family <family> -> newest id the API serves this CL
   # What it costs: one `claude -p` per probe. An id the API does not serve
   # this CLI is refused before any turn runs (exit 1 with a 404, or the 400
   # of a newer CLI's model; $0, no tokens, ~5 s of wall time, nearly all of
-  # it CLI start-up); only an id that is served costs a turn, and the search
-  # stops at the first. So a family costs at most 11 probes (2 majors + 9
-  # minors) and 2 turns -- about a minute on the usual day, when nothing
-  # newer exists. It runs once per family per MODELS_TTL: in the tick's
+  # it CLI start-up); only an id that is served costs a turn -- PROBE_TURN's,
+  # the smallest the CLI makes -- and the search stops at the first. So a
+  # family costs at most 11 probes (2 majors + 9 minors) and 2 turns, plus
+  # the baseline's, about a minute on the usual day, when nothing newer
+  # exists. It runs once per family per MODELS_TTL: in the tick's
   # detached _resolve_models, or inline in effective_model when a family's
   # cached id has expired. A probe with no verdict ends the search at once:
   # the next ten would have none either.
@@ -4370,8 +4520,15 @@ cmd_runs() { # <id> — one active run per line: <run-pid>\t<agent-pid>\t<logfil
   [ -d "$base" ] || return 0
   for d in "$base"/*/; do
     [ -d "$d" ] || continue
-    slot_alive "${d%/}" || { rm -rf "$d"; continue; }
+    # Its pid, read once. A slot with none is a run still claiming it, as in
+    # slots_active: nothing to list yet, and not pruned from under that run
+    # unless it is older than the grace (lock_abandoned).
     pid="$(cat "$d/pid" 2>/dev/null || true)"
+    if [ -z "$pid" ]; then
+      lock_abandoned "${d%/}" && rm -rf "$d"
+      continue
+    fi
+    slot_alive "${d%/}" || { rm -rf "$d"; continue; }
     child="$(cat "$d/child" 2>/dev/null || true)"
     logf="$(cat "$d/logfile" 2>/dev/null || true)"
     printf '%s\t%s\t%s\n' "$pid" "$child" "$logf"
@@ -5266,6 +5423,16 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   # cwd, model, permission, budget and timeout inherit from the project when the
   # job doesn't set them (see resolve()).
   cwd="$(resolve "$id" cwd "$HOME")"
+  # An analysis runs in the checkout of the repo it names. It used to inherit
+  # the project's cwd like any other run -- the PRIMARY repo, on a project that
+  # spans several -- so an analysis of any other repo ran `prepare` and the
+  # agent over the primary's code, and filed that report under the repo it
+  # named. The same lookup cmd_security_analyze resolved the branch and the
+  # commit against; only security_run_analysis sets AL_SECURITY_REPO.
+  if [ -n "${AL_SECURITY_REPO:-}" ]; then
+    cwd="$(project_repo_path "$project" "$AL_SECURITY_REPO")"
+    [ -n "$cwd" ] || { log_tick "$id: project '$project' declares no repo named '$AL_SECURITY_REPO' — the analysis cannot run"; return 1; }
+  fi
   prompt="$(jobs_json | "$JQ" -r --arg id "$id" '.jobs[] | select(.id==$id) | .prompt')"
   model="$(resolve "$id" model "$(platform_default_model "$platform")")"
   # A family (opus/sonnet/…) becomes the newest concrete id of that family --
@@ -5529,7 +5696,7 @@ ${prompt}"
   if [ "$platform" = "opencode" ]; then
     run_env+=("OPENCODE_CONFIG_CONTENT=$_occ1")
   fi
-  if wt_isolation_enabled "$project" "$cwd"; then
+  if wt_isolation_enabled "$project" "$cwd" "$id"; then
     local reattached=""
     [ -n "$resume_sid" ] && reattached="$(wt_find_by_session "$id" "$resume_sid")"
     if [ -n "$reattached" ]; then
@@ -7388,8 +7555,8 @@ case "${1:-}" in
   # detached analysis re-execs into. A real process, so its slot records a pid
   # that is actually alive for the run's duration.
   __run-analysis)
-             [ $# -ge 4 ] || die "usage: agentloop __run-analysis <job-id> <analysis-id> <branch>"
-             security_run_analysis "$2" "$3" "$4" ;;
+             [ $# -ge 4 ] || die "usage: agentloop __run-analysis <job-id> <analysis-id> <branch> [repo]"
+             security_run_analysis "$2" "$3" "$4" "${5:-}" ;;
   security)  shift
              case "${1:-}" in
                analyze) shift; [ $# -ge 3 ] || die "usage: agentloop security analyze [--detach] <project> <repo> <branch> [profile]"

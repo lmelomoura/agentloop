@@ -1362,3 +1362,27 @@ def test_the_findings_route_forwards_confidence_and_refuses_a_value_outside_the_
     code, payload = srv.security_findings({"project": "web", "confidence": "maybe"})
     assert code == 400
     assert "confidence" in payload["error"]
+
+
+def test_the_findings_route_forwards_verdict_and_refuses_a_value_outside_the_set(srv, monkeypatch):
+    """The fourth closed vocabulary this route checks at the edge (block 4.2),
+    beside severity/state/category/confidence."""
+    seen = {}
+
+    def fake(args, stdin=None):
+        seen["args"] = args
+        return True, json.dumps({"rows": [], "total": 0, "unique": 0,
+                                 "by_severity": {}, "page": 1, "per_page": 25})
+    monkeypatch.setattr(srv, "al", fake)
+    code, _ = srv.security_findings({"project": "web", "verdict": "confirmed,rejected"})
+    assert code == 200
+    args = seen["args"]
+    assert [args[i + 1] for i, a in enumerate(args) if a == "--verdict"] == \
+        ["confirmed", "rejected"]
+
+    def must_not_run(args, stdin=None):
+        raise AssertionError("the CLI must not be reached")
+    monkeypatch.setattr(srv, "al", must_not_run)
+    code, payload = srv.security_findings({"project": "web", "verdict": "maybe"})
+    assert code == 400
+    assert "verdict" in payload["error"]

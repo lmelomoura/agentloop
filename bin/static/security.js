@@ -145,6 +145,11 @@
     const rows = ((p || {}).repos || []).map((r) => r && r.name).filter(Boolean);
     return rows.length ? rows : [(p || {}).name].filter(Boolean);
   }
+  function secScopeName(item, items) {
+    const repos = new Set((items || []).map((x) => (x || {}).repo).filter(Boolean));
+    const it = item || {};
+    return (repos.size > 1 && it.repo ? it.repo + " \u203A " : "") + (it.branch || "");
+  }
   function secVisible(findings, minSeverity) {
     const floor = SEV_ORDER.indexOf(minSeverity || "low");
     return findings.filter((f) => f.state === "fixed" || secSevRank(f.severity) >= floor);
@@ -335,6 +340,12 @@
 
   // ui/security/candidate.js
   var SEC_CONFIDENCE = ["high", "medium", "low"];
+  var SEC_VERDICTS = ["confirmed", "needs_validation", "rejected"];
+  var VERDICT_LABEL = {
+    confirmed: "confirmed",
+    needs_validation: "needs validation",
+    rejected: "disproved"
+  };
   var SCORED = [["confidence", "Confidence"], ["likelihood", "Likelihood"], ["impact", "Impact"]];
   function _doc(f) {
     const c = f && f.candidate;
@@ -346,6 +357,18 @@
     if (!score) return null;
     const chip = secEl("span", "secconf " + score, score);
     if (c && c.confidence && c.confidence.reason) chip.title = c.confidence.reason;
+    return chip;
+  }
+  function secVerdictChip(f) {
+    const v = f && f.verdict;
+    if (!v) return null;
+    const labels = {
+      confirmed: "confirmed",
+      needs_validation: "needs validation",
+      rejected: "disproved"
+    };
+    const chip = secEl("span", "secverdict " + v, labels[v] || v);
+    if (f.verdict_reason) chip.title = f.verdict_reason;
     return chip;
   }
   function secCandidateBlock(f) {
@@ -376,6 +399,13 @@
     }
     const scored = SCORED.filter(([k]) => c[k] && typeof c[k] === "object").map(([k, label]) => label + ": " + (c[k].score || "") + " \u2014 " + (c[k].reason || ""));
     if (scored.length) box.appendChild(secEl("p", "seccand-scored", scored.join(" \xB7 ")));
+    if (f && f.verdict && f.verdict_reason) {
+      box.appendChild(secEl(
+        "p",
+        "seccand-verdict",
+        (VERDICT_LABEL[f.verdict] || f.verdict) + ": " + f.verdict_reason
+      ));
+    }
     return box;
   }
 
@@ -588,16 +618,22 @@
     await secSyncScope();
   }
   var secGitBranches = 0;
+  var secGitBranchesRepo = "";
   function secGitBranchCount() {
     return secGitBranches;
+  }
+  function secGitBranchRepo() {
+    return secGitBranchesRepo;
   }
   async function secLoadBranches(want) {
     const seq = secState.seq;
     secGitBranches = 0;
+    const repo = $("sec-repo").value;
+    secGitBranchesRepo = repo;
     secBranchCombo.set("\u2026", [{ v: "\u2026", label: "\u2026" }]);
     let branches = [];
     try {
-      const j = await secFetch("/api/security/branches?project=" + encodeURIComponent(secState.project) + "&repo=" + encodeURIComponent($("sec-repo").value));
+      const j = await secFetch("/api/security/branches?project=" + encodeURIComponent(secState.project) + "&repo=" + encodeURIComponent(repo));
       if (seq !== secState.seq) return;
       branches = j.branches || [];
       secGitBranches = branches.length;
@@ -974,6 +1010,8 @@
     h.appendChild(st);
     const chip = secConfidenceChip(f);
     if (chip) h.appendChild(chip);
+    const vchip = secVerdictChip(f);
+    if (vchip) h.appendChild(vchip);
     row.appendChild(h);
     const where = document.createElement("ul");
     where.className = "secwhere";
@@ -2159,6 +2197,7 @@
       state: [],
       category: [],
       confidence: [],
+      verdict: [],
       branch: "",
       path: "",
       q: "",
@@ -2208,6 +2247,7 @@
     if (f.state.length) p.set("state", f.state.join(","));
     if (f.category.length) p.set("category", f.category.join(","));
     if (f.confidence.length) p.set("confidence", f.confidence.join(","));
+    if (f.verdict.length) p.set("verdict", f.verdict.join(","));
     if (f.branch.trim()) p.set("branch", f.branch.trim());
     if (f.path.trim()) p.set("path", f.path.trim());
     if (f.q.trim()) p.set("q", f.q.trim());
@@ -2325,7 +2365,7 @@
     });
     return n;
   }
-  var ROW_PILL_TITLE = "Rows matching the current filters \u2014 the same finding open on two branches counts twice here.";
+  var ROW_PILL_TITLE = "Findings matching the current filters \u2014 one row per finding, so the same finding on two branches counts once here.";
   function _secCap(s) {
     s = String(s || "");
     return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
@@ -2388,14 +2428,6 @@
       ));
       strip.appendChild(card);
     });
-    const uniqueCard = kpiCard({
-      icon: "diamond",
-      value: String(data.unique || 0),
-      label: "Unique issues",
-      title: "Distinct problems (fingerprints) \u2014 the same finding open on two branches counts once here."
-    });
-    uniqueCard.className += " secfind-stat unique";
-    strip.appendChild(uniqueCard);
     box.appendChild(strip);
     if (!any && data.analysed !== false) {
       box.appendChild(secEl("span", "sevpill clean", "Nothing matches"));
@@ -2522,6 +2554,7 @@
     if (f.state.length) n++;
     if (f.category.length) n++;
     if (f.confidence.length) n++;
+    if (f.verdict.length) n++;
     if (f.branch.trim()) n++;
     if (f.path.trim()) n++;
     if (f.analysis.trim()) n++;
@@ -2548,6 +2581,7 @@
       state: f.state,
       category: f.category,
       confidence: f.confidence,
+      verdict: f.verdict,
       branch: f.branch,
       path: f.path,
       q: f.q,
@@ -2567,6 +2601,9 @@
       // Absent from a filter saved before block 4.1: "no filter", as every
       // other absent key reads.
       confidence: Array.isArray(query.confidence) ? query.confidence.slice() : [],
+      // Absent from a filter saved before block 4.2: "no filter", as every
+      // other absent key reads.
+      verdict: Array.isArray(query.verdict) ? query.verdict.slice() : [],
       branch: typeof query.branch === "string" ? query.branch : "",
       path: typeof query.path === "string" ? query.path : "",
       q: typeof query.q === "string" ? query.q : "",
@@ -2675,6 +2712,13 @@
     secFindPositionPop(details, trigger, pop);
     return details;
   }
+  function secFindRunOptions(analyses) {
+    const runs = analyses || [];
+    return runs.map((a) => ({
+      v: String(a.id),
+      label: "#" + a.id + " (" + _secCap(a.profile) + ") \u2014 " + secScopeName(a, runs)
+    }));
+  }
   function secFindFilterBar(fs, data) {
     const wrap = secEl("div", "secfind-filters");
     const row1 = secEl("div", "secfind-filters-row");
@@ -2716,10 +2760,7 @@
     ));
     row1.appendChild(secFindSinglePicker(
       "Analysis run",
-      (data.analyses || []).map((a) => ({
-        v: String(a.id),
-        label: "#" + a.id + " (" + _secCap(a.profile) + ") \u2014 " + a.branch
-      })),
+      secFindRunOptions(data.analyses),
       fs.filters.analysis,
       (v) => {
         fs.filters.analysis = v || "";
@@ -2771,6 +2812,16 @@
       fs.filters.confidence,
       (v) => {
         secFindToggleIn(fs.filters.confidence, v);
+        fs.page = 1;
+        secFindRefresh(fs);
+      }
+    ));
+    row2.appendChild(secFindMultiPicker(
+      "Verdict",
+      SEC_VERDICTS.map((v) => ({ v, label: v === "rejected" ? "Disproved" : v === "needs_validation" ? "Needs validation" : "Confirmed" })),
+      fs.filters.verdict,
+      (v) => {
+        secFindToggleIn(fs.filters.verdict, v);
         fs.page = 1;
         secFindRefresh(fs);
       }
@@ -2843,10 +2894,15 @@
     const tdConf = document.createElement("td");
     const chip = secConfidenceChip(f);
     if (chip) tdConf.appendChild(chip);
+    const vchip = secVerdictChip(f);
+    if (vchip) tdConf.appendChild(vchip);
+    if (f.verdict === "rejected") tr.className += " verdict-rejected";
     tr.appendChild(tdConf);
     const tdRun = document.createElement("td");
     const runWrap = secEl("div", "secfind-run");
-    const runInfo = ((fs.data || {}).analyses || []).find((a) => a.id === f.analysis_id);
+    const runs = (fs.data || {}).analyses || [];
+    const runInfo = runs.find((a) => a.id === f.analysis_id);
+    const runLine = secEl("div");
     if (f.analysis_id != null) {
       const runBtn = document.createElement("button");
       runBtn.type = "button";
@@ -2858,15 +2914,33 @@
         secSwitchProjectTab("runs");
         secShowAnalysis(f.analysis_id, true);
       };
-      runWrap.appendChild(runBtn);
+      runLine.appendChild(runBtn);
     }
+    const otherRuns = (f.branches || []).filter((b) => b.analysis_id !== f.analysis_id);
+    if (otherRuns.length) {
+      const more = secEl("span", "secmeta", " +" + otherRuns.length);
+      more.title = otherRuns.map((b) => "#" + b.analysis_id + " " + secScopeName(b, runs)).join(", ");
+      runLine.appendChild(more);
+    }
+    runWrap.appendChild(runLine);
     if (runInfo && runInfo.started) {
       runWrap.appendChild(secEl("div", "secmeta", fmtWhen(runInfo.started)));
     }
     tdRun.appendChild(runWrap);
     tr.appendChild(tdRun);
     const tdBranch = document.createElement("td");
-    tdBranch.textContent = f.branch || "";
+    const onBranches = f.branches && f.branches.length ? f.branches : [{ repo: f.repo, branch: f.branch || "", analysis_id: f.analysis_id, state: f.state }];
+    const stateWord = (s) => SEC_STATE_LABEL[s] || s;
+    if (onBranches.some((b) => b.state !== onBranches[0].state)) {
+      onBranches.forEach((b) => tdBranch.appendChild(
+        secEl("div", null, secScopeName(b, runs) + " \xB7 " + stateWord(b.state))
+      ));
+    } else {
+      tdBranch.textContent = onBranches.map((b) => secScopeName(b, runs)).join(", ");
+    }
+    if (onBranches.length > 1) {
+      tdBranch.title = onBranches.map((b) => secScopeName(b, runs) + " \u2014 #" + b.analysis_id + " \u2014 " + stateWord(b.state)).join("\n");
+    }
     tr.appendChild(tdBranch);
     const tdState = document.createElement("td");
     const stBadge = secEl("span", "secstate " + secStateKey(f), SEC_STATE_LABEL[f.state] || f.state);
@@ -2874,14 +2948,15 @@
     tdState.appendChild(stBadge);
     const fe = f.fixed_elsewhere;
     if (fe && fe.branch) {
-      const where = fe.branch + (fe.commit ? " @ " + String(fe.commit).slice(0, 12) : "");
+      const where = secScopeName({ repo: f.repo, branch: fe.branch }, runs) + (fe.commit ? " @ " + String(fe.commit).slice(0, 12) : "");
       const merged = fe.in_this_branch === true, pending = fe.in_this_branch === false;
       const feBadge = secEl(
         "span",
         "secstate fixed-elsewhere " + (merged ? "merged" : pending ? "pending" : "unknown"),
         merged ? "fix already here" : pending ? "fixed on " + fe.branch : "fixed on " + fe.branch + " (?)"
       );
-      feBadge.title = merged ? "Fixed on " + where + ", and that commit is already in this branch \u2014 very likely resolved here too. Re-analyse this branch to confirm; nothing is marked fixed until somebody looks again." : pending ? "Fixed on " + where + ", and that commit is NOT in this branch yet \u2014 the hole is real here; read that fix before writing a new one." : "Fixed on " + where + "; whether that fix is in this branch could not be determined (" + (fe.unknown_reason || "unknown") + ").";
+      const here = secScopeName(f, runs) || "this branch";
+      feBadge.title = merged ? "Fixed on " + where + ", and that commit is already in " + here + " \u2014 very likely resolved there too. Re-analyse " + here + " to confirm; nothing is marked fixed until somebody looks again." : pending ? "Fixed on " + where + ", and that commit is NOT in " + here + " yet \u2014 the hole is real there; read that fix before writing a new one." : "Fixed on " + where + "; whether that fix is in " + here + " could not be determined (" + (fe.unknown_reason || "unknown") + ").";
       tdState.appendChild(feBadge);
     }
     tr.appendChild(tdState);
@@ -3174,15 +3249,16 @@
       title: "A branch is active while its latest finished analysis is at most " + SEC_BRANCH_ACTIVE_DAYS + " days old \u2014 the same rule the Status column and filter read."
     }));
     const base = secBrDefaultBranch();
-    const baseRow = rows.find((r) => r.branch === base);
-    const crit = baseRow && baseRow.open ? String(baseRow.open.critical || 0) : "\u2014";
+    const baseRows = rows.filter((r) => r.branch === base);
+    const read = baseRows.filter((r) => r.open);
+    const crit = read.length ? String(read.reduce((n, r) => n + (r.open.critical || 0), 0)) : "\u2014";
     wrap.appendChild(kpiCard({
       icon: "shield",
       tone: "sev-crit",
       value: crit,
       label: "Critical findings",
       sub: "in default branch",
-      title: crit === "\u2014" ? "The declared base (" + (base || "none declared") + ") has no finished analysis to read a posture from." : "Open critical findings in " + base + "'s latest finished analysis."
+      title: crit === "\u2014" ? "The declared base (" + (base || "none declared") + ") has no finished analysis to read a posture from." : "Open critical findings in " + base + "'s latest finished analysis" + (baseRows.length > 1 ? " in each of its " + baseRows.length + " repositories" : "") + "."
     }));
     const donut = (payload.sidebar || {}).donut || {};
     wrap.appendChild(kpiCard({
@@ -3192,13 +3268,14 @@
       sub: "across all branches",
       title: "Distinct problems (fingerprints) \u2014 the same finding open on two branches counts once here, while each branch's own row counts it again for itself."
     }));
-    const covered = !baseRow || !baseRow.state ? "\u2014" : baseRow.state === "done" ? "100%" : "Partial";
+    const covered = !read.length ? "\u2014" : baseRows.every((r) => r.state === "done") ? "100%" : "Partial";
+    const lastFinished = Math.max(0, ...baseRows.map((r) => r.last_finished || 0));
     wrap.appendChild(kpiCard({
       icon: "covers",
       value: covered,
       label: "Default branch covered",
-      sub: baseRow && baseRow.last_finished ? "last analysis " + fmtAgo(baseRow.last_finished) : SEC_NEVER.short,
-      title: "100% means the default branch's latest finished analysis completed clean; Partial means it stopped before covering the whole scope (capped)."
+      sub: lastFinished ? "last analysis " + fmtAgo(lastFinished) : SEC_NEVER.short,
+      title: "100% means the default branch's latest finished analysis completed clean" + (baseRows.length > 1 ? " in every repository" : "") + "; Partial means it stopped before covering the whole scope (capped)" + (baseRows.length > 1 ? " in at least one of them" : "") + "."
     }));
     return wrap;
   }
@@ -3313,7 +3390,7 @@
     thead.appendChild(htr);
     table.appendChild(thead);
     const tbody = document.createElement("tbody");
-    filtered.forEach((r) => tbody.appendChild(secBranchRow(r)));
+    filtered.forEach((r) => tbody.appendChild(secBranchRow(r, rows)));
     table.appendChild(tbody);
     scroll.appendChild(table);
     wrap.appendChild(scroll);
@@ -3328,13 +3405,13 @@
     hostWrap.appendChild(wrap);
     return hostWrap;
   }
-  function secBranchRow(r) {
+  function secBranchRow(r, rows) {
     const tr = document.createElement("tr");
     const now = Math.floor(Date.now() / 1e3);
     const tdName = document.createElement("td");
     const name = secEl("div", "secbr-name");
     name.appendChild(secIcon("gitbranch"));
-    name.appendChild(secEl("span", "secbr-branch", r.branch || ""));
+    name.appendChild(secEl("span", "secbr-branch", secScopeName(r, rows)));
     if (r.branch && r.branch === secBrDefaultBranch()) {
       const badge = secEl("span", "pill profile", "Default");
       badge.title = "This project's declared base branch";
@@ -3409,7 +3486,7 @@
       };
     }
     tdActs.appendChild(view);
-    tdActs.appendChild(secBrKebab(r));
+    tdActs.appendChild(secBrKebab(r, rows));
     tr.appendChild(tdActs);
     return tr;
   }
@@ -3462,7 +3539,7 @@
     });
     return svg;
   }
-  function secBrKebab(r) {
+  function secBrKebab(r, rows) {
     const kebab = document.createElement("details");
     kebab.className = "secidx-kebab";
     const summary = document.createElement("summary");
@@ -3485,7 +3562,12 @@
       e.stopPropagation();
       kebab.open = false;
       secSwitchProjectTab("findings");
-      renderFindings($("sec-pj-findings"), secState.project, { branch: r.branch });
+      const own = r.analysis_id != null && new Set((rows || []).map((x) => x.repo).filter(Boolean)).size > 1;
+      renderFindings(
+        $("sec-pj-findings"),
+        secState.project,
+        own ? { analysis: String(r.analysis_id) } : { branch: r.branch }
+      );
     };
     pop.appendChild(findings);
     const report = document.createElement("button");
@@ -3586,9 +3668,12 @@
     head.appendChild(secEl("h3", null, "Branch coverage"));
     card.appendChild(head);
     const now = Math.floor(Date.now() / 1e3);
-    const analyzed = rows.filter((r) => r.last_finished && now - r.last_finished <= 30 * 86400).length;
     const gitCount = secGitBranchCount();
-    const total = Math.max(gitCount, rows.length);
+    const gitRepo = secGitBranchRepo();
+    const multi = new Set(rows.map((r) => r.repo).filter(Boolean)).size > 1;
+    const counted = gitCount && multi ? rows.filter((r) => r.repo === gitRepo) : rows;
+    const analyzed = counted.filter((r) => r.last_finished && now - r.last_finished <= 30 * 86400).length;
+    const total = Math.max(gitCount, counted.length);
     const pct = total ? Math.round(analyzed / total * 100) : 0;
     const line = secEl("div", "secbr-covline");
     line.appendChild(secEl("span", "secbr-covcount", analyzed + " / " + total + " analyzed"));
@@ -3599,7 +3684,7 @@
     bar.style.width = pct + "%";
     barTrack.appendChild(bar);
     card.appendChild(barTrack);
-    const scope = gitCount ? "of the branches the repository lists" : "of the branches ever analysed";
+    const scope = gitCount ? "of the branches " + (multi ? gitRepo : "the repository") + " lists" : "of the branches ever analysed";
     card.appendChild(secEl(
       "div",
       "secpj-caption",
@@ -3631,7 +3716,7 @@
   function secRpFinished(r) {
     return r.state === "done" || r.state === "capped";
   }
-  function secReportRow(r) {
+  function secReportRow(r, rows) {
     const tr = document.createElement("tr");
     const tdId = document.createElement("td");
     const idBtn = document.createElement("button");
@@ -3655,7 +3740,7 @@
     tdProfile.appendChild(secEl("div", "secmeta", "Run #" + r.analysis_id));
     tr.appendChild(tdProfile);
     const tdBranch = document.createElement("td");
-    tdBranch.textContent = r.branch || "";
+    tdBranch.textContent = secScopeName(r, rows);
     tr.appendChild(tdBranch);
     const tdWhen = document.createElement("td");
     if (r.started) {
@@ -3717,7 +3802,7 @@
     thead.appendChild(htr);
     table.appendChild(thead);
     const tbody = document.createElement("tbody");
-    sorted.forEach((r) => tbody.appendChild(secReportRow(r)));
+    sorted.forEach((r) => tbody.appendChild(secReportRow(r, rows)));
     table.appendChild(tbody);
     scroll.appendChild(table);
     wrap.appendChild(scroll);
@@ -3951,7 +4036,13 @@
     profile.appendChild(secEl("span", null, "Profile"));
     profile.appendChild(secEl("span", "pill profile", h.profile || "standard"));
     meta.appendChild(profile);
-    meta.appendChild(secHeaderBit("gitbranch", "Branch", h.branch || "\u2014"));
+    const repos = h.repos || [];
+    meta.appendChild(secHeaderBit(
+      "gitbranch",
+      "Branch",
+      (h.branch || "\u2014") + (repos.length > 1 ? " \xB7 " + repos.length + " repositories" : ""),
+      repos.length > 1 ? "Read in every repository analysed on it: " + repos.join(", ") : ""
+    ));
     if (h.branch_fell_back) {
       const warn = secEl("span", "secpj-fellback");
       warn.appendChild(secIcon("alert"));
@@ -4981,7 +5072,10 @@
     tdProfile.appendChild(a.profile ? secEl("span", "pill profile", secProfileLabel(a.profile)) : secEl("span", "muted", "\u2014"));
     tr.appendChild(tdProfile);
     const tdBranch = document.createElement("td");
-    tdBranch.textContent = a.branch || "\u2014";
+    tdBranch.textContent = secScopeName(
+      a,
+      secRepos(projById(a.project)).map((repo) => ({ repo }))
+    ) || "\u2014";
     tr.appendChild(tdBranch);
     const tdFindings = document.createElement("td");
     tdFindings.appendChild(secIndexRecentFindingsChips(a.severities));
@@ -5346,5 +5440,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: 9f313868c9da7836a352576e6139f3a4cab19b147e1f8e8e1fcae38a02100ff0 */
-/* ui-sources: a427659a41818346d46a7603c9b048a4e82446b82b017c4d47cefed75ae37191 */
+/* ui-bundle: 31c71a4c2dba799805b1a5d53ad16656ffaf2f176e6111c48d6be1b160db8839 */
+/* ui-sources: 921ad9161b3324699171abac8807904b91ef2844429ae5d73598058f5208dcd3 */

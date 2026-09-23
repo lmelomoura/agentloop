@@ -191,6 +191,20 @@ export function secRepos(p){
   return rows.length ? rows : [(p || {}).name].filter(Boolean);
 }
 
+/* A branch NAME is not a place once a project holds more than one repository:
+   `main` of one and `main` of another are two branches, read by two analyses
+   (queries.finding_rows and branch_rows carry `repo` on each). Wherever a list
+   can hold both, each entry names its repository -- and only then, so a
+   single-repository project reads exactly as it always did. `items` is the
+   list `item` was drawn from: the one that says whether more than one
+   repository is in play. Self-contained on purpose: the page-contract tests
+   extract it by name beside the functions that call it. */
+export function secScopeName(item, items){
+  const repos = new Set((items || []).map(x => (x || {}).repo).filter(Boolean));
+  const it = item || {};
+  return (repos.size > 1 && it.repo ? it.repo + " › " : "") + (it.branch || "");
+}
+
 export function secVisible(findings, minSeverity){
   const floor = SEV_ORDER.indexOf(minSeverity || "low");
   // A fixed finding is always shown regardless of severity: the checklist's

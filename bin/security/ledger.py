@@ -251,6 +251,22 @@ _FINDING_COLUMNS = (
     # by `diff`, and '' -- what every row from before the column carries --
     # decodes to None, which every renderer draws as nothing.
     ("candidate", "TEXT NOT NULL DEFAULT ''"),
+    # WHAT A VERIFIER CONCLUDED about this finding, in THIS analysis -- see
+    # security/verdict.py for the three words and security/prompts.py for what
+    # the verifier was asked. Additive exactly as `candidate` is: '' is what
+    # every row from before the column carries and what every row nobody
+    # verified carries, and it means "nobody tried" -- never "it is fine".
+    # Not a fingerprint input, not read by `diff`, and NOT inherited: the next
+    # analysis puts the finding back in the queue (see queries.verify_queue),
+    # because a reading of one day is not a permanent decision. That is what
+    # `decision` is for.
+    ("verdict", "TEXT NOT NULL DEFAULT ''"),
+    ("verdict_reason", "TEXT NOT NULL DEFAULT ''"),
+    # Who wrote it -- always 'subagent' today, written by `record_verdict` and
+    # never accepted from a payload, on the same rule as `producer`. It exists
+    # so that the day a second origin appears is not the day somebody
+    # discovers the column was missing.
+    ("verified_by", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -688,6 +704,35 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
             conn.execute(
                 "INSERT INTO occurrence (finding_id, file, line, snippet_hash) VALUES (?,?,?,?)",
                 (fid, occ.get("file", ""), int(occ.get("line", 0)), occ.get("snippet_hash", "")))
+
+
+def record_verdict(conn, analysis_id, fingerprint, verdict, reason,
+                   by="subagent") -> bool:
+    """Write a verifier's verdict onto one finding of one analysis.
+
+    True when it landed, False when there was nothing to write on: no such
+    finding in THIS analysis, or one that already carries a verdict.
+
+    WRITTEN ONCE, BY THE `verdict=''` IN THE WHERE CLAUSE. A second verdict on
+    one row is not a correction, it is either a verifier contradicting itself
+    or a hunter overwriting the answer it did not like -- and the caller is
+    told (False), rather than the row quietly changing. The same reason
+    `record_finding` refuses a rubber stamp instead of ignoring it.
+
+    `verified_by` is this function's own record of who arrived, never a field
+    a payload can set -- the rule `producer` already follows.
+
+    NOT TOUCHED BY `record_finding`: that function's UPDATE names its columns
+    one by one and none of the three is among them, so a hunter re-reporting a
+    finding after it was verified (a corrected occurrence list, say) cannot
+    erase what the verifier wrote.
+    """
+    with conn:
+        cur = conn.execute(
+            "UPDATE finding SET verdict=?, verdict_reason=?, verified_by=?"
+            " WHERE analysis_id=? AND fingerprint=? AND verdict=''",
+            (verdict, reason, by, analysis_id, fingerprint))
+    return cur.rowcount > 0
 
 
 # How to rebuild a finding's fingerprint after its rule has been renamed, per

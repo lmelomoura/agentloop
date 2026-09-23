@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, ledger, osv, queries, report, secrets, taxonomy  # noqa: E402
+from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, ledger, osv, prompts, queries, report, secrets, taxonomy, verdict  # noqa: E402
 
 REQUIRED_FINDING_KEYS = ("fingerprint", "category", "rule", "severity", "title")
 
@@ -1612,6 +1612,85 @@ def cmd_findings(args):
     print(json.dumps(ledger.findings_of(conn, args.analysis), indent=2))
 
 
+def cmd_verify_queue(args):
+    """The findings still waiting for a verifier, worst first.
+
+    The SCOPE lives in `queries.verify_queue` -- see its comment -- and this
+    verb exists so the agent never has to derive it from prose. A filter the
+    model applies by reading a paragraph is the kind of instruction this
+    module has already watched fail twice: the triage nobody did, and the
+    subagents nobody was supposed to launch.
+    """
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    print(json.dumps(queries.verify_queue(conn, args.analysis), indent=2))
+
+
+def cmd_verify_prompt(args):
+    """The text the agent pastes into a `Task` for this finding.
+
+    Refused for a fingerprint outside the queue, on the same rule as
+    `report-verdict`: a prompt for something nobody is verifying is a
+    subagent nobody asked for, and the close counts those.
+    """
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    row = next((f for f in queries.verify_queue(conn, args.analysis)
+                if f["fingerprint"] == args.fingerprint), None)
+    if row is None:
+        sys.exit(f"verify-prompt: {args.fingerprint[:12]}… is not in the verification "
+                 "queue of this analysis — `verify-queue` lists what is")
+    print(prompts.verifier_prompt(args.analysis, row))
+
+
+def cmd_report_verdict(args):
+    """What a VERIFIER concluded. Called by the subagent itself, not by the
+    hunter that reported the finding -- the write is the evidence that a
+    second agent existed and what it read (see security/prompts.py).
+
+    Deliberately NOT in AGENT_FORBIDDEN: a subagent runs under the same
+    `AL_SECURITY_AGENT` the hunter carries, so a refusal there would close the
+    door on the only caller this verb has. What makes it verifiable is not a
+    flag but a count -- `cmd_finish` compares the verdicts recorded here with
+    the `Task` calls the engine counted in the run's stream.
+    """
+    try:
+        stdin_text = sys.stdin.read()
+    except Exception as exc:
+        sys.exit(f"report-verdict: could not read stdin: {exc}")
+    if len(stdin_text.encode("utf-8")) > MAX_STDIN_BYTES:
+        sys.exit(f"report-verdict: stdin is {len(stdin_text.encode('utf-8'))} bytes "
+                 f"and the limit is {MAX_STDIN_BYTES}")
+    try:
+        payload = json.loads(stdin_text)
+    except (ValueError, RecursionError) as exc:
+        sys.exit(f"report-verdict: stdin is not valid JSON: {exc}")
+    try:
+        value, reason = verdict.validate(payload)
+    except verdict.VerdictError as exc:
+        where = f"report-verdict: {exc.field}" if exc.field else "report-verdict"
+        sys.exit(f"{where} {exc.message}. Nothing was recorded")
+    # The same scanner every other agent-written free text goes through: a
+    # verifier reads the same repository the hunter read.
+    _refuse_if_secret("report-verdict: reason", reason)
+    conn = _conn(args)
+    _running(conn, args.analysis)
+    # The queue is the authority on both questions at once -- is this finding
+    # one somebody was asked to verify, and does it still need one. A row that
+    # already carries a verdict has left the queue, so a second verdict lands
+    # here rather than in `record_verdict`'s own guard.
+    if not any(f["fingerprint"] == args.fingerprint
+               for f in queries.verify_queue(conn, args.analysis)):
+        sys.exit(f"report-verdict: {args.fingerprint[:12]}… is not in the verification "
+                 "queue of this analysis — `verify-queue` lists what is, and a finding "
+                 "leaves that list the moment it carries a verdict: a verifier does not "
+                 "contradict itself, and the first answer is the one that counts. "
+                 "Nothing was recorded")
+    if not ledger.record_verdict(conn, args.analysis, args.fingerprint, value, reason):
+        sys.exit(f"report-verdict: {args.fingerprint[:12]}… could not be written. "
+                 "Nothing was recorded")
+
+
 def cmd_fingerprint(args):
     """Print the 64-hex identity of a finding -- computed, never typed.
 
@@ -1690,6 +1769,68 @@ def _candidate_requirements(conn, analysis_id, payload):
             required = ["confidence"]
         return required, True
     return (["confidence"] if triage else []), category == "dependency"
+
+
+def _decided_identity_refusal(conn, analysis_id, payload) -> str:
+    """Why this payload may not land on the fingerprint it names -- '' when
+    it may.
+
+    A DECIDED FINDING KEEPS ITS IDENTITY AT THE DOOR. A fingerprint the
+    operator ruled on takes that ruling wherever it lands: accepted or
+    false_positive, hidden by default, out of the posture and the triage
+    count. The ruling was made about a finding of one category under one
+    rule -- both are inputs to its fingerprint -- so a report landing on it
+    under another category or rule is a different flaw taking an old
+    ruling, whichever way it arrives: a fold into a `decided_sast` entry
+    (SKILL.md, Job 3), a second report re-labelling a fold that already
+    landed, or a carried-over decided row re-labelled. The first version of
+    this check held only the first of those, and only for `sast`.
+
+    THE COMPARISON IS WITH THE RECORD THE AGENT WAS SHOWN, in the order it
+    was shown it: this analysis's own row first; otherwise its BASELINE's
+    -- the checklist's `previous`, same project, repository and branch;
+    otherwise the newest `done`/`capped` record of this project AND
+    repository on ANY branch -- the record `decided_sast` hands over
+    beside the checklist; and only then the project's newest record
+    anywhere, whatever its repository, branch or state -- a fingerprint the
+    agent was never shown. The first version of this comparison stopped at
+    the first step and fell straight through to the last one: a
+    fingerprint re-labelled by a newer analysis on another branch, another
+    repository, or a run that failed was never something the agent saw,
+    and comparing with it refused the exact re-reports the checklist told
+    the agent to make -- pushing it to either re-label the row its own
+    checklist showed as decided, or mint a fresh fingerprint and bring the
+    finding back as `new`. One query decides the common case: a
+    fingerprint nobody ruled on is held to nothing here, exactly as before
+    this door existed. A decided fingerprint with no record at all has
+    nothing to compare with and is let through; the agent cannot target
+    one without inventing its 64 hex digits.
+    """
+    analysis = _analysis(conn, analysis_id)
+    project = analysis["project"]
+    if conn.execute("SELECT 1 FROM decision WHERE project=? AND fingerprint=?",
+                    (project, payload["fingerprint"])).fetchone() is None:
+        return ""
+    baseline = ledger.latest_analysis(conn, project, analysis["repo"],
+                                      analysis["branch"], before=analysis_id)
+    held = conn.execute(
+        "SELECT f.category, f.rule FROM finding f"
+        " JOIN analysis a ON a.id = f.analysis_id"
+        " WHERE f.fingerprint=? AND a.project=?"
+        " ORDER BY (f.analysis_id = ?) DESC, (f.analysis_id = ?) DESC,"
+        " (a.repo = ? AND a.state IN ('done','capped')) DESC, a.id DESC LIMIT 1",
+        (payload["fingerprint"], project, analysis_id,
+         baseline["id"] if baseline else -1, analysis["repo"])).fetchone()
+    if held is None or (held["category"], held["rule"]) == (payload["category"], payload["rule"]):
+        return ""
+    return (f"report-finding: {payload['fingerprint'][:12]}… carries an operator "
+            f"decision, recorded as a {held['category']} finding under rule "
+            f"{held['rule']!r}, and this report says {payload['category']} / "
+            f"{payload['rule']!r}. A decided finding keeps its category and rule "
+            "-- both are part of its identity, and the ruling was made about "
+            "them: re-report it under the recorded ones, or, if what you found "
+            "is a different flaw, mint its own fingerprint with `fingerprint "
+            "--snippet`. Nothing was recorded")
 
 
 def cmd_report_finding(args):
@@ -1845,6 +1986,9 @@ def cmd_report_finding(args):
                  "at all")
     conn = _conn(args)
     _running(conn, args.analysis)
+    refusal = _decided_identity_refusal(conn, args.analysis, payload)
+    if refusal:
+        sys.exit(refusal)
     # THE CANDIDATE, after every text field above has been through the same
     # gates -- so a rationale that quotes a key is still refused as
     # `rationale`, never as a missing candidate -- and before the producer is
@@ -2072,6 +2216,39 @@ def _triage_phase(conn, analysis_id, untriaged, untriaged_note, decided_note):
          decided_note])
 
 
+# The `verification` row's prose. Four outcomes, and the three that lower a
+# `done` say names and numbers -- a count alone is a scold the reader cannot
+# act on, the same rule the triage note already follows.
+VERIFY_NOTHING_NOTE = ("No finding was waiting for a verifier: this analysis "
+                       "reported no agent finding at medium or above, and none "
+                       "below it claiming a high impact.")
+VERIFY_DONE_NOTE = ("{n} verified: {confirmed} confirmed, {rejected} rejected, "
+                    "{needs} needs validation.")
+VERIFY_UNVERIFIED_NOTE = ("{n} finding{s} left unverified: nobody tried to "
+                          "disprove {them}, so this analysis says nothing about "
+                          "whether {they} real. {lead}: {named}.")
+VERIFY_TASKS_WITHOUT_VERDICTS_NOTE = (
+    "{tasks} subagents were launched and {v} verdict{s} recorded: the rest "
+    "produced nothing, which is budget spent on parallelism rather than on "
+    "reading. Subagents in this run are for verification.")
+VERIFY_VERDICTS_WITHOUT_TASKS_NOTE = (
+    "{v} verdict{s} recorded and no subagent was launched: a verdict is a "
+    "second agent's reading, and nothing in this run's stream shows one ran.")
+VERIFY_UNVERIFIED_UNREACHED = ("This analysis did not close `done`, so nothing "
+                               "checked whether the findings were verified.")
+
+
+def _verdict_counts(conn, analysis_id) -> dict:
+    """How many verdicts of each kind this analysis recorded."""
+    out = {v: 0 for v in verdict.VERDICTS}
+    for row in conn.execute(
+            "SELECT verdict, COUNT(*) AS n FROM finding WHERE analysis_id=?"
+            " AND verdict<>'' GROUP BY verdict", (analysis_id,)):
+        if row["verdict"] in out:
+            out[row["verdict"]] = row["n"]
+    return out
+
+
 GUIDES_UNKNOWN = "unknown"
 
 
@@ -2263,6 +2440,69 @@ def cmd_finish(args):
         # one close.
         triage_phase = _triage_phase(conn, args.analysis, skipped,
                                      untriaged_note, decided_note)
+    # THE VERIFICATION, checked the way the triage is: three facts the ledger
+    # and the run's stream hold between them, and a `done` that survives all
+    # three or is lowered with the reason in writing.
+    #
+    #   the queue    findings in scope that nobody verified. This is the guard
+    #                the two counts below CANNOT see: an agent that ignores
+    #                the phase launches nothing and records nothing, so N and
+    #                V agree at zero while the work never happened.
+    #   N > V        subagents that produced no verdict -- the $51.44 failure,
+    #                budget spent on parallelism.
+    #   V > N        verdicts with no subagent behind them: the hunter wrote
+    #                them itself.
+    #
+    # N is only known to the ENGINE's close (`--tasks-launched`, from
+    # `security_task_count` over the stream); the agent's own close omits the
+    # flag and the two comparisons are simply not made.
+    # `verify_note` is the ROW's prose; `verify_gap` is the part of it that is
+    # a GAP and therefore belongs in the paragraph too. The summary sentences
+    # -- nothing was waiting, N verified -- describe what happened rather than
+    # what was missed, and the paragraph is the list of blind spots: the same
+    # exemption `TRIAGE_NOTHING_NOTE`/`TRIAGE_ALL_READ_NOTE` already carry.
+    verify_note = ""
+    verify_gap = ""
+    verify_phase = None
+    if row["prepared"]:
+        unverified = queries.verify_queue(conn, args.analysis)
+        counts = _verdict_counts(conn, args.analysis)
+        recorded = sum(counts.values())
+        tasks = args.tasks_launched
+        if unverified:
+            n = len(unverified)
+            named = "; ".join(
+                f"{f['rule']} ({f['occurrences'][0]['file'] if f['occurrences'] else 'no file recorded'})"
+                for f in unverified[:3])
+            verify_note = verify_gap = VERIFY_UNVERIFIED_NOTE.format(
+                n=n, s="s" if n != 1 else "", them="them" if n != 1 else "it",
+                they="they are" if n != 1 else "it is",
+                lead=("The first three" if n > 3 else "They are" if n > 1 else "It is"),
+                named=named)
+        elif recorded:
+            verify_note = VERIFY_DONE_NOTE.format(
+                n=recorded, confirmed=counts["confirmed"],
+                rejected=counts["rejected"], needs=counts["needs_validation"])
+        else:
+            verify_note = VERIFY_NOTHING_NOTE
+        mismatch = ""
+        if tasks is not None and tasks > recorded:
+            mismatch = VERIFY_TASKS_WITHOUT_VERDICTS_NOTE.format(
+                tasks=tasks, v=recorded, s="s" if recorded != 1 else "")
+        elif tasks is not None and recorded > tasks:
+            mismatch = VERIFY_VERDICTS_WITHOUT_TASKS_NOTE.format(
+                v=recorded, s="s" if recorded != 1 else "")
+        if mismatch:
+            verify_note = f"{verify_note} {mismatch}".strip()
+            verify_gap = f"{verify_gap} {mismatch}".strip()
+        bad = bool(unverified) or (tasks is not None and tasks != recorded)
+        if state == "done" and bad:
+            state = "capped"
+            print(f"finish: analysis {args.analysis} — {verify_note}", file=sys.stderr)
+        verify_phase = coverage.phase(
+            coverage.VERIFICATION,
+            coverage.WARNING if bad else coverage.RAN,
+            diff.AGENT, verify_note)
     # finish_analysis writes coverage_note unconditionally, and neither caller
     # of `finish` carries the note `prepare` printed: the agent never saw it,
     # and the engine's close-out knows only the run's status and cost. An
@@ -2283,7 +2523,7 @@ def cmd_finish(args):
     stored = row["coverage_note"] or ""
     note = ""
     for part in (stored, args.note or "", unprepared_note, untriaged_note,
-                 decided_note, guides_note):
+                 decided_note, guides_note, verify_gap):
         part = part.strip()
         # `not in`, not `!=`: a row is closed twice (the agent, then the
         # engine) and each close re-reads the note it already wrote. Without
@@ -2349,6 +2589,9 @@ def cmd_finish(args):
             triage_phase = coverage.phase(
                 coverage.TRIAGE, coverage.SKIPPED,
                 note=unprepared_note or TRIAGE_UNVERIFIED_NOTE)
+            verify_phase = coverage.phase(
+                coverage.VERIFICATION, coverage.SKIPPED,
+                note=unprepared_note or VERIFY_UNVERIFIED_UNREACHED)
     else:
         # The guides sentence joins whatever the row already says -- the
         # agent's `--note`, or the sentence a previous close stored -- once:
@@ -2364,7 +2607,8 @@ def cmd_finish(args):
             triage_phase = coverage.phase(coverage.TRIAGE, coverage.SKIPPED,
                                           note=TRIAGE_UNVERIFIED_NOTE)
     phases = coverage.merge(
-        phases, [sast_phase] + ([triage_phase] if triage_phase else []))
+        phases, [sast_phase] + ([triage_phase] if triage_phase else [])
+        + ([verify_phase] if verify_phase else []))
     ledger.finish_analysis(conn, args.analysis, state, _spend(args.spend), note,
                            coverage.encode(phases))
     # `row`'s own project and branch, never a flag the caller passed: `finish`
@@ -2399,7 +2643,17 @@ def cmd_checklist(args):
         analysis, findings = queries.checklist(conn, args.analysis)
     except queries.AnalysisNotFound as e:
         sys.exit(str(e))
-    print(json.dumps({"analysis": analysis, "findings": findings}, indent=2))
+    # `decided_sast` rides BESIDE the checklist, never inside it: `findings`
+    # is this analysis and its baseline, which every screen and report reads,
+    # while the list describes no state of this analysis at all -- it is for
+    # the agent's fold-before-you-mint rule (SKILL.md, Job 3). Printed ahead
+    # of `findings`, which carries every row's rationale and candidate: a
+    # shell tool that truncates a long output keeps its head, and the short
+    # list the skill's fold rule depends on must not be the part that is cut.
+    print(json.dumps({"analysis": analysis,
+                      "decided_sast": queries.decided_sast(conn, args.analysis, listed=findings),
+                      "findings": findings},
+                     indent=2))
 
 
 def _sbom_document(conn, analysis_id):
@@ -2459,11 +2713,18 @@ def cmd_export_findings(args):
     """Every finding of a project, across branches, as one document.
 
     THE SAME PATH THE SCREEN READS, paged to exhaustion. `queries.finding_rows`
-    is what the Findings tab is drawn from -- one checklist per branch, the
-    latest finished analysis of each, unioned -- so the export and the screen
-    can never come to disagree about what exists. A second query here would be
-    a second answer to the same question, which is how this repository has
-    been bitten before.
+    is what the Findings tab is drawn from -- one checklist per (repository,
+    branch), the latest finished analysis of each, unioned -- so the export
+    and the screen can never come to disagree about what exists. A second
+    query here would be a second answer to the same question, which is how
+    this repository has been bitten before.
+
+    The screen asks for it grouped, one row per finding; this asks for
+    `group=False` -- the same union, one row per finding per BRANCH --
+    because a fix is applied on a branch, and each branch's section has to
+    list what there is to fix on it. A branch of a REPOSITORY: two
+    repositories of the project analysed on `main` are two sections, each
+    at its own commit, and the sections are keyed that way below.
 
     NO FILTERS. Not "the filters are ignored": the arguments do not exist, so
     there is no room for the question of whether they were applied. The page
@@ -2492,21 +2753,24 @@ def cmd_export_findings(args):
         payload = queries.finding_rows(conn, args.project,
                                        filters={"show_resolved": True},
                                        page=page, per_page=queries.MAX_PER_PAGE,
-                                       repo_paths=repo_paths)
+                                       repo_paths=repo_paths, group=False)
         rows.extend(payload["rows"])
         if len(rows) >= payload["total"] or not payload["rows"]:
             break
         page += 1
 
-    # The commit each branch was read at: on the analysis row, not on the
-    # picker entry `finding_rows` returns, and worth the extra read -- without
-    # it the agent cannot tell whether the code in front of it is the code
-    # that was scanned.
-    branch_meta = {}
+    # The commit each (repository, branch) was read at: on the analysis row,
+    # not on the picker entry `finding_rows` returns, and worth the extra read
+    # -- without it the agent cannot tell whether the code in front of it is
+    # the code that was scanned. Keyed by repository AND branch: by branch
+    # name alone, two repositories' `main` overwrote each other here and one
+    # section printed the other repository's commit.
+    scope_meta = {}
     for a in payload.get("analyses", []):
         row = dict(queries._analysis_row(conn, a["id"]))
-        branch_meta[a["branch"]] = {"id": a["id"], "profile": a.get("profile", ""),
-                                    "commit_sha": row.get("commit_sha", "")}
+        scope_meta[(a["repo"], a["branch"])] = {
+            "id": a["id"], "profile": a.get("profile", ""),
+            "commit_sha": row.get("commit_sha", "")}
 
     meta = {"at": int(time.time()), "shown_on_screen": args.shown}
     if args.format == "sbom":
@@ -2514,17 +2778,17 @@ def cmd_export_findings(args):
         # branch, side by side. Same branch set as the findings above, so a
         # branch with findings and no lockfile appears with `sbom: null`.
         entries = []
-        for br, m in branch_meta.items():
+        for (repo, br), m in scope_meta.items():
             try:
                 text = _sbom_document(conn, m["id"])
                 sbom = json.loads(text) if text and text.strip() else None
             except (SystemExit, ValueError, LookupError):
                 sbom = None
-            entries.append({"branch": br, "analysis_id": m["id"],
+            entries.append({"repo": repo, "branch": br, "analysis_id": m["id"],
                             "commit_sha": m.get("commit_sha", ""), "sbom": sbom})
         print(report.consolidated_sboms(args.project, entries, meta))
         return
-    groups = report._consolidated_groups(rows, branch_meta)
+    groups = report._consolidated_groups(rows, scope_meta)
     renderer = {"json": report.consolidated_as_json,
                 "html": report.consolidated_as_html,
                 "md": report.consolidated_as_markdown}[args.format]
@@ -2871,15 +3135,20 @@ def cmd_project_data(args):
     the same reason `index-data` uses it: a screen that only ever LOOKS must
     not conjure the ledger file it is asking about into existence.
 
-    The header's `branch`/`lines_of_code`/`last_analysis` and the Overview
-    tab's posture and checklist counts all come from the SAME analysis row --
-    `default_branch_posture`'s own `latest`, the latest FINISHED analysis of
-    the branch actually shown (the project's declared base, or the branch it
-    fell back to) -- so the numbers on this screen never describe two
-    different runs under one label. The second `queries.checklist()` call
-    below, for the same id `posture()` already read through
-    `default_branch_posture`, is a cache hit on the read-only connection (see
-    `_CachingConnection`), not a second pass over the ledger.
+    The header's `branch`/`repos`/`lines_of_code`/`last_analysis` and the
+    Overview tab's posture, checklist counts, categories, top findings,
+    previous and trend all come from the SAME readings --
+    `default_branch_posture`'s own: every repository's newest FINISHED
+    analysis of the branch actually shown (the project's declared base, or
+    the branch it fell back to), one entry per fingerprint
+    (`queries.branch_findings`, the findings browser's own grouping) -- so
+    the numbers on this screen never describe two different sets of runs
+    under one label. A project whose repositories are all analysed on `main`
+    used to be read off whichever of them ran last, and the others' findings
+    were missing from the whole tab. The checklists behind them were already
+    read through `default_branch_posture`, so reading them again below is a
+    cache hit on the read-only connection (see `_CachingConnection`), not a
+    second pass over the ledger.
 
     That one-branch posture is not the WHOLE story, though: `sidebar.donut`/
     `categories` roll up EVERY analysed branch (see `severity_totals`'s own
@@ -2924,10 +3193,9 @@ def cmd_project_data(args):
     reading as if nothing had ever run.
 
     `tabs.branches` is exactly `queries.branch_rows`'s own rows -- one entry
-    per branch that has EVER been analysed, not only the one `header`/
-    `tabs.overview` show. Each row's `open` is that branch's OWN posture
-    (`queries.posture`, the identical computation `default_branch_posture`
-    ran for the header's one branch above) -- a different scope from
+    per (repository, branch) that has EVER been analysed, not only the one
+    `header`/`tabs.overview` show. Each row's `open` is that branch's OWN
+    posture in that repository (`queries.posture`) -- a different scope from
     `sidebar.donut`, which collapses every analysed branch's open findings
     into one count per FINGERPRINT project-wide (see
     `_open_findings_by_fingerprint`'s own docstring). A finding open on both
@@ -2939,9 +3207,10 @@ def cmd_project_data(args):
     `tabs.reports` gathers the four downloads (Markdown, JSON, HTML, SBOM)
     that used to be reachable only from whichever single analysis happened
     to be on screen, one row per analysis. It is a plain projection of the
-    `runs` rows already fetched above -- analysis id, branch, started, state
-    -- not a second `SELECT * FROM analysis`, the same reuse-what-is-already-
-    in-hand rule `finding_counts_by_analysis` applied to the Runs tab itself.
+    `runs` rows already fetched above -- analysis id, repository, branch,
+    started, state -- not a second `SELECT * FROM analysis`, the same
+    reuse-what-is-already-in-hand rule `finding_counts_by_analysis` applied
+    to the Runs tab itself.
     A running or failed analysis still gets a row: the single-analysis view's
     own download buttons are shown for any state (see `secPaint`), and this
     tab is that same door, just gathered into one table instead of scattered
@@ -2953,7 +3222,7 @@ def cmd_project_data(args):
         print(json.dumps({
             "project": args.project,
             "header": {"profile": default_profile, "branch": args.base or "",
-                       "branch_fell_back": False, "lines_of_code": 0,
+                       "repos": [], "branch_fell_back": False, "lines_of_code": 0,
                        "last_analysis": 0},
             "tabs": {"overview": {"posture": queries._empty_posture(),
                                   "checklist": _empty_checklist_counts(),
@@ -2966,28 +3235,32 @@ def cmd_project_data(args):
                        "capped_branches": 0}}))
         return
 
-    branch, posture, fell_back, latest = queries.default_branch_posture(
+    branch, posture, fell_back, readings = queries.default_branch_posture(
         conn, args.project, args.base or None)
+    # The newest of the readings -- one per repository -- is what "last
+    # analysis" and the run a lone finding points at mean here.
+    latest = readings[0] if readings else None
 
     # The Overview tab's own cards beyond the posture row (ProjectOverview.png):
-    # `categories` and `top_findings` are projections of the SAME checklist
-    # already fetched for `checklist_counts` -- one branch, the same scope as
-    # `posture` above, so the KPI total, the category donut's centre and the
-    # Top findings rows can never disagree about what they count. `previous`
-    # is that same posture computed one finished analysis earlier, for the
-    # "vs. previous analysis" delta -- None (not an empty posture) when there
-    # is no previous analysis, so the page can say "no previous analysis"
-    # instead of rendering a 0% delta nothing was compared against.
+    # `categories` and `top_findings` are projections of the SAME grouped rows
+    # `checklist_counts` counts -- one branch, every repository's reading of
+    # it, the same scope as `posture` above, so the KPI total, the category
+    # donut's centre and the Top findings rows can never disagree about what
+    # they count. `previous` is that same posture as the branch read just
+    # before its newest analysis, for the "vs. previous analysis" delta --
+    # None (not an empty posture) when there is nothing to compare against,
+    # so the page can say "no previous analysis" instead of rendering a 0%
+    # delta nothing was compared against.
     checklist_counts = _empty_checklist_counts()
     overview_categories = []
     top_findings = []
     previous = None
-    if latest is not None:
-        _analysis, findings = queries.checklist(conn, latest["id"])
+    if readings:
+        findings = queries.branch_findings(conn, readings)
         for f in findings:
             if f["state"] in checklist_counts:
                 checklist_counts[f["state"]] += 1
-        open_findings = [f for f in findings if queries.is_open(f["state"])]
+        open_findings = [f for f in findings if queries.counted(f)]
         buckets = {}
         for f in open_findings:
             b = buckets.setdefault(f.get("rule") or "", {
@@ -3005,6 +3278,8 @@ def cmd_project_data(args):
         top = sorted(open_findings, key=lambda f: (
             queries._SEV_RANK.get(f.get("severity"), 99),
             -(first_seen.get(f.get("fingerprint", ""), 0) or 0)))[:5]
+        # Each row's run is the reading its representative came from.
+        profiles = {r["id"]: r.get("profile", "") for r in readings}
         for f in top:
             occ = f.get("occurrences") or []
             first = occ[0] if occ else {}
@@ -3017,13 +3292,11 @@ def cmd_project_data(args):
                 "file": first.get("file", ""),
                 "line": first.get("line", 0) or 0,
                 "more": max(0, len(occ) - 1),
-                "analysis_id": latest["id"],
-                "profile": latest.get("profile", ""),
+                "analysis_id": f["analysis_id"],
+                "profile": profiles.get(f["analysis_id"], ""),
                 "first_seen": first_seen.get(f.get("fingerprint", ""), 0),
             })
-        prev_row = queries.previous_finished(conn, args.project, branch, latest["id"])
-        if prev_row is not None:
-            previous = queries.posture(conn, args.project, branch, latest=prev_row)
+        previous = queries.previous_posture(conn, args.project, branch, readings)
 
     # ONE grouped query for the whole Runs tab, replacing what used to be one
     # checklist() call per done/capped row (see this function's own
@@ -3059,29 +3332,40 @@ def cmd_project_data(args):
     # A thin projection of the `runs` rows above -- not a second pass over
     # `analysis` -- into just what the Reports tab's downloads need. See this
     # function's own docstring for why a row survives for every state.
-    reports = [{"analysis_id": r["id"], "branch": r["branch"],
+    reports = [{"analysis_id": r["id"], "repo": r["repo"], "branch": r["branch"],
                "started": r["started"], "state": r["state"],
                "profile": r["profile"]} for r in runs]
 
     print(json.dumps({
         "project": args.project,
         "header": {"profile": default_profile, "branch": branch,
+                   # The repositories the branch was read in: more than one,
+                   # and the page says the numbers span them.
+                   "repos": sorted(r["repo"] for r in readings),
                    "branch_fell_back": fell_back,
-                   "lines_of_code": (latest or {}).get("lines_of_code", 0),
+                   # Every repository's count, added: 0 in one of them is
+                   # "not counted" there, never a claim that it is empty.
+                   "lines_of_code": sum(r.get("lines_of_code") or 0 for r in readings),
                    "last_analysis": (latest or {}).get("started", 0)
                                     or (runs[0]["started"] if runs else 0)},
         "tabs": {"overview": {"posture": posture, "checklist": checklist_counts,
-                              "state": (latest or {}).get("state", ""),
+                              # A partial read anywhere makes the whole
+                              # branch's numbers partial.
+                              "state": ("capped" if any(r["state"] == "capped"
+                                                        for r in readings)
+                                        else (latest or {}).get("state", "")),
                               "attempted": bool(runs),
                               # 7 days, fixed: ProjectOverview.png's own
                               # trend card reads "over the last 7 days" --
                               # the SHOWN branch (fell back or not; the
                               # header names it), unlike `trend_series`,
                               # which never falls back because a bare
-                              # sparkline has nowhere to say so.
-                              "trend": (queries.trend(conn, args.project,
-                                                      branch, days=7)
-                                        if branch else []),
+                              # sparkline has nowhere to say so. Across
+                              # every repository, as the posture is; no
+                              # reading, no trend.
+                              "trend": (queries.branch_trend(conn, args.project,
+                                                             branch, days=7)
+                                        if readings else []),
                               "previous": previous,
                               "categories": overview_categories,
                               "top_findings": top_findings},
@@ -3172,6 +3456,7 @@ def cmd_findings_page(args):
         "state": args.state or [],
         "category": args.category or [],
         "confidence": args.confidence or [],
+        "verdict": args.verdict or [],
         "branch": args.branch or [],
         "analysis": args.analysis or [],
         "path": args.path,
@@ -3378,6 +3663,21 @@ def main(argv=None):
     rf = sub.add_parser("report-finding", parents=[dbflag]); rf.set_defaults(fn=cmd_report_finding)
     rf.add_argument("--analysis", type=int, required=True)
 
+    # Deliberately absent from AGENT_FORBIDDEN, all three: the verifier is a
+    # subagent of the analysis and runs under the same flag the hunter does,
+    # so refusing them there would close the door on their only caller. The
+    # close's count is what makes the phase verifiable -- see `cmd_finish`.
+    vq = sub.add_parser("verify-queue", parents=[dbflag]); vq.set_defaults(fn=cmd_verify_queue)
+    vq.add_argument("--analysis", type=int, required=True)
+
+    vp = sub.add_parser("verify-prompt", parents=[dbflag]); vp.set_defaults(fn=cmd_verify_prompt)
+    vp.add_argument("--analysis", type=int, required=True)
+    vp.add_argument("--fingerprint", required=True)
+
+    rv = sub.add_parser("report-verdict", parents=[dbflag]); rv.set_defaults(fn=cmd_report_verdict)
+    rv.add_argument("--analysis", type=int, required=True)
+    rv.add_argument("--fingerprint", required=True)
+
     fn = sub.add_parser("finish", parents=[dbflag]); fn.set_defaults(fn=cmd_finish)
     fn.add_argument("--analysis", type=int, required=True)
     fn.add_argument("--state", required=True, choices=ledger.ANALYSIS_END_STATES)
@@ -3387,6 +3687,10 @@ def main(argv=None):
     # The ENGINE's close only: a comma list of guide names, '' for none, or
     # `unknown` when the run's stream could not be read. See `cmd_finish`.
     fn.add_argument("--guides-read", default=None, dest="guides_read")
+    # How many subagents the run launched, from `security_task_count` over the
+    # stream. The ENGINE's close only: the agent does not know its own stream,
+    # omits the flag, and the two count comparisons are then not made.
+    fn.add_argument("--tasks-launched", type=int, default=None, dest="tasks_launched")
 
     ck = sub.add_parser("checklist", parents=[dbflag]); ck.set_defaults(fn=cmd_checklist)
     ck.add_argument("--analysis", type=int, required=True)
@@ -3478,6 +3782,8 @@ def main(argv=None):
                      choices=FINDING_CATEGORIES)
     fpg.add_argument("--confidence", action="append", default=None,
                      choices=candidate.CONFIDENCE_SCORES)
+    fpg.add_argument("--verdict", action="append", default=None,
+                     choices=verdict.VERDICTS)
     fpg.add_argument("--branch", action="append", default=None)
     fpg.add_argument("--repo-path", action="append", default=None, dest="repo_path")
     fpg.add_argument("--analysis", action="append", type=int, default=None)

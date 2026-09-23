@@ -24,6 +24,10 @@
 #                      (CLAUDE_CONFIG_DIR, empty line when it has none) — the
 #                      one fact the argv cannot show, since it travels in the
 #                      environment
+#   FAKE_CWD_OUT       a path to record where this launch runs, one
+#                      "<key><TAB><value>" line each: PWD, the HEAD commit
+#                      checked out there, and the run's MANIFEST
+#                      ($AL_RUN_MANIFEST, on one line)
 #   FAKE_CLAUDE_LOGGED_OUT  set to play a CLI with no session: `auth status` exits 1,
 #                      and in the probe world below every model probe gets the
 #                      CLI's not-logged-in answer
@@ -116,6 +120,17 @@ fi
 
 if [ -n "${FAKE_ACCOUNT_OUT:-}" ]; then
   printf '%s\n' "${CLAUDE_CONFIG_DIR:-}" > "$FAKE_ACCOUNT_OUT"
+fi
+
+# Where the engine put the agent, read from the agent's own side: its working
+# directory is the tree `prepare` and every tool call read, and neither the
+# argv nor the account says which tree that is. Written before `prepare` and
+# the stream, so a run that fails later still leaves the answer behind.
+if [ -n "${FAKE_CWD_OUT:-}" ]; then
+  { printf 'PWD\t%s\n' "$PWD"
+    printf 'HEAD\t%s\n' "$(git rev-parse HEAD 2>/dev/null)"
+    printf 'MANIFEST\t%s\n' "$(jq -c . "${AL_RUN_MANIFEST:-/dev/null}" 2>/dev/null)"
+  } > "$FAKE_CWD_OUT"
 fi
 
 # The one place this file reads its own arguments. First line only, because the

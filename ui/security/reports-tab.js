@@ -45,6 +45,7 @@
    longer a paragraph above the table. */
 import { $, fmtAgo, fmtWhen, tableFooter } from "./page.js";
 import { secEl, secIcon } from "./dom.js";
+import { secScopeName } from "./vocabulary.js";
 import { secDownloadReport } from "./actions.js";
 import { secAllBranchDonutCard, secTopCategoriesCard } from "./branches-tab.js";
 import { secShowAnalysis } from "./analysis.js";
@@ -84,7 +85,10 @@ function secRpFinished(r){
   return r.state === "done" || r.state === "capped";
 }
 
-function secReportRow(r){
+/* `rows` is every report row on the tab: when they span more than one
+   repository, each row's branch names its repository (secScopeName) --
+   two repositories' runs of `main` are two different reports. */
+function secReportRow(r, rows){
   const tr = document.createElement("tr");
 
   // The run chip is a door to the same drill-down every other "#N" on this
@@ -117,7 +121,7 @@ function secReportRow(r){
   tr.appendChild(tdProfile);
 
   const tdBranch = document.createElement("td");
-  tdBranch.textContent = r.branch || "";
+  tdBranch.textContent = secScopeName(r, rows);
   tr.appendChild(tdBranch);
 
   const tdWhen = document.createElement("td");
@@ -186,7 +190,7 @@ function secReportsTable(rows){
   thead.appendChild(htr);
   table.appendChild(thead);
   const tbody = document.createElement("tbody");
-  sorted.forEach(r => tbody.appendChild(secReportRow(r)));
+  sorted.forEach(r => tbody.appendChild(secReportRow(r, rows)));
   table.appendChild(tbody);
   scroll.appendChild(table);
   wrap.appendChild(scroll);

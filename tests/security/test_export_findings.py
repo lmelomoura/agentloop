@@ -35,8 +35,8 @@ def _run(db, *args, check=True):
     return out
 
 
-def _open(db, project, branch, commit, aid_profile="quick"):
-    out = _run(db, "open-analysis", "--project", project, "--repo", project,
+def _open(db, project, branch, commit, aid_profile="quick", repo=None):
+    out = _run(db, "open-analysis", "--project", project, "--repo", repo or project,
                "--branch", branch, "--commit", commit, "--profile", aid_profile,
                "--run-id", f"r-{branch}")
     return json.loads(out.stdout)["analysis_id"]
@@ -57,8 +57,8 @@ def _finding(db, aid, fingerprint, severity="high", title="a finding",
     assert out.returncode == 0, out.stderr
 
 
-def _prepared(db, tmp_path, project, branch, commit):
-    aid = _open(db, project, branch, commit)
+def _prepared(db, tmp_path, project, branch, commit, repo=None):
+    aid = _open(db, project, branch, commit, repo=repo)
     root = tmp_path / f"repo-{aid}"
     root.mkdir(parents=True, exist_ok=True)
     _run(db, "prepare", "--analysis", str(aid), "--root", str(root), "--offline")
@@ -141,3 +141,65 @@ def test_the_header_reports_what_the_screen_was_showing_when_asked(tmp_path):
     # and without the flag it still says the filters were not applied
     plain = _run(db, "export-findings", "--project", "web", "--format", "md").stdout
     assert "carries everything recorded" in plain
+
+
+def test_the_document_stays_one_row_per_branch(tmp_path):
+    # The screen groups a finding on two branches into one row; this document
+    # does not -- a fix is applied on a branch, and each branch's section has
+    # to list what there is to fix on it.
+    db = tmp_path / "l.db"
+    a1 = _prepared(db, tmp_path, "web", "main", "1111111111111111")
+    _finding(db, a1, "f" * 64, title="on both")
+    _close(db, a1)
+    a2 = _prepared(db, tmp_path, "web", "develop", "2222222222222222")
+    _finding(db, a2, "f" * 64, title="on both")
+    _close(db, a2)
+    doc = json.loads(_run(db, "export-findings", "--project", "web",
+                          "--format", "json").stdout)
+    on = {b["branch"]: [f["fingerprint"] for f in b["open"]] for b in doc["branches"]}
+    assert on == {"develop": ["f" * 64], "main": ["f" * 64]}
+
+
+def _two_repositories_on_main(db, tmp_path):
+    a1 = _prepared(db, tmp_path, "web", "main", "1111111111111111")
+    _finding(db, a1, "f" * 64, title="in web")
+    _close(db, a1)
+    a2 = _prepared(db, tmp_path, "web", "main", "2222222222222222", repo="web-admin")
+    _finding(db, a2, "e" * 64, title="in web-admin")
+    _close(db, a2)
+    return a1, a2
+
+
+def test_every_repository_on_a_shared_branch_name_is_its_own_section(tmp_path):
+    # A fix is applied in a checkout: `main` of web and `main` of web-admin
+    # are two places, each read at its own commit. The document used to hold
+    # only the repository analysed last, under the other one's name.
+    db = tmp_path / "l.db"
+    a1, a2 = _two_repositories_on_main(db, tmp_path)
+    doc = json.loads(_run(db, "export-findings", "--project", "web",
+                          "--format", "json").stdout)
+    got = [(b["repo"], b["branch"], b["analysis_id"], b["commit_sha"],
+            [f["title"] for f in b["open"]], [f["repo"] for f in b["open"]])
+           for b in doc["branches"]]
+    assert got == [("web", "main", a1, "1111111111111111", ["in web"], ["web"]),
+                   ("web-admin", "main", a2, "2222222222222222", ["in web-admin"], ["web-admin"])]
+    md = _run(db, "export-findings", "--project", "web", "--format", "md").stdout
+    assert "## `web` › `main` at `111111111111`" in md
+    assert "## `web-admin` › `main` at `222222222222`" in md
+    assert "- **Repository:** `web-admin`" in md
+    sbom = json.loads(_run(db, "export-findings", "--project", "web",
+                           "--format", "sbom").stdout)
+    assert [(b["repo"], b["branch"], b["analysis_id"]) for b in sbom["branches"]] == \
+        [("web", "main", a1), ("web-admin", "main", a2)]
+
+
+def test_a_single_repository_document_does_not_name_the_repository(tmp_path):
+    # The control: a project with one checkout reads as it always did -- its
+    # repository is the project's own name, and saying it is noise.
+    db = tmp_path / "l.db"
+    aid = _prepared(db, tmp_path, "web", "main", "1111111111111111")
+    _finding(db, aid, "f" * 64)
+    _close(db, aid)
+    md = _run(db, "export-findings", "--project", "web", "--format", "md").stdout
+    assert "## `main` at `111111111111`" in md
+    assert "›" not in md and "**Repository:**" not in md

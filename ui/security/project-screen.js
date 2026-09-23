@@ -319,7 +319,13 @@ function secRenderProjectHeader(payload){
   profile.appendChild(secEl("span", null, "Profile"));
   profile.appendChild(secEl("span", "pill profile", h.profile || "standard"));
   meta.appendChild(profile);
-  meta.appendChild(secHeaderBit("gitbranch", "Branch", h.branch || "—"));
+  // The Overview reads the branch in every repository the project analysed
+  // on it (queries.default_branch_posture) -- with more than one, the
+  // header says its numbers span them, and names them one hover away.
+  const repos = h.repos || [];
+  meta.appendChild(secHeaderBit("gitbranch", "Branch",
+    (h.branch || "—") + (repos.length > 1 ? " · " + repos.length + " repositories" : ""),
+    repos.length > 1 ? "Read in every repository analysed on it: " + repos.join(", ") : ""));
   if(h.branch_fell_back){
     // Postures of different branches must never be confused in silence --
     // the SAME sentence the index screen's own project table gives a branch

@@ -126,7 +126,7 @@ def test_a_deterministic_finding_with_no_classification_carries_empty_strings(co
 def test_posture_counts_open_findings_of_the_latest_finished_analysis(conn):
     _analysis(conn, "main", findings=[("critical", "secret"), ("low", "hygiene")])
     _analysis(conn, "main", findings=[("critical", "secret")])
-    p = queries.posture(conn, "web", "main")
+    p = queries.posture(conn, "web", "web", "main")
     assert p["critical"] == 1
     assert p["low"] == 0, "the older analysis must not be counted"
 
@@ -144,19 +144,19 @@ def test_pending_counts_as_open(conn):
 def test_a_running_analysis_is_never_the_posture(conn):
     _analysis(conn, "main", findings=[("high", "sast")])
     _analysis(conn, "main", state="running", findings=[])
-    assert queries.posture(conn, "web", "main")["high"] == 1
+    assert queries.posture(conn, "web", "web", "main")["high"] == 1
 
 
 def test_the_default_branch_falls_back_and_says_so(conn):
     aid = _analysis(conn, "develop", findings=[("critical", "secret")])
-    branch, posture, fell_back, latest = queries.default_branch_posture(conn, "web", "main")
+    branch, posture, fell_back, readings = queries.default_branch_posture(conn, "web", "main")
     assert branch == "develop"
     assert fell_back is True
     assert posture["critical"] == 1
-    assert latest["id"] == aid, "the row posture was computed from, handed back"
+    assert [r["id"] for r in readings] == [aid], "the rows posture was computed from, handed back"
 
     _analysis(conn, "main", findings=[("low", "hygiene")])
-    branch, posture, fell_back, _latest = queries.default_branch_posture(conn, "web", "main")
+    branch, posture, fell_back, _readings = queries.default_branch_posture(conn, "web", "main")
     assert branch == "main"
     assert fell_back is False
 
@@ -393,7 +393,7 @@ def test_trend_query_carries_the_id_tiebreak_in_its_order_by(conn):
     statements = []
     conn.set_trace_callback(statements.append)
     try:
-        queries.trend(conn, "web", "main")
+        queries.trend(conn, "web", "web", "main")
     finally:
         conn.set_trace_callback(None)
     select = next(s for s in statements
@@ -409,7 +409,7 @@ def test_trend_points_carry_a_per_severity_breakdown_that_sums_to_open(conn):
     more or less than the Total line at the same point."""
     _analysis(conn, "main", findings=[("critical", "secret"), ("high", "sast"),
                                       ("high", "sast2")])
-    points = queries.trend(conn, "web", "main")
+    points = queries.trend(conn, "web", "web", "main")
     assert len(points) == 1
     p = points[0]
     assert p["by_severity"]["critical"] == 1
@@ -426,10 +426,10 @@ def test_previous_finished_returns_the_next_older_done_or_capped_row(conn):
     a1 = _analysis(conn, "main", findings=[("high", "sast")])
     failed = _analysis(conn, "main", findings=[], state="failed")
     a3 = _analysis(conn, "main", findings=[("critical", "secret")])
-    prev = queries.previous_finished(conn, "web", "main", a3)
+    prev = queries.previous_finished(conn, "web", "web", "main", a3)
     assert prev is not None and prev["id"] == a1, \
         f"expected {a1} (skipping failed {failed}), got {prev}"
-    assert queries.previous_finished(conn, "web", "main", a1) is None
+    assert queries.previous_finished(conn, "web", "web", "main", a1) is None
 
 
 # ---- Task 2 (Phase 4): the trend series comes back, this time served and
@@ -546,14 +546,19 @@ def test_trend_series_reuses_the_checklist_already_cached_by_posture(tmp_path):
     Uses `queries.read_only`, not the plain `conn` fixture: the fixture is
     `ledger.connect`'s own writable connection, which carries no
     `_checklist_cache` at all (see `checklist`'s own docstring) -- asserting
-    a cache hit through it would pass for the wrong reason, or not at all."""
+    a cache hit through it would pass for the wrong reason, or not at all.
+
+    Driven the way `project_rows` drives it: `default_branch_posture` first,
+    then `trend_series` -- whose one SELECT reads every repository's run of
+    the branch at once, so knowing which readings each point stands on costs
+    no query of its own."""
     db = tmp_path / "security.db"
     conn = ledger.connect(db)
     _analysis(conn, "main", findings=[("high", "sast")])
     conn.close()
 
     ro = queries.read_only(db)
-    queries.posture(ro, "web", "main")
+    queries.default_branch_posture(ro, "web", "main")
 
     statements = []
     ro.set_trace_callback(statements.append)
@@ -920,11 +925,11 @@ def test_severity_totals_with_no_project_argument_stays_fleet_wide(conn):
 def test_severity_totals_and_top_categories_count_one_fingerprint_once_across_branches(conn):
     """The reviewer's exact reproduction. A fingerprint never includes the
     branch, so the same committed secret open on `main` AND `develop` is ONE
-    problem needing one rotation -- exactly what `finding_rows`'s own
-    total/unique split already says elsewhere on this same screen (189
-    findings can be 93 problems). Summing each branch's posture -- what both
-    functions used to do -- counted it twice, on both the donut and the
-    category rollup that feeds off the same numbers."""
+    problem needing one rotation -- `finding_rows` groups by fingerprint, one
+    row per finding, the same line this test holds the donut to. Summing
+    each branch's posture -- what both functions used to do -- counted it
+    twice, on both the donut and the category rollup that feeds off the same
+    numbers."""
     fp = "e" * 64
     for br in ("main", "develop"):
         aid = ledger.start_analysis(conn, "web", "web", br, "s", "quick", "r")
@@ -1210,9 +1215,10 @@ def test_fixed_by_severity_lets_the_hidden_count_exempt_a_fixed_finding(conn):
     assert got["fixed_by_severity"]["high"] == 0, "the still-open high finding must not"
 
 
-def test_unique_counts_fingerprints_not_rows(conn):
-    """189 findings across branches can be 93 problems. The two numbers answer
-    different questions and the screen shows both."""
+def test_group_off_is_one_row_per_branch_as_it_was(conn):
+    """`group=False` is the union one row per finding per branch -- what the
+    consolidated export reads, because a fix is applied on a branch. Two rows
+    and one fingerprint there; one of each on the screen."""
     fp = "d" * 64
     for br in ("main", "develop"):
         aid = ledger.start_analysis(conn, "web", "web", br, "s", "quick", "r")
@@ -1221,9 +1227,341 @@ def test_unique_counts_fingerprints_not_rows(conn):
             "severity": "critical", "title": "t", "occurrences": []})
         ledger.mark_prepared(conn, aid)
         ledger.finish_analysis(conn, aid, "done")
+    per_branch = queries.finding_rows(conn, "web", group=False)
+    assert per_branch["total"] == 2 and per_branch["unique"] == 1
+    assert all("branches" not in r for r in per_branch["rows"])
+    grouped = queries.finding_rows(conn, "web")
+    assert grouped["total"] == 1 and grouped["unique"] == 1
+
+
+def _on(conn, branch, fp=None, severity="critical", title="t", file="k.py", repo="web"):
+    """One finished analysis of `branch` holding `fp` -- or nothing, which is
+    how a finding the branch held last time becomes `fixed` there: its minter
+    is deterministic (no producer, a `secret`), so `prepared` proves it gone.
+    `repo` is the repository of project `web` the analysis is filed under."""
+    aid = ledger.start_analysis(conn, "web", repo, branch, "s", "quick", "r")
+    if fp:
+        ledger.record_finding(conn, aid, {
+            "fingerprint": fp, "category": "secret", "rule": "aws-access-token",
+            "severity": severity, "title": title,
+            "occurrences": [{"file": file, "line": 3, "snippet_hash": ""}]})
+    ledger.mark_prepared(conn, aid)
+    ledger.finish_analysis(conn, aid, "done")
+    return aid
+
+
+def test_one_finding_on_two_branches_is_one_row_naming_both(conn):
+    fp = "1" * 64
+    _on(conn, "main", fp)
+    _on(conn, "develop", fp)
     got = queries.finding_rows(conn, "web")
-    assert got["total"] == 2
-    assert got["unique"] == 1
+    assert got["total"] == 1 and got["unique"] == 1
+    (row,) = got["rows"]
+    assert [b["branch"] for b in row["branches"]] == ["develop", "main"]
+    assert {b["state"] for b in row["branches"]} == {"new"}
+
+
+def test_a_decision_taken_once_is_one_resolved_row_not_one_per_branch(conn):
+    """The screen the operator sent (2026-09-23): the same false positive,
+    decided once, listed under develop AND main -- which read as the decision
+    coming undone every time the other branch was analysed."""
+    fp = "2" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    ledger.set_decision(conn, "web", fp, "false_positive", "synthetic fixture", "me")
+    assert queries.finding_rows(conn, "web")["total"] == 0, \
+        "resolved on every branch: hidden by default"
+    (row,) = queries.finding_rows(conn, "web", {"state": ["false_positive"]})["rows"]
+    assert row["state"] == "false_positive"
+    assert [b["branch"] for b in row["branches"]] == ["develop", "main"]
+
+
+def test_open_on_one_branch_outranks_fixed_on_another(conn):
+    fp = "3" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    _on(conn, "main")                      # gone from main: fixed there
+    (row,) = queries.finding_rows(conn, "web")["rows"]
+    assert row["state"] == "new" and row["branch"] == "develop"
+    assert {b["branch"]: b["state"] for b in row["branches"]} == \
+        {"develop": "new", "main": "fixed"}
+
+
+def test_a_decision_outranks_fixed_and_fixed_needs_every_branch(conn):
+    fp = "4" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    _on(conn, "main")                      # fixed on main
+    ledger.set_decision(conn, "web", fp, "accepted", "tracked in RP-1", "me")
+    (row,) = queries.finding_rows(conn, "web", {"show_resolved": True})["rows"]
+    assert row["state"] == "accepted", "still on develop, and the decision covers it"
+    _on(conn, "develop")                   # and now gone from develop too
+    (row,) = queries.finding_rows(conn, "web", {"show_resolved": True})["rows"]
+    assert row["state"] == "fixed"
+
+
+def test_the_row_reads_the_newest_holder_and_the_worst_open_severity(conn):
+    fp = "5" * 64
+    older = _on(conn, "develop", fp, severity="critical", title="the older reading")
+    newer = _on(conn, "main", fp, severity="high", title="the newer reading")
+    conn.execute("UPDATE analysis SET started=100 WHERE id=?", (older,))
+    conn.execute("UPDATE analysis SET started=200 WHERE id=?", (newer,))
+    conn.commit()
+    (row,) = queries.finding_rows(conn, "web")["rows"]
+    assert row["title"] == "the newer reading" and row["analysis_id"] == newer
+    assert row["severity"] == "critical", "the donut's rule: the worst open reading"
+    assert {b["branch"]: b["severity"] for b in row["branches"]} == \
+        {"develop": "critical", "main": "high"}
+
+
+def test_the_branch_filter_reads_the_finding_as_that_branch_sees_it(conn):
+    fp = "6" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    _on(conn, "main")                      # fixed on main, still new on develop
+    got = queries.finding_rows(conn, "web", {"branch": ["main"], "show_resolved": True})
+    (row,) = got["rows"]
+    assert row["state"] == "fixed", "main's reading, not the group across branches"
+    assert [b["branch"] for b in row["branches"]] == ["main"]
+
+
+def test_a_state_filter_reads_the_group_not_one_branch(conn):
+    fp = "7" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    _on(conn, "main")                      # fixed on main, still new on develop
+    assert queries.finding_rows(conn, "web", {"state": ["fixed"]})["total"] == 0, \
+        "fixed on main but open on develop is not a fixed finding"
+    assert queries.finding_rows(conn, "web", {"state": ["new"]})["total"] == 1
+
+
+def test_path_and_q_find_a_group_through_any_branch(conn):
+    fp = "8" * 64
+    older = _on(conn, "develop", fp, file="legacy/keys.py")
+    newer = _on(conn, "main", fp, file="config/keys.py")
+    conn.execute("UPDATE analysis SET started=100 WHERE id=?", (older,))
+    conn.execute("UPDATE analysis SET started=200 WHERE id=?", (newer,))
+    conn.commit()
+    # main's reading is the row; develop's file lives only in its member
+    assert queries.finding_rows(conn, "web", {"path": "legacy/"})["total"] == 1
+    assert queries.finding_rows(conn, "web", {"q": "legacy/keys"})["total"] == 1
+    assert queries.finding_rows(conn, "web", {"path": "nowhere/"})["total"] == 0
+
+
+def test_counts_and_pages_are_of_findings_not_rows(conn):
+    fps = [c * 64 for c in "abc"]
+    for br in ("develop", "main"):
+        aid = ledger.start_analysis(conn, "web", "web", br, "s", "quick", "r")
+        for fp in fps:
+            ledger.record_finding(conn, aid, {
+                "fingerprint": fp, "category": "secret", "rule": "aws-access-token",
+                "severity": "high", "title": "t",
+                "occurrences": [{"file": "k.py", "line": 1, "snippet_hash": ""}]})
+        ledger.mark_prepared(conn, aid)
+        ledger.finish_analysis(conn, aid, "done")
+    first = queries.finding_rows(conn, "web", per_page=2, page=1)
+    second = queries.finding_rows(conn, "web", per_page=2, page=2)
+    assert first["total"] == 3 and first["unique"] == 3
+    assert first["by_severity"]["high"] == 3
+    assert len(first["rows"]) == 2 and len(second["rows"]) == 1
+    assert {r["fingerprint"] for r in first["rows"] + second["rows"]} == set(fps)
+
+
+def test_the_grouping_state_never_leaves_the_function(conn):
+    fp = "9" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    (row,) = queries.finding_rows(conn, "web")["rows"]
+    assert "_members" not in row
+    assert all("_members" not in r
+               for r in queries.finding_rows(conn, "web", group=False)["rows"])
+
+
+def test_every_state_has_a_place_in_the_grouping_order():
+    """A state missing from GROUP_STATE_ORDER ranks after `fixed`, so `fixed`
+    on one branch would hide it open on another -- the one thing the order
+    exists to prevent. A state added to either vocabulary has to be placed."""
+    assert set(queries.GROUP_STATE_ORDER) == \
+        set(diff.DERIVED_STATES) | set(ledger.DECISION_STATES)
+
+
+# ------------------------------------ every repository, not every branch name
+# A project can hold several repositories (`analysis.repo`), and two of them
+# are routinely analysed on the same branch name. A reading keyed by
+# (project, branch) alone picks ONE analysis per branch NAME -- the newest,
+# whichever repository it came from -- and the other repository's findings
+# vanish from whatever that reading feeds. Found in the final review of
+# fix/security-findings-one-row (2026-09-23), in the findings browser; the
+# probes below hold every reader that had the same key.
+
+def test_the_browser_reads_every_repository_on_a_shared_branch_name(conn):
+    in_web = _on(conn, "main", "1" * 64, title="in web")
+    in_admin = _on(conn, "main", "2" * 64, title="in web-admin", repo="web-admin")
+    got = queries.finding_rows(conn, "web")
+    assert {(r["repo"], r["title"], r["analysis_id"]) for r in got["rows"]} == \
+        {("web", "in web", in_web), ("web-admin", "in web-admin", in_admin)}
+    # the export's read: the same union, one row per finding per branch
+    per_branch = queries.finding_rows(conn, "web", group=False)
+    assert {(r["repo"], r["title"]) for r in per_branch["rows"]} == \
+        {("web", "in web"), ("web-admin", "in web-admin")}
+
+
+def test_each_repository_s_latest_analysis_is_read_not_every_analysis(conn):
+    """The containment side of the scope: widened to every repository, the
+    browser still reads each one's LATEST finished analysis -- `web`'s older
+    run, which still held the secret, must not bring it back as `new`."""
+    fp = "3" * 64
+    _on(conn, "main", fp)
+    _on(conn, "main")                                  # gone from web: fixed
+    _on(conn, "main", "4" * 64, repo="web-admin")
+    got = queries.finding_rows(conn, "web", {"show_resolved": True}, group=False)
+    assert {(r["repo"], r["fingerprint"], r["state"]) for r in got["rows"]} == \
+        {("web", fp, "fixed"), ("web-admin", "4" * 64, "new")}
+
+
+def test_one_fingerprint_in_two_repositories_is_one_row_naming_both(conn):
+    """Grouping spans the repositories, as the decision key does -- and each
+    member says which repository it was read in, or two `main`s are two
+    indistinguishable names on the screen."""
+    fp = "5" * 64
+    _on(conn, "main", fp)
+    _on(conn, "main", fp, repo="web-admin")
+    (row,) = queries.finding_rows(conn, "web")["rows"]
+    assert [(b.get("repo"), b["branch"]) for b in row["branches"]] == \
+        [("web", "main"), ("web-admin", "main")]
+
+
+def test_the_pickers_offer_each_repository_s_run_and_one_name_per_branch(conn):
+    """The Analysis run picker offers one run per (repository, branch), each
+    saying its repository, and every one of them matches its own rows. The
+    Branch picker offers the NAME once: "Branch: main" reads main in every
+    repository that has one."""
+    in_web = _on(conn, "main", "1" * 64, title="in web")
+    in_admin = _on(conn, "main", "2" * 64, title="in web-admin", repo="web-admin")
+    got = queries.finding_rows(conn, "web")
+    assert {(a.get("repo"), a["branch"], a["id"]) for a in got["analyses"]} == \
+        {("web", "main", in_web), ("web-admin", "main", in_admin)}
+    assert got["branches"] == ["main"]
+    for aid, title in ((in_web, "in web"), (in_admin, "in web-admin")):
+        (only,) = queries.finding_rows(conn, "web", {"analysis": [aid]})["rows"]
+        assert only["title"] == title
+    named = queries.finding_rows(conn, "web", {"branch": ["main"]})["rows"]
+    assert {r["title"] for r in named} == {"in web", "in web-admin"}
+
+
+def test_a_capped_repository_is_counted_when_another_finished_the_branch_later(conn):
+    """The strip's partial-read cue, the sidebar's and the sidebar's own count
+    of what the donut spans: all three count (repository, branch) scopes, the
+    unit the donut and the browser now read."""
+    capped = ledger.start_analysis(conn, "web", "web", "main", "s", "quick", "r")
+    ledger.mark_prepared(conn, capped)
+    ledger.finish_analysis(conn, capped, "capped")
+    _on(conn, "main", "2" * 64, repo="web-admin")      # newer, and done
+    assert queries.finding_rows(conn, "web")["capped_branches"] == 1
+    assert queries.capped_branch_count(conn, "web") == 1
+    assert queries.analysed_branch_count(conn, "web") == 2
+
+
+def test_the_donut_and_the_categories_count_every_repository(conn):
+    _on(conn, "main", "1" * 64)                        # critical, in web
+    _on(conn, "main", "2" * 64, severity="high", repo="web-admin")
+    totals = queries.severity_totals(conn, "web")
+    assert (totals["critical"], totals["high"], totals["total"]) == (1, 1, 2)
+    assert queries.top_categories(conn, "web") == \
+        [{"rule": "aws-access-token", "count": 2, "category": "secret"}]
+
+
+def test_the_donut_still_counts_one_fingerprint_in_two_repositories_once(conn):
+    """The containment side: every repository is read, and a fingerprint
+    open in two of them is still ONE problem -- the donut's rule and the
+    browser's, which groups it into one row."""
+    fp = "6" * 64
+    _on(conn, "main", fp)
+    _on(conn, "main", fp, repo="web-admin")
+    assert queries.severity_totals(conn, "web")["total"] == 1
+    assert queries.finding_rows(conn, "web")["total"] == 1
+
+
+def test_the_branches_tab_has_one_row_per_repository_and_branch(conn):
+    """Each row IS one analysis reading -- its drill-down, its commit, its
+    trend -- so its unit is (repository, branch). One row per branch NAME
+    counted both repositories' runs and read one repository's posture."""
+    in_web = _on(conn, "main", "1" * 64)
+    in_admin = _on(conn, "main", "2" * 64, severity="high", repo="web-admin")
+    rows = {(r.get("repo"), r["branch"]): r for r in queries.branch_rows(conn, "web")}
+    assert set(rows) == {("web", "main"), ("web-admin", "main")}
+    web, admin = rows[("web", "main")], rows[("web-admin", "main")]
+    assert (web["analysis_id"], web["analyses"], web["open"]["critical"]) == (in_web, 1, 1)
+    assert (admin["analysis_id"], admin["analyses"], admin["open"]["high"]) == (in_admin, 1, 1)
+    assert [p["analysis_id"] for p in web["trend"]] == [in_web]
+
+
+def _open_in(conn, repo, branch, n):
+    """A finished analysis of `repo`/`branch` with `n` distinct open findings,
+    the same `n` fingerprints every time for the same repository."""
+    aid = ledger.start_analysis(conn, "web", repo, branch, "s", "quick", "r")
+    for i in range(n):
+        ledger.record_finding(conn, aid, {
+            "fingerprint": f"{repo}-{i}".ljust(64, "0"), "category": "secret",
+            "rule": "aws-access-token", "severity": "high", "title": "t",
+            "occurrences": [{"file": "k.py", "line": 1, "snippet_hash": ""}]})
+    ledger.mark_prepared(conn, aid)
+    ledger.finish_analysis(conn, aid, "done")
+    return aid
+
+
+def test_the_index_sparkline_plots_every_repository_s_reading_of_the_branch(conn):
+    """Each point is the declared branch as it read the moment that analysis
+    finished: every repository's newest reading of it by then, one entry per
+    fingerprint. Read by branch name alone the line zigzagged between the
+    repositories' own counts; read off one repository it lost the other's."""
+    _open_in(conn, "web", "main", 1)
+    _open_in(conn, "web-admin", "main", 3)
+    _open_in(conn, "web", "main", 2)
+    assert queries.trend_series(conn, {"name": "web", "base": "main"}) == [1, 4, 5]
+
+
+def test_the_project_row_reads_every_repository_s_declared_branch(conn):
+    """The index row, the index cards and the Overview describe the project's
+    declared branch -- every repository's newest reading of it, one entry per
+    fingerprint, the rule the donut and the findings browser already read.
+    Off the newest repository alone, `web`'s findings on main were missing
+    from all three."""
+    first = _open_in(conn, "web", "main", 1)
+    newest = _open_in(conn, "web-admin", "main", 3)
+    branch, posture, fell_back, readings = queries.default_branch_posture(conn, "web", "main")
+    assert (branch, fell_back) == ("main", False)
+    assert [(r["repo"], r["id"]) for r in readings] == [("web-admin", newest), ("web", first)]
+    assert posture["total"] == 4
+
+
+def test_the_index_counts_and_flags_every_repository_s_declared_branch(conn):
+    """The fleet cards and the project row: `web`'s capped run of main holds a
+    critical, `web-admin`'s newer run of main is clean. Off the newest
+    repository alone the project read clean, and complete."""
+    capped = ledger.start_analysis(conn, "web", "web", "main", "s", "quick", "r")
+    ledger.record_finding(conn, capped, {
+        "fingerprint": "c" * 64, "category": "secret", "rule": "aws-access-token",
+        "severity": "critical", "title": "t",
+        "occurrences": [{"file": "k.py", "line": 1, "snippet_hash": ""}]})
+    ledger.mark_prepared(conn, capped)
+    ledger.finish_analysis(conn, capped, "capped")
+    _open_in(conn, "web-admin", "main", 0)
+    project = {"name": "web", "base": "main"}
+    summary = queries.index_summary(conn, [project])
+    assert (summary["critical"], summary["capped_projects"]) == (1, 1)
+    (row,) = queries.project_rows(conn, [project])
+    assert (row["posture"]["critical"], row["last_state"]) == (1, "capped")
+
+
+def test_one_repository_s_project_row_reads_as_it_always_did(conn):
+    """The control: one repository, one reading -- the newest analysis of
+    the declared branch, its posture, its state."""
+    _open_in(conn, "web", "main", 1)
+    newest = _open_in(conn, "web", "main", 2)
+    branch, posture, fell_back, readings = queries.default_branch_posture(conn, "web", "main")
+    assert ([r["id"] for r in readings], posture["total"]) == ([newest], 2)
+    assert queries.trend_series(conn, {"name": "web", "base": "main"}) == [1, 2]
 
 
 def test_finding_rows_carries_a_findings_cwe_and_owasp_class(conn):
@@ -1734,3 +2072,70 @@ def test_checklist_hands_the_guides_over_decoded(tmp_path):
     ledger.set_guides(conn, aid, recommended=["ATTACK-CLASSES"])
     analysis, _ = queries.checklist(conn, aid)
     assert analysis["guides"] == {"recommended": ["ATTACK-CLASSES"]}
+
+
+# ------------------------------------------- what a disproved finding costs
+
+def test_a_rejected_finding_leaves_the_posture_and_stays_in_the_rows(tmp_path):
+    """`counted` is the one predicate: open AND not disproved. A rejected
+    finding is not exposure -- somebody read the code and said so -- but it is
+    still a row, still in the report, and still searchable."""
+    db = tmp_path / "s.db"
+    conn = ledger.connect(db)
+    aid = ledger.start_analysis(conn, "web", "web", "main", "abc", "quick", "r1")
+    ledger.mark_prepared(conn, aid, ["semgrep"])
+    for fp, sev in (("a" * 64, "critical"), ("b" * 64, "high")):
+        ledger.record_finding(conn, aid, {
+            "fingerprint": fp, "category": "sast", "rule": "xss", "severity": sev,
+            "title": "t", "rationale": "r", "producer": "agent",
+            "occurrences": [{"file": "a.py", "line": 1}]})
+    ledger.record_verdict(conn, aid, "a" * 64, "rejected", "the escaping helper at a.py:1")
+    ledger.finish_analysis(conn, aid, "done")
+    ro = queries.read_only(db)
+
+    post = queries.posture(ro, "web", "web", "main")
+    assert post["critical"] == 0, "a rejected finding is not exposure"
+    assert post["high"] == 1
+    assert post["total"] == 1
+
+    # Off the page by default, exactly as a `fixed` finding is -- and there
+    # when the reader asks for the resolved, because the record of what was
+    # dismissed and why is worth reading.
+    default = queries.finding_rows(ro, "web", {})
+    assert [r["fingerprint"][0] for r in default["rows"]] == ["b"]
+    page = queries.finding_rows(ro, "web", {"show_resolved": True})
+    assert {r["fingerprint"][0] for r in page["rows"]} == {"a", "b"}, \
+        "it is still a row: the reader sees what was disproved and why"
+
+    only = queries.finding_rows(ro, "web", {"verdict": ["rejected"], "show_resolved": True})
+    assert [r["fingerprint"][0] for r in only["rows"]] == ["a"]
+    # Asked for by name, it passes the gate on its own -- the rule a Status
+    # filter naming a resolved state already follows. The page's Verdict
+    # picker sets no show_resolved, and "Disproved" alone showed an empty page.
+    named = queries.finding_rows(ro, "web", {"verdict": ["rejected"]})
+    assert [r["fingerprint"][0] for r in named["rows"]] == ["a"], \
+        "a verdict the reader asked for by name must not be hidden by the gate"
+
+
+def test_the_checklist_carries_the_previous_analysis_verdict(tmp_path):
+    """Not inherited -- shown. The hunter sees that the last analysis had this
+    disproved, so it does not re-discover it from scratch; the verdict of THIS
+    analysis is still empty until somebody verifies it again."""
+    db = tmp_path / "s.db"
+    conn = ledger.connect(db)
+    row = {"fingerprint": "a" * 64, "category": "sast", "rule": "xss",
+           "severity": "high", "title": "t", "rationale": "r", "producer": "agent",
+           "occurrences": [{"file": "a.py", "line": 1}]}
+    first = ledger.start_analysis(conn, "web", "web", "main", "abc", "quick", "r1")
+    ledger.mark_prepared(conn, first, ["semgrep"])
+    ledger.record_finding(conn, first, row)
+    ledger.record_verdict(conn, first, "a" * 64, "rejected", "the guard at a.py:1")
+    ledger.finish_analysis(conn, first, "done")
+
+    second = ledger.start_analysis(conn, "web", "web", "main", "def", "quick", "r2")
+    ledger.mark_prepared(conn, second, ["semgrep"])
+    ledger.record_finding(conn, second, row)
+    _an, findings = queries.checklist(conn, second)
+    f = findings[0]
+    assert f["verdict"] == "", "this analysis has not verified it"
+    assert f["previous_verdict"] == "rejected"

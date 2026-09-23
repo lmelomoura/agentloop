@@ -398,6 +398,8 @@ The agent finds everything through `$AL_RUN_MANIFEST`. The canonical checkouts
 are never modified: they are read to cut worktrees from, nothing more.
 
 `enabled` is `"auto"` (isolate when the cwd is a git repo), `true` or `false`.
+A security analysis is isolated whatever it says, in a worktree of the one
+repository it names — see [The branch is chosen per analysis](#the-branch-is-chosen-per-analysis-and-the-worktree-is-cut-clean).
 
 A run dir is removed when the run ends. A run that was cut short keeps its dir
 until it is resumed or expires — see [Sessions that are still open](#sessions-that-are-still-open).
@@ -1307,10 +1309,18 @@ dialog that opens when you click a decision's fingerprint on Activity are the
 same browser, filtered differently, and not two tables to drift apart. Both can
 be open at once, and each keeps its own filters.
 
-`total` and `unique` are shown as two labelled numbers above it, never collapsed
-into one: the same finding open on `main` and on `develop` is two rows and one
-problem, so 189 findings can be 93 problems, and a single number silently
-answers whichever question you were not asking.
+**One row per finding, not one per branch.** The browser unions the latest
+finished analysis of every branch and groups it by fingerprint: the same
+finding on `main` and on `develop` is one row naming both. Its Status is the
+reading that needs attention first — open on any branch outranks a decision,
+and a decision outranks `fixed`, so a finding reads fixed only once every
+branch it is on says so — and when the branches disagree, each one's own
+state is written beside its name. A decision is recorded against the
+project, so one row is also the honest shape of what you decide on: before
+this, every finding already ruled on came back in front of you, as a second
+row, each time another branch was analysed. *Branch: main* shows the finding
+as `main` reads it. The consolidated export stays one row per branch,
+because a fix is applied on a branch.
 
 **Saved filters.** The view somebody works from every day — say critical and
 high, secrets only, resolved hidden, sorted by branch — is saved under a name per
@@ -1406,6 +1416,16 @@ for a project's `up` hook nor is stopped by one that fails. The canonical
 checkout is read to cut from and never modified, as in every other run, and the
 tree is removed when the analysis ends.
 
+**On a project that spans several repositories, an analysis is about one of
+them.** It runs in a worktree of the repository it names, cut from the branch
+it names, and nothing else is checked out: the other repositories are not what
+the report describes, and a branch of one repository need not exist in the
+next. An analysis is also cut into a worktree on a project whose
+`worktree.enabled` is `false` — a worktree is the only way to read a branch
+without moving the canonical checkout, and an analysis run in the checkout
+itself would read whatever happened to be checked out there under the name of
+the branch you asked for.
+
 The profile decides how far the **agent** reads. The deterministic half below
 runs in full in all three:
 
@@ -1478,6 +1498,40 @@ The criterion behind it is the boundary requirement of
 a finding names the lower-trust principal, the input, the control that should
 have held, the boundary crossed, what is affected and the observable result;
 a missing best practice is a hardening note at `info`, not a vulnerability.
+
+### And who checks it
+
+A finding the agent minted is a claim until somebody who did not make it has
+tried to disprove it. After the SAST pass, the analysis works a **verification
+queue** — its own `sast` findings at `medium` or above, plus any below that
+claim a `high` impact — and for each one launches a **subagent with a prompt
+the CLI minted from the ledger**, not one the hunter wrote. The subagent reads
+the code, looks for what contradicts the claim, and writes its own verdict:
+`confirmed` (read it, could not disprove it), `rejected` (disproved, and here
+is what disproves it) or `needs_validation` (turns on a fact the code does not
+hold). The hunter's `rationale` is deliberately not shown to it — everything
+checkable line by line is in the candidate, and the rest is persuasion.
+
+**A disproved finding leaves the posture and stays in the ledger**: out of the
+donut and the severity counts, off the browser's default view exactly as a
+`fixed` one is, and into its own section of the report with the reason. It is
+not inherited — the next analysis puts it back in the queue, because a reading
+of one day is not a permanent decision. That is what *Accept risk* and *False
+positive* are for.
+
+**And the close counts it, rather than asking for it.** The engine reads the
+run's stream for the subagents it launched and compares that with the verdicts
+in the ledger: findings left unverified, subagents that produced no verdict,
+and verdicts with no subagent behind them each lower `done` to `capped` with
+the numbers in the report. The first of the three is the one the other two
+cannot see — an agent that ignores the phase launches nothing and records
+nothing, so the two counts agree at zero while the work never happened. It is
+the same shape as the triage guard, for the same reason: asking is what
+failed.
+
+The phase runs on Claude Code only, where a subagent has a shell and can write
+its own verdict; on the Codex CLI and OpenCode the `verification` row of the
+coverage table reads `skipped`.
 
 ### Hunting guides
 
@@ -1560,6 +1614,27 @@ whole report, and the line number is left out so that an import added above a
 finding does not either. Change what the code actually *says* and it is
 different code, which deserves a fresh judgement rather than an inherited one.
 Surprising the first time it happens; correct.
+
+**The agent's own finding keeps its identity across branches.** A `sast`
+fingerprint the agent mints is built from the rule, the path and the snippet
+it chose, and it reuses one only when the checklist it works from lists the
+weakness — a checklist that compares with the same branch alone. So a finding
+decided on `develop` was minted again on `main`, without its decision: one
+access-control hole was accepted twice on one project, once per branch.
+`agentloop security checklist` now also prints `decided_sast` — every `sast`
+the agent minted in this project and repository that carries a decision the
+checklist does not already list, with its rule, title, occurrences, where it
+was last seen and the decision — and the skill tells the agent to re-report
+the same flaw in the same place under that fingerprint, so the decision
+applies instead of the finding coming back as `new`. Semgrep's rows are left
+out: their identity comes from Semgrep's own check id and does not drift. A
+decided finding keeps its identity at the door — `report-finding` refuses
+any report that lands on a decided fingerprint under another category or
+rule, whether a fold, a second report re-labelling one, or a carried-over
+row, since both are what the ruling was made about — and the agent's final
+summary lists every fold, where it found it and whether its reading agrees
+with the decision's reason: a finding that takes an old ruling the moment it
+lands is otherwise invisible.
 
 ### A secret's value is never stored, and never shown
 

@@ -22,11 +22,11 @@
    card's own "(all branches)" each carry their half of it. */
 import { $, fmtAgo, fmtWhen, kpiCard, projById, tableFooter } from "./page.js";
 import { secEl, secIcon, secPlaceMenu } from "./dom.js";
-import { SEC_NEVER, SEC_FLOOR_SCOPE_NOTE } from "./vocabulary.js";
+import { SEC_NEVER, SEC_FLOOR_SCOPE_NOTE, secScopeName } from "./vocabulary.js";
 import { secIndexDonutSvg, secIndexDonutLegend, secIndexCategories,
          secCappedScopeNote } from "./index-screen.js";
 import { secFindTriggerLabel, secFindPositionPop, renderFindings } from "./findings-screen.js";
-import { secShowAnalysis, secGitBranchCount } from "./analysis.js";
+import { secShowAnalysis, secGitBranchCount, secGitBranchRepo } from "./analysis.js";
 import { secDownloadReport } from "./actions.js";
 import { secSwitchProjectTab, secRefreshProject } from "./project-screen.js";
 import { closeMenus } from "./page.js";
@@ -137,17 +137,24 @@ function secBrKpis(rows, payload){
       + "most " + SEC_BRANCH_ACTIVE_DAYS + " days old — the same rule the "
       + "Status column and filter read."}));
 
-  // The DECLARED base's own posture, straight off its row -- a dash when it
-  // was never successfully read, which is not the same claim as zero.
+  // The DECLARED base's own posture, straight off its rows -- a dash when it
+  // was never successfully read, which is not the same claim as zero. ROWS:
+  // a project with several repositories has one row per repository on the
+  // base (queries.branch_rows), and the card counts each of them the way the
+  // table does, once per branch -- never whichever row happened to be first.
   const base = secBrDefaultBranch();
-  const baseRow = rows.find(r => r.branch === base);
-  const crit = baseRow && baseRow.open ? String(baseRow.open.critical || 0) : "—";
+  const baseRows = rows.filter(r => r.branch === base);
+  const read = baseRows.filter(r => r.open);
+  const crit = read.length
+    ? String(read.reduce((n, r) => n + (r.open.critical || 0), 0)) : "—";
   wrap.appendChild(kpiCard({icon: "shield", tone: "sev-crit", value: crit,
     label: "Critical findings", sub: "in default branch",
     title: crit === "—"
       ? "The declared base (" + (base || "none declared") + ") has no "
         + "finished analysis to read a posture from."
-      : "Open critical findings in " + base + "'s latest finished analysis."}));
+      : "Open critical findings in " + base + "'s latest finished analysis"
+        + (baseRows.length > 1 ? " in each of its " + baseRows.length + " repositories" : "")
+        + "."}));
 
   const donut = (payload.sidebar || {}).donut || {};
   wrap.appendChild(kpiCard({icon: "alertcircle", value: String(donut.total || 0),
@@ -160,15 +167,18 @@ function secBrKpis(rows, payload){
   // `done` read the whole scope (100%), a `capped` one stopped early
   // (Partial), and no finished analysis at all is a dash -- there is no
   // finer-grained coverage number recorded than that, so none is invented.
-  const covered = !baseRow || !baseRow.state ? "—"
-    : baseRow.state === "done" ? "100%" : "Partial";
+  // With several repositories on the base, 100% needs every one of them
+  // read clean: one that stopped early, or never finished, is Partial.
+  const covered = !read.length ? "—"
+    : baseRows.every(r => r.state === "done") ? "100%" : "Partial";
+  const lastFinished = Math.max(0, ...baseRows.map(r => r.last_finished || 0));
   wrap.appendChild(kpiCard({icon: "covers", value: covered,
     label: "Default branch covered",
-    sub: baseRow && baseRow.last_finished
-      ? "last analysis " + fmtAgo(baseRow.last_finished) : SEC_NEVER.short,
+    sub: lastFinished ? "last analysis " + fmtAgo(lastFinished) : SEC_NEVER.short,
     title: "100% means the default branch's latest finished analysis "
-      + "completed clean; Partial means it stopped before covering the "
-      + "whole scope (capped)."}));
+      + "completed clean" + (baseRows.length > 1 ? " in every repository" : "")
+      + "; Partial means it stopped before covering the whole scope (capped)"
+      + (baseRows.length > 1 ? " in at least one of them" : "") + "."}));
   return wrap;
 }
 
@@ -290,7 +300,9 @@ function secBrTable(rows){
   thead.appendChild(htr);
   table.appendChild(thead);
   const tbody = document.createElement("tbody");
-  filtered.forEach(r => tbody.appendChild(secBranchRow(r)));
+  // `rows`, not `filtered`, decides whether a row names its repository: a
+  // search that leaves one repository's rows on screen must not rename them.
+  filtered.forEach(r => tbody.appendChild(secBranchRow(r, rows)));
   table.appendChild(tbody);
   scroll.appendChild(table);
   wrap.appendChild(scroll);
@@ -304,14 +316,19 @@ function secBrTable(rows){
   return hostWrap;
 }
 
-function secBranchRow(r){
+/* One row per (repository, branch) -- queries.branch_rows -- named with its
+   repository once the project has more than one (secScopeName), or two
+   repositories' `main` would be two rows both called main. The Default badge
+   still reads the NAME: the declared base is a branch name, worn by every
+   repository's row of it. */
+function secBranchRow(r, rows){
   const tr = document.createElement("tr");
   const now = Math.floor(Date.now() / 1000);
 
   const tdName = document.createElement("td");
   const name = secEl("div", "secbr-name");
   name.appendChild(secIcon("gitbranch"));
-  name.appendChild(secEl("span", "secbr-branch", r.branch || ""));
+  name.appendChild(secEl("span", "secbr-branch", secScopeName(r, rows)));
   if(r.branch && r.branch === secBrDefaultBranch()){
     const badge = secEl("span", "pill profile", "Default");
     badge.title = "This project's declared base branch";
@@ -398,7 +415,7 @@ function secBranchRow(r){
     };
   }
   tdActs.appendChild(view);
-  tdActs.appendChild(secBrKebab(r));
+  tdActs.appendChild(secBrKebab(r, rows));
   tr.appendChild(tdActs);
   return tr;
 }
@@ -457,7 +474,7 @@ function secBrTrendBars(trend){
   return svg;
 }
 
-function secBrKebab(r){
+function secBrKebab(r, rows){
   const kebab = document.createElement("details");
   kebab.className = "secidx-kebab";
   const summary = document.createElement("summary");
@@ -487,8 +504,14 @@ function secBrKebab(r){
     // this one starts, so the browser lands filtered, never racing back.
     // `branch` is a STRING here -- the browser's own client-side filter
     // shape (_defaultFilters, findings-screen.js), not finding_rows's
-    // server-side list form.
-    renderFindings($("sec-pj-findings"), secState.project, {branch: r.branch});
+    // server-side list form. A branch NAME reads every repository's branch
+    // of that name, so once the rows span more than one repository this row
+    // opens its OWN reading instead: the Analysis run filter on its latest
+    // finished analysis -- the one its posture was read from.
+    const own = r.analysis_id != null
+      && new Set((rows || []).map(x => x.repo).filter(Boolean)).size > 1;
+    renderFindings($("sec-pj-findings"), secState.project,
+      own ? {analysis: String(r.analysis_id)} : {branch: r.branch});
   };
   pop.appendChild(findings);
 
@@ -640,17 +663,24 @@ export function secBranchesSidebar(payload){
    picked repo when the launcher's list has answered (secGitBranchCount,
    analysis.js -- the same fetch, no second git call), and never less than
    the branches the ledger itself knows; before that list answers it is the
-   ledger's count alone, and the caption says which of the two it was. */
+   ledger's count alone, and the caption says which of the two it was.
+   git answers for ONE repository, and the rows are one per (repository,
+   branch): once they span more than one, X and Y count that repository's
+   rows only, or another repository's branches would fill this one's
+   coverage. */
 function secBrCoverageCard(rows){
   const card = secEl("div", "card secpj-plaincard");
   const head = secEl("div", "secpj-cardhead");
   head.appendChild(secEl("h3", null, "Branch coverage"));
   card.appendChild(head);
   const now = Math.floor(Date.now() / 1000);
-  const analyzed = rows.filter(r =>
-    r.last_finished && (now - r.last_finished) <= 30 * 86400).length;
   const gitCount = secGitBranchCount();
-  const total = Math.max(gitCount, rows.length);
+  const gitRepo = secGitBranchRepo();
+  const multi = new Set(rows.map(r => r.repo).filter(Boolean)).size > 1;
+  const counted = gitCount && multi ? rows.filter(r => r.repo === gitRepo) : rows;
+  const analyzed = counted.filter(r =>
+    r.last_finished && (now - r.last_finished) <= 30 * 86400).length;
+  const total = Math.max(gitCount, counted.length);
   const pct = total ? Math.round((analyzed / total) * 100) : 0;
 
   const line = secEl("div", "secbr-covline");
@@ -662,8 +692,9 @@ function secBrCoverageCard(rows){
   bar.style.width = pct + "%";
   barTrack.appendChild(bar);
   card.appendChild(barTrack);
-  const scope = gitCount ? "of the branches the repository lists"
-                         : "of the branches ever analysed";
+  const scope = gitCount
+    ? "of the branches " + (multi ? gitRepo : "the repository") + " lists"
+    : "of the branches ever analysed";
   card.appendChild(secEl("div", "secpj-caption",
     !total ? "Nothing has been analysed yet."
     : analyzed >= total

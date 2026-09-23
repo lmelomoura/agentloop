@@ -5687,7 +5687,7 @@ def _branches_tab_deps(block):
          "SEC_BRANCH_ACTIVE_DAYS", "BRANCH_CAPPED_TITLE", "BRANCH_SCOPE_TITLE",
          "SEC_NEVER"))
     fns = "\n".join(_plainfn(block, n) for n in
-        ("secEl", "secIcon", "secBranchIsActive", "secBrDefaultBranch",
+        ("secEl", "secIcon", "secScopeName", "secBranchIsActive", "secBrDefaultBranch",
          "secBrKpis", "secBrRepaint", "secBrPicker", "secBrFilterBar",
          "secBrFiltered", "secBrTable", "secBranchRow", "secBrSevChips",
          "secBrTrendBars", "secBrKebab", "secBranchTrendText",
@@ -5724,6 +5724,7 @@ def _branches_tab_deps(block):
     function secDownloadReport(_id, _fmt, _el){}
     function secRefreshProject(){}
     function secGitBranchCount(){ return 0; }
+    function secGitBranchRepo(){ return ""; }
     function closeMenus(){}
     """
     return consts + stubs + fns
@@ -5785,6 +5786,104 @@ def test_the_branches_tab_renders_one_row_per_branch_with_its_own_posture(srv, t
     assert "once per branch" in titles, \
         f"the per-branch-vs-fingerprint scope note must ride a title: {titles}"
     assert "3 branch" in joined, f"the footer must count the rows: {joined}"
+    assert "›" not in joined, "one repository: no row names it"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_branches_tab_names_each_row_s_repository_when_there_are_two(srv, tmp_path):
+    """queries.branch_rows is one row per (repository, branch): two
+    repositories analysed on the declared base are two rows, each named with
+    its repository, and the default-branch cards read both of them -- not
+    whichever row happened to come first."""
+    block = _security_js(srv)
+    script = tmp_path / "pj-branches-repos.js"
+    script.write_text(_PROJECT_DOM_HARNESS + _branches_tab_deps(block) + """
+    const now = Math.floor(Date.now() / 1000);
+    secRenderProjectBranches({project: "web", sidebar: {donut: {total: 3}}, tabs: {
+      overview: {attempted: true},
+      branches: [
+      {repo: "web-admin", branch: "develop", last_analysis: now - 60, last_finished: now - 60,
+       analyses: 1, state: "done", latest_state: "done", analysis_id: 14, sha: "aaaaaaa1",
+       open: {critical: 0, high: 1, medium: 0, low: 0, info: 0, total: 1}, trend: []},
+      {repo: "web", branch: "develop", last_analysis: now - 120, last_finished: now - 120,
+       analyses: 1, state: "capped", latest_state: "capped", analysis_id: 12, sha: "bbbbbbb2",
+       open: {critical: 2, high: 0, medium: 0, low: 0, info: 0, total: 2}, trend: []},
+    ]}});
+    console.log(JSON.stringify(collectAll(_els["sec-pj-branches"], [])));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    texts = [r["text"] for r in out]
+    assert "web-admin › develop" in texts and "web › develop" in texts, texts
+    crit = next(r for r in out if r["cls"] == "kpi-card sev-crit")
+    assert crit["text"].startswith("2"), f"both repositories' base, not the first row's: {crit}"
+    covered = next(r for r in out if "Default branch covered" in r["text"]
+                   and r["cls"].startswith("kpi-card"))
+    assert covered["text"].startswith("Partial"), f"one of the two stopped early: {covered}"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_view_findings_opens_the_row_s_own_reading_when_repositories_share_a_branch(
+        srv, tmp_path):
+    """"View findings" filtered the browser by branch NAME, so with two
+    repositories on develop one row's click listed both repositories'
+    findings. With more than one repository the row opens its own reading --
+    the Analysis run filter on its latest finished analysis; with one, the
+    Branch filter, as before."""
+    block = _security_js(srv)
+    script = tmp_path / "pj-branches-view.js"
+    script.write_text(_PROJECT_DOM_HARNESS + _branches_tab_deps(block) + """
+    const asked = [];
+    renderFindings = function(_host, _project, filters){ asked.push(filters); };
+    function find(n){
+      if(n.tagName === "button" && n.textContent === "View findings") return n;
+      for(const c of (n.childNodes || [])){ const hit = find(c); if(hit) return hit; }
+      return null;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const row = (repo, id) => ({repo, branch: "develop", last_analysis: now,
+      last_finished: now, analyses: 1, state: "done", latest_state: "done",
+      analysis_id: id, sha: "a1", trend: [],
+      open: {critical: 0, high: 0, medium: 0, low: 0, info: 0, total: 0}});
+    for(const rows of [[row("web-admin", 14), row("web", 12)], [row("web", 12)]]){
+      secRenderProjectBranches({project: "web", sidebar: {},
+        tabs: {overview: {attempted: true}, branches: rows}});
+      find(_els["sec-pj-branches"]).onclick({stopPropagation(){}});
+    }
+    console.log(JSON.stringify(asked));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert out == [{"analysis": "14"}, {"branch": "develop"}], out
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_branch_coverage_counts_the_repository_git_listed_the_branches_of(srv, tmp_path):
+    """git's branch list is ONE repository's -- the one the launcher has
+    picked (secGitBranchCount) -- and the rows are one per (repository,
+    branch). With two repositories, "X / Y analyzed" counts the picked
+    repository's rows over its own list, not every repository's rows over
+    it; with one, every row, as before."""
+    block = _security_js(srv)
+    script = tmp_path / "pj-branch-coverage.js"
+    script.write_text(_PROJECT_DOM_HARNESS + _branches_tab_deps(block)
+                      + _plainfn(block, "secBrCoverageCard") + """
+    secGitBranchCount = function(){ return 4; };
+    secGitBranchRepo = function(){ return "web"; };
+    const now = Math.floor(Date.now() / 1000);
+    const line = (card) => collectAll(card, []).find(r => r.cls === "secbr-covcount").text;
+    const two = line(secBrCoverageCard([
+      {repo: "web", branch: "main", last_finished: now - 60},
+      {repo: "web-admin", branch: "main", last_finished: now - 60},
+      {repo: "web-admin", branch: "develop", last_finished: now - 60}]));
+    const one = line(secBrCoverageCard([
+      {repo: "web", branch: "main", last_finished: now - 60},
+      {repo: "web", branch: "develop", last_finished: now - 60}]));
+    console.log(JSON.stringify({two, one}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert out == {"two": "1 / 4 analyzed", "one": "2 / 4 analyzed"}, out
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -5975,7 +6074,7 @@ def test_the_reports_tab_renders_one_row_per_analysis_with_four_downloads(srv, t
     consts = (_const(block, "SEC_REPORT_FORMATS") + _const(block, "SEC_REPORT_COLS")
               + _const(block, "SBOM_CAVEAT") + _const(block, "GENERATED_NOTE"))
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secRpCap", "secRpFinished",
+                     ("secEl", "secIcon", "secScopeName", "secRpCap", "secRpFinished",
                       "secReportRow",
                       "secReportsTable", "secRenderProjectReports"))
     script = tmp_path / "pj-reports.js"
@@ -6028,6 +6127,38 @@ def test_the_reports_tab_renders_one_row_per_analysis_with_four_downloads(srv, t
         f"the SBOM caveat must ride the SBOM controls' own tooltips: {titles}"
     assert "every recorded finding" in joined, f"the severity-floor note is missing: {joined}"
     assert "3 report" in joined, f"the footer must count the rows: {joined}"
+    assert "›" not in joined, "one repository: no row names it"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_reports_tab_names_each_run_s_repository_when_there_are_two(srv, tmp_path):
+    """One row per analysis, and two repositories analysed on main are two
+    rows that both said "main" -- the report of one downloaded for the other
+    by a reader who could not tell them apart."""
+    block = _security_js(srv)
+    consts = (_const(block, "SEC_REPORT_FORMATS") + _const(block, "SEC_REPORT_COLS")
+              + _const(block, "SBOM_CAVEAT") + _const(block, "GENERATED_NOTE"))
+    deps = "\n".join(_plainfn(block, n) for n in
+                     ("secEl", "secIcon", "secScopeName", "secRpCap", "secRpFinished",
+                      "secReportRow", "secReportsTable", "secRenderProjectReports"))
+    script = tmp_path / "pj-reports-repos.js"
+    script.write_text(_PROJECT_DOM_HARNESS + """
+    let secRpSortDir = "desc", secRpPayload = null;
+    function secDownloadReport(){}
+    function secShowAnalysis(_id, _pin){}
+    function secSwitchProjectTab(_t){}
+    function tableFooter(o){ return new FakeElement("footer"); }
+    """ + consts + deps + """
+    secRenderProjectReports({tabs: {reports: [
+      {analysis_id: 7, repo: "web", branch: "main", started: 1700000000, state: "done", profile: "deep"},
+      {analysis_id: 8, repo: "web-admin", branch: "main", started: 1700000100, state: "done", profile: "deep"},
+    ]}});
+    console.log(JSON.stringify(collectAll(_els["sec-pj-reports"], [])));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    texts = [r["text"] for r in out]
+    assert "web › main" in texts and "web-admin › main" in texts, texts
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -6091,7 +6222,8 @@ def test_the_runs_table_observes_but_never_manages_a_security_run(srv):
 # ---- Task 11: the findings browser (ui/security/findings-screen.js). Same
 # reasoning as the project screen's and the Branches/Reports tabs' own
 # Node-driven tests above -- the JSON contract in tests/test_security_api.py
-# never paints anything, so a regression in the total-vs-unique labelling, the
+# never paints anything, so a regression in the strip's one count (one row per
+# finding: the Unique issues card is gone), the
 # severity-floor note, the fixed-finding exemption, the sort-header click
 # logic or the pager math would pass every test in that file.
 #
@@ -6121,8 +6253,8 @@ def test_findings_row_renders_analysed_strings_as_text_never_markup(srv, tmp_pat
     arrows = (re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
-                      "secFindDecisionControls", "secFindActionsCell"))
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secVerdictChip", "secFindRow",
+                      "secFindDecisionControls", "secFindActionsCell", "secScopeName"))
     script = tmp_path / "find-row.js"
     script.write_text(_INDEX_DOM_HARNESS + """
     function fmtWhen(t){ return "w" + String(t); }
@@ -6168,8 +6300,8 @@ def test_a_fixed_finding_gets_no_decision_controls(srv, tmp_path):
     arrows = (re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
-                      "secFindDecisionControls", "secFindActionsCell"))
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secVerdictChip", "secFindRow",
+                      "secFindDecisionControls", "secFindActionsCell", "secScopeName"))
     script = tmp_path / "find-row-fixed.js"
     script.write_text(_INDEX_DOM_HARNESS + """
     function fmtWhen(t){ return "w" + String(t); }
@@ -6194,16 +6326,134 @@ def test_a_fixed_finding_gets_no_decision_controls(srv, tmp_path):
     assert out["buttons"] == 0, f"a fixed finding must not offer Accept risk / False positive: {out}"
 
 
+_FIND_ROW_CONSTS = ("SEC_STATE_LABEL", "SEC_STATE_HELP", "SEV_ORDER", "SEC_STATES",
+                    "ICON_HYGIENE", "SEC_CATEGORY_LABEL", "SEC_CATEGORY_ICON")
+_FIND_ROW_DEPS = ("secEl", "secIcon", "_secCap", "secCategoryMeta", "secConfidenceChip",
+                  "secVerdictChip", "secFindRow", "secFindDecisionControls", "secFindActionsCell",
+                  "secScopeName")
+
+
+def _find_row_script(block):
+    consts = "".join(_const(block, n) for n in _FIND_ROW_CONSTS)
+    arrows = (re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
+              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
+    deps = "\n".join(_plainfn(block, n) for n in _FIND_ROW_DEPS)
+    return _INDEX_DOM_HARNESS + """
+    function fmtWhen(t){ return "w" + String(t); }
+    const fs = {project: "web", data: {analyses: [{id: 18, profile: "deep", started: 5}]}};
+    const base = {title: "t", severity: "high", category: "sast", first_seen: 1,
+      occurrences: [], fingerprint: "a".repeat(64)};
+    """ + consts + arrows + deps
+
+
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
-def test_the_strip_labels_total_and_unique_and_counts_the_floor_from_the_whole_filtered_set(
+def test_a_finding_on_two_branches_names_both_and_each_state_when_they_differ(srv, tmp_path):
+    """One row per finding: the Branch cell names every branch the finding is
+    on, and when they read it differently each branch carries its own state --
+    the Status beside it is the reading that needs attention first, and this
+    cell is where the rest is said. The run shown is the representative's;
+    "+N" counts the others, their runs one hover away."""
+    script = tmp_path / "find-row-branches.js"
+    script.write_text(_find_row_script(_security_js(srv)) + """
+    const mixed = secFindRow(fs, Object.assign({}, base, {state: "open", branch: "main",
+      analysis_id: 18, branches: [
+        {branch: "develop", analysis_id: 16, state: "fixed", severity: "high"},
+        {branch: "main", analysis_id: 18, state: "open", severity: "high"}]}));
+    const same = secFindRow(fs, Object.assign({}, base, {state: "false_positive",
+      branch: "main", analysis_id: 18, branches: [
+        {branch: "develop", analysis_id: 16, state: "false_positive", severity: "high"},
+        {branch: "main", analysis_id: 18, state: "false_positive", severity: "high"}]}));
+    console.log(JSON.stringify({mixed: collectAll(mixed, []), same: collectAll(same, [])}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    mixed = " ".join(r["text"] for r in out["mixed"])
+    assert "develop · Fixed" in mixed and "main · Open" in mixed, mixed
+    more = [r for r in out["mixed"] if r["text"].strip() == "+1"]
+    assert more and more[0]["title"] == "#16 develop", out["mixed"]
+    same = [r["text"] for r in out["same"]]
+    assert "develop, main" in same, same
+    assert "develop · False positive" not in " ".join(same), \
+        "branches that agree carry no per-branch state"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_fixed_elsewhere_badge_names_the_branch_it_speaks_about(srv, tmp_path):
+    """On a row that can stand for several branches, "this branch" no longer
+    says which: the badge's title names the representative's branch -- the
+    one whose ancestry git was asked about."""
+    script = tmp_path / "find-row-badge.js"
+    script.write_text(_find_row_script(_security_js(srv)) + """
+    const row = secFindRow(fs, Object.assign({}, base, {state: "open", branch: "develop",
+      analysis_id: 16, fixed_elsewhere: {branch: "main", commit: "abcdef0123456789",
+      in_this_branch: false}}));
+    console.log(JSON.stringify(collectAll(row, [])));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    badge = next(r for r in out if "fixed-elsewhere" in r["cls"])
+    assert "NOT in develop" in badge["title"], badge
+    assert "this branch" not in badge["title"], badge
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_finding_read_in_two_repositories_names_each_member_s_repository(srv, tmp_path):
+    """queries.finding_rows reads every (repository, branch), and one
+    fingerprint in two repositories analysed on main is one row with two
+    members. Named by branch alone its Branch cell read "main, main". Each
+    member names its repository -- only because the project has two: the
+    single-repository rows above read exactly as they always did."""
+    script = tmp_path / "find-row-repos.js"
+    script.write_text(_find_row_script(_security_js(srv)) + """
+    fs.data.analyses = [{id: 12, profile: "quick", repo: "web", branch: "main", started: 1},
+                        {id: 14, profile: "deep", repo: "web-admin", branch: "main", started: 2}];
+    const row = secFindRow(fs, Object.assign({}, base, {state: "open", repo: "web-admin",
+      branch: "main", analysis_id: 14, fixed_elsewhere: {branch: "develop",
+      commit: "abcdef0123456789", in_this_branch: false}, branches: [
+        {repo: "web", branch: "main", analysis_id: 12, state: "open", severity: "high"},
+        {repo: "web-admin", branch: "main", analysis_id: 14, state: "open", severity: "high"}]}));
+    console.log(JSON.stringify(collectAll(row, [])));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert "web › main, web-admin › main" in [r["text"] for r in out], out
+    more = [r for r in out if r["text"].strip() == "+1"]
+    assert more and more[0]["title"] == "#12 web › main", out
+    badge = next(r for r in out if "fixed-elsewhere" in r["cls"])
+    assert "Fixed on web-admin › develop" in badge["title"], badge
+    assert "NOT in web-admin › main" in badge["title"], badge
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_analysis_run_picker_names_the_repository_when_there_are_two(srv, tmp_path):
+    """One run per (repository, branch) -- two repositories analysed on main
+    are two options, and "#14 (Deep) — main" beside "#12 (Quick) — main"
+    does not say which checkout either one read. One repository: unchanged."""
+    block = _security_js(srv)
+    deps = "\n".join(_plainfn(block, n) for n in ("_secCap", "secScopeName", "secFindRunOptions"))
+    script = tmp_path / "find-run-options.js"
+    script.write_text(deps + """
+    const two = secFindRunOptions([
+      {id: 14, profile: "deep", repo: "web-admin", branch: "main", started: 2},
+      {id: 12, profile: "quick", repo: "web", branch: "main", started: 1}]);
+    const one = secFindRunOptions([{id: 12, profile: "quick", repo: "web", branch: "main"}]);
+    console.log(JSON.stringify({two, one}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert out["two"] == [{"v": "14", "label": "#14 (Deep) — web-admin › main"},
+                          {"v": "12", "label": "#12 (Quick) — web › main"}], out
+    assert out["one"] == [{"v": "12", "label": "#12 (Quick) — main"}], out
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_strip_counts_each_finding_once_and_the_floor_from_the_whole_filtered_set(
         srv, tmp_path):
-    """Total vs unique must both appear, labelled distinctly -- 189 findings
-    can be 93 problems, and collapsing the two into one number silently
-    answers whichever question the reader was not asking. And the count of
-    what the severity floor hides has to come from `by_severity` (every row
-    the current filters match, computed by finding_rows BEFORE pagination),
-    not from whatever slice of rows happens to be on THIS page -- a browser
-    with several pages would otherwise undercount how much the floor hides."""
+    """One row per finding (queries.finding_rows groups by fingerprint), so
+    the strip shows one count: the Unique issues card could only ever repeat
+    the total, and is gone. The count of what the severity floor hides still
+    comes from `by_severity` (every row the current filters match, computed
+    BEFORE pagination), not from the slice of rows on THIS page."""
     block = _security_js(srv)
     consts = (_const(block, "SEV_ORDER") + _const(block, "ROW_PILL_TITLE")
               + _const(block, "SEV_KPI_ICON") + _const(block, "SEV_KPI_TONE"))
@@ -6214,29 +6464,19 @@ def test_the_strip_labels_total_and_unique_and_counts_the_floor_from_the_whole_f
     function secMinSeverity(_p){ return "medium"; }
     const fs = {project: "web"};
     """ + consts + deps + """
-    // by_severity describes EVERY row the current filters match, across every
-    // page -- 3 low + 2 info sit below the "medium" floor, even though this
-    // fabricated payload carries no `rows` at all for secFindStrip to look at.
-    const data = {total: 10, unique: 8,
+    const data = {total: 10, unique: 10,
       by_severity: {critical: 1, high: 4, medium: 0, low: 3, info: 2}, page: 1, per_page: 25};
     console.log(JSON.stringify(collectAll(secFindStrip(fs, data), [])));
     """)
     out = json.loads(subprocess.run(["node", str(script)],
                                     capture_output=True, text=True, check=True).stdout)
     joined = " ".join(r["text"] for r in out)
-    # Total and Unique are two of the seven KPI CARDS now
-    # (ProjectFindings.png), each still carrying its marker class -- found
-    # by that marker rather than by a literal wording, each one's own
-    # aggregated text still carrying both its label and its number
-    # together, which is what "distinctly labelled" means.
     total_stat = next(r for r in out if "secfind-stat total" in r["cls"])
-    unique_stat = next(r for r in out if "secfind-stat unique" in r["cls"])
     assert "Total findings" in total_stat["text"] and "10" in total_stat["text"], \
         f"the Total stat must carry both its label and its number: {total_stat}"
-    assert "Unique issues" in unique_stat["text"] and "8" in unique_stat["text"], \
-        f"the Unique stat must carry both its label and its number: {unique_stat}"
-    assert total_stat["text"] != unique_stat["text"], \
-        "total and unique must not collapse into the same number"
+    assert not [r for r in out if "secfind-stat unique" in r["cls"]], \
+        "one row per finding: a Unique card could only repeat the total"
+    assert "Unique issues" not in joined
     assert "5 findings below medium" in joined, \
         f"the hidden count must be 3 low + 2 info = 5, read from by_severity: {joined}"
     assert "every recorded finding" in joined, "the downloads-are-unfiltered sentence is missing"
@@ -6256,8 +6496,9 @@ def test_the_table_excludes_rows_below_the_floor_on_this_page(srv, tmp_path):
              + re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
-                      "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible"))
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secVerdictChip", "secFindRow",
+                      "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible",
+                      "secScopeName"))
     script = tmp_path / "find-table-floor.js"
     script.write_text(_INDEX_DOM_HARNESS + """
     function fmtWhen(t){ return "w" + String(t); }
@@ -6311,8 +6552,8 @@ def test_a_fixed_finding_stays_visible_and_uncounted_below_the_floor(srv, tmp_pa
               + _const(block, "SEV_KPI_ICON") + _const(block, "SEV_KPI_TONE"))
     deps = "\n".join(_plainfn(block, n) for n in
                      ("secEl", "secIcon", "_secCap", "secCategoryMeta",
-                      "secFindHiddenByFloor", "secFindStrip", "secConfidenceChip", "secFindRow", "secFindDecisionControls", "secFindActionsCell",
-                      "secFindTableSection", "secVisible"))
+                      "secFindHiddenByFloor", "secFindStrip", "secConfidenceChip", "secVerdictChip", "secFindRow", "secFindDecisionControls", "secFindActionsCell",
+                      "secFindTableSection", "secVisible", "secScopeName"))
     script = tmp_path / "find-fixed-floor.js"
     script.write_text(_INDEX_DOM_HARNESS + _KPI_CARD_STUB + """
     function fmtWhen(t){ return "w" + String(t); }
@@ -6368,8 +6609,9 @@ def test_clicking_a_sort_header_toggles_direction_then_switching_column_resets_i
              + re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
-                      "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible"))
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secVerdictChip", "secFindRow",
+                      "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible",
+                      "secScopeName"))
     script = tmp_path / "find-sort-click.js"
     script.write_text(_INDEX_DOM_HARNESS + """
     function fmtWhen(t){ return "w" + String(t); }
@@ -7486,10 +7728,11 @@ def test_the_findings_strip_says_when_a_branch_behind_it_stopped_early(srv, tmp_
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_the_two_kinds_of_severity_pill_each_say_what_they_count(srv, tmp_path):
     """IMPORTANT 5(a). The sidebar donut is a flex sibling of the tab panes,
-    so it is on screen DURING the Findings tab: the strip's per-severity
-    pills are ROW counts and the donut's are DISTINCT FINGERPRINTS, four
-    inches apart, in identical markup. The strip labelled `total` vs `unique`
-    and left both sets of per-severity pills bare."""
+    so it is on screen DURING the Findings tab, four inches from the strip,
+    in identical markup. Both count a finding once however many branches it
+    is on (the browser is one row per finding), and they still answer
+    different questions -- the strip, the findings the current filters
+    match; the donut, every open problem -- so each says which."""
     block = _security_js(srv)
     strip_consts = (_const(block, "SEV_ORDER") + _const(block, "SEC_NEVER")
                     + _const(block, "ROW_PILL_TITLE")
@@ -7520,9 +7763,9 @@ def test_the_two_kinds_of_severity_pill_each_say_what_they_count(srv, tmp_path):
                                     capture_output=True, text=True, check=True).stdout)
     assert "2" in out["strip"].get("text", ""), out["strip"]
     assert out["legend"].get("text") == "1 critical", out["legend"]
-    assert "Rows" in out["strip"].get("title", ""), \
-        f"the strip's severity pill does not say it counts rows: {out['strip']}"
-    assert "counts twice" in out["strip"].get("title", ""), out["strip"]
+    assert "matching the current filters" in out["strip"].get("title", ""), \
+        f"the strip's severity pill does not say what it counts: {out['strip']}"
+    assert "counts once" in out["strip"].get("title", ""), out["strip"]
     assert "fingerprint" in out["legend"].get("title", "").lower(), \
         f"the donut's severity pill does not say it counts problems: {out['legend']}"
     assert "counts once" in out["legend"].get("title", ""), out["legend"]
@@ -7804,6 +8047,67 @@ def test_the_project_header_says_a_dash_means_not_counted(srv, tmp_path):
     counted_titles = " ".join(r["title"] for r in out["counted"] if r["title"])
     assert "Not counted" not in counted_titles, \
         "the explanation shows over a real line count"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_project_header_says_the_branch_spans_its_repositories(srv, tmp_path):
+    """The Overview reads the declared branch in every repository the project
+    has analysed on it (queries.default_branch_posture). With more than one,
+    the header's Branch says so and names them; with one, it reads as it
+    always did."""
+    block = _security_js(srv)
+    deps = (_const(block, "SEC_NEVER") + "\n".join(_plainfn(block, n) for n in
+            ("secEl", "secIcon", "secHeaderBit", "secRenderProjectHeader")))
+    script = tmp_path / "pj-head-repos.js"
+    script.write_text(_PROJECT_DOM_HARNESS + deps + """
+    secRenderProjectHeader({header: {profile: "standard", branch: "main",
+      repos: ["web", "web-admin"], branch_fell_back: false, lines_of_code: 0,
+      last_analysis: 0}});
+    const two = collectAll(_els["sec-pj-head"], []);
+    _els["sec-pj-head"] = new FakeElement("div");
+    secRenderProjectHeader({header: {profile: "standard", branch: "main",
+      repos: ["web"], branch_fell_back: false, lines_of_code: 0, last_analysis: 0}});
+    const one = collectAll(_els["sec-pj-head"], []);
+    console.log(JSON.stringify({two, one}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    bit = next(r for r in out["two"] if r["cls"] == "secpjbit" and r["text"].startswith("Branch"))
+    assert bit["text"] == "Branchmain · 2 repositories", bit
+    assert "web, web-admin" in bit["title"], bit
+    one = next(r for r in out["one"] if r["cls"] == "secpjbit" and r["text"].startswith("Branch"))
+    assert (one["text"], one["title"]) == ("Branchmain", ""), one
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_recent_analysis_names_its_repository_when_its_project_has_two(srv, tmp_path):
+    """The index's Recent analyses mixes projects, so whether a run's
+    repository is worth naming is its PROJECT's fact: one configured with
+    several repositories (secRepos) names it, one with a single checkout
+    reads as it always did."""
+    block = _security_js(srv)
+    deps = (_const(block, "SEC_RUN_STATUS_LABEL")
+            + _index_screen_deps(block, "secEl", "secIcon", "secRepos", "secScopeName",
+                                 "secProfileLabel", "secIndexRecentFindingsChips",
+                                 "secIndexRunStatusPill", "secIndexRunWhen",
+                                 "secIndexRecentRow"))
+    script = tmp_path / "recent-repos.js"
+    script.write_text(_INDEX_DOM_HARNESS + deps + """
+    function secOpenProject(_p){}
+    const CONFIG = {web: {name: "web", repos: [{name: "web"}, {name: "web-admin"}]},
+                    solo: {name: "solo"}};
+    function projById(id){ return CONFIG[id]; }
+    const run = (a) => collectAll(secIndexRecentRow(Object.assign(
+      {id: 1, profile: "quick", severities: null, state: "done", started: 0}, a)), []);
+    console.log(JSON.stringify({
+      two: run({project: "web", repo: "web-admin", branch: "main"}),
+      one: run({project: "solo", repo: "solo", branch: "main"})}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert "web-admin › main" in [r["text"] for r in out["two"]], out["two"]
+    assert "main" in [r["text"] for r in out["one"]], out["one"]
+    assert not any("›" in r["text"] for r in out["one"]), out["one"]
 
 
 def test_the_activity_fingerprint_dialog_titles_the_project_not_the_filter(srv):
@@ -8449,13 +8753,12 @@ _UNSTYLED_CLASS_ALLOWLIST = {
     # styling. A wrapper that adds nothing of its own is deliberately left
     # unstyled rather than given an empty rule.
     "secidx-categories",
-    # secFindStrip's Total/Unique KPI cards (findings-screen.js): pure
-    # MARKER classes appended to two .kpi-card elements whose whole layout
-    # and colour come from the shared component -- the hooks the pinned
-    # total-vs-unique test finds them by, styled by nothing on purpose.
+    # secFindStrip's Total KPI card (findings-screen.js): pure MARKER classes
+    # appended to a .kpi-card element whose whole layout and colour come from
+    # the shared component -- the hooks the pinned strip test finds it by,
+    # styled by nothing on purpose.
     "secfind-stat",
     "total",
-    "unique",
     # setupBanner's Open Settings button (settings.js): a pure MARKER class
     # -- "btn primary" already carries its whole look -- so a click on it can
     # be delegated by class once this banner is mounted on two views at once
@@ -11099,3 +11402,20 @@ def test_the_findings_browser_declares_the_confidence_column_and_filter(srv, tmp
     assert ["confidence", "Confidence"] in out["table"] and len(out["table"]) == 10
     assert out["picker"] == ["high", "medium", "low"]
     assert out["filters"]["confidence"] == []
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_findings_browser_declares_the_verdict_filter(srv, tmp_path):
+    """`verdict` is a multi-select filter beside Confidence, and
+    `_defaultFilters` carries the key empty -- so a page that can show a
+    verdict can also ask for one, and a filter saved before block 4.2 reads
+    as "no filter"."""
+    block = _security_js(srv)
+    script = tmp_path / "find-verdict.js"
+    script.write_text(_const(block, "SEC_VERDICTS") + _plainfn(block, "_defaultFilters") + """
+    console.log(JSON.stringify({picker: SEC_VERDICTS, filters: _defaultFilters()}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert out["picker"] == ["confirmed", "needs_validation", "rejected"]
+    assert out["filters"]["verdict"] == []

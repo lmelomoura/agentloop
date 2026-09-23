@@ -12,6 +12,12 @@ import { secEl } from "./dom.js";
 
 // Most confident first -- the order the filter's picker lists them in.
 export const SEC_CONFIDENCE = ["high", "medium", "low"];
+// Most conclusive first -- the order the filter's picker lists them in.
+export const SEC_VERDICTS = ["confirmed", "needs_validation", "rejected"];
+// "disproved", not "rejected", in the reader's own words: what happened is
+// that somebody read the code and the claim did not hold.
+const VERDICT_LABEL = {confirmed: "confirmed", needs_validation: "needs validation",
+                       rejected: "disproved"};
 const SCORED = [["confidence", "Confidence"], ["likelihood", "Likelihood"], ["impact", "Impact"]];
 
 function _doc(f){
@@ -28,6 +34,18 @@ export function secConfidenceChip(f){
   if(!score) return null;
   const chip = secEl("span", "secconf " + score, score);
   if(c && c.confidence && c.confidence.reason) chip.title = c.confidence.reason;
+  return chip;
+}
+
+export function secVerdictChip(f){
+  // Self-contained, like secConfidenceChip: the page-contract harness lifts
+  // this function out of the bundle by name, with nothing else in scope.
+  const v = f && f.verdict;
+  if(!v) return null;
+  const labels = {confirmed: "confirmed", needs_validation: "needs validation",
+                  rejected: "disproved"};
+  const chip = secEl("span", "secverdict " + v, labels[v] || v);
+  if(f.verdict_reason) chip.title = f.verdict_reason;
   return chip;
 }
 
@@ -60,5 +78,12 @@ export function secCandidateBlock(f){
   const scored = SCORED.filter(([k]) => c[k] && typeof c[k] === "object")
     .map(([k, label]) => label + ": " + (c[k].score || "") + " — " + (c[k].reason || ""));
   if(scored.length) box.appendChild(secEl("p", "seccand-scored", scored.join(" · ")));
+  // What a verifier concluded, in its own words. The chip carries the word;
+  // this carries the reason, which is what a reader needs when a finding has
+  // left the posture.
+  if(f && f.verdict && f.verdict_reason){
+    box.appendChild(secEl("p", "seccand-verdict",
+      (VERDICT_LABEL[f.verdict] || f.verdict) + ": " + f.verdict_reason));
+  }
   return box;
 }

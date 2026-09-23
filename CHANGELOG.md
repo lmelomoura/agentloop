@@ -18,7 +18,78 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The dashboard shows the verdict**: a chip beside the confidence one on
+  every row and in the drill-down, the verifier's reason inside the candidate
+  block, a Verdict filter, and a disproved row drawn dimmed — it is recorded,
+  not work. Naming *Disproved* in that filter shows the disproved findings on
+  its own, as a Status filter naming a resolved state already does: the
+  resolved gate hid them first, and the filter alone showed an empty page.
+
+- **Reports print the verdict** under each verified finding, and the ones a
+  verifier disproved move to their own section at the end — *Disproved in
+  verification* — with the reason. They are recorded and not counted; a report
+  over a ledger nobody verified renders byte for byte as before.
+
+- **The close verifies that the verification happened**, with three facts the
+  ledger and the run's stream hold between them: findings in scope nobody
+  verified, subagents that produced no verdict, and verdicts with no subagent
+  behind them. Any of the three lowers `done` to `capped` and writes the
+  reason into the report, as the triage guard already does — and the first is
+  the one the other two cannot see, because an agent that ignores the phase
+  launches nothing and records nothing. A new `verification` row in the
+  coverage table says what was verified and what was not.
+
+- **`verify-queue`, `verify-prompt` and `report-verdict`.** The queue is a
+  query, so the agent never derives the scope from prose; the prompt is minted
+  from the ledger, with the job stated as disproving the claim and the
+  hunter's `rationale` deliberately left out — a fresh reader that reads the
+  argument stops being fresh; and the verdict is written by the verifier
+  itself, refused for a finding outside the queue, refused a second time on
+  the same row, with its reason through the same credential scan as every
+  other agent-written text.
+
+- **The verification queue.** `queries.verify_queue` is the one place the
+  scope lives: the agent's own `sast` findings at medium or above, plus any
+  below that whose candidate declares a high or critical impact — the evasion
+  route block 4.1 wrote down as open. Ordered by the **worse of the declared
+  severity and the declared impact**, so the group whose severity is least
+  trustworthy is not the group a budget that runs out never reaches.
+
+- **A finding can carry a verdict** — `confirmed`, `needs_validation` or
+  `rejected`, each with a reason that is never optional — validated by
+  `bin/security/verdict.py`. Until now the severity of a `sast` finding was
+  the word of the agent that found it, and nothing in the ledger could tell a
+  read claim from an unread one.
+
+- **`finding.verdict`, `verdict_reason` and `verified_by` columns**, additive
+  and '' on every existing row, written once per finding per analysis and
+  never cleared by a re-report; a verdict is not inherited between analyses.
+
 ### Changed
+
+- **The security-analysis skill has a fourth job: verification** — the queue,
+  the minted prompt, one subagent per finding, and the fact that the close
+  counts. The README's *Security analysis* section documents the verdicts, the
+  posture change and the three guards.
+
+- **The `Agent` tool is open again for a security analysis, and the close
+  counts what it was used for.** Verification is subagents, so closing the
+  tool would close the phase; `security_task_count` reads the run's stream and
+  `finish --tasks-launched` compares it with the verdicts in the ledger. The
+  prompt now says what subagents are for and that the count happens. On the
+  Codex CLI and OpenCode, where the phase cannot run, they stay forbidden by
+  the prompt — what changed there is only that the denial is no longer a
+  permission rule.
+
+- **A disproved finding leaves the posture.** `queries.counted` — open AND
+  not `rejected` — replaces the copies of the open-ness rule across the
+  counters, the reports and the browser: a finding a verifier disproved stops
+  being counted as exposure everywhere at once, is kept off the page by
+  default exactly as a `fixed` one is, and stays a row the reader can still
+  open. The checklist also carries the previous analysis's verdict, shown and
+  never inherited.
 
 - **The security-analysis skill has a criterion for what qualifies as a
   finding** — Cloudflare's boundary requirement and five severity anchors —
@@ -68,6 +139,174 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   function of 230 lines whose inputs are listed at the top.
 
 ### Fixed
+
+- **An analysis of one repository of a multi-repo project reads that
+  repository, at the branch it names.** Every analysis ran in the project's
+  `cwd` — the primary repository — so an analysis of any other repository
+  ran `prepare` and the agent over the primary's code, and filed that report
+  under the repository it named, at the commit of the branch it named: a
+  report correct about the wrong code. And every declared repository was cut
+  from the analysed branch, so a branch only the analysed repository has — a
+  feature branch, the ordinary case — aborted the run with "no base ref
+  resolvable" at a repository nobody had asked about. The analysis now runs
+  in the checkout of the repository it names, and that repository is the only
+  one cut (`AL_SECURITY_REPO`, beside the branch's `AL_BASE_OVERRIDE`; the
+  detached re-exec carries it as a fourth argument). A project whose
+  `worktree.enabled` is `false` no longer runs an analysis in its canonical
+  checkout, on whatever branch was checked out there: an analysis is always
+  isolated, decided by its job id, so its resume is too. The selftest covers
+  the repo rows an analysis is handed, a worktree cut from a branch only the
+  second repository has, the isolation rule and its one caller; e2e scenario
+  46 analyses the second repository of a two-repository project at such a
+  branch and reads where the agent was launched from the agent's own side
+  (`FAKE_CWD_OUT` in `test/fake-claude`).
+
+- **Two waiters that judge the same stale lock break it once.** Breaking a
+  lock was check-then-act: two waiters that both found the owner dead — or
+  a lock with no pid abandoned, or the models.json lock too old — each
+  removed "it", and the slower one removed the lock the faster one had just
+  taken in its place, so both held it: two rewrites of the journal at once,
+  two writers of models.json, two refreshes. Reproduced every time with the
+  second waiter held right after its judgement. A lock is now judged as one
+  directory — its inode and birth, read before anything else about it — and
+  removed only while it is still that directory naming the same owner, under
+  its breaker: a hidden sibling taken by `mkdir`, so no other breaker looks
+  between that check and the removal; a breaker left by one killed mid-break
+  goes after five seconds. The same in `lock_take` (dead owner, abandoned,
+  bounded), `acquire_lock` and the server's `journal_lock`, which also counts
+  its grace for a lock with no pid per lock: a lock broken and taken again by
+  an owner still before its pid used to inherit the waiter's patience with
+  the first one, and was broken in the instant after.
+
+- **The model probes' turns cost about a twelfth of what they did.** The
+  family resolver's baseline was documented as needing no API call, but with
+  a session its "hi" is a real turn — the init event naming the alias's
+  model comes first, and the answer still follows — and so is every probe
+  of an id that is served. Both ran with the operator's whole setup loaded:
+  every tool, every MCP server, every skill in the system prompt. They now
+  run the smallest turn the CLI makes (`--tools ""`, `--strict-mcp-config`,
+  `--disable-slash-commands`, a one-line `--system-prompt`): measured on
+  haiku, $0.0018 against $0.0226, with the same model named in the init
+  event. The comments say what the baseline costs.
+
+- **A waiter that has queued for a while no longer breaks the next holder's
+  lock.** Every serialized write — the state file, the journal, port
+  blocks, a resume, the tick — takes a mkdir lock and then writes its pid
+  into it. A lock with no pid yet was broken once the waiter had polled for
+  the grace (`AGENTLOOP_LOCK_GRACE`, 30 s), counting every poll, those spent
+  behind live holders too: a waiter that had already queued 30 s, behind a
+  long journal rewrite say, broke the next holder's lock if it looked in
+  the instant between that holder's mkdir and its pid, and both then held
+  it — one read-modify-write free to overwrite the other, a run's record or
+  a state field. A lock with no pid is now judged by its own age: older
+  than the grace, its taker died in that gap and the lock is taken at once
+  (it used to wait out the grace in polls, however old the lock was);
+  younger, its taker is on its way, and it is never broken however long
+  anyone has waited. `acquire_lock`, which keeps the daily model refresh
+  and `resolve-pricing` from running twice at once, broke a lock with no
+  pid on sight — the same instant, with no wait at all — and now follows
+  the same rule: refused while young, taken once old. The grace itself is
+  now read as a decimal number or the default: a value such as `abc` or
+  `08` killed the engine at the first lock found with no pid, and judged by
+  age such a lock would now wait for good instead. The dashboard's side
+  of the journal lock starts that clock only when it stops reading a pid,
+  drops it whenever it reads one, and never waits longer than the grace in
+  all, so it never had this and is unchanged; two tests now hold it to
+  that. The selftest covers an old lock with no pid, a waiter well past a
+  grace of 1 s meeting the next holder before its pid, the exact edge of
+  the grace, a grace that is not a number, and `acquire_lock` on a young
+  and an old lock with no pid.
+
+- **A run that is just starting no longer loses its slot to a count of its
+  job's runs.** A run claims a slot directory and then writes its pid into
+  it, and every count or list of a job's live runs pruned a slot with no
+  pid on sight — the tick's `max_parallel` gate, `running`, `runs`, the
+  stall check, a security analysis, a rename, all of them outside the
+  claim's own mutex. A count in that instant deleted the new run's slot,
+  and the run went on with none on disk: not counted against
+  `max_parallel`, missing from the dashboard and from `stop`, its port
+  block never recorded. A slot with no pid is now counted and kept while it
+  is younger than the lock grace (`runs` lists it once it has its pid), and
+  pruned once older, like the locks. The selftest covers a slot mid-claim
+  and one abandoned with no pid, through both.
+
+- **A finding on several branches is one row in the findings browser, and a
+  decision no longer seems to come undone when another branch is analysed.**
+  `queries.finding_rows` united one checklist per branch, so a finding on
+  `develop` and on `main` was two rows — and every finding the operator had
+  already ruled on came back in front of them, as a second row, each time the
+  other branch was analysed: on one project, 46 secrets decided once and
+  listed twice. The decisions were never lost (they are recorded against the
+  project); the rows were duplicated. The browser now groups by fingerprint:
+  one row, whose state is the reading that needs attention first across the
+  branches (open anywhere, then a decision, then `fixed` only once every
+  branch says so), whose severity is the worst open reading — the donut's
+  rule — and which lists each branch's analysis, state and severity in
+  `branches`. The `branch` and `analysis` filters choose which branches are
+  grouped at all; every other filter reads the grouped row. The consolidated
+  export stays one row per branch (`group=False`), and its header now
+  measures the count the screen was showing against distinct open findings,
+  not rows.
+  On the screen, the Branch column names every branch a finding is on and,
+  when they disagree, each one's own state; the Analysis run shows the
+  representative's run with `+N` for the others; the *Unique issues* card is
+  gone, since it could only repeat the total.
+
+- **Every repository of a project is read, not one analysis per branch
+  name.** A project can hold several repositories, routinely analysed on the
+  same branch name — and the findings browser read one analysis per branch
+  NAME, the newest, whichever repository it came from: with `web` and
+  `web-admin` both analysed on `main`, only the one analysed last was listed,
+  and the other's findings vanished from the browser and from the
+  consolidated export alike. Every reading that picked "the latest finished
+  analysis of a branch" had the same key, and each now reads every
+  (repository, branch) on its own: the browser and its export, the Analysis
+  run picker (one run per repository), the partial-read cue, the sidebar
+  donut, the category ranking and the analysed-branch count beside them, the
+  Branches tab (one row per repository and branch, its default-branch cards
+  over all of them), and `fixed_elsewhere`, which could prove a fix in one
+  repository out of another's newer run of the same branch, or miss its own.
+  The index row, the index cards and the Overview read the declared branch
+  in every repository too — one entry per fingerprint, the browser's own
+  grouping — instead of whichever repository ran last: the posture, the
+  checklist counts, the top findings, the incomplete cue (any repository's
+  run that stopped early), the "vs. previous analysis" delta (the branch as
+  it read just before its newest analysis), and the trend and the index
+  sparkline, where each point is the branch as it read when that analysis
+  finished, instead of a line zigzagging between two repositories' counts.
+  The export has a section per repository and branch, each at its own
+  commit; it names the repository — on the headings and on every finding —
+  only when there is more than one, and its JSON always carries `repo`. A
+  screen listing branches of more than one repository names each one's
+  (`web-admin › main`): the findings browser, the Branches tab, the Reports
+  tab, the index's Recent analyses and the project header, which says how
+  many repositories its branch spans; the Branches tab's *View findings*
+  opens that row's own reading. A single-repository project reads as
+  before.
+
+- **A `sast` finding the operator ruled on no longer comes back as `new` when
+  another branch's analysis finds it.** The agent mints a `sast` fingerprint
+  from the rule, path and snippet it chose, and reuses one only when the
+  checklist lists the weakness — and the checklist compares with the same
+  branch only. So a finding decided on `develop` was minted again on `main`,
+  without its decision: one access-control hole was accepted twice, under two
+  identities. `agentloop security checklist` now also prints `decided_sast` —
+  every agent-minted `sast` of the same project and repository with an
+  operator decision the checklist does not already list, with its rule,
+  title, occurrences, where it was last seen and the decision — and the
+  skill's Job 3 tells the agent to re-report the same flaw in the same place
+  under that fingerprint. Semgrep's rows are left out: their identity is
+  deterministic and does not drift. The list is built from the checklist the
+  verb has already read, not from a second reading of it on a connection
+  that does not memoise one. A decided finding keeps its category and rule
+  at the door — `report-finding` refuses any report that lands on a decided
+  fingerprint under others, a fold, a re-labelled fold or a carried-over row
+  alike — and the agent's final summary lists every fold, with where it was
+  found and whether the reading agrees with the decision's reason. It
+  compares with the record the agent was shown — the checklist's row, then
+  the one `decided_sast` handed over — so a re-label on another branch does
+  not refuse a re-report made exactly as shown. The checklist prints
+  `decided_sast` ahead of the findings, so an output cut for length keeps it.
 
 - **Two writers of `config/models.json` at once no longer lose an update.**
   Every writer rewrites the file whole — jq into a temporary file, then

@@ -1532,3 +1532,61 @@ def test_set_guides_merges_the_two_halves(tmp_path):
                                        "read": ["AI-AND-LLM"]}
     ledger.set_guides(c, aid, read=[])
     assert ledger.guides_of(row())["read"] == []
+
+
+# ------------------------------------------------- the verifier's verdict
+
+def test_the_verdict_columns_are_added_to_a_finding_table_that_predates_them(tmp_path):
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(str(path))
+    raw.executescript(
+        "CREATE TABLE finding (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " analysis_id INTEGER NOT NULL, fingerprint TEXT NOT NULL,"
+        " category TEXT NOT NULL, rule TEXT NOT NULL, severity TEXT NOT NULL,"
+        " title TEXT NOT NULL, UNIQUE(analysis_id, fingerprint));"
+        "INSERT INTO finding (analysis_id, fingerprint, category, rule, severity, title)"
+        " VALUES (1, 'old', 'sast', 'xss', 'high', 't');")
+    raw.commit()
+    raw.close()
+    c = ledger.connect(path)
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(finding)")}
+    assert {"verdict", "verdict_reason", "verified_by"} <= cols
+    row = ledger.findings_of(c, 1)[0]
+    assert row["verdict"] == "" and row["verdict_reason"] == "" and row["verified_by"] == ""
+
+
+def test_a_verdict_is_written_once_and_never_twice(tmp_path):
+    c = ledger.connect(tmp_path / "s.db")
+    aid = ledger.start_analysis(c, "p", "r", "main", "abc", "quick", "run")
+    ledger.record_finding(c, aid, _sast("a" * 64))
+    assert ledger.record_verdict(c, aid, "a" * 64, "rejected", "the guard at x.py:3") is True
+    row = ledger.findings_of(c, aid)[0]
+    assert row["verdict"] == "rejected"
+    assert row["verdict_reason"] == "the guard at x.py:3"
+    assert row["verified_by"] == "subagent"
+    # A second verdict on the same row is refused: a verifier does not
+    # contradict itself, and a hunter does not correct the verdict it disliked.
+    assert ledger.record_verdict(c, aid, "a" * 64, "confirmed", "changed my mind") is False
+    assert ledger.findings_of(c, aid)[0]["verdict"] == "rejected"
+
+
+def test_a_verdict_on_a_finding_this_analysis_does_not_hold_is_refused(tmp_path):
+    c = ledger.connect(tmp_path / "s.db")
+    aid = ledger.start_analysis(c, "p", "r", "main", "abc", "quick", "run")
+    other = ledger.start_analysis(c, "p", "r", "main", "abc", "quick", "run2")
+    ledger.record_finding(c, aid, _sast("a" * 64))
+    assert ledger.record_verdict(c, other, "a" * 64, "confirmed", "r") is False
+
+
+def test_a_re_report_does_not_clear_a_verdict(tmp_path):
+    """`record_finding` replaces the row's fields; the verdict is not one of
+    them. A hunter that re-reports a finding after it was verified (a
+    corrected occurrence list, say) must not erase what the verifier wrote."""
+    c = ledger.connect(tmp_path / "s.db")
+    aid = ledger.start_analysis(c, "p", "r", "main", "abc", "quick", "run")
+    ledger.record_finding(c, aid, _sast("a" * 64))
+    ledger.record_verdict(c, aid, "a" * 64, "confirmed", "read it end to end")
+    ledger.record_finding(c, aid, _sast("a" * 64, title="a better title"))
+    row = ledger.findings_of(c, aid)[0]
+    assert row["title"] == "a better title"
+    assert row["verdict"] == "confirmed"

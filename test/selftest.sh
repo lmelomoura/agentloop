@@ -1688,8 +1688,10 @@ JSON
     && ok "security_prompt: no platform argument reads as anthropic" || bad "the six-argument call differs from anthropic"
   printf '%s\n' "$_pa" | grep -qF 'Invoke the `security-analysis` skill' \
     && ok "security_prompt anthropic: invokes the skill by name" || bad "anthropic head: $(printf '%s\n' "$_pa" | head -1)"
-  printf '%s\n' "$_pa" | grep -qF 'You have no `Agent` tool' \
-    && ok "security_prompt anthropic: names the Agent tool it closed" || bad "anthropic prompt lacks the Agent paragraph"
+  printf '%s\n' "$_pa" | grep -qF 'You HAVE subagents in this run' \
+    && printf '%s\n' "$_pa" | grep -qF 'Use subagents for nothing else' \
+    && ok "security_prompt anthropic: says subagents exist, and for what alone" \
+    || bad "anthropic prompt lacks the verification paragraph"
   printf '%s\n' "$_po" | grep -qF "Read \`$SKILLS_DIR/security-analysis/SKILL.md\`" \
     && ok "security_prompt openai: names the skill file by path, not by discovery" || bad "openai head: $(printf '%s\n' "$_po" | head -1)"
   printf '%s\n' "$_po" | grep -qF 'ALREADY RAN for this analysis' \
@@ -1702,6 +1704,14 @@ JSON
     && bad "openai prompt still speaks of the Agent tool" || ok "security_prompt openai: never speaks of the Agent tool"
   printf '%s\n' "$_pa" | grep -qF 'security prepare --analysis 7' && printf '%s\n' "$_pa" | grep -qF 'YOUR FIRST COMMAND' \
     && ok "security_prompt anthropic: prepare is still the agent's first command, with the analysis id filled in" || bad "the anthropic prompt lost its prepare line"
+  printf '%s\n' "$_pa" | grep -qF 'verify-queue' \
+    && printf '%s\n' "$_pa" | grep -qF 'The close counts' \
+    && ok "security_prompt anthropic: names the verification phase and that it is counted" \
+    || bad "the anthropic prompt does not describe the verification phase"
+  printf '%s\n' "$_po" | grep -qF 'Do not spawn subagents' \
+    && printf '%s\n' "$_pc" | grep -qF 'there are no subagents' \
+    && ok "security_prompt openai/opencode: subagents stay forbidden where verification cannot run" \
+    || bad "a platform without verification lost its ban"
   printf '%s\n' "$_pa" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
     && printf '%s\n' "$_po" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
     && printf '%s\n' "$_pc" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
@@ -1765,8 +1775,8 @@ JSON
   dplat security-of .prompt | grep -qF 'The `task` tool is closed for this run' \
     && ok "the derived job on opencode carries the by-rule paragraph" || bad "Of prompt lacks the task paragraph"
   [ "$(dplat security-of .platform)" = "opencode" ] && [ "$(dplat security-of .model)" = "pdm_ai/glm-5.3-flash" ] && [ "$(dplat security-of .effort)" = "high" ] \
-    && [ "$(dplat security-of .permission_mode)" = "full-access" ] && [ "$(dplat security-of .disallowed_tools)" = "Agent" ] \
-    && ok "an opencode block: platform, model, a variant the model lists, full-access, and Agent closed (task: deny)" || bad "Of: $(dplat security-of '{platform,model,effort,permission_mode,disallowed_tools}')"
+    && [ "$(dplat security-of .permission_mode)" = "full-access" ] && [ -z "$(dplat security-of .disallowed_tools)" ] \
+    && ok "an opencode block: platform, model, a variant the model lists, full-access, and no tool closed" || bad "Of: $(dplat security-of '{platform,model,effort,permission_mode,disallowed_tools}')"
   [ "$(dplat security-og .model)" = "pdm_ai/glm-5.3-flash" ] \
     && ok "a model that makes no tool calls falls back to the first enabled model that does" || bad "Og model $(dplat security-og .model)"
   grep -q "names a model that makes no tool calls ('pdm_ai/vision') -- an analysis needs tools; using pdm_ai/glm-5.3-flash" "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null \
@@ -1856,6 +1866,29 @@ EOF
   got="$(CLAUDE_BIN="$tmp/no-such-claude"; model_alias_baseline opus)"
   [ -z "$got" ] && ok "a CLI that cannot run reports nothing, so resolve_family can give up" \
     || bad "a missing CLI invented '$got'"
+  # The baseline and every probe run a real turn when the CLI has a session:
+  # the init event comes first, but the "hi" is still answered. So the turn is
+  # the smallest the CLI can make -- no tools, no MCP server, no skill and a
+  # one-line system prompt. Measured on haiku: $0.0018, against $0.0226 for
+  # the same turn with the operator's whole setup loaded.
+  cat > "$tmp/argv-claude" <<'EOF'
+#!/bin/sh
+echo "--- call" >> "$ARGV_LOG"
+for a in "$@"; do printf '[%s]\n' "$a"; done >> "$ARGV_LOG"
+case " $* " in
+  *" stream-json "*) printf '%s\n' '{"type":"system","subtype":"init","model":"claude-opus-5"}' '{"type":"result","is_error":false,"result":"hi"}' ;;
+  *) printf '%s\n' '{"type":"result","is_error":false,"result":"ok"}' ;;
+esac
+EOF
+  chmod +x "$tmp/argv-claude"; : > "$tmp/argv.log"
+  ( CLAUDE_BIN="$tmp/argv-claude"; ARGV_LOG="$tmp/argv.log"; export ARGV_LOG
+    model_alias_baseline opus >/dev/null; model_probe_ok claude-opus-6 ) >/dev/null 2>&1
+  got="$(awk '/^--- call$/ {n++} $0 == "[]" && prev == "[--tools]" {t[n]++} $0 == "[--strict-mcp-config]" {m[n]++}
+              $0 == "[--disable-slash-commands]" {s[n]++} $0 == "[--system-prompt]" {p[n]++} {prev = $0}
+              END {for (i = 1; i <= n; i++) printf "%d%d%d%d ", t[i], m[i], s[i], p[i]}' "$tmp/argv.log")"
+  [ "$got" = "1111 1111 " ] \
+    && ok "the baseline and the probe run the smallest turn the CLI makes: no tools, no MCP, no skills, one-line system prompt" \
+    || bad "the two calls carried [$got] of --tools \"\", --strict-mcp-config, --disable-slash-commands, --system-prompt (1111 each wanted)"
 
   echo "resolve_family() — the newest id the API serves this CLI, never one older than its alias"
   # Each scenario is one world for test/fake-claude's probe mode: what the
@@ -2961,6 +2994,22 @@ EOF
   [ "$got" = "$(printf 'solo\t/x/solo\t')" ] && ok "no .repos[] synthesises one row from cwd" \
     || bad "solo row was '$got'"
 
+  echo "wt_repos() — an analysis gets the one repo it names, never the others"
+  # An analysis names ONE repository and a branch of it (AL_BASE_OVERRIDE), and
+  # runs in that repository's checkout. Every declared row used to come back
+  # here, so each repo was cut from the analysed branch -- a branch of one
+  # repository need not exist in another, and one that lacked it aborted the
+  # whole analysis -- and the report read whichever repo matched the PROJECT's
+  # cwd rather than the one it named.
+  got="$( PROJECTS_FILE="$tmp/proj/projects.json"; AL_BASE_OVERRIDE=feat/x wt_repos multi /x/back )"
+  [ "$got" = "$(printf 'back\t/x/back\trelease')" ] \
+    && ok "under an analysis's branch, only the repo the run is in" \
+    || bad "an analysis of back was handed '$(printf '%s\n' "$got" | cut -f1 | tr '\n' ' ')'"
+  got="$( PROJECTS_FILE="$tmp/proj/projects.json"; AL_BASE_OVERRIDE=feat/x wt_repos solo /x/solo )"
+  [ "$got" = "$(printf 'solo\t/x/solo\t')" ] \
+    && ok "and a single-repo project's synthesised row is that repo already" \
+    || bad "a single-repo analysis was handed '$got'"
+
   echo "wt_base_ref() — declared base wins, then local, then HEAD"
   local gitc="git -c user.name=cc -c user.email=cc@local -c commit.gpgsign=false"
   mkdir -p "$tmp/g"
@@ -3073,6 +3122,54 @@ EOF
     || bad "single-repo primary was '$prim'"
   got="$(wt_run_worktrees "$tmp/wtroot/j9/stampS" | wc -l | tr -d ' ')"
   [ "$got" = "1" ] && ok "exactly one worktree, named after the cwd" || bad "got $got worktrees"
+
+  echo "wt_setup() — an analysis of the second repo is cut from its branch, and alone"
+  # The run's cwd is the repo the analysis names (run_job, AL_SECURITY_REPO);
+  # from here on that repo is the whole of the run. Before, every declared repo
+  # was cut from the analysed branch, so a branch only the second repo has
+  # aborted the analysis on the first -- "no base ref resolvable".
+  ( cd "$tmp/g/repo2" && git checkout -q -b feat/only-two && echo two > g && git add g \
+      && $gitc commit -qm two && git checkout -q develop ) >/dev/null 2>&1
+  local rdN="$tmp/wtroot/jan/stampN"
+  prim="$( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+           AL_BASE_OVERRIDE=feat/only-two wt_setup jan two "$tmp/g/repo2" stampN 2>/dev/null )"
+  [ "$prim" = "$rdN/two" ] && ok "the run is in the repo the analysis named" \
+    || bad "an analysis of repo two ran in '$prim'"
+  [ -n "$prim" ] && [ "$(git -C "$rdN/two" rev-parse HEAD 2>/dev/null)" = "$(git -C "$tmp/g/repo2" rev-parse feat/only-two)" ] \
+    && ok "cut from the branch it named, which the other repo does not have" \
+    || bad "repo two's worktree is at '$(git -C "$rdN/two" rev-parse HEAD 2>/dev/null)'"
+  [ -n "$prim" ] && [ ! -e "$rdN/one" ] \
+    && [ "$("$JQ" -r '[.repos[].name] | join(",")' "$rdN/.run.json" 2>/dev/null)" = "two" ] \
+    && ok "and nothing else is cut: the manifest lists that repo alone" \
+    || bad "the manifest lists '$("$JQ" -r '[.repos[].name] | join(",")' "$rdN/.run.json" 2>/dev/null)'"
+  if [ -d "$rdN" ]; then
+    echo done > "$rdN/.ended"
+    ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+      wt_teardown jan two "$rdN" ) >/dev/null 2>&1
+  fi
+
+  echo "wt_isolation_enabled() — an analysis is isolated even where runs are not"
+  # An analysis reads the branch it names, and a worktree cut from that branch
+  # is the only way to read it without touching the canonical checkout. With a
+  # project's isolation off, the analysis ran in the checkout itself -- on
+  # whatever branch was checked out there -- and the report was filed under the
+  # commit of the branch it named. By job id, like every other rule about a
+  # derived security job: a resume carries the id, and none of the run's env.
+  printf '%s' '{"projects":[{"name":"flat","cwd":"'"$tmp"'/g/repo2","worktree":{"enabled":false}}]}' \
+    > "$tmp/proj/flat.json"
+  ( PROJECTS_FILE="$tmp/proj/flat.json"; wt_isolation_enabled flat "$tmp/g/repo2" j1 )
+  want "an ordinary run of a project with isolation off stays in its checkout" 1 $?
+  ( PROJECTS_FILE="$tmp/proj/flat.json"; wt_isolation_enabled flat "$tmp/g/repo2" security-flat )
+  want "an analysis of that same project is isolated all the same" 0 $?
+  # Structural: the rule is worth nothing if its one caller keeps asking the
+  # question without the id. Captured, then matched: `sed | grep -q` under
+  # pipefail fails on the SIGPIPE a match sends back up the pipe.
+  local rjbody
+  rjbody="$(sed -n '/^run_job() {/,/^}/p' "$SELF")"
+  case "$rjbody" in
+    *'wt_isolation_enabled "$project" "$cwd" "$id"'*) ok "and run_job asks it with the job's id" ;;
+    *) bad "run_job asks wt_isolation_enabled without the job's id" ;;
+  esac
 
   echo "wt_repos() — a single-repo project pins its base without declaring a repo"
   # The row it used to need was a copy of .cwd carrying one new field. Reading
@@ -4422,6 +4519,84 @@ NASTY
   kill "$waiter2" 2>/dev/null; wait "$waiter2" 2>/dev/null
   rm -rf "$tmp/thisboot" "$tmp/thisboot-was-stolen"
 
+  # An owner with no pid to read is a taker between its mkdir and its pid, or
+  # one killed there -- and only the lock's own age tells them apart: a lock
+  # directory changes when an entry is added or removed, so one with no pid is
+  # as old as its mkdir. Older than the grace, nobody is on the way to it, and
+  # an unbounded wait takes it at once; the wait used to give such an owner
+  # the grace counted in its own polls, however old the lock already was. In
+  # the background, so that a wait that never ends fails here instead of
+  # hanging the suite; the grace pinned, as the operator may have set it.
+  mkdir -p "$tmp/ownerless"; touch -t 202001010000 "$tmp/ownerless"
+  ( LOCK_GRACE_SECONDS=30; t0="$(now_epoch)"; lock_take "$tmp/ownerless"; r=$?; echo "$r $(( $(now_epoch) - t0 ))" > "$tmp/ownerless.rc" ) >/dev/null 2>&1 & local owaiter=$!
+  i=0; while [ ! -s "$tmp/ownerless.rc" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$(( i + 1 )); done
+  kill "$owaiter" 2>/dev/null; wait "$owaiter" 2>/dev/null
+  got="$(cat "$tmp/ownerless.rc" 2>/dev/null)"
+  [ "${got%% *}" = 0 ] && [ "$(num "${got#* }" 99)" -lt 2 ] && [ "$(cat "$tmp/ownerless/pid" 2>/dev/null)" = "$$" ] \
+    && ok "an old lock left with no pid is taken at once by an unbounded wait (${got#* }s)" \
+    || bad "an unbounded wait on an old lock with no pid: [$got] (exit, seconds) within 5 s, the lock names pid [$(cat "$tmp/ownerless/pid" 2>/dev/null)]"
+  rm -rf "$tmp/ownerless" "$tmp/ownerless.rc"
+
+  # The regression that rule is for. A waiter that had already waited past
+  # the grace -- behind live owners, a long journal rewrite -- broke the NEXT
+  # owner's lock if it looked in the instant between that owner's mkdir and
+  # its pid, and both then held it. How long the waiter has waited says
+  # nothing about that lock; its age does. Here the owner stays live until
+  # the waiter has polled half as many times again as a grace of 1 s allowed
+  # (150 polls against 100: the sleep between polls counts them), then leaves
+  # the lock the way the next owner holds it before its pid: empty, and as
+  # young as that moment, since removing its entries is a change like any.
+  mkdir -p "$tmp/handover"; echo $$ > "$tmp/handover/pid"; boot_id > "$tmp/handover/boot"
+  ( LOCK_GRACE_SECONDS=1; n=0
+    sleep() { n=$(( n + 1 )); [ "$n" != 150 ] || : > "$tmp/handover.polled"; command sleep "$@"; }
+    lock_take "$tmp/handover" && : > "$tmp/handover.taken" ) >/dev/null 2>&1 & local hwaiter=$!
+  i=0; while [ ! -e "$tmp/handover.polled" ] && [ "$i" -lt 150 ]; do sleep 0.1; i=$(( i + 1 )); done
+  rm -f "$tmp/handover/pid" "$tmp/handover/boot"; sleep 0.3
+  [ -e "$tmp/handover.polled" ] && [ ! -e "$tmp/handover.taken" ] && [ ! -e "$tmp/handover/pid" ] && kill -0 "$hwaiter" 2>/dev/null \
+    && ok "a young lock with no pid is never broken by an unbounded wait, however long that wait has already been" \
+    || bad "the next owner's lock, before its pid, was broken: polled 150 times [$([ -e "$tmp/handover.polled" ] && echo yes || echo no)], taken [$([ -e "$tmp/handover.taken" ] && echo yes || echo no)], pid [$(cat "$tmp/handover/pid" 2>/dev/null)]"
+  i=0; while [ ! -e "$tmp/handover.taken" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$(( i + 1 )); done
+  [ -e "$tmp/handover.taken" ] && [ "$(cat "$tmp/handover/pid" 2>/dev/null)" = "$$" ] \
+    && ok "and the same wait takes it once it is older than the grace" \
+    || bad "a lock with no pid, past a grace of 1 s, was still not taken 5 s later"
+  kill "$hwaiter" 2>/dev/null; wait "$hwaiter" 2>/dev/null
+  rm -rf "$tmp/handover" "$tmp/handover.polled" "$tmp/handover.taken"
+
+  # Where that age ends: both clocks count whole seconds, so a lock whose age
+  # reads exactly the grace may be up to a second younger than it, and is not
+  # abandoned yet; a second more and it is. Asked right after a second turns,
+  # both inside it -- tried again should a stall carry them into the next.
+  local edge_s edge_now at_grace="" past_grace="" tries=0
+  mkdir -p "$tmp/edge"
+  while [ "$tries" -lt 3 ]; do
+    tries=$(( tries + 1 ))
+    edge_s="$(now_epoch)"; while [ "$(now_epoch)" = "$edge_s" ]; do sleep 0.01; done
+    edge_now="$(now_epoch)"
+    touch -t "$(date -r $(( edge_now - 30 )) +%Y%m%d%H%M.%S)" "$tmp/edge"; ( LOCK_GRACE_SECONDS=30; lock_abandoned "$tmp/edge" ); at_grace=$?
+    touch -t "$(date -r $(( edge_now - 31 )) +%Y%m%d%H%M.%S)" "$tmp/edge"; ( LOCK_GRACE_SECONDS=30; lock_abandoned "$tmp/edge" ); past_grace=$?
+    [ "$(now_epoch)" = "$edge_now" ] && break
+    at_grace="" past_grace=""
+  done
+  [ "$at_grace" = 1 ] && [ "$past_grace" = 0 ] \
+    && ok "a lock whose age reads exactly the grace is not abandoned yet; one second more and it is" \
+    || bad "lock_abandoned at the grace [$at_grace], a second past it [$past_grace]: 1 and 0 wanted, empty if never inside one second"
+  rm -rf "$tmp/edge"
+
+  # The grace comes from the environment (AGENTLOOP_LOCK_GRACE), and every
+  # lock does arithmetic with it. Anything but a plain number killed the
+  # engine at the first lock found with no pid -- set -u reads abc as an
+  # unset variable, and 08 is no octal -- and judged by age such a lock would
+  # now wait for good instead. It is read as a decimal number, or the default.
+  sed '/^case "${1:-}" in$/,$d' "$SELF" > "$tmp/engine-lib.sh"
+  got="$(for g in abc 1x 08 ' 7 ' ''; do
+           AGENTLOOP_LOCK_GRACE="$g" AGENTLOOP_CONFIG="$tmp/lg/config" AGENTLOOP_DATA="$tmp/lg/data" \
+             /bin/bash -c '. "$1"; printf "%s," "$LOCK_GRACE_SECONDS"' "$SELF" "$tmp/engine-lib.sh" 2>/dev/null
+         done)"
+  [ "$got" = "30,30,8,7,30," ] \
+    && ok "a grace that is not a plain number reads as the default, one with a leading zero as decimal" \
+    || bad "AGENTLOOP_LOCK_GRACE abc, 1x, 08, ' 7 ' and unset read as [$got], wanted 30,30,8,7,30,"
+  rm -rf "$tmp/engine-lib.sh" "$tmp/lg"
+
   # Bounded, as the models.json lock takes it: a live holder is given up on
   # once the time is up, and never a moment before it -- exit 1, and the lock
   # stays with its owner -- while a dead one is still taken at once. Timed in
@@ -4478,6 +4653,116 @@ NASTY
       || bad "a bounded wait on a stale lock it cannot remove: dead owner [$ua], old with no pid [$ub] (exit, seconds), within 6 s"
     rm -rf "$tmp/unremovable" "$tmp/unremovable2" "$tmp/unremovable.rc" "$tmp/unremovable2.rc"
   fi
+
+  # acquire_lock, the _models mutex, takes the same lock without waiting --
+  # and broke one with no pid on sight: the owner inside that gap robbed
+  # outright, and two refreshes then ran at once. The same rule holds there:
+  # a young lock with no pid is a taker on its way, refused like a live one;
+  # an old one is nobody's, and taken.
+  mkdir -p "$tmp/acq/_young" "$tmp/acq/_old"; touch -t 202001010000 "$tmp/acq/_old"
+  ( LOCK_DIR="$tmp/acq"; LOCK_GRACE_SECONDS=30; acquire_lock _young ); local ryoung=$?
+  ( LOCK_DIR="$tmp/acq"; LOCK_GRACE_SECONDS=30; acquire_lock _old ); local rold=$?
+  [ "$ryoung" = 1 ] && [ -d "$tmp/acq/_young" ] && [ ! -e "$tmp/acq/_young/pid" ] \
+    && ok "acquire_lock refuses a young lock with no pid, a taker between its mkdir and its pid, instead of breaking it" \
+    || bad "acquire_lock on a young lock with no pid: exit $ryoung, the lock names pid [$(cat "$tmp/acq/_young/pid" 2>/dev/null)]"
+  [ "$rold" = 0 ] && [ "$(cat "$tmp/acq/_old/pid" 2>/dev/null)" = "$$" ] \
+    && ok "and takes an old one, abandoned" \
+    || bad "acquire_lock on an old lock with no pid: exit $rold, the lock names pid [$(cat "$tmp/acq/_old/pid" 2>/dev/null)]"
+  rm -rf "$tmp/acq"
+
+  echo "lock_take()/acquire_lock() — two waiters that judged the same stale lock break it once"
+  # Breaking a lock is check-then-act. Two waiters that both found the owner
+  # gone each removed "it" -- and the slower one removed the lock the faster
+  # one had just taken in its place, so both held it: two journal rewrites,
+  # two state writes, two refreshes at once. Here the slower waiter (B) is held
+  # right after its judgement of the stale lock until the faster one (A) has
+  # broken it, taken it and left a mark in it; a second later A checks its
+  # mark is still there. Both are subshells, where $$ is this suite's own pid
+  # for either, so the mark says whose lock it is, not the pid.
+  local rdead=99999; if kill -0 "$rdead" 2>/dev/null; then rdead=99998; fi
+  eval "orig_slot_alive() $(declare -f slot_alive | tail -n +2)"
+  eval "orig_lock_abandoned() $(declare -f lock_abandoned | tail -n +2)"
+  race_a() { # race_a <case> <take-command...> -- waits for B's judgement, then takes, marks, holds 1 s, checks
+    local c="$tmp/$1" i=0; shift
+    while [ ! -e "$c.B-judged" ] && [ "$i" -lt 500 ]; do sleep 0.01; i=$(( i + 1 )); done
+    "$@" || return 1
+    : > "$c.lock/A-mark"; : > "$c.A-holds"; sleep 1
+    [ -e "$c.lock/A-mark" ] && : > "$c.A-kept"
+    : > "$c.A-done"
+  }
+  race_wait() { # race_wait <case> <pids...> -- until A is done and B has an answer, 6 s at most
+    local c="$tmp/$1" i=0; shift
+    while { [ ! -e "$c.A-done" ] || [ ! -e "$c.B-rc" ]; } && [ "$i" -lt 60 ]; do sleep 0.1; i=$(( i + 1 )); done
+    kill "$@" 2>/dev/null; wait "$@" 2>/dev/null
+  }
+  # 1. lock_take, the owner dead.
+  mkdir -p "$tmp/race1.lock"; echo "$rdead" > "$tmp/race1.lock/pid"; boot_id > "$tmp/race1.lock/boot"
+  ( slot_alive() { orig_slot_alive "$@" && return 0; : > "$tmp/race1.B-judged"
+                   while [ ! -e "$tmp/race1.A-holds" ]; do command sleep 0.01; done; return 1; }
+    lock_take "$tmp/race1.lock"; r=$?; [ -e "$tmp/race1.A-done" ] && w=after || w=during
+    echo "$r $w" > "$tmp/race1.B-rc" ) >/dev/null 2>&1 & local rb1=$!
+  ( race_a race1 lock_take "$tmp/race1.lock" && lock_drop "$tmp/race1.lock" ) >/dev/null 2>&1 & local ra1=$!
+  race_wait race1 "$rb1" "$ra1"
+  [ -e "$tmp/race1.A-kept" ] && [ "$(cat "$tmp/race1.B-rc" 2>/dev/null)" = "0 after" ] \
+    && ok "lock_take: a dead owner's lock is broken once -- the waiter that judged it too is left waiting, and takes it after" \
+    || bad "lock_take on a dead owner's lock, two waiters: the first one's mark kept [$([ -e "$tmp/race1.A-kept" ] && echo yes || echo no)], the second one [$(cat "$tmp/race1.B-rc" 2>/dev/null)] (exit, while or after the first held it)"
+  # 2. lock_take, an old lock with no pid (abandoned). A holds the new lock
+  # as a taker does between its mkdir and its pid -- with no pid either --
+  # so only which directory was judged tells the two locks apart.
+  mkdir -p "$tmp/race2.lock"; touch -t 202001010000 "$tmp/race2.lock"
+  take_before_its_pid() { lock_take "$1" && rm -f "$1/pid" "$1/boot"; }
+  ( lock_abandoned() { orig_lock_abandoned "$@" || return 1; : > "$tmp/race2.B-judged"
+                       while [ ! -e "$tmp/race2.A-holds" ]; do command sleep 0.01; done; return 0; }
+    LOCK_GRACE_SECONDS=30; lock_take "$tmp/race2.lock"; r=$?; [ -e "$tmp/race2.A-done" ] && w=after || w=during
+    echo "$r $w" > "$tmp/race2.B-rc" ) >/dev/null 2>&1 & local rb2=$!
+  ( LOCK_GRACE_SECONDS=30; race_a race2 take_before_its_pid "$tmp/race2.lock" && lock_drop "$tmp/race2.lock" ) >/dev/null 2>&1 & local ra2=$!
+  race_wait race2 "$rb2" "$ra2"
+  [ -e "$tmp/race2.A-kept" ] && [ "$(cat "$tmp/race2.B-rc" 2>/dev/null)" = "0 after" ] \
+    && ok "lock_take: an abandoned lock is broken once, never the fresh one the first waiter took in its place" \
+    || bad "lock_take on an abandoned lock, two waiters: the first one's mark kept [$([ -e "$tmp/race2.A-kept" ] && echo yes || echo no)], the second one [$(cat "$tmp/race2.B-rc" 2>/dev/null)] (exit, while or after the first held it)"
+  # 3. acquire_lock, which does not wait: the second taker is refused.
+  mkdir -p "$tmp/race3/_job"; echo "$rdead" > "$tmp/race3/_job/pid"; boot_id > "$tmp/race3/_job/boot"
+  ln -s "$tmp/race3/_job" "$tmp/race3.lock"
+  ( slot_alive() { orig_slot_alive "$@" && return 0; : > "$tmp/race3.B-judged"
+                   while [ ! -e "$tmp/race3.A-holds" ]; do command sleep 0.01; done; return 1; }
+    LOCK_DIR="$tmp/race3"; acquire_lock _job; r=$?; [ -e "$tmp/race3.A-done" ] && w=after || w=during
+    echo "$r $w" > "$tmp/race3.B-rc" ) >/dev/null 2>&1 & local rb3=$!
+  ( LOCK_DIR="$tmp/race3"; race_a race3 acquire_lock _job && release_lock _job ) >/dev/null 2>&1 & local ra3=$!
+  race_wait race3 "$rb3" "$ra3"
+  [ -e "$tmp/race3.A-kept" ] && [ "$(cat "$tmp/race3.B-rc" 2>/dev/null)" = "1 during" ] \
+    && ok "acquire_lock: a dead owner's lock is taken once -- the other taker that judged it too is refused, not handed the same lock" \
+    || bad "acquire_lock on a dead owner's lock, two takers: the first one's mark kept [$([ -e "$tmp/race3.A-kept" ] && echo yes || echo no)], the second one [$(cat "$tmp/race3.B-rc" 2>/dev/null)] (exit, while or after the first held it)"
+  # 4. The bounded wait (models_lock), which takes a lock for its age alone,
+  # whoever it names.
+  eval "orig_lock_older_than() $(declare -f lock_older_than | tail -n +2)"
+  mkdir -p "$tmp/race4.lock"; echo $$ > "$tmp/race4.lock/pid"; boot_id > "$tmp/race4.lock/boot"; touch -t 202001010000 "$tmp/race4.lock"
+  ( lock_older_than() { orig_lock_older_than "$@" || return 1; : > "$tmp/race4.B-judged"
+                        while [ ! -e "$tmp/race4.A-holds" ]; do command sleep 0.01; done; return 0; }
+    LOCK_GRACE_SECONDS=30; lock_take "$tmp/race4.lock" 5; r=$?; [ -e "$tmp/race4.A-done" ] && w=after || w=during
+    echo "$r $w" > "$tmp/race4.B-rc" ) >/dev/null 2>&1 & local rb4=$!
+  ( LOCK_GRACE_SECONDS=30; race_a race4 lock_take "$tmp/race4.lock" 5 && lock_drop "$tmp/race4.lock" ) >/dev/null 2>&1 & local ra4=$!
+  race_wait race4 "$rb4" "$ra4"
+  [ -e "$tmp/race4.A-kept" ] && [ "$(cat "$tmp/race4.B-rc" 2>/dev/null)" = "0 after" ] \
+    && ok "lock_take, bounded: a lock taken for its age is taken once, never the fresh one the first writer took in its place" \
+    || bad "a bounded lock_take on an old lock, two writers: the first one's mark kept [$([ -e "$tmp/race4.A-kept" ] && echo yes || echo no)], the second one [$(cat "$tmp/race4.B-rc" 2>/dev/null)] (exit, while or after the first held it)"
+  rm -rf "$tmp"/race1.* "$tmp"/race2.* "$tmp"/race3 "$tmp"/race3.* "$tmp"/race4.*
+  # The breaker itself. While another breaker holds it nothing is removed --
+  # that one checks and removes, the rest take their turn -- and one left by
+  # a breaker killed mid-break is cleared once older than LOCK_BREAKER_STALE,
+  # so the stale lock is still broken after it. The server's journal_lock
+  # takes the breaker by the same name, a hidden sibling of the lock.
+  mkdir -p "$tmp/brk/.x.break" "$tmp/brk/x"; echo "$rdead" > "$tmp/brk/x/pid"
+  lock_break "$tmp/brk/x" "$(lock_id "$tmp/brk/x")" "$rdead"; local rbusy=$?
+  [ "$rbusy" = 1 ] && [ -d "$tmp/brk/x" ] && [ -d "$tmp/brk/.x.break" ] \
+    && ok "lock_break removes nothing while another breaker holds the breaker" \
+    || bad "lock_break with the breaker held elsewhere: exit $rbusy, the lock [$([ -d "$tmp/brk/x" ] && echo kept || echo removed)]"
+  touch -t 202001010000 "$tmp/brk/.x.break"
+  lock_break "$tmp/brk/x" "$(lock_id "$tmp/brk/x")" "$rdead"
+  lock_break "$tmp/brk/x" "$(lock_id "$tmp/brk/x")" "$rdead"; local rnext=$?
+  [ "$rnext" = 0 ] && [ ! -e "$tmp/brk/x" ] && [ ! -e "$tmp/brk/.x.break" ] \
+    && ok "and one left behind by a killed breaker is cleared, so the stale lock is broken after all" \
+    || bad "lock_break past a stale breaker: exit $rnext, the lock [$([ -e "$tmp/brk/x" ] && echo kept || echo removed)], the breaker [$([ -e "$tmp/brk/.x.break" ] && echo kept || echo cleared)]"
+  rm -rf "$tmp/brk"
 
   echo "backoff_multiplier() — a job that only ever fails must stop costing full price"
   # Nothing slowed a failing job down: it relaunched every interval, at full
@@ -5564,6 +5849,32 @@ PY
     || bad "slots_active pruned a live slot"
   rm -rf "$tmp/locks/sa"
 
+  # A slot with no pid is a run between acquire_slot's mkdir and its pid, and
+  # slots_active is asked from outside acquire_slot's mutex too: the tick's
+  # max_parallel gate, running, the stall check, a security analysis, a
+  # rename. Pruned on sight, that run went on with no slot on disk -- not
+  # counted against max_parallel, unseen by the dashboard and by stop, its
+  # ports never recorded. A young one is counted and kept, like a live slot;
+  # one left with no pid past the grace is abandoned, and pruned.
+  mkdir -p "$tmp/locks/sm/111" "$tmp/locks/sm/222"; touch -t 202001010000 "$tmp/locks/sm/222"
+  got="$( LOCK_DIR="$tmp/locks"; LOCK_GRACE_SECONDS=30; slots_active sm )"
+  [ "$got" = "1" ] && [ -d "$tmp/locks/sm/111" ] \
+    && ok "a slot not given its pid yet is counted and kept, not pruned from under its run" \
+    || bad "slots_active on a slot mid-claim: counted $got, wanted 1; kept [$([ -d "$tmp/locks/sm/111" ] && echo yes || echo no)]"
+  [ ! -d "$tmp/locks/sm/222" ] && ok "and one left with no pid past the grace is pruned" \
+    || bad "an abandoned slot with no pid survived the count"
+  rm -rf "$tmp/locks/sm"
+  # agentloop runs walks the same slots and pruned them the same way. A slot
+  # mid-claim is left alone, and not listed -- it has nothing to list yet --
+  # while an abandoned one goes and a live one is listed.
+  mkdir -p "$tmp/locks/rn/111" "$tmp/locks/rn/222" "$tmp/locks/rn/$$"; touch -t 202001010000 "$tmp/locks/rn/222"
+  echo $$ > "$tmp/locks/rn/$$/pid"; boot_id > "$tmp/locks/rn/$$/boot"
+  got="$( LOCK_DIR="$tmp/locks"; LOCK_GRACE_SECONDS=30; cmd_runs rn | cut -f1 )"
+  [ "$got" = "$$" ] && [ -d "$tmp/locks/rn/111" ] && [ ! -d "$tmp/locks/rn/222" ] \
+    && ok "agentloop runs lists the live run, leaves one mid-claim alone and prunes one abandoned" \
+    || bad "agentloop runs listed [$got], kept mid-claim [$([ -d "$tmp/locks/rn/111" ] && echo yes || echo no)], kept abandoned [$([ -d "$tmp/locks/rn/222" ] && echo yes || echo no)]"
+  rm -rf "$tmp/locks/rn"
+
   echo "alloc_port_base() — two live runs never get the same ports"
   # Isolation settles the filesystem and says nothing about ports: two runs of
   # one repo each publish 5432 and the second dies on "address already in use",
@@ -6034,18 +6345,27 @@ JSON
   # ordinary jobs, and run_job actually turning the field into a CLI flag.
   #
   # The literal "Agent", NOT $SECURITY_DISALLOWED_TOOLS. Comparing the emitted
-  # value against the very constant that produced it asserts nothing: emptying
-  # the constant was tried, and it re-opened the tool with all five assertions
-  # here still green -- including the one whose failure message says "subagents
-  # are back". A test may not take its expected value from the thing it tests.
+  # value against the very constant that produced it asserts nothing: a test
+  # may not take its expected value from the thing it tests.
+  #
+  # SINCE BLOCK 4.2 THE ASSERTION IS THE OTHER WAY UP. The verification phase
+  # IS subagents, so the tool is open and the derived job closes nothing --
+  # and what keeps that honest is not this field but the CLOSE, which counts
+  # the `Task` calls in the run's stream against the verdicts in the ledger
+  # (see security_task_count and `finish --tasks-launched`). An empty field
+  # here would also be what a BROKEN derivation produces, so the job is read
+  # for a field it must carry as well: an empty `disallowed_tools` on a job
+  # that has a prompt is the open tool; an empty one on a job that has
+  # nothing is a derivation that fell over.
   ( JOBS_FILE="$tmp/derived/jobs.json"; PROJECTS_FILE="$tmp/derived/projects.json"
     DATA_DIR="$tmp/derived/data"
-    [ "$(job_get security-web '.disallowed_tools' '')" = "Agent" ] ) \
-    && ok "the derived job is emitted with the Agent tool closed off" \
-    || bad "the derived job no longer carries disallowed_tools — subagents are back"
+    [ -z "$(job_get security-web '.disallowed_tools' '')" ] \
+    && [ -n "$(job_get security-web '.prompt' '')" ] ) \
+    && ok "the derived job closes no tool: verification needs subagents, and the close counts them" \
+    || bad "the derived job's disallowed_tools is '$(job_get security-web '.disallowed_tools' '')' with prompt length $(job_get security-web '.prompt' '' | wc -c)"
 
-  # A real job of the operator's must be untouched by this: an empty read here
-  # is what makes run_job leave the flag off entirely for everybody else.
+  # A real job of the operator's carries no such field either, and never did:
+  # what a user's job may launch is the user's business.
   ( JOBS_FILE="$tmp/derived/jobs.json"; PROJECTS_FILE="$tmp/derived/projects.json"
     DATA_DIR="$tmp/derived/data"
     [ -z "$(job_get real-job '.disallowed_tools' '')" ] ) \
@@ -6179,9 +6499,9 @@ JSON
   # rediscovering the wall the first analysis already paid to find.
   ( JOBS_FILE="$tmp/derived/jobs.json"; PROJECTS_FILE="$tmp/derived/projects.json"
     DATA_DIR="$tmp/derived/data"
-    job_get security-web '.prompt' '' | grep -q 'no `Agent` tool' ) \
-    && ok "the derived job's prompt says the Agent tool is absent, and why" \
-    || bad "the prompt no longer explains the missing Agent tool"
+    job_get security-web '.prompt' '' | grep -q 'You HAVE subagents in this run' ) \
+    && ok "the derived job's prompt says subagents exist and what they are for" \
+    || bad "the prompt no longer explains what subagents are for"
 
   # The mode the analysis runs under. dontAsk looked safer and was the
   # opposite: headless dontAsk denies every tool outside an allowlist a fresh
@@ -6299,6 +6619,41 @@ JSON
     && grep -q -- '--guides-read unknown' "$tmp/guides/calls" \
     && ok "security_close_analysis passes what was read to finish, and unknown without a stream" \
     || bad "security_close_analysis calls: $(cat "$tmp/guides/calls")"
+
+  # The subagents a run launched, off its own stream. BOTH NAMES: a `tool_use`
+  # block carries `Agent` on Claude Code (measured on the block 4.2 acceptance
+  # run) while the init roster and OpenCode's normaliser say `Task`. The
+  # fixture below holds one of each, and the count is 2.
+  cat > "$tmp/guides/tasks.ndjson" <<'JSON'
+{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"1","name":"Task","input":{"description":"verify b1b1","prompt":"You are verifying one security finding"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"2","name":"Read","input":{"file_path":"/Users/me/x.py"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"3","name":"Agent","input":{"description":"verify c2c2","prompt":"You are verifying one security finding","subagent_type":"general-purpose"}}]}}
+{"type":"result","subtype":"success"}
+JSON
+  [ "$(security_task_count "$tmp/guides/tasks.ndjson")" = "2" ] \
+    && ok "security_task_count: counts the subagents a run launched" \
+    || bad "security_task_count: got '$(security_task_count "$tmp/guides/tasks.ndjson")'"
+  [ "$(security_task_count "$tmp/guides/none.ndjson")" = "0" ] \
+    && ok "security_task_count: a run that launched none answers 0" \
+    || bad "security_task_count on a Task-less stream: '$(security_task_count "$tmp/guides/none.ndjson")'"
+  [ -z "$(security_task_count "$tmp/guides/missing.ndjson")" ] \
+    && [ -z "$(security_task_count "")" ] \
+    && ok "security_task_count: a missing stream answers nothing, never 0 -- the close then makes no comparison" \
+    || bad "security_task_count on a missing stream: '$(security_task_count "$tmp/guides/missing.ndjson")'"
+  ( DATA_DIR="$tmp/derived/data"; AL_SECURITY_ANALYSIS_ID=7
+    security_py() { printf '%s\n' "$*" >> "$tmp/guides/tcalls"; }
+    security_close_analysis "security-x" success 1 "" "$tmp/guides/tasks.ndjson"
+    security_close_analysis "security-x" success 1 "" )
+  grep -q -- '--tasks-launched 2' "$tmp/guides/tcalls" \
+    && [ "$(grep -c -- '--tasks-launched' "$tmp/guides/tcalls")" = "1" ] \
+    && ok "security_close_analysis passes the Task count, and omits the flag without a stream" \
+    || bad "security_close_analysis calls: $(cat "$tmp/guides/tcalls")"
+
+  # The Agent tool is OPEN now, and the prompt says what for.
+  [ -z "$SECURITY_DISALLOWED_TOOLS" ] \
+    && ok "the Agent tool is no longer closed at launch: verification needs subagents" \
+    || bad "SECURITY_DISALLOWED_TOOLS is '$SECURITY_DISALLOWED_TOOLS'"
 
   # A project name that slugs to nothing (e.g. "!!!") would derive the bare
   # prefix -- not a usable id, and not any project's job. It must be skipped,
@@ -6806,6 +7161,7 @@ JSON
     run_job() {
       printf '%s\n' "$*" > "$sec/runjob.args"
       printf '%s|%s\n' "${AL_BASE_OVERRIDE:-}" "${AL_SKIP_PROVISION:-}" > "$sec/runjob.env"
+      printf '%s\n' "${AL_SECURITY_REPO:-}" > "$sec/runjob.repo"
       # A CHILD PROCESS, not this shell: what matters is that the two markers
       # are EXPORTED all the way down to the agent's own tool shell, not that
       # run_job can see them as shell variables.
@@ -6815,8 +7171,8 @@ JSON
       return 0
     }
     cmd_security_analyze "Sec App" repo main quick
-    printf '%s|%s\n' "${AL_SECURITY_AGENT:-unset}" "${AL_SECURITY_ANALYSIS_ID:-unset}" \
-      > "$sec/after-analyze.env" ) > "$sec/analyze.out" 2>&1
+    printf '%s|%s|%s\n' "${AL_SECURITY_AGENT:-unset}" "${AL_SECURITY_ANALYSIS_ID:-unset}" \
+      "${AL_SECURITY_REPO:-unset}" > "$sec/after-analyze.env" ) > "$sec/analyze.out" 2>&1
   [ "$("$JQ" -r '.analysis_id' "$secreq" 2>/dev/null)" = "1" ] \
     && ok "the request file carries the analysis id the run has to report against" \
     || bad "request file: $(cat "$secreq" 2>/dev/null)"
@@ -6839,6 +7195,12 @@ JSON
   [ "$(cat "$sec/runjob.env" 2>/dev/null)" = "main|1" ] \
     && ok "with the branch as AL_BASE_OVERRIDE and provisioning skipped" \
     || bad "run_job saw '$(cat "$sec/runjob.env" 2>/dev/null)'"
+  # The repo travels beside the branch: run_job runs the analysis in the
+  # checkout of the repo it names, which on a multi-repo project is not the
+  # project's cwd. The spelling the ledger files it under, so the two agree.
+  [ "$(cat "$sec/runjob.repo" 2>/dev/null)" = "Sec App" ] \
+    && ok "and the repo it names as AL_SECURITY_REPO, spelt as the ledger files it" \
+    || bad "run_job saw AL_SECURITY_REPO='$(cat "$sec/runjob.repo" 2>/dev/null)'"
   # The agent reaches `security decide` and `security rename-project` through
   # the very same command the operator does; the marker is what tells the door
   # who is knocking, and it is worth nothing unless it reaches the agent's own
@@ -6846,7 +7208,7 @@ JSON
   [ "$(cat "$sec/runjob.childenv" 2>/dev/null)" = "1|1" ] \
     && ok "and AL_SECURITY_AGENT=1 plus the analysis id exported into every process the run starts" \
     || bad "a child of run_job saw '$(cat "$sec/runjob.childenv" 2>/dev/null)'"
-  [ "$(cat "$sec/after-analyze.env" 2>/dev/null)" = "unset|unset" ] \
+  [ "$(cat "$sec/after-analyze.env" 2>/dev/null)" = "unset|unset|unset" ] \
     && ok "and gone again the moment run_job returns, so the sweep after it is not marked as the agent" \
     || bad "the markers outlived the run: '$(cat "$sec/after-analyze.env" 2>/dev/null)'"
   # The stub never reached security_close_analysis, which is precisely the
@@ -6901,9 +7263,11 @@ FAKESELF
   [ -f "$sec/detached.ran" ] \
     && ok "the detached process really ran, after its parent had already exited" \
     || bad "the detached process never ran (waited ${detwait}s)"
+  # The repo last, after the branch: the new process is a fresh `agentloop`,
+  # and the repo the analysis names reaches run_job through nothing else.
   case "$(cat "$sec/detached.argv" 2>/dev/null)" in
-    "__run-analysis Sec-App-"*" main"|"__run-analysis "*" main")
-      ok "and it was re-execed as __run-analysis <job> <analysis> <branch>" ;;
+    "__run-analysis "*" main Sec App")
+      ok "and it was re-execed as __run-analysis <job> <analysis> <branch> <repo>" ;;
     *) bad "the detached process got '$(cat "$sec/detached.argv" 2>/dev/null)'" ;;
   esac
 
