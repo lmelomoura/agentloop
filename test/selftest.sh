@@ -1866,6 +1866,29 @@ EOF
   got="$(CLAUDE_BIN="$tmp/no-such-claude"; model_alias_baseline opus)"
   [ -z "$got" ] && ok "a CLI that cannot run reports nothing, so resolve_family can give up" \
     || bad "a missing CLI invented '$got'"
+  # The baseline and every probe run a real turn when the CLI has a session:
+  # the init event comes first, but the "hi" is still answered. So the turn is
+  # the smallest the CLI can make -- no tools, no MCP server, no skill and a
+  # one-line system prompt. Measured on haiku: $0.0018, against $0.0226 for
+  # the same turn with the operator's whole setup loaded.
+  cat > "$tmp/argv-claude" <<'EOF'
+#!/bin/sh
+echo "--- call" >> "$ARGV_LOG"
+for a in "$@"; do printf '[%s]\n' "$a"; done >> "$ARGV_LOG"
+case " $* " in
+  *" stream-json "*) printf '%s\n' '{"type":"system","subtype":"init","model":"claude-opus-5"}' '{"type":"result","is_error":false,"result":"hi"}' ;;
+  *) printf '%s\n' '{"type":"result","is_error":false,"result":"ok"}' ;;
+esac
+EOF
+  chmod +x "$tmp/argv-claude"; : > "$tmp/argv.log"
+  ( CLAUDE_BIN="$tmp/argv-claude"; ARGV_LOG="$tmp/argv.log"; export ARGV_LOG
+    model_alias_baseline opus >/dev/null; model_probe_ok claude-opus-6 ) >/dev/null 2>&1
+  got="$(awk '/^--- call$/ {n++} $0 == "[]" && prev == "[--tools]" {t[n]++} $0 == "[--strict-mcp-config]" {m[n]++}
+              $0 == "[--disable-slash-commands]" {s[n]++} $0 == "[--system-prompt]" {p[n]++} {prev = $0}
+              END {for (i = 1; i <= n; i++) printf "%d%d%d%d ", t[i], m[i], s[i], p[i]}' "$tmp/argv.log")"
+  [ "$got" = "1111 1111 " ] \
+    && ok "the baseline and the probe run the smallest turn the CLI makes: no tools, no MCP, no skills, one-line system prompt" \
+    || bad "the two calls carried [$got] of --tools \"\", --strict-mcp-config, --disable-slash-commands, --system-prompt (1111 each wanted)"
 
   echo "resolve_family() — the newest id the API serves this CLI, never one older than its alias"
   # Each scenario is one world for test/fake-claude's probe mode: what the

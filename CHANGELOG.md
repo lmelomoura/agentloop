@@ -178,6 +178,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   an owner still before its pid used to inherit the waiter's patience with
   the first one, and was broken in the instant after.
 
+- **The model probes' turns cost about a twelfth of what they did.** The
+  family resolver's baseline was documented as needing no API call, but with
+  a session its "hi" is a real turn — the init event naming the alias's
+  model comes first, and the answer still follows — and so is every probe
+  of an id that is served. Both ran with the operator's whole setup loaded:
+  every tool, every MCP server, every skill in the system prompt. They now
+  run the smallest turn the CLI makes (`--tools ""`, `--strict-mcp-config`,
+  `--disable-slash-commands`, a one-line `--system-prompt`): measured on
+  haiku, $0.0018 against $0.0226, with the same model named in the init
+  event. The comments say what the baseline costs.
+
 - **A waiter that has queued for a while no longer breaks the next holder's
   lock.** Every serialized write — the state file, the journal, port
   blocks, a resume, the tick — takes a mkdir lock and then writes its pid

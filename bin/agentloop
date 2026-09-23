@@ -4029,10 +4029,16 @@ global_daily_cap() { # -> dollars, or empty for "no cap"
 # that: it resolves to the newest model the INSTALLED CLI knows, which lags the
 # API after a release (2026-07-24: `opus` still meant claude-opus-4-8 while
 # claude-opus-5 was live and absent from the CLI binary). So we discover it:
-# the alias gives a free baseline (the init event needs no API call), then we
+# the alias gives the baseline (its init event names the model), then we
 # probe the next versions up. An unknown id is rejected by the API with
 # "issue with the selected model", which is how a probe fails. Results are
 # cached in config/models.json for MODELS_TTL so this costs almost nothing.
+# Not nothing: with a session, the baseline's "hi" and a served probe's "ok"
+# are real turns -- the init event comes first, the answer still follows. So
+# both run the smallest turn the CLI makes (PROBE_TURN): no tools, no MCP
+# server, no skill, a one-line system prompt. Measured on haiku, $0.0018
+# against $0.0226 with the operator's whole setup loaded; the model the init
+# event names is the same.
 # What no probe can reach is a release the API serves only to a newer CLI:
 # it refuses an older one with a 400 naming the version required (measured:
 # claude-opus-5-5 needs 2.1.280, claude-fable-5-1 needs 2.1.251). That model
@@ -4051,6 +4057,8 @@ global_daily_cap() { # -> dollars, or empty for "no cap"
 #     find its keychain credential -- and so does an API that is down.
 #     PROBE_ANSWER keeps the CLI's own words. Read as a refusal, every family
 #     quietly stayed on its alias and the pass was cached as fresh for a day.
+PROBE_TURN=(--tools "" --strict-mcp-config --disable-slash-commands --system-prompt "Reply with one word.")
+
 model_probe_ok() { # model_probe_ok <id> -> 0 served, 1 refused, 2 kept for a newer CLI, 3 no verdict
   PROBE_NEEDS="" PROBE_INSTALLED="" PROBE_ANSWER=""
   local out rc res kind
@@ -4060,7 +4068,7 @@ model_probe_ok() { # model_probe_ok <id> -> 0 served, 1 refused, 2 kept for a ne
   # than the CLI is exactly what this probes for. Read together with the
   # JSON, that line made jq fail, so a served id the CLI did not know read
   # as refused.
-  out="$("$(platform_bin anthropic)" -p --output-format json --model "$1" "ok" 2>/dev/null)"; rc=$?
+  out="$("$(platform_bin anthropic)" -p "${PROBE_TURN[@]}" --output-format json --model "$1" "ok" 2>/dev/null)"; rc=$?
   # The result event alone, the last one: another JSON line a later CLI may
   # print around it must not blind every probe. No result event is no verdict.
   res="$(printf '%s' "$out" | "$JQ" -cs '[.[] | objects | select(.type == "result")] | last // empty' 2>/dev/null)"
@@ -4093,10 +4101,10 @@ claude_cli_version() { # the installed CLI's version, digits only ("2.1.280"); e
   run_bounded "$OPENCODE_DEADLINE" "$(platform_bin anthropic)" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1
 }
 
-model_alias_baseline() { # what the CLI's own alias points at (no API call)
+model_alias_baseline() { # what the CLI's own alias points at (the init event; the turn after it is PROBE_TURN's)
   # The init event is selected, not assumed first: with any hook configured
   # the CLI emits hook_started/hook_response system events ahead of it.
-  "$(platform_bin anthropic)" -p --output-format stream-json --verbose --model "$1" "hi" 2>/dev/null \
+  "$(platform_bin anthropic)" -p "${PROBE_TURN[@]}" --output-format stream-json --verbose --model "$1" "hi" 2>/dev/null \
     | "$JQ" -r 'select(.type=="system" and .subtype=="init") | .model // empty' 2>/dev/null \
     | head -1
 }
@@ -4153,10 +4161,11 @@ resolve_family() { # resolve_family <family> -> newest id the API serves this CL
   # What it costs: one `claude -p` per probe. An id the API does not serve
   # this CLI is refused before any turn runs (exit 1 with a 404, or the 400
   # of a newer CLI's model; $0, no tokens, ~5 s of wall time, nearly all of
-  # it CLI start-up); only an id that is served costs a turn, and the search
-  # stops at the first. So a family costs at most 11 probes (2 majors + 9
-  # minors) and 2 turns -- about a minute on the usual day, when nothing
-  # newer exists. It runs once per family per MODELS_TTL: in the tick's
+  # it CLI start-up); only an id that is served costs a turn -- PROBE_TURN's,
+  # the smallest the CLI makes -- and the search stops at the first. So a
+  # family costs at most 11 probes (2 majors + 9 minors) and 2 turns, plus
+  # the baseline's, about a minute on the usual day, when nothing newer
+  # exists. It runs once per family per MODELS_TTL: in the tick's
   # detached _resolve_models, or inline in effective_model when a family's
   # cached id has expired. A probe with no verdict ends the search at once:
   # the next ten would have none either.
