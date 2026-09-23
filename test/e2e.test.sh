@@ -154,6 +154,20 @@ mkjob_opencode() { # mkjob_opencode <id> [permission] [model] [extra-json-fields
   chmod +x "$ROOT/config/prechecks/$1.sh"
 }
 
+# mkjob_acct <id> <account> [platform] -- a job of the sandbox project on one
+# of the platform's accounts (the account must be registered first).
+mkjob_acct() {
+  E2E_JOB="$1"
+  jq -nc --arg id "$1" --arg a "$2" --arg p "${3:-anthropic}" \
+    '{jobs:[{id:$id, project:"sandbox", enabled:false, prompt:"do the thing", interval_seconds:3600,
+             platform:$p, model:(if $p == "openai" then "gpt-5.6-sol" else "claude-opus-5" end),
+             permission_mode:(if $p == "openai" then "workspace-write" else "bypassPermissions" end),
+             max_parallel:1, account:$a}]}' > "$ROOT/config/jobs.json"
+  mkdir -p "$ROOT/config/prechecks"
+  printf '#!/bin/bash\nexit 0\n' > "$ROOT/config/prechecks/$1.sh"
+  chmod +x "$ROOT/config/prechecks/$1.sh"
+}
+
 scenario_1() {
 echo "1. a run that declares a clean ending is torn down and removed"
 mkjob j1 complete
@@ -1273,6 +1287,106 @@ esac
 echo
 }
 
+scenario_47() {
+echo "47. a job on a registered Claude account launches in that account's directory, and so does its precheck"
+mkdir -p "$ROOT/accounts/claude-a"
+"$AL" platform account-add anthropic "Client A" "$ROOT/accounts/claude-a" >/dev/null 2>&1 || bad "account-add over the stand-in failed"
+mkjob_acct j47 client-a
+jq --arg pc "printf '%s' \"\${CLAUDE_CONFIG_DIR-<unset>}\" > $ROOT/pc-47; exit 0" '.jobs[0].precheck = $pc' \
+  "$ROOT/config/jobs.json" > "$ROOT/config/jobs.next" && mv "$ROOT/config/jobs.next" "$ROOT/config/jobs.json"
+acct47="$ROOT/account-47"; rm -f "$acct47" "$ROOT/pc-47"
+FAKE_ACCOUNT_OUT="$acct47" FAKE_MODE=complete FAKE_SESSION=sess-47 "$AL" run j47 >/dev/null 2>&1
+sleep 1
+[ "$(cat "$acct47" 2>/dev/null)" = "$ROOT/accounts/claude-a" ] \
+  && ok "the agent runs with CLAUDE_CONFIG_DIR set to the account's directory" || bad "the agent saw '$(cat "$acct47" 2>/dev/null)'"
+[ "$(cat "$ROOT/pc-47" 2>/dev/null)" = "$ROOT/accounts/claude-a" ] \
+  && ok "and so does its precheck" || bad "the precheck saw '$(cat "$ROOT/pc-47" 2>/dev/null)'"
+[ "$(lastrun | jq -r '[.account, .account_dir] | join(" ")')" = "client-a $ROOT/accounts/claude-a" ] \
+  && ok "the journal records the account and the directory the run used" || bad "record: $(lastrun | jq -c '{account, account_dir}')"
+
+echo
+}
+
+scenario_48() {
+echo "48. a job on a registered Codex account launches with that CODEX_HOME, and its rollout is read from there"
+mkdir -p "$ROOT/accounts/codex-a"
+"$AL" platform account-add openai "Client A" "$ROOT/accounts/codex-a" >/dev/null 2>&1 || bad "openai account-add failed"
+mkjob_acct j48 client-a openai
+acct48="$ROOT/account-48"; rm -f "$acct48"
+FAKE_ACCOUNT_OUT="$acct48" FAKE_MODE=complete FAKE_SESSION=thr-48 "$AL" run j48 >/dev/null 2>&1
+sleep 1
+[ "$(cat "$acct48" 2>/dev/null)" = "$ROOT/accounts/codex-a" ] \
+  && ok "the Codex CLI runs with CODEX_HOME set to the account's home" || bad "codex saw '$(cat "$acct48" 2>/dev/null)'"
+ls "$ROOT"/accounts/codex-a/sessions/*/*/*/rollout-*-thr-48.jsonl >/dev/null 2>&1 \
+  && ok "the stand-in wrote its rollout under that home" || bad "no rollout under the account's home"
+[ "$(lastrun | jq -r .model_id)" = "gpt-5.6-sol-real" ] \
+  && ok "and model_id came from it: the rollout was looked for where the run wrote it" || bad "model_id $(lastrun | jq -r .model_id)"
+
+echo
+}
+
+scenario_49() {
+echo "49. an account on the CLI's own directory runs with CLAUDE_CONFIG_DIR unset, even under a pin"
+# Claude Code reads its credentials from another Keychain entry the moment
+# CLAUDE_CONFIG_DIR is set at all -- even to ~/.claude (measured, 2.1.280) --
+# so an account there must reach the CLI with the variable gone. A home of
+# its own for the engine: ~/.claude is the sandbox's.
+home49="$ROOT/home-49"; mkdir -p "$home49/.claude" "$ROOT/pinned-49"
+HOME="$home49" AGENTLOOP_CLAUDE_CONFIG_DIR="$ROOT/pinned-49" \
+  "$AL" platform account-add anthropic "Home" "~/.claude" >/dev/null 2>&1 || bad "account-add of ~/.claude under a pin failed"
+mkjob_acct j49 home
+acct49="$ROOT/account-49"; rm -f "$acct49"
+HOME="$home49" AGENTLOOP_CLAUDE_CONFIG_DIR="$ROOT/pinned-49" FAKE_ACCOUNT_OUT="$acct49" \
+  FAKE_MODE=complete FAKE_SESSION=sess-49 "$AL" run j49 >/dev/null 2>&1
+sleep 1
+[ -f "$acct49" ] && [ -z "$(cat "$acct49")" ] \
+  && ok "the agent ran with no CLAUDE_CONFIG_DIR at all: not the pin, not ~/.claude" || bad "the agent saw '$(cat "$acct49" 2>/dev/null)'"
+[ "$(lastrun | jq -r '[.account, .account_dir] | join("|")')" = "home|" ] \
+  && ok "and the journal says so: the account, and no directory to export" || bad "record: $(lastrun | jq -c '{account, account_dir}')"
+
+echo
+}
+
+scenario_50() {
+echo "50. a job on an account with no session, or one Settings does not have, is refused before a slot"
+mkdir -p "$ROOT/accounts/claude-out"; : > "$ROOT/accounts/claude-out/.fake-logged-out"
+"$AL" platform account-add anthropic "Signed Out" "$ROOT/accounts/claude-out" >/dev/null 2>&1 || bad "account-add failed"
+mkjob_acct j50 signed-out
+FAKE_MODE=complete FAKE_SESSION=sess-50 "$AL" run j50 >/dev/null 2>&1
+grep -qF "j50: anthropic is not ready (claude is not signed in in $ROOT/accounts/claude-out (run: CLAUDE_CONFIG_DIR=$ROOT/accounts/claude-out claude auth login)), skipped" "$ROOT/data/tick.log" \
+  && ok "no session: the refusal names the account's directory and the login to run" || bad "no refusal line: $(tail -3 "$ROOT/data/tick.log")"
+[ -z "$(dirs j50)" ] && ok "and no run directory was cut" || bad "a worktree was cut for a refused run"
+mkjob_acct j50c ghost
+"$AL" run j50c >/dev/null 2>&1
+grep -qF "j50c: account 'ghost' is not an account of anthropic in Settings, skipped" "$ROOT/data/tick.log" \
+  && ok "an account Settings does not have is refused by name" || bad "no ghost refusal: $(tail -3 "$ROOT/data/tick.log")"
+mkjob j50b
+FAKE_MODE=complete FAKE_SESSION=sess-50b "$AL" run j50b >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .session)" = "sess-50b" ] && ok "a job on the Default account runs as before" || bad "the Default job did not run: $(lastrun)"
+
+echo
+}
+
+scenario_51() {
+echo "51. a resume signs in where its session was created, whatever the job says now"
+mkdir -p "$ROOT/accounts/claude-r1" "$ROOT/accounts/claude-r2"
+"$AL" platform account-add anthropic "R1" "$ROOT/accounts/claude-r1" >/dev/null 2>&1
+"$AL" platform account-add anthropic "R2" "$ROOT/accounts/claude-r2" >/dev/null 2>&1
+mkjob_acct j51 r1
+FAKE_MODE=undeclared FAKE_SESSION=sess-51 "$AL" run j51 >/dev/null 2>&1
+sleep 2
+printf 'r2' | "$AL" set-field j51 account >/dev/null 2>&1 || bad "set-field account r2 failed"
+acct51="$ROOT/account-51"; rm -f "$acct51"
+FAKE_ACCOUNT_OUT="$acct51" FAKE_MODE=complete FAKE_SESSION=sess-51 "$AL" resume j51 sess-51 >/dev/null 2>&1
+sleep 2
+[ "$(cat "$acct51" 2>/dev/null)" = "$ROOT/accounts/claude-r1" ] \
+  && ok "the resume ran on R1, where sess-51 lives, though the job now names R2" || bad "the resume saw '$(cat "$acct51" 2>/dev/null)'"
+[ "$(lastrun | jq -r .account)" = "r1" ] && ok "and its record names R1 too" || bad "resume record: $(lastrun | jq -c '{account, account_dir}')"
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1294,11 +1408,11 @@ echo
 # scenario goes at the END of the file and into the LAST list, or, if it is
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # and the count assertion below fails if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26"
 E2E_LIST_3="27 28 29 30 31 32 33 33b 34 35 35b 36 37"
-E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46"
+E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

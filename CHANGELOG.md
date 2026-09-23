@@ -46,6 +46,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   effective platform changes by any route — `set-field platform`,
   `set-field project`, a project's own platform change, or the project
   being deleted — loses an account that platform does not have.
+  A run signs in with its account's directory — the agent and its precheck,
+  `agentloop precheck` and `check` included — and is refused in `tick.log`,
+  before a slot is taken, when the account is not in Settings, its directory
+  is gone, or it has no session. The journal records the account and the
+  directory each run used, a resume signs in where its session was created
+  whatever the job says today, and the Codex rollout is read from the run's
+  own `CODEX_HOME`.
 
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate

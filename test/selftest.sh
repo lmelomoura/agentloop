@@ -3184,6 +3184,36 @@ EOF
     && ok "run_job calls the three, once each, in that order" \
     || bad "run_job's calls read: $(printf '%s\n' "$_rj_body" | grep -E '^  (run_refusals |run_launch_and_watch |run_classify$)' | tr '\n' ' ')"
 
+  echo "run_refusals() — the account's gates sit after Settings' own and before the CLI is asked"
+  local _rfb _rfo
+  _rfb="$(sed -n '/^run_refusals()/,/^}/p' "$BIN_DIR/agentloop")"
+  # Which gate each line is, in the order the lines come: a gate moved ahead
+  # of Settings' own, or behind the readiness probe, changes this sequence.
+  _rfo="$(printf '%s\n' "$_rfb" | awk '
+    /no model is enabled for/ { print "nomodel" }
+    /OpenCode has no accounts/ { print "opencode" }
+    /is not an account of/ { print "unknown" }
+    /is missing its directory/ { print "missing" }
+    /platform_ready "\$platform" "\$account" "\$account_dir"/ { print "ready" }' | tr '\n' ' ')"
+  [ "$_rfo" = "nomodel opencode unknown missing ready " ] \
+    && ok "no model -> OpenCode -> unknown account -> missing directory -> the account's own readiness, in that order" \
+    || bad "gate order: $_rfo"
+  : > "$tmp/acct-runs.ndjson"
+  ( RUNS_FILE="$tmp/acct-runs.ndjson"; LOCK_DIR="$tmp"
+    record_run j1 success 1 2 0 1 sess-a /x.json "" false "" P opus claude-opus-5 "" "" anthropic reported null cliente-a /x/.claude-a
+    record_run j2 success 1 2 0 1 sess-b /y.json "" false "" P opus claude-opus-5 "" "" anthropic reported null )
+  [ "$( RUNS_FILE="$tmp/acct-runs.ndjson"; journal_account_of_session sess-a | tr '\037' '|' )" = "cliente-a|/x/.claude-a" ] \
+    && [ -z "$( RUNS_FILE="$tmp/acct-runs.ndjson"; journal_account_of_session sess-b )" ] \
+    && ok "record_run keeps the account and its directory; a record without them says nothing" \
+    || bad "journal: $(cat "$tmp/acct-runs.ndjson")"
+  ( env -u CLAUDE_CONFIG_DIR AGENTLOOP_CONFIG="$tmp/acexp/config" AGENTLOOP_DATA="$tmp/acexp/data" \
+      bash -c '. "$1" --help >/dev/null 2>&1; CLAUDE_CONFIG_DIR=/pin; export CLAUDE_CONFIG_DIR
+      account_export anthropic ""; printf "%s|" "${CLAUDE_CONFIG_DIR-<unset>}"
+      account_export anthropic /x/a; printf "%s" "$CLAUDE_CONFIG_DIR"' _ "$SELF" ) > "$tmp/acct-export.out" 2>/dev/null
+  [ "$(cat "$tmp/acct-export.out")" = "<unset>|/x/a" ] \
+    && ok "account_export: the CLI's own directory unsets the variable, even over a pin; any other sets it" \
+    || bad "account_export: $(cat "$tmp/acct-export.out")"
+
   echo "cpu_tree_sum() — a busy tool tree is proof of life, not a stall"
   # A run whose agent is quiet because a test suite is grinding away in a child
   # (shell -> make -> pytest) must read as ALIVE. This is the case that got a

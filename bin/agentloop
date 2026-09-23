@@ -1942,6 +1942,14 @@ account_env_dir() { # account_env_dir <platform> <id> -> what the platform's var
   account_env_value "$1" "$(account_field "$1" "$2" dir)"
 }
 
+account_export() { # account_export <platform> <account-dir> -- in the calling shell: the platform's account variable unset, then exported when the account has a directory of its own (run_env's rule, for a precheck)
+  local v
+  account_platform "${1:-}" || return 0
+  v="$(account_var "$1")"
+  unset "$v"
+  [ -z "${2:-}" ] || export "$v=$2"
+}
+
 account_slug() { # account_slug <name> -> the id a new account is given: lower case, each run outside [a-z0-9] one dash, no dash at either end, at most 40 characters; account when nothing is left. Pinned to LC_ALL=C so the alphabet is the same regardless of the operator's own locale.
   local s
   s="$(export LC_ALL=C; printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//' | cut -c1-40 | sed 's/-$//')"
@@ -2856,9 +2864,9 @@ opencode_export_model() { # opencode_export_model <run_cwd> <session-id> [tmp-ba
 # appends to the same file). Sets PF_MODEL_ID and PF_ROLLOUT; both empty when
 # the rollout is not found, with one line in tick.log saying so.
 PF_MODEL_ID=""; PF_ROLLOUT=""
-platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-id] [run_cwd]
+platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-id] [run_cwd] [codex-home]
   PF_MODEL_ID=""; PF_ROLLOUT=""
-  local tid="${3:-}" id="${4:-run}"
+  local tid="${3:-}" id="${4:-run}" home="${6:-$CODEX_HOME_DIR}"
   case "$1" in
     openai) ;;
     opencode)
@@ -2878,9 +2886,9 @@ platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-
     *) return 0 ;;
   esac
   [ -n "$tid" ] || return 0
-  PF_ROLLOUT="$(openai_rollout_for "$tid")"
+  PF_ROLLOUT="$(openai_rollout_for "$tid" "$home")"
   if [ -z "$PF_ROLLOUT" ]; then
-    log_tick "$id: no codex rollout for thread $tid under $CODEX_HOME_DIR/sessions — model_id stays the requested slug, no rate-limit reading"
+    log_tick "$id: no codex rollout for thread $tid under $home/sessions — model_id stays the requested slug, no rate-limit reading"
     return 0
   fi
   # The LAST turn_context: a resumed thread may have changed model.
@@ -2895,11 +2903,11 @@ platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-
   return 0
 }
 
-openai_rollout_for() { # openai_rollout_for <thread_id> -> the rollout's path, or nothing
+openai_rollout_for() { # openai_rollout_for <thread_id> [codex-home] -> the rollout's path, or nothing
   local hit
   # A thread id is unique, so the first hit is the only hit; the glob is
   # bounded to the three date levels the CLI uses.
-  hit="$(ls -t "$CODEX_HOME_DIR"/sessions/*/*/*/rollout-*-"$1".jsonl 2>/dev/null | head -1)"
+  hit="$(ls -t "${2:-$CODEX_HOME_DIR}"/sessions/*/*/*/rollout-*-"$1".jsonl 2>/dev/null | head -1)"
   [ -n "$hit" ] && [ -f "$hit" ] && printf '%s' "$hit"
   return 0
 }
@@ -3921,7 +3929,7 @@ port_base_reclaim() { # port_base_reclaim <slot-dir> <base>
 # journaled (it drops `journaled` the moment it does), so a run that reached its
 # own ending is never recorded twice.
 run_record_stopped_early() { # <id> <slot-dir>
-  local id="$1" slot="${2:-}" start end logf project note model model_family wt sid
+  local id="$1" slot="${2:-}" start end logf project note model model_family wt sid account account_dir
   [ -n "$slot" ] || return 0
   [ -f "$slot/stopped" ] || return 0
   [ -f "$slot/journaled" ] && return 0
@@ -3993,8 +4001,10 @@ run_record_stopped_early() { # <id> <slot-dir>
     result:("**Stopped by you.**\n\n"+$r)}' > "$logf" 2>/dev/null || logf=""
   state_set_many "$id" "$("$JQ" -nc --argjson end "$end" --argjson start "$start" \
     '{last_end:$end, last_status:"stopped", last_run_start:$start, last_run_status:"stopped"}')"
+  account="$(cat "$slot/account" 2>/dev/null || true)"
+  account_dir="$(cat "$slot/account_dir" 2>/dev/null || true)"
   record_run "$id" "stopped" "$start" "$end" "0" "0" "$sid" "${logf:-}" "$note" "false" "" "$project" \
-             "${model_family:-$model}" "" "" "" "$(job_platform "$id")" "none" "null"
+             "${model_family:-$model}" "" "" "" "$(job_platform "$id")" "none" "null" "$account" "$account_dir"
   # A derived security job stopped here left its analysis `running` in the
   # ledger with no run behind it: the page said so, refused a second Analyse
   # on the project, and the operator had to close the row by hand. The run's
@@ -4061,7 +4071,7 @@ lock_active() { # 0 = a run is currently holding the lock for <id> (single mutex
 journal_lock()   { lock_take "$LOCK_DIR/.journal.lock"; }
 journal_unlock() { lock_drop "$LOCK_DIR/.journal.lock"; }
 
-record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> <note> <forced> <precheck> <project> <model> <model_id> <resumed_from> <cause> <platform> <cost_basis> <tokens-json>
+record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> <note> <forced> <precheck> <project> <model> <model_id> <resumed_from> <cause> <platform> <cost_basis> <tokens-json> [account] [account-dir]
   "$JQ" -nc \
     --arg id "$1" --arg status "$2" --argjson start "$3" --argjson end "$4" \
     --arg cost "$5" --arg turns "$6" --arg session "$7" --arg logfile "$8" --arg note "$9" \
@@ -4069,6 +4079,7 @@ record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> 
     --arg model "${13:-}" --arg model_id "${14:-}" --arg resumed_from "${15:-}" \
     --arg cause "${16:-}" \
     --arg platform "${17:-anthropic}" --arg cost_basis "${18:-reported}" --argjson tokens "${19:-null}" \
+    --arg account "${20:-}" --arg account_dir "${21:-}" \
     '{id:$id, status:$status, start:$start, end:$end, duration:($end-$start),
       cost:($cost|tonumber? // 0), turns:($turns|tonumber? // 0),
       session:$session, log:$logfile, note:$note,
@@ -4084,7 +4095,11 @@ record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> 
       # Which CLI ran it; how its cost is known (reported by the CLI,
       # estimated from tokens, or none); its token counts, or null when the
       # run died without a final event -- unknown is not zero.
-      platform:$platform, cost_basis:$cost_basis, tokens:$tokens}' > "$LOCK_DIR/.rec.$$"
+      platform:$platform, cost_basis:$cost_basis, tokens:$tokens}
+      # The account the run signed in as, and the directory its variable
+      # carried (empty: the CLI default) -- what a resume signs in with. Left
+      # out when the caller does not know it, so a record never guesses.
+      + (if $account == "" then {} else {account:$account, account_dir:$account_dir} end)' > "$LOCK_DIR/.rec.$$"
   # Append under the journal lock, so a concurrent rewrite cannot drop this
   # record on the floor (build the line first — the lock is held for the append
   # alone, never across the jq run).
@@ -4100,6 +4115,12 @@ journal_platform_of_session() { # journal_platform_of_session <session-id> -> an
   # platforms existed carries none, and is anthropic by definition.
   grep -F "\"session\":\"$1\"" "$RUNS_FILE" 2>/dev/null | tail -1 \
     | "$JQ" -r 'select(type == "object") | .platform // "anthropic"' 2>/dev/null
+}
+
+journal_account_of_session() { # journal_account_of_session <session-id> -> the account and its directory, joined by U+001F, off the run that recorded the session; nothing when that run predates accounts
+  [ -s "$RUNS_FILE" ] && [ -n "${1:-}" ] || return 0
+  grep -F "\"session\":\"$1\"" "$RUNS_FILE" 2>/dev/null | tail -1 \
+    | "$JQ" -r 'select(type == "object" and has("account")) | [.account, (.account_dir // "")] | join("\u001f")' 2>/dev/null
 }
 
 # How much of the journal the daily-spend scan reads. Records are appended in
@@ -5123,7 +5144,11 @@ cmd_precheck() { # <id> — run the job's precheck once and RECORD it, without t
   # A probe reports; it must not claim. See AL_PRECHECK_DRY_RUN in the
   # prechecks: a claim is a write, and spending it here leaves a ticket
   # claimed with no session behind it.
-  pc_out="$( cd "$cwd" && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1 && eval "$precheck" 2>&1 )"; pc_rc=$?
+  # The same account as the run it gates (run_job's precheck): a probe that
+  # asks the CLI itself must answer for the account the job signs in as.
+  local plat adir
+  plat="$(job_platform "$id")"; adir="$(account_env_dir "$plat" "$(job_account "$id")")"
+  pc_out="$( cd "$cwd" && account_export "$plat" "$adir" && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1 && eval "$precheck" 2>&1 )"; pc_rc=$?
   state_set "$id" last_precheck "$("$JQ" -nc --arg o "${pc_out:-(no output)}" --argjson rc "$pc_rc" '{output:$o, exit:$rc}')"
   printf '%s\n(exit %s)\n' "$pc_out" "$pc_rc"
 }
@@ -5262,7 +5287,7 @@ undelivered_note() { # undelivered_note <description>
 # inputs are arrays, which bash 3.2 cannot pass by name); each header lists
 # what it reads. They never assign one: what goes back goes back as RJ_*.
 
-# run_refusals <id> <platform> <model> <effort> <permission> <allowed> <disallowed> <interactive>
+# run_refusals <id> <platform> <model> <effort> <permission> <allowed> <disallowed> <interactive> <account> <account-dir> <resume-sid>
 #   -> 0 to go on, 1 to refuse -- the reason already in tick.log, exactly as
 #   before: the caller reconstructs nothing. The operator's gates, then the
 #   CLI's own readiness, then the platform blocks (openai, opencode), then
@@ -5274,6 +5299,7 @@ undelivered_note() { # undelivered_note <description>
 run_refusals() {
   RJ_EFFORT=""; RJ_OPENCODE_CONFIG=""
   local id="$1" platform="$2" model="$3" effort="$4" permission="$5" allowed="$6" disallowed="$7" interactive="$8"
+  local account="${9:-default}" account_dir="${10:-}" resume_sid="${11:-}"
   # A run that cannot start is refused HERE, before a slot, a precheck or a
   # turn is spent, with the reason in tick.log -- the treatment `cwd missing`
   # gets. Each of these would otherwise fail at launch with nothing saying why.
@@ -5294,7 +5320,23 @@ run_refusals() {
   if [ -z "$(platform_models_enabled "$platform" | head -1)" ]; then
     log_tick "$id: no model is enabled for $platform in Settings, skipped"; return 1
   fi
-  if ! not_ready="$(platform_ready "$platform")"; then
+  # The account, before the CLI is asked anything: an id Settings no longer
+  # has, or a registered account whose directory is gone, fails at the login
+  # prompt otherwise. A resume is exempt from the id test -- it signs in with
+  # the directory its session was created under, whatever Settings says
+  # today. The Default's directory is the install's (the pin, CODEX_HOME):
+  # the readiness check below speaks for it, as it always has.
+  if [ "$platform" = "opencode" ] && [ "$account" != "default" ]; then
+    log_tick "$id: OpenCode has no accounts (account '$account'), skipped"; return 1
+  fi
+  if [ -z "$resume_sid" ] && ! account_known "$platform" "$account"; then
+    log_tick "$id: account '$account' is not an account of $platform in Settings, skipped"; return 1
+  fi
+  if [ "$account" != "default" ] && [ -n "$account_dir" ] && [ ! -d "$account_dir" ]; then
+    local _an; _an="$(account_field "$platform" "$account" name)"; [ -n "$_an" ] || _an="$account"
+    log_tick "$id: account '$_an' is missing its directory ($account_dir), skipped"; return 1
+  fi
+  if ! not_ready="$(platform_ready "$platform" "$account" "$account_dir")"; then
     log_tick "$id: $platform is not ready ($not_ready), skipped"; return 1
   fi
   if [ "$platform" = "openai" ]; then
@@ -5874,7 +5916,7 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   local id="$1" force="${2:-}" resume_sid="${3:-}"
   [ -n "$resume_sid" ] && force="--force"
   local cwd prompt model effort budget timeout stall permission allowed disallowed precheck project proj_desc interactive fifo
-  local run_cwd worktree run_dir run_env run_cfgdir _envln slot max_par
+  local run_cwd worktree run_dir run_env account account_dir _envln slot max_par
   # Loop variables for replaying a reattached run's manifest through `up` again
   # (see the isolation branch below). Declared here, not just inside the loop,
   # because `read` happily creates GLOBALS for anything not already local, and
@@ -5887,12 +5929,23 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   local platform
   platform="$(resolve "$id" platform 'anthropic')"
   case "$platform" in ''|null) platform="anthropic" ;; esac
-  # Which account this run signs in as: the install's pin, exported as
-  # CLAUDE_CONFIG_DIR at load time, and nothing else -- a project's or a
-  # security block's own claude_config_dir was removed in this version; the
-  # account is the platform's, shown in Settings. Empty here: the two readers
-  # below (the precheck's env, run_env) then leave the exported variable alone.
-  run_cfgdir=""
+  # Which account this run signs in as (see the accounts block): the job's
+  # own, else its project's when both run on the same platform, else the
+  # Default. account_dir is what the platform's variable carries -- empty is
+  # the CLI's own directory, and means the variable is left unset. A RESUME
+  # signs in where its session was created, off the journal: the session is
+  # stored in that account's directory, whatever the job says today.
+  account="$(job_account "$id")"
+  account_dir="$(account_env_dir "$platform" "$account")"
+  if [ -n "$resume_sid" ]; then
+    local _ra
+    _ra="$(journal_account_of_session "$resume_sid")"
+    if [ -n "$_ra" ]; then
+      IFS="$(printf '\037')" read -r account account_dir <<EOF
+$_ra
+EOF
+    fi
+  fi
   # cwd, model, permission, budget and timeout inherit from the project when the
   # job doesn't set them (see resolve()).
   cwd="$(resolve "$id" cwd "$HOME")"
@@ -5962,7 +6015,7 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   local _inert; _inert="$(permission_inert_warning "$platform" "$permission" "$allowed")"
   [ -z "$_inert" ] || log_tick "$id: $_inert"
 
-  run_refusals "$id" "$platform" "$model" "$effort" "$permission" "$allowed" "$disallowed" "$interactive" || return 1
+  run_refusals "$id" "$platform" "$model" "$effort" "$permission" "$allowed" "$disallowed" "$interactive" "$account" "$account_dir" "$resume_sid" || return 1
   effort="$RJ_EFFORT"
   local _occ1; _occ1="$RJ_OPENCODE_CONFIG"
   # Resolved once, after the gate, so the binary that was checked is the
@@ -6080,7 +6133,7 @@ $(run_ending_contract)" ;;
     # so a precheck that takes a ticket would move one out of the queue for a
     # run that is never going to look at it. Same contract as the standalone
     # probes: report, touch nothing.
-    pc_out="$( cd "$cwd" && { [ -n "$run_cfgdir" ] && export CLAUDE_CONFIG_DIR="$run_cfgdir"
+    pc_out="$( cd "$cwd" && { account_export "$platform" "$account_dir"
                               [ -n "$resume_sid" ] && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1
                               eval "$precheck" 2>&1; } )"; pc_rc=$?
     state_set "$id" last_precheck "$("$JQ" -nc --arg o "${pc_out:-(no output)}" --argjson rc "$pc_rc" '{output:$o, exit:$rc}')"
@@ -6150,10 +6203,18 @@ ${prompt}"
   # under set -u; this line makes the safety explicit instead of borrowed.
   run_dir=""
   # The env the agent starts with. It exists whether or not this project is
-  # isolated — the account is a property of the project, not of the worktree —
-  # and the worktree's own venv/vars are appended to it below when there is one.
+  # isolated — the account is not a property of the worktree — and the
+  # worktree's own venv/vars are appended to it below when there is one.
+  # First the account: the platform's variable is cleared, then set when the
+  # account has a directory of its own. The engine's environment may carry
+  # the install's pin, and an account on the CLI's own directory needs the
+  # variable GONE, not pointed at ~/.claude. `env` applies the -u before the
+  # assignments. OpenCode has no such variable.
   run_env=()
-  [ -n "$run_cfgdir" ] && run_env+=("CLAUDE_CONFIG_DIR=$run_cfgdir")
+  if account_platform "$platform"; then
+    run_env+=(-u "$(account_var "$platform")")
+    [ -z "$account_dir" ] || run_env+=("$(account_var "$platform")=$account_dir")
+  fi
   # The agent's own process environment -- not the precheck (it already ran,
   # before run_env existed) and not a provisioning hook (those run before this
   # array is finished and read exported AL_* variables).
@@ -6430,6 +6491,10 @@ ${prompt}"
   # A resume is in flight for that session: recorded here so nothing offers to
   # resume it a second time while this one is still working.
   [ -n "$resume_sid" ] && echo "$resume_sid" > "$slot/resume_of" 2>/dev/null || true
+  # The account, for the dialog while the run is going and for a stop that
+  # records the run before it ends (run_record_stopped_early).
+  printf '%s\n' "$account" > "$slot/account" 2>/dev/null || true
+  printf '%s\n' "$account_dir" > "$slot/account_dir" 2>/dev/null || true
   log_tick "$id: starting run ($stamp)"
 
   # stream-json gives one NDJSON event per message — the per-turn trace the
@@ -6629,7 +6694,7 @@ If the work turns out to be already finished, or it can no longer be done at all
   # On openai and opencode the init event carries the slug that was ASKED
   # for; the model that ran is in the rollout (openai) or the export
   # (opencode). platform_finish also feeds the usage gate on openai.
-  platform_finish "$platform" "$streamfile" "$session" "$id" "$run_cwd"
+  platform_finish "$platform" "$streamfile" "$session" "$id" "$run_cwd" "${account_dir:-$(account_cli_default openai)}"
   [ -z "$PF_MODEL_ID" ] || model_id="$PF_MODEL_ID"
 
   run_classify
@@ -6669,7 +6734,7 @@ If the work turns out to be already finished, or it can no longer be done at all
       last_cost:($cost|tonumber? // 0),
       last_session:$session, fail_streak:$streak}')"
   # Record what was CHOSEN (the family, when one was) plus what actually ran.
-  record_run "$id" "$status" "$start" "$end" "${cost:-0}" "${turns:-0}" "$session" "$logfile" "$wdreason" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$model_id" "$resume_sid" "$cause" "$platform" "$cost_basis" "$tokens_json"
+  record_run "$id" "$status" "$start" "$end" "${cost:-0}" "${turns:-0}" "$session" "$logfile" "$wdreason" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$model_id" "$resume_sid" "$cause" "$platform" "$cost_basis" "$tokens_json" "$account" "$account_dir"
   # Tells the EXIT path this run has already filed its record, so a stop that
   # lands while we are finishing here cannot produce a second one.
   : > "$slot/journaled" 2>/dev/null || true
@@ -7861,18 +7926,12 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
   ma="$(echo "$merged" | "$JQ" -r '.account // ""')"
   msa="$(echo "$merged" | "$JQ" -r '((.security | objects) // {}).account // ""')"
   if [ -n "$ma" ] && ! account_known "$mp" "$ma"; then
-    if echo "$partial" | "$JQ" -e 'has("account")' >/dev/null 2>&1; then
-      die "project-set: account '$ma' is not an account of $mp — $mp has: $(account_ids_line "$mp")"
-    fi
     # A platforms.json this cannot read makes account_known refuse every id --
     # not a real platform change, so a value only STORED is left exactly as
     # it was rather than cleared on a false alarm.
     platforms_valid && drop="$drop project"
   fi
   if [ -n "$msa" ] && ! account_known "$msp" "$msa"; then
-    if echo "$partial" | "$JQ" -e '((.security | objects) // {}) | has("account")' >/dev/null 2>&1; then
-      die "project-set: security.account '$msa' is not an account of $msp — $msp has: $(account_ids_line "$msp")"
-    fi
     platforms_valid && drop="$drop security"
   fi
   # claude_config_dir is never read (accounts live in Settings) -- the
@@ -8148,7 +8207,9 @@ cmd_check() {
   cwd="$(resolve "$id" cwd "$HOME")"   # inherit the project's cwd, like run_job
   [ -n "$precheck" ] || { echo "$id has no precheck — every due tick spends a session."; return 0; }
   # Read-only, like every standalone probe (see AL_PRECHECK_DRY_RUN).
-  ( cd "$cwd" && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1 && eval "$precheck" ); local rc=$?
+  local plat adir
+  plat="$(job_platform "$id")"; adir="$(account_env_dir "$plat" "$(job_account "$id")")"
+  ( cd "$cwd" && account_export "$plat" "$adir" && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1 && eval "$precheck" ); local rc=$?
   case "$(precheck_verdict "$rc")" in
     work)  echo "precheck: WORK FOUND — a due tick would start a Claude run" ;;
     idle)  echo "precheck: nothing to do — a due tick would cost nothing" ;;

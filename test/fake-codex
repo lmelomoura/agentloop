@@ -10,6 +10,7 @@
 #   FAKE_MODE              complete | undeclared | dirty | hang | quota | unknown_model
 #   FAKE_ARGV_OUT          record the argv, one line per argument, "<n><TAB><first line>"
 #   FAKE_PROMPT_OUT        record the last argument (the prompt) WHOLE -- FAKE_ARGV_OUT keeps first lines only
+#   FAKE_ACCOUNT_OUT       record the CODEX_HOME this launch runs with (empty line when unset)
 #   FAKE_SKIP_PREPARE      set to skip `security prepare` inside a security run -- see the hook below:
 #                          on openai the ENGINE runs prepare before it launches the CLI, so the hook
 #                          only fires for a launch that carries no AL_PLATFORM=openai marker
@@ -39,6 +40,11 @@ if [ -n "${FAKE_ARGV_OUT:-}" ]; then
     n=0
     for a in "$@"; do n=$((n + 1)); printf '%s\t%s\n' "$n" "${a%%$'\n'*}"; done
   } > "$FAKE_ARGV_OUT"
+fi
+# The account this launch signs in as travels in the environment, where the
+# argv cannot show it: CODEX_HOME, or an empty line when it has none.
+if [ -n "${FAKE_ACCOUNT_OUT:-}" ]; then
+  printf '%s\n' "${CODEX_HOME:-}" > "$FAKE_ACCOUNT_OUT"
 fi
 if [ -n "${FAKE_PROMPT_OUT:-}" ]; then
   last=""; for a in "$@"; do last="$a"; done
