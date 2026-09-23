@@ -69,6 +69,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A family resolves to the newest model the API serves the installed CLI,
+  even one that CLI has never heard of.** Two defects sat on the probe's
+  path. The minor probe asked only for 3, 2 and 1, and releases skip minors
+  (5 went straight to 5.5). And for every request that goes out for an id it
+  does not recognise, the CLI writes `[claude-code:unrecognized_model] {...}`
+  to stderr, which `model_probe_ok` parsed together with the JSON: jq
+  failed, and a served id the CLI did not know — a whole new major included
+  — read as refused, though finding exactly those ids is the resolver's job.
+  The probe now reads stdout alone and asks for every minor from 9 down,
+  stopping at the first one served. Opus 5.5 itself was beyond any probe on
+  2026-09-22: the API serves it only to Claude Code 2.1.280 or newer and
+  answers an older CLI with a 400 naming that version (fable 5.1 likewise
+  needs 2.1.251), so a run on it would have failed too, and `claude update`
+  was the one way to it. The probe reads that 400 as the refusal it is, and
+  the README now says a release like that waits for the update. What the
+  probe costs is written above the loop and in the README: a refused id is
+  turned away before any turn runs (measured: $0, no tokens, about five
+  seconds), so a family is at most eleven probes and two turns a day.
+  `test/fake-claude` answers these probes from real captures — the 404, the
+  400 and the CLI's stderr line are committed under `test/fixtures/` — and
+  the selftest holds the search to the order it probes in and to where it
+  stops.
+
+- **A family never resolves to a model older than the CLI's own alias.**
+  When the alias already carried a minor (CLI 2.1.280's `opus` is
+  `claude-opus-5-5`), the minor probe took the first of 5-3, 5-2 and 5-1 the
+  API still served — a silent downgrade on the next daily refresh. Probes now
+  start above the baseline's own minor. A dated alias's 8-digit suffix is a
+  snapshot date, not a minor: today's `claude-haiku-4-5-20251001` is 4.5 and
+  comes back unchanged, and `claude-opus-4-20250514` is 4.0, so the 4.1
+  above it is still found.
+
 - **A job with no schedule window is launched by the tick again.** The
   tick's plan was one tab-separated line per enabled job, read back with
   `IFS=tab` -- and a tab is IFS whitespace, which bash folds: a run of it

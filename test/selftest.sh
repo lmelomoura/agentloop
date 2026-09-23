@@ -1843,6 +1843,90 @@ EOF
   [ -z "$got" ] && ok "a CLI that cannot run reports nothing, so resolve_family can give up" \
     || bad "a missing CLI invented '$got'"
 
+  echo "resolve_family() — the newest id the API serves this CLI, never one older than its alias"
+  # Each scenario is one world for test/fake-claude's probe mode: what the
+  # family alias points at in that CLI build, the ids the build recognises,
+  # the ids the API serves it, and the ids the API serves only to a newer
+  # build. Every probed id lands in $tmp/rf.log in order, so the order and
+  # the stop are held too, not just the answer.
+  rf() { # rf <family> <alias's id> <ids the CLI knows> <ids the API serves it> [ids gated to a newer CLI] -> the resolution
+    : > "$tmp/rf.log"
+    ( CLAUDE_BIN="$BASE_DIR/test/fake-claude"
+      FAKE_ALIASES="$1=$2" FAKE_CLI_MODELS="$3" FAKE_API_MODELS="$4" FAKE_GATED_MODELS="${5:-}" FAKE_PROBE_LOG="$tmp/rf.log"
+      export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS FAKE_GATED_MODELS FAKE_PROBE_LOG
+      resolve_family "$1" )
+  }
+  # A release that skips minors (5 went straight to 5.5) and that the API
+  # serves to this CLI build although the build does not know it yet -- the
+  # case the resolver exists for. The probe used to ask for 3, 2 and 1 only,
+  # and the stderr line the CLI writes for an id it does not recognise made
+  # even a served one read as refused.
+  got="$(rf opus claude-opus-5 "claude-opus-5 claude-opus-4-8" "claude-opus-5 claude-opus-5-5 claude-opus-4-8")"
+  [ "$got" = "claude-opus-5-5" ] && ok "minors skipped on the way up: claude-opus-5 resolves to claude-opus-5-5" \
+    || bad "claude-opus-5 with 5.5 served resolved to '$got', wanted claude-opus-5-5"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-opus-7 claude-opus-6 claude-opus-5-9 claude-opus-5-8 claude-opus-5-7 claude-opus-5-6 claude-opus-5-5 " ] \
+    && ok "minors are probed highest first, and the first one served ends the search" \
+    || bad "probes: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # 2026-09-22 as it really was: the API served claude-opus-5-5 only to CLI
+  # 2.1.280 or newer, and answered 2.1.258's probe with a 400 naming that
+  # version. A model the installed CLI cannot run is no answer -- a launch on
+  # it fails the same way -- so the family stays on the alias until
+  # `claude update`.
+  got="$(rf opus claude-opus-5 "claude-opus-5 claude-opus-4-8" "claude-opus-5 claude-opus-4-8" "claude-opus-5-5")"
+  [ "$got" = "claude-opus-5" ] && ok "a release gated to a newer CLI (the API's real 400) is never resolved to" \
+    || bad "claude-opus-5 with 5.5 gated to a newer CLI resolved to '$got', wanted claude-opus-5"
+  grep -qx 'claude-opus-5-5' "$tmp/rf.log" && ok "though it was asked for, and read as refused" \
+    || bad "claude-opus-5-5 was never probed: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # The alias already carries a minor (2.1.280: claude-opus-5-5). A lower
+  # minor the API still serves must never win, so the probe starts above the
+  # baseline's own minor and never even asks for it.
+  got="$(rf opus claude-opus-5-5 "claude-opus-5 claude-opus-5-3 claude-opus-5-5" "claude-opus-5 claude-opus-5-3 claude-opus-5-5")"
+  [ "$got" = "claude-opus-5-5" ] && ok "a baseline with a minor is never resolved below itself (5-3 served, 5-5 stays)" \
+    || bad "claude-opus-5-5 resolved to '$got', wanted claude-opus-5-5"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-opus-7 claude-opus-6 claude-opus-5-9 claude-opus-5-8 claude-opus-5-7 claude-opus-5-6 " ] \
+    && ok "and nothing at or below the baseline's minor is probed" || bad "probes: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # Today's haiku alias is a dated snapshot. The 8-digit date is not a minor:
+  # the baseline is 4.5, so 4-9..4-6 are asked, claude-haiku-4-5 (served,
+  # the same model) is not, and the answer stays the id the CLI named.
+  local _h="claude-haiku-4-5-20251001 claude-haiku-4-5 claude-haiku-4 claude-haiku-3-5"
+  got="$(rf haiku claude-haiku-4-5-20251001 "$_h" "$_h")"
+  [ "$got" = "claude-haiku-4-5-20251001" ] && ok "a dated baseline (claude-haiku-4-5-20251001) comes back unchanged" \
+    || bad "claude-haiku-4-5-20251001 resolved to '$got'"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-haiku-6 claude-haiku-5 claude-haiku-4-9 claude-haiku-4-8 claude-haiku-4-7 claude-haiku-4-6 " ] \
+    && ok "and its date is not read as a minor: 4-9..4-6 are probed, nothing built from the date" \
+    || bad "probes: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # A dated alias with no minor at all -- `opus` meant claude-opus-4-20250514
+  # until claude-opus-4-1 shipped. That baseline is 4.0: read as minor
+  # 20250514 it would have probed nothing, and 4.1 would never be found.
+  got="$(rf opus claude-opus-4-20250514 "claude-opus-4-20250514" "claude-opus-4-20250514 claude-opus-4-1")"
+  [ "$got" = "claude-opus-4-1" ] && ok "a dated baseline with no minor is 4.0: claude-opus-4-20250514 resolves to claude-opus-4-1" \
+    || bad "claude-opus-4-20250514 with 4.1 served resolved to '$got', wanted claude-opus-4-1"
+  # A CLI a whole major behind (2026-07-24: `opus` still meant
+  # claude-opus-4-8). The bare major is found first, then its minors from the
+  # top: the baseline's minor 8 belongs to the old major and caps nothing.
+  got="$(rf opus claude-opus-4-8 "claude-opus-4-8" "claude-opus-4-8 claude-opus-5 claude-opus-5-5")"
+  [ "$got" = "claude-opus-5-5" ] && ok "a new major and its minor are found in one pass (4-8 -> 5-5)" \
+    || bad "claude-opus-4-8 with 5 and 5.5 served resolved to '$got', wanted claude-opus-5-5"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-opus-6 claude-opus-5 claude-opus-5-9 claude-opus-5-8 claude-opus-5-7 claude-opus-5-6 claude-opus-5-5 " ] \
+    && ok "and the new major's minors are probed from the top" || bad "probes: $(tr '\n' ' ' < "$tmp/rf.log")"
+
+  echo "model_probe_ok() — the JSON answer alone decides, whatever the CLI adds on stderr"
+  # For every request that goes out for an id it does not recognise, the CLI
+  # writes `[claude-code:unrecognized_model] {...}` to stderr -- its own
+  # changelog says so, and both refusals captured here carry it -- and an id
+  # newer than the CLI is what a probe asks for. Parsed together with the
+  # JSON on stdout, that line made jq fail, so a served id the CLI did not
+  # know would have read as refused. The answers are the stand-in's captures.
+  ( CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_CLI_MODELS=""; FAKE_API_MODELS="claude-opus-5-5"
+    export FAKE_CLI_MODELS FAKE_API_MODELS; model_probe_ok claude-opus-5-5 ) 2>/dev/null
+  want "a served id the CLI flags as unrecognized on stderr is accepted" 0 $?
+  ( CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_CLI_MODELS=""; FAKE_API_MODELS="claude-opus-5-5"
+    export FAKE_CLI_MODELS FAKE_API_MODELS; model_probe_ok claude-opus-5-3 ) 2>/dev/null
+  want "an id the API does not serve (the real 404) is refused" 1 $?
+  ( CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_CLI_MODELS=""; FAKE_API_MODELS="claude-opus-5"; FAKE_GATED_MODELS="claude-opus-5-5"
+    export FAKE_CLI_MODELS FAKE_API_MODELS FAKE_GATED_MODELS; model_probe_ok claude-opus-5-5 ) 2>/dev/null
+  want "an id the API serves only to a newer CLI (the real 400) is refused" 1 $?
+
   echo "bind_session() — one shot, atomic, and a no-op without a run dir"
   mkdir -p "$tmp/rd1"
   bind_session "$tmp/rd1" "$tmp/s1.ndjson"

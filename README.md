@@ -864,7 +864,17 @@ a family (`opus`) to always run that family's newest model. Families are resolve
 by the engine, not by the CLI alias: an alias points at the newest model the
 *installed CLI* knows, which lags the API right after a release. `agentloop
 resolve-models` probes for the newest of each family and caches the answer in
-`config/models.json`; the tick refreshes it roughly once a day on its own.
+`config/models.json`; the tick refreshes it roughly once a day on its own. The
+probe asks for the next two majors, then every minor from `.9` down, and stops at
+the first id the API serves — releases skip minors (`claude-opus-5` went straight
+to `claude-opus-5-5`) — and it never settles on anything older than the id the
+CLI's alias already names. An id the API does not serve is refused before any
+turn runs (no tokens, about five seconds each), so a family costs at most eleven
+probes a day, and real turns only on the ids that are served — two at most. A
+release the API serves only to a newer CLI cannot be found this way: it refuses
+the probe with a 400 naming the version required (Opus 5.5 needed Claude Code
+2.1.280), a run on it would fail the same way, and the family stays on the alias
+until you run `claude update`.
 
 On the OpenAI platform a model is a catalog slug used verbatim (`gpt-5.6-sol`);
 `agentloop resolve-models openai` reads the catalog from `codex debug models`
