@@ -1674,8 +1674,10 @@ JSON
     && ok "security_prompt: no platform argument reads as anthropic" || bad "the six-argument call differs from anthropic"
   printf '%s\n' "$_pa" | grep -qF 'Invoke the `security-analysis` skill' \
     && ok "security_prompt anthropic: invokes the skill by name" || bad "anthropic head: $(printf '%s\n' "$_pa" | head -1)"
-  printf '%s\n' "$_pa" | grep -qF 'You have no `Agent` tool' \
-    && ok "security_prompt anthropic: names the Agent tool it closed" || bad "anthropic prompt lacks the Agent paragraph"
+  printf '%s\n' "$_pa" | grep -qF 'You HAVE subagents in this run' \
+    && printf '%s\n' "$_pa" | grep -qF 'Use subagents for nothing else' \
+    && ok "security_prompt anthropic: says subagents exist, and for what alone" \
+    || bad "anthropic prompt lacks the verification paragraph"
   printf '%s\n' "$_po" | grep -qF "Read \`$SKILLS_DIR/security-analysis/SKILL.md\`" \
     && ok "security_prompt openai: names the skill file by path, not by discovery" || bad "openai head: $(printf '%s\n' "$_po" | head -1)"
   printf '%s\n' "$_po" | grep -qF 'ALREADY RAN for this analysis' \
@@ -1688,6 +1690,14 @@ JSON
     && bad "openai prompt still speaks of the Agent tool" || ok "security_prompt openai: never speaks of the Agent tool"
   printf '%s\n' "$_pa" | grep -qF 'security prepare --analysis 7' && printf '%s\n' "$_pa" | grep -qF 'YOUR FIRST COMMAND' \
     && ok "security_prompt anthropic: prepare is still the agent's first command, with the analysis id filled in" || bad "the anthropic prompt lost its prepare line"
+  printf '%s\n' "$_pa" | grep -qF 'verify-queue' \
+    && printf '%s\n' "$_pa" | grep -qF 'The close counts' \
+    && ok "security_prompt anthropic: names the verification phase and that it is counted" \
+    || bad "the anthropic prompt does not describe the verification phase"
+  printf '%s\n' "$_po" | grep -qF 'Do not spawn subagents' \
+    && printf '%s\n' "$_pc" | grep -qF 'there are no subagents' \
+    && ok "security_prompt openai/opencode: subagents stay forbidden where verification cannot run" \
+    || bad "a platform without verification lost its ban"
   printf '%s\n' "$_pa" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
     && printf '%s\n' "$_po" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
     && printf '%s\n' "$_pc" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
@@ -1751,8 +1761,8 @@ JSON
   dplat security-of .prompt | grep -qF 'The `task` tool is closed for this run' \
     && ok "the derived job on opencode carries the by-rule paragraph" || bad "Of prompt lacks the task paragraph"
   [ "$(dplat security-of .platform)" = "opencode" ] && [ "$(dplat security-of .model)" = "pdm_ai/glm-5.3-flash" ] && [ "$(dplat security-of .effort)" = "high" ] \
-    && [ "$(dplat security-of .permission_mode)" = "full-access" ] && [ "$(dplat security-of .disallowed_tools)" = "Agent" ] \
-    && ok "an opencode block: platform, model, a variant the model lists, full-access, and Agent closed (task: deny)" || bad "Of: $(dplat security-of '{platform,model,effort,permission_mode,disallowed_tools}')"
+    && [ "$(dplat security-of .permission_mode)" = "full-access" ] && [ -z "$(dplat security-of .disallowed_tools)" ] \
+    && ok "an opencode block: platform, model, a variant the model lists, full-access, and no tool closed" || bad "Of: $(dplat security-of '{platform,model,effort,permission_mode,disallowed_tools}')"
   [ "$(dplat security-og .model)" = "pdm_ai/glm-5.3-flash" ] \
     && ok "a model that makes no tool calls falls back to the first enabled model that does" || bad "Og model $(dplat security-og .model)"
   grep -q "names a model that makes no tool calls ('pdm_ai/vision') -- an analysis needs tools; using pdm_ai/glm-5.3-flash" "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null \
@@ -5269,18 +5279,27 @@ JSON
   # ordinary jobs, and run_job actually turning the field into a CLI flag.
   #
   # The literal "Agent", NOT $SECURITY_DISALLOWED_TOOLS. Comparing the emitted
-  # value against the very constant that produced it asserts nothing: emptying
-  # the constant was tried, and it re-opened the tool with all five assertions
-  # here still green -- including the one whose failure message says "subagents
-  # are back". A test may not take its expected value from the thing it tests.
+  # value against the very constant that produced it asserts nothing: a test
+  # may not take its expected value from the thing it tests.
+  #
+  # SINCE BLOCK 4.2 THE ASSERTION IS THE OTHER WAY UP. The verification phase
+  # IS subagents, so the tool is open and the derived job closes nothing --
+  # and what keeps that honest is not this field but the CLOSE, which counts
+  # the `Task` calls in the run's stream against the verdicts in the ledger
+  # (see security_task_count and `finish --tasks-launched`). An empty field
+  # here would also be what a BROKEN derivation produces, so the job is read
+  # for a field it must carry as well: an empty `disallowed_tools` on a job
+  # that has a prompt is the open tool; an empty one on a job that has
+  # nothing is a derivation that fell over.
   ( JOBS_FILE="$tmp/derived/jobs.json"; PROJECTS_FILE="$tmp/derived/projects.json"
     DATA_DIR="$tmp/derived/data"
-    [ "$(job_get security-web '.disallowed_tools' '')" = "Agent" ] ) \
-    && ok "the derived job is emitted with the Agent tool closed off" \
-    || bad "the derived job no longer carries disallowed_tools — subagents are back"
+    [ -z "$(job_get security-web '.disallowed_tools' '')" ] \
+    && [ -n "$(job_get security-web '.prompt' '')" ] ) \
+    && ok "the derived job closes no tool: verification needs subagents, and the close counts them" \
+    || bad "the derived job's disallowed_tools is '$(job_get security-web '.disallowed_tools' '')' with prompt length $(job_get security-web '.prompt' '' | wc -c)"
 
-  # A real job of the operator's must be untouched by this: an empty read here
-  # is what makes run_job leave the flag off entirely for everybody else.
+  # A real job of the operator's carries no such field either, and never did:
+  # what a user's job may launch is the user's business.
   ( JOBS_FILE="$tmp/derived/jobs.json"; PROJECTS_FILE="$tmp/derived/projects.json"
     DATA_DIR="$tmp/derived/data"
     [ -z "$(job_get real-job '.disallowed_tools' '')" ] ) \
@@ -5414,9 +5433,9 @@ JSON
   # rediscovering the wall the first analysis already paid to find.
   ( JOBS_FILE="$tmp/derived/jobs.json"; PROJECTS_FILE="$tmp/derived/projects.json"
     DATA_DIR="$tmp/derived/data"
-    job_get security-web '.prompt' '' | grep -q 'no `Agent` tool' ) \
-    && ok "the derived job's prompt says the Agent tool is absent, and why" \
-    || bad "the prompt no longer explains the missing Agent tool"
+    job_get security-web '.prompt' '' | grep -q 'You HAVE subagents in this run' ) \
+    && ok "the derived job's prompt says subagents exist and what they are for" \
+    || bad "the prompt no longer explains what subagents are for"
 
   # The mode the analysis runs under. dontAsk looked safer and was the
   # opposite: headless dontAsk denies every tool outside an allowlist a fresh
@@ -5534,6 +5553,41 @@ JSON
     && grep -q -- '--guides-read unknown' "$tmp/guides/calls" \
     && ok "security_close_analysis passes what was read to finish, and unknown without a stream" \
     || bad "security_close_analysis calls: $(cat "$tmp/guides/calls")"
+
+  # The Task calls a run made, off its own stream. `Task` is the roster's name
+  # for the tool `--disallowedTools Agent` used to close; on OpenCode the
+  # normaliser already canonicalises `task` to `Task` (bin/platforms/
+  # opencode_stream.py), so one name is enough here.
+  cat > "$tmp/guides/tasks.ndjson" <<'JSON'
+{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"1","name":"Task","input":{"description":"verify b1b1","prompt":"You are verifying one security finding"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"2","name":"Read","input":{"file_path":"/Users/me/x.py"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"3","name":"Task","input":{"description":"verify c2c2","prompt":"You are verifying one security finding"}}]}}
+{"type":"result","subtype":"success"}
+JSON
+  [ "$(security_task_count "$tmp/guides/tasks.ndjson")" = "2" ] \
+    && ok "security_task_count: counts the subagents a run launched" \
+    || bad "security_task_count: got '$(security_task_count "$tmp/guides/tasks.ndjson")'"
+  [ "$(security_task_count "$tmp/guides/none.ndjson")" = "0" ] \
+    && ok "security_task_count: a run that launched none answers 0" \
+    || bad "security_task_count on a Task-less stream: '$(security_task_count "$tmp/guides/none.ndjson")'"
+  [ -z "$(security_task_count "$tmp/guides/missing.ndjson")" ] \
+    && [ -z "$(security_task_count "")" ] \
+    && ok "security_task_count: a missing stream answers nothing, never 0 -- the close then makes no comparison" \
+    || bad "security_task_count on a missing stream: '$(security_task_count "$tmp/guides/missing.ndjson")'"
+  ( DATA_DIR="$tmp/derived/data"; AL_SECURITY_ANALYSIS_ID=7
+    security_py() { printf '%s\n' "$*" >> "$tmp/guides/tcalls"; }
+    security_close_analysis "security-x" success 1 "" "$tmp/guides/tasks.ndjson"
+    security_close_analysis "security-x" success 1 "" )
+  grep -q -- '--tasks-launched 2' "$tmp/guides/tcalls" \
+    && [ "$(grep -c -- '--tasks-launched' "$tmp/guides/tcalls")" = "1" ] \
+    && ok "security_close_analysis passes the Task count, and omits the flag without a stream" \
+    || bad "security_close_analysis calls: $(cat "$tmp/guides/tcalls")"
+
+  # The Agent tool is OPEN now, and the prompt says what for.
+  [ -z "$SECURITY_DISALLOWED_TOOLS" ] \
+    && ok "the Agent tool is no longer closed at launch: verification needs subagents" \
+    || bad "SECURITY_DISALLOWED_TOOLS is '$SECURITY_DISALLOWED_TOOLS'"
 
   # A project name that slugs to nothing (e.g. "!!!") would derive the bare
   # prefix -- not a usable id, and not any project's job. It must be skipped,

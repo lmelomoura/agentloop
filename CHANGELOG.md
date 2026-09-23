@@ -57,6 +57,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The `Agent` tool is open again for a security analysis, and the close
+  counts what it was used for.** Verification is subagents, so closing the
+  tool would close the phase; `security_task_count` reads the run's stream and
+  `finish --tasks-launched` compares it with the verdicts in the ledger. The
+  prompt now says what subagents are for and that the count happens. On the
+  Codex CLI and OpenCode, where the phase cannot run, they stay forbidden by
+  the prompt — what changed there is only that the denial is no longer a
+  permission rule.
+
 - **A disproved finding leaves the posture.** `queries.counted` — open AND
   not `rejected` — replaces the copies of the open-ness rule across the
   counters, the reports and the browser: a finding a verifier disproved stops
