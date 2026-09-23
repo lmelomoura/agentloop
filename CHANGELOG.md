@@ -31,6 +31,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   could not load. Removing an account is refused while jobs.json or
   projects.json cannot be parsed, rather than assuming nobody uses it; an
   account whose skills could not be linked says so on its own add/edit line.
+  A job, a project and a security block pick one (`account`): a job inherits
+  its project's when both run on the same platform, an analysis its
+  project's on the same terms, and `set-field`, `create` and `project-set`
+  refuse an account the platform does not have — a platform change clears
+  one it leaves behind, and says so. `install` turns a `claude_config_dir`
+  still in `projects.json` into an account.
 
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate

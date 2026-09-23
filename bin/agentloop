@@ -77,15 +77,80 @@ legacy_scripts_warnings() { # one line per personal script under config/ still r
     done
 }
 
-legacy_config_dir_warning() { # one line per project or security block still naming an account: the field is ignored since this version
+legacy_config_dir_warning() { # one line per project or security block still carrying claude_config_dir: install converts what it can, and this names the rest
   [ -f "$PROJECTS_FILE" ] || return 0
   "$JQ" -r '
     .projects[]? | select(type == "object")
     | (.claude_config_dir // "") as $a | (((.security | objects) // {}).claude_config_dir // "") as $b
     | select($a != "" or $b != "") | .name' "$PROJECTS_FILE" 2>/dev/null \
   | while IFS= read -r n; do
-      printf "WARNING: projects.json: claude_config_dir on %s is ignored since this version — the account is the platform's, see Settings\n" "$n"
+      printf "WARNING: projects.json: claude_config_dir on %s is not read — accounts live in Settings › Platforms; pick one in the project editor\n" "$n"
     done
+}
+
+# The per-project account before accounts: a directory written into
+# projects.json, read by no version since the account became the platform's.
+# install turns each one into an account -- the Default when it is the
+# Default's directory, the registered account that has it, or a new one named
+# after the directory -- and sets it on the level that carried it. A level
+# that does not run on Anthropic, or a directory that is gone, keeps the
+# field, said here and warned about by status.
+accounts_migrate_legacy() { # accounts_migrate_legacy -> one line per level converted or left
+  [ -f "$PROJECTS_FILE" ] || return 0
+  local rows name level dir plat nd aid nm
+  rows="$("$JQ" -r '.projects[]? | select(type == "object") | .name as $n
+      | ( ((.claude_config_dir // "") | select(type == "string" and . != "") | [$n, "project", .]),
+          ((((.security | objects) // {}).claude_config_dir // "") | select(type == "string" and . != "") | [$n, "security", .]) )
+      | @tsv' "$PROJECTS_FILE" 2>/dev/null)"
+  [ -n "$rows" ] || return 0
+  while IFS="$(printf '\t')" read -r name level dir; do
+    [ -n "$name" ] || continue
+    if [ "$level" = "project" ]; then plat="$(project_get "$name" '.platform' 'anthropic')"
+    else
+      plat="$(security_get "$name" '.platform' '')"
+      [ -n "$plat" ] || plat="$(project_get "$name" '.platform' 'anthropic')"
+    fi
+    case "$plat" in ''|null) plat="anthropic" ;; esac
+    platform_known "$plat" || plat="anthropic"
+    if [ "$plat" != "anthropic" ]; then
+      echo "projects.json: claude_config_dir on $name ($level) left in place — that level runs on $plat, and a Claude account signs in Anthropic runs only"
+      continue
+    fi
+    if ! nd="$(account_norm_dir "$dir")"; then
+      echo "projects.json: claude_config_dir on $name ($level) left in place — '$dir' is not an absolute directory"; continue
+    fi
+    if [ "$nd" = "$(account_default_dir anthropic)" ]; then aid="default"
+    else
+      aid="$(accounts_json anthropic | "$JQ" -r '.[] | [.id, .dir] | @tsv' \
+        | while IFS="$(printf '\t')" read -r i d; do
+            if [ "$(account_norm_dir "$d")" = "$nd" ]; then printf '%s' "$i"; break; fi
+          done)"
+      if [ -z "$aid" ]; then
+        if [ ! -d "$nd" ]; then
+          echo "projects.json: claude_config_dir on $name ($level) left in place — $nd does not exist"; continue
+        fi
+        nm="$(basename "$nd" | sed 's/^\.//')"
+        if ! aid="$(account_add anthropic "$nm" "$nd")"; then
+          if ! aid="$(account_add anthropic "$nd" "$nd")"; then
+            echo "projects.json: claude_config_dir on $name ($level) left in place — $aid"; continue
+          fi
+        fi
+        echo "registered the Claude account '$(account_field anthropic "$aid" name)' ($nd) from projects.json"
+      fi
+    fi
+    if [ "$level" = "project" ]; then
+      write_projects --arg n "$name" --arg a "$aid" '.projects = [.projects[] | if .name == $n
+          then ((if ((.account // "") == "" and $a != "default") then .account = $a else . end) | del(.claude_config_dir))
+          else . end]'
+    else
+      write_projects --arg n "$name" --arg a "$aid" '.projects = [.projects[] | if .name == $n and (.security | type) == "object"
+          then .security |= ((if ((.account // "") == "" and $a != "default") then .account = $a else . end) | del(.claude_config_dir))
+          else . end]'
+    fi
+    echo "projects.json: claude_config_dir on $name ($level) is now the account '$aid'"
+  done <<EOF
+$rows
+EOF
 }
 
 CONFIG_DIR="${AGENTLOOP_CONFIG:-$BASE_DIR/config}"
@@ -413,6 +478,29 @@ security_derived_jobs() {
       security_warn "security: project '$project' has a permission_mode the CLI does not know ('$perm') -- using $(platform_default_permission "$splat" security)"
       perm="$(platform_default_permission "$splat" security)"
     fi
+    # The account the analysis signs in as: the block's own, else the
+    # project's when the analysis runs on the project's platform, else the
+    # Default -- job_account's rule, settled here because the derived job is
+    # the only place it can travel, and always written ON the job, so the job
+    # never re-inherits the project's when the block said Default. One the
+    # platform does not have falls back to the Default, with the warning the
+    # other fallbacks give.
+    local sacct pplat
+    sacct="$(security_get "$project" '.account' '')"
+    if [ -z "$sacct" ]; then
+      pplat="$(project_get "$project" '.platform' 'anthropic')"
+      case "$pplat" in ''|null) pplat="anthropic" ;; esac
+      platform_known "$pplat" || pplat="anthropic"
+      if [ "$splat" = "$pplat" ]; then
+        sacct="$(project_get "$project" '.account' '')"
+        case "$sacct" in null) sacct="" ;; esac
+      fi
+    fi
+    [ -n "$sacct" ] || sacct="default"
+    if ! account_known "$splat" "$sacct"; then
+      security_warn "security: project '$project' names an account $splat does not have ('$sacct') -- using the Default account"
+      sacct="default"
+    fi
     # The prompt is built AFTER the platform is settled: its two platform
     # paragraphs read $splat, and $splat is only final here.
     prompt="$(security_prompt "$project" "$repo" "$branch" "$profile" "$aid" "$ignore" "$splat")"
@@ -432,8 +520,10 @@ security_derived_jobs() {
       --arg budget "$budget" \
       --arg daily "$daily" \
       --arg perm "$perm" \
+      --arg account "$sacct" \
       --arg notools "$SECURITY_DISALLOWED_TOOLS" \
       '{id:$id, project:$project, prompt:$prompt, model:$model, platform:$platform,
+        account:$account,
         description:"Security analysis (derived from the project, not a job you created).",
         enabled:false, precheck:"", permission_mode:$perm,
         disallowed_tools:$notools,
@@ -1512,6 +1602,27 @@ job_platform() { # job_platform <id>
   local p; p="$(resolve "$1" platform 'anthropic')"
   platform_known "$p" || p="anthropic"
   printf '%s\n' "$p"
+}
+
+# job_account <id> -> the account a run of the job signs in as (see the
+# accounts block): its own `account`, else its project's when the job runs on
+# the project's platform -- whether or not the job names that platform itself
+# -- else default. PLATFORMS_JQ's job_account is the same rule, for counting.
+job_account() { # job_account <id>
+  local a proj pp
+  a="$(job_get "$1" '.account' '')"
+  case "$a" in ''|null) ;; *) printf '%s\n' "$a"; return 0 ;; esac
+  proj="$(job_get "$1" '.project' '')"
+  case "$proj" in ''|null) printf 'default\n'; return 0 ;; esac
+  pp="$(project_get "$proj" '.platform' 'anthropic')"
+  case "$pp" in ''|null) pp="anthropic" ;; esac
+  platform_known "$pp" || pp="anthropic"
+  if [ "$(job_platform "$1")" = "$pp" ]; then
+    a="$(project_get "$proj" '.account' '')"
+    case "$a" in ''|null) a="default" ;; esac
+    printf '%s\n' "$a"; return 0
+  fi
+  printf 'default\n'
 }
 
 # --- config/platforms.json: what the operator enabled ---------------------------
@@ -6908,6 +7019,7 @@ PLIST
   echo "Skills (linked into ~/.claude/skills, into ~/.codex/skills when the Codex CLI has a home, and into every account directory Settings registers):"
   cmd_skills install
   echo "Open the dashboard with: agentloop dashboard"
+  accounts_migrate_legacy
   legacy_env_warnings
   legacy_scripts_warnings
   statusline_path_warning
@@ -7361,6 +7473,25 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
         dm="$(platform_default_permission "$eff" job)"
         write_jobs --arg id "$id" --arg v "$dm" '.jobs = [.jobs[] | if .id == $id then .permission_mode = $v else . end]'
         echo "permission_mode '$cur' is not a $eff mode — rewritten to $dm"
+      fi
+      # The account is one of a platform's too: an own account the new
+      # platform does not have is cleared, and the job inherits.
+      cur="$(job_get "$id" '.account' '')"
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && ! account_known "$eff" "$cur"; then
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+        echo "account '$cur' is not an account of $eff — cleared, the job inherits"
+      fi ;;
+    account)
+      # Which of the platform's accounts the job signs in as. Empty clears it:
+      # the job then inherits its project's when it runs on the project's
+      # platform, else the Default (job_account).
+      local p
+      p="$(job_platform "$id")"
+      if [ -z "$value" ]; then
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+      else
+        account_known "$p" "$value" || die "account '$value' is not an account of $p — $p has: $(account_ids_line "$p")"
+        write_jobs --arg id "$id" --arg v "$value" '.jobs = [.jobs[] | if .id == $id then .account = $v else . end]'
       fi ;;
     active_hours|description|cwd)
       write_jobs --arg id "$id" --arg f "$field" --arg v "$value" \
@@ -7537,6 +7668,11 @@ cmd_create() { # reads a partial job object (JSON) from stdin
   # not switched on before spending a `codex debug models` round trip on it,
   # the same order run_job's launch gates use.
   platform_usable "$cplat" || die "create: $cplat is not enabled in Settings — enable it there, or: agentloop platform enable $cplat"
+  local cacct
+  cacct="$(echo "$partial" | "$JQ" -r '.account // ""')"
+  if [ -n "$cacct" ] && ! account_known "$cplat" "$cacct"; then
+    die "create: account '$cacct' is not an account of $cplat — $cplat has: $(account_ids_line "$cplat")"
+  fi
   if [ "$cplat" = "openai" ] && ! openai_catalog_ensure; then
     die "create: no OpenAI catalog yet: install codex, sign in, and run: agentloop resolve-models openai"
   fi
@@ -7610,18 +7746,42 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
     platform_model_enabled "$eff_sp" "$sm" \
       || die "project-set: security.model '$sm' is not enabled in Settings — $eff_sp enables: $(platform_models_enabled_line "$eff_sp")"
   fi
-  # The account is the platform's now (see Settings): a claude_config_dir sent
-  # at either level is dropped from the partial AND from the stored project, and said.
-  if echo "$partial" | "$JQ" -e '((.claude_config_dir // "") != "") or ((((.security | objects) // {}).claude_config_dir // "") != "")' >/dev/null 2>&1; then
-    echo "note: claude_config_dir is ignored since this version — the account is the platform's, see Settings"
+  # The account each level signs in as has to be one of that level's own
+  # platform -- judged on the project as it will be once this save merges
+  # (jq `. * $p`). A value SENT that is not one is refused; one only STORED
+  # that a platform change leaves behind is cleared after the save, and said.
+  local merged mp msp ma msa drop=""
+  merged="$(projects_json | "$JQ" -c --arg n "$name" --argjson p "$partial" '([.projects[] | select(.name == $n)] | first // {}) * $p')"
+  mp="$(echo "$merged" | "$JQ" -r '.platform // ""')"; [ -n "$mp" ] || mp="anthropic"; platform_known "$mp" || mp="anthropic"
+  msp="$(echo "$merged" | "$JQ" -r '((.security | objects) // {}).platform // ""')"; [ -n "$msp" ] || msp="$mp"; platform_known "$msp" || msp="anthropic"
+  ma="$(echo "$merged" | "$JQ" -r '.account // ""')"
+  msa="$(echo "$merged" | "$JQ" -r '((.security | objects) // {}).account // ""')"
+  if [ -n "$ma" ] && ! account_known "$mp" "$ma"; then
+    if echo "$partial" | "$JQ" -e 'has("account")' >/dev/null 2>&1; then
+      die "project-set: account '$ma' is not an account of $mp — $mp has: $(account_ids_line "$mp")"
+    fi
+    drop="$drop project"
   fi
-  partial="$(echo "$partial" | "$JQ" -c 'del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end')"
+  if [ -n "$msa" ] && ! account_known "$msp" "$msa"; then
+    if echo "$partial" | "$JQ" -e '((.security | objects) // {}) | has("account")' >/dev/null 2>&1; then
+      die "project-set: security.account '$msa' is not an account of $msp — $msp has: $(account_ids_line "$msp")"
+    fi
+    drop="$drop security"
+  fi
   if projects_json | "$JQ" -e --arg n "$name" 'any(.projects[]; .name==$n)' >/dev/null 2>&1; then
     write_projects --arg n "$name" --argjson p "$partial" \
-      '.projects = [.projects[] | if .name==$n then ((. * $p) | del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end) else . end]'
+      '.projects = [.projects[] | if .name==$n then (. * $p) else . end]'
   else
     write_projects --argjson p "$partial" '.projects += [$p]'
   fi
+  case "$drop" in *project*)
+    write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n then del(.account) else . end]'
+    echo "account '$ma' is not an account of $mp — cleared, the project runs on the Default account" ;;
+  esac
+  case "$drop" in *security*)
+    write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n and (.security | type) == "object" then .security |= del(.account) else . end]'
+    echo "security.account '$msa' is not an account of $msp — cleared, the analysis inherits" ;;
+  esac
   # Best effort, and never the reason a save fails: the event is a record of
   # what happened, not a gate on whether it is allowed to happen.
   if security_enabled "$name"; then
@@ -7772,7 +7932,7 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop create <id>     create a job from a partial JSON object on stdin
   agentloop set-prompt <id> replace a job's prompt, read from stdin
   agentloop set-field <id> <field>   set interval_seconds|active_hours|active_days|
-                              platform|model|max_budget_usd|timeout_seconds|
+                              platform|account|model|max_budget_usd|timeout_seconds|
                               stall_timeout_seconds, value from stdin
   agentloop set-precheck <id>   replace a job's precheck script, read from stdin
   agentloop provision-set <project> <up|down>   replace a worktree provisioning hook (stdin)
