@@ -415,7 +415,7 @@ function secBranchRow(r, rows){
     };
   }
   tdActs.appendChild(view);
-  tdActs.appendChild(secBrKebab(r));
+  tdActs.appendChild(secBrKebab(r, rows));
   tr.appendChild(tdActs);
   return tr;
 }
@@ -474,7 +474,7 @@ function secBrTrendBars(trend){
   return svg;
 }
 
-function secBrKebab(r){
+function secBrKebab(r, rows){
   const kebab = document.createElement("details");
   kebab.className = "secidx-kebab";
   const summary = document.createElement("summary");
@@ -504,8 +504,14 @@ function secBrKebab(r){
     // this one starts, so the browser lands filtered, never racing back.
     // `branch` is a STRING here -- the browser's own client-side filter
     // shape (_defaultFilters, findings-screen.js), not finding_rows's
-    // server-side list form.
-    renderFindings($("sec-pj-findings"), secState.project, {branch: r.branch});
+    // server-side list form. A branch NAME reads every repository's branch
+    // of that name, so once the rows span more than one repository this row
+    // opens its OWN reading instead: the Analysis run filter on its latest
+    // finished analysis -- the one its posture was read from.
+    const own = r.analysis_id != null
+      && new Set((rows || []).map(x => x.repo).filter(Boolean)).size > 1;
+    renderFindings($("sec-pj-findings"), secState.project,
+      own ? {analysis: String(r.analysis_id)} : {branch: r.branch});
   };
   pop.appendChild(findings);
 

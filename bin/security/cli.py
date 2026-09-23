@@ -2956,15 +2956,20 @@ def cmd_project_data(args):
     the same reason `index-data` uses it: a screen that only ever LOOKS must
     not conjure the ledger file it is asking about into existence.
 
-    The header's `branch`/`lines_of_code`/`last_analysis` and the Overview
-    tab's posture and checklist counts all come from the SAME analysis row --
-    `default_branch_posture`'s own `latest`, the latest FINISHED analysis of
-    the branch actually shown (the project's declared base, or the branch it
-    fell back to) -- so the numbers on this screen never describe two
-    different runs under one label. The second `queries.checklist()` call
-    below, for the same id `posture()` already read through
-    `default_branch_posture`, is a cache hit on the read-only connection (see
-    `_CachingConnection`), not a second pass over the ledger.
+    The header's `branch`/`repos`/`lines_of_code`/`last_analysis` and the
+    Overview tab's posture, checklist counts, categories, top findings,
+    previous and trend all come from the SAME readings --
+    `default_branch_posture`'s own: every repository's newest FINISHED
+    analysis of the branch actually shown (the project's declared base, or
+    the branch it fell back to), one entry per fingerprint
+    (`queries.branch_findings`, the findings browser's own grouping) -- so
+    the numbers on this screen never describe two different sets of runs
+    under one label. A project whose repositories are all analysed on `main`
+    used to be read off whichever of them ran last, and the others' findings
+    were missing from the whole tab. The checklists behind them were already
+    read through `default_branch_posture`, so reading them again below is a
+    cache hit on the read-only connection (see `_CachingConnection`), not a
+    second pass over the ledger.
 
     That one-branch posture is not the WHOLE story, though: `sidebar.donut`/
     `categories` roll up EVERY analysed branch (see `severity_totals`'s own
@@ -3009,10 +3014,9 @@ def cmd_project_data(args):
     reading as if nothing had ever run.
 
     `tabs.branches` is exactly `queries.branch_rows`'s own rows -- one entry
-    per branch that has EVER been analysed, not only the one `header`/
-    `tabs.overview` show. Each row's `open` is that branch's OWN posture
-    (`queries.posture`, the identical computation `default_branch_posture`
-    ran for the header's one branch above) -- a different scope from
+    per (repository, branch) that has EVER been analysed, not only the one
+    `header`/`tabs.overview` show. Each row's `open` is that branch's OWN
+    posture in that repository (`queries.posture`) -- a different scope from
     `sidebar.donut`, which collapses every analysed branch's open findings
     into one count per FINGERPRINT project-wide (see
     `_open_findings_by_fingerprint`'s own docstring). A finding open on both
@@ -3024,9 +3028,10 @@ def cmd_project_data(args):
     `tabs.reports` gathers the four downloads (Markdown, JSON, HTML, SBOM)
     that used to be reachable only from whichever single analysis happened
     to be on screen, one row per analysis. It is a plain projection of the
-    `runs` rows already fetched above -- analysis id, branch, started, state
-    -- not a second `SELECT * FROM analysis`, the same reuse-what-is-already-
-    in-hand rule `finding_counts_by_analysis` applied to the Runs tab itself.
+    `runs` rows already fetched above -- analysis id, repository, branch,
+    started, state -- not a second `SELECT * FROM analysis`, the same
+    reuse-what-is-already-in-hand rule `finding_counts_by_analysis` applied
+    to the Runs tab itself.
     A running or failed analysis still gets a row: the single-analysis view's
     own download buttons are shown for any state (see `secPaint`), and this
     tab is that same door, just gathered into one table instead of scattered
@@ -3038,7 +3043,7 @@ def cmd_project_data(args):
         print(json.dumps({
             "project": args.project,
             "header": {"profile": default_profile, "branch": args.base or "",
-                       "branch_fell_back": False, "lines_of_code": 0,
+                       "repos": [], "branch_fell_back": False, "lines_of_code": 0,
                        "last_analysis": 0},
             "tabs": {"overview": {"posture": queries._empty_posture(),
                                   "checklist": _empty_checklist_counts(),
@@ -3051,24 +3056,28 @@ def cmd_project_data(args):
                        "capped_branches": 0}}))
         return
 
-    branch, posture, fell_back, latest = queries.default_branch_posture(
+    branch, posture, fell_back, readings = queries.default_branch_posture(
         conn, args.project, args.base or None)
+    # The newest of the readings -- one per repository -- is what "last
+    # analysis" and the run a lone finding points at mean here.
+    latest = readings[0] if readings else None
 
     # The Overview tab's own cards beyond the posture row (ProjectOverview.png):
-    # `categories` and `top_findings` are projections of the SAME checklist
-    # already fetched for `checklist_counts` -- one branch, the same scope as
-    # `posture` above, so the KPI total, the category donut's centre and the
-    # Top findings rows can never disagree about what they count. `previous`
-    # is that same posture computed one finished analysis earlier, for the
-    # "vs. previous analysis" delta -- None (not an empty posture) when there
-    # is no previous analysis, so the page can say "no previous analysis"
-    # instead of rendering a 0% delta nothing was compared against.
+    # `categories` and `top_findings` are projections of the SAME grouped rows
+    # `checklist_counts` counts -- one branch, every repository's reading of
+    # it, the same scope as `posture` above, so the KPI total, the category
+    # donut's centre and the Top findings rows can never disagree about what
+    # they count. `previous` is that same posture as the branch read just
+    # before its newest analysis, for the "vs. previous analysis" delta --
+    # None (not an empty posture) when there is nothing to compare against,
+    # so the page can say "no previous analysis" instead of rendering a 0%
+    # delta nothing was compared against.
     checklist_counts = _empty_checklist_counts()
     overview_categories = []
     top_findings = []
     previous = None
-    if latest is not None:
-        _analysis, findings = queries.checklist(conn, latest["id"])
+    if readings:
+        findings = queries.branch_findings(conn, readings)
         for f in findings:
             if f["state"] in checklist_counts:
                 checklist_counts[f["state"]] += 1
@@ -3090,6 +3099,8 @@ def cmd_project_data(args):
         top = sorted(open_findings, key=lambda f: (
             queries._SEV_RANK.get(f.get("severity"), 99),
             -(first_seen.get(f.get("fingerprint", ""), 0) or 0)))[:5]
+        # Each row's run is the reading its representative came from.
+        profiles = {r["id"]: r.get("profile", "") for r in readings}
         for f in top:
             occ = f.get("occurrences") or []
             first = occ[0] if occ else {}
@@ -3102,18 +3113,11 @@ def cmd_project_data(args):
                 "file": first.get("file", ""),
                 "line": first.get("line", 0) or 0,
                 "more": max(0, len(occ) - 1),
-                "analysis_id": latest["id"],
-                "profile": latest.get("profile", ""),
+                "analysis_id": f["analysis_id"],
+                "profile": profiles.get(f["analysis_id"], ""),
                 "first_seen": first_seen.get(f.get("fingerprint", ""), 0),
             })
-        # The same repository's previous reading: `latest` is one
-        # repository's run of `branch`, and another repository's run of the
-        # same branch name is not what it changed from.
-        prev_row = queries.previous_finished(conn, args.project, latest["repo"], branch,
-                                             latest["id"])
-        if prev_row is not None:
-            previous = queries.posture(conn, args.project, latest["repo"], branch,
-                                       latest=prev_row)
+        previous = queries.previous_posture(conn, args.project, branch, readings)
 
     # ONE grouped query for the whole Runs tab, replacing what used to be one
     # checklist() call per done/capped row (see this function's own
@@ -3149,31 +3153,40 @@ def cmd_project_data(args):
     # A thin projection of the `runs` rows above -- not a second pass over
     # `analysis` -- into just what the Reports tab's downloads need. See this
     # function's own docstring for why a row survives for every state.
-    reports = [{"analysis_id": r["id"], "branch": r["branch"],
+    reports = [{"analysis_id": r["id"], "repo": r["repo"], "branch": r["branch"],
                "started": r["started"], "state": r["state"],
                "profile": r["profile"]} for r in runs]
 
     print(json.dumps({
         "project": args.project,
         "header": {"profile": default_profile, "branch": branch,
+                   # The repositories the branch was read in: more than one,
+                   # and the page says the numbers span them.
+                   "repos": sorted(r["repo"] for r in readings),
                    "branch_fell_back": fell_back,
-                   "lines_of_code": (latest or {}).get("lines_of_code", 0),
+                   # Every repository's count, added: 0 in one of them is
+                   # "not counted" there, never a claim that it is empty.
+                   "lines_of_code": sum(r.get("lines_of_code") or 0 for r in readings),
                    "last_analysis": (latest or {}).get("started", 0)
                                     or (runs[0]["started"] if runs else 0)},
         "tabs": {"overview": {"posture": posture, "checklist": checklist_counts,
-                              "state": (latest or {}).get("state", ""),
+                              # A partial read anywhere makes the whole
+                              # branch's numbers partial.
+                              "state": ("capped" if any(r["state"] == "capped"
+                                                        for r in readings)
+                                        else (latest or {}).get("state", "")),
                               "attempted": bool(runs),
                               # 7 days, fixed: ProjectOverview.png's own
                               # trend card reads "over the last 7 days" --
                               # the SHOWN branch (fell back or not; the
                               # header names it), unlike `trend_series`,
                               # which never falls back because a bare
-                              # sparkline has nowhere to say so. In the
-                              # shown reading's own repository, like
-                              # `previous`; no reading, no trend.
-                              "trend": (queries.trend(conn, args.project,
-                                                      latest["repo"], branch, days=7)
-                                        if latest else []),
+                              # sparkline has nowhere to say so. Across
+                              # every repository, as the posture is; no
+                              # reading, no trend.
+                              "trend": (queries.branch_trend(conn, args.project,
+                                                             branch, days=7)
+                                        if readings else []),
                               "previous": previous,
                               "categories": overview_categories,
                               "top_findings": top_findings},

@@ -3439,7 +3439,7 @@
       };
     }
     tdActs.appendChild(view);
-    tdActs.appendChild(secBrKebab(r));
+    tdActs.appendChild(secBrKebab(r, rows));
     tr.appendChild(tdActs);
     return tr;
   }
@@ -3492,7 +3492,7 @@
     });
     return svg;
   }
-  function secBrKebab(r) {
+  function secBrKebab(r, rows) {
     const kebab = document.createElement("details");
     kebab.className = "secidx-kebab";
     const summary = document.createElement("summary");
@@ -3515,7 +3515,12 @@
       e.stopPropagation();
       kebab.open = false;
       secSwitchProjectTab("findings");
-      renderFindings($("sec-pj-findings"), secState.project, { branch: r.branch });
+      const own = r.analysis_id != null && new Set((rows || []).map((x) => x.repo).filter(Boolean)).size > 1;
+      renderFindings(
+        $("sec-pj-findings"),
+        secState.project,
+        own ? { analysis: String(r.analysis_id) } : { branch: r.branch }
+      );
     };
     pop.appendChild(findings);
     const report = document.createElement("button");
@@ -3664,7 +3669,7 @@
   function secRpFinished(r) {
     return r.state === "done" || r.state === "capped";
   }
-  function secReportRow(r) {
+  function secReportRow(r, rows) {
     const tr = document.createElement("tr");
     const tdId = document.createElement("td");
     const idBtn = document.createElement("button");
@@ -3688,7 +3693,7 @@
     tdProfile.appendChild(secEl("div", "secmeta", "Run #" + r.analysis_id));
     tr.appendChild(tdProfile);
     const tdBranch = document.createElement("td");
-    tdBranch.textContent = r.branch || "";
+    tdBranch.textContent = secScopeName(r, rows);
     tr.appendChild(tdBranch);
     const tdWhen = document.createElement("td");
     if (r.started) {
@@ -3750,7 +3755,7 @@
     thead.appendChild(htr);
     table.appendChild(thead);
     const tbody = document.createElement("tbody");
-    sorted.forEach((r) => tbody.appendChild(secReportRow(r)));
+    sorted.forEach((r) => tbody.appendChild(secReportRow(r, rows)));
     table.appendChild(tbody);
     scroll.appendChild(table);
     wrap.appendChild(scroll);
@@ -3984,7 +3989,13 @@
     profile.appendChild(secEl("span", null, "Profile"));
     profile.appendChild(secEl("span", "pill profile", h.profile || "standard"));
     meta.appendChild(profile);
-    meta.appendChild(secHeaderBit("gitbranch", "Branch", h.branch || "\u2014"));
+    const repos = h.repos || [];
+    meta.appendChild(secHeaderBit(
+      "gitbranch",
+      "Branch",
+      (h.branch || "\u2014") + (repos.length > 1 ? " \xB7 " + repos.length + " repositories" : ""),
+      repos.length > 1 ? "Read in every repository analysed on it: " + repos.join(", ") : ""
+    ));
     if (h.branch_fell_back) {
       const warn = secEl("span", "secpj-fellback");
       warn.appendChild(secIcon("alert"));
@@ -5014,7 +5025,10 @@
     tdProfile.appendChild(a.profile ? secEl("span", "pill profile", secProfileLabel(a.profile)) : secEl("span", "muted", "\u2014"));
     tr.appendChild(tdProfile);
     const tdBranch = document.createElement("td");
-    tdBranch.textContent = a.branch || "\u2014";
+    tdBranch.textContent = secScopeName(
+      a,
+      secRepos(projById(a.project)).map((repo) => ({ repo }))
+    ) || "\u2014";
     tr.appendChild(tdBranch);
     const tdFindings = document.createElement("td");
     tdFindings.appendChild(secIndexRecentFindingsChips(a.severities));
@@ -5379,5 +5393,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: a055fd5645cbd6afa5b4061688f7e3aed4b88751880b9edc4fd738d768c295d6 */
-/* ui-sources: 05414be9e32dca8e8a8d8a77b5430d96a199a1ca73a60da49d0f21eb71a7c253 */
+/* ui-bundle: bbfe7da4043f681fedc82e536446c317c3e5c85b2ce4d8c1d62333b68728533e */
+/* ui-sources: 41b43adda1f075f2ac34d1632f8996e2735d4da4a9419b231938250ca8a1e1b6 */

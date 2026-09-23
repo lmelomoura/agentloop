@@ -431,8 +431,8 @@ def _latest_finished(conn, project, repo, branch, since=None):
     repository's findings (the findings browser, its export, the donut) or
     answered for one repository out of another's analysis (`fixed_elsewhere`,
     the Branches tab). `repo` is positional and required so no caller can
-    leave it out again; the one reading that wants the newest of a branch in
-    ANY repository says so by name -- `_newest_reading_of`.
+    leave it out again; a reading of a branch across every repository says
+    so by name -- `_readings_of`.
 
     The `>=` boundary matches `trend`'s own (`AND started >= ?`) rather than
     inventing a second one: an analysis started exactly at the cutoff second
@@ -456,24 +456,40 @@ def _latest_finished(conn, project, repo, branch, since=None):
     return dict(row) if row else None
 
 
-def _newest_reading_of(conn, project, branch):
-    """The newest finished analysis of `branch` in ANY of the project's
-    repositories -- ONE analysis, for the two surfaces built on one: the
-    index row and the Overview (`default_branch_posture`), and the index
-    sparkline (`trend_series`), which has to plot that same reading's
-    history.
+def _readings_of(conn, project, branch):
+    """Every repository's newest finished analysis of `branch` -- one row per
+    repository of the project that has one, newest first.
 
-    NOT A SCOPE READING. A project whose two repositories are both analysed
-    on `main` has two readings of it, and anything that rolls a branch up
-    reads them both, through `_analysed_scopes` and `_latest_finished`. The
-    row carries its own `repo`, and what a one-analysis surface derives from
-    it -- the previous analysis, the trend -- is keyed to that repository,
-    never to the branch name alone."""
-    row = conn.execute(
-        "SELECT * FROM analysis WHERE project=? AND branch=?"
-        " AND state IN ('done','capped') ORDER BY id DESC LIMIT 1",
-        (project, branch)).fetchone()
-    return dict(row) if row else None
+    The declared branch of a PROJECT is all of them. The index row, the
+    index cards and the Overview read the branch this way
+    (`default_branch_posture`), one entry per fingerprint across the lot
+    (`branch_findings`): read off the newest analysis alone, a project whose
+    repositories are all analysed on `main` was described by whichever one
+    ran last, and the others' findings were missing from all three."""
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM analysis WHERE id IN ("
+        "SELECT MAX(id) FROM analysis WHERE project=? AND branch=?"
+        " AND state IN ('done','capped') GROUP BY repo)"
+        " ORDER BY id DESC", (project, branch))]
+
+
+def branch_findings(conn, readings):
+    """One row per fingerprint across `readings` -- the findings browser's
+    own grouping (`_group_by_fingerprint`) over those analyses' checklists:
+    the state that needs attention first, the worst open severity, and the
+    representative reading's own fields and `analysis_id`. Shared by the
+    Overview, the index and their trends, so none of them can count a
+    finding differently from the browser. One reading is its checklist,
+    row for row."""
+    rows = []
+    for a in readings:
+        _an, findings = checklist(conn, a["id"])
+        for f in findings:
+            row = dict(f)
+            row["repo"], row["branch"], row["analysis_id"] = a["repo"], a["branch"], a["id"]
+            rows.append(row)
+    grouped = _group_by_fingerprint(rows, {a["id"]: a["started"] for a in readings})
+    return [{k: v for k, v in r.items() if k != "_members"} for r in grouped]
 
 
 def previous_finished(conn, project, repo, branch, before_id):
@@ -516,18 +532,11 @@ def _empty_posture():
     return {s: 0 for s in ("critical", "high", "medium", "low", "info")} | {"total": 0}
 
 
-def posture(conn, project, repo, branch, latest=None):
-    """The open findings of one (repository, branch), by severity, off its
-    latest finished analysis. `latest`, when given, is that already-fetched
-    analysis row -- callers that have one (`default_branch_posture` does)
-    pass it through instead of making this re-run the same query for the
-    same row."""
-    a = latest if latest is not None else _latest_finished(conn, project, repo, branch)
-    if not a:
-        return _empty_posture()
-    _analysis, findings = checklist(conn, a["id"])
+def _posture_of(rows):
+    """Open rows by severity, plus their total -- a checklist's findings or
+    `branch_findings`' grouped rows alike."""
     out = _empty_posture()
-    for f in findings:
+    for f in rows:
         if not is_open(f["state"]):
             continue
         if f["severity"] in out:
@@ -536,43 +545,65 @@ def posture(conn, project, repo, branch, latest=None):
     return out
 
 
+def posture(conn, project, repo, branch, latest=None):
+    """The open findings of one (repository, branch), by severity, off its
+    latest finished analysis. `latest`, when given, is that already-fetched
+    analysis row -- callers that have one (`branch_rows` does) pass it
+    through instead of making this re-run the same query for the same
+    row."""
+    a = latest if latest is not None else _latest_finished(conn, project, repo, branch)
+    if not a:
+        return _empty_posture()
+    _analysis, findings = checklist(conn, a["id"])
+    return _posture_of(findings)
+
+
+def previous_posture(conn, project, branch, readings):
+    """The posture of `branch` as it read just before its newest reading
+    finished -- the Overview's "vs. previous analysis" delta. The newest of
+    `readings` (`_readings_of`, newest first) is swapped for its own
+    repository's previous finished run, or dropped when it has none; every
+    other repository's reading is older than it, so it stood then exactly
+    as it stands now. None -- not an empty posture -- when that leaves
+    nothing to compare against, the page's "no previous analysis"."""
+    if not readings:
+        return None
+    newest = readings[0]
+    prev = previous_finished(conn, project, newest["repo"], branch, newest["id"])
+    before = readings[1:] + ([prev] if prev else [])
+    return _posture_of(branch_findings(conn, before)) if before else None
+
+
 def default_branch_posture(conn, project, preferred):
     """The project's own branch when it has been analysed; otherwise the most
     recently analysed one, and a flag saying so -- postures of different
     branches must never be confused in silence.
 
-    Returns (branch, posture, fell_back, latest) -- `latest` is the same
-    analysis row `posture` was computed from, handed back so a caller like
-    `project_rows` (which also wants its `started`/`ended`/`profile`) does not
-    have to fetch the identical row a second time.
+    Returns (branch, posture, fell_back, readings) -- `readings` is what
+    `posture` was read from, every repository's newest finished analysis of
+    that branch, newest first (`_readings_of`; empty when nothing has ever
+    finished), handed back so a caller like `project_rows` (which also wants
+    the newest one's `started`/`ended`/`profile`, and whether any of them
+    stopped early) does not fetch them a second time.
 
-    ONE ANALYSIS, AND ITS REPOSITORY WITH IT. The index row and the Overview
-    are built on one reading -- the Overview's own docstring
-    (`cmd_project_data`) is why -- so a project whose several repositories
-    are all analysed on the declared branch is read off the newest of them
-    (`_newest_reading_of`), exactly as before repositories were told apart.
-    What changed is that `latest["repo"]` is now what everything derived
-    from this reading keys on (`previous_finished`, `trend`,
-    `trend_series`), so the Overview no longer compares one repository with
-    another. Reading every repository's declared branch there is a design
-    change of its own, not a key."""
+    EVERY REPOSITORY'S READING OF THE BRANCH, one entry per fingerprint
+    (`branch_findings`) -- the rule the donut and the findings browser
+    read. A project whose repositories are all analysed on `main` used to
+    be read off the newest of them alone, and the others' findings were
+    missing from the index row, the index cards and the Overview."""
     if preferred:
-        a = _newest_reading_of(conn, project, preferred)
-        if a:
-            return preferred, posture(conn, project, a["repo"], preferred, latest=a), False, a
-    # The single latest finished analysis of the project, whatever branch it
-    # is on. Its own branch column IS that branch's latest finished analysis
-    # too -- nothing with a higher id and the same branch can exist, since
-    # this row already has the highest id project-wide -- so one query gets
-    # both the fallback branch and the row `posture` needs, instead of a
-    # second round trip through `_newest_reading_of` for the same thing.
+        readings = _readings_of(conn, project, preferred)
+        if readings:
+            return preferred, _posture_of(branch_findings(conn, readings)), False, readings
+    # The branch of the project's single latest finished analysis, whatever
+    # branch it is on -- read, like the declared one, in every repository.
     row = conn.execute(
-        "SELECT * FROM analysis WHERE project=? AND state IN ('done','capped')"
+        "SELECT branch FROM analysis WHERE project=? AND state IN ('done','capped')"
         " ORDER BY id DESC LIMIT 1", (project,)).fetchone()
     if not row:
-        return (preferred or ""), _empty_posture(), False, None
-    a = dict(row)
-    return a["branch"], posture(conn, project, a["repo"], a["branch"], latest=a), True, a
+        return (preferred or ""), _empty_posture(), False, []
+    readings = _readings_of(conn, project, row["branch"])
+    return row["branch"], _posture_of(branch_findings(conn, readings)), True, readings
 
 
 def index_summary(conn, projects):
@@ -604,13 +635,15 @@ def index_summary(conn, projects):
     relying on that would make the "no projects" case correct by accident of
     the engine, not by the code saying what it means.
 
-    `capped_projects` counts, among `projects`, how many have their latest
-    finished analysis in `capped` state -- a PARTIAL read of the repository,
+    `capped_projects` counts, among `projects`, how many read their branch
+    off at least one `capped` analysis -- a PARTIAL read of that repository,
     whose contribution to `critical`/`high` above means "none found before it
     stopped," not "none" (the identical notice `secPaint` already gives on
     the analysis screen). The index screen's KPI cards use this count to say
     the fleet total may be an undercount, rather than presenting it as
-    complete.
+    complete. Any of the branch's readings, not only the newest: a
+    repository whose run stopped early is partial however recently another
+    repository finished clean.
 
     `fell_back_projects` is the same idea for the OTHER way these totals can
     mislead: how many of them were read off a branch nobody declared, because
@@ -639,11 +672,11 @@ def index_summary(conn, projects):
     for proj in projects:
         # `proj.get("base")`, exactly as `project_rows` passes it -- see this
         # function's own docstring for what stripping it costs.
-        _br, p, fb, last = default_branch_posture(
+        _br, p, fb, readings = default_branch_posture(
             conn, proj.get("name", ""), proj.get("base"))
         crit += p["critical"]
         high += p["high"]
-        if last and last["state"] == "capped":
+        if any(r["state"] == "capped" for r in readings):
             capped += 1
         if fb:
             fell_back += 1
@@ -672,7 +705,10 @@ def project_rows(conn, projects):
     out = []
     for proj in projects:
         name = proj["name"]
-        branch, p, fell_back, last = default_branch_posture(conn, name, proj.get("base"))
+        branch, p, fell_back, readings = default_branch_posture(conn, name, proj.get("base"))
+        # The newest of the branch's readings -- one per repository -- is
+        # what "last analysis" means in this row; the posture is all of them.
+        last = readings[0] if readings else None
         out.append({
             "name": name, "description": proj.get("description", ""),
             "branch": branch, "branch_fell_back": fell_back, "posture": p,
@@ -692,17 +728,17 @@ def project_rows(conn, projects):
             # own docstring and `secPaint`'s identical notice on the analysis
             # screen): the row's counts mean "none found before it stopped,"
             # not "none," and the screen has to say so rather than render them
-            # as if the analysis had finished.
-            "last_state": (last or {}).get("state", ""),
+            # as if the analysis had finished. Any reading that stopped early
+            # makes the row's posture partial, the newest or not.
+            "last_state": ("capped" if any(r["state"] == "capped" for r in readings)
+                           else (last or {}).get("state", "")),
             "analyses": conn.execute(
                 "SELECT COUNT(*) c FROM analysis WHERE project=?", (name,)
             ).fetchone()["c"],
             # `proj`, not `name`/`branch`: `trend_series` reads the DECLARED
             # base off the record itself, never the fallback branch resolved
-            # two lines above -- see its own docstring and `8c0eaf8`. `last`
-            # rides along so the sparkline plots the repository this row's
-            # posture was read in; a fallen-back `last` is ignored there.
-            "trend": trend_series(conn, proj, latest=last)})
+            # two lines above -- see its own docstring and `8c0eaf8`.
+            "trend": trend_series(conn, proj)})
     return out
 
 
@@ -750,7 +786,52 @@ def trend(conn, project, repo, branch, days=30):
     return out
 
 
-def trend_series(conn, project, days=30, latest=None):
+def branch_trend(conn, project, branch, days=30):
+    """The branch of a PROJECT over time -- `trend`'s points, read across
+    every repository: one point per finished analysis of `branch`, in any
+    repository, started in the window, and each point is the branch as it
+    read the moment that analysis finished -- every repository's newest
+    reading by then (which may itself predate the window), one entry per
+    fingerprint (`branch_findings`). With one repository every point is its
+    analysis's own checklist, exactly `trend`'s. A point stands on a PARTIAL
+    read -- `state` `capped` -- when any reading it counts stopped early.
+
+    The Overview's trend card and the index sparkline read this, the same
+    readings `default_branch_posture` gives their posture: per repository,
+    or by branch name, the line zigzagged between the repositories' counts,
+    and off the newest repository alone it lost the others' findings.
+
+    ONE query: every finished analysis of the branch, walked in id order
+    while the newest reading per repository is carried along, so the
+    readings a point stands on cost nothing more to find. Checklists are
+    memoised per analysis on the read-only connection, so a reading several
+    points stand on is read once."""
+    since = int(time.time()) - days * 86400
+    current, out = {}, []
+    for a in conn.execute(
+            "SELECT id, repo, branch, started, state FROM analysis"
+            " WHERE project=? AND branch=? AND state IN ('done','capped')"
+            " ORDER BY id", (project, branch)):
+        a = dict(a)
+        current[a["repo"]] = a
+        if a["started"] < since:
+            continue
+        readings = sorted(current.values(), key=lambda r: r["id"], reverse=True)
+        open_rows = [f for f in branch_findings(conn, readings) if is_open(f["state"])]
+        by_severity = {s: 0 for s in _SEV_RANK}
+        for f in open_rows:
+            if f["severity"] in by_severity:
+                by_severity[f["severity"]] += 1
+        out.append({"analysis_id": a["id"], "started": a["started"],
+                    "state": ("capped" if any(r["state"] == "capped" for r in readings)
+                              else a["state"]),
+                    "open": len(open_rows), "by_severity": by_severity})
+    # Oldest first, `id` breaking a tie on the 1-second `started`, as `trend`.
+    out.sort(key=lambda p: (p["started"], p["analysis_id"]))
+    return out
+
+
+def trend_series(conn, project, days=30):
     """The open-findings count at each finished analysis of `project`'s OWN
     DECLARED branch, oldest first -- the sparkline the index screen's Trend
     column needs. This is the reading `8c0eaf8` deleted (it computed one per
@@ -773,46 +854,34 @@ def trend_series(conn, project, days=30, latest=None):
     at all (`project.get("base")` empty) is the same "nothing to show",
     answered without a query.
 
-    Delegates entirely to `trend()` for the actual reading -- same window,
-    same `done`/`capped` treatment (a `capped` analysis is a PARTIAL read,
-    exactly as `posture`/`default_branch_posture` already treat it: counted,
-    not excluded, with the incomplete badge carried elsewhere), same
-    `is_open()` -- and keeps only the `open` count from each point, since
-    the sparkline needs relative heights and nothing else. Restating
-    `trend`'s SQL or its open-state predicate here would be a fourth
-    duplicated vocabulary in this module (see its own opening docstring);
-    this is the first time it is a thin wrapper instead.
+    Delegates entirely to `branch_trend()` for the actual reading -- same
+    window, same `done`/`capped` treatment (a `capped` analysis is a PARTIAL
+    read, exactly as `posture`/`default_branch_posture` already treat it:
+    counted, not excluded, with the incomplete badge carried elsewhere),
+    same `is_open()` -- and keeps only the `open` count from each point,
+    since the sparkline needs relative heights and nothing else. Restating
+    its SQL or its open-state predicate here would be a fourth duplicated
+    vocabulary in this module (see its own opening docstring); this is a
+    thin wrapper instead. Across every repository, as the row's own posture
+    is: each point is the declared branch as it read then, one entry per
+    fingerprint.
 
-    ONE REPOSITORY'S HISTORY: the one the row's own posture is read from.
-    `default_branch_posture` reads the declared branch off its newest
-    reading in any repository (`_newest_reading_of`); this plots that
-    reading's repository, and nothing another repository recorded under the
-    same branch name. `latest`, when given, is that reading already in hand
-    -- `project_rows` passes `default_branch_posture`'s own -- and is used
-    only when it IS a reading of the declared branch: a fallen-back row's
-    reading is another branch's, and this never falls back.
-
-    Cost: one extra SQL query per project (`trend`'s own SELECT; a second,
-    for the newest reading, only when no `latest` is handed in) plus one
-    `checklist()` per finished analysis actually inside the window -- but
+    Cost: one extra SQL query per project (`branch_trend`'s own SELECT) plus
+    one `checklist()` per finished analysis a point stands on -- but
     `project_rows` already computes and caches `checklist()` for the
-    declared branch's LATEST finished analysis via `posture()`, on the SAME
-    connection, and that is also the newest point in this series whenever
-    the branch has not fallen back. So the common case (one analysis in the
-    last 30 days) costs zero additional `checklist()` calls, and a busier
-    project pays once per analysis actually in the window -- never once per
-    analysis in the ledger's full history, which is the cost `8c0eaf8`
-    removed for having no reader.
+    declared branch's newest readings via `default_branch_posture`, on the
+    SAME connection, and those are also what the newest point in this
+    series stands on whenever the branch has not fallen back. So the common
+    case (one analysis in the last 30 days) costs zero additional
+    `checklist()` calls, and a busier project pays once per analysis a point
+    actually stands on -- never once per analysis in the ledger's full
+    history, which is the cost `8c0eaf8` removed for having no reader.
     """
     branch = project.get("base")
     if not branch:
         return []
-    name = project.get("name", "")
-    reading = (latest if latest is not None and latest.get("branch") == branch
-               else _newest_reading_of(conn, name, branch))
-    if not reading:
-        return []
-    return [point["open"] for point in trend(conn, name, reading["repo"], branch, days=days)]
+    return [point["open"]
+            for point in branch_trend(conn, project.get("name", ""), branch, days=days)]
 
 
 def recent_analyses(conn, limit=5, offset=0, projects=None):

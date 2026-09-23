@@ -105,16 +105,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Branches tab (one row per repository and branch, its default-branch cards
   over all of them), and `fixed_elsewhere`, which could prove a fix in one
   repository out of another's newer run of the same branch, or miss its own.
-  The Overview's "vs. previous analysis" delta and trend, and the index
-  sparkline, now stay in the repository of the one reading they are built on
-  instead of zigzagging between two. The export has a section per repository
-  and branch, each at its own commit; it names the repository — on the
-  headings and on every finding — only when there is more than one, and its
-  JSON always carries `repo`. A screen listing branches of more than one
-  repository names each one's (`web-admin › main`); a single-repository
-  project reads as before. The index row and the Overview still describe one
-  analysis, the newest reading of the declared branch in any repository, as
-  they always did.
+  The index row, the index cards and the Overview read the declared branch
+  in every repository too — one entry per fingerprint, the browser's own
+  grouping — instead of whichever repository ran last: the posture, the
+  checklist counts, the top findings, the incomplete cue (any repository's
+  run that stopped early), the "vs. previous analysis" delta (the branch as
+  it read just before its newest analysis), and the trend and the index
+  sparkline, where each point is the branch as it read when that analysis
+  finished, instead of a line zigzagging between two repositories' counts.
+  The export has a section per repository and branch, each at its own
+  commit; it names the repository — on the headings and on every finding —
+  only when there is more than one, and its JSON always carries `repo`. A
+  screen listing branches of more than one repository names each one's
+  (`web-admin › main`): the findings browser, the Branches tab, the Reports
+  tab, the index's Recent analyses and the project header, which says how
+  many repositories its branch spans; the Branches tab's *View findings*
+  opens that row's own reading. A single-repository project reads as
+  before.
 
 - **A `sast` finding the operator ruled on no longer comes back as `new` when
   another branch's analysis finds it.** The agent mints a `sast` fingerprint

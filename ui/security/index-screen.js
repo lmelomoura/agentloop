@@ -18,9 +18,10 @@
    when something that changed the numbers just happened (secBack(), after
    leaving a project screen where an analysis may have just finished). */
 import { $, fmtAgo, pageHeader, kpiCard, tableFooter, openProjectEditor, makePicker,
-         closeMenus } from "./page.js";
+         closeMenus, projById } from "./page.js";
 import { secIcon, secIconHTML, secEl, secFetch, secPlaceMenu } from "./dom.js";
-import { SEC_NEVER, SEC_FLOOR_SCOPE_NOTE, secRuleMeta } from "./vocabulary.js";
+import { SEC_NEVER, SEC_FLOOR_SCOPE_NOTE, secRuleMeta, secRepos,
+         secScopeName } from "./vocabulary.js";
 // secSwitchProjectTab: "View full report" (Phase 4 Task 4) opens a project
 // straight onto its own Reports tab -- see secViewFullReportButton, below.
 import { secOpenProject, secSwitchProjectTab } from "./project-screen.js";
@@ -1174,9 +1175,12 @@ function secIndexRecentRow(a){
 
   // textContent, never markup: a branch name may legally contain '<', '>'
   // and '&' (vocabulary.js's own opening comment) and a repository chooses
-  // it, not this page.
+  // it, not this page. The rows mix projects, so whether the repository is
+  // worth naming is the PROJECT's own fact: configured with more than one
+  // (secRepos), two of its runs of `main` are two different branches.
   const tdBranch = document.createElement("td");
-  tdBranch.textContent = a.branch || "—";
+  tdBranch.textContent = secScopeName(a,
+    secRepos(projById(a.project)).map(repo => ({repo}))) || "—";
   tr.appendChild(tdBranch);
 
   const tdFindings = document.createElement("td");

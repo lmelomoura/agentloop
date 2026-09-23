@@ -149,14 +149,14 @@ def test_a_running_analysis_is_never_the_posture(conn):
 
 def test_the_default_branch_falls_back_and_says_so(conn):
     aid = _analysis(conn, "develop", findings=[("critical", "secret")])
-    branch, posture, fell_back, latest = queries.default_branch_posture(conn, "web", "main")
+    branch, posture, fell_back, readings = queries.default_branch_posture(conn, "web", "main")
     assert branch == "develop"
     assert fell_back is True
     assert posture["critical"] == 1
-    assert latest["id"] == aid, "the row posture was computed from, handed back"
+    assert [r["id"] for r in readings] == [aid], "the rows posture was computed from, handed back"
 
     _analysis(conn, "main", findings=[("low", "hygiene")])
-    branch, posture, fell_back, _latest = queries.default_branch_posture(conn, "web", "main")
+    branch, posture, fell_back, _readings = queries.default_branch_posture(conn, "web", "main")
     assert branch == "main"
     assert fell_back is False
 
@@ -549,20 +549,21 @@ def test_trend_series_reuses_the_checklist_already_cached_by_posture(tmp_path):
     a cache hit through it would pass for the wrong reason, or not at all.
 
     Driven the way `project_rows` drives it: `default_branch_posture` first,
-    and its reading handed to `trend_series`, which then needs no query of
-    its own to know which repository's history to plot."""
+    then `trend_series` -- whose one SELECT reads every repository's run of
+    the branch at once, so knowing which readings each point stands on costs
+    no query of its own."""
     db = tmp_path / "security.db"
     conn = ledger.connect(db)
     _analysis(conn, "main", findings=[("high", "sast")])
     conn.close()
 
     ro = queries.read_only(db)
-    _branch, _posture, _fell_back, latest = queries.default_branch_posture(ro, "web", "main")
+    queries.default_branch_posture(ro, "web", "main")
 
     statements = []
     ro.set_trace_callback(statements.append)
     try:
-        series = queries.trend_series(ro, {"name": "web", "base": "main"}, latest=latest)
+        series = queries.trend_series(ro, {"name": "web", "base": "main"})
     finally:
         ro.set_trace_callback(None)
     ro.close()
@@ -1509,28 +1510,58 @@ def _open_in(conn, repo, branch, n):
     return aid
 
 
-def test_the_index_sparkline_plots_one_repository_s_branch(conn):
-    """The sparkline is the history of the reading the project row shows --
-    one analysis, the newest finished reading of the declared branch -- and
-    so of THAT reading's repository. Read by branch name alone it zigzagged
-    between the repositories' counts."""
+def test_the_index_sparkline_plots_every_repository_s_reading_of_the_branch(conn):
+    """Each point is the declared branch as it read the moment that analysis
+    finished: every repository's newest reading of it by then, one entry per
+    fingerprint. Read by branch name alone the line zigzagged between the
+    repositories' own counts; read off one repository it lost the other's."""
     _open_in(conn, "web", "main", 1)
     _open_in(conn, "web-admin", "main", 3)
     _open_in(conn, "web", "main", 2)
-    assert queries.trend_series(conn, {"name": "web", "base": "main"}) == [1, 2]
+    assert queries.trend_series(conn, {"name": "web", "base": "main"}) == [1, 4, 5]
 
 
-def test_the_project_row_reads_the_newest_reading_of_the_declared_branch(conn):
-    """A pin, not a probe: the index row and the Overview are built on ONE
-    analysis on purpose -- the newest finished reading of the declared
-    branch, in whichever repository it was taken -- and the repository it
-    comes from is now carried with it. Showing every repository's base
-    branch there is a design change of its own, not this fix."""
-    _open_in(conn, "web", "main", 1)
+def test_the_project_row_reads_every_repository_s_declared_branch(conn):
+    """The index row, the index cards and the Overview describe the project's
+    declared branch -- every repository's newest reading of it, one entry per
+    fingerprint, the rule the donut and the findings browser already read.
+    Off the newest repository alone, `web`'s findings on main were missing
+    from all three."""
+    first = _open_in(conn, "web", "main", 1)
     newest = _open_in(conn, "web-admin", "main", 3)
-    branch, posture, fell_back, latest = queries.default_branch_posture(conn, "web", "main")
-    assert (branch, fell_back, latest["id"], latest["repo"]) == ("main", False, newest, "web-admin")
-    assert posture["total"] == 3
+    branch, posture, fell_back, readings = queries.default_branch_posture(conn, "web", "main")
+    assert (branch, fell_back) == ("main", False)
+    assert [(r["repo"], r["id"]) for r in readings] == [("web-admin", newest), ("web", first)]
+    assert posture["total"] == 4
+
+
+def test_the_index_counts_and_flags_every_repository_s_declared_branch(conn):
+    """The fleet cards and the project row: `web`'s capped run of main holds a
+    critical, `web-admin`'s newer run of main is clean. Off the newest
+    repository alone the project read clean, and complete."""
+    capped = ledger.start_analysis(conn, "web", "web", "main", "s", "quick", "r")
+    ledger.record_finding(conn, capped, {
+        "fingerprint": "c" * 64, "category": "secret", "rule": "aws-access-token",
+        "severity": "critical", "title": "t",
+        "occurrences": [{"file": "k.py", "line": 1, "snippet_hash": ""}]})
+    ledger.mark_prepared(conn, capped)
+    ledger.finish_analysis(conn, capped, "capped")
+    _open_in(conn, "web-admin", "main", 0)
+    project = {"name": "web", "base": "main"}
+    summary = queries.index_summary(conn, [project])
+    assert (summary["critical"], summary["capped_projects"]) == (1, 1)
+    (row,) = queries.project_rows(conn, [project])
+    assert (row["posture"]["critical"], row["last_state"]) == (1, "capped")
+
+
+def test_one_repository_s_project_row_reads_as_it_always_did(conn):
+    """The control: one repository, one reading -- the newest analysis of
+    the declared branch, its posture, its state."""
+    _open_in(conn, "web", "main", 1)
+    newest = _open_in(conn, "web", "main", 2)
+    branch, posture, fell_back, readings = queries.default_branch_posture(conn, "web", "main")
+    assert ([r["id"] for r in readings], posture["total"]) == ([newest], 2)
+    assert queries.trend_series(conn, {"name": "web", "base": "main"}) == [1, 2]
 
 
 def test_finding_rows_carries_a_findings_cwe_and_owasp_class(conn):

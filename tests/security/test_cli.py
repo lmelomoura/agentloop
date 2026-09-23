@@ -5075,7 +5075,7 @@ def test_project_data_survives_a_ledger_that_does_not_exist_yet(tmp_path):
              "--default-profile", "deep")
     assert not db.exists()
     assert out["project"] == "web"
-    assert out["header"] == {"profile": "deep", "branch": "main",
+    assert out["header"] == {"profile": "deep", "branch": "main", "repos": [],
                              "branch_fell_back": False, "lines_of_code": 0,
                              "last_analysis": 0}
     assert out["tabs"]["overview"]["posture"] == {
@@ -5243,11 +5243,15 @@ def test_project_data_previous_is_none_not_zeros_without_a_prior_analysis(tmp_pa
     assert out["tabs"]["overview"]["trend"] != []
 
 
-def test_project_data_compares_the_overview_with_its_own_repository(tmp_path):
-    """The Overview reads ONE analysis -- here `web`'s newest run of main --
-    and its "vs. previous" delta and its trend are that reading's history.
-    Picked by branch name alone, the previous analysis was `web-admin`'s run
-    of main in between, and the delta compared two repositories."""
+def test_project_data_reads_every_repository_s_declared_branch(tmp_path):
+    """The Overview describes the declared branch of the PROJECT: every
+    repository's newest reading of it, one entry per fingerprint. Read off
+    the newest repository alone, `web-admin`'s three findings on main were
+    missing from the posture, the checklist counts and the top findings;
+    picked by branch name, "previous" and the trend mixed the two. Previous
+    is the branch as it read just before its newest analysis -- that one
+    swapped for its own repository's previous run -- and each trend point is
+    the branch as it read when that analysis finished."""
     db = tmp_path / "security.db"
 
     def run_of(repo, names):
@@ -5260,13 +5264,20 @@ def test_project_data_compares_the_overview_with_its_own_repository(tmp_path):
         return aid
 
     first = run_of("web", ["a"])
-    run_of("web-admin", ["b", "c", "d"])
+    admin = run_of("web-admin", ["b", "c", "d"])
     latest = run_of("web", ["a", "e"])
-    ov = run(db, "project-data", "--project", "web", "--base", "main",
-             "--default-profile", "")["tabs"]["overview"]
-    assert ov["posture"]["total"] == 2
-    assert ov["previous"]["total"] == 1, "web's own previous run, not web-admin's"
-    assert [p["analysis_id"] for p in ov["trend"]] == [first, latest]
+    out = run(db, "project-data", "--project", "web", "--base", "main",
+              "--default-profile", "")
+    ov = out["tabs"]["overview"]
+    assert ov["posture"]["total"] == 5
+    assert (ov["checklist"]["new"], ov["checklist"]["open"]) == (4, 1)
+    assert {f["analysis_id"] for f in ov["top_findings"]} == {admin, latest}
+    assert ov["previous"]["total"] == 4, "web-admin's run and web's run before the newest"
+    assert [(p["analysis_id"], p["open"]) for p in ov["trend"]] == \
+        [(first, 1), (admin, 4), (latest, 5)]
+    assert (out["header"]["branch"], out["header"]["repos"]) == ("main", ["web", "web-admin"])
+    assert {(r["analysis_id"], r["repo"]) for r in out["tabs"]["reports"]} == \
+        {(first, "web"), (admin, "web-admin"), (latest, "web")}
 
 
 def test_project_data_overview_cards_follow_the_fallen_back_branch(tmp_path):

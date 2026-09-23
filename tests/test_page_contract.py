@@ -5773,6 +5773,41 @@ def test_the_branches_tab_names_each_row_s_repository_when_there_are_two(srv, tm
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_view_findings_opens_the_row_s_own_reading_when_repositories_share_a_branch(
+        srv, tmp_path):
+    """"View findings" filtered the browser by branch NAME, so with two
+    repositories on develop one row's click listed both repositories'
+    findings. With more than one repository the row opens its own reading --
+    the Analysis run filter on its latest finished analysis; with one, the
+    Branch filter, as before."""
+    block = _security_js(srv)
+    script = tmp_path / "pj-branches-view.js"
+    script.write_text(_PROJECT_DOM_HARNESS + _branches_tab_deps(block) + """
+    const asked = [];
+    renderFindings = function(_host, _project, filters){ asked.push(filters); };
+    function find(n){
+      if(n.tagName === "button" && n.textContent === "View findings") return n;
+      for(const c of (n.childNodes || [])){ const hit = find(c); if(hit) return hit; }
+      return null;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const row = (repo, id) => ({repo, branch: "develop", last_analysis: now,
+      last_finished: now, analyses: 1, state: "done", latest_state: "done",
+      analysis_id: id, sha: "a1", trend: [],
+      open: {critical: 0, high: 0, medium: 0, low: 0, info: 0, total: 0}});
+    for(const rows of [[row("web-admin", 14), row("web", 12)], [row("web", 12)]]){
+      secRenderProjectBranches({project: "web", sidebar: {},
+        tabs: {overview: {attempted: true}, branches: rows}});
+      find(_els["sec-pj-branches"]).onclick({stopPropagation(){}});
+    }
+    console.log(JSON.stringify(asked));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert out == [{"analysis": "14"}, {"branch": "develop"}], out
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_branch_coverage_counts_the_repository_git_listed_the_branches_of(srv, tmp_path):
     """git's branch list is ONE repository's -- the one the launcher has
     picked (secGitBranchCount) -- and the rows are one per (repository,
@@ -5989,7 +6024,7 @@ def test_the_reports_tab_renders_one_row_per_analysis_with_four_downloads(srv, t
     consts = (_const(block, "SEC_REPORT_FORMATS") + _const(block, "SEC_REPORT_COLS")
               + _const(block, "SBOM_CAVEAT") + _const(block, "GENERATED_NOTE"))
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secRpCap", "secRpFinished",
+                     ("secEl", "secIcon", "secScopeName", "secRpCap", "secRpFinished",
                       "secReportRow",
                       "secReportsTable", "secRenderProjectReports"))
     script = tmp_path / "pj-reports.js"
@@ -6042,6 +6077,38 @@ def test_the_reports_tab_renders_one_row_per_analysis_with_four_downloads(srv, t
         f"the SBOM caveat must ride the SBOM controls' own tooltips: {titles}"
     assert "every recorded finding" in joined, f"the severity-floor note is missing: {joined}"
     assert "3 report" in joined, f"the footer must count the rows: {joined}"
+    assert "›" not in joined, "one repository: no row names it"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_reports_tab_names_each_run_s_repository_when_there_are_two(srv, tmp_path):
+    """One row per analysis, and two repositories analysed on main are two
+    rows that both said "main" -- the report of one downloaded for the other
+    by a reader who could not tell them apart."""
+    block = _security_js(srv)
+    consts = (_const(block, "SEC_REPORT_FORMATS") + _const(block, "SEC_REPORT_COLS")
+              + _const(block, "SBOM_CAVEAT") + _const(block, "GENERATED_NOTE"))
+    deps = "\n".join(_plainfn(block, n) for n in
+                     ("secEl", "secIcon", "secScopeName", "secRpCap", "secRpFinished",
+                      "secReportRow", "secReportsTable", "secRenderProjectReports"))
+    script = tmp_path / "pj-reports-repos.js"
+    script.write_text(_PROJECT_DOM_HARNESS + """
+    let secRpSortDir = "desc", secRpPayload = null;
+    function secDownloadReport(){}
+    function secShowAnalysis(_id, _pin){}
+    function secSwitchProjectTab(_t){}
+    function tableFooter(o){ return new FakeElement("footer"); }
+    """ + consts + deps + """
+    secRenderProjectReports({tabs: {reports: [
+      {analysis_id: 7, repo: "web", branch: "main", started: 1700000000, state: "done", profile: "deep"},
+      {analysis_id: 8, repo: "web-admin", branch: "main", started: 1700000100, state: "done", profile: "deep"},
+    ]}});
+    console.log(JSON.stringify(collectAll(_els["sec-pj-reports"], [])));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    texts = [r["text"] for r in out]
+    assert "web › main" in texts and "web-admin › main" in texts, texts
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -7928,6 +7995,67 @@ def test_the_project_header_says_a_dash_means_not_counted(srv, tmp_path):
     counted_titles = " ".join(r["title"] for r in out["counted"] if r["title"])
     assert "Not counted" not in counted_titles, \
         "the explanation shows over a real line count"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_project_header_says_the_branch_spans_its_repositories(srv, tmp_path):
+    """The Overview reads the declared branch in every repository the project
+    has analysed on it (queries.default_branch_posture). With more than one,
+    the header's Branch says so and names them; with one, it reads as it
+    always did."""
+    block = _security_js(srv)
+    deps = (_const(block, "SEC_NEVER") + "\n".join(_plainfn(block, n) for n in
+            ("secEl", "secIcon", "secHeaderBit", "secRenderProjectHeader")))
+    script = tmp_path / "pj-head-repos.js"
+    script.write_text(_PROJECT_DOM_HARNESS + deps + """
+    secRenderProjectHeader({header: {profile: "standard", branch: "main",
+      repos: ["web", "web-admin"], branch_fell_back: false, lines_of_code: 0,
+      last_analysis: 0}});
+    const two = collectAll(_els["sec-pj-head"], []);
+    _els["sec-pj-head"] = new FakeElement("div");
+    secRenderProjectHeader({header: {profile: "standard", branch: "main",
+      repos: ["web"], branch_fell_back: false, lines_of_code: 0, last_analysis: 0}});
+    const one = collectAll(_els["sec-pj-head"], []);
+    console.log(JSON.stringify({two, one}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    bit = next(r for r in out["two"] if r["cls"] == "secpjbit" and r["text"].startswith("Branch"))
+    assert bit["text"] == "Branchmain · 2 repositories", bit
+    assert "web, web-admin" in bit["title"], bit
+    one = next(r for r in out["one"] if r["cls"] == "secpjbit" and r["text"].startswith("Branch"))
+    assert (one["text"], one["title"]) == ("Branchmain", ""), one
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_recent_analysis_names_its_repository_when_its_project_has_two(srv, tmp_path):
+    """The index's Recent analyses mixes projects, so whether a run's
+    repository is worth naming is its PROJECT's fact: one configured with
+    several repositories (secRepos) names it, one with a single checkout
+    reads as it always did."""
+    block = _security_js(srv)
+    deps = (_const(block, "SEC_RUN_STATUS_LABEL")
+            + _index_screen_deps(block, "secEl", "secIcon", "secRepos", "secScopeName",
+                                 "secProfileLabel", "secIndexRecentFindingsChips",
+                                 "secIndexRunStatusPill", "secIndexRunWhen",
+                                 "secIndexRecentRow"))
+    script = tmp_path / "recent-repos.js"
+    script.write_text(_INDEX_DOM_HARNESS + deps + """
+    function secOpenProject(_p){}
+    const CONFIG = {web: {name: "web", repos: [{name: "web"}, {name: "web-admin"}]},
+                    solo: {name: "solo"}};
+    function projById(id){ return CONFIG[id]; }
+    const run = (a) => collectAll(secIndexRecentRow(Object.assign(
+      {id: 1, profile: "quick", severities: null, state: "done", started: 0}, a)), []);
+    console.log(JSON.stringify({
+      two: run({project: "web", repo: "web-admin", branch: "main"}),
+      one: run({project: "solo", repo: "solo", branch: "main"})}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert "web-admin › main" in [r["text"] for r in out["two"]], out["two"]
+    assert "main" in [r["text"] for r in out["one"]], out["one"]
+    assert not any("›" in r["text"] for r in out["one"]), out["one"]
 
 
 def test_the_activity_fingerprint_dialog_titles_the_project_not_the_filter(srv):
