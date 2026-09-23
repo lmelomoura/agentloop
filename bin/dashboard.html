@@ -3625,8 +3625,12 @@ function applyPlatformToJobEditor(p, keep){
   // Settings keeps off it -- so a model the operator remembers but cannot find
   // here is explained, not a mystery.
   const hid=ALApp.hiddenModelCount(p, PLATFORMS);
+  // And a release the API keeps for a newer Claude Code: the model the
+  // operator may be looking for, and the command that gets it.
+  const waits=p==="anthropic" ? ALApp.newerModelNotes(PLATFORMS.anthropic, null) : [];
   $("ed-model-help").textContent="The model the agent uses to execute this job — one of the models switched on in Settings."
-    +(hid ? " "+hid+" more in the catalog "+(hid===1?"is":"are")+" switched off there." : "");
+    +(hid ? " "+hid+" more in the catalog "+(hid===1?"is":"are")+" switched off there." : "")
+    +(waits.length ? " "+waits.join(". ")+"." : "");
   edPlatApplied=p;
 }
 // On OpenAI the effort ladder is the MODEL's; a new model means a new ladder.

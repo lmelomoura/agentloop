@@ -864,7 +864,42 @@ a family (`opus`) to always run that family's newest model. Families are resolve
 by the engine, not by the CLI alias: an alias points at the newest model the
 *installed CLI* knows, which lags the API right after a release. `agentloop
 resolve-models` probes for the newest of each family and caches the answer in
-`config/models.json`; the tick refreshes it roughly once a day on its own.
+`config/models.json`; the tick refreshes it roughly once a day on its own. The
+probe asks for the next two majors, then every minor from `.9` down, and stops at
+the first id the API serves — releases skip minors (`claude-opus-5` went straight
+to `claude-opus-5-5`) — and it never settles on anything older than the id the
+CLI's alias already names. An id the API does not serve is refused before any
+turn runs (no tokens, about five seconds each), so a family costs at most eleven
+probes a day, and real turns only on the ids that are served — two at most. A
+release the API serves only to a newer CLI cannot be found this way: it refuses
+the probe with a 400 naming the version required (Opus 5.5 needed Claude Code
+2.1.280), a run on it would fail the same way, and the family stays on the alias
+until you run `claude update`. The pass writes that release down next to the
+family in `config/models.json` and says so — one line in `tick.log`, a note on
+the Anthropic card in Settings › Platforms and in the job editor's model help:
+*claude-opus-5-5 is out and needs Claude Code 2.1.280 (installed 2.1.258): run
+claude update*. The tick notices the update by itself: while such a release
+waits it asks the CLI its version each minute (and never otherwise), probes the
+Claude families again as soon as `claude --version` differs from what it said
+when the release was recorded, and the note goes once a pass meets no release
+it cannot run.
+
+A probe that gets no verdict at all — *Not logged in*, an API that is down —
+says nothing about the id. The family's search stops there and nothing is
+trusted as fresh: the family keeps the newer of the id its last finished pass
+found and the best this pass reached (never below the CLI's own alias), the
+CLI's answer goes to `tick.log`, and the tick probes again only the families
+whose pass failed — ten minutes later, twenty after a second failure in a row,
+forty after a third, never more than a day apart, and only daily while Settings
+keeps Anthropic off (a launch then spends no probe either: it is refused next).
+`resolve-models` exits 1; `resolve-models anthropic opus` probes one family. The
+tick's line says why a pass runs:
+*cache older than 86400s*, *retrying opus after a failed probe*, or *Claude Code
+went from 2.1.258 to 2.1.280 while a release waited for it*. Run by hand, keep
+`USER` in the environment: without
+it the CLI cannot find its login in the keychain and answers *Not logged in* to
+every probe (launchd sets `USER` for the tick, though `launchctl print` does not
+list it).
 
 On the OpenAI platform a model is a catalog slug used verbatim (`gpt-5.6-sol`);
 `agentloop resolve-models openai` reads the catalog from `codex debug models`
@@ -884,6 +919,21 @@ two. The catalog is what the CLI itself resolves at launch: a provider added to
 `~/.config/opencode/opencode.json` appears at the next refresh (measured),
 and no `--refresh` is passed — refreshing the CLI's own models.dev cache is
 the CLI's business (`opencode models --refresh`, by hand).
+
+The families and both catalogs share `config/models.json`, and more than one
+writer reaches it at once: the tick's pass, and a launch whose family has
+expired and resolves on the spot. Every write takes one short lock
+(`data/locks/.models.lock`) for its read-modify-write alone, never for a probe,
+so neither drops the other's update and a launch waits milliseconds, not the
+minute a pass takes. A write that cannot have the lock within ten seconds
+gives up rather than hold a launch back, and says so in `tick.log` — *models:
+opus — gave up writing claude-opus-5-5: pid 4242 held the lock on models.json
+for more than 10 s* — and the next pass or launch writes it again;
+`resolve-models` exits 1 when that happens to a family it resolved. A lock
+older than thirty seconds (`AGENTLOOP_LOCK_GRACE`, never less than twice the
+wait) belongs to no write: it is taken whoever it names, with a line in
+`tick.log`, and a writer that stalled that long writes nothing when it comes
+back.
 
 ### Effort
 
@@ -2085,7 +2135,7 @@ agentloop worktree-drop <id> <stamp>   # discard a preserved run dir for good
 agentloop security analyze [--detach] <project> <repo> <branch> [profile]
                                #   run an analysis (see Security analysis)
 agentloop security-branches <project> <repo>   # branches that checkout has
-agentloop resolve-models [anthropic|openai|opencode]  # refresh the model catalogs (all three, without an argument)
+agentloop resolve-models [anthropic [family…]|openai|opencode]  # refresh the model catalogs (all three, without an argument; `anthropic opus` probes one family)
 agentloop resolve-pricing    # refresh config/pricing.json's openai rows from the price source (daily on its own); the opencode rows are yours and are left alone
 agentloop platforms          # what each platform offers, whether it is ready, and what Settings switched on
 agentloop platform check|enable|disable|set-bin|models|set-models <platform> [path]

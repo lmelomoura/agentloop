@@ -475,6 +475,92 @@ def test_the_old_models_key_lists_anthropic_models_only(srv, tmp_path, monkeypat
     assert "gpt-5.6-luna" in [m["v"] for m in out["platforms"]["openai"]["models"]]
 
 
+def _anthropic_models_from(srv, tmp_path, monkeypatch, ids):
+    """`models` when the only source is a CLI binary carrying `ids` -- raw
+    bytes the scan reads, the ids alphabetical with NULs between, never in
+    the order they are expected back. No jobs, no runs, no family resolved."""
+    blob = tmp_path / "claude-bin"
+    blob.write_bytes(b"\x00".join(i.encode() for i in sorted(ids)) + b"\x00")
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_BIN", str(blob))
+    monkeypatch.setattr(srv, "JOBS_FILE", tmp_path / "no-jobs.json")
+    monkeypatch.setattr(srv, "PROJECTS_FILE", tmp_path / "no-projects.json")
+    monkeypatch.setattr(srv, "DB_FILE", tmp_path / "index.db")
+    (srv.CONFIG_DIR / "models.json").write_text(json.dumps({"resolved": {}, "openai": _catalog_block()}))
+    return srv.list_models()["models"]
+
+
+def test_the_anthropic_models_are_newest_first_in_each_family(srv, tmp_path, monkeypatch):
+    """A bare major is minor 0 and a date suffix is a snapshot, not a minor.
+    Compared as raw number lists, the shorter list won: on the day Opus 5.5
+    shipped, claude-opus-5 was listed above claude-opus-5-5, claude-fable-5
+    above claude-fable-5-1, and claude-opus-4-20250514 above claude-opus-4-8.
+    Two ids of one version keep the undated alias first -- it always names
+    the newest snapshot -- then the snapshots, newest date first."""
+    ids = ["claude-opus-5", "claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-20250514",
+           "claude-haiku-4-5-20251001", "claude-haiku-4-5", "claude-fable-5", "claude-fable-5-1"]
+    assert _anthropic_models_from(srv, tmp_path, monkeypatch, ids) == [
+        "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-20250514",
+        "claude-haiku-4-5", "claude-haiku-4-5-20251001",
+        "claude-fable-5-1", "claude-fable-5"]
+
+
+def test_the_real_cli_catalog_is_listed_newest_first(srv, tmp_path, monkeypatch):
+    """Every id the scan finds in the real CLI 2.1.280 binary, laid out by the
+    fixture in the order the picker must show them. The selftest holds the
+    engine's anthropic_catalog_ids -- the Settings list -- to the same file,
+    so the two lists cannot drift apart."""
+    want = (REPO / "test" / "fixtures" / "claude-cli-model-ids-newest-first.txt").read_text().split()
+    assert _anthropic_models_from(srv, tmp_path, monkeypatch, want) == want
+
+
+def test_a_release_kept_for_a_newer_cli_rides_on_the_anthropic_entry(srv, tmp_path, monkeypatch):
+    """The engine writes one next to a family's resolution when the API
+    answers a probe with its 400: the release exists, and only `claude
+    update` reaches it. On 2026-09-22 Opus 5.5 needed Claude Code 2.1.280,
+    2.1.258 was installed, and nothing on the dashboard said so. /api/models
+    carries every such notice, in family order, for the Settings card and
+    the job editor -- and never offers the release itself to a job, which
+    this CLI cannot run."""
+    blob = tmp_path / "claude-bin"
+    blob.write_bytes(b"claude-opus-5\x00claude-fable-5\x00")
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_BIN", str(blob))
+    monkeypatch.setattr(srv, "JOBS_FILE", tmp_path / "no-jobs.json")
+    monkeypatch.setattr(srv, "PROJECTS_FILE", tmp_path / "no-projects.json")
+    monkeypatch.setattr(srv, "DB_FILE", tmp_path / "index.db")
+    _write_models(srv, openai=_catalog_block(), resolved={
+        "opus": {"id": "claude-opus-5", "at": 1790100000,
+                 "newer": {"id": "claude-opus-5-5", "needs": "2.1.280", "installed": "2.1.258", "at": 1790100000}},
+        "sonnet": {"id": "claude-sonnet-5", "at": 1790100000},
+        "fable": {"id": "claude-fable-5", "at": 1790100000,
+                  "newer": {"id": "claude-fable-5-1", "needs": "2.1.251", "installed": "", "at": 1790100001}}})
+    a = srv.list_models()["platforms"]["anthropic"]
+    assert a["newer"] == [
+        {"family": "opus", "id": "claude-opus-5-5", "needs": "2.1.280", "installed": "2.1.258", "at": 1790100000},
+        {"family": "fable", "id": "claude-fable-5-1", "needs": "2.1.251", "installed": "", "at": 1790100001}]
+    assert "claude-opus-5-5" not in a["models"] and "claude-fable-5-1" not in a["models"]
+    assert a["families"] == {"opus": "claude-opus-5", "sonnet": "claude-sonnet-5", "fable": "claude-fable-5"}
+
+
+def test_no_release_waiting_is_an_empty_list_and_a_hand_edit_never_breaks_it(srv, tmp_path, monkeypatch):
+    """Nothing waiting is [] -- the page reads the list, never its absence.
+    A hand-edited models.json -- a family that is a bare string, a notice that
+    is not an object, one with no version to name -- is left out, and never
+    takes /api/models down with it."""
+    monkeypatch.setattr(srv, "JOBS_FILE", tmp_path / "no-jobs.json")
+    monkeypatch.setattr(srv, "PROJECTS_FILE", tmp_path / "no-projects.json")
+    monkeypatch.setattr(srv, "DB_FILE", tmp_path / "index.db")
+    _write_models(srv, openai=_catalog_block())
+    assert srv.list_models()["platforms"]["anthropic"]["newer"] == []
+    _write_models(srv, openai=_catalog_block(), resolved={
+        "opus": "claude-opus-5",
+        "sonnet": {"id": "claude-sonnet-5", "at": 1, "newer": "claude-sonnet-5-5"},
+        "haiku": {"id": "claude-haiku-4-5", "at": 1, "newer": {"id": "claude-haiku-5"}},
+        "fable": {"id": "claude-fable-5", "at": 1, "newer": {"needs": "2.1.300"}}})
+    a = srv.list_models()["platforms"]["anthropic"]
+    assert a["newer"] == []
+    assert a["families"] == {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5", "fable": "claude-fable-5"}
+
+
 def test_platforms_carry_the_catalog_visible_models_in_priority_order(srv):
     _write_models(srv, openai=_catalog_block())
     (srv.CONFIG_DIR / "pricing.json").write_text(

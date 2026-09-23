@@ -67,6 +67,21 @@ export function settingsSummary(platforms){
   return enabled + " of " + REGISTRY.length + " platforms enabled · " + models + " model" + (models === 1 ? "" : "s") + " available to jobs";
 }
 
+// The releases /api/models says wait for a newer Claude Code -- the engine
+// records one off the probe's 400, family by family -- one sentence each, in
+// the words tick.log gets. On 2026-09-22 Opus 5.5 was out and needed 2.1.280,
+// and nothing on this page said "run claude update". `check` is the card's
+// live check when there is one: a CLI that is no longer the one a release
+// was recorded against is said so, since the tick probes again on its own.
+export function newerModelNotes(entry, check){
+  const list = (entry && Array.isArray(entry.newer)) ? entry.newer : [];
+  const m = /\d+(?:\.\d+)+/.exec((check && check.version) || "");
+  const now = m ? m[0] : "";
+  return list.map(n => n.id + " is out and needs Claude Code " + n.needs
+    + " (installed " + (n.installed || "version unknown") + "): run claude update"
+    + (now && n.installed && now !== n.installed ? " — Claude Code is " + now + " now: the next tick probes again" : ""));
+}
+
 // The chip's word, from the registry entry and the last live check.
 export function platformStatus(entry, check){
   if(entry && entry.supported === false) return {cls: "disabled", label: "Coming soon"};
@@ -379,6 +394,14 @@ function platformCard(r, entry, check, catalog){
     nd.appendChild(document.createTextNode(note.text));
     card.appendChild(nd);
   }
+  // A release the API keeps for a newer Claude Code: where the operator
+  // looks for a model, which one, the version it needs, and what to run.
+  newerModelNotes(entry, check).forEach(text => {
+    const nd = el("div", "platnote warn");
+    nd.appendChild(icon("alert"));
+    nd.appendChild(document.createTextNode(text));
+    card.appendChild(nd);
+  });
   const g = el("div", "platcard-g"); g.appendChild(binaryBlock(r, entry, check)); g.appendChild(sessionBlock(r, entry, check)); card.appendChild(g);
   card.appendChild(modelsSection(r, entry, check, catalog));
   return card;

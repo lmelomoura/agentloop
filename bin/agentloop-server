@@ -2940,9 +2940,25 @@ def list_models():
     if not isinstance(resolved, dict):
         resolved = {}
     families = []
+    # The releases the API keeps for a newer Claude Code than the one
+    # installed: the engine's family_refresh writes one next to a family's
+    # resolution when a probe gets the API's 400 ("version X or newer is
+    # required"), and drops it once a pass meets none. Family order; a
+    # hand-edited entry without an id or a version is left out, and a family
+    # that is not an object at all reads as unresolved rather than taking
+    # /api/models down.
+    newer = []
     for fam, desc in MODEL_FAMILIES:
-        r = resolved.get(fam) or {}
+        r = resolved.get(fam)
+        if not isinstance(r, dict):
+            r = {}
         families.append({"v": fam, "desc": desc, "id": r.get("id") or "", "at": r.get("at") or 0})
+        n = r.get("newer")
+        if (isinstance(n, dict) and isinstance(n.get("id"), str) and n["id"]
+                and isinstance(n.get("needs"), str) and n["needs"]):
+            newer.append({"family": fam, "id": n["id"], "needs": n["needs"],
+                          "installed": n["installed"] if isinstance(n.get("installed"), str) else "",
+                          "at": n["at"] if isinstance(n.get("at"), int) else 0})
 
     ids = set()
     # Scan the CLI binary ourselves rather than shelling out to `strings`:
@@ -2993,8 +3009,20 @@ def list_models():
     fam_order = [f[0] for f in MODEL_FAMILIES]
 
     def sort_key(v):
+        # Newest first within each family, by (major, minor) with a missing
+        # minor read as 0. Compared as raw number lists, the shorter list won:
+        # [5] sorted ahead of [5, 5], so claude-opus-5 was listed above
+        # claude-opus-5-5. An 8-digit last number is a snapshot date, not a
+        # version (claude-opus-4-20250514 is 4.0): it only orders the ids of
+        # one version, the undated alias first -- it always names the newest
+        # snapshot -- then newest date first. The id itself settles the rest,
+        # so the order never depends on the order of the set. The engine's
+        # anthropic_catalog_ids sorts the Settings list the same way.
         f = next((i for i, x in enumerate(fam_order) if x in v), 9)
-        return (f, [-int(n) for n in re.findall(r"\d+", v)])   # newest first
+        nums = re.findall(r"\d+", v)
+        date = int(nums.pop()) if len(nums) > 1 and len(nums[-1]) == 8 else 0
+        ver = [int(n) for n in nums] + [0] * (2 - len(nums))
+        return (f, [-n for n in ver], date != 0, -date, v)
     models = sorted(ids, key=sort_key)
 
     anthropic = {"available": True, "reason": "", "models": models,
@@ -3007,6 +3035,10 @@ def list_models():
                  # modelEnabled reads this instead of guessing from the id's
                  # prefix; a family the cache has not resolved is left out.
                  "families": {f["v"]: f["id"] for f in families if f["id"]},
+                 # What waits for `claude update` -- the Settings card and
+                 # the job editor say it (ui/app/settings.js newerModelNotes).
+                 # Never a model a job can pick: this CLI cannot run it.
+                 "newer": newer,
                  "catalog_at": max([int(r.get("at") or 0) for r in resolved.values() if isinstance(r, dict)] or [0])}
     anthropic.update(platform_entry("anthropic", cfg, jobs, projects, resolved, catalog_slugs))
     # By construction the first id of the filtered models_enabled list, like the engine.

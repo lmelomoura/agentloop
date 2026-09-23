@@ -2484,6 +2484,12 @@
     const models = entries.reduce((n, p) => n + (p.enabled === true ? (p.models_enabled || []).length : 0), 0);
     return enabled + " of " + REGISTRY.length + " platforms enabled \xB7 " + models + " model" + (models === 1 ? "" : "s") + " available to jobs";
   }
+  function newerModelNotes(entry, check) {
+    const list = entry && Array.isArray(entry.newer) ? entry.newer : [];
+    const m = /\d+(?:\.\d+)+/.exec(check && check.version || "");
+    const now = m ? m[0] : "";
+    return list.map((n) => n.id + " is out and needs Claude Code " + n.needs + " (installed " + (n.installed || "version unknown") + "): run claude update" + (now && n.installed && now !== n.installed ? " \u2014 Claude Code is " + now + " now: the next tick probes again" : ""));
+  }
   function platformStatus(entry, check) {
     if (entry && entry.supported === false) return { cls: "disabled", label: "Coming soon" };
     if (check && check.bin_found === false) return { cls: "off", label: "Not installed" };
@@ -2768,6 +2774,12 @@
       nd.appendChild(document.createTextNode(note.text));
       card.appendChild(nd);
     }
+    newerModelNotes(entry, check).forEach((text) => {
+      const nd = el("div", "platnote warn");
+      nd.appendChild(icon("alert"));
+      nd.appendChild(document.createTextNode(text));
+      card.appendChild(nd);
+    });
     const g = el("div", "platcard-g");
     g.appendChild(binaryBlock(r, entry, check));
     g.appendChild(sessionBlock(r, entry, check));
@@ -3061,8 +3073,13 @@
     renderSettingsPage,
     settingsSummary,
     platformStatus,
-    setupBanner
+    setupBanner,
+    // newerModelNotes: the releases waiting for `claude update`,
+    // one sentence each -- the Anthropic card draws them, and the
+    // job editor's model help line (applyPlatformToJobEditor in
+    // bin/dashboard.html) reaches them through here.
+    newerModelNotes
   };
 })();
-/* ui-bundle: 22b2db40599f2f84a3a63059485494dbffecd6f6c86fc435edf9d5a8c736404e */
-/* ui-sources: b7a8fd3a260b7239f6e3980e8467fa5beed7d61e93c6fb1f5fccfe7d40aedcd1 */
+/* ui-bundle: 4e788223f1097169306303297183b6df4eed3073bfac9d730d2ac68867083879 */
+/* ui-sources: a427659a41818346d46a7603c9b048a4e82446b82b017c4d47cefed75ae37191 */
