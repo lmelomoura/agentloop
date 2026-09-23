@@ -87,17 +87,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the file holds and the one it reached, and says it was not recorded
   rather than promise a retry it never stamped; `resolve-models` exits 1
   for a family it resolved but could not record. A dead holder's lock is
-  taken at once, as everywhere here, and so is any lock older than
-  `LOCK_GRACE_SECONDS`, whoever it names — no write holds it that long, and
-  a writer that stopped, died under a parent that lives on, or was killed
-  before writing its pid would otherwise turn every later writer away for
-  good and keep the whole pass due. `lock_take` takes the bound as an
-  optional second argument, and a stale lock it cannot remove no longer
-  spins it on `rm` past the bound; its other callers wait as before. The
-  selftest races two real writers through a jq that answers a second late,
-  holds every write path — the seed of a missing or unreadable file too — to
-  a lock held by a live process, and covers a dead holder, an old lock and
-  a lock with no pid.
+  taken at once, as everywhere here, and so is any lock older than the
+  grace (`AGENTLOOP_LOCK_GRACE`, 30 s) and twice the wait, whoever it names,
+  with a line in `tick.log` — no write holds it that long, and a writer that
+  stopped, died under a parent that lives on, or was killed before writing
+  its pid would otherwise turn every later writer away for good and keep
+  the whole pass due. A writer that stalled that long and comes back finds
+  its lock gone: it writes nothing, says so, and never drops the lock the
+  next writer holds. `lock_take` takes the bound as an optional second
+  argument, and a stale lock it cannot remove no longer spins it on `rm`
+  past the bound; its other callers wait as before. The selftest races two
+  real writers through a jq that answers a second late, holds every write
+  path — the seed of a missing or unreadable file too — to a lock held by a
+  live process, and covers a dead holder, an old lock, a lock with no pid,
+  a writer robbed of its lock, a grace set to 1 and a lock that cannot be
+  removed.
 
 - **A model probe that gets no verdict no longer reads as "this model does
   not exist", and its pass is no longer trusted for a day.** A CLI with no

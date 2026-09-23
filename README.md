@@ -930,8 +930,10 @@ gives up rather than hold a launch back, and says so in `tick.log` — *models:
 opus — gave up writing claude-opus-5-5: pid 4242 held the lock on models.json
 for more than 10 s* — and the next pass or launch writes it again;
 `resolve-models` exits 1 when that happens to a family it resolved. A lock
-older than thirty seconds (`AGENTLOOP_LOCK_GRACE`) belongs to no write, and is
-taken whoever it names.
+older than thirty seconds (`AGENTLOOP_LOCK_GRACE`, never less than twice the
+wait) belongs to no write: it is taken whoever it names, with a line in
+`tick.log`, and a writer that stalled that long writes nothing when it comes
+back.
 
 ### Effort
 

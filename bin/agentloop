@@ -1139,11 +1139,20 @@ state_get() { # state_get <id> <field> [default]
 LOCK_GRACE_SECONDS="${AGENTLOOP_LOCK_GRACE:-30}"
 
 lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with <seconds>, for a lock only ever held a moment: gives up (1) once they have passed
-  local d="${1:-}" hold i=0 deadline="" now born
+  local d="${1:-}" hold i=0 deadline="" stale="" aged="" now born
   # A bound counts on the shell's own clock, in whole seconds and with no
-  # fork; the extra second makes the wait at least <seconds>, never less.
-  [ -z "${2:-}" ] || deadline=$(( SECONDS + $2 + 1 ))
+  # fork; the extra second makes the wait at least <seconds>, never less. A
+  # lock is old enough to take once it is older than the grace AND twice the
+  # wait: a grace set as low as 1 must not turn the lock into none. What an
+  # age-based take took over is left in LOCK_TAKEN_OVER and LOCK_TAKEN_AGE,
+  # for the caller to say.
+  LOCK_TAKEN_OVER="" LOCK_TAKEN_AGE=""
+  if [ -n "${2:-}" ]; then
+    deadline=$(( SECONDS + $2 + 1 ))
+    stale=$(( LOCK_GRACE_SECONDS > 2 * $2 ? LOCK_GRACE_SECONDS : 2 * $2 ))
+  fi
   while ! mkdir "$d" 2>/dev/null; do
+    LOCK_TAKEN_OVER="" LOCK_TAKEN_AGE=""    # a break another writer won the mkdir after
     hold="$(cat "$d/pid" 2>/dev/null || true)"
     # slot_alive, not a bare `kill -0`: this is the identical defect Task 1
     # exists to remove, on a different kind of directory. .state.lock,
@@ -1158,7 +1167,7 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
     # rather than straight back to mkdir, so a bound still ends it: it used
     # to spin on rm for ever.
     if [ -n "$hold" ] && ! slot_alive "$d"; then
-      rm -rf "$d"; [ -e "$d" ] || continue   # the owner is gone: genuinely stale
+      rm -rf "$d" 2>/dev/null; [ -e "$d" ] || continue   # the owner is gone: genuinely stale
     fi
     if [ -z "$deadline" ]; then
       # A live owner is WAITED for, however long it takes. An unreadable owner
@@ -1170,15 +1179,21 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
       fi
     else
       # Bounded: the models.json lock (models_lock), held for a few jq calls
-      # and an mv, never longer -- so a lock older than the grace is no write,
-      # whoever it names: a writer killed between mkdir and its pid, one
-      # stopped mid-write, a subshell gone under a parent whose $$ it
-      # recorded, a pid reissued. Taken, or every later writer would give up
-      # for good. A younger one is waited for until the time is up; a writer
-      # inside that very gap before its pid is never robbed.
-      now="$(now_epoch)"; born="$(num "$(stat -f %m "$d" 2>/dev/null)" "$now")"
-      if [ $(( now - born )) -ge "$LOCK_GRACE_SECONDS" ]; then
-        rm -rf "$d"; [ -e "$d" ] || continue
+      # and an mv, never longer -- so a lock that old is no write, whoever it
+      # names: a writer killed between mkdir and its pid, one stopped
+      # mid-write, a subshell gone under a parent whose $$ it recorded, a pid
+      # reissued. Taken, or every later writer would give up for good; a
+      # holder that comes back finds its lock gone (models_lock_mine). A
+      # younger one is waited for until the time is up, and a writer inside
+      # the gap before its pid is never robbed. The age is read once a
+      # second, not on every poll: it costs two forks.
+      if [ "$SECONDS" != "$aged" ]; then
+        aged=$SECONDS; now="$(now_epoch)"; born="$(num "$(stat -f %m "$d" 2>/dev/null)" "$now")"
+        if [ $(( now - born )) -ge "$stale" ]; then
+          LOCK_TAKEN_OVER="${hold:+pid $hold}"; LOCK_TAKEN_OVER="${LOCK_TAKEN_OVER:-a writer that never wrote its pid}"
+          LOCK_TAKEN_AGE=$(( now - born ))
+          rm -rf "$d" 2>/dev/null; [ -e "$d" ] || continue
+        fi
       fi
       [ "$SECONDS" -lt "$deadline" ] || return 1
     fi
@@ -2391,23 +2406,48 @@ openai_catalog_all_efforts() { # the union of every VISIBLE model's efforts, fir
 # not the minute a pass holds "_models" for. It is bounded all the same
 # (lock_take's <seconds>): a writer that cannot have it within
 # MODELS_LOCK_WAIT seconds gives up and says in tick.log what it did not
-# write, rather than hang a launch behind a holder that stopped; and a lock
-# older than LOCK_GRACE_SECONDS is taken whoever it names, since no write
-# holds it that long.
+# write, rather than hang a launch behind a holder that stopped. A lock older
+# than the grace (AGENTLOOP_LOCK_GRACE) and twice that wait is taken whoever it
+# names, with a line in tick.log -- no write holds it that long -- and a
+# holder that stalled that long finds on its return that the lock is gone
+# (models_lock_mine), and writes nothing.
+MODELS_LOCK_MARK="" MODELS_LOCK_WHO="" MODELS_LOCK_WHAT=""   # the hold models_lock took, for set -u
 models_lock() { # models_lock <who> <what> -- 0 held; 1 gave up, and tick.log names what was not written
-  local p holder="another writer"
-  lock_take "$LOCK_DIR/.models.lock" "$MODELS_LOCK_WAIT" && return 0
-  p="$(cat "$LOCK_DIR/.models.lock/pid" 2>/dev/null || true)"
+  local d="$LOCK_DIR/.models.lock" p holder="another writer"
+  MODELS_LOCK_WHO="$1" MODELS_LOCK_WHAT="$2" MODELS_LOCK_MARK=""
+  if lock_take "$d" "$MODELS_LOCK_WAIT"; then
+    # This hold's own mark, a file only it created: taken over (above), the
+    # directory goes, and the mark with it.
+    MODELS_LOCK_MARK="$(mktemp "$d/mark.XXXXXX" 2>/dev/null)" || MODELS_LOCK_MARK="unmarked"
+    [ -z "$LOCK_TAKEN_OVER" ] || log_tick "models: $1 — took over the lock on models.json from $LOCK_TAKEN_OVER, held for $LOCK_TAKEN_AGE s"
+    return 0
+  fi
+  p="$(cat "$d/pid" 2>/dev/null || true)"
   [ -z "$p" ] || holder="pid $p"
   log_tick "models: $1 — gave up writing $2: $holder held the lock on models.json for more than $MODELS_LOCK_WAIT s"
   return 1
 }
-models_unlock() { lock_drop "$LOCK_DIR/.models.lock"; }
+models_lock_mine() { # 0 while the lock models_lock took is still this hold's
+  [ "$MODELS_LOCK_MARK" = "unmarked" ] || { [ -n "$MODELS_LOCK_MARK" ] && [ -e "$MODELS_LOCK_MARK" ]; }
+}
+models_unlock() { # drops the lock only while it is still this hold's, never a lock another writer took over
+  if models_lock_mine; then lock_drop "$LOCK_DIR/.models.lock"; fi
+  MODELS_LOCK_MARK=""
+  return 0
+}
 
 _models_rmw() { # _models_rmw <jq args…> -- one read-modify-write of config/models.json; the caller holds models_lock
   local tmp
   tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
-  "$JQ" "$@" "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE" && return 0
+  if "$JQ" "$@" "$MODELS_FILE" > "$tmp"; then
+    # Moved into place only while the lock is still this hold's: one that
+    # stalled past the grace has lost it, and would drop the update written since.
+    if models_lock_mine; then
+      mv "$tmp" "$MODELS_FILE" && return 0
+    else
+      log_tick "models: $MODELS_LOCK_WHO — gave up writing $MODELS_LOCK_WHAT: its lock went to another writer while it held it"
+    fi
+  fi
   rm -f "$tmp"
   return 1
 }
@@ -4096,10 +4136,12 @@ family_refresh() { # family_refresh <family> -> the id to run the family on
       FR_NOTE="the probe of $RF_PROBE failed ($RF_FAILED); kept $FR_ID, trying again in $(models_wait_text "${out##* }")"
     else
       # Nothing was written: still the newer of the id the file holds and the
-      # best this pass reached, as the write would have kept -- a launch never
-      # runs below either -- and no retry is promised, since none was stamped.
-      FR_ID="$( { family_cached_id "$fam"; printf '%s\n' "$RF_ID"; } \
-        | "$JQ" -R . | "$JQ" -rs "$CLAUDE_ID_JQ"'map(select(. != "")) | sort_by(newest_first) | .[0] // empty' 2>/dev/null)"
+      # best this pass reached, read exactly as models_cache_fail reads them
+      # -- a launch never runs below either -- and no retry is promised,
+      # since none was stamped.
+      FR_ID="$("$JQ" -r --arg f "$fam" --arg id "$RF_ID" "$CLAUDE_ID_JQ"'
+        [((.resolved | objects | .[$f] | objects | .id) // empty), $id]
+        | map(select(type == "string" and . != "")) | sort_by(newest_first) | .[0] // empty' "$MODELS_FILE" 2>/dev/null)"
       [ -n "$FR_ID" ] || FR_ID="$RF_ID"
       FR_NOTE="the probe of $RF_PROBE failed ($RF_FAILED); kept $FR_ID, not recorded in models.json"
     fi
@@ -4462,8 +4504,9 @@ cmd_resolve_models() { # cmd_resolve_models [anthropic [family…]|openai|openco
   # be written exited 0 and the failure was invisible to the operator and to
   # install.sh. An UNAVAILABLE codex is not a failure: that is a written
   # {available:false} block, and resolve_models_openai already returns 0 for it.
-  # A family whose pass a probe cut short makes it exit 1 as well: family_refresh
-  # already kept its id and logged why, and the line says so. Families named
+  # A family whose pass a probe cut short makes it exit 1 as well, and so does
+  # one whose pass could not be recorded (models.json busy or unreadable):
+  # family_refresh already kept its id and logged why, and the line says so. Families named
   # after `anthropic` are the only ones probed -- a retry the tick runs for
   # the families whose pass failed (models_stale), not the ones that finished.
   local which="${1:-}" fam id rc=0 fams="opus sonnet haiku fable"
