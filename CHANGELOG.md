@@ -20,6 +20,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`verify-queue`, `verify-prompt` and `report-verdict`.** The queue is a
+  query, so the agent never derives the scope from prose; the prompt is minted
+  from the ledger, with the job stated as disproving the claim and the
+  hunter's `rationale` deliberately left out — a fresh reader that reads the
+  argument stops being fresh; and the verdict is written by the verifier
+  itself, refused for a finding outside the queue, refused a second time on
+  the same row, with its reason through the same credential scan as every
+  other agent-written text.
+
 - **The verification queue.** `queries.verify_queue` is the one place the
   scope lives: the agent's own `sast` findings at medium or above, plus any
   below that whose candidate declares a high or critical impact — the evasion

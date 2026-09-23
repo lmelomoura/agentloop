@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, ledger, osv, queries, report, secrets, taxonomy  # noqa: E402
+from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, ledger, osv, prompts, queries, report, secrets, taxonomy, verdict  # noqa: E402
 
 REQUIRED_FINDING_KEYS = ("fingerprint", "category", "rule", "severity", "title")
 
@@ -1610,6 +1610,85 @@ def cmd_findings(args):
     conn = _conn(args)
     _analysis(conn, args.analysis)
     print(json.dumps(ledger.findings_of(conn, args.analysis), indent=2))
+
+
+def cmd_verify_queue(args):
+    """The findings still waiting for a verifier, worst first.
+
+    The SCOPE lives in `queries.verify_queue` -- see its comment -- and this
+    verb exists so the agent never has to derive it from prose. A filter the
+    model applies by reading a paragraph is the kind of instruction this
+    module has already watched fail twice: the triage nobody did, and the
+    subagents nobody was supposed to launch.
+    """
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    print(json.dumps(queries.verify_queue(conn, args.analysis), indent=2))
+
+
+def cmd_verify_prompt(args):
+    """The text the agent pastes into a `Task` for this finding.
+
+    Refused for a fingerprint outside the queue, on the same rule as
+    `report-verdict`: a prompt for something nobody is verifying is a
+    subagent nobody asked for, and the close counts those.
+    """
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    row = next((f for f in queries.verify_queue(conn, args.analysis)
+                if f["fingerprint"] == args.fingerprint), None)
+    if row is None:
+        sys.exit(f"verify-prompt: {args.fingerprint[:12]}… is not in the verification "
+                 "queue of this analysis — `verify-queue` lists what is")
+    print(prompts.verifier_prompt(args.analysis, row))
+
+
+def cmd_report_verdict(args):
+    """What a VERIFIER concluded. Called by the subagent itself, not by the
+    hunter that reported the finding -- the write is the evidence that a
+    second agent existed and what it read (see security/prompts.py).
+
+    Deliberately NOT in AGENT_FORBIDDEN: a subagent runs under the same
+    `AL_SECURITY_AGENT` the hunter carries, so a refusal there would close the
+    door on the only caller this verb has. What makes it verifiable is not a
+    flag but a count -- `cmd_finish` compares the verdicts recorded here with
+    the `Task` calls the engine counted in the run's stream.
+    """
+    try:
+        stdin_text = sys.stdin.read()
+    except Exception as exc:
+        sys.exit(f"report-verdict: could not read stdin: {exc}")
+    if len(stdin_text.encode("utf-8")) > MAX_STDIN_BYTES:
+        sys.exit(f"report-verdict: stdin is {len(stdin_text.encode('utf-8'))} bytes "
+                 f"and the limit is {MAX_STDIN_BYTES}")
+    try:
+        payload = json.loads(stdin_text)
+    except (ValueError, RecursionError) as exc:
+        sys.exit(f"report-verdict: stdin is not valid JSON: {exc}")
+    try:
+        value, reason = verdict.validate(payload)
+    except verdict.VerdictError as exc:
+        where = f"report-verdict: {exc.field}" if exc.field else "report-verdict"
+        sys.exit(f"{where} {exc.message}. Nothing was recorded")
+    # The same scanner every other agent-written free text goes through: a
+    # verifier reads the same repository the hunter read.
+    _refuse_if_secret("report-verdict: reason", reason)
+    conn = _conn(args)
+    _running(conn, args.analysis)
+    # The queue is the authority on both questions at once -- is this finding
+    # one somebody was asked to verify, and does it still need one. A row that
+    # already carries a verdict has left the queue, so a second verdict lands
+    # here rather than in `record_verdict`'s own guard.
+    if not any(f["fingerprint"] == args.fingerprint
+               for f in queries.verify_queue(conn, args.analysis)):
+        sys.exit(f"report-verdict: {args.fingerprint[:12]}… is not in the verification "
+                 "queue of this analysis — `verify-queue` lists what is, and a finding "
+                 "leaves that list the moment it carries a verdict: a verifier does not "
+                 "contradict itself, and the first answer is the one that counts. "
+                 "Nothing was recorded")
+    if not ledger.record_verdict(conn, args.analysis, args.fingerprint, value, reason):
+        sys.exit(f"report-verdict: {args.fingerprint[:12]}… could not be written. "
+                 "Nothing was recorded")
 
 
 def cmd_fingerprint(args):
@@ -3377,6 +3456,21 @@ def main(argv=None):
 
     rf = sub.add_parser("report-finding", parents=[dbflag]); rf.set_defaults(fn=cmd_report_finding)
     rf.add_argument("--analysis", type=int, required=True)
+
+    # Deliberately absent from AGENT_FORBIDDEN, all three: the verifier is a
+    # subagent of the analysis and runs under the same flag the hunter does,
+    # so refusing them there would close the door on their only caller. The
+    # close's count is what makes the phase verifiable -- see `cmd_finish`.
+    vq = sub.add_parser("verify-queue", parents=[dbflag]); vq.set_defaults(fn=cmd_verify_queue)
+    vq.add_argument("--analysis", type=int, required=True)
+
+    vp = sub.add_parser("verify-prompt", parents=[dbflag]); vp.set_defaults(fn=cmd_verify_prompt)
+    vp.add_argument("--analysis", type=int, required=True)
+    vp.add_argument("--fingerprint", required=True)
+
+    rv = sub.add_parser("report-verdict", parents=[dbflag]); rv.set_defaults(fn=cmd_report_verdict)
+    rv.add_argument("--analysis", type=int, required=True)
+    rv.add_argument("--fingerprint", required=True)
 
     fn = sub.add_parser("finish", parents=[dbflag]); fn.set_defaults(fn=cmd_finish)
     fn.add_argument("--analysis", type=int, required=True)

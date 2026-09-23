@@ -6026,3 +6026,88 @@ def test_guides_read_that_were_never_recommended_are_still_listed(tmp_path):
     note, analysis = _sast_note(db, aid)
     assert "Guides read: WEB-PROTOCOL-AND-AUTH. Recommended but not read: ATTACK-CLASSES." in note
     assert "bogus" not in note
+
+
+# ------------------------------------------------ the verifier's door
+
+def _agent_sast(db, aid, fp, severity="high"):
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(_payload(
+        fp, severity=severity, candidate=SAST_CANDIDATE)))
+
+
+def test_verify_queue_lists_the_scope_and_report_verdict_writes_it(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    queue = run(db, "verify-queue", "--analysis", str(aid))
+    assert [f["fingerprint"] for f in queue] == ["b" * 64]
+    assert queue[0]["candidate"]["trace"], "the prompt needs the chain"
+
+    run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+        stdin=json.dumps({"verdict": "rejected",
+                          "reason": "app/db.py:12 is parameterised; the concatenation is in a comment"}))
+    row = _finding_row(db, aid)
+    assert row["verdict"] == "rejected"
+    assert row["verified_by"] == "subagent"
+    assert run(db, "verify-queue", "--analysis", str(aid)) == []
+
+
+def test_a_verdict_on_something_outside_the_queue_is_refused(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "9" * 64,
+                stdin=json.dumps({"verdict": "confirmed", "reason": "r"}))
+    assert out.returncode != 0
+    assert "not in the verification queue" in out.stderr
+
+
+def test_a_second_verdict_on_one_finding_is_refused(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+        stdin=json.dumps({"verdict": "confirmed", "reason": "read it end to end"}))
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+                stdin=json.dumps({"verdict": "rejected", "reason": "on second thoughts"}))
+    assert out.returncode != 0
+    assert "not in the verification queue" in out.stderr
+    assert _finding_row(db, aid)["verdict"] == "confirmed"
+
+
+def test_a_verified_by_sent_by_the_payload_is_refused(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+                stdin=json.dumps({"verdict": "confirmed", "reason": "r", "verified_by": "me"}))
+    assert out.returncode != 0
+    assert "does not know: verified_by" in out.stderr
+
+
+def test_a_credential_in_a_verdict_reason_is_refused_and_never_echoed(tmp_path):
+    """The adversarial test, on the third door. A verifier reads the same
+    repository the hunter read, so its free text is exactly as likely to
+    quote a key -- and the ledger is exactly as unable to hold one."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+                stdin=json.dumps({"verdict": "rejected", "reason": f"it is the test key {AWS}"}))
+    assert out.returncode != 0
+    assert "reason" in out.stderr and "aws_access_key" in out.stderr
+    assert AWS not in out.stdout and AWS not in out.stderr
+    assert _finding_row(db, aid)["verdict"] == ""
+    conn = sqlite3.connect(str(db))
+    assert AWS not in "".join(str(tuple(r)) for r in conn.execute("SELECT * FROM finding"))
+
+
+def test_verify_prompt_is_minted_for_a_queued_finding_only(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    out = raw(db, "verify-prompt", "--analysis", str(aid), "--fingerprint", "b" * 64)
+    assert "your job is to disprove" in out.lower()
+    assert "report-verdict --analysis" in out
+    assert "my own reading" not in out, "the hunter's rationale must not travel"
+    bad = fails(db, "verify-prompt", "--analysis", str(aid), "--fingerprint", "9" * 64)
+    assert bad.returncode != 0 and "not in the verification queue" in bad.stderr
