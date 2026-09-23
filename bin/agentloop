@@ -1715,10 +1715,15 @@ account_platform() { case "${1:-}" in anthropic|openai) return 0 ;; *) return 1 
 account_var() { case "${1:-}" in anthropic) printf 'CLAUDE_CONFIG_DIR' ;; openai) printf 'CODEX_HOME' ;; esac; }
 account_cli_default() { case "${1:-}" in anthropic) printf '%s/.claude\n' "$HOME" ;; openai) printf '%s/.codex\n' "$HOME" ;; esac; }
 
+account_trim_dir() { # account_trim_dir <text> -> the text without trailing slashes; a lone "/" is kept as is
+  local d="${1:-}"
+  while [ "${#d}" -gt 1 ] && [ "${d%/}" != "$d" ]; do d="${d%/}"; done
+  printf '%s\n' "$d"
+}
+
 account_norm_dir() { # account_norm_dir <text> -> the directory with ~ expanded and no trailing slash; rc 1 and nothing printed unless that is an absolute path
   local d
-  d="$(expand_home "${1:-}")"
-  while [ "${#d}" -gt 1 ] && [ "${d%/}" != "$d" ]; do d="${d%/}"; done
+  d="$(account_trim_dir "$(expand_home "${1:-}")")"
   case "$d" in /?*) printf '%s\n' "$d" ;; *) return 1 ;; esac
 }
 
@@ -1735,13 +1740,14 @@ account_env_value() { # account_env_value <platform> <dir> -> the normalized dir
   printf '%s\n' "$d"
 }
 
-accounts_json() { # accounts_json <platform> -> the registered accounts as a JSON list: only well-formed {id,name,dir}, never one called default; [] for a platform that has none
+accounts_json() { # accounts_json <platform> -> the registered accounts as a JSON list: only well-formed {id,name,dir} whose id is account_slug's own alphabet, never one called default; [] for a platform that has none
   account_platform "${1:-}" || { printf '[]\n'; return 0; }
   platforms_json | "$JQ" -c --arg p "$1" '
     [ ((.platforms[$p].accounts // []) | if type == "array" then .[] else empty end)
       | objects
       | select((.id | type) == "string" and (.name | type) == "string" and (.dir | type) == "string")
       | select(.id != "" and .id != "default" and .name != "" and .dir != "")
+      | select(.id | test("^[a-z0-9-]+$"))
       | {id, name, dir} ]'
 }
 
@@ -1778,9 +1784,9 @@ account_env_dir() { # account_env_dir <platform> <id> -> what the platform's var
   account_env_value "$1" "$(account_field "$1" "$2" dir)"
 }
 
-account_slug() { # account_slug <name> -> the id a new account is given: lower case, each run outside [a-z0-9] one dash, no dash at either end, at most 40 characters; account when nothing is left
+account_slug() { # account_slug <name> -> the id a new account is given: lower case, each run outside [a-z0-9] one dash, no dash at either end, at most 40 characters; account when nothing is left. Pinned to LC_ALL=C so the alphabet is the same regardless of the operator's own locale.
   local s
-  s="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//' | cut -c1-40 | sed 's/-$//')"
+  s="$(export LC_ALL=C; printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//' | cut -c1-40 | sed 's/-$//')"
   [ -n "$s" ] || s="account"
   printf '%s\n' "$s"
 }
@@ -1830,8 +1836,7 @@ account_add() { # account_add <platform> <name> <dir> -> the new account's id; r
   [ -z "$why" ] || { printf '%s\n' "$why"; return 1; }
   base="$(account_slug "$name")"; id="$base"; n=2
   while [ "$id" = "default" ] || account_known "$p" "$id"; do id="$base-$n"; n=$(( n + 1 )); done
-  sdir="$dir"
-  while [ "${#sdir}" -gt 1 ] && [ "${sdir%/}" != "$sdir" ]; do sdir="${sdir%/}"; done
+  sdir="$(account_trim_dir "$dir")"
   write_platforms --arg p "$p" --arg id "$id" --arg n "$name" --arg d "$sdir" '
     .platforms[$p] = ((.platforms[$p] // {enabled:false, bin:"", models:[]})
       | .accounts = ((if (.accounts | type) == "array" then .accounts else [] end) + [{id:$id, name:$n, dir:$d}]))'
@@ -1846,8 +1851,7 @@ account_edit() { # account_edit <platform> <id> <name> <dir> -> rc 1 with the re
   why="$(account_refusal "$p" "$aid" "$name" "$dir")"
   [ -z "$why" ] || { printf '%s\n' "$why"; return 1; }
   old="$(account_norm_dir "$(account_field "$p" "$aid" dir)")"
-  sdir="$dir"
-  while [ "${#sdir}" -gt 1 ] && [ "${sdir%/}" != "$sdir" ]; do sdir="${sdir%/}"; done
+  sdir="$(account_trim_dir "$dir")"
   write_platforms --arg p "$p" --arg id "$aid" --arg n "$name" --arg d "$sdir" '
     .platforms[$p].accounts = [ .platforms[$p].accounts[] | if (type == "object" and .id == $id) then (. + {name:$n, dir:$d}) else . end ]'
   if [ "$old" != "$(account_norm_dir "$dir")" ]; then
@@ -1857,9 +1861,19 @@ account_edit() { # account_edit <platform> <id> <name> <dir> -> rc 1 with the re
 }
 
 account_remove() { # account_remove <platform> <id> -> rc 1 with the refusal on stdout
-  local p="$1" aid="$2" users
+  local p="$1" aid="$2" users f
   if [ "$aid" = "default" ]; then printf "the Default account is the install's own — it cannot be removed\n"; return 1; fi
   account_known "$p" "$aid" || { printf "no account '%s' on %s\n" "$aid" "$p"; return 1; }
+  # account_users reads jobs.json/projects.json through platforms_jq, which
+  # treats a file that does not parse as though it were empty -- so a broken
+  # file would otherwise read as "nobody uses it" and the account would be
+  # removed out from under whoever it is actually wired to.
+  for f in "$JOBS_FILE" "$PROJECTS_FILE"; do
+    if [ -f "$f" ] && ! "$JQ" -e . "$f" >/dev/null 2>&1; then
+      printf "cannot tell who uses '%s': %s does not parse — fix it first\n" "$(account_field "$p" "$aid" name)" "$f"
+      return 1
+    fi
+  done
   users="$(account_users "$p" "$aid" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
   if [ -n "$users" ]; then
     printf "'%s' is used by %s — move them to another account first\n" "$(account_field "$p" "$aid" name)" "$users"; return 1
@@ -1877,6 +1891,14 @@ account_check_sentence() { # account_check_sentence <platform> <id> -> signed in
   else
     printf '%s' "$(printf '%s' "$j" | "$JQ" -r .reason)"
   fi
+}
+
+account_skills_suffix() { # account_skills_suffix <dir-as-typed> -> "" when every skill is linked into that directory's skills/, else "; <n> skill(s) could not be linked into <dir>/skills (agentloop skills install)". A saved account's own skills_link_into call swallows its result (an account is registered whether or not the link worked), so this is what makes a failed link visible on the success line.
+  local nd n
+  nd="$(account_norm_dir "${1:-}")" || return 0
+  n="$(skills_missing "$nd/skills")"
+  [ "${n:-0}" -gt 0 ] || return 0
+  printf '; %s skill(s) could not be linked into %s/skills (agentloop skills install)' "$n" "$nd"
 }
 
 # Every account of a platform, the Default first, each with its live check and
@@ -1946,6 +1968,11 @@ platform_check() { # platform_check <platform> [account-id [account-dir]] -> one
   elif account_platform "$p"; then
     if [ "$aid" = "default" ] || account_known "$p" "$aid"; then adir="$(account_env_dir "$p" "$aid")"
     else arefusal="account '$aid' is not an account of $p in Settings"; fi
+  elif [ "$aid" != "default" ]; then
+    # A platform with no accounts (opencode) has nothing to check per id --
+    # without this, any id at all, valid or not, silently got the same
+    # platform-wide probe back, looking like a real per-account check.
+    arefusal="OpenCode has no accounts (account '$aid')"
   fi
   platform_planned "$p" && supported=false
   bin="$(platform_bin "$p")"; src="$(platform_bin_source "$p")"
@@ -2043,8 +2070,8 @@ platform_check() { # platform_check <platform> [account-id [account-dir]] -> one
   fi
   "$JQ" -nc --arg p "$p" --argjson supported "$supported" --argjson ready "$ready" --arg bin "$bin" \
     --argjson found "$found" --arg src "$src" --arg ver "$ver" --arg acct "$acct" --arg reason "$reason" \
-    --arg aid "$aid" --arg adisp "${adir:-$(account_cli_default "$p")}" \
-    '{platform:$p, supported:$supported, ready:$ready, bin:$bin, bin_found:$found, bin_source:$src, version:$ver, account:$acct, reason:$reason, account_id:$aid, account_dir:$adisp}'
+    --arg aid "$aid" --arg adir "$adir" \
+    '{platform:$p, supported:$supported, ready:$ready, bin:$bin, bin_found:$found, bin_source:$src, version:$ver, account:$acct, reason:$reason, account_id:$aid, account_dir:$adir}'
 }
 
 platform_ready() { # platform_ready <platform> [account-id [account-dir]] -> 0; or 1 with the reason on stdout (platform_check decides)
@@ -2240,11 +2267,11 @@ cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-m
     account-add)
       account_platform "$p" || die "platform account-add: $ACCOUNTS_NONE_OPENCODE"
       out="$(account_add "$p" "${3:-}" "${4:-}")" || die "platform account-add: $out"
-      echo "account '${3:-}' added on $p (id $out) — $(account_check_sentence "$p" "$out")" ;;
+      echo "account '${3:-}' added on $p (id $out) — $(account_check_sentence "$p" "$out")$(account_skills_suffix "${4:-}")" ;;
     account-edit)
       account_platform "$p" || die "platform account-edit: $ACCOUNTS_NONE_OPENCODE"
       out="$(account_edit "$p" "${3:-}" "${4:-}" "${5:-}")" || die "platform account-edit: $out"
-      echo "account '${4:-}' saved on $p — $(account_check_sentence "$p" "${3:-}")" ;;
+      echo "account '${4:-}' saved on $p — $(account_check_sentence "$p" "${3:-}")$(account_skills_suffix "${5:-}")" ;;
     account-remove)
       account_platform "$p" || die "platform account-remove: $ACCOUNTS_NONE_OPENCODE"
       out="$(account_remove "$p" "${3:-}")" || die "platform account-remove: $out"

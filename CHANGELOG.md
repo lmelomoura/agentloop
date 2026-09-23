@@ -28,7 +28,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   skills are linked into every account directory too, the pinned one
   included: Claude Code reads the `skills/` of the config directory it runs
   with, so a run on any other account read prompts naming mandatory skills it
-  could not load.
+  could not load. Removing an account is refused while jobs.json or
+  projects.json cannot be parsed, rather than assuming nobody uses it; an
+  account whose skills could not be linked says so on its own add/edit line.
 
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate
