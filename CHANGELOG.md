@@ -85,7 +85,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   anyone has waited. `acquire_lock`, which keeps the daily model refresh
   and `resolve-pricing` from running twice at once, broke a lock with no
   pid on sight — the same instant, with no wait at all — and now follows
-  the same rule: refused while young, taken once old. The dashboard's side
+  the same rule: refused while young, taken once old. The grace itself is
+  now read as a decimal number or the default: a value such as `abc` or
+  `08` killed the engine at the first lock found with no pid, and judged by
+  age such a lock would now wait for good instead. The dashboard's side
   of the journal lock starts that clock only when it stops reading a pid,
   drops it whenever it reads one, and never waits longer than the grace in
   all, so it never had this and is unchanged; two tests now hold it to

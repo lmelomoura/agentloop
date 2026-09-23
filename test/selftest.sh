@@ -4465,6 +4465,41 @@ NASTY
   kill "$hwaiter" 2>/dev/null; wait "$hwaiter" 2>/dev/null
   rm -rf "$tmp/handover" "$tmp/handover.polled" "$tmp/handover.taken"
 
+  # Where that age ends: both clocks count whole seconds, so a lock whose age
+  # reads exactly the grace may be up to a second younger than it, and is not
+  # abandoned yet; a second more and it is. Asked right after a second turns,
+  # both inside it -- tried again should a stall carry them into the next.
+  local edge_s edge_now at_grace="" past_grace="" tries=0
+  mkdir -p "$tmp/edge"
+  while [ "$tries" -lt 3 ]; do
+    tries=$(( tries + 1 ))
+    edge_s="$(now_epoch)"; while [ "$(now_epoch)" = "$edge_s" ]; do sleep 0.01; done
+    edge_now="$(now_epoch)"
+    touch -t "$(date -r $(( edge_now - 30 )) +%Y%m%d%H%M.%S)" "$tmp/edge"; ( LOCK_GRACE_SECONDS=30; lock_abandoned "$tmp/edge" ); at_grace=$?
+    touch -t "$(date -r $(( edge_now - 31 )) +%Y%m%d%H%M.%S)" "$tmp/edge"; ( LOCK_GRACE_SECONDS=30; lock_abandoned "$tmp/edge" ); past_grace=$?
+    [ "$(now_epoch)" = "$edge_now" ] && break
+    at_grace="" past_grace=""
+  done
+  [ "$at_grace" = 1 ] && [ "$past_grace" = 0 ] \
+    && ok "a lock whose age reads exactly the grace is not abandoned yet; one second more and it is" \
+    || bad "lock_abandoned at the grace [$at_grace], a second past it [$past_grace]: 1 and 0 wanted, empty if never inside one second"
+  rm -rf "$tmp/edge"
+
+  # The grace comes from the environment (AGENTLOOP_LOCK_GRACE), and every
+  # lock does arithmetic with it. Anything but a plain number killed the
+  # engine at the first lock found with no pid -- set -u reads abc as an
+  # unset variable, and 08 is no octal -- and judged by age such a lock would
+  # now wait for good instead. It is read as a decimal number, or the default.
+  sed '/^case "${1:-}" in$/,$d' "$SELF" > "$tmp/engine-lib.sh"
+  got="$(for g in abc 1x 08 ' 7 ' ''; do
+           AGENTLOOP_LOCK_GRACE="$g" AGENTLOOP_CONFIG="$tmp/lg/config" AGENTLOOP_DATA="$tmp/lg/data" \
+             /bin/bash -c '. "$1"; printf "%s," "$LOCK_GRACE_SECONDS"' "$SELF" "$tmp/engine-lib.sh" 2>/dev/null
+         done)"
+  [ "$got" = "30,30,8,7,30," ] \
+    && ok "a grace that is not a plain number reads as the default, one with a leading zero as decimal" \
+    || bad "AGENTLOOP_LOCK_GRACE abc, 1x, 08, ' 7 ' and unset read as [$got], wanted 30,30,8,7,30,"
+  rm -rf "$tmp/engine-lib.sh" "$tmp/lg"
+
   # Bounded, as the models.json lock takes it: a live holder is given up on
   # once the time is up, and never a moment before it -- exit 1, and the lock
   # stays with its owner -- while a dead one is still taken at once. Timed in

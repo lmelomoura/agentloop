@@ -1136,7 +1136,10 @@ state_get() { # state_get <id> <field> [default]
 # record a run had just appended could be lost to the very mechanism meant to
 # protect it. `acquire_lock` already knew the right answer (write your pid, and
 # only break the lock when that pid is gone); this generalises it to the rest.
-LOCK_GRACE_SECONDS="${AGENTLOOP_LOCK_GRACE:-30}"
+# A plain decimal number, or the default: every lock below does arithmetic
+# with it, and a value such as abc (an unset variable, under set -u) or 08 (no
+# octal digit) killed the engine at the first lock found with no pid.
+LOCK_GRACE_SECONDS=$(( 10#$(num "${AGENTLOOP_LOCK_GRACE:-}" 30) ))
 
 # An owner with no pid to read is a taker between its mkdir and its pid, or
 # one killed there, and only the lock's own age tells them apart. A directory
