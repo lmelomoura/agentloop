@@ -99,6 +99,10 @@ INTERACTIVE_GRACE=20        # seconds to wait for a human reply before ending
                             # an interactive run that has finished its turn
 MODELS_TTL=86400            # 24h — how long a family→id resolution is trusted,
                             # and how often the tick refreshes it on its own
+MODELS_RETRY=600            # 10 min — how soon a family's pass is tried again
+                            # when a probe had no verdict (no session, an API
+                            # error): never cached as fresh, never re-run
+                            # back to back either
 STATE_FILE="$DATA_DIR/state.json"
 RUNS_FILE="$DATA_DIR/runs.ndjson"
 LOG_DIR="$DATA_DIR/logs"
@@ -3789,20 +3793,57 @@ global_daily_cap() { # -> dollars, or empty for "no cap"
 # What no probe can reach is a release the API serves only to a newer CLI:
 # it refuses an older one with a 400 naming the version required (measured:
 # claude-opus-5-5 needs 2.1.280, claude-fable-5-1 needs 2.1.251). That model
-# could not run on the installed CLI anyway -- only `claude update` gets it.
-
-model_probe_ok() { # model_probe_ok <id> -> 0 when the API accepts it
-  local out
+# could not run on the installed CLI anyway -- only `claude update` gets it,
+# so the pass writes it down and tick.log and the dashboard say so.
+#
+# Four answers, and only two are about the id. All but the first exit 1, so
+# the JSON decides, never the exit code:
+#   0 served
+#   1 refused: the API's 404, "issue with the selected model"
+#   2 kept for a newer CLI: the 400 above. The id exists; PROBE_NEEDS and
+#     PROBE_INSTALLED carry the two versions.
+#   3 no verdict: anything else, and it says nothing about the id. A CLI with
+#     no session answers every id alike -- "Not logged in · Please run
+#     /login", measured with no USER in the environment, where the CLI cannot
+#     find its keychain credential -- and so does an API that is down.
+#     PROBE_ANSWER keeps the CLI's own words. Read as a refusal, every family
+#     quietly stayed on its alias and the pass was cached as fresh for a day.
+model_probe_ok() { # model_probe_ok <id> -> 0 served, 1 refused, 2 kept for a newer CLI, 3 no verdict
+  PROBE_NEEDS="" PROBE_INSTALLED="" PROBE_ANSWER=""
+  local out rc kind
   # stdout alone: it is the JSON answer. For every request that goes out for
   # an id it does not recognise, the CLI also writes a
   # `[claude-code:unrecognized_model] {...}` line to stderr -- and an id newer
   # than the CLI is exactly what this probes for. Read together with the
   # JSON, that line made jq fail, so a served id the CLI did not know read
   # as refused.
-  out="$("$(platform_bin anthropic)" -p --output-format json --model "$1" "ok" 2>/dev/null)" || return 1
-  printf '%s' "$out" | "$JQ" -e '
-    (.is_error != true) and (((.result // "") | test("issue with the selected model"; "i")) | not)
-  ' >/dev/null 2>&1
+  out="$("$(platform_bin anthropic)" -p --output-format json --model "$1" "ok" 2>/dev/null)"; rc=$?
+  kind="$(printf '%s' "$out" | "$JQ" -r '
+    if type != "object" then "none"
+    else (.result // "" | tostring) as $r
+      | if .is_error != true and ($r | test("issue with the selected model"; "i") | not) then "served"
+        elif .api_error_status == 404 or ($r | test("issue with the selected model"; "i")) then "refused"
+        elif $r | test("version [0-9]+(\\.[0-9]+)+ or newer is required") then "gated"
+        else "none" end
+    end' 2>/dev/null)"
+  if [ "$kind" = "served" ]; then return 0; fi
+  if [ "$kind" = "refused" ]; then return 1; fi
+  if [ "$kind" = "gated" ]; then
+    PROBE_NEEDS="$(printf '%s' "$out" | "$JQ" -r '.result | capture("version (?<v>[0-9]+(\\.[0-9]+)+) or newer is required") | .v' 2>/dev/null)"
+    # The 400 names the build that asked; the CLI is asked only when it does not.
+    PROBE_INSTALLED="$(printf '%s' "$out" | "$JQ" -r '.result | capture("Claude Code (?<v>[0-9]+(\\.[0-9]+)+)") | .v' 2>/dev/null)"
+    [ -n "$PROBE_INSTALLED" ] || PROBE_INSTALLED="$(claude_cli_version)"
+    return 2
+  fi
+  # One line for tick.log: -j leaves no newline of its own to turn into a space.
+  PROBE_ANSWER="$(printf '%s' "$out" | "$JQ" -j 'if type == "object" then (.result // empty | tostring) else empty end' 2>/dev/null \
+                  | tr '\t\n' '  ' | cut -c1-300)"
+  [ -n "$PROBE_ANSWER" ] || PROBE_ANSWER="no answer from $(platform_cli_name anthropic) (exit $rc)"
+  return 3
+}
+
+claude_cli_version() { # the installed CLI's version, digits only ("2.1.280"); empty when it does not say
+  run_bounded "$OPENCODE_DEADLINE" "$(platform_bin anthropic)" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1
 }
 
 model_alias_baseline() { # what the CLI's own alias points at (no API call)
@@ -3813,12 +3854,33 @@ model_alias_baseline() { # what the CLI's own alias points at (no API call)
     | head -1
 }
 
-resolve_family() { # resolve_family <family> -> newest id (prints, and caches)
-  local fam="$1" base major minor floor cand best=""
+# One probe of resolve_family's search, and what it leaves for the record:
+# the first release kept for a newer CLI is noted (probes run newest first,
+# so it is the newest), and a probe with no verdict names itself and why.
+family_probe() { # family_probe <id> -> 0 served, 1 not served (the search goes on), 3 no verdict (the search stops)
+  local rc
+  model_probe_ok "$1"; rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) if [ -z "$RF_NEWER" ]; then RF_NEWER="$1"; RF_NEEDS="$PROBE_NEEDS"; RF_INSTALLED="$PROBE_INSTALLED"; fi ;;
+    3) RF_PROBE="$1"; RF_FAILED="$PROBE_ANSWER"; return 3 ;;
+  esac
+  return 1
+}
+
+# The search alone -- family_refresh writes down what it found. Prints the id
+# and leaves it in RF_ID; RF_NEWER/RF_NEEDS/RF_INSTALLED name the newest
+# release the API keeps for a newer CLI, and RF_PROBE/RF_FAILED the probe
+# that had no verdict, when one did (exit 3: the search stopped there, and
+# RF_ID is only the best id found before it). Every RF_* is assigned on the
+# first line, so nothing carries over from an earlier family.
+resolve_family() { # resolve_family <family> -> newest id the API serves this CLI; exit 3 when a probe had no verdict
+  RF_ID="" RF_NEWER="" RF_NEEDS="" RF_INSTALLED="" RF_PROBE="" RF_FAILED=""
+  local fam="$1" base major minor floor cand best="" rc=1
   base="$(model_alias_baseline "$fam")"
-  [ -n "$base" ] || { echo "$fam"; return; }
+  [ -n "$base" ] || { RF_ID="$fam"; echo "$fam"; return 0; }
   major="$(printf '%s' "$base" | sed -E "s/^claude-${fam}-([0-9]+).*/\1/")"
-  case "$major" in ''|*[!0-9]*) echo "$base"; return ;; esac
+  case "$major" in ''|*[!0-9]*) RF_ID="$base"; echo "$base"; return 0 ;; esac
   # The baseline's own minor. Every probe below asks for something above it,
   # so the answer is never older than the id the CLI already names. A bare
   # major is minor 0, and an 8-digit snapshot date is not a minor:
@@ -3831,7 +3893,9 @@ resolve_family() { # resolve_family <family> -> newest id (prints, and caches)
   local m
   for m in $(( major + 2 )) $(( major + 1 )); do
     cand="claude-${fam}-${m}"
-    if model_probe_ok "$cand"; then best="$cand"; major="$m"; floor=0; break; fi
+    family_probe "$cand"; rc=$?
+    [ "$rc" -ne 0 ] || { best="$cand"; major="$m"; floor=0; }
+    [ "$rc" -eq 1 ] || break
   done
   [ -n "$best" ] || best="$base"
 
@@ -3847,27 +3911,90 @@ resolve_family() { # resolve_family <family> -> newest id (prints, and caches)
   # minors) and 2 turns -- about a minute on the usual day, when nothing
   # newer exists. It runs once per family per MODELS_TTL: in the tick's
   # detached _resolve_models, or inline in effective_model when a family's
-  # cached id has expired.
-  for minor in 9 8 7 6 5 4 3 2 1; do
-    [ "$minor" -gt "$floor" ] || break
-    cand="claude-${fam}-${major}-${minor}"
-    if model_probe_ok "$cand"; then best="$cand"; break; fi
-  done
+  # cached id has expired. A probe with no verdict ends the search at once:
+  # the next ten would have none either.
+  if [ "$rc" -ne 3 ]; then
+    for minor in 9 8 7 6 5 4 3 2 1; do
+      [ "$minor" -gt "$floor" ] || break
+      cand="claude-${fam}-${major}-${minor}"
+      family_probe "$cand"; rc=$?
+      [ "$rc" -ne 0 ] || best="$cand"
+      [ "$rc" -eq 1 ] || break
+    done
+  fi
+  RF_ID="$best"
   echo "$best"
+  [ "$rc" -ne 3 ] || return 3
+  return 0
 }
 
-models_cache_get() { # models_cache_get <family> -> cached id if still fresh
+# config/models.json, one entry per family under .resolved:
+#   {id, at}               the last pass that finished, fresh for MODELS_TTL
+#   newer: {id, needs, installed, at}
+#                          the newest release that pass met which the API
+#                          keeps for a newer CLI; gone once a pass meets none
+#   failed_at, failed      the last pass a probe cut short, and the CLI's
+#                          answer; it leaves id/at alone and is tried again
+#                          MODELS_RETRY later
+models_cache_get() { # models_cache_get <family> -> cached id while fresh: MODELS_TTL after a finished pass, MODELS_RETRY after one cut short
   [ -f "$MODELS_FILE" ] || return 1
-  "$JQ" -er --arg f "$1" --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" \
-    '.resolved[$f] | select(.id != null and (($now - (.at // 0)) < $ttl)) | .id' \
+  "$JQ" -er --arg f "$1" --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" --argjson retry "$MODELS_RETRY" \
+    '.resolved[$f] | select(.id != null and ((($now - (.at // 0)) < $ttl) or (($now - (.failed_at // 0)) < $retry))) | .id' \
     "$MODELS_FILE" 2>/dev/null
 }
 
-models_cache_set() { # models_cache_set <family> <id>
+models_cache_set() { # models_cache_set <family> <id> [<newer id> <needs> <installed>] -- a finished pass: the whole entry is replaced
   local tmp; tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")"
   [ -f "$MODELS_FILE" ] || echo '{"resolved":{}}' > "$MODELS_FILE"
-  "$JQ" --arg f "$1" --arg id "$2" --argjson at "$(now_epoch)" \
-    '.resolved[$f] = {id:$id, at:$at}' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"
+  "$JQ" --arg f "$1" --arg id "$2" --arg nid "${3:-}" --arg needs "${4:-}" --arg inst "${5:-}" --argjson at "$(now_epoch)" \
+    '.resolved[$f] = ({id:$id, at:$at} + (if $nid == "" then {} else {newer:{id:$nid, needs:$needs, installed:$inst, at:$at}} end))' \
+    "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE" || rm -f "$tmp"
+}
+
+# A pass cut short is never written as fresh: .id and .at stay what the last
+# finished pass wrote -- the id is kept, not the partial answer, which can
+# be older than it -- and only a family with no id yet takes the best one the
+# search found. A release met before the cut is still noted: the 400 was a
+# real answer. Prints the id to run on.
+models_cache_fail() { # models_cache_fail <family> <best id found> <why> [<newer id> <needs> <installed>] -> the id to run on
+  local tmp; tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")"
+  [ -f "$MODELS_FILE" ] || echo '{"resolved":{}}' > "$MODELS_FILE"
+  "$JQ" --arg f "$1" --arg id "$2" --arg why "$3" --arg nid "${4:-}" --arg needs "${5:-}" --arg inst "${6:-}" --argjson now "$(now_epoch)" \
+    '.resolved[$f] = ((.resolved[$f] // {}) | .id = (.id // $id) | .at = (.at // 0) | .failed_at = $now | .failed = $why
+                      | if $nid == "" then . else .newer = {id:$nid, needs:$needs, installed:$inst, at:$now} end)' \
+    "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE" || rm -f "$tmp"
+  "$JQ" -r --arg f "$1" '.resolved[$f].id // empty' "$MODELS_FILE" 2>/dev/null
+}
+
+newer_cli_note() { # newer_cli_note <id> <needs> <installed> -> the sentence tick.log and resolve-models print
+  printf '%s is out and needs Claude Code %s (installed %s): run claude update' "$1" "$2" "${3:-version unknown}"
+}
+
+# One family's pass, written down: resolve_family's search, what it found in
+# config/models.json, and in tick.log the two things the operator has to act
+# on -- a release that waits for `claude update`, and a probe that had no
+# verdict. Prints the id to run the family on; FR_ID and FR_NOTE carry it and
+# that note for resolve-models' own line. Exit 3 when the pass was cut short.
+family_refresh() { # family_refresh <family> -> the id to run the family on
+  FR_ID="" FR_NOTE=""
+  local fam="$1" rc
+  resolve_family "$fam" >/dev/null; rc=$?
+  if [ "$rc" -eq 3 ]; then
+    FR_ID="$(models_cache_fail "$fam" "$RF_ID" "$RF_FAILED" "$RF_NEWER" "$RF_NEEDS" "$RF_INSTALLED")"
+    [ -n "$FR_ID" ] || FR_ID="$RF_ID"
+    FR_NOTE="the probe of $RF_PROBE failed ($RF_FAILED); kept $FR_ID, trying again in ${MODELS_RETRY}s"
+    log_tick "models: $fam — $FR_NOTE"
+  else
+    FR_ID="$RF_ID"
+    models_cache_set "$fam" "$FR_ID" "$RF_NEWER" "$RF_NEEDS" "$RF_INSTALLED"
+    if [ -n "$RF_NEWER" ]; then
+      FR_NOTE="$(newer_cli_note "$RF_NEWER" "$RF_NEEDS" "$RF_INSTALLED")"
+      log_tick "models: $fam — $FR_NOTE"
+    fi
+  fi
+  printf '%s\n' "$FR_ID"
+  [ "$rc" -ne 3 ] || return 3
+  return 0
 }
 
 effective_model() { # effective_model <model> -> concrete id (families resolved)
@@ -3877,30 +4004,48 @@ effective_model() { # effective_model <model> -> concrete id (families resolved)
     *) echo "$m"; return ;;          # already an explicit id — use it verbatim
   esac
   if hit="$(models_cache_get "$m")"; then echo "$hit"; return; fi
-  hit="$(resolve_family "$m")"
+  hit="$(family_refresh "$m")"
   [ -n "$hit" ] || hit="$m"
-  models_cache_set "$m" "$hit"
   echo "$hit"
 }
 
-models_stale() { # 0 = either cache is missing or older than MODELS_TTL
-  local oldest oa
+models_stale() { # 0 = a cache is missing or due: a block past MODELS_TTL, a cut-short family past MODELS_RETRY, or a CLI that changed under a release waiting for it
+  local due waiting cur
   [ -f "$MODELS_FILE" ] || return 0
-  oldest="$("$JQ" -r '[.resolved[]?.at // 0] | min // 0' "$MODELS_FILE" 2>/dev/null)"
-  case "$oldest" in ''|null|*[!0-9]*) oldest=0 ;; esac
-  # The openai block ages the same way. Absent, it is stale by definition --
-  # which is what gets it written on the first tick after this upgrade. It
-  # ages from the last ATTEMPT: a failed refresh keeps the catalog and stamps
-  # `stale_at` (resolve_models_openai) instead of moving `.at`, so the stamp
-  # is what keeps a missing codex from re-running the whole pass every tick.
-  oa="$("$JQ" -r '[.openai.at // 0, .openai.stale_at // 0] | max' "$MODELS_FILE" 2>/dev/null)"
-  case "$oa" in ''|null|*[!0-9]*) oa=0 ;; esac
-  [ "$oa" -lt "$oldest" ] && oldest="$oa"
-  local oc
-  oc="$("$JQ" -r '[.opencode.at // 0, .opencode.stale_at // 0] | max' "$MODELS_FILE" 2>/dev/null)"
-  case "$oc" in ''|null|*[!0-9]*) oc=0 ;; esac
-  [ "$oc" -lt "$oldest" ] && oldest="$oc"
-  [ "$(( $(now_epoch) - oldest ))" -ge "$MODELS_TTL" ]
+  # When each block is due, the earliest deciding. A family is fresh for
+  # MODELS_TTL after its last finished pass, or MODELS_RETRY after one a
+  # probe cut short -- whichever ends later -- so a failed pass is retried
+  # ten minutes on, neither a day later nor on every tick. No family at all
+  # is due at once. The openai block ages the same way. Absent, it is stale
+  # by definition -- which is what gets it written on the first tick after
+  # this upgrade. It ages from the last ATTEMPT: a failed refresh keeps the
+  # catalog and stamps `stale_at` (resolve_models_openai) instead of moving
+  # `.at`, so the stamp is what keeps a missing codex from re-running the
+  # whole pass every tick. The opencode block likewise. An unreadable file
+  # answers nothing, which is due: the pass reseeds it.
+  due="$("$JQ" -r --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" --argjson retry "$MODELS_RETRY" '
+    [ ((.resolved | if type == "object" then . else {} end)
+       | if length == 0 then 0
+         else [.[] | if type == "object" then [(.at // 0) + $ttl, (.failed_at // 0) + $retry] | max else 0 end] | min end),
+      (([.openai.at // 0, .openai.stale_at // 0] | max) + $ttl),
+      (([.opencode.at // 0, .opencode.stale_at // 0] | max) + $ttl) ]
+    | min <= $now' "$MODELS_FILE" 2>/dev/null)"
+  [ "$due" = "false" ] || return 0
+  # A release that waits for `claude update` is re-probed as soon as the CLI
+  # is not the one it was recorded against, so the notice goes -- and the
+  # family moves to the release -- within a tick of the update, not a day
+  # later. The CLI is asked its version only while such a release waits, and
+  # not for a family whose last pass failed less than MODELS_RETRY ago: a CLI
+  # that changed and lost its session would relaunch the pass every minute.
+  waiting="$("$JQ" -r --argjson now "$(now_epoch)" --argjson retry "$MODELS_RETRY" '
+    [.resolved[]? | objects | select(($now - (.failed_at // 0)) >= $retry) | .newer.installed? // empty | strings | select(. != "")]
+    | unique | join(" ")' "$MODELS_FILE" 2>/dev/null)"
+  [ -n "$waiting" ] || return 1
+  cur="$(claude_cli_version)"
+  [ -n "$cur" ] || return 1
+  local v
+  for v in $waiting; do [ "$v" = "$cur" ] || return 0; done
+  return 1
 }
 
 cmd_say() { # cmd_say <id> — message on stdin, delivered to the live run
@@ -4142,14 +4287,16 @@ cmd_resolve_models() { # cmd_resolve_models [anthropic|openai|opencode] -- no ar
   # be written exited 0 and the failure was invisible to the operator and to
   # install.sh. An UNAVAILABLE codex is not a failure: that is a written
   # {available:false} block, and resolve_models_openai already returns 0 for it.
+  # A family whose pass a probe cut short makes it exit 1 as well: family_refresh
+  # already kept its id and logged why, and the line says so.
   local which="${1:-}" fam id rc=0
   case "$which" in
     ""|anthropic)
       for fam in opus sonnet haiku fable; do
-        id="$(resolve_family "$fam")"
+        family_refresh "$fam" >/dev/null || rc=1
+        id="$FR_ID"
         [ -n "$id" ] || id="$fam"
-        models_cache_set "$fam" "$id"
-        echo "$fam -> $id"
+        echo "$fam -> $id${FR_NOTE:+ — $FR_NOTE}"
       done ;;
   esac
   case "$which" in

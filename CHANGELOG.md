@@ -69,6 +69,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A model probe that gets no verdict no longer reads as "this model does
+  not exist", and its pass is no longer trusted for a day.** A CLI with no
+  session answers every probe with `Not logged in · Please run /login`
+  (measured: run with no `USER` in its environment, Claude Code cannot find
+  its keychain login), and every one of them read as a refusal: each family
+  silently stayed on its alias, and the pass was cached as fresh for 24
+  hours. Such an answer — or an API error, or no JSON at all — now ends
+  that family's search at once, keeps the id its last finished pass found
+  (`.at` is left alone; `failed_at` and the CLI's answer are added), puts
+  the probe and the CLI's words in `tick.log`, and is tried again ten
+  minutes later (`MODELS_RETRY`), neither a day later nor on every tick; a
+  launch in between runs on the kept id without probing. `resolve-models`
+  exits 1 when a family's pass was cut short. `test/fake-claude` answers
+  from the real capture, committed as
+  `test/fixtures/claude-probe-not-logged-in.*`.
+
 - **A family resolves to the newest model the API serves the installed CLI,
   even one that CLI has never heard of.** Two defects sat on the probe's
   path. The minor probe asked only for 3, 2 and 1, and releases skip minors
@@ -229,6 +245,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   resize, the way a native select does.
 
 ### Added
+
+- **A model the API keeps for a newer Claude Code is named, with the command
+  that gets it.** On 2026-09-22 Opus 5.5 was out, the API served it only to
+  Claude Code 2.1.280 or newer, 2.1.258 was installed, and nothing in
+  agentloop said "run `claude update`": the family pass read the API's 400
+  as "no such id" and moved on. `model_probe_ok` now tells four answers
+  apart — served, refused (the 404), kept for a newer CLI (the 400, with the
+  version it needs and the one installed) and no verdict — and the pass
+  writes the newest such release down next to the family in
+  `config/models.json` (`resolved.<family>.newer`). It is said once per pass
+  in `tick.log`: *claude-opus-5-5 is out and needs Claude Code 2.1.280
+  (installed 2.1.258): run claude update*. It goes by itself: while a
+  release waits, the tick asks the
+  CLI its version (only then — it runs every minute), probes again as soon
+  as the version changes, and a pass that meets no such release drops the
+  note. `resolve-models` prints it next to the family.
 
 - **A `sast` finding can carry a `candidate` document** — trace (entrypoint →
   propagation → sink), the control that should have held, confidence,

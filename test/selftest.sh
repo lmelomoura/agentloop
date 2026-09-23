@@ -1923,6 +1923,53 @@ EOF
     || bad "claude-opus-4-8 with 5 and 5.5 served resolved to '$got', wanted claude-opus-5-5"
   [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-opus-6 claude-opus-5 claude-opus-5-9 claude-opus-5-8 claude-opus-5-7 claude-opus-5-6 claude-opus-5-5 " ] \
     && ok "and the new major's minors are probed from the top" || bad "probes: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # What the search leaves for whoever records it, besides the id: RF_ID,
+  # the newest release the API keeps for a newer CLI (RF_NEWER, RF_NEEDS,
+  # RF_INSTALLED) and, when a probe had no verdict, which one and why
+  # (RF_PROBE, RF_FAILED, exit 3). One line per world: rc|id|newer|needs|
+  # installed|probe|failed.
+  rfx() { # rfx <family> <alias's id> <ids the CLI knows> <ids the API serves it> [gated ids] [ids with no verdict]
+    : > "$tmp/rf.log"
+    ( CLAUDE_BIN="$BASE_DIR/test/fake-claude"
+      FAKE_ALIASES="$1=$2" FAKE_CLI_MODELS="$3" FAKE_API_MODELS="$4" FAKE_GATED_MODELS="${5:-}" FAKE_FAILED_MODELS="${6:-}" FAKE_PROBE_LOG="$tmp/rf.log"
+      export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS FAKE_GATED_MODELS FAKE_FAILED_MODELS FAKE_PROBE_LOG
+      resolve_family "$1" >/dev/null 2>&1
+      echo "$?|${RF_ID-}|${RF_NEWER-}|${RF_NEEDS-}|${RF_INSTALLED-}|${RF_PROBE-}|${RF_FAILED-}" )
+  }
+  # 2026-09-22 again, now with what the operator lacked that day: the family
+  # stays on the alias, and the search says which release waits for
+  # `claude update`, which version it needs and which one is installed.
+  got="$(rfx opus claude-opus-5 "claude-opus-5 claude-opus-4-8" "claude-opus-5 claude-opus-4-8" "claude-opus-5-5")"
+  [ "$got" = "0|claude-opus-5|claude-opus-5-5|2.1.280|2.1.258||" ] \
+    && ok "a release kept for a newer CLI is named, with the version it needs and the one installed" \
+    || bad "the 2026-09-22 world left '$got'"
+  # Probes run newest first, so the first such release met is the newest.
+  got="$(rfx opus claude-opus-5 "claude-opus-5" "claude-opus-5" "claude-opus-6 claude-opus-5-5")"
+  [ "$got" = "0|claude-opus-5|claude-opus-6|2.1.280|2.1.258||" ] \
+    && ok "of two such releases the newer is named (claude-opus-6 over claude-opus-5-5)" \
+    || bad "two gated releases left '$got'"
+  # No session: the first probe has no verdict, and neither would the next
+  # ten. The search stops there, keeps the best id it has (the alias's), and
+  # exits 3 with the CLI's own words.
+  : > "$tmp/rf.log"
+  got="$( CLAUDE_BIN="$BASE_DIR/test/fake-claude"
+          FAKE_ALIASES="opus=claude-opus-5-5" FAKE_CLI_MODELS="claude-opus-5-5" FAKE_API_MODELS="claude-opus-5-5" FAKE_CLAUDE_LOGGED_OUT=1 FAKE_PROBE_LOG="$tmp/rf.log"
+          export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS FAKE_CLAUDE_LOGGED_OUT FAKE_PROBE_LOG
+          resolve_family opus >/dev/null 2>&1
+          echo "$?|${RF_ID-}|${RF_NEWER-}|${RF_NEEDS-}|${RF_INSTALLED-}|${RF_PROBE-}|${RF_FAILED-}" )"
+  [ "$got" = "3|claude-opus-5-5||||claude-opus-7|Not logged in · Please run /login" ] \
+    && ok "a probe with no verdict ends the family's search: exit 3, the alias's id, which probe and why" \
+    || bad "a logged-out search left '$got'"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-opus-7 " ] && ok "and nothing is probed after it" \
+    || bad "probes after a failed one: $(tr '\n' ' ' < "$tmp/rf.log")"
+  # A session that goes mid-pass, after a newer CLI's release was met: the
+  # release is still reported -- the 400 was a real answer -- and the
+  # search stops at the probe that had none.
+  got="$(rfx opus claude-opus-5 "claude-opus-5" "claude-opus-5" "claude-opus-6" "claude-opus-5-8")"
+  [ "$got" = "3|claude-opus-5|claude-opus-6|2.1.280|2.1.258|claude-opus-5-8|Not logged in · Please run /login" ] \
+    && ok "a release met before the pass was cut short is still named" || bad "a mid-pass failure left '$got'"
+  [ "$(tr '\n' ' ' < "$tmp/rf.log")" = "claude-opus-7 claude-opus-6 claude-opus-5-9 claude-opus-5-8 " ] \
+    && ok "and the search stopped at the probe with no verdict" || bad "probes: $(tr '\n' ' ' < "$tmp/rf.log")"
 
   echo "model_probe_ok() — the JSON answer alone decides, whatever the CLI adds on stderr"
   # For every request that goes out for an id it does not recognise, the CLI
@@ -1937,9 +1984,151 @@ EOF
   ( CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_CLI_MODELS=""; FAKE_API_MODELS="claude-opus-5-5"
     export FAKE_CLI_MODELS FAKE_API_MODELS; model_probe_ok claude-opus-5-3 ) 2>/dev/null
   want "an id the API does not serve (the real 404) is refused" 1 $?
-  ( CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_CLI_MODELS=""; FAKE_API_MODELS="claude-opus-5"; FAKE_GATED_MODELS="claude-opus-5-5"
-    export FAKE_CLI_MODELS FAKE_API_MODELS FAKE_GATED_MODELS; model_probe_ok claude-opus-5-5 ) 2>/dev/null
-  want "an id the API serves only to a newer CLI (the real 400) is refused" 1 $?
+  # Three answers used to read as that same "no such id". The 400 of a
+  # release the API keeps for a newer CLI is an id that exists, and the one
+  # thing that reaches it is `claude update` -- so it is its own answer, with
+  # both versions kept. The 400 names the build that asked; the stand-in
+  # plays 2.1.270 here so the installed version is read, not assumed.
+  got="$( CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_CLI_MODELS=""; FAKE_API_MODELS="claude-opus-5"; FAKE_GATED_MODELS="claude-opus-5-5"; FAKE_CLAUDE_VERSION=2.1.270
+          export FAKE_CLI_MODELS FAKE_API_MODELS FAKE_GATED_MODELS FAKE_CLAUDE_VERSION
+          model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_NEEDS-}|${PROBE_INSTALLED-}|${PROBE_ANSWER-}" )"
+  [ "$got" = "2|2.1.280|2.1.270|" ] \
+    && ok "an id the API serves only to a newer CLI (the real 400) is its own answer, 2, naming the version required and the one installed" \
+    || bad "the 400 of a newer CLI's release read as '$got', wanted '2|2.1.280|2.1.270|'"
+  # A CLI with no session answers every id alike -- the real capture, taken
+  # with no USER in the environment -- so the probe learned nothing about
+  # the id. Read as a refusal, every family quietly stayed on its alias and
+  # the pass was cached as fresh for a day. The CLI's own words are kept.
+  got="$( CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_CLI_MODELS=""; FAKE_API_MODELS="claude-opus-5-5"; FAKE_CLAUDE_LOGGED_OUT=1
+          export FAKE_CLI_MODELS FAKE_API_MODELS FAKE_CLAUDE_LOGGED_OUT
+          model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_NEEDS-}|${PROBE_ANSWER-}" )"
+  [ "$got" = "3||Not logged in · Please run /login" ] \
+    && ok "no session is no verdict (3), even for a served id, and the CLI's answer is kept to say why" \
+    || bad "a logged-out probe read as '$got'"
+  # The version is what makes a 400 a newer CLI's release. The real capture
+  # with its sentence swapped: a 400 that names no version says nothing
+  # about the id either.
+  "$JQ" -c '.result = "API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"something else\"}}"' \
+    "$BASE_DIR/test/fixtures/claude-probe-version-gated.json" > "$tmp/probe-400.json"
+  printf '#!/bin/sh\ncat "%s"\nexit 1\n' "$tmp/probe-400.json" > "$tmp/claude-400"; chmod +x "$tmp/claude-400"
+  got="$( CLAUDE_BIN="$tmp/claude-400"; model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_NEEDS-}" )"
+  [ "$got" = "3|" ] && ok "a 400 that names no version is no verdict either, never a newer CLI's release" \
+    || bad "a 400 with no version read as '$got'"
+  # And a CLI that dies without a word: nothing on stdout, exit 1.
+  printf '#!/bin/sh\nexit 1\n' > "$tmp/claude-mute"; chmod +x "$tmp/claude-mute"
+  got="$( CLAUDE_BIN="$tmp/claude-mute"; model_probe_ok claude-opus-5-5 2>/dev/null; echo "$?|${PROBE_ANSWER-}" )"
+  [ "$got" = "3|no answer from claude (exit 1)" ] && ok "a CLI that answers nothing is no verdict, and says so with its exit code" \
+    || bad "a mute CLI read as '$got'"
+
+  echo "family_refresh() — a pass written down: a newer CLI's release noted and cleared, a pass cut short never fresh"
+  # The recorder around resolve_family, for the tick's daily pass
+  # (cmd_resolve_models) and for a launch whose family has expired
+  # (effective_model). One scratch config throughout, in a subshell so
+  # MODELS_FILE cannot leak -- ok/bad count into _upass/_ufail and the
+  # RESULT line carries the count out, as in the catalog blocks above. No
+  # `case` in here: bash 3.2 reads a case pattern's `)` as the end of $( ).
+  local _frout
+  _frout="$(
+    mkdir -p "$tmp/fr"
+    CONFIG_DIR="$tmp/fr"; MODELS_FILE="$tmp/fr/models.json"; TICK_LOG="$tmp/fr/tick.log"
+    CLAUDE_BIN="$BASE_DIR/test/fake-claude"; FAKE_PROBE_LOG="$tmp/fr/probes.log"; export FAKE_PROBE_LOG
+    _upass=0; _ufail=0
+    ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
+    bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }
+    # The other two catalogs fresh, so only the anthropic families decide models_stale here.
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{}, openai:{at:$now, models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    : > "$TICK_LOG"
+
+    # 2026-09-22 on 2.1.258: the API keeps claude-opus-5-5 for 2.1.280 or newer.
+    FAKE_ALIASES="opus=claude-opus-5 sonnet=claude-sonnet-5" FAKE_CLI_MODELS="claude-opus-5 claude-sonnet-5"
+    FAKE_API_MODELS="claude-opus-5 claude-sonnet-5" FAKE_GATED_MODELS="claude-opus-5-5"
+    export FAKE_ALIASES FAKE_CLI_MODELS FAKE_API_MODELS FAKE_GATED_MODELS
+    got="$(family_refresh opus)"; rc=$?
+    [ "$rc:$got" = "0:claude-opus-5" ] && ok "family_refresh: the family stays on the id this CLI can run" || bad "family_refresh opus: rc=$rc '$got'"
+    "$JQ" -e '.resolved.opus | .id == "claude-opus-5" and .at > 0 and .newer.id == "claude-opus-5-5" and .newer.needs == "2.1.280"
+              and .newer.installed == "2.1.258" and .newer.at > 0 and (has("failed_at") | not)' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "family_refresh: the release is written next to the resolution -- the id, the version it needs, the one installed, when" \
+      || bad "models.json after the pass that met it: $(cat "$MODELS_FILE")"
+    [ "$(grep -c . "$TICK_LOG")" = 1 ] && grep -qF 'models: opus — claude-opus-5-5 is out and needs Claude Code 2.1.280 (installed 2.1.258): run claude update' "$TICK_LOG" \
+      && ok "family_refresh: and tick.log gets one line that says what to run" || bad "tick.log: $(cat "$TICK_LOG")"
+    [ "$(models_cache_get opus)" = "claude-opus-5" ] && ok "models_cache_get: that pass finished, so its id is fresh" \
+      || bad "cache after the pass: '$(models_cache_get opus)'"
+    models_stale; want "models_stale: not due while the CLI is the one the release was recorded against" 1 $?
+
+    # `claude update`: 2.1.280, whose alias is claude-opus-5-5, which the API serves it.
+    FAKE_CLAUDE_VERSION=2.1.280; export FAKE_CLAUDE_VERSION
+    models_stale; want "models_stale: due at once when the CLI is not the one a release was recorded against" 0 $?
+    FAKE_ALIASES="opus=claude-opus-5-5 sonnet=claude-sonnet-5" FAKE_CLI_MODELS="claude-opus-5 claude-opus-5-5 claude-sonnet-5"
+    FAKE_API_MODELS="claude-opus-5 claude-opus-5-5 claude-sonnet-5" FAKE_GATED_MODELS=""
+    got="$(family_refresh opus)"; rc=$?
+    [ "$rc:$got" = "0:claude-opus-5-5" ] && ok "family_refresh: after the update the family moves to the release" || bad "after the update: rc=$rc '$got'"
+    "$JQ" -e '.resolved.opus | .id == "claude-opus-5-5" and (has("newer") | not)' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "family_refresh: and the notice is gone once the CLI is new enough" || bad "models.json after the update: $(cat "$MODELS_FILE")"
+    [ "$(grep -c . "$TICK_LOG")" = 1 ] && ok "family_refresh: a pass with nothing to act on logs nothing" || bad "tick.log: $(cat "$TICK_LOG")"
+    models_stale; want "models_stale: fresh again after that pass" 1 $?
+
+    # No session -- the tick's environment without USER -- once opus has expired.
+    "$JQ" --argjson old "$(( $(now_epoch) - MODELS_TTL - 60 ))" '.resolved.opus.at = $old' "$MODELS_FILE" > "$MODELS_FILE.t" && mv "$MODELS_FILE.t" "$MODELS_FILE"
+    _old="$("$JQ" -r '.resolved.opus.at' "$MODELS_FILE")"
+    FAKE_CLAUDE_LOGGED_OUT=1; export FAKE_CLAUDE_LOGGED_OUT
+    got="$(family_refresh opus)"; rc=$?
+    [ "$rc:$got" = "3:claude-opus-5-5" ] && ok "family_refresh: a pass cut short keeps the id the family had, and exits 3" || bad "logged out: rc=$rc '$got'"
+    "$JQ" -e --argjson old "$_old" '.resolved.opus | .id == "claude-opus-5-5" and .at == $old and .failed_at > 0
+              and .failed == "Not logged in · Please run /login"' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "family_refresh: and is never written as fresh -- .at stays, .failed_at and the CLI's answer are added" \
+      || bad "models.json after a failed pass: $(cat "$MODELS_FILE")"
+    [ "$(grep -c . "$TICK_LOG")" = 2 ] \
+      && grep -qF "models: opus — the probe of claude-opus-7 failed (Not logged in · Please run /login); kept claude-opus-5-5, trying again in ${MODELS_RETRY}s" "$TICK_LOG" \
+      && ok "family_refresh: tick.log gets the probe, the CLI's answer, and when it is tried again" || bad "tick.log: $(cat "$TICK_LOG")"
+    [ "$(models_cache_get opus)" = "claude-opus-5-5" ] && ok "models_cache_get: the kept id serves a launch until the retry, with no probe of its own" \
+      || bad "cache after a failed pass: '$(models_cache_get opus)'"
+    models_stale; want "models_stale: not due again before MODELS_RETRY" 1 $?
+    "$JQ" --argjson t "$(( $(now_epoch) - MODELS_RETRY - 1 ))" '.resolved.opus.failed_at = $t' "$MODELS_FILE" > "$MODELS_FILE.t" && mv "$MODELS_FILE.t" "$MODELS_FILE"
+    models_stale; want "models_stale: due once MODELS_RETRY has passed -- the tick retries, not a day later" 0 $?
+    [ -z "$(models_cache_get opus)" ] && ok "models_cache_get: and a launch then probes again" || bad "cache past the retry: '$(models_cache_get opus)'"
+
+    # A launch on that expired family, still with no session.
+    got="$(effective_model opus)"
+    [ "$got" = "claude-opus-5-5" ] && "$JQ" -e --argjson old "$_old" '.resolved.opus.at == $old' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "effective_model: a launch whose probe failed runs on the kept id, and caches nothing as fresh" \
+      || bad "effective_model logged out: '$got', $(cat "$MODELS_FILE")"
+
+    # A family never resolved before, no session: the alias's id, and nothing fresh.
+    got="$(family_refresh sonnet)"; rc=$?
+    [ "$rc:$got" = "3:claude-sonnet-5" ] && "$JQ" -e '.resolved.sonnet | .id == "claude-sonnet-5" and .at == 0 and .failed_at > 0' "$MODELS_FILE" >/dev/null 2>&1 \
+      && ok "family_refresh: with nothing cached the alias's id is kept, and .at is 0" || bad "sonnet logged out: rc=$rc '$got', $(cat "$MODELS_FILE")"
+
+    # A release recorded against another CLI does not bring the pass back
+    # inside MODELS_RETRY of a failed one -- or a CLI that changed and lost
+    # its session would relaunch it every minute.
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{opus:{id:"claude-opus-5", at:$now, failed_at:$now, failed:"x",
+        newer:{id:"claude-opus-5-5", needs:"2.1.280", installed:"2.1.258", at:$now}}},
+      openai:{at:$now, models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    models_stale; want "models_stale: a changed CLI waits for MODELS_RETRY after a failed pass" 1 $?
+
+    # What `agentloop resolve-models` prints, and its exit code.
+    out="$(cmd_resolve_models anthropic 2>&1)"; rc=$?
+    [ "$rc" = 1 ] && grep -qF "opus -> claude-opus-5 — the probe of claude-opus-7 failed (Not logged in · Please run /login); kept claude-opus-5, trying again in ${MODELS_RETRY}s" <<< "$out" \
+      && ok "resolve-models: a family's pass cut short is printed as such, and the command exits 1" || bad "resolve-models logged out: rc=$rc $out"
+    unset FAKE_CLAUDE_LOGGED_OUT
+    FAKE_CLAUDE_VERSION=2.1.258 FAKE_ALIASES="opus=claude-opus-5" FAKE_CLI_MODELS="claude-opus-5" FAKE_API_MODELS="claude-opus-5" FAKE_GATED_MODELS="claude-opus-5-5"
+    out="$(cmd_resolve_models anthropic 2>&1)"; rc=$?
+    [ "$rc" = 0 ] && grep -qF "opus -> claude-opus-5 — claude-opus-5-5 is out and needs Claude Code 2.1.280 (installed 2.1.258): run claude update" <<< "$out" \
+      && ok "resolve-models: the release is printed next to the family, and the pass that met it exits 0" || bad "resolve-models gated: rc=$rc $out"
+
+    # The tick asks models_stale every minute: the CLI is asked its version
+    # only while a release waits for an update.
+    printf '#!/bin/sh\necho "$*" >> "%s"\necho "2.1.280 (Claude Code)"\n' "$tmp/fr/asked.log" > "$tmp/fr/claude-v"; chmod +x "$tmp/fr/claude-v"
+    CLAUDE_BIN="$tmp/fr/claude-v"; : > "$tmp/fr/asked.log"
+    "$JQ" -n --argjson now "$(now_epoch)" '{resolved:{opus:{id:"claude-opus-5-5", at:$now}}, openai:{at:$now, models:[]}, opencode:{at:$now, models:[]}}' > "$MODELS_FILE"
+    models_stale; want "models_stale: fresh, with nothing waiting" 1 $?
+    [ ! -s "$tmp/fr/asked.log" ] && ok "models_stale: and the CLI was not run to find out" || bad "the CLI was asked: $(cat "$tmp/fr/asked.log")"
+    echo "RESULT ok=$_upass bad=$_ufail"
+  )"
+  printf '%s\n' "$_frout" | grep -v '^RESULT '
+  printf '%s\n' "$_frout" | grep -qx 'RESULT ok=24 bad=0' \
+    && ok "family_refresh over the probe stand-in: all 24 assertions reach the gate" \
+    || bad "family_refresh over the probe stand-in did not: $(printf '%s\n' "$_frout" | tail -1)"
 
   echo "bind_session() — one shot, atomic, and a no-op without a run dir"
   mkdir -p "$tmp/rd1"
