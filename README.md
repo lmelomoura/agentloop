@@ -1429,6 +1429,40 @@ a finding names the lower-trust principal, the input, the control that should
 have held, the boundary crossed, what is affected and the observable result;
 a missing best practice is a hardening note at `info`, not a vulnerability.
 
+### And who checks it
+
+A finding the agent minted is a claim until somebody who did not make it has
+tried to disprove it. After the SAST pass, the analysis works a **verification
+queue** — its own `sast` findings at `medium` or above, plus any below that
+claim a `high` impact — and for each one launches a **subagent with a prompt
+the CLI minted from the ledger**, not one the hunter wrote. The subagent reads
+the code, looks for what contradicts the claim, and writes its own verdict:
+`confirmed` (read it, could not disprove it), `rejected` (disproved, and here
+is what disproves it) or `needs_validation` (turns on a fact the code does not
+hold). The hunter's `rationale` is deliberately not shown to it — everything
+checkable line by line is in the candidate, and the rest is persuasion.
+
+**A disproved finding leaves the posture and stays in the ledger**: out of the
+donut and the severity counts, off the browser's default view exactly as a
+`fixed` one is, and into its own section of the report with the reason. It is
+not inherited — the next analysis puts it back in the queue, because a reading
+of one day is not a permanent decision. That is what *Accept risk* and *False
+positive* are for.
+
+**And the close counts it, rather than asking for it.** The engine reads the
+run's stream for the subagents it launched and compares that with the verdicts
+in the ledger: findings left unverified, subagents that produced no verdict,
+and verdicts with no subagent behind them each lower `done` to `capped` with
+the numbers in the report. The first of the three is the one the other two
+cannot see — an agent that ignores the phase launches nothing and records
+nothing, so the two counts agree at zero while the work never happened. It is
+the same shape as the triage guard, for the same reason: asking is what
+failed.
+
+The phase runs on Claude Code only, where a subagent has a shell and can write
+its own verdict; on the Codex CLI and OpenCode the `verification` row of the
+coverage table reads `skipped`.
+
 ### Hunting guides
 
 `skills/security-analysis/references/` carries `ATTACK-CLASSES.md` and ten

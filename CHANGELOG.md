@@ -67,6 +67,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The security-analysis skill has a fourth job: verification** — the queue,
+  the minted prompt, one subagent per finding, and the fact that the close
+  counts. The README's *Security analysis* section documents the verdicts, the
+  posture change and the three guards.
+
 - **The `Agent` tool is open again for a security analysis, and the close
   counts what it was used for.** Verification is subagents, so closing the
   tool would close the phase; `security_task_count` reads the run's stream and
