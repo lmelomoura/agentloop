@@ -1697,11 +1697,19 @@ JSON
     printf '%s\n' "$_b" | grep -qF "            account Client A ($tmp/sp/acct-a) — signed in as a@example.org · max plan; used by 0; $(skills_missing "$tmp/sp/acct-a/skills") skill(s) not linked there (agentloop skills install)" \
       && ok "status_platforms_block: one line per registered account, under its platform" \
       || bad "account line: $(printf '%s\n' "$_b" | grep account)"
+    # The account lines do not depend on the platform readiness check above:
+    # a Default with no session must still say which accounts exist and
+    # whether each one of them is ready, or an operator staring at "not
+    # ready" cannot tell whether every account is down too.
+    _b="$(FAKE_CLAUDE_LOGGED_OUT=1 status_platforms_block)"
+    printf '%s\n' "$_b" | grep -qF "            account Client A ($tmp/sp/acct-a)" \
+      && ok "status_platforms_block: the account lines still print when the platform's Default is not ready" \
+      || bad "no account line with the Default down: $(printf '%s\n' "$_b" | grep account)"
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_spout" | grep -v '^RESULT '
-  printf '%s\n' "$_spout" | grep -qx 'RESULT ok=10 bad=0' \
-    && ok "status_platforms_block over the stand-ins: all 10 assertions reach the gate" \
+  printf '%s\n' "$_spout" | grep -qx 'RESULT ok=11 bad=0' \
+    && ok "status_platforms_block over the stand-ins: all 11 assertions reach the gate" \
     || bad "status_platforms_block did not: $(printf '%s\n' "$_spout" | tail -1)"
   got="$(age_label "$(( $(now_epoch) + 600 ))")"
   [ "$got" = "0m ago" ] \
@@ -5490,6 +5498,13 @@ NASTY
             '{($k): {five_hour: {status:"allowed", utilization:0.97, resets_at:$r, overage:null, seen_at:0}}}' > "$RATE_LIMIT_FILE"
           rl_gate "anthropic@/x/.claude-a" "Client A" 2>/dev/null )"
   case "$got" in *"the anthropic five_hour window of Client A is 97% used"*) ok "and the hold names the account" ;; *) bad "named gate: '$got'" ;; esac
+  # The OTHER branch of the same sentence -- a refusal, not a percentage --
+  # names the account too; only the utilisation one was ever probed with a name.
+  got="$( DATA_DIR="$tmp/rl"; RATE_LIMIT_FILE="$tmp/rl/named2.json"
+          "$JQ" -n --arg k "anthropic@/x/.claude-a" --argjson r "$soon" \
+            '{($k): {five_hour: {status:"rejected", utilization:null, resets_at:$r, overage:null, seen_at:0}}}' > "$RATE_LIMIT_FILE"
+          rl_gate "anthropic@/x/.claude-a" "Client A" 2>/dev/null )"
+  case "$got" in *"the anthropic five_hour window of Client A is spent (API says rejected)"*) ok "and so does the refusal sentence" ;; *) bad "named refusal gate: '$got'" ;; esac
 
   echo "statusline-rate-limits.sh — the figure the run stream never carries"
   # The stream only reports utilisation once the CLI has decided to warn (0.75),
@@ -5563,6 +5578,25 @@ NASTY
     | CLAUDE_CONFIG_DIR="$HOME/.claude" AGENTLOOP_DATA="$tmp/sl" AGENTLOOP_STATUSLINE_MIN_SECONDS=0 sh "$sl" >/dev/null 2>&1
   [ "$(sl_get '.anthropic.five_hour.utilization')" = "0.41" ] \
     && ok "and one pointed at ~/.claude feeds the platform's own" || bad "statusline ~/.claude: $(sl_get '.|tostring')"
+
+  # The write floor is per KEY, not per file: every case above pinned
+  # AGENTLOOP_STATUSLINE_MIN_SECONDS=0, so the floor itself -- the one thing
+  # this script exists to have at all -- was never actually exercised.
+  rm -f "$tmp/sl/rate-limits.json"
+  printf '%s' '{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":444}}}' \
+    | CLAUDE_CONFIG_DIR="/x/.claude-b" AGENTLOOP_DATA="$tmp/sl" AGENTLOOP_STATUSLINE_MIN_SECONDS=999 sh "$sl" >/dev/null 2>&1
+  [ "$(sl_get '.["anthropic@/x/.claude-b"].five_hour.utilization')" = "0.1" ] \
+    && ok "a fresh account key writes through the floor the first time" || bad "first account write under the floor: $(sl_get '.|tostring')"
+  printf '%s' '{"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":333}}}' \
+    | env -u CLAUDE_CONFIG_DIR AGENTLOOP_DATA="$tmp/sl" AGENTLOOP_STATUSLINE_MIN_SECONDS=999 sh "$sl" >/dev/null 2>&1
+  [ "$(sl_get '.anthropic.five_hour.utilization')" = "0.5" ] \
+    && ok "...and a Default write right after is NOT held back by another account's floor" \
+    || bad "Default write held by account B's floor: $(sl_get '.|tostring')"
+  printf '%s' '{"rate_limits":{"five_hour":{"used_percentage":99,"resets_at":444}}}' \
+    | CLAUDE_CONFIG_DIR="/x/.claude-b" AGENTLOOP_DATA="$tmp/sl" AGENTLOOP_STATUSLINE_MIN_SECONDS=999 sh "$sl" >/dev/null 2>&1
+  [ "$(sl_get '.["anthropic@/x/.claude-b"].five_hour.utilization')" = "0.1" ] \
+    && ok "but a second write to the SAME account key inside the floor IS held back" \
+    || bad "same-key floor did not hold: $(sl_get '.["anthropic@/x/.claude-b"].five_hour.utilization')"
 
   echo "failure causes — an outage is not the job's fault, and must not slow it down"
   # `error` covered a 529 the API returned and an agent that got its tools taken
@@ -5746,7 +5780,13 @@ NASTY
     if [ -n "${2:-}" ]; then printf '%s' "$2" > "$tmp/usg/rate-limits.json"
     else rm -f "$tmp/usg/rate-limits.json"; fi
     ( HOME="$tmp/usg_home"; mkdir -p "$HOME/.claude"; cp "$tmp/usg/settings.json" "$HOME/.claude/settings.json"
-      PLIST_PATH=/nonexistent; AGENTLOOP_CLAUDE_CONFIG_DIR=""; PLATFORMS_FILE="${USG_PLATFORMS:-$PLATFORMS_FILE}"
+      # CODEX_HOME_DIR is set once, at script load, off the REAL $HOME -- it
+      # does not track this HOME override the way account_cli_default's own
+      # fresh read of $HOME does. Left alone, the openai Default would look
+      # pinned to every test below, never the CLI's own directory. Kept in
+      # step with HOME above, the same way a real process's never drifts.
+      PLIST_PATH=/nonexistent; AGENTLOOP_CLAUDE_CONFIG_DIR="${USG_PIN:-}"; PLATFORMS_FILE="${USG_PLATFORMS:-$PLATFORMS_FILE}"
+      CODEX_HOME_DIR="$HOME/.codex"
       DATA_DIR="$tmp/usg"; RATE_LIMIT_FILE="$tmp/usg/rate-limits.json"; cmd_usage ) 2>/dev/null
   }
   soon2="$(( $(now_epoch) + 3600 ))"
@@ -5797,10 +5837,46 @@ NASTY
   printf '%s' "$wired" > "$tmp/usg/acct-a/settings.json"
   printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":[],"accounts":[{"id":"a","name":"Client A","dir":"%s"}]}}}\n' "$tmp/usg/acct-a" > "$tmp/usg/platforms.json"
   got="$(USG_PLATFORMS="$tmp/usg/platforms.json" usg '{}' '{"anthropic@'"$tmp/usg/acct-a"'":{"five_hour":{"status":"allowed","utilization":0.3,"resets_at":'"$soon2"',"seen_at":0,"source":"statusline"}},"anthropic@/gone/.claude-x":{"five_hour":{"status":"allowed","utilization":0.2,"resets_at":'"$soon2"',"seen_at":0}}}')"
-  case "$got" in *"anthropic (Client A) five_hour: 30% used"*"anthropic (/gone/.claude-x — no longer an account) five_hour: 20% used"*)
+  case "$got" in *"anthropic (Client A) five_hour: 30% used"*"anthropic (/gone/.claude-x — not an account) five_hour: 20% used"*)
       ok "usage names each account's block: a registered one by name, one Settings no longer has by its directory" ;;
     *) bad "usage per account: $got" ;; esac
   case "$got" in *"statusline (Client A): wired to"*"it has fed the gate"*) ok "and says whether each account's own settings feed its gate" ;; *) bad "statusline per account: $got" ;; esac
+
+  # usage_account_label's own "Default" branch, directly: a pinned Claude
+  # Default, and a Codex Default whose CODEX_HOME is not ~/.codex.
+  got="$( AGENTLOOP_CLAUDE_CONFIG_DIR="$tmp/usg/pin"; usage_account_label anthropic "$tmp/usg/pin" )"
+  [ "$got" = "Default" ] && ok "usage_account_label: a pinned Claude Default is named Default" || bad "pinned Default label: '$got'"
+  got="$( CODEX_HOME_DIR="$tmp/usg/codex-x"; usage_account_label openai "$tmp/usg/codex-x" )"
+  [ "$got" = "Default" ] && ok "and so is a Codex Default on a non-default CODEX_HOME" || bad "codex Default label: '$got'"
+
+  # The bug this round fixes: a pinned install upgraded from an unpinned one
+  # carries a STALE, spent bare block that no scheduled run reads any more
+  # (the Default's own gate moved to the pinned key) -- `usage` used to cry
+  # HOLD over it anyway, while the run it was actually worried about went
+  # right through. Reproduced here rather than only in the bug report: a bare
+  # block and the pinned key's block, both spent, on a platforms.json with no
+  # registered accounts at all -- nothing but the pin decides either label.
+  mkdir -p "$tmp/usg/pin"
+  printf '{"platforms":{}}\n' > "$tmp/usg/platforms-pin.json"
+  pinrl="$("$JQ" -nc --argjson r "$soon2" --arg k "anthropic@$tmp/usg/pin" \
+    '{anthropic: {five_hour:{status:"allowed",utilization:0.97,resets_at:$r,seen_at:0}},
+      ($k): {five_hour:{status:"allowed",utilization:0.97,resets_at:$r,seen_at:0}}}')"
+  got="$(USG_PLATFORMS="$tmp/usg/platforms-pin.json" USG_PIN="$tmp/usg/pin" usg '{}' "$pinrl")"
+  case "$got" in
+    *"anthropic ($tmp/usg_home/.claude — not an account) five_hour: 97% used"*)
+      ok "usage: under a pin, the stale bare block is labelled not an account" ;;
+    *) bad "bare block under a pin: $got" ;;
+  esac
+  case "$got" in
+    *"SCHEDULED anthropic ($tmp/usg_home/.claude — not an account) RUNS ARE BEING HELD BACK"*)
+      bad "the bare block still claims to hold runs back under a pin: $got" ;;
+    *) ok "...and carries no HOLD line: no scheduled run reads it any more" ;;
+  esac
+  case "$got" in
+    *"anthropic (Default) five_hour: 97% used"*"SCHEDULED anthropic (Default) RUNS ARE BEING HELD BACK"*)
+      ok "while the pinned key's own block -- the Default's real gate -- does carry the HOLD line" ;;
+    *) bad "pinned Default block: $got" ;;
+  esac
 
   echo "the Claude account comes from the setting, never from the environment"
   # cmd_install refuses an ambient CLAUDE_CONFIG_DIR, and for a while the runtime

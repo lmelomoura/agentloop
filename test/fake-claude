@@ -31,6 +31,12 @@
 #   FAKE_CLAUDE_LOGGED_OUT  set to play a CLI with no session: `auth status` exits 1,
 #                      and in the probe world below every model probe gets the
 #                      CLI's not-logged-in answer
+#   FAKE_RATE_LIMIT_EVENT  set to emit one rate_limit_event line into the
+#                      stream, shaped like the real one (see the fixture in
+#                      test/selftest.sh's rate-limits block): status
+#                      allowed_warning, rateLimitType seven_day, utilization
+#                      0.98. rl_capture reads it off the account's own stream,
+#                      whichever account's directory this launch ran with.
 #   $CLAUDE_CONFIG_DIR/.fake-logged-out  that one directory has no session (an account signed out)
 #   $CLAUDE_CONFIG_DIR/.fake-email       the email `auth status` names for that directory
 #   FAKE_CLAUDE_VERSION  the build this stand-in plays (default 2.1.258): what
@@ -183,6 +189,8 @@ fi
 }
 
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}\n'
+
+[ -z "${FAKE_RATE_LIMIT_EVENT:-}" ] || printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785427200,"rateLimitType":"seven_day","utilization":0.98,"surpassedThreshold":0.75}}\n'
 
 case "$mode" in
   dirty)

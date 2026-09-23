@@ -1307,8 +1307,8 @@ mkdir -p "$ROOT/accounts/claude-a"
 mkjob_acct j47 client-a
 jq --arg pc "printf '%s' \"\${CLAUDE_CONFIG_DIR-<unset>}\" > $ROOT/pc-47; exit 0" '.jobs[0].precheck = $pc' \
   "$ROOT/config/jobs.json" > "$ROOT/config/jobs.next" && mv "$ROOT/config/jobs.next" "$ROOT/config/jobs.json"
-acct47="$ROOT/account-47"; rm -f "$acct47" "$ROOT/pc-47"
-FAKE_ACCOUNT_OUT="$acct47" FAKE_MODE=complete FAKE_SESSION=sess-47 "$AL" run j47 >/dev/null 2>&1
+acct47="$ROOT/account-47"; rm -f "$acct47" "$ROOT/pc-47" "$ROOT/data/rate-limits.json"
+FAKE_ACCOUNT_OUT="$acct47" FAKE_MODE=complete FAKE_SESSION=sess-47 FAKE_RATE_LIMIT_EVENT=1 "$AL" run j47 >/dev/null 2>&1
 sleep 1
 [ "$(cat "$acct47" 2>/dev/null)" = "$ROOT/accounts/claude-a" ] \
   && ok "the agent runs with CLAUDE_CONFIG_DIR set to the account's directory" || bad "the agent saw '$(cat "$acct47" 2>/dev/null)'"
@@ -1316,6 +1316,14 @@ sleep 1
   && ok "and so does its precheck" || bad "the precheck saw '$(cat "$ROOT/pc-47" 2>/dev/null)'"
 [ "$(lastrun | jq -r '[.account, .account_dir] | join(" ")')" = "client-a $ROOT/accounts/claude-a" ] \
   && ok "the journal records the account and the directory the run used" || bad "record: $(lastrun | jq -c '{account, account_dir}')"
+# run_job's own Claude capture key: the run's rate_limit_event lands in this
+# account's block (rl_key), never the bare platform one -- fake-claude never
+# emitted one at all until FAKE_RATE_LIMIT_EVENT above gave it one to capture.
+[ "$(jq -r --arg k "anthropic@$ROOT/accounts/claude-a" '.[$k].seven_day.utilization' "$ROOT/data/rate-limits.json" 2>/dev/null)" = "0.98" ] \
+  && [ "$(jq -r 'has("anthropic")' "$ROOT/data/rate-limits.json" 2>/dev/null)" = "false" ] \
+  && ok "the run's usage reading lands in anthropic@<account dir>, not the bare anthropic block" \
+  || bad "rate-limits after an account run: $(cat "$ROOT/data/rate-limits.json" 2>/dev/null)"
+rm -f "$ROOT/data/rate-limits.json"
 rm -f "$ROOT/pc-47"
 "$AL" check j47 >/dev/null 2>&1
 [ "$(cat "$ROOT/pc-47" 2>/dev/null)" = "$ROOT/accounts/claude-a" ] \
@@ -1382,11 +1390,19 @@ grep -qF "j50: anthropic is not ready (claude is not signed in in $ROOT/accounts
 # cleaned up that way -- their absence is what actually proves no slot ran.
 [ ! -d "$ROOT/data/logs/j50" ] && [ -z "$(run_of j50)" ] && [ -z "$(dirs j50)" ] \
   && ok "and no run directory, log or journal record was left behind" \
-  || bad "log dir: $(ls -d "$ROOT/data/logs/j50" 2>&1); record: $(run_of j50)"
+  || bad "log dir: $(ls -d "$ROOT/data/logs/j50" 2>&1); record: $(run_of j50); dirs j50: $(dirs j50)"
 mkjob_acct j50c ghost
 "$AL" run j50c >/dev/null 2>&1
 grep -qF "j50c: account 'ghost' is not an account of anthropic in Settings, skipped" "$ROOT/data/tick.log" \
   && ok "an account Settings does not have is refused by name" || bad "no ghost refusal: $(tail -3 "$ROOT/data/tick.log")"
+# check must refuse the same unregistered account before it even asks whether
+# the job has a precheck -- j50c has none yet (mkjob_acct sets no precheck
+# field), so this is the plain "account not known" route the OpenCode one
+# below (j50e) is not: every platform's accounts gate check the same way.
+out50c0="$("$AL" check j50c 2>&1)"; rc50c0=$?
+[ "$rc50c0" -ne 0 ] && [ "$out50c0" = "j50c: account 'ghost' is not an account of anthropic in Settings" ] \
+  && ok "agentloop check refuses an unregistered account before it even asks whether there is a precheck" \
+  || bad "check j50c with no precheck: rc=$rc50c0 out='$out50c0'"
 # The standalone probes must refuse the same unregistered account, before
 # ever touching the precheck script -- not silently ask the CLI's default.
 jq --arg pc "printf '%s' \"\${CLAUDE_CONFIG_DIR-<unset>}\" > $ROOT/pc-50c; exit 0" '.jobs[0].precheck = $pc' \

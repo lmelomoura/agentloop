@@ -4167,8 +4167,10 @@ spent_today_all() { _spend_since_midnight ""; }
 # merely showing: with no overage to fall through to, hitting the ceiling is a
 # dead stop mid-run, not a slowdown.
 
-# data/rate-limits.json has one block per platform. Before platforms it held
-# the two windows at the top level; that shape is read as anthropic and
+# data/rate-limits.json has one block per ACCOUNT, not per platform: rl_key,
+# just below, is the platform's own key for the CLI's default directory, and
+# <platform>@<dir> for any other. Before platforms existed it held the two
+# windows at the top level; that shape is read as anthropic's block and
 # rewritten the first time anything touches the file, under the same lock the
 # writers take. Every reader and writer below calls this first.
 #
@@ -4407,18 +4409,13 @@ fleet_stall_check() {
   return 0
 }
 
-# What the gate can currently see, and whether the thing that feeds it is
-# actually wired up. This exists because the honest answer to "is the statusline
-# working?" was a hand-written one-liner over the JSON — which puts the burden of
-# verifying the product on the person using it. A feature that cannot say whether
-# it is on is a feature nobody can trust.
 usage_account_label() { # usage_account_label <platform> <account-dir> -> the name a usage block goes by: Default, a registered account, or the directory with a note
   local aid
   if [ "$(account_env_dir "$1" default)" = "$2" ]; then printf 'Default'; return 0; fi
   for aid in $(accounts_json "$1" | "$JQ" -r '.[].id'); do
     if [ "$(account_env_dir "$1" "$aid")" = "$2" ]; then account_field "$1" "$aid" name | tr -d '\n'; return 0; fi
   done
-  printf '%s — no longer an account' "$2"
+  printf '%s — not an account' "$2"
 }
 
 usage_statusline() { # usage_statusline <settings.json> <rate-limit key> <account name, or empty for the Default> -- whether that account's interactive sessions feed its gate
@@ -4447,8 +4444,13 @@ usage_statusline() { # usage_statusline <settings.json> <rate-limit key> <accoun
   fi
 }
 
+# What the gate can currently see, and whether the thing that feeds it is
+# actually wired up. This exists because the honest answer to "is the statusline
+# working?" was a hand-written one-liner over the JSON — which puts the burden of
+# verifying the product on the person using it. A feature that cannot say whether
+# it is on is a feature nobody can trust.
 cmd_usage() {
-  local now p key keys who reason aid adir
+  local now p key keys who reason aid adir read_keys
   now="$(now_epoch)"
 
   rl_migrate
@@ -4460,13 +4462,35 @@ cmd_usage() {
         echo "opencode: no usage windows — each provider has its own API, and nothing on the stream or in the export reports one"
         continue
       fi
+      # The keys some account's runs actually read: the Default's own, plus
+      # every registered account's. A block nothing here reads any more --
+      # what pinning a previously-unpinned install leaves under the bare
+      # platform key, for up to 7 days -- gets no HOLD line below: no
+      # scheduled run is waiting on it, whatever its own reading says.
+      read_keys="$(
+        rl_key "$p" "$(account_env_dir "$p" default)"
+        accounts_json "$p" | "$JQ" -r '.[].id' | while IFS= read -r aid; do
+          rl_key "$p" "$(account_env_dir "$p" "$aid")"
+        done
+      )"
       # The platform's own block -- the account on the CLI's own directory --
       # first, then one per other account directory the file holds.
       keys="$("$JQ" -r --arg p "$p" '[keys_unsorted[] | select(. == $p or startswith($p + "@"))]
           | (map(select(. == $p)) + map(select(. != $p)))[]' "$RATE_LIMIT_FILE" 2>/dev/null)"
       while IFS= read -r key; do
         [ -n "$key" ] || continue
-        if [ "$key" = "$p" ]; then who="$p"; else who="$p ($(usage_account_label "$p" "${key#*@}"))"; fi
+        # Labelled through usage_account_label, one lookup for every key that
+        # needs one: the bare key is the Default's plain name ONLY while the
+        # read set says the Default is who actually reads it (the CLI's own
+        # directory); once a pin moves the Default's own runs to their own
+        # key, the bare one falls through to the same lookup as any other,
+        # naming the CLI default dir it no longer stands for.
+        if [ "$key" = "$p" ]; then
+          if printf '%s\n' "$read_keys" | grep -qxF "$key"; then who="$p"
+          else who="$p ($(usage_account_label "$p" "$(account_cli_default "$p")"))"; fi
+        else
+          who="$p ($(usage_account_label "$p" "${key#*@}"))"
+        fi
         "$JQ" -r --arg k "$key" --arg who "$who" --argjson now "$now" '
           (.[$k] // {}) | to_entries[]
           | .value as $v
@@ -4481,7 +4505,8 @@ cmd_usage() {
             + (if $v.status != null then ", API said \($v.status)" else "" end)
             + (if $v.overage == "rejected" then ", overage off (the ceiling is a dead stop)" else "" end)
         ' "$RATE_LIMIT_FILE" 2>/dev/null
-        if reason="$(rl_gate "$key")" && [ -n "$reason" ]; then
+        if printf '%s\n' "$read_keys" | grep -qxF "$key" \
+           && reason="$(rl_gate "$key")" && [ -n "$reason" ]; then
           echo
           echo "SCHEDULED $who RUNS ARE BEING HELD BACK: $reason"
           echo "  (\`agentloop run <job>\` still overrides this, as it does the budget.)"

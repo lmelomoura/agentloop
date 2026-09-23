@@ -22,7 +22,12 @@
 # in Claude Code during the day, and the fleet learns how full the window is
 # without spending a token to find out.
 #
-# INSTALL — add to ~/.claude/settings.json (adjust the path to your checkout):
+# INSTALL — add to ~/.claude/settings.json (adjust the path to your checkout).
+# Each Claude account keeps its OWN settings.json — the pin's, or a
+# registered account's own directory — and feeds only that account's window
+# (CLAUDE_CONFIG_DIR decides which, see KEY below): wire this into every
+# account's settings.json whose usage should reach the gate, not ~/.claude's
+# alone.
 #   "statusLine": { "type": "command",
 #                   "command": "/path/to/agentloop/bin/statusline-rate-limits.sh" }
 #

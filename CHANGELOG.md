@@ -186,7 +186,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   by its directory.** `anthropic@<pin>` replaces the bare `anthropic` block
   for pinned runs, so the gate is blind for them until the next reading lands
   — one run, or the next interactive turn of a session wired to the
-  statusline in that account.
+  statusline in that account. An engine whose `CODEX_HOME` is not `~/.codex`
+  moves its own Default the same way, from `openai` to `openai@<home>`, and
+  is blind for the same stretch. `check` and `precheck` already refused an
+  account not in Settings, or an OpenCode job naming an account at all,
+  before ever touching the precheck script; `check` now runs that same
+  refusal before its own "has no precheck" shortcut too, so a job with no
+  precheck at all now exits 1 over a bad account, where it used to exit 0
+  and say there was nothing to check.
 
 ### Fixed
 
