@@ -6252,7 +6252,7 @@ def test_findings_row_renders_analysed_strings_as_text_never_markup(srv, tmp_pat
     arrows = (re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secVerdictChip", "secFindRow",
                       "secFindDecisionControls", "secFindActionsCell", "secScopeName"))
     script = tmp_path / "find-row.js"
     script.write_text(_INDEX_DOM_HARNESS + """
@@ -6299,7 +6299,7 @@ def test_a_fixed_finding_gets_no_decision_controls(srv, tmp_path):
     arrows = (re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secVerdictChip", "secFindRow",
                       "secFindDecisionControls", "secFindActionsCell", "secScopeName"))
     script = tmp_path / "find-row-fixed.js"
     script.write_text(_INDEX_DOM_HARNESS + """
@@ -6328,7 +6328,8 @@ def test_a_fixed_finding_gets_no_decision_controls(srv, tmp_path):
 _FIND_ROW_CONSTS = ("SEC_STATE_LABEL", "SEC_STATE_HELP", "SEV_ORDER", "SEC_STATES",
                     "ICON_HYGIENE", "SEC_CATEGORY_LABEL", "SEC_CATEGORY_ICON")
 _FIND_ROW_DEPS = ("secEl", "secIcon", "_secCap", "secCategoryMeta", "secConfidenceChip",
-                  "secFindRow", "secFindDecisionControls", "secFindActionsCell", "secScopeName")
+                  "secVerdictChip", "secFindRow", "secFindDecisionControls", "secFindActionsCell",
+                  "secScopeName")
 
 
 def _find_row_script(block):
@@ -6494,7 +6495,7 @@ def test_the_table_excludes_rows_below_the_floor_on_this_page(srv, tmp_path):
              + re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secVerdictChip", "secFindRow",
                       "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible",
                       "secScopeName"))
     script = tmp_path / "find-table-floor.js"
@@ -6550,7 +6551,7 @@ def test_a_fixed_finding_stays_visible_and_uncounted_below_the_floor(srv, tmp_pa
               + _const(block, "SEV_KPI_ICON") + _const(block, "SEV_KPI_TONE"))
     deps = "\n".join(_plainfn(block, n) for n in
                      ("secEl", "secIcon", "_secCap", "secCategoryMeta",
-                      "secFindHiddenByFloor", "secFindStrip", "secConfidenceChip", "secFindRow", "secFindDecisionControls", "secFindActionsCell",
+                      "secFindHiddenByFloor", "secFindStrip", "secConfidenceChip", "secVerdictChip", "secFindRow", "secFindDecisionControls", "secFindActionsCell",
                       "secFindTableSection", "secVisible", "secScopeName"))
     script = tmp_path / "find-fixed-floor.js"
     script.write_text(_INDEX_DOM_HARNESS + _KPI_CARD_STUB + """
@@ -6607,7 +6608,7 @@ def test_clicking_a_sort_header_toggles_direction_then_switching_column_resets_i
              + re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
+                     ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secVerdictChip", "secFindRow",
                       "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible",
                       "secScopeName"))
     script = tmp_path / "find-sort-click.js"
@@ -11400,3 +11401,20 @@ def test_the_findings_browser_declares_the_confidence_column_and_filter(srv, tmp
     assert ["confidence", "Confidence"] in out["table"] and len(out["table"]) == 10
     assert out["picker"] == ["high", "medium", "low"]
     assert out["filters"]["confidence"] == []
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_findings_browser_declares_the_verdict_filter(srv, tmp_path):
+    """`verdict` is a multi-select filter beside Confidence, and
+    `_defaultFilters` carries the key empty -- so a page that can show a
+    verdict can also ask for one, and a filter saved before block 4.2 reads
+    as "no filter"."""
+    block = _security_js(srv)
+    script = tmp_path / "find-verdict.js"
+    script.write_text(_const(block, "SEC_VERDICTS") + _plainfn(block, "_defaultFilters") + """
+    console.log(JSON.stringify({picker: SEC_VERDICTS, filters: _defaultFilters()}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert out["picker"] == ["confirmed", "needs_validation", "rejected"]
+    assert out["filters"]["verdict"] == []

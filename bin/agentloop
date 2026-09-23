@@ -557,10 +557,22 @@ SECURITY_FALLBACK_BUDGET_USD=2
 # CLI that ever dropped the flag would fail loudly at launch rather than run
 # the analysis with the tool quietly back open.
 #
-# Deliberately NOT a per-project setting the way model or budget are: a
-# `security.disallowed_tools` a project could set would be a way to re-open the
-# tool, and re-opening it is exactly the $51 the measurement above paid for.
-SECURITY_DISALLOWED_TOOLS="Agent"
+# WHAT CHANGED, AND WHY THE MEASUREMENT ABOVE STILL GOVERNS. The verification
+# phase (block 4.2) IS subagents: a second agent with fresh context that reads
+# the code, tries to disprove one finding and writes its own verdict through
+# `report-verdict`. Closing the tool would close the phase. So the door moved
+# from the flag to the CLOSE: `security_task_count` counts the `Task` calls in
+# the run's stream and `finish --tasks-launched` compares that number with the
+# verdicts recorded in the ledger. Subagents that produced no verdict -- six
+# hunters splitting the repository, which is what analysis 9 spent $51.44 on --
+# lower `done` to `capped` with both numbers in the report, and so do verdicts
+# with no subagent behind them and findings nobody verified. Asking is what
+# failed in the first place; counting does not.
+#
+# Deliberately NOT a per-project setting the way model or budget are, in
+# either direction: what a security analysis may launch is this file's
+# decision, not a field a project can widen.
+SECURITY_DISALLOWED_TOOLS=""
 
 # How long an analysis row that says `running` is given the benefit of the doubt
 # when the derived job holds no live slot (see the sweep in cmd_security_analyze).
@@ -720,12 +732,19 @@ It runs the deterministic phases inside this worktree -- secrets, dependency
 CVEs, SBOM, hygiene and infrastructure-as-code misconfigurations -- in seconds
 and at no token cost, and prints a coverage note you must repeat in your final
 message if it is not empty."
-    agents_para="You have no \`Agent\` tool in this run -- the CLI's own tool roster calls it
-\`Task\`, and it is the same tool under both names. It is closed at launch, on
-purpose. Two earlier analyses spent their whole budget fanning the SAST pass out
-to six subagents and triaged none of the deterministic findings -- which is the
-part that matters most. Do the work yourself, in this one session, and spend the
-budget on triage first."
+    agents_para="You HAVE subagents in this run, and they have one use: verification.
+After you have reported your findings, \`agentloop security verify-queue
+--analysis $5\` lists the ones a second agent has to try to disprove, worst
+first. For each, \`agentloop security verify-prompt --analysis $5 --fingerprint
+<fp>\` prints the text to launch a subagent with -- pass it as written; it is
+built from the ledger, not by you. The subagent reads the code and writes its
+own verdict; you do not write it and you do not summarise it.
+The close counts this: every subagent this run launched is compared with every
+verdict recorded, and findings left unverified, subagents that produced no
+verdict, and verdicts with no subagent each lower \`done\` to \`capped\` with the
+numbers in the report. Use subagents for nothing else -- two earlier analyses
+spent their whole budget fanning the SAST pass out to six of them and triaged
+none of the deterministic findings, which is what the count exists to catch."
   fi
   cat <<EOF
 $skill_para
@@ -1056,6 +1075,33 @@ security_guides_read() { # security_guides_read <stream.ndjson> -> a,b | '' | un
   printf '%s\n' "$out" | grep -v '^$' | sort -u | paste -s -d, -
 }
 
+# How many subagents a run launched, off its own stream.
+#
+# BOTH NAMES, AND THE MEASUREMENT IS THE REASON. The same tool answers to
+# `Agent` and to `Task`: `--disallowedTools Agent` is what the CLI accepts,
+# the roster in its `init` event calls it `Task`, and -- measured on the block
+# 4.2 acceptance run, 2026-09-23 -- what a `tool_use` block in the stream
+# actually carries is **`Agent`**. Counting one name found zero subagents in a
+# run that launched one, and the close then accused the analysis of writing a
+# verdict nobody earned. OpenCode's normaliser canonicalises its own `task` to
+# `Task`, so both spellings have to be counted wherever this runs.
+#
+# EMPTY, NOT 0, when there is no stream to read: the close omits the flag
+# entirely then, and `finish` makes no comparison at all. Answering 0 for a
+# stream nobody could read would accuse an analysis of writing verdicts out of
+# thin air on the strength of a missing file.
+security_task_count() { # security_task_count <stream.ndjson> -> <n> | ''
+  local f="${1:-}" n
+  [ -n "$f" ] && [ -r "$f" ] || return 0
+  # `grep -c` exits 1 on zero matches, so the count is taken with `|| true`:
+  # a run that launched no subagent must answer 0, which is a FACT the close
+  # compares, and not the empty "nothing to say" a missing stream gives.
+  n="$("$JQ" -R -r 'fromjson? | select(.type == "assistant") | .message.content[]?
+      | select(.type == "tool_use") | select(.name == "Task" or .name == "Agent") | 1' "$f" 2>/dev/null \
+      | { grep -c '^1$' || true; })"
+  printf '%s\n' "${n:-0}"
+}
+
 security_close_analysis() { # <job-id> <status> <cost> <wdreason> [stream]
   case "$1" in "$SECURITY_JOB_PREFIX"*) ;; *) return 0 ;; esac
   local req aid state
@@ -1099,8 +1145,13 @@ security_close_analysis() { # <job-id> <status> <cost> <wdreason> [stream]
   # `--guides-read` is the engine's to pass, never the agent's: this close
   # has the run's stream (or knows it has not), and `finish` writes the
   # sentence only when the flag is present. See security_guides_read.
+  # `--tasks-launched` only when there IS a stream: an absent flag means "the
+  # engine has nothing to say about subagents", which is a different fact from
+  # "none were launched" and `finish` treats it as one.
+  local tasks; tasks="$(security_task_count "${5:-}")"
   security_py finish --analysis "$aid" --state "$state" --spend "${3:-0}" \
     --guides-read "$(security_guides_read "${5:-}")" \
+    ${tasks:+--tasks-launched "$tasks"} \
     >/dev/null 2>&1 || log_tick "$1: could not close analysis $aid"
 }
 

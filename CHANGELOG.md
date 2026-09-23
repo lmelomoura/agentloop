@@ -18,7 +18,76 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The dashboard shows the verdict**: a chip beside the confidence one on
+  every row and in the drill-down, the verifier's reason inside the candidate
+  block, a Verdict filter, and a disproved row drawn dimmed — it is recorded,
+  not work.
+
+- **Reports print the verdict** under each verified finding, and the ones a
+  verifier disproved move to their own section at the end — *Disproved in
+  verification* — with the reason. They are recorded and not counted; a report
+  over a ledger nobody verified renders byte for byte as before.
+
+- **The close verifies that the verification happened**, with three facts the
+  ledger and the run's stream hold between them: findings in scope nobody
+  verified, subagents that produced no verdict, and verdicts with no subagent
+  behind them. Any of the three lowers `done` to `capped` and writes the
+  reason into the report, as the triage guard already does — and the first is
+  the one the other two cannot see, because an agent that ignores the phase
+  launches nothing and records nothing. A new `verification` row in the
+  coverage table says what was verified and what was not.
+
+- **`verify-queue`, `verify-prompt` and `report-verdict`.** The queue is a
+  query, so the agent never derives the scope from prose; the prompt is minted
+  from the ledger, with the job stated as disproving the claim and the
+  hunter's `rationale` deliberately left out — a fresh reader that reads the
+  argument stops being fresh; and the verdict is written by the verifier
+  itself, refused for a finding outside the queue, refused a second time on
+  the same row, with its reason through the same credential scan as every
+  other agent-written text.
+
+- **The verification queue.** `queries.verify_queue` is the one place the
+  scope lives: the agent's own `sast` findings at medium or above, plus any
+  below that whose candidate declares a high or critical impact — the evasion
+  route block 4.1 wrote down as open. Ordered by the **worse of the declared
+  severity and the declared impact**, so the group whose severity is least
+  trustworthy is not the group a budget that runs out never reaches.
+
+- **A finding can carry a verdict** — `confirmed`, `needs_validation` or
+  `rejected`, each with a reason that is never optional — validated by
+  `bin/security/verdict.py`. Until now the severity of a `sast` finding was
+  the word of the agent that found it, and nothing in the ledger could tell a
+  read claim from an unread one.
+
+- **`finding.verdict`, `verdict_reason` and `verified_by` columns**, additive
+  and '' on every existing row, written once per finding per analysis and
+  never cleared by a re-report; a verdict is not inherited between analyses.
+
 ### Changed
+
+- **The security-analysis skill has a fourth job: verification** — the queue,
+  the minted prompt, one subagent per finding, and the fact that the close
+  counts. The README's *Security analysis* section documents the verdicts, the
+  posture change and the three guards.
+
+- **The `Agent` tool is open again for a security analysis, and the close
+  counts what it was used for.** Verification is subagents, so closing the
+  tool would close the phase; `security_task_count` reads the run's stream and
+  `finish --tasks-launched` compares it with the verdicts in the ledger. The
+  prompt now says what subagents are for and that the count happens. On the
+  Codex CLI and OpenCode, where the phase cannot run, they stay forbidden by
+  the prompt — what changed there is only that the denial is no longer a
+  permission rule.
+
+- **A disproved finding leaves the posture.** `queries.counted` — open AND
+  not `rejected` — replaces the copies of the open-ness rule across the
+  counters, the reports and the browser: a finding a verifier disproved stops
+  being counted as exposure everywhere at once, is kept off the page by
+  default exactly as a `fixed` one is, and stays a row the reader can still
+  open. The checklist also carries the previous analysis's verdict, shown and
+  never inherited.
 
 - **The security-analysis skill has a criterion for what qualifies as a
   finding** — Cloudflare's boundary requirement and five severity anchors —

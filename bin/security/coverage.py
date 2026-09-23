@@ -82,8 +82,13 @@ IAC = "iac"
 SAST_PREPASS = "sast-prepass"
 SAST_AGENT = "sast"
 TRIAGE = "triage"
+# The verifier's phase, last because it is the last thing that happens: the
+# hunter reports, and only then is there anything to disprove. Filed by
+# `cmd_finish`, like `sast` and `triage`, because nothing deterministic can
+# report on it.
+VERIFICATION = "verification"
 PHASE_ORDER = (SCOPE, SECRETS, HYGIENE, DEPENDENCIES, SBOM, IAC, SAST_PREPASS,
-               SAST_AGENT, TRIAGE)
+               SAST_AGENT, TRIAGE, VERIFICATION)
 
 
 def phase(name, status, by="", note="") -> dict:

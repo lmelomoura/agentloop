@@ -2714,6 +2714,13 @@ def test_the_agents_own_findings_are_never_counted_as_untriaged(tmp_path):
         "fingerprint": "c" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "sql-injection",
         "severity": "critical", "title": "String-built SQL",
         "occurrences": [{"file": "app/db.py", "line": 12}]}), env=AS_AGENT)
+    # And verified, because since block 4.2 an agent finding at medium or
+    # above is a debt of its OWN kind: not to the triage gate (which is what
+    # this test is about) but to the verification one. Leaving it unverified
+    # would close `capped` for a reason this test does not name.
+    run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "c" * 64,
+        stdin=json.dumps({"verdict": "confirmed", "reason": "read app/db.py end to end"}),
+        env=AS_AGENT)
 
     run(db, "finish", "--analysis", str(aid), "--state", "done")
     row = run(db, "list", "--project", "web")[0]
@@ -3190,9 +3197,18 @@ def test_every_phases_prose_is_a_substring_of_the_paragraph(tmp_path):
     was not a substring of the paragraph, and the only test of the property
     put the lockfile at the root, where the sentence is never said at all.
     Asserted for every phase `prepare` files -- all of `PHASE_ORDER` but the
-    two the close adds -- and then again after the close, for the two it adds.
+    three the close adds -- and then again after the close, for the three it
+    adds.
 
-    THE DELIBERATE EXCEPTIONS are all on the triage row. Its two summary
+    THE DELIBERATE EXCEPTIONS are on the triage row and on the verification
+    row, for one reason: a summary of what was done is not a gap, and the
+    paragraph is the list of gaps. `VERIFY_NOTHING_NOTE` ("no finding was
+    waiting for a verifier") and `VERIFY_DONE_NOTE` ("N verified: ...") are
+    the verification row's two summaries; its gap sentences -- findings left
+    unverified, subagents that produced no verdict, verdicts with no subagent
+    -- are in the paragraph like every other gap.
+
+    THE REST OF THE EXCEPTIONS are on the triage row. Its two summary
     sentences (`TRIAGE_NOTHING_NOTE`, `TRIAGE_ALL_READ_NOTE`) describe what the
     agent did, not a gap, and the paragraph is the list of gaps. Its third,
     `TRIAGE_UNVERIFIED_NOTE` -- filed when a direct `capped` or `failed` close
@@ -3232,7 +3248,7 @@ def test_every_phases_prose_is_a_substring_of_the_paragraph(tmp_path):
         security_cli.adapters.SYFT_SBOM_NOTE)), by_name["sbom"]["note"]
     # Every phase `prepare` writes, and each one's whole prose.
     assert [p["name"] for p in phases] == \
-        list(security_cli.coverage.PHASE_ORDER[:-2])
+        list(security_cli.coverage.PHASE_ORDER[:-3])
     for p in phases:
         assert p["note"] in note, \
             f"{p['name']}'s note is not in the paragraph: {p['note']!r}"
@@ -3245,6 +3261,9 @@ def test_every_phases_prose_is_a_substring_of_the_paragraph(tmp_path):
         if p["name"] == "triage":
             assert p["note"] == security_cli.TRIAGE_NOTHING_NOTE.format(
                 floor=security_cli.TRIAGE_FLOOR)
+            continue
+        if p["name"] == "verification":
+            assert p["note"] == security_cli.VERIFY_NOTHING_NOTE
             continue
         assert p["note"] in row["coverage_note"], \
             f"{p['name']}'s note is not in the paragraph: {p['note']!r}"
@@ -3262,7 +3281,8 @@ def test_the_close_adds_a_triage_phase_carrying_the_count(tmp_path):
     run(db, "finish", "--analysis", str(aid), "--state", "done")
     row, phases = _coverage_phases(db, aid)
     triage = [p for p in phases if p["name"] == "triage"][0]
-    assert phases[-1]["name"] == "triage", "triage is the last row of the table"
+    assert [p["name"] for p in phases][-2:] == ["triage", "verification"], \
+        "triage and then verification close the table"
     assert triage["status"] == "warning"
     assert triage["by"] == "agent"
     assert "2 deterministic findings were never triaged" in triage["note"]
@@ -3447,10 +3467,12 @@ def test_the_downloaded_report_opens_with_the_phase_table(tmp_path):
     assert "| iac | skipped | — |" in md
     assert "| sast | ran | agent |" in md
     assert "| triage | ran | agent |" in md
+    assert "| verification | ran | agent |" in md
     assert md.index("| sast | ran | agent |") < md.index("| triage | ran | agent |")
+    assert md.index("| triage | ran | agent |") < md.index("| verification | ran | agent |")
     doc = json.loads(run_text(db, "render", "--analysis", str(aid),
                               "--format", "json"))
-    assert [p["name"] for p in doc["coverage"]["phases"]][-1] == "triage"
+    assert [p["name"] for p in doc["coverage"]["phases"]][-1] == "verification"
 
 
 # -------------------------------- the two rows the close writes, and when not
@@ -4835,6 +4857,13 @@ def finished_analysis(db, tmp_path, project, branch, severity="high", rule="r",
     if category == "sast":
         payload["candidate"] = SAST_CANDIDATE
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
+    # A `sast` finding at medium or above owes a verdict since block 4.2, and
+    # a close that leaves the queue unworked is lowered to `capped` -- which
+    # is not what a fixture for a DONE analysis is for.
+    if category == "sast":
+        run(db, "report-verdict", "--analysis", str(aid),
+            "--fingerprint", fingerprint_for(project, branch, rule),
+            stdin=json.dumps({"verdict": "confirmed", "reason": "read it end to end"}))
     run(db, "finish", "--analysis", str(aid), "--state", "done", "--spend", "0.5")
     return aid
 
@@ -6350,3 +6379,177 @@ def test_guides_read_that_were_never_recommended_are_still_listed(tmp_path):
     note, analysis = _sast_note(db, aid)
     assert "Guides read: WEB-PROTOCOL-AND-AUTH. Recommended but not read: ATTACK-CLASSES." in note
     assert "bogus" not in note
+
+
+# ------------------------------------------------ the verifier's door
+
+def _agent_sast(db, aid, fp, severity="high"):
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(_payload(
+        fp, severity=severity, candidate=SAST_CANDIDATE)))
+
+
+def test_verify_queue_lists_the_scope_and_report_verdict_writes_it(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    queue = run(db, "verify-queue", "--analysis", str(aid))
+    assert [f["fingerprint"] for f in queue] == ["b" * 64]
+    assert queue[0]["candidate"]["trace"], "the prompt needs the chain"
+
+    run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+        stdin=json.dumps({"verdict": "rejected",
+                          "reason": "app/db.py:12 is parameterised; the concatenation is in a comment"}))
+    row = _finding_row(db, aid)
+    assert row["verdict"] == "rejected"
+    assert row["verified_by"] == "subagent"
+    assert run(db, "verify-queue", "--analysis", str(aid)) == []
+
+
+def test_a_verdict_on_something_outside_the_queue_is_refused(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "9" * 64,
+                stdin=json.dumps({"verdict": "confirmed", "reason": "r"}))
+    assert out.returncode != 0
+    assert "not in the verification queue" in out.stderr
+
+
+def test_a_second_verdict_on_one_finding_is_refused(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+        stdin=json.dumps({"verdict": "confirmed", "reason": "read it end to end"}))
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+                stdin=json.dumps({"verdict": "rejected", "reason": "on second thoughts"}))
+    assert out.returncode != 0
+    assert "not in the verification queue" in out.stderr
+    assert _finding_row(db, aid)["verdict"] == "confirmed"
+
+
+def test_a_verified_by_sent_by_the_payload_is_refused(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+                stdin=json.dumps({"verdict": "confirmed", "reason": "r", "verified_by": "me"}))
+    assert out.returncode != 0
+    assert "does not know: verified_by" in out.stderr
+
+
+def test_a_credential_in_a_verdict_reason_is_refused_and_never_echoed(tmp_path):
+    """The adversarial test, on the third door. A verifier reads the same
+    repository the hunter read, so its free text is exactly as likely to
+    quote a key -- and the ledger is exactly as unable to hold one."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+                stdin=json.dumps({"verdict": "rejected", "reason": f"it is the test key {AWS}"}))
+    assert out.returncode != 0
+    assert "reason" in out.stderr and "aws_access_key" in out.stderr
+    assert AWS not in out.stdout and AWS not in out.stderr
+    assert _finding_row(db, aid)["verdict"] == ""
+    conn = sqlite3.connect(str(db))
+    assert AWS not in "".join(str(tuple(r)) for r in conn.execute("SELECT * FROM finding"))
+
+
+def test_verify_prompt_is_minted_for_a_queued_finding_only(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    out = raw(db, "verify-prompt", "--analysis", str(aid), "--fingerprint", "b" * 64)
+    assert "your job is to disprove" in out.lower()
+    assert "report-verdict --analysis" in out
+    assert "my own reading" not in out, "the hunter's rationale must not travel"
+    bad = fails(db, "verify-prompt", "--analysis", str(aid), "--fingerprint", "9" * 64)
+    assert bad.returncode != 0 and "not in the verification queue" in bad.stderr
+
+
+# --------------------------------------------- the close counts the phase
+
+def _verification_note(db, aid):
+    analysis = run(db, "checklist", "--analysis", str(aid))["analysis"]
+    phases = json.loads(analysis["coverage"])["phases"]
+    row = next(p for p in phases if p["name"] == "verification")
+    return row, analysis
+
+
+def _verdict(db, aid, fp, value="confirmed", reason="read it end to end"):
+    run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", fp,
+        stdin=json.dumps({"verdict": value, "reason": reason}))
+
+
+def test_a_queue_nobody_worked_lowers_done_to_capped(tmp_path):
+    """The guard the N=V count cannot see: an agent that ignores the phase
+    launches no subagents and writes no verdicts, so the two numbers agree at
+    zero. What does not agree is the queue."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
+    row, analysis = _verification_note(db, aid)
+    assert run(db, "list", "--project", "web")[0]["state"] == "capped"
+    assert "1 finding left unverified" in row["note"]
+    assert "sql-injection" in row["note"]
+    assert row["note"] in analysis["coverage_note"]
+    assert row["status"] == "warning"
+
+
+def test_subagents_that_produced_no_verdict_lower_done_to_capped(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    _verdict(db, aid, "b" * 64)
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "5")
+    row, _ = _verification_note(db, aid)
+    assert run(db, "list", "--project", "web")[0]["state"] == "capped"
+    assert "5 subagents were launched and 1 verdict recorded" in row["note"]
+
+
+def test_verdicts_without_subagents_lower_done_to_capped(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    _verdict(db, aid, "b" * 64)
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
+    row, _ = _verification_note(db, aid)
+    assert run(db, "list", "--project", "web")[0]["state"] == "capped"
+    assert "1 verdict recorded and no subagent was launched" in row["note"]
+
+
+def test_a_worked_queue_closes_done_and_counts_the_verdicts(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    _agent_sast(db, aid, "c" * 64)
+    _verdict(db, aid, "b" * 64, "confirmed")
+    _verdict(db, aid, "c" * 64, "rejected", "the escaping helper at app/db.py:12")
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "2")
+    row, _ = _verification_note(db, aid)
+    assert run(db, "list", "--project", "web")[0]["state"] == "done"
+    assert row["status"] == "ran"
+    assert "2 verified: 1 confirmed, 1 rejected" in row["note"]
+
+
+def test_an_analysis_with_nothing_to_verify_closes_done(tmp_path):
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
+    row, _ = _verification_note(db, aid)
+    assert run(db, "list", "--project", "web")[0]["state"] == "done"
+    assert row["status"] == "ran"
+    assert "No finding was waiting" in row["note"]
+
+
+def test_without_the_flag_the_counts_are_not_compared(tmp_path):
+    """The agent's own close does not know its stream. Only the engine's
+    close passes --tasks-launched, so only it can compare."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _agent_sast(db, aid, "b" * 64)
+    _verdict(db, aid, "b" * 64)
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
+    assert run(db, "list", "--project", "web")[0]["state"] == "done"
+    row, _ = _verification_note(db, aid)
+    assert "subagent" not in row["note"]

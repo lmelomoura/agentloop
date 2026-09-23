@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, ledger, osv, queries, report, secrets, taxonomy  # noqa: E402
+from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, ledger, osv, prompts, queries, report, secrets, taxonomy, verdict  # noqa: E402
 
 REQUIRED_FINDING_KEYS = ("fingerprint", "category", "rule", "severity", "title")
 
@@ -1612,6 +1612,85 @@ def cmd_findings(args):
     print(json.dumps(ledger.findings_of(conn, args.analysis), indent=2))
 
 
+def cmd_verify_queue(args):
+    """The findings still waiting for a verifier, worst first.
+
+    The SCOPE lives in `queries.verify_queue` -- see its comment -- and this
+    verb exists so the agent never has to derive it from prose. A filter the
+    model applies by reading a paragraph is the kind of instruction this
+    module has already watched fail twice: the triage nobody did, and the
+    subagents nobody was supposed to launch.
+    """
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    print(json.dumps(queries.verify_queue(conn, args.analysis), indent=2))
+
+
+def cmd_verify_prompt(args):
+    """The text the agent pastes into a `Task` for this finding.
+
+    Refused for a fingerprint outside the queue, on the same rule as
+    `report-verdict`: a prompt for something nobody is verifying is a
+    subagent nobody asked for, and the close counts those.
+    """
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    row = next((f for f in queries.verify_queue(conn, args.analysis)
+                if f["fingerprint"] == args.fingerprint), None)
+    if row is None:
+        sys.exit(f"verify-prompt: {args.fingerprint[:12]}… is not in the verification "
+                 "queue of this analysis — `verify-queue` lists what is")
+    print(prompts.verifier_prompt(args.analysis, row))
+
+
+def cmd_report_verdict(args):
+    """What a VERIFIER concluded. Called by the subagent itself, not by the
+    hunter that reported the finding -- the write is the evidence that a
+    second agent existed and what it read (see security/prompts.py).
+
+    Deliberately NOT in AGENT_FORBIDDEN: a subagent runs under the same
+    `AL_SECURITY_AGENT` the hunter carries, so a refusal there would close the
+    door on the only caller this verb has. What makes it verifiable is not a
+    flag but a count -- `cmd_finish` compares the verdicts recorded here with
+    the `Task` calls the engine counted in the run's stream.
+    """
+    try:
+        stdin_text = sys.stdin.read()
+    except Exception as exc:
+        sys.exit(f"report-verdict: could not read stdin: {exc}")
+    if len(stdin_text.encode("utf-8")) > MAX_STDIN_BYTES:
+        sys.exit(f"report-verdict: stdin is {len(stdin_text.encode('utf-8'))} bytes "
+                 f"and the limit is {MAX_STDIN_BYTES}")
+    try:
+        payload = json.loads(stdin_text)
+    except (ValueError, RecursionError) as exc:
+        sys.exit(f"report-verdict: stdin is not valid JSON: {exc}")
+    try:
+        value, reason = verdict.validate(payload)
+    except verdict.VerdictError as exc:
+        where = f"report-verdict: {exc.field}" if exc.field else "report-verdict"
+        sys.exit(f"{where} {exc.message}. Nothing was recorded")
+    # The same scanner every other agent-written free text goes through: a
+    # verifier reads the same repository the hunter read.
+    _refuse_if_secret("report-verdict: reason", reason)
+    conn = _conn(args)
+    _running(conn, args.analysis)
+    # The queue is the authority on both questions at once -- is this finding
+    # one somebody was asked to verify, and does it still need one. A row that
+    # already carries a verdict has left the queue, so a second verdict lands
+    # here rather than in `record_verdict`'s own guard.
+    if not any(f["fingerprint"] == args.fingerprint
+               for f in queries.verify_queue(conn, args.analysis)):
+        sys.exit(f"report-verdict: {args.fingerprint[:12]}… is not in the verification "
+                 "queue of this analysis — `verify-queue` lists what is, and a finding "
+                 "leaves that list the moment it carries a verdict: a verifier does not "
+                 "contradict itself, and the first answer is the one that counts. "
+                 "Nothing was recorded")
+    if not ledger.record_verdict(conn, args.analysis, args.fingerprint, value, reason):
+        sys.exit(f"report-verdict: {args.fingerprint[:12]}… could not be written. "
+                 "Nothing was recorded")
+
+
 def cmd_fingerprint(args):
     """Print the 64-hex identity of a finding -- computed, never typed.
 
@@ -2137,6 +2216,39 @@ def _triage_phase(conn, analysis_id, untriaged, untriaged_note, decided_note):
          decided_note])
 
 
+# The `verification` row's prose. Four outcomes, and the three that lower a
+# `done` say names and numbers -- a count alone is a scold the reader cannot
+# act on, the same rule the triage note already follows.
+VERIFY_NOTHING_NOTE = ("No finding was waiting for a verifier: this analysis "
+                       "reported no agent finding at medium or above, and none "
+                       "below it claiming a high impact.")
+VERIFY_DONE_NOTE = ("{n} verified: {confirmed} confirmed, {rejected} rejected, "
+                    "{needs} needs validation.")
+VERIFY_UNVERIFIED_NOTE = ("{n} finding{s} left unverified: nobody tried to "
+                          "disprove {them}, so this analysis says nothing about "
+                          "whether {they} real. {lead}: {named}.")
+VERIFY_TASKS_WITHOUT_VERDICTS_NOTE = (
+    "{tasks} subagents were launched and {v} verdict{s} recorded: the rest "
+    "produced nothing, which is budget spent on parallelism rather than on "
+    "reading. Subagents in this run are for verification.")
+VERIFY_VERDICTS_WITHOUT_TASKS_NOTE = (
+    "{v} verdict{s} recorded and no subagent was launched: a verdict is a "
+    "second agent's reading, and nothing in this run's stream shows one ran.")
+VERIFY_UNVERIFIED_UNREACHED = ("This analysis did not close `done`, so nothing "
+                               "checked whether the findings were verified.")
+
+
+def _verdict_counts(conn, analysis_id) -> dict:
+    """How many verdicts of each kind this analysis recorded."""
+    out = {v: 0 for v in verdict.VERDICTS}
+    for row in conn.execute(
+            "SELECT verdict, COUNT(*) AS n FROM finding WHERE analysis_id=?"
+            " AND verdict<>'' GROUP BY verdict", (analysis_id,)):
+        if row["verdict"] in out:
+            out[row["verdict"]] = row["n"]
+    return out
+
+
 GUIDES_UNKNOWN = "unknown"
 
 
@@ -2328,6 +2440,69 @@ def cmd_finish(args):
         # one close.
         triage_phase = _triage_phase(conn, args.analysis, skipped,
                                      untriaged_note, decided_note)
+    # THE VERIFICATION, checked the way the triage is: three facts the ledger
+    # and the run's stream hold between them, and a `done` that survives all
+    # three or is lowered with the reason in writing.
+    #
+    #   the queue    findings in scope that nobody verified. This is the guard
+    #                the two counts below CANNOT see: an agent that ignores
+    #                the phase launches nothing and records nothing, so N and
+    #                V agree at zero while the work never happened.
+    #   N > V        subagents that produced no verdict -- the $51.44 failure,
+    #                budget spent on parallelism.
+    #   V > N        verdicts with no subagent behind them: the hunter wrote
+    #                them itself.
+    #
+    # N is only known to the ENGINE's close (`--tasks-launched`, from
+    # `security_task_count` over the stream); the agent's own close omits the
+    # flag and the two comparisons are simply not made.
+    # `verify_note` is the ROW's prose; `verify_gap` is the part of it that is
+    # a GAP and therefore belongs in the paragraph too. The summary sentences
+    # -- nothing was waiting, N verified -- describe what happened rather than
+    # what was missed, and the paragraph is the list of blind spots: the same
+    # exemption `TRIAGE_NOTHING_NOTE`/`TRIAGE_ALL_READ_NOTE` already carry.
+    verify_note = ""
+    verify_gap = ""
+    verify_phase = None
+    if row["prepared"]:
+        unverified = queries.verify_queue(conn, args.analysis)
+        counts = _verdict_counts(conn, args.analysis)
+        recorded = sum(counts.values())
+        tasks = args.tasks_launched
+        if unverified:
+            n = len(unverified)
+            named = "; ".join(
+                f"{f['rule']} ({f['occurrences'][0]['file'] if f['occurrences'] else 'no file recorded'})"
+                for f in unverified[:3])
+            verify_note = verify_gap = VERIFY_UNVERIFIED_NOTE.format(
+                n=n, s="s" if n != 1 else "", them="them" if n != 1 else "it",
+                they="they are" if n != 1 else "it is",
+                lead=("The first three" if n > 3 else "They are" if n > 1 else "It is"),
+                named=named)
+        elif recorded:
+            verify_note = VERIFY_DONE_NOTE.format(
+                n=recorded, confirmed=counts["confirmed"],
+                rejected=counts["rejected"], needs=counts["needs_validation"])
+        else:
+            verify_note = VERIFY_NOTHING_NOTE
+        mismatch = ""
+        if tasks is not None and tasks > recorded:
+            mismatch = VERIFY_TASKS_WITHOUT_VERDICTS_NOTE.format(
+                tasks=tasks, v=recorded, s="s" if recorded != 1 else "")
+        elif tasks is not None and recorded > tasks:
+            mismatch = VERIFY_VERDICTS_WITHOUT_TASKS_NOTE.format(
+                v=recorded, s="s" if recorded != 1 else "")
+        if mismatch:
+            verify_note = f"{verify_note} {mismatch}".strip()
+            verify_gap = f"{verify_gap} {mismatch}".strip()
+        bad = bool(unverified) or (tasks is not None and tasks != recorded)
+        if state == "done" and bad:
+            state = "capped"
+            print(f"finish: analysis {args.analysis} — {verify_note}", file=sys.stderr)
+        verify_phase = coverage.phase(
+            coverage.VERIFICATION,
+            coverage.WARNING if bad else coverage.RAN,
+            diff.AGENT, verify_note)
     # finish_analysis writes coverage_note unconditionally, and neither caller
     # of `finish` carries the note `prepare` printed: the agent never saw it,
     # and the engine's close-out knows only the run's status and cost. An
@@ -2348,7 +2523,7 @@ def cmd_finish(args):
     stored = row["coverage_note"] or ""
     note = ""
     for part in (stored, args.note or "", unprepared_note, untriaged_note,
-                 decided_note, guides_note):
+                 decided_note, guides_note, verify_gap):
         part = part.strip()
         # `not in`, not `!=`: a row is closed twice (the agent, then the
         # engine) and each close re-reads the note it already wrote. Without
@@ -2414,6 +2589,9 @@ def cmd_finish(args):
             triage_phase = coverage.phase(
                 coverage.TRIAGE, coverage.SKIPPED,
                 note=unprepared_note or TRIAGE_UNVERIFIED_NOTE)
+            verify_phase = coverage.phase(
+                coverage.VERIFICATION, coverage.SKIPPED,
+                note=unprepared_note or VERIFY_UNVERIFIED_UNREACHED)
     else:
         # The guides sentence joins whatever the row already says -- the
         # agent's `--note`, or the sentence a previous close stored -- once:
@@ -2429,7 +2607,8 @@ def cmd_finish(args):
             triage_phase = coverage.phase(coverage.TRIAGE, coverage.SKIPPED,
                                           note=TRIAGE_UNVERIFIED_NOTE)
     phases = coverage.merge(
-        phases, [sast_phase] + ([triage_phase] if triage_phase else []))
+        phases, [sast_phase] + ([triage_phase] if triage_phase else [])
+        + ([verify_phase] if verify_phase else []))
     ledger.finish_analysis(conn, args.analysis, state, _spend(args.spend), note,
                            coverage.encode(phases))
     # `row`'s own project and branch, never a flag the caller passed: `finish`
@@ -3081,7 +3260,7 @@ def cmd_project_data(args):
         for f in findings:
             if f["state"] in checklist_counts:
                 checklist_counts[f["state"]] += 1
-        open_findings = [f for f in findings if queries.is_open(f["state"])]
+        open_findings = [f for f in findings if queries.counted(f)]
         buckets = {}
         for f in open_findings:
             b = buckets.setdefault(f.get("rule") or "", {
@@ -3277,6 +3456,7 @@ def cmd_findings_page(args):
         "state": args.state or [],
         "category": args.category or [],
         "confidence": args.confidence or [],
+        "verdict": args.verdict or [],
         "branch": args.branch or [],
         "analysis": args.analysis or [],
         "path": args.path,
@@ -3483,6 +3663,21 @@ def main(argv=None):
     rf = sub.add_parser("report-finding", parents=[dbflag]); rf.set_defaults(fn=cmd_report_finding)
     rf.add_argument("--analysis", type=int, required=True)
 
+    # Deliberately absent from AGENT_FORBIDDEN, all three: the verifier is a
+    # subagent of the analysis and runs under the same flag the hunter does,
+    # so refusing them there would close the door on their only caller. The
+    # close's count is what makes the phase verifiable -- see `cmd_finish`.
+    vq = sub.add_parser("verify-queue", parents=[dbflag]); vq.set_defaults(fn=cmd_verify_queue)
+    vq.add_argument("--analysis", type=int, required=True)
+
+    vp = sub.add_parser("verify-prompt", parents=[dbflag]); vp.set_defaults(fn=cmd_verify_prompt)
+    vp.add_argument("--analysis", type=int, required=True)
+    vp.add_argument("--fingerprint", required=True)
+
+    rv = sub.add_parser("report-verdict", parents=[dbflag]); rv.set_defaults(fn=cmd_report_verdict)
+    rv.add_argument("--analysis", type=int, required=True)
+    rv.add_argument("--fingerprint", required=True)
+
     fn = sub.add_parser("finish", parents=[dbflag]); fn.set_defaults(fn=cmd_finish)
     fn.add_argument("--analysis", type=int, required=True)
     fn.add_argument("--state", required=True, choices=ledger.ANALYSIS_END_STATES)
@@ -3492,6 +3687,10 @@ def main(argv=None):
     # The ENGINE's close only: a comma list of guide names, '' for none, or
     # `unknown` when the run's stream could not be read. See `cmd_finish`.
     fn.add_argument("--guides-read", default=None, dest="guides_read")
+    # How many subagents the run launched, from `security_task_count` over the
+    # stream. The ENGINE's close only: the agent does not know its own stream,
+    # omits the flag, and the two count comparisons are then not made.
+    fn.add_argument("--tasks-launched", type=int, default=None, dest="tasks_launched")
 
     ck = sub.add_parser("checklist", parents=[dbflag]); ck.set_defaults(fn=cmd_checklist)
     ck.add_argument("--analysis", type=int, required=True)
@@ -3583,6 +3782,8 @@ def main(argv=None):
                      choices=FINDING_CATEGORIES)
     fpg.add_argument("--confidence", action="append", default=None,
                      choices=candidate.CONFIDENCE_SCORES)
+    fpg.add_argument("--verdict", action="append", default=None,
+                     choices=verdict.VERDICTS)
     fpg.add_argument("--branch", action="append", default=None)
     fpg.add_argument("--repo-path", action="append", default=None, dest="repo_path")
     fpg.add_argument("--analysis", action="append", type=int, default=None)

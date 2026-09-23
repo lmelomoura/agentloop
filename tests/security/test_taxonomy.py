@@ -456,25 +456,30 @@ def test_the_pins_catch_the_rewrites_that_used_to_slip_past_them():
         _skill_section(r"^## Ending the run$"))
 
 
-def test_the_skill_forbids_subagents_and_says_why():
-    # Closed at launch by the runner (--disallowedTools Task); this sentence
-    # explains the absence rather than enforcing it, which is why it has to
-    # name BOTH spellings: the CLI's roster calls the tool `Task`, and an agent
-    # told only about `Agent` reads the missing `Task` as a broken environment.
+def test_the_skill_scopes_subagents_to_verification_and_says_why():
+    """Since block 4.2 the tool is OPEN -- verification is subagents -- so the
+    rule is no longer "you have none" but "you have them for one job". Both
+    spellings still have to be named: the CLI's roster calls the tool `Task`,
+    and an agent told only about `Agent` does not connect the two."""
     text = SKILL.read_text()
     sentences = [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
     naming = [s for s in sentences if "`Agent`" in s and "`Task`" in s]
     assert naming, (
-        "no sentence in SKILL.md names both `Agent` and `Task` -- the tool is "
-        "denied at launch under the name `Task`, and nothing tells the agent")
-    assert any(re.search(r"closed at launch|not available|no subagents", s, re.I)
+        "no sentence in SKILL.md names both `Agent` and `Task` -- the agent is "
+        "told to launch subagents and the roster calls them by the other name")
+    assert any(re.search(r"verification|for one job|nothing else", s, re.I)
                for s in naming), (
-        "SKILL.md names `Agent`/`Task` but never says it is closed: "
+        "SKILL.md names `Agent`/`Task` but never says what they are for: "
         f"{naming!r}")
+    # What keeps the tool from being used for anything else is the COUNT at the
+    # close, and the skill has to say so -- an instruction with no consequence
+    # is exactly what failed before.
+    assert re.search(r"close counts", text, re.I), \
+        "SKILL.md opens subagents without saying that the close counts them"
     # The reason travels with the rule, or the next reader deletes the rule as
     # unexplained. $51.44 on six subagents that triaged nothing is the reason.
     assert "51.44" in text, \
-        "SKILL.md forbids subagents without the cost that made it a rule"
+        "SKILL.md scopes subagents without the cost that made it a rule"
 
 
 # ---- RULE_RENAMES: the declared history of every rule name that changed.

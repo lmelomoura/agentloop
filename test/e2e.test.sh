@@ -366,10 +366,16 @@ rm -f "$argv"
 FAKE_ARGV_OUT="$argv" FAKE_MODE=complete FAKE_SESSION=sess-sec-argv \
   "$AL" security analyze sandbox anything main quick >/dev/null 2>&1
 argc="$(awk -F'\t' '$1=="ARGC" {print $2; exit}' "$argv" 2>/dev/null)"
+# Since block 4.2 the launch closes NOTHING: the verification phase is
+# subagents, and what keeps them honest is the close counting them against the
+# verdicts in the ledger, not a flag at launch. `--max-budget-usd` is read
+# beside it so an argv that lost every flag fails here rather than passing for
+# the wrong reason.
 di="$(idx '--disallowedTools' 2>/dev/null)"
-[ -n "${di:-}" ] && [ "$(at "$((di + 1))")" = "Agent" ] \
-  && ok "the real analysis launch carries --disallowedTools Agent" \
-  || bad "no --disallowedTools Agent in the launch argv: $(tr '\n' ' ' < "$argv" 2>/dev/null)"
+mb="$(idx '--max-budget-usd' 2>/dev/null)"
+[ -z "${di:-}" ] && [ -n "${mb:-}" ] \
+  && ok "the real analysis launch closes no tool, and still carries its budget cap" \
+  || bad "unexpected --disallowedTools in the launch argv: $(tr '\n' ' ' < "$argv" 2>/dev/null)"
 mi="$(idx '--' 2>/dev/null)"
 [ -n "${mi:-}" ] && [ "$((mi + 1))" = "${argc:-0}" ] \
   && ok "and its prompt is the one argument after --, not swallowed by the variadic flag" \
@@ -1081,7 +1087,11 @@ grep -q 'security-sandbox-oc: deterministic phase ran before the agent (prepare'
 [ "$(at_in "$argv42" 1)" = "run" ] && ok "it went down the OpenCode launch line" || bad "argv: $(tr '\n' ' ' < "$argv42" 2>/dev/null)"
 mi="$(idx_in "$argv42" -m)"; [ -n "${mi:-}" ] && [ "$(at_in "$argv42" $((mi + 1)))" = "pdm_ai/glm-5.3-flash" ] \
   && ok "-m carries the block's model" || bad "-m '$(at_in "$argv42" $((${mi:-0} + 1)))'"
-[ "$(jq -r '.permission.task' "$cfg42")" = "deny" ] && ok "task is closed BY RULE in the permission block (Agent -> task: deny)" || bad "permission: $(jq -c .permission "$cfg42")"
+# No `task: deny` since block 4.2: the derived job closes no tool, so nothing
+# translates into one here. OpenCode still runs no verification (the prompt
+# forbids subagents there and the queue is not served) -- what changed is that
+# the denial is no longer expressed as a permission rule.
+[ "$(jq -r '.permission.task // "unset"' "$cfg42")" = "unset" ] && ok "no task rule: the derived job closes no tool any more" || bad "permission: $(jq -c .permission "$cfg42")"
 [ -n "$(idx_in "$argv42" --auto)" ] && [ "$(jq -r '.permission.bash // "open"' "$cfg42")" != "deny" ] \
   && ok "--auto with bash open: full-access, the security default on opencode" || bad "auto/bash: $(idx_in "$argv42" --auto) / $(jq -c .permission "$cfg42")"
 grep -q 'The `task` tool is closed for this run' "$prompt42" && ok "the prompt says the task tool is closed, by rule" || bad "no task paragraph in the prompt"
