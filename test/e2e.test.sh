@@ -618,10 +618,21 @@ sleep 2
 # stand-in cannot resolve a family, so a bare `opus` would be refused by the
 # model gate first, and never reach the resume refusal this scenario is about.
 sed -i '' 's/"platform":"openai"/"platform":"anthropic"/; s/"gpt-5.6-sol"/"claude-opus-5"/; s/"workspace-write"/"dontAsk"/; s/"effort":"high"/"effort":"low"/' "$ROOT/config/jobs.json"
+# The old run's account was the Default on openai, which carried CODEX_HOME
+# as its directory (see account_env_value). Marking THAT directory logged
+# out forces the anthropic readiness probe to fail if the resume ever
+# adopts it under the new platform -- proof the mismatch refusal below is
+# reached honestly, not because the probe happened to pass over a directory
+# that just has no claude credentials in it either way.
+: > "$CODEX_HOME/.fake-logged-out"
 "$AL" resume j22 thr-moved >/dev/null 2>&1
 grep -q 'j22: refusing to resume thr-moved — this session belongs to openai; the job now runs on anthropic' "$ROOT/data/tick.log" \
   && ok "the resume is refused, naming both platforms" || bad "no refusal line for the moved job"
+grep -q 'j22: anthropic is not ready' "$ROOT/data/tick.log" \
+  && bad "the readiness probe ran on the OLD platform's directory: $(grep 'j22: anthropic is not ready' "$ROOT/data/tick.log")" \
+  || ok "no 'is not ready' line: the mismatch is the only refusal reached"
 [ -n "$(dirs j22)" ] && ok "and the open session's tree is left where it was" || bad "the tree was taken"
+rm -f "$CODEX_HOME/.fake-logged-out"
 
 echo
 }
@@ -1303,6 +1314,14 @@ sleep 1
   && ok "and so does its precheck" || bad "the precheck saw '$(cat "$ROOT/pc-47" 2>/dev/null)'"
 [ "$(lastrun | jq -r '[.account, .account_dir] | join(" ")')" = "client-a $ROOT/accounts/claude-a" ] \
   && ok "the journal records the account and the directory the run used" || bad "record: $(lastrun | jq -c '{account, account_dir}')"
+rm -f "$ROOT/pc-47"
+"$AL" check j47 >/dev/null 2>&1
+[ "$(cat "$ROOT/pc-47" 2>/dev/null)" = "$ROOT/accounts/claude-a" ] \
+  && ok "agentloop check runs the precheck on the same account too" || bad "check saw '$(cat "$ROOT/pc-47" 2>/dev/null)'"
+rm -f "$ROOT/pc-47"
+"$AL" precheck j47 >/dev/null 2>&1
+[ "$(cat "$ROOT/pc-47" 2>/dev/null)" = "$ROOT/accounts/claude-a" ] \
+  && ok "and so does agentloop precheck, standalone" || bad "precheck saw '$(cat "$ROOT/pc-47" 2>/dev/null)'"
 
 echo
 }
@@ -1355,11 +1374,46 @@ mkjob_acct j50 signed-out
 FAKE_MODE=complete FAKE_SESSION=sess-50 "$AL" run j50 >/dev/null 2>&1
 grep -qF "j50: anthropic is not ready (claude is not signed in in $ROOT/accounts/claude-out (run: CLAUDE_CONFIG_DIR=$ROOT/accounts/claude-out claude auth login)), skipped" "$ROOT/data/tick.log" \
   && ok "no session: the refusal names the account's directory and the login to run" || bad "no refusal line: $(tail -3 "$ROOT/data/tick.log")"
-[ -z "$(dirs j50)" ] && ok "and no run directory was cut" || bad "a worktree was cut for a refused run"
+# dirs() alone does not prove this: FAKE_MODE=complete removes its own
+# worktree once a run finishes, so an empty tree also describes a run that
+# launched and was cleaned up. A log directory and a journal record are not
+# cleaned up that way -- their absence is what actually proves no slot ran.
+[ ! -d "$ROOT/data/logs/j50" ] && [ -z "$(run_of j50)" ] \
+  && ok "and no run directory, log or journal record was left behind" \
+  || bad "log dir: $(ls -d "$ROOT/data/logs/j50" 2>&1); record: $(run_of j50)"
 mkjob_acct j50c ghost
 "$AL" run j50c >/dev/null 2>&1
 grep -qF "j50c: account 'ghost' is not an account of anthropic in Settings, skipped" "$ROOT/data/tick.log" \
   && ok "an account Settings does not have is refused by name" || bad "no ghost refusal: $(tail -3 "$ROOT/data/tick.log")"
+# The standalone probes must refuse the same unregistered account, before
+# ever touching the precheck script -- not silently ask the CLI's default.
+jq --arg pc "printf '%s' \"\${CLAUDE_CONFIG_DIR-<unset>}\" > $ROOT/pc-50c; exit 0" '.jobs[0].precheck = $pc' \
+  "$ROOT/config/jobs.json" > "$ROOT/config/jobs.next" && mv "$ROOT/config/jobs.next" "$ROOT/config/jobs.json"
+rm -f "$ROOT/pc-50c"
+out50c="$("$AL" check j50c 2>&1)"; rc50c=$?
+[ "$rc50c" -ne 0 ] && [ "$out50c" = "j50c: account 'ghost' is not an account of anthropic in Settings" ] && [ ! -f "$ROOT/pc-50c" ] \
+  && ok "agentloop check refuses the unregistered account before the precheck runs" \
+  || bad "check j50c: rc=$rc50c out='$out50c' pc50c='$(cat "$ROOT/pc-50c" 2>/dev/null)'"
+rm -f "$ROOT/pc-50c"
+out50cp="$("$AL" precheck j50c 2>&1)"; rc50cp=$?
+[ "$rc50cp" -ne 0 ] && [ "$out50cp" = "j50c: account 'ghost' is not an account of anthropic in Settings" ] && [ ! -f "$ROOT/pc-50c" ] \
+  && ok "agentloop precheck refuses it too, before running anything" \
+  || bad "precheck j50c: rc=$rc50cp out='$out50cp' pc50c='$(cat "$ROOT/pc-50c" 2>/dev/null)'"
+# The two gates the selftest can only see in run_refusals' own source (no
+# scenario ever tripped them for real): a directory gone after registration,
+# and OpenCode -- which has no accounts at all -- naming one anyway.
+mkdir -p "$ROOT/accounts/claude-missing"
+"$AL" platform account-add anthropic "Missing Dir" "$ROOT/accounts/claude-missing" >/dev/null 2>&1 || bad "account-add (missing-dir fixture) failed"
+rm -rf "$ROOT/accounts/claude-missing"
+mkjob_acct j50d missing-dir
+"$AL" run j50d >/dev/null 2>&1
+grep -qF "j50d: account 'Missing Dir' is missing its directory ($ROOT/accounts/claude-missing), skipped" "$ROOT/data/tick.log" \
+  && ok "a registered account whose directory disappeared is refused by name" || bad "no missing-dir refusal: $(tail -3 "$ROOT/data/tick.log")"
+mkjob_opencode j50e
+jq '.jobs[0].account = "nope"' "$ROOT/config/jobs.json" > "$ROOT/config/jobs.next" && mv "$ROOT/config/jobs.next" "$ROOT/config/jobs.json"
+"$AL" run j50e >/dev/null 2>&1
+grep -qF "j50e: OpenCode has no accounts (account 'nope'), skipped" "$ROOT/data/tick.log" \
+  && ok "an OpenCode job naming an account is refused: OpenCode has none" || bad "no opencode-account refusal: $(tail -3 "$ROOT/data/tick.log")"
 mkjob j50b
 FAKE_MODE=complete FAKE_SESSION=sess-50b "$AL" run j50b >/dev/null 2>&1
 sleep 1
@@ -1377,6 +1431,11 @@ mkjob_acct j51 r1
 FAKE_MODE=undeclared FAKE_SESSION=sess-51 "$AL" run j51 >/dev/null 2>&1
 sleep 2
 printf 'r2' | "$AL" set-field j51 account >/dev/null 2>&1 || bad "set-field account r2 failed"
+# No job names R1 any more (j51 is now on r2) -- removing it from Settings
+# proves the resume below signs in with the recorded directory even though
+# the account id itself no longer exists there to be looked up.
+"$AL" platform account-remove anthropic r1 >/dev/null 2>&1
+[ $? -eq 0 ] && ok "R1 can be removed from Settings now that no job names it" || bad "account-remove r1 failed"
 acct51="$ROOT/account-51"; rm -f "$acct51"
 FAKE_ACCOUNT_OUT="$acct51" FAKE_MODE=complete FAKE_SESSION=sess-51 "$AL" resume j51 sess-51 >/dev/null 2>&1
 sleep 2

@@ -1038,10 +1038,10 @@ JSON
       and .[0].builtin == true and .[0].dir == $h and .[0].account_dir == "" and .[0].check.ready == true
       and .[0].used_by == {jobs: ["ja"], projects: ["P"], security: []}' >/dev/null 2>&1 \
     && ok "platform accounts: the Default alone, on the CLI's own directory, with who runs on it" || bad "accounts before any: $_aj"
-  out="$(ac_al platform account-add anthropic "Cliente A" "~/.claude-a" 2>&1)"; rc=$?
-  [ "$rc" -eq 0 ] && [ "$out" = "account 'Cliente A' added on anthropic (id cliente-a) — signed in as fake@example.org · max plan" ] \
+  out="$(ac_al platform account-add anthropic "Client A" "~/.claude-a" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = "account 'Client A' added on anthropic (id client-a) — signed in as fake@example.org · max plan" ] \
     && ok "account-add registers it, names its id and whom it is signed in as" || bad "account-add: rc=$rc $out"
-  [ "$("$JQ" -c '.platforms.anthropic.accounts' "$ac/config/platforms.json")" = '[{"id":"cliente-a","name":"Cliente A","dir":"~/.claude-a"}]' ] \
+  [ "$("$JQ" -c '.platforms.anthropic.accounts' "$ac/config/platforms.json")" = '[{"id":"client-a","name":"Client A","dir":"~/.claude-a"}]' ] \
     && ok "and the file keeps the directory as it was typed" || bad "file: $(cat "$ac/config/platforms.json")"
   [ "$(readlink "$ac/home/.claude-a/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
     && ok "and the skills are linked into that account's own skills directory" || bad "skills in the account: $(ls "$ac/home/.claude-a" 2>&1)"
@@ -1055,59 +1055,59 @@ JSON
   ac_al platform account-remove anthropic filed >/dev/null 2>&1   # done with it: keeps the later "only it leaves the file" count exact
   ac_refused "an account needs a name" "an account needs a name" account-add anthropic "" "~/.claude-a"
   ac_refused "an account needs a directory" "an account needs a directory" account-add anthropic "NeedsDir" ""
-  ac_refused "a name already used is refused, whatever its case" "an account named 'cliente a' already exists on anthropic" account-add anthropic "cliente a" "~/.claude-b"
-  ac_refused "a directory another account has is refused, trailing slash or not" "$ac/home/.claude-a is already the directory of the account 'Cliente A'" account-add anthropic "Other" "$ac/home/.claude-a/"
+  ac_refused "a name already used is refused, whatever its case" "an account named 'client a' already exists on anthropic" account-add anthropic "client a" "~/.claude-b"
+  ac_refused "a directory another account has is refused, trailing slash or not" "$ac/home/.claude-a is already the directory of the account 'Client A'" account-add anthropic "Other" "$ac/home/.claude-a/"
   ac_refused "a relative directory is refused" "the directory must be absolute or start with ~/ (got 'relative/dir')" account-add anthropic "Rel" "relative/dir"
   ac_refused "a directory that does not exist says how to create it" "$ac/home/.claude-none does not exist — create it by signing in: CLAUDE_CONFIG_DIR=$ac/home/.claude-none claude auth login" account-add anthropic "None" "~/.claude-none"
   ac_refused "the Default's own directory is refused" "$ac/home/.claude is the Default account's directory" account-add anthropic "Home" "~/.claude"
   ac_refused "Default is not a name an account can take" "Default is the install's own account — choose another name" account-add anthropic "default" "~/.claude-b"
   ac_refused "OpenCode has no accounts" "OpenCode has no accounts — its credentials are the providers configured in opencode itself" account-add opencode "X" "~/.claude-b"
-  out="$(ac_al platform account-add anthropic "Cliente-A" "~/.claude-b" 2>&1)"
-  case "$out" in *"(id cliente-a-2)"*) ok "an id already taken gets a numbered suffix" ;; *) bad "suffix: $out" ;; esac
+  out="$(ac_al platform account-add anthropic "Client-A" "~/.claude-b" 2>&1)"
+  case "$out" in *"(id client-a-2)"*) ok "an id already taken gets a numbered suffix" ;; *) bad "suffix: $out" ;; esac
   : > "$ac/home/.claude-b/.fake-logged-out"
-  _aj="$(ac_al platform check anthropic cliente-a-2 2>/dev/null)"
-  printf '%s' "$_aj" | "$JQ" -e --arg d "$ac/home/.claude-b" '.ready == false and .account_id == "cliente-a-2" and .account_dir == $d
+  _aj="$(ac_al platform check anthropic client-a-2 2>/dev/null)"
+  printf '%s' "$_aj" | "$JQ" -e --arg d "$ac/home/.claude-b" '.ready == false and .account_id == "client-a-2" and .account_dir == $d
       and .reason == ("claude is not signed in in " + $d + " (run: CLAUDE_CONFIG_DIR=" + $d + " claude auth login)")' >/dev/null 2>&1 \
-    && ok "platform check <p> <id> checks that account's own directory" || bad "check cliente-a-2: $_aj"
+    && ok "platform check <p> <id> checks that account's own directory" || bad "check client-a-2: $_aj"
   _aj="$(ac_al platform accounts anthropic 2>/dev/null)"
   printf '%s' "$_aj" | "$JQ" -e --arg d "$ac/home/.claude-b" \
-      '(.[] | select(.id == "cliente-a-2")) as $e
+      '(.[] | select(.id == "client-a-2")) as $e
        | $e.dir == "~/.claude-b" and $e.account_dir == $d and $e.builtin == false and $e.check.ready == false
        and $e.used_by == {jobs:[], projects:[], security:[]}' >/dev/null 2>&1 \
-    && ok "platform accounts: a registered, logged-out account shows its typed dir, its exported dir, and that nobody uses it" || bad "accounts cliente-a-2: $_aj"
+    && ok "platform accounts: a registered, logged-out account shows its typed dir, its exported dir, and that nobody uses it" || bad "accounts client-a-2: $_aj"
   printf 'a@example.org' > "$ac/home/.claude-a/.fake-email"
-  [ "$(ac_al platform check anthropic cliente-a 2>/dev/null | "$JQ" -r .account)" = "a@example.org · max plan" ] \
-    && ok "and says whom that directory is signed in as" || bad "check cliente-a: $(ac_al platform check anthropic cliente-a 2>&1)"
+  [ "$(ac_al platform check anthropic client-a 2>/dev/null | "$JQ" -r .account)" = "a@example.org · max plan" ] \
+    && ok "and says whom that directory is signed in as" || bad "check client-a: $(ac_al platform check anthropic client-a 2>&1)"
   [ "$(ac_al platform check anthropic nope 2>/dev/null | "$JQ" -r '.ready, .account_dir, .reason' | tr '\n' '|')" = "false||account 'nope' is not an account of anthropic in Settings|" ] \
     && ok "an id Settings does not have is not ready, and says so, and exports nothing for account_dir" || bad "check nope: $(ac_al platform check anthropic nope 2>&1)"
-  out="$(ac_al platform account-edit anthropic cliente-a "Cliente Alfa" "~/.claude-a" 2>&1)"; rc=$?
-  [ "$rc" -eq 0 ] && [ "$out" = "account 'Cliente Alfa' saved on anthropic — signed in as a@example.org · max plan" ] \
-    && [ "$("$JQ" -r '.platforms.anthropic.accounts[0] | "\(.id) \(.name)"' "$ac/config/platforms.json")" = "cliente-a Cliente Alfa" ] \
+  out="$(ac_al platform account-edit anthropic client-a "Client Alfa" "~/.claude-a" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = "account 'Client Alfa' saved on anthropic — signed in as a@example.org · max plan" ] \
+    && [ "$("$JQ" -r '.platforms.anthropic.accounts[0] | "\(.id) \(.name)"' "$ac/config/platforms.json")" = "client-a Client Alfa" ] \
     && ok "account-edit renames it and keeps its id" || bad "edit: rc=$rc $out"
-  out="$(ac_al platform account-edit anthropic cliente-a "Cliente Alfa" "~/.claude-c" 2>&1)"; rc=$?
-  [ "$rc" -eq 0 ] && [ "$out" = "account 'Cliente Alfa' saved on anthropic — signed in as fake@example.org · max plan" ] \
+  out="$(ac_al platform account-edit anthropic client-a "Client Alfa" "~/.claude-c" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = "account 'Client Alfa' saved on anthropic — signed in as fake@example.org · max plan" ] \
     && [ "$(readlink "$ac/home/.claude-c/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
     && ok "account-edit moving an account to a new, existing directory relinks the skills there too" || bad "edit relink: rc=$rc $out $(ls "$ac/home/.claude-c" 2>&1)"
   ac_refused "the Default is not edited here" "the Default account is the install's own — it is not edited here" account-edit anthropic default "X" "~/.claude-b"
   ac_refused "an unknown id is not edited" "no account 'nope' on anthropic" account-edit anthropic nope "X" "~/.claude-b"
-  "$JQ" '.jobs[0].account = "cliente-a"' "$ac/config/jobs.json" > "$ac/jobs.next" && mv "$ac/jobs.next" "$ac/config/jobs.json"
-  ac_refused "an account in use is not removed, and the refusal names who uses it" "'Cliente Alfa' is used by ja — move them to another account first" account-remove anthropic cliente-a
+  "$JQ" '.jobs[0].account = "client-a"' "$ac/config/jobs.json" > "$ac/jobs.next" && mv "$ac/jobs.next" "$ac/config/jobs.json"
+  ac_refused "an account in use is not removed, and the refusal names who uses it" "'Client Alfa' is used by ja — move them to another account first" account-remove anthropic client-a
   "$JQ" 'del(.jobs[0].account)' "$ac/config/jobs.json" > "$ac/jobs.next" && mv "$ac/jobs.next" "$ac/config/jobs.json"
   printf '{oops' > "$ac/config/jobs.json"
-  ac_refused "account-remove refuses when jobs.json cannot be read, rather than assuming nobody uses it" "cannot tell who uses 'Cliente Alfa': $ac/config/jobs.json does not parse — fix it first" account-remove anthropic cliente-a
+  ac_refused "account-remove refuses when jobs.json cannot be read, rather than assuming nobody uses it" "cannot tell who uses 'Client Alfa': $ac/config/jobs.json does not parse — fix it first" account-remove anthropic client-a
   printf '{"jobs":[{"id":"ja","project":"P","prompt":"x","model":"claude-opus-5"},{"id":"jo","platform":"openai","model":"gpt-a","prompt":"x"}]}\n' > "$ac/config/jobs.json"
-  out="$(ac_al platform account-remove anthropic cliente-a 2>&1)"; rc=$?
-  [ "$rc" -eq 0 ] && [ "$out" = "account 'cliente-a' removed from anthropic" ] \
-    && [ "$("$JQ" -c '[.platforms.anthropic.accounts[].id]' "$ac/config/platforms.json")" = '["cliente-a-2"]' ] \
+  out="$(ac_al platform account-remove anthropic client-a 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = "account 'client-a' removed from anthropic" ] \
+    && [ "$("$JQ" -c '[.platforms.anthropic.accounts[].id]' "$ac/config/platforms.json")" = '["client-a-2"]' ] \
     && ok "once nobody uses it, it is removed, and only it leaves the file" || bad "remove: rc=$rc $out $(cat "$ac/config/platforms.json")"
   ac_refused "the Default is never removed" "the Default account is the install's own — it cannot be removed" account-remove anthropic default
   ac_refused "an unknown id is not removed" "no account 'nope' on anthropic" account-remove anthropic nope
-  out="$(ac_al platform account-add openai "Cliente A" "~/.codex-a" 2>&1)"; rc=$?
-  [ "$rc" -eq 0 ] && [ "$out" = "account 'Cliente A' added on openai (id cliente-a) — Logged in using ChatGPT" ] \
+  out="$(ac_al platform account-add openai "Client A" "~/.codex-a" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = "account 'Client A' added on openai (id client-a) — Logged in using ChatGPT" ] \
     && ok "an OpenAI account has its own list: the same name and id are free there" || bad "openai add: rc=$rc $out"
   : > "$ac/home/.codex-a/.fake-logged-out"
-  [ "$(ac_al platform check openai cliente-a 2>/dev/null | "$JQ" -r .reason)" = "codex is not signed in in $ac/home/.codex-a (run: CODEX_HOME=$ac/home/.codex-a codex login)" ] \
-    && ok "and its check runs codex login status in that CODEX_HOME" || bad "openai check: $(ac_al platform check openai cliente-a 2>&1)"
+  [ "$(ac_al platform check openai client-a 2>/dev/null | "$JQ" -r .reason)" = "codex is not signed in in $ac/home/.codex-a (run: CODEX_HOME=$ac/home/.codex-a codex login)" ] \
+    && ok "and its check runs codex login status in that CODEX_HOME" || bad "openai check: $(ac_al platform check openai client-a 2>&1)"
   [ "$(readlink "$ac/home/.codex-a/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
     && ok "and the skills are linked into its home too" || bad "codex account skills: $(ls "$ac/home/.codex-a" 2>&1)"
   ac_refused "a Codex home that does not exist says how to create it" "$ac/home/.codex-none does not exist — create it and sign in: mkdir -p $ac/home/.codex-none && CODEX_HOME=$ac/home/.codex-none codex login" account-add openai "N" "~/.codex-none"
@@ -1130,8 +1130,8 @@ JSON
     && ok "account_env_value: the CLI's own directory (and nothing) is no value at all; any other is normalized" || bad "account_env_value"
   ( account_norm_dir "rel/dir" >/dev/null ); want "account_norm_dir refuses a relative path" 1 $?
   ( account_norm_dir "/" >/dev/null ); want "and the root" 1 $?
-  [ "$(account_slug "  Cliente Á / Nº 2 ")" = "cliente-n-2" ] && [ "$(account_slug "!!!")" = "account" ] \
-    && ok "account_slug: lower case, dashes, nothing at the ends, a fallback for nothing" || bad "slug: $(account_slug "  Cliente Á / Nº 2 ") / $(account_slug "!!!")"
+  [ "$(account_slug "  Client Á / Nº 2 ")" = "client-n-2" ] && [ "$(account_slug "!!!")" = "account" ] \
+    && ok "account_slug: lower case, dashes, nothing at the ends, a fallback for nothing" || bad "slug: $(account_slug "  Client Á / Nº 2 ") / $(account_slug "!!!")"
   printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":[],"accounts":[{"id":"ok","name":"Ok","dir":"/x"},{"id":"","name":"n","dir":"/y"},"junk",{"id":"default","name":"D","dir":"/z"},{"id":"n","name":"N"},{"id":"a b","name":"S","dir":"/s"},{"id":"*","name":"G","dir":"/g"}]}}}\n' > "$ac/malformed.json"
   [ "$( PLATFORMS_FILE="$ac/malformed.json"; accounts_json anthropic )" = '[{"id":"ok","name":"Ok","dir":"/x"}]' ] \
     && [ "$( PLATFORMS_FILE="$ac/malformed.json"; accounts_json opencode )" = '[]' ] \
@@ -3200,9 +3200,9 @@ EOF
     || bad "gate order: $_rfo"
   : > "$tmp/acct-runs.ndjson"
   ( RUNS_FILE="$tmp/acct-runs.ndjson"; LOCK_DIR="$tmp"
-    record_run j1 success 1 2 0 1 sess-a /x.json "" false "" P opus claude-opus-5 "" "" anthropic reported null cliente-a /x/.claude-a
+    record_run j1 success 1 2 0 1 sess-a /x.json "" false "" P opus claude-opus-5 "" "" anthropic reported null client-a /x/.claude-a
     record_run j2 success 1 2 0 1 sess-b /y.json "" false "" P opus claude-opus-5 "" "" anthropic reported null )
-  [ "$( RUNS_FILE="$tmp/acct-runs.ndjson"; journal_account_of_session sess-a | tr '\037' '|' )" = "cliente-a|/x/.claude-a" ] \
+  [ "$( RUNS_FILE="$tmp/acct-runs.ndjson"; journal_account_of_session sess-a | tr '\037' '|' )" = "client-a|/x/.claude-a" ] \
     && [ -z "$( RUNS_FILE="$tmp/acct-runs.ndjson"; journal_account_of_session sess-b )" ] \
     && ok "record_run keeps the account and its directory; a record without them says nothing" \
     || bad "journal: $(cat "$tmp/acct-runs.ndjson")"

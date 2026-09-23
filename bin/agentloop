@@ -5145,9 +5145,16 @@ cmd_precheck() { # <id> — run the job's precheck once and RECORD it, without t
   # prechecks: a claim is a write, and spending it here leaves a ticket
   # claimed with no session behind it.
   # The same account as the run it gates (run_job's precheck): a probe that
-  # asks the CLI itself must answer for the account the job signs in as.
-  local plat adir
-  plat="$(job_platform "$id")"; adir="$(account_env_dir "$plat" "$(job_account "$id")")"
+  # asks the CLI itself must answer for the account the job signs in as --
+  # and an id Settings no longer has must refuse HERE too, exactly as the
+  # launch gate does, rather than quietly asking the CLI's own default.
+  local plat acct adir
+  plat="$(job_platform "$id")"; acct="$(job_account "$id")"
+  if ! account_known "$plat" "$acct"; then
+    echo "$id: account '$acct' is not an account of $plat in Settings"
+    return 1
+  fi
+  adir="$(account_env_dir "$plat" "$acct")"
   pc_out="$( cd "$cwd" && account_export "$plat" "$adir" && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1 && eval "$precheck" 2>&1 )"; pc_rc=$?
   state_set "$id" last_precheck "$("$JQ" -nc --arg o "${pc_out:-(no output)}" --argjson rc "$pc_rc" '{output:$o, exit:$rc}')"
   printf '%s\n(exit %s)\n' "$pc_out" "$pc_rc"
@@ -5324,8 +5331,13 @@ run_refusals() {
   # has, or a registered account whose directory is gone, fails at the login
   # prompt otherwise. A resume is exempt from the id test -- it signs in with
   # the directory its session was created under, whatever Settings says
-  # today. The Default's directory is the install's (the pin, CODEX_HOME):
-  # the readiness check below speaks for it, as it always has.
+  # today -- but resume_sid arrives here NON-EMPTY only when run_job actually
+  # took the account off that session's journal record for THIS platform; a
+  # resume whose account is still the job's own (an old record with no
+  # account, or one recorded on another platform) gets no exemption at all,
+  # exactly like a plain run. The Default's directory is the install's (the
+  # pin, CODEX_HOME): the readiness check below speaks for it, as it always
+  # has.
   if [ "$platform" = "opencode" ] && [ "$account" != "default" ]; then
     log_tick "$id: OpenCode has no accounts (account '$account'), skipped"; return 1
   fi
@@ -5934,16 +5946,30 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   # Default. account_dir is what the platform's variable carries -- empty is
   # the CLI's own directory, and means the variable is left unset. A RESUME
   # signs in where its session was created, off the journal: the session is
-  # stored in that account's directory, whatever the job says today.
+  # stored in that account's directory, whatever the job says today -- but
+  # ONLY when that session ran on the platform this job still runs on
+  # (journal_platform_of_session answers "anthropic" for a record with no
+  # platform of its own, same as everywhere else that field is read). A
+  # platform change leaves the job's own account/account_dir in place, so
+  # run_refusals below is asked about the CURRENT platform's own account
+  # instead of the old session's directory under the new CLI, and the
+  # mismatch check further down (unchanged) is the one that names the real
+  # cause. resume_account_sid feeds run_refusals' 11th argument (resume-sid)
+  # and is left EMPTY unless the account above actually came from the
+  # journal just now -- so the "unknown account" gate is exempted only for a
+  # genuine same-platform resume, never for a job's own (possibly stale)
+  # account riding along on a resume of some other session.
   account="$(job_account "$id")"
   account_dir="$(account_env_dir "$platform" "$account")"
-  if [ -n "$resume_sid" ]; then
+  local resume_account_sid=""
+  if [ -n "$resume_sid" ] && [ "$(journal_platform_of_session "$resume_sid")" = "$platform" ]; then
     local _ra
     _ra="$(journal_account_of_session "$resume_sid")"
     if [ -n "$_ra" ]; then
       IFS="$(printf '\037')" read -r account account_dir <<EOF
 $_ra
 EOF
+      resume_account_sid="$resume_sid"
     fi
   fi
   # cwd, model, permission, budget and timeout inherit from the project when the
@@ -6015,7 +6041,7 @@ EOF
   local _inert; _inert="$(permission_inert_warning "$platform" "$permission" "$allowed")"
   [ -z "$_inert" ] || log_tick "$id: $_inert"
 
-  run_refusals "$id" "$platform" "$model" "$effort" "$permission" "$allowed" "$disallowed" "$interactive" "$account" "$account_dir" "$resume_sid" || return 1
+  run_refusals "$id" "$platform" "$model" "$effort" "$permission" "$allowed" "$disallowed" "$interactive" "$account" "$account_dir" "$resume_account_sid" || return 1
   effort="$RJ_EFFORT"
   local _occ1; _occ1="$RJ_OPENCODE_CONFIG"
   # Resolved once, after the gate, so the binary that was checked is the
@@ -8206,9 +8232,17 @@ cmd_check() {
   precheck="$(jobs_json | "$JQ" -r --arg id "$id" '.jobs[] | select(.id==$id) | .precheck // ""')"
   cwd="$(resolve "$id" cwd "$HOME")"   # inherit the project's cwd, like run_job
   [ -n "$precheck" ] || { echo "$id has no precheck — every due tick spends a session."; return 0; }
-  # Read-only, like every standalone probe (see AL_PRECHECK_DRY_RUN).
-  local plat adir
-  plat="$(job_platform "$id")"; adir="$(account_env_dir "$plat" "$(job_account "$id")")"
+  # Read-only, like every standalone probe (see AL_PRECHECK_DRY_RUN). The
+  # same account as the run it gates -- an id Settings no longer has must
+  # refuse HERE too, exactly as the launch gate does, rather than quietly
+  # asking the CLI's own default.
+  local plat acct adir
+  plat="$(job_platform "$id")"; acct="$(job_account "$id")"
+  if ! account_known "$plat" "$acct"; then
+    echo "$id: account '$acct' is not an account of $plat in Settings"
+    return 1
+  fi
+  adir="$(account_env_dir "$plat" "$acct")"
   ( cd "$cwd" && account_export "$plat" "$adir" && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1 && eval "$precheck" ); local rc=$?
   case "$(precheck_verdict "$rc")" in
     work)  echo "precheck: WORK FOUND — a due tick would start a Claude run" ;;
