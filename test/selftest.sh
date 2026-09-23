@@ -735,6 +735,20 @@ JSON
   if [ -s "$_gcpid" ] && ! kill -0 "$(cat "$_gcpid")" 2>/dev/null; then ok "and the grandchild that ignored the TERM went with its group on the KILL"
   else bad "the TERM-proof grandchild (pid $(cat "$_gcpid" 2>/dev/null)) outlived the deadline"; kill -9 "$(cat "$_gcpid" 2>/dev/null)" 2>/dev/null; fi
 
+  echo "anthropic_catalog_ids() — the Settings list, every family newest first"
+  # The fixture is every id the scan finds in the real CLI 2.1.280 binary,
+  # laid out in the order the list must show; tests/test_platforms_api.py
+  # holds the dashboard's picker to the same file. The stand-in binary
+  # carries them alphabetically, NUL between, so the order can only come
+  # from the sort. Compared as raw number lists, the shorter list won:
+  # claude-opus-5 listed above claude-opus-5-5, and a date sorted as a minor.
+  LC_ALL=C sort "$BASE_DIR/test/fixtures/claude-cli-model-ids-newest-first.txt" | tr '\n' '\000' > "$tmp/idblob"
+  got="$( CLAUDE_BIN="$tmp/idblob"; MODELS_FILE="$tmp/no-models.json"; JOBS_FILE="$tmp/no-jobs.json"; PROJECTS_FILE="$tmp/no-projects.json"
+          anthropic_catalog_ids | tr '\n' ' ' )"
+  [ "$got" = "$(tr '\n' ' ' < "$BASE_DIR/test/fixtures/claude-cli-model-ids-newest-first.txt")" ] \
+    && ok "newest first: a missing minor is 0, and a date only orders the snapshots of one version" \
+    || bad "anthropic_catalog_ids: $got"
+
   echo "agentloop platform … — the commands the Settings page is made of"
   local pc="$tmp/pc" out rc _pm _pl; mkdir -p "$pc/config" "$pc/data"
   printf '{"jobs":[{"id":"u1","model":"claude-opus-5","prompt":"x"},{"id":"u2","platform":"openai","model":"gpt-a","prompt":"x"}]}\n' > "$pc/config/jobs.json"

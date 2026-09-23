@@ -101,6 +101,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   comes back unchanged, and `claude-opus-4-20250514` is 4.0, so the 4.1
   above it is still found.
 
+- **Every Anthropic model list is newest first — the dashboard's picker and
+  Settings › Platforms.** Both compared version numbers as raw lists, where
+  the shorter list wins: the day Opus 5.5 shipped, `claude-opus-5` was
+  listed above `claude-opus-5-5`, `claude-fable-5` above `claude-fable-5-1`,
+  and `claude-opus-4-20250514` above `claude-opus-4-8`, its date read as a
+  minor. A missing minor now counts as 0 and a date only orders the
+  snapshots of one version — the undated alias first, then the newest date —
+  in the server's `list_models` and the engine's `anthropic_catalog_ids`
+  alike. Both are held to one fixture: every id the scan finds in the real
+  CLI 2.1.280 binary, in the order the lists must show.
+
 - **A job with no schedule window is launched by the tick again.** The
   tick's plan was one tab-separated line per enabled job, read back with
   `IFS=tab` -- and a tab is IFS whitespace, which bash folds: a run of it

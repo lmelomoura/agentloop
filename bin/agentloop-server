@@ -2993,8 +2993,20 @@ def list_models():
     fam_order = [f[0] for f in MODEL_FAMILIES]
 
     def sort_key(v):
+        # Newest first within each family, by (major, minor) with a missing
+        # minor read as 0. Compared as raw number lists, the shorter list won:
+        # [5] sorted ahead of [5, 5], so claude-opus-5 was listed above
+        # claude-opus-5-5. An 8-digit last number is a snapshot date, not a
+        # version (claude-opus-4-20250514 is 4.0): it only orders the ids of
+        # one version, the undated alias first -- it always names the newest
+        # snapshot -- then newest date first. The id itself settles the rest,
+        # so the order never depends on the order of the set. The engine's
+        # anthropic_catalog_ids sorts the Settings list the same way.
         f = next((i for i, x in enumerate(fam_order) if x in v), 9)
-        return (f, [-int(n) for n in re.findall(r"\d+", v)])   # newest first
+        nums = re.findall(r"\d+", v)
+        date = int(nums.pop()) if len(nums) > 1 and len(nums[-1]) == 8 else 0
+        ver = [int(n) for n in nums] + [0] * (2 - len(nums))
+        return (f, [-n for n in ver], date != 0, -date, v)
     models = sorted(ids, key=sort_key)
 
     anthropic = {"available": True, "reason": "", "models": models,

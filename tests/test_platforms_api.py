@@ -475,6 +475,44 @@ def test_the_old_models_key_lists_anthropic_models_only(srv, tmp_path, monkeypat
     assert "gpt-5.6-luna" in [m["v"] for m in out["platforms"]["openai"]["models"]]
 
 
+def _anthropic_models_from(srv, tmp_path, monkeypatch, ids):
+    """`models` when the only source is a CLI binary carrying `ids` -- raw
+    bytes the scan reads, the ids alphabetical with NULs between, never in
+    the order they are expected back. No jobs, no runs, no family resolved."""
+    blob = tmp_path / "claude-bin"
+    blob.write_bytes(b"\x00".join(i.encode() for i in sorted(ids)) + b"\x00")
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_BIN", str(blob))
+    monkeypatch.setattr(srv, "JOBS_FILE", tmp_path / "no-jobs.json")
+    monkeypatch.setattr(srv, "PROJECTS_FILE", tmp_path / "no-projects.json")
+    monkeypatch.setattr(srv, "DB_FILE", tmp_path / "index.db")
+    (srv.CONFIG_DIR / "models.json").write_text(json.dumps({"resolved": {}, "openai": _catalog_block()}))
+    return srv.list_models()["models"]
+
+
+def test_the_anthropic_models_are_newest_first_in_each_family(srv, tmp_path, monkeypatch):
+    """A bare major is minor 0 and a date suffix is a snapshot, not a minor.
+    Compared as raw number lists, the shorter list won: on the day Opus 5.5
+    shipped, claude-opus-5 was listed above claude-opus-5-5, claude-fable-5
+    above claude-fable-5-1, and claude-opus-4-20250514 above claude-opus-4-8.
+    Two ids of one version keep the undated alias first -- it always names
+    the newest snapshot -- then the snapshots, newest date first."""
+    ids = ["claude-opus-5", "claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-20250514",
+           "claude-haiku-4-5-20251001", "claude-haiku-4-5", "claude-fable-5", "claude-fable-5-1"]
+    assert _anthropic_models_from(srv, tmp_path, monkeypatch, ids) == [
+        "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-20250514",
+        "claude-haiku-4-5", "claude-haiku-4-5-20251001",
+        "claude-fable-5-1", "claude-fable-5"]
+
+
+def test_the_real_cli_catalog_is_listed_newest_first(srv, tmp_path, monkeypatch):
+    """Every id the scan finds in the real CLI 2.1.280 binary, laid out by the
+    fixture in the order the picker must show them. The selftest holds the
+    engine's anthropic_catalog_ids -- the Settings list -- to the same file,
+    so the two lists cannot drift apart."""
+    want = (REPO / "test" / "fixtures" / "claude-cli-model-ids-newest-first.txt").read_text().split()
+    assert _anthropic_models_from(srv, tmp_path, monkeypatch, want) == want
+
+
 def test_platforms_carry_the_catalog_visible_models_in_priority_order(srv):
     _write_models(srv, openai=_catalog_block())
     (srv.CONFIG_DIR / "pricing.json").write_text(

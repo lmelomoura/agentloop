@@ -1664,12 +1664,24 @@ anthropic_catalog_ids() { # every claude-* id this install can name, most capabl
     [ -f "$PROJECTS_FILE" ] && "$JQ" -r '.projects[]? | ((.security | objects) // {}).model // empty | select(startswith("claude-"))' "$PROJECTS_FILE" 2>/dev/null
   } | "$JQ" -R . | "$JQ" -rs '
     def fam: (capture("^claude-(?<f>[a-z]+)") | .f) // "";
-    def nums: [scan("[0-9]+") | tonumber | -.];
+    # Every number in the id. An 8-digit last one is a snapshot date, not a
+    # version: claude-opus-4-20250514 is 4.0, dated 20250514.
+    def nums: [scan("[0-9]+")];
+    def dated: nums | length > 1 and (.[-1] | length) == 8;
+    # (major, minor), a missing minor read as 0. Compared raw, the shorter
+    # list won: [5] sorted ahead of [5,5], so claude-opus-5 was listed above
+    # claude-opus-5-5, and a date sorted as if it were a minor.
+    def ver: (if dated then (nums | .[:-1]) else nums end) | map(tonumber) | . + [range(2 - length) | 0];
+    def date: if dated then (nums | .[-1] | tonumber) else 0 end;
     # fam is bound to $f BEFORE the array | index(...) pipe below, because that pipe
     # changes "." to the priority array itself -- calling fam(.) after it would feed
     # capture() an array instead of the id string (jq: "cannot be matched, as it is
-    # not a string"). Binding first keeps "." on the id for both sort keys.
-    unique | sort_by(fam as $f | [((["opus","sonnet","haiku","fable"] | index($f)) // 9), nums]) | .[]' 2>/dev/null
+    # not a string"). Binding first keeps "." on the id for every sort key.
+    # Within one version the undated alias comes first -- it always names the
+    # newest snapshot -- then the snapshots, newest date first; the id itself
+    # settles the rest (claude-opus-4 before claude-opus-4-0).
+    unique | sort_by(fam as $f | [((["opus","sonnet","haiku","fable"] | index($f)) // 9),
+                                  (ver | map(-.)), (if dated then 1 else 0 end), (date | -.), .]) | .[]' 2>/dev/null
 }
 platform_catalog_ids() { # platform_catalog_ids <platform> -> what set-models may enable, one id per line: the VISIBLE catalog, what the Settings page lists
   case "$1" in anthropic) anthropic_catalog_ids ;; openai) openai_catalog_visible ;; opencode) opencode_catalog_visible ;; *) : ;; esac
