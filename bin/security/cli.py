@@ -2151,6 +2151,39 @@ def _triage_phase(conn, analysis_id, untriaged, untriaged_note, decided_note):
          decided_note])
 
 
+# The `verification` row's prose. Four outcomes, and the three that lower a
+# `done` say names and numbers -- a count alone is a scold the reader cannot
+# act on, the same rule the triage note already follows.
+VERIFY_NOTHING_NOTE = ("No finding was waiting for a verifier: this analysis "
+                       "reported no agent finding at medium or above, and none "
+                       "below it claiming a high impact.")
+VERIFY_DONE_NOTE = ("{n} verified: {confirmed} confirmed, {rejected} rejected, "
+                    "{needs} needs validation.")
+VERIFY_UNVERIFIED_NOTE = ("{n} finding{s} left unverified: nobody tried to "
+                          "disprove {them}, so this analysis says nothing about "
+                          "whether {they} real. {lead}: {named}.")
+VERIFY_TASKS_WITHOUT_VERDICTS_NOTE = (
+    "{tasks} subagents were launched and {v} verdict{s} recorded: the rest "
+    "produced nothing, which is budget spent on parallelism rather than on "
+    "reading. Subagents in this run are for verification.")
+VERIFY_VERDICTS_WITHOUT_TASKS_NOTE = (
+    "{v} verdict{s} recorded and no subagent was launched: a verdict is a "
+    "second agent's reading, and nothing in this run's stream shows one ran.")
+VERIFY_UNVERIFIED_UNREACHED = ("This analysis did not close `done`, so nothing "
+                               "checked whether the findings were verified.")
+
+
+def _verdict_counts(conn, analysis_id) -> dict:
+    """How many verdicts of each kind this analysis recorded."""
+    out = {v: 0 for v in verdict.VERDICTS}
+    for row in conn.execute(
+            "SELECT verdict, COUNT(*) AS n FROM finding WHERE analysis_id=?"
+            " AND verdict<>'' GROUP BY verdict", (analysis_id,)):
+        if row["verdict"] in out:
+            out[row["verdict"]] = row["n"]
+    return out
+
+
 GUIDES_UNKNOWN = "unknown"
 
 
@@ -2342,6 +2375,69 @@ def cmd_finish(args):
         # one close.
         triage_phase = _triage_phase(conn, args.analysis, skipped,
                                      untriaged_note, decided_note)
+    # THE VERIFICATION, checked the way the triage is: three facts the ledger
+    # and the run's stream hold between them, and a `done` that survives all
+    # three or is lowered with the reason in writing.
+    #
+    #   the queue    findings in scope that nobody verified. This is the guard
+    #                the two counts below CANNOT see: an agent that ignores
+    #                the phase launches nothing and records nothing, so N and
+    #                V agree at zero while the work never happened.
+    #   N > V        subagents that produced no verdict -- the $51.44 failure,
+    #                budget spent on parallelism.
+    #   V > N        verdicts with no subagent behind them: the hunter wrote
+    #                them itself.
+    #
+    # N is only known to the ENGINE's close (`--tasks-launched`, from
+    # `security_task_count` over the stream); the agent's own close omits the
+    # flag and the two comparisons are simply not made.
+    # `verify_note` is the ROW's prose; `verify_gap` is the part of it that is
+    # a GAP and therefore belongs in the paragraph too. The summary sentences
+    # -- nothing was waiting, N verified -- describe what happened rather than
+    # what was missed, and the paragraph is the list of blind spots: the same
+    # exemption `TRIAGE_NOTHING_NOTE`/`TRIAGE_ALL_READ_NOTE` already carry.
+    verify_note = ""
+    verify_gap = ""
+    verify_phase = None
+    if row["prepared"]:
+        unverified = queries.verify_queue(conn, args.analysis)
+        counts = _verdict_counts(conn, args.analysis)
+        recorded = sum(counts.values())
+        tasks = args.tasks_launched
+        if unverified:
+            n = len(unverified)
+            named = "; ".join(
+                f"{f['rule']} ({f['occurrences'][0]['file'] if f['occurrences'] else 'no file recorded'})"
+                for f in unverified[:3])
+            verify_note = verify_gap = VERIFY_UNVERIFIED_NOTE.format(
+                n=n, s="s" if n != 1 else "", them="them" if n != 1 else "it",
+                they="they are" if n != 1 else "it is",
+                lead=("The first three" if n > 3 else "They are" if n > 1 else "It is"),
+                named=named)
+        elif recorded:
+            verify_note = VERIFY_DONE_NOTE.format(
+                n=recorded, confirmed=counts["confirmed"],
+                rejected=counts["rejected"], needs=counts["needs_validation"])
+        else:
+            verify_note = VERIFY_NOTHING_NOTE
+        mismatch = ""
+        if tasks is not None and tasks > recorded:
+            mismatch = VERIFY_TASKS_WITHOUT_VERDICTS_NOTE.format(
+                tasks=tasks, v=recorded, s="s" if recorded != 1 else "")
+        elif tasks is not None and recorded > tasks:
+            mismatch = VERIFY_VERDICTS_WITHOUT_TASKS_NOTE.format(
+                v=recorded, s="s" if recorded != 1 else "")
+        if mismatch:
+            verify_note = f"{verify_note} {mismatch}".strip()
+            verify_gap = f"{verify_gap} {mismatch}".strip()
+        bad = bool(unverified) or (tasks is not None and tasks != recorded)
+        if state == "done" and bad:
+            state = "capped"
+            print(f"finish: analysis {args.analysis} — {verify_note}", file=sys.stderr)
+        verify_phase = coverage.phase(
+            coverage.VERIFICATION,
+            coverage.WARNING if bad else coverage.RAN,
+            diff.AGENT, verify_note)
     # finish_analysis writes coverage_note unconditionally, and neither caller
     # of `finish` carries the note `prepare` printed: the agent never saw it,
     # and the engine's close-out knows only the run's status and cost. An
@@ -2362,7 +2458,7 @@ def cmd_finish(args):
     stored = row["coverage_note"] or ""
     note = ""
     for part in (stored, args.note or "", unprepared_note, untriaged_note,
-                 decided_note, guides_note):
+                 decided_note, guides_note, verify_gap):
         part = part.strip()
         # `not in`, not `!=`: a row is closed twice (the agent, then the
         # engine) and each close re-reads the note it already wrote. Without
@@ -2428,6 +2524,9 @@ def cmd_finish(args):
             triage_phase = coverage.phase(
                 coverage.TRIAGE, coverage.SKIPPED,
                 note=unprepared_note or TRIAGE_UNVERIFIED_NOTE)
+            verify_phase = coverage.phase(
+                coverage.VERIFICATION, coverage.SKIPPED,
+                note=unprepared_note or VERIFY_UNVERIFIED_UNREACHED)
     else:
         # The guides sentence joins whatever the row already says -- the
         # agent's `--note`, or the sentence a previous close stored -- once:
@@ -2443,7 +2542,8 @@ def cmd_finish(args):
             triage_phase = coverage.phase(coverage.TRIAGE, coverage.SKIPPED,
                                           note=TRIAGE_UNVERIFIED_NOTE)
     phases = coverage.merge(
-        phases, [sast_phase] + ([triage_phase] if triage_phase else []))
+        phases, [sast_phase] + ([triage_phase] if triage_phase else [])
+        + ([verify_phase] if verify_phase else []))
     ledger.finish_analysis(conn, args.analysis, state, _spend(args.spend), note,
                            coverage.encode(phases))
     # `row`'s own project and branch, never a flag the caller passed: `finish`
@@ -3481,6 +3581,10 @@ def main(argv=None):
     # The ENGINE's close only: a comma list of guide names, '' for none, or
     # `unknown` when the run's stream could not be read. See `cmd_finish`.
     fn.add_argument("--guides-read", default=None, dest="guides_read")
+    # How many subagents the run launched, from `security_task_count` over the
+    # stream. The ENGINE's close only: the agent does not know its own stream,
+    # omits the flag, and the two count comparisons are then not made.
+    fn.add_argument("--tasks-launched", type=int, default=None, dest="tasks_launched")
 
     ck = sub.add_parser("checklist", parents=[dbflag]); ck.set_defaults(fn=cmd_checklist)
     ck.add_argument("--analysis", type=int, required=True)

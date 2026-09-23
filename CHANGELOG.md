@@ -20,6 +20,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The close verifies that the verification happened**, with three facts the
+  ledger and the run's stream hold between them: findings in scope nobody
+  verified, subagents that produced no verdict, and verdicts with no subagent
+  behind them. Any of the three lowers `done` to `capped` and writes the
+  reason into the report, as the triage guard already does — and the first is
+  the one the other two cannot see, because an agent that ignores the phase
+  launches nothing and records nothing. A new `verification` row in the
+  coverage table says what was verified and what was not.
+
 - **`verify-queue`, `verify-prompt` and `report-verdict`.** The queue is a
   query, so the agent never derives the scope from prose; the prompt is minted
   from the ledger, with the job stated as disproving the claim and the
