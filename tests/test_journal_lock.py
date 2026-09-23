@@ -94,6 +94,88 @@ def test_a_live_holder_is_never_robbed(srv):
         lock.rmdir()
 
 
+class _Clock:
+    """The server module's `time`, for one test: it moves only when the lock
+    sleeps, and runs each scripted event once its moment has come, so a wait
+    of a minute costs none and lands the same way on every run."""
+
+    def __init__(self, *events):
+        self.start = self.now = 1_000_000.0
+        self.events = sorted(events, key=lambda e: e[0])
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+        while self.events and self.now - self.start >= self.events[0][0]:
+            self.events.pop(0)[1]()
+
+
+def _made_without_pid(srv):
+    """The journal lock as an owner holds it between its mkdir and its pid."""
+    lock = srv.DATA_DIR / "locks" / ".journal.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    _drop(lock)
+    lock.mkdir()
+    return lock
+
+
+def _drop(lock):
+    if lock.exists():
+        for f in lock.iterdir():
+            f.unlink()
+        lock.rmdir()
+
+
+def test_a_waiter_that_waited_past_the_grace_never_robs_the_next_owner(srv, monkeypatch):
+    """The engine's lock_take counted its own polls as the time an owner with
+    no pid had had, so a waiter that had queued past the grace behind a live
+    owner broke the NEXT owner's lock in the instant between its mkdir and its
+    pid, and both held it. This side starts that clock when it stops reading
+    an owner and drops it whenever it reads one: the waiter below arrives
+    while the first owner has yet to write its pid, waits on it for longer
+    than the grace, and then finds the lock as the next owner holds it before
+    its pid -- which it waits on to the end of its time, and never breaks."""
+    grace = srv.journal_lock.GRACE
+    lock = _made_without_pid(srv)
+
+    def owner_writes_its_pid():
+        (lock / "pid").write_text(str(os.getpid()))
+        (lock / "boot").write_text(srv.boot_id())
+
+    def next_owner_before_its_pid():
+        for f in lock.iterdir():
+            f.unlink()
+
+    monkeypatch.setattr(srv, "time", _Clock((0.5, owner_writes_its_pid),
+                                            (grace + 5, next_owner_before_its_pid)))
+    try:
+        with pytest.raises(TimeoutError):
+            with srv.journal_lock(timeout=2 * grace):
+                pass
+        assert lock.is_dir() and not any(lock.iterdir())
+    finally:
+        _drop(lock)
+
+
+def test_a_lock_that_never_had_a_pid_is_broken_after_the_grace(srv, monkeypatch):
+    """The control beside it: an owner killed between its mkdir and its pid
+    must not wedge the journal, so a lock no poll ever found a pid in goes
+    once the grace has passed -- and not before."""
+    grace = srv.journal_lock.GRACE
+    lock = _made_without_pid(srv)
+    clock = _Clock()
+    monkeypatch.setattr(srv, "time", clock)
+    try:
+        with srv.journal_lock(timeout=2 * grace):
+            waited = clock.now - clock.start
+            assert (lock / "pid").read_text().strip() == str(os.getpid())
+        assert grace < waited < grace + 1
+    finally:
+        _drop(lock)
+
+
 def _alive(pid):
     try:
         os.kill(pid, 0)

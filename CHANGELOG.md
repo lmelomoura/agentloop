@@ -69,6 +69,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A waiter that has queued for a while no longer breaks the next holder's
+  lock.** Every serialized write — the state file, the journal, port
+  blocks, a resume, the tick — takes a mkdir lock and then writes its pid
+  into it. A lock with no pid yet was broken once the waiter had polled for
+  the grace (`AGENTLOOP_LOCK_GRACE`, 30 s), counting every poll, those spent
+  behind live holders too: a waiter that had already queued 30 s, behind a
+  long journal rewrite say, broke the next holder's lock if it looked in
+  the instant between that holder's mkdir and its pid, and both then held
+  it — one read-modify-write free to overwrite the other, a run's record or
+  a state field. A lock with no pid is now judged by its own age: older
+  than the grace, its taker died in that gap and the lock is taken at once
+  (it used to wait out the grace in polls, however old the lock was);
+  younger, its taker is on its way, and it is never broken however long
+  anyone has waited. `acquire_lock`, which keeps the daily model refresh
+  and `resolve-pricing` from running twice at once, broke a lock with no
+  pid on sight — the same instant, with no wait at all — and now follows
+  the same rule: refused while young, taken once old. The dashboard's side
+  of the journal lock starts that clock only when it stops reading a pid,
+  drops it whenever it reads one, and never waits longer than the grace in
+  all, so it never had this and is unchanged; two tests now hold it to
+  that. The selftest covers an old lock with no pid, a waiter well past a
+  grace of 1 s meeting the next holder before its pid, and `acquire_lock`
+  on a young and an old lock with no pid.
+
 - **A finding on several branches is one row in the findings browser, and a
   decision no longer seems to come undone when another branch is analysed.**
   `queries.finding_rows` united one checklist per branch, so a finding on

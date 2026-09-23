@@ -4422,6 +4422,49 @@ NASTY
   kill "$waiter2" 2>/dev/null; wait "$waiter2" 2>/dev/null
   rm -rf "$tmp/thisboot" "$tmp/thisboot-was-stolen"
 
+  # An owner with no pid to read is a taker between its mkdir and its pid, or
+  # one killed there -- and only the lock's own age tells them apart: a lock
+  # directory changes when an entry is added or removed, so one with no pid is
+  # as old as its mkdir. Older than the grace, nobody is on the way to it, and
+  # an unbounded wait takes it at once; the wait used to give such an owner
+  # the grace counted in its own polls, however old the lock already was. In
+  # the background, so that a wait that never ends fails here instead of
+  # hanging the suite; the grace pinned, as the operator may have set it.
+  mkdir -p "$tmp/ownerless"; touch -t 202001010000 "$tmp/ownerless"
+  ( LOCK_GRACE_SECONDS=30; t0="$(now_epoch)"; lock_take "$tmp/ownerless"; r=$?; echo "$r $(( $(now_epoch) - t0 ))" > "$tmp/ownerless.rc" ) >/dev/null 2>&1 & local owaiter=$!
+  i=0; while [ ! -s "$tmp/ownerless.rc" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$(( i + 1 )); done
+  kill "$owaiter" 2>/dev/null; wait "$owaiter" 2>/dev/null
+  got="$(cat "$tmp/ownerless.rc" 2>/dev/null)"
+  [ "${got%% *}" = 0 ] && [ "$(num "${got#* }" 99)" -lt 2 ] && [ "$(cat "$tmp/ownerless/pid" 2>/dev/null)" = "$$" ] \
+    && ok "an old lock left with no pid is taken at once by an unbounded wait (${got#* }s)" \
+    || bad "an unbounded wait on an old lock with no pid: [$got] (exit, seconds) within 5 s, the lock names pid [$(cat "$tmp/ownerless/pid" 2>/dev/null)]"
+  rm -rf "$tmp/ownerless" "$tmp/ownerless.rc"
+
+  # The regression that rule is for. A waiter that had already waited past
+  # the grace -- behind live owners, a long journal rewrite -- broke the NEXT
+  # owner's lock if it looked in the instant between that owner's mkdir and
+  # its pid, and both then held it. How long the waiter has waited says
+  # nothing about that lock; its age does. Here the owner stays live until
+  # the waiter has polled half as many times again as a grace of 1 s allowed
+  # (150 polls against 100: the sleep between polls counts them), then leaves
+  # the lock the way the next owner holds it before its pid: empty, and as
+  # young as that moment, since removing its entries is a change like any.
+  mkdir -p "$tmp/handover"; echo $$ > "$tmp/handover/pid"; boot_id > "$tmp/handover/boot"
+  ( LOCK_GRACE_SECONDS=1; n=0
+    sleep() { n=$(( n + 1 )); [ "$n" != 150 ] || : > "$tmp/handover.polled"; command sleep "$@"; }
+    lock_take "$tmp/handover" && : > "$tmp/handover.taken" ) >/dev/null 2>&1 & local hwaiter=$!
+  i=0; while [ ! -e "$tmp/handover.polled" ] && [ "$i" -lt 150 ]; do sleep 0.1; i=$(( i + 1 )); done
+  rm -f "$tmp/handover/pid" "$tmp/handover/boot"; sleep 0.3
+  [ -e "$tmp/handover.polled" ] && [ ! -e "$tmp/handover.taken" ] && [ ! -e "$tmp/handover/pid" ] && kill -0 "$hwaiter" 2>/dev/null \
+    && ok "a young lock with no pid is never broken by an unbounded wait, however long that wait has already been" \
+    || bad "the next owner's lock, before its pid, was broken: polled 150 times [$([ -e "$tmp/handover.polled" ] && echo yes || echo no)], taken [$([ -e "$tmp/handover.taken" ] && echo yes || echo no)], pid [$(cat "$tmp/handover/pid" 2>/dev/null)]"
+  i=0; while [ ! -e "$tmp/handover.taken" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$(( i + 1 )); done
+  [ -e "$tmp/handover.taken" ] && [ "$(cat "$tmp/handover/pid" 2>/dev/null)" = "$$" ] \
+    && ok "and the same wait takes it once it is older than the grace" \
+    || bad "a lock with no pid, past a grace of 1 s, was still not taken 5 s later"
+  kill "$hwaiter" 2>/dev/null; wait "$hwaiter" 2>/dev/null
+  rm -rf "$tmp/handover" "$tmp/handover.polled" "$tmp/handover.taken"
+
   # Bounded, as the models.json lock takes it: a live holder is given up on
   # once the time is up, and never a moment before it -- exit 1, and the lock
   # stays with its owner -- while a dead one is still taken at once. Timed in
@@ -4478,6 +4521,22 @@ NASTY
       || bad "a bounded wait on a stale lock it cannot remove: dead owner [$ua], old with no pid [$ub] (exit, seconds), within 6 s"
     rm -rf "$tmp/unremovable" "$tmp/unremovable2" "$tmp/unremovable.rc" "$tmp/unremovable2.rc"
   fi
+
+  # acquire_lock, the _models mutex, takes the same lock without waiting --
+  # and broke one with no pid on sight: the owner inside that gap robbed
+  # outright, and two refreshes then ran at once. The same rule holds there:
+  # a young lock with no pid is a taker on its way, refused like a live one;
+  # an old one is nobody's, and taken.
+  mkdir -p "$tmp/acq/_young" "$tmp/acq/_old"; touch -t 202001010000 "$tmp/acq/_old"
+  ( LOCK_DIR="$tmp/acq"; LOCK_GRACE_SECONDS=30; acquire_lock _young ); local ryoung=$?
+  ( LOCK_DIR="$tmp/acq"; LOCK_GRACE_SECONDS=30; acquire_lock _old ); local rold=$?
+  [ "$ryoung" = 1 ] && [ -d "$tmp/acq/_young" ] && [ ! -e "$tmp/acq/_young/pid" ] \
+    && ok "acquire_lock refuses a young lock with no pid, a taker between its mkdir and its pid, instead of breaking it" \
+    || bad "acquire_lock on a young lock with no pid: exit $ryoung, the lock names pid [$(cat "$tmp/acq/_young/pid" 2>/dev/null)]"
+  [ "$rold" = 0 ] && [ "$(cat "$tmp/acq/_old/pid" 2>/dev/null)" = "$$" ] \
+    && ok "and takes an old one, abandoned" \
+    || bad "acquire_lock on an old lock with no pid: exit $rold, the lock names pid [$(cat "$tmp/acq/_old/pid" 2>/dev/null)]"
+  rm -rf "$tmp/acq"
 
   echo "backoff_multiplier() — a job that only ever fails must stop costing full price"
   # Nothing slowed a failing job down: it relaunched every interval, at full

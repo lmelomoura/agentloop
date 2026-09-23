@@ -1138,8 +1138,22 @@ state_get() { # state_get <id> <field> [default]
 # only break the lock when that pid is gone); this generalises it to the rest.
 LOCK_GRACE_SECONDS="${AGENTLOOP_LOCK_GRACE:-30}"
 
+# An owner with no pid to read is a taker between its mkdir and its pid, or
+# one killed there, and only the lock's own age tells them apart. A directory
+# changes only when an entry is added or removed, so a lock with no pid in it
+# is as old as its mkdir: older than the grace, it is nobody's; younger, it is
+# a taker on its way, and never broken, however long anyone has waited on it.
+# Both clocks count whole seconds, so a lock whose count reads the grace may
+# be up to a second younger than it: "older than" is -gt, never -ge. A lock
+# gone meanwhile reads as brand new.
+lock_abandoned() { # lock_abandoned <lockdir> — 0 = older than the grace; asked only of a lock with no pid
+  local now born
+  now="$(now_epoch)"; born="$(num "$(stat -f %m "$1" 2>/dev/null)" "$now")"
+  [ $(( now - born )) -gt "$LOCK_GRACE_SECONDS" ]
+}
+
 lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with <seconds>, for a lock only ever held a moment: gives up (1) once they have passed
-  local d="${1:-}" hold i=0 deadline="" stale="" aged="" now born
+  local d="${1:-}" hold deadline="" stale="" aged="" now born
   # A bound counts on the shell's own clock, in whole seconds and with no
   # fork; the extra second makes the wait at least <seconds>, never less. A
   # lock is old enough to take once it is older than the grace AND twice the
@@ -1170,12 +1184,14 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
       rm -rf "$d" 2>/dev/null; [ -e "$d" ] || continue   # the owner is gone: genuinely stale
     fi
     if [ -z "$deadline" ]; then
-      # A live owner is WAITED for, however long it takes. An unreadable owner
-      # is the narrow race between mkdir and writing the pid — give that, and
-      # only that, a time-based escape.
-      i=$(( i + 1 ))
-      if [ -z "$hold" ] && [ "$i" -ge $(( LOCK_GRACE_SECONDS * 100 )) ]; then
-        rm -rf "$d"; i=0; continue
+      # A live owner is WAITED for, however long it takes. An owner with no
+      # pid is judged by the lock's own age (lock_abandoned), read at most once
+      # a second, never by how long this wait has lasted: counting its own
+      # polls, a waiter that had queued past the grace behind live owners broke
+      # the NEXT owner's lock in the instant before its pid, and both held it.
+      if [ -z "$hold" ] && [ "$SECONDS" != "$aged" ]; then
+        aged=$SECONDS
+        if lock_abandoned "$d"; then rm -rf "$d" 2>/dev/null; [ -e "$d" ] || continue; fi
       fi
     else
       # Bounded: the models.json lock (models_lock), held for a few jq calls
@@ -3157,8 +3173,15 @@ acquire_lock() { # 0 = acquired
   if mkdir "$lock" 2>/dev/null; then
     echo $$ > "$lock/pid"; boot_id > "$lock/boot"; return 0
   fi
-  if slot_alive "$lock"; then
-    return 1                      # a previous run is still going
+  # Its pid, read once. A lock without one is another taker between its mkdir
+  # and its pid, refused like a live one, unless it is older than the grace
+  # (lock_abandoned): it used to be broken on sight, and both takers then ran.
+  # One gone meanwhile falls through, to be taken again.
+  pid="$(cat "$lock/pid" 2>/dev/null || true)"
+  if [ -n "$pid" ]; then
+    slot_alive "$lock" && return 1   # a previous run is still going
+  elif [ -d "$lock" ]; then
+    lock_abandoned "$lock" || return 1
   fi
   rm -rf "$lock"                  # stale lock from a killed run, or an old boot
   mkdir "$lock" 2>/dev/null && { echo $$ > "$lock/pid"; boot_id > "$lock/boot"; return 0; }
