@@ -3420,6 +3420,8 @@ FINDING_STATES = ("new", "open", "partial", "pending", "fixed", "regressed",
 FINDING_CATEGORIES = ("secret", "dependency", "sast", "hygiene", "iac")
 # `candidate.CONFIDENCE_SCORES`, duplicated for the reason the three above are.
 FINDING_CONFIDENCE = ("low", "medium", "high")
+# `verdict.VERDICTS`, duplicated for the same reason again.
+FINDING_VERDICTS = ("confirmed", "needs_validation", "rejected")
 MAX_FINDINGS_PER_PAGE = 100
 
 
@@ -3522,6 +3524,9 @@ def security_findings(params):
     confidence, err = _checked_list(params, "confidence", FINDING_CONFIDENCE)
     if err:
         return 400, err
+    verdict, err = _checked_list(params, "verdict", FINDING_VERDICTS)
+    if err:
+        return 400, err
 
     branch = str(_param(params, "branch")).strip()
     path = str(_param(params, "path")).strip()
@@ -3564,6 +3569,8 @@ def security_findings(params):
         args += ["--category", s]
     for s in confidence:
         args += ["--confidence", s]
+    for s in verdict:
+        args += ["--verdict", s]
     if branch:
         args += ["--branch", branch]
     for a in analysis_ids:

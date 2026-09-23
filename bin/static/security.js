@@ -335,6 +335,12 @@
 
   // ui/security/candidate.js
   var SEC_CONFIDENCE = ["high", "medium", "low"];
+  var SEC_VERDICTS = ["confirmed", "needs_validation", "rejected"];
+  var VERDICT_LABEL = {
+    confirmed: "confirmed",
+    needs_validation: "needs validation",
+    rejected: "disproved"
+  };
   var SCORED = [["confidence", "Confidence"], ["likelihood", "Likelihood"], ["impact", "Impact"]];
   function _doc(f) {
     const c = f && f.candidate;
@@ -346,6 +352,18 @@
     if (!score) return null;
     const chip = secEl("span", "secconf " + score, score);
     if (c && c.confidence && c.confidence.reason) chip.title = c.confidence.reason;
+    return chip;
+  }
+  function secVerdictChip(f) {
+    const v = f && f.verdict;
+    if (!v) return null;
+    const labels = {
+      confirmed: "confirmed",
+      needs_validation: "needs validation",
+      rejected: "disproved"
+    };
+    const chip = secEl("span", "secverdict " + v, labels[v] || v);
+    if (f.verdict_reason) chip.title = f.verdict_reason;
     return chip;
   }
   function secCandidateBlock(f) {
@@ -376,6 +394,13 @@
     }
     const scored = SCORED.filter(([k]) => c[k] && typeof c[k] === "object").map(([k, label]) => label + ": " + (c[k].score || "") + " \u2014 " + (c[k].reason || ""));
     if (scored.length) box.appendChild(secEl("p", "seccand-scored", scored.join(" \xB7 ")));
+    if (f && f.verdict && f.verdict_reason) {
+      box.appendChild(secEl(
+        "p",
+        "seccand-verdict",
+        (VERDICT_LABEL[f.verdict] || f.verdict) + ": " + f.verdict_reason
+      ));
+    }
     return box;
   }
 
@@ -974,6 +999,8 @@
     h.appendChild(st);
     const chip = secConfidenceChip(f);
     if (chip) h.appendChild(chip);
+    const vchip = secVerdictChip(f);
+    if (vchip) h.appendChild(vchip);
     row.appendChild(h);
     const where = document.createElement("ul");
     where.className = "secwhere";
@@ -2159,6 +2186,7 @@
       state: [],
       category: [],
       confidence: [],
+      verdict: [],
       branch: "",
       path: "",
       q: "",
@@ -2208,6 +2236,7 @@
     if (f.state.length) p.set("state", f.state.join(","));
     if (f.category.length) p.set("category", f.category.join(","));
     if (f.confidence.length) p.set("confidence", f.confidence.join(","));
+    if (f.verdict.length) p.set("verdict", f.verdict.join(","));
     if (f.branch.trim()) p.set("branch", f.branch.trim());
     if (f.path.trim()) p.set("path", f.path.trim());
     if (f.q.trim()) p.set("q", f.q.trim());
@@ -2522,6 +2551,7 @@
     if (f.state.length) n++;
     if (f.category.length) n++;
     if (f.confidence.length) n++;
+    if (f.verdict.length) n++;
     if (f.branch.trim()) n++;
     if (f.path.trim()) n++;
     if (f.analysis.trim()) n++;
@@ -2548,6 +2578,7 @@
       state: f.state,
       category: f.category,
       confidence: f.confidence,
+      verdict: f.verdict,
       branch: f.branch,
       path: f.path,
       q: f.q,
@@ -2567,6 +2598,9 @@
       // Absent from a filter saved before block 4.1: "no filter", as every
       // other absent key reads.
       confidence: Array.isArray(query.confidence) ? query.confidence.slice() : [],
+      // Absent from a filter saved before block 4.2: "no filter", as every
+      // other absent key reads.
+      verdict: Array.isArray(query.verdict) ? query.verdict.slice() : [],
       branch: typeof query.branch === "string" ? query.branch : "",
       path: typeof query.path === "string" ? query.path : "",
       q: typeof query.q === "string" ? query.q : "",
@@ -2775,6 +2809,16 @@
         secFindRefresh(fs);
       }
     ));
+    row2.appendChild(secFindMultiPicker(
+      "Verdict",
+      SEC_VERDICTS.map((v) => ({ v, label: v === "rejected" ? "Disproved" : v === "needs_validation" ? "Needs validation" : "Confirmed" })),
+      fs.filters.verdict,
+      (v) => {
+        secFindToggleIn(fs.filters.verdict, v);
+        fs.page = 1;
+        secFindRefresh(fs);
+      }
+    ));
     const toggleField = secEl("label", "secfind-toggle-field");
     toggleField.title = "Fixed, accepted and false-positive rows are excluded unless this is on.";
     const sw = secEl("span", "switch");
@@ -2843,6 +2887,9 @@
     const tdConf = document.createElement("td");
     const chip = secConfidenceChip(f);
     if (chip) tdConf.appendChild(chip);
+    const vchip = secVerdictChip(f);
+    if (vchip) tdConf.appendChild(vchip);
+    if (f.verdict === "rejected") tr.className += " verdict-rejected";
     tr.appendChild(tdConf);
     const tdRun = document.createElement("td");
     const runWrap = secEl("div", "secfind-run");
@@ -5346,5 +5393,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: 9f313868c9da7836a352576e6139f3a4cab19b147e1f8e8e1fcae38a02100ff0 */
-/* ui-sources: b7a8fd3a260b7239f6e3980e8467fa5beed7d61e93c6fb1f5fccfe7d40aedcd1 */
+/* ui-bundle: f98347c2aaafa57a9cbb4441697f88c7d625196b14340712bdfc38ba9852faf3 */
+/* ui-sources: 535214e67ba28ebfc64e890d524a0e9633bffa377d5b7028f34903323f2e703c */

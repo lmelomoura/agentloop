@@ -90,7 +90,7 @@
    contract. */
 import { api, toast, fmtWhen, tableFooter, closeMenus, kpiCard } from "./page.js";
 import { secEl, secIcon, secFetch, secPlaceMenu } from "./dom.js";
-import { SEC_CONFIDENCE, secConfidenceChip } from "./candidate.js";
+import { SEC_CONFIDENCE, SEC_VERDICTS, secConfidenceChip, secVerdictChip } from "./candidate.js";
 import { SEC_STATES, SEC_STATE_LABEL, SEC_STATE_HELP, SEV_ORDER, SEC_NEVER,
          secMinSeverity, secSevKey, secStateKey, secVisible, secCategoryMeta } from "./vocabulary.js";
 import { SEV_KPI_ICON, SEV_KPI_TONE } from "./overview-tab.js";
@@ -147,7 +147,8 @@ const FIND_PER_PAGE = 25;
 const FIND_PER_PAGE_OPTIONS = [10, 25, 50];
 
 function _defaultFilters(){
-  return {severity: [], state: [], category: [], confidence: [], branch: "", path: "", q: "",
+  return {severity: [], state: [], category: [], confidence: [], verdict: [],
+          branch: "", path: "", q: "",
           analysis: "", show_resolved: false, fingerprint: ""};
 }
 
@@ -196,6 +197,7 @@ function secFindQuery(fs){
   if(f.state.length) p.set("state", f.state.join(","));
   if(f.category.length) p.set("category", f.category.join(","));
   if(f.confidence.length) p.set("confidence", f.confidence.join(","));
+  if(f.verdict.length) p.set("verdict", f.verdict.join(","));
   if(f.branch.trim()) p.set("branch", f.branch.trim());
   if(f.path.trim()) p.set("path", f.path.trim());
   if(f.q.trim()) p.set("q", f.q.trim());
@@ -692,6 +694,7 @@ function secFindActiveFilterCount(fs){
   if(f.state.length) n++;
   if(f.category.length) n++;
   if(f.confidence.length) n++;
+  if(f.verdict.length) n++;
   if(f.branch.trim()) n++;
   if(f.path.trim()) n++;
   if(f.analysis.trim()) n++;
@@ -712,7 +715,7 @@ function secFindClearButton(fs){
 function secFindCurrentQuery(fs){
   const f = fs.filters;
   return {severity: f.severity, state: f.state, category: f.category,
-          confidence: f.confidence,
+          confidence: f.confidence, verdict: f.verdict,
           branch: f.branch, path: f.path, q: f.q, analysis: f.analysis,
           show_resolved: f.show_resolved, fingerprint: f.fingerprint,
           sort: fs.sort, dir: fs.dir};
@@ -727,6 +730,9 @@ function secFindApplyQuery(fs, q){
     // Absent from a filter saved before block 4.1: "no filter", as every
     // other absent key reads.
     confidence: Array.isArray(query.confidence) ? query.confidence.slice() : [],
+    // Absent from a filter saved before block 4.2: "no filter", as every
+    // other absent key reads.
+    verdict: Array.isArray(query.verdict) ? query.verdict.slice() : [],
     branch: typeof query.branch === "string" ? query.branch : "",
     path: typeof query.path === "string" ? query.path : "",
     q: typeof query.q === "string" ? query.q : "",
@@ -929,6 +935,12 @@ function secFindFilterBar(fs, data){
     fs.filters.confidence,
     (v) => { secFindToggleIn(fs.filters.confidence, v); fs.page = 1; secFindRefresh(fs); }));
 
+  row2.appendChild(secFindMultiPicker("Verdict",
+    SEC_VERDICTS.map(v => ({v, label: v === "rejected" ? "Disproved"
+                              : v === "needs_validation" ? "Needs validation" : "Confirmed"})),
+    fs.filters.verdict,
+    (v) => { secFindToggleIn(fs.filters.verdict, v); fs.page = 1; secFindRefresh(fs); }));
+
   const toggleField = secEl("label", "secfind-toggle-field");
   // Fixed, accepted and false-positive rows are excluded unless this is on
   // -- said out loud on the control itself (a hover, not a permanent line
@@ -1045,6 +1057,12 @@ function secFindRow(fs, f){
   const tdConf = document.createElement("td");
   const chip = secConfidenceChip(f);
   if(chip) tdConf.appendChild(chip);
+  // The verdict beside it: what a second agent concluded about this claim.
+  const vchip = secVerdictChip(f);
+  if(vchip) tdConf.appendChild(vchip);
+  // A disproved row is recorded, not work -- drawn dimmed, the way the table
+  // already treats what is no longer exposure.
+  if(f.verdict === "rejected") tr.className += " verdict-rejected";
   tr.appendChild(tdConf);
 
   // ANALYSIS RUN: "#<id> (<Profile>)", the date beneath -- links to that

@@ -3351,6 +3351,7 @@ def cmd_findings_page(args):
         "state": args.state or [],
         "category": args.category or [],
         "confidence": args.confidence or [],
+        "verdict": args.verdict or [],
         "branch": args.branch or [],
         "analysis": args.analysis or [],
         "path": args.path,
@@ -3676,6 +3677,8 @@ def main(argv=None):
                      choices=FINDING_CATEGORIES)
     fpg.add_argument("--confidence", action="append", default=None,
                      choices=candidate.CONFIDENCE_SCORES)
+    fpg.add_argument("--verdict", action="append", default=None,
+                     choices=verdict.VERDICTS)
     fpg.add_argument("--branch", action="append", default=None)
     fpg.add_argument("--repo-path", action="append", default=None, dest="repo_path")
     fpg.add_argument("--analysis", action="append", type=int, default=None)

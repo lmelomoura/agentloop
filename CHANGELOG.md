@@ -20,6 +20,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The dashboard shows the verdict**: a chip beside the confidence one on
+  every row and in the drill-down, the verifier's reason inside the candidate
+  block, a Verdict filter, and a disproved row drawn dimmed — it is recorded,
+  not work.
+
 - **Reports print the verdict** under each verified finding, and the ones a
   verifier disproved move to their own section at the end — *Disproved in
   verification* — with the reason. They are recorded and not counted; a report

@@ -2,7 +2,7 @@
 import { $, AL, api, toast, projById, fmtDur, fmtWhen, money, createCombo,
          makePicker, pushNav, markPending, clearPending, isPending } from "./page.js";
 import { secIcon, secIconHTML, secEl, secFetch, secPlaceMenu } from "./dom.js";
-import { secConfidenceChip, secCandidateBlock } from "./candidate.js";
+import { secConfidenceChip, secVerdictChip, secCandidateBlock } from "./candidate.js";
 import { SEC_POLL_MS, SEC_PROFILES, SEC_STATES, SEC_STATE_HELP, SEC_STATE_LABEL,
          SEC_NEVER, secCategoryMeta, secCfg, secDefaultProfile, secMinSeverity,
          secPlatformLabel, secRepos, secSevKey, secSevRank, secStateKey, secVisible } from "./vocabulary.js";
@@ -831,6 +831,8 @@ function secFindingRow(f){
   // finding, it does not classify it (see candidate.js).
   const chip = secConfidenceChip(f);
   if(chip) h.appendChild(chip);
+  const vchip = secVerdictChip(f);
+  if(vchip) h.appendChild(vchip);
   row.appendChild(h);
   const where = document.createElement("ul");
   where.className = "secwhere";

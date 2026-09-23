@@ -1484,6 +1484,17 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 .seccand-scope{font-style:italic;color:var(--muted)}
 .seccand p{margin:6px 0 0}
 .seccand-scored{color:var(--muted)}
+.seccand-verdict{color:var(--muted)}
+/* The verdict chip: what a second agent concluded (ui/security/candidate.js).
+   `confirmed` borrows the ok tone -- it survived an attempt to disprove it;
+   `needs_validation` the warn tone; `disproved` stays neutral and takes the
+   row's opacity with it, because it is a record and not work. */
+.secverdict{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;
+  border-radius:20px;padding:1px 8px;margin-left:5px;background:var(--panel2);
+  color:var(--muted);border:1px solid var(--line);white-space:nowrap}
+.secverdict.confirmed{background:var(--ok-soft);color:var(--ok);border-color:transparent}
+.secverdict.needs_validation{background:var(--warn-soft);color:var(--warn);border-color:transparent}
+.secfind-table tr.verdict-rejected td{opacity:.6}
 .secwhere{margin:9px 0 0;padding-left:18px;font:11.5px/1.65 ui-monospace,"SF Mono",Menlo,monospace;
   color:var(--muted);word-break:break-all}
 .secfinding p{margin:8px 0 0;font-size:12.5px;line-height:1.6}
