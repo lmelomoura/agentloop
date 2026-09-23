@@ -95,10 +95,12 @@ legacy_config_dir_warning() { # one line per project or security block still car
 # after the directory -- and sets it on the level that carried it. A level
 # that does not run on Anthropic, or a directory that is gone, keeps the
 # field, said here and warned about by status.
-accounts_migrate_legacy() { # accounts_migrate_legacy -> one line per level converted or left
+accounts_migrate_legacy() { # accounts_migrate_legacy [project] -> one line per level converted or left; a project name limits it to that project alone
+  local only="${1:-}"
   [ -f "$PROJECTS_FILE" ] || return 0
   local rows name level dir plat nd aid nm existing
-  rows="$("$JQ" -r '.projects[]? | select(type == "object") | .name as $n
+  rows="$("$JQ" -r --arg only "$only" '.projects[]? | select(type == "object") | .name as $n
+      | select($only == "" or $n == $only)
       | ( ((.claude_config_dir // "") | select(type == "string" and . != "") | [$n, "project", .]),
           ((((.security | objects) // {}).claude_config_dir // "") | select(type == "string" and . != "") | [$n, "security", .]) )
       | @tsv' "$PROJECTS_FILE" 2>/dev/null)"
@@ -7776,14 +7778,6 @@ cmd_create() { # reads a partial job object (JSON) from stdin
 
 cmd_project_set() { # reads a partial project object (JSON) from stdin; merges by name
   local partial name plat
-  # A leftover claude_config_dir this file still carries (from before the
-  # account lived in Settings) is converted to a real account first, exactly
-  # as install does -- an operator who saves a project between updating the
-  # code and running install must not lose it to the drop below. Only a
-  # level the migration itself leaves in place (a platform that is not
-  # Anthropic, or a directory that no longer exists) still reaches that
-  # drop. Its own output lines are project-set's output too.
-  accounts_migrate_legacy
   partial="$(cat)"
   echo "$partial" | "$JQ" -e 'type == "object"' >/dev/null 2>&1 || die "project-set: stdin must be a JSON object"
   name="$(echo "$partial" | "$JQ" -r '.name // ""')"
@@ -7822,14 +7816,46 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
     platform_model_enabled "$eff_sp" "$sm" \
       || die "project-set: security.model '$sm' is not enabled in Settings — $eff_sp enables: $(platform_models_enabled_line "$eff_sp")"
   fi
+  # A SENT account or security.account has to be one of the resolved
+  # platform's own, judged against the registry as it stands right now --
+  # BEFORE accounts_migrate_legacy below gets a chance to touch this project,
+  # so a refused save never mutates config, this project's own leftover
+  # claude_config_dir included. A value only STORED (never sent) is judged
+  # again after migration, once a leftover directory has had its chance to
+  # become a real, valid account.
+  local pre_merged pre_mp pre_msp pre_ma pre_msa
+  pre_merged="$(projects_json | "$JQ" -c --arg n "$name" --argjson p "$partial" '([.projects[] | select(.name == $n)] | first // {}) * $p')"
+  pre_mp="$(echo "$pre_merged" | "$JQ" -r '.platform // ""')"; [ -n "$pre_mp" ] || pre_mp="anthropic"; platform_known "$pre_mp" || pre_mp="anthropic"
+  pre_msp="$(echo "$pre_merged" | "$JQ" -r '((.security | objects) // {}).platform // ""')"; [ -n "$pre_msp" ] || pre_msp="$pre_mp"; platform_known "$pre_msp" || pre_msp="anthropic"
+  pre_ma="$(echo "$pre_merged" | "$JQ" -r '.account // ""')"
+  pre_msa="$(echo "$pre_merged" | "$JQ" -r '((.security | objects) // {}).account // ""')"
+  if [ -n "$pre_ma" ] && ! account_known "$pre_mp" "$pre_ma" && echo "$partial" | "$JQ" -e 'has("account")' >/dev/null 2>&1; then
+    die "project-set: account '$pre_ma' is not an account of $pre_mp — $pre_mp has: $(account_ids_line "$pre_mp")"
+  fi
+  if [ -n "$pre_msa" ] && ! account_known "$pre_msp" "$pre_msa" && echo "$partial" | "$JQ" -e '((.security | objects) // {}) | has("account")' >/dev/null 2>&1; then
+    die "project-set: security.account '$pre_msa' is not an account of $pre_msp — $pre_msp has: $(account_ids_line "$pre_msp")"
+  fi
+  # A leftover claude_config_dir this file still carries (from before the
+  # account lived in Settings) is converted to a real account now, exactly as
+  # install does -- only for the project being saved, never any other, and
+  # only now that every refusal above has been decided. Only when
+  # platforms.json is valid: account registration is impossible otherwise,
+  # and a level the migration would have left in place is exactly what the
+  # drop below also leaves alone in that case, so the field survives as the
+  # only record of that account until it can be read again.
+  platforms_valid && accounts_migrate_legacy "$name"
   # The account each level signs in as has to be one of that level's own
   # platform -- judged on the project as it will be once this save merges
-  # (jq `. * $p`). A value SENT that is not one is refused; one only STORED
-  # that a platform change leaves behind is cleared after the save, and said.
+  # (jq `. * $p`), now that any leftover claude_config_dir above has had its
+  # chance to become a real, valid stored account. A value SENT that is not
+  # one already died above; one only STORED that a platform change leaves
+  # behind is cleared after the save, and said.
   local merged mp msp ma msa drop="" had_ccd=false
   merged="$(projects_json | "$JQ" -c --arg n "$name" --argjson p "$partial" '([.projects[] | select(.name == $n)] | first // {}) * $p')"
-  echo "$merged" | "$JQ" -e 'has("claude_config_dir") or (((.security | objects) // {}) | has("claude_config_dir"))' >/dev/null 2>&1 \
-    && had_ccd=true
+  if platforms_valid; then
+    echo "$merged" | "$JQ" -e 'has("claude_config_dir") or (((.security | objects) // {}) | has("claude_config_dir"))' >/dev/null 2>&1 \
+      && had_ccd=true
+  fi
   mp="$(echo "$merged" | "$JQ" -r '.platform // ""')"; [ -n "$mp" ] || mp="anthropic"; platform_known "$mp" || mp="anthropic"
   msp="$(echo "$merged" | "$JQ" -r '((.security | objects) // {}).platform // ""')"; [ -n "$msp" ] || msp="$mp"; platform_known "$msp" || msp="anthropic"
   ma="$(echo "$merged" | "$JQ" -r '.account // ""')"
@@ -7853,15 +7879,19 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
   # migration above already converted what it could; this still drops it
   # unconditionally at both levels on every save, sent or not, so a level
   # accounts_migrate_legacy left in place does not linger past the next
-  # time this project is saved.
+  # time this project is saved. Skipped when platforms.json cannot be read,
+  # exactly like the migration above -- dropping the field here would throw
+  # away the only record of that account, with no way to get it back.
+  local keep_ccd=false
+  platforms_valid || keep_ccd=true
   if projects_json | "$JQ" -e --arg n "$name" 'any(.projects[]; .name==$n)' >/dev/null 2>&1; then
-    write_projects --arg n "$name" --argjson p "$partial" \
+    write_projects --arg n "$name" --argjson p "$partial" --argjson keep "$keep_ccd" \
       '.projects = [.projects[] | if .name==$n
-          then ((. * $p) | del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end)
+          then ((. * $p) | if $keep then . else (del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end) end)
           else . end]'
   else
-    write_projects --argjson p "$partial" \
-      '.projects += [($p | del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end)]'
+    write_projects --argjson p "$partial" --argjson keep "$keep_ccd" \
+      '.projects += [($p | if $keep then . else (del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end) end)]'
   fi
   case "$drop" in *project*)
     write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n then del(.account) else . end]'

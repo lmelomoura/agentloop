@@ -1139,7 +1139,7 @@ JSON
 
   echo "claude_config_dir — install turns what is left of it into accounts"
   local ccd="$tmp/ccd" _mig
-  mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/home/.claude" "$ccd/home/old-elsewhere" "$ccd/old-acct" "$ccd/orphan-p" "$ccd/orphan-s" "$ccd/old-acct2"
+  mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/home/.claude" "$ccd/home/old-elsewhere" "$ccd/old-acct" "$ccd/orphan-p" "$ccd/orphan-s" "$ccd/old-acct2" "$ccd/old-acct3"
   cat > "$ccd/cfg/projects.json" <<JSON
 {"projects":[{"name":"Old1","cwd":"$ccd","claude_config_dir":"$ccd/old-acct/"},
              {"name":"Old2","cwd":"$ccd","security":{"enabled":false,"claude_config_dir":"$ccd/old-acct"}},
@@ -1212,6 +1212,53 @@ JSON
       = '{"a":"old-acct2","c":false,"d":"x"}' ] \
     && ok "and the project ends with the account, no claude_config_dir, and the rest of the save still applied" \
     || bad "Old8 after project-set: $("$JQ" -c '.projects[] | select(.name=="Old8")' "$ccd/cfg/projects.json")"
+
+  # Fix round 3: accounts_migrate_legacy now runs only after every refusal
+  # gate has cleared, only for the project actually being saved, and only
+  # when platforms.json is valid -- before this fix it ran first, unscoped,
+  # so a REFUSED save could still register a new account and rewrite an
+  # unrelated project's leftover claude_config_dir (or, with platforms.json
+  # unreadable, die with an unrelated error instead of refusing plainly).
+  "$JQ" --arg c "$ccd" --arg d "$ccd/old-acct3" \
+      '.projects += [{"name":"Old9","cwd":$c,"claude_config_dir":$d}, {"name":"Old10","cwd":$c}]' \
+      "$ccd/cfg/projects.json" > "$ccd/cfg/projects.json.next" && mv "$ccd/cfg/projects.json.next" "$ccd/cfg/projects.json"
+  local snap1 snap2
+  snap1="$(cksum < "$ccd/cfg/projects.json") / $(cksum < "$ccd/cfg/platforms.json")"
+  out="$( ( ccd_env; printf '{}' | cmd_project_set ) 2>&1 )"; rc=$?
+  snap2="$(cksum < "$ccd/cfg/projects.json") / $(cksum < "$ccd/cfg/platforms.json")"
+  case "$out" in
+    *registered*|*"is now the account"*) bad "project-set {}: migrated anyway: $out" ;;
+    *) [ "$rc" -ne 0 ] && [ "$snap1" = "$snap2" ] \
+         && ok "a refused project-set ({}) touches nothing, not even another project's leftover claude_config_dir" \
+         || bad "project-set {}: rc=$rc snap1=[$snap1] snap2=[$snap2] out=$out" ;;
+  esac
+  out="$( ( ccd_env; printf '{"name":"Old7","account":"nonexistent-xyz"}' | cmd_project_set ) 2>&1 )"; rc=$?
+  snap2="$(cksum < "$ccd/cfg/projects.json") / $(cksum < "$ccd/cfg/platforms.json")"
+  case "$out" in
+    *registered*|*"is now the account"*) bad "project-set Old7 bad account: migrated anyway: $out" ;;
+    *) [ "$rc" -ne 0 ] && [ "$snap1" = "$snap2" ] \
+         && ok "a refused save of an existing project with a bad sent account touches nothing either" \
+         || bad "project-set Old7 bad account: rc=$rc snap1=[$snap1] snap2=[$snap2] out=$out" ;;
+  esac
+  out="$( ( ccd_env; printf '{"name":"Old9","account":"nonexistent-xyz"}' | cmd_project_set ) 2>&1 )"; rc=$?
+  snap2="$(cksum < "$ccd/cfg/projects.json") / $(cksum < "$ccd/cfg/platforms.json")"
+  case "$out" in
+    *registered*|*"is now the account"*) bad "project-set Old9 bad account: migrated anyway: $out" ;;
+    *) [ "$rc" -ne 0 ] && [ "$snap1" = "$snap2" ] \
+         && ok "a refused save of the SAME project carrying the leftover field changes nothing either" \
+         || bad "project-set Old9 bad account: rc=$rc snap1=[$snap1] snap2=[$snap2] out=$out" ;;
+  esac
+  out="$( ( ccd_env; printf '{"name":"Old10","description":"touched"}' | cmd_project_set ) 2>&1 )"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$("$JQ" -r '.projects[] | select(.name=="Old9") | has("claude_config_dir")' "$ccd/cfg/projects.json")" = "true" ] \
+    && ok "a successful save of one project does not touch another project's leftover claude_config_dir" \
+    || bad "project-set Old10: rc=$rc out=$out Old9=$("$JQ" -c '.projects[] | select(.name=="Old9")' "$ccd/cfg/projects.json")"
+  cp "$ccd/cfg/platforms.json" "$ccd/cfg/platforms.json.bak"
+  printf 'not json\n' > "$ccd/cfg/platforms.json"
+  out="$( ( ccd_env; printf '{"name":"Old9","description":"kept-too"}' | cmd_project_set ) 2>&1 )"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$("$JQ" -c '.projects[] | select(.name=="Old9") | {c: has("claude_config_dir"), d: .description}' "$ccd/cfg/projects.json")" = '{"c":true,"d":"kept-too"}' ] \
+    && ok "with platforms.json unreadable, a save still applies its other fields and keeps the leftover claude_config_dir" \
+    || bad "project-set Old9 over broken platforms.json: rc=$rc out=$out Old9=$("$JQ" -c '.projects[] | select(.name=="Old9")' "$ccd/cfg/projects.json")"
+  mv "$ccd/cfg/platforms.json.bak" "$ccd/cfg/platforms.json"
 
   echo "job_account() — its own, else its project's on the same platform, else the Default"
   local ja="$tmp/jacct"; mkdir -p "$ja/a" "$ja/b" "$ja/c" "$ja/prechecks"
