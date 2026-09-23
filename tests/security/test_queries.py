@@ -2109,6 +2109,12 @@ def test_a_rejected_finding_leaves_the_posture_and_stays_in_the_rows(tmp_path):
 
     only = queries.finding_rows(ro, "web", {"verdict": ["rejected"], "show_resolved": True})
     assert [r["fingerprint"][0] for r in only["rows"]] == ["a"]
+    # Asked for by name, it passes the gate on its own -- the rule a Status
+    # filter naming a resolved state already follows. The page's Verdict
+    # picker sets no show_resolved, and "Disproved" alone showed an empty page.
+    named = queries.finding_rows(ro, "web", {"verdict": ["rejected"]})
+    assert [r["fingerprint"][0] for r in named["rows"]] == ["a"], \
+        "a verdict the reader asked for by name must not be hidden by the gate"
 
 
 def test_the_checklist_carries_the_previous_analysis_verdict(tmp_path):

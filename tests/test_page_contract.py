@@ -6222,7 +6222,8 @@ def test_the_runs_table_observes_but_never_manages_a_security_run(srv):
 # ---- Task 11: the findings browser (ui/security/findings-screen.js). Same
 # reasoning as the project screen's and the Branches/Reports tabs' own
 # Node-driven tests above -- the JSON contract in tests/test_security_api.py
-# never paints anything, so a regression in the total-vs-unique labelling, the
+# never paints anything, so a regression in the strip's one count (one row per
+# finding: the Unique issues card is gone), the
 # severity-floor note, the fixed-finding exemption, the sort-header click
 # logic or the pager math would pass every test in that file.
 #

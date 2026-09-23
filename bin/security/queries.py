@@ -1588,10 +1588,16 @@ def finding_rows(conn, project, filters=None, sort="severity",
     # Status: Fixed showed "No findings match these filters" on a project with
     # dozens of them. A state the operator asked for by name passes the gate.
     # On a grouped row the state is the group's, so the gate hides a finding
-    # only when it is resolved on every branch it is on.
+    # only when it is resolved on every branch it is on. A verdict asked for
+    # by name passes it the same way: an open finding the gate hides only
+    # because a verifier disproved it (`counted`) is exactly what a Verdict
+    # filter naming `rejected` asks for -- the page's picker sets no
+    # show_resolved, and "Disproved" alone showed an empty page.
     asked_for = set(f.get("state") or ())
+    asked_verdict = set(f.get("verdict") or ())
     if not f.get("show_resolved"):
-        rows = [r for r in rows if counted(r) or r["state"] in asked_for]
+        rows = [r for r in rows if counted(r) or r["state"] in asked_for
+                or (is_open(r["state"]) and r.get("verdict") in asked_verdict)]
     for key in ("severity", "state", "category", "confidence", "verdict"):
         if f.get(key):
             rows = [r for r in rows if r.get(key) in f[key]]

@@ -23,7 +23,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate
   block, a Verdict filter, and a disproved row drawn dimmed — it is recorded,
-  not work.
+  not work. Naming *Disproved* in that filter shows the disproved findings on
+  its own, as a Status filter naming a resolved state already does: the
+  resolved gate hid them first, and the filter alone showed an empty page.
 
 - **Reports print the verdict** under each verified finding, and the ones a
   verifier disproved move to their own section at the end — *Disproved in
