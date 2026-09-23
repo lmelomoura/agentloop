@@ -101,6 +101,31 @@ def test_another_repository_does_not_count(tmp_path):
     assert queries.fixed_elsewhere(_conn(db), "web", "web", "develop", [FP_A]) == {}
 
 
+def test_another_repository_s_newer_run_of_the_branch_does_not_answer_for_this_one(tmp_path):
+    # The same route through a shared branch name: this repository HAS a
+    # main, where the finding is still open, and the other repository's run
+    # of main -- the newer one, where it is fixed -- used to be the one read.
+    db = tmp_path / "l.db"
+    _analysis(db, tmp_path, "develop", "d" * 16, [FP_A])
+    _analysis(db, tmp_path, "main", "1" * 16, [FP_A])
+    _analysis(db, tmp_path, "main", "2" * 16, [FP_A], repo="other")
+    _analysis(db, tmp_path, "main", "3" * 16, [], repo="other")
+    assert queries.fixed_elsewhere(_conn(db), "web", "web", "develop", [FP_A]) == {}
+
+
+def test_this_repository_s_own_fix_is_found_when_another_ran_the_branch_later(tmp_path):
+    # The control beside it: the proof on this repository's main is still
+    # found when the other repository analysed main after it.
+    db = tmp_path / "l.db"
+    _analysis(db, tmp_path, "develop", "d" * 16, [FP_A])
+    _analysis(db, tmp_path, "main", "1" * 16, [FP_A])
+    _analysis(db, tmp_path, "main", "2" * 16, [])
+    _analysis(db, tmp_path, "main", "3" * 16, [FP_A], repo="other")
+    got = queries.fixed_elsewhere(_conn(db), "web", "web", "develop", [FP_A])
+    assert set(got) == {FP_A}
+    assert (got[FP_A]["branch"], got[FP_A]["commit"]) == ("main", "2" * 16)
+
+
 def test_only_the_asked_for_fingerprints_come_back(tmp_path):
     db = tmp_path / "l.db"
     _analysis(db, tmp_path, "develop", "d" * 16, [FP_A, FP_B])

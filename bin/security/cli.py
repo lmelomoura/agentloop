@@ -2534,16 +2534,18 @@ def cmd_export_findings(args):
     """Every finding of a project, across branches, as one document.
 
     THE SAME PATH THE SCREEN READS, paged to exhaustion. `queries.finding_rows`
-    is what the Findings tab is drawn from -- one checklist per branch, the
-    latest finished analysis of each, unioned -- so the export and the screen
-    can never come to disagree about what exists. A second query here would be
-    a second answer to the same question, which is how this repository has
-    been bitten before.
+    is what the Findings tab is drawn from -- one checklist per (repository,
+    branch), the latest finished analysis of each, unioned -- so the export
+    and the screen can never come to disagree about what exists. A second
+    query here would be a second answer to the same question, which is how
+    this repository has been bitten before.
 
     The screen asks for it grouped, one row per finding; this asks for
     `group=False` -- the same union, one row per finding per BRANCH --
     because a fix is applied on a branch, and each branch's section has to
-    list what there is to fix on it.
+    list what there is to fix on it. A branch of a REPOSITORY: two
+    repositories of the project analysed on `main` are two sections, each
+    at its own commit, and the sections are keyed that way below.
 
     NO FILTERS. Not "the filters are ignored": the arguments do not exist, so
     there is no room for the question of whether they were applied. The page
@@ -2578,15 +2580,18 @@ def cmd_export_findings(args):
             break
         page += 1
 
-    # The commit each branch was read at: on the analysis row, not on the
-    # picker entry `finding_rows` returns, and worth the extra read -- without
-    # it the agent cannot tell whether the code in front of it is the code
-    # that was scanned.
-    branch_meta = {}
+    # The commit each (repository, branch) was read at: on the analysis row,
+    # not on the picker entry `finding_rows` returns, and worth the extra read
+    # -- without it the agent cannot tell whether the code in front of it is
+    # the code that was scanned. Keyed by repository AND branch: by branch
+    # name alone, two repositories' `main` overwrote each other here and one
+    # section printed the other repository's commit.
+    scope_meta = {}
     for a in payload.get("analyses", []):
         row = dict(queries._analysis_row(conn, a["id"]))
-        branch_meta[a["branch"]] = {"id": a["id"], "profile": a.get("profile", ""),
-                                    "commit_sha": row.get("commit_sha", "")}
+        scope_meta[(a["repo"], a["branch"])] = {
+            "id": a["id"], "profile": a.get("profile", ""),
+            "commit_sha": row.get("commit_sha", "")}
 
     meta = {"at": int(time.time()), "shown_on_screen": args.shown}
     if args.format == "sbom":
@@ -2594,17 +2599,17 @@ def cmd_export_findings(args):
         # branch, side by side. Same branch set as the findings above, so a
         # branch with findings and no lockfile appears with `sbom: null`.
         entries = []
-        for br, m in branch_meta.items():
+        for (repo, br), m in scope_meta.items():
             try:
                 text = _sbom_document(conn, m["id"])
                 sbom = json.loads(text) if text and text.strip() else None
             except (SystemExit, ValueError, LookupError):
                 sbom = None
-            entries.append({"branch": br, "analysis_id": m["id"],
+            entries.append({"repo": repo, "branch": br, "analysis_id": m["id"],
                             "commit_sha": m.get("commit_sha", ""), "sbom": sbom})
         print(report.consolidated_sboms(args.project, entries, meta))
         return
-    groups = report._consolidated_groups(rows, branch_meta)
+    groups = report._consolidated_groups(rows, scope_meta)
     renderer = {"json": report.consolidated_as_json,
                 "html": report.consolidated_as_html,
                 "md": report.consolidated_as_markdown}[args.format]
@@ -3101,9 +3106,14 @@ def cmd_project_data(args):
                 "profile": latest.get("profile", ""),
                 "first_seen": first_seen.get(f.get("fingerprint", ""), 0),
             })
-        prev_row = queries.previous_finished(conn, args.project, branch, latest["id"])
+        # The same repository's previous reading: `latest` is one
+        # repository's run of `branch`, and another repository's run of the
+        # same branch name is not what it changed from.
+        prev_row = queries.previous_finished(conn, args.project, latest["repo"], branch,
+                                             latest["id"])
         if prev_row is not None:
-            previous = queries.posture(conn, args.project, branch, latest=prev_row)
+            previous = queries.posture(conn, args.project, latest["repo"], branch,
+                                       latest=prev_row)
 
     # ONE grouped query for the whole Runs tab, replacing what used to be one
     # checklist() call per done/capped row (see this function's own
@@ -3158,10 +3168,12 @@ def cmd_project_data(args):
                               # the SHOWN branch (fell back or not; the
                               # header names it), unlike `trend_series`,
                               # which never falls back because a bare
-                              # sparkline has nowhere to say so.
+                              # sparkline has nowhere to say so. In the
+                              # shown reading's own repository, like
+                              # `previous`; no reading, no trend.
                               "trend": (queries.trend(conn, args.project,
-                                                      branch, days=7)
-                                        if branch else []),
+                                                      latest["repo"], branch, days=7)
+                                        if latest else []),
                               "previous": previous,
                               "categories": overview_categories,
                               "top_findings": top_findings},

@@ -5637,7 +5637,7 @@ def _branches_tab_deps(block):
          "SEC_BRANCH_ACTIVE_DAYS", "BRANCH_CAPPED_TITLE", "BRANCH_SCOPE_TITLE",
          "SEC_NEVER"))
     fns = "\n".join(_plainfn(block, n) for n in
-        ("secEl", "secIcon", "secBranchIsActive", "secBrDefaultBranch",
+        ("secEl", "secIcon", "secScopeName", "secBranchIsActive", "secBrDefaultBranch",
          "secBrKpis", "secBrRepaint", "secBrPicker", "secBrFilterBar",
          "secBrFiltered", "secBrTable", "secBranchRow", "secBrSevChips",
          "secBrTrendBars", "secBrKebab", "secBranchTrendText",
@@ -5674,6 +5674,7 @@ def _branches_tab_deps(block):
     function secDownloadReport(_id, _fmt, _el){}
     function secRefreshProject(){}
     function secGitBranchCount(){ return 0; }
+    function secGitBranchRepo(){ return ""; }
     function closeMenus(){}
     """
     return consts + stubs + fns
@@ -5735,6 +5736,69 @@ def test_the_branches_tab_renders_one_row_per_branch_with_its_own_posture(srv, t
     assert "once per branch" in titles, \
         f"the per-branch-vs-fingerprint scope note must ride a title: {titles}"
     assert "3 branch" in joined, f"the footer must count the rows: {joined}"
+    assert "›" not in joined, "one repository: no row names it"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_branches_tab_names_each_row_s_repository_when_there_are_two(srv, tmp_path):
+    """queries.branch_rows is one row per (repository, branch): two
+    repositories analysed on the declared base are two rows, each named with
+    its repository, and the default-branch cards read both of them -- not
+    whichever row happened to come first."""
+    block = _security_js(srv)
+    script = tmp_path / "pj-branches-repos.js"
+    script.write_text(_PROJECT_DOM_HARNESS + _branches_tab_deps(block) + """
+    const now = Math.floor(Date.now() / 1000);
+    secRenderProjectBranches({project: "web", sidebar: {donut: {total: 3}}, tabs: {
+      overview: {attempted: true},
+      branches: [
+      {repo: "web-admin", branch: "develop", last_analysis: now - 60, last_finished: now - 60,
+       analyses: 1, state: "done", latest_state: "done", analysis_id: 14, sha: "aaaaaaa1",
+       open: {critical: 0, high: 1, medium: 0, low: 0, info: 0, total: 1}, trend: []},
+      {repo: "web", branch: "develop", last_analysis: now - 120, last_finished: now - 120,
+       analyses: 1, state: "capped", latest_state: "capped", analysis_id: 12, sha: "bbbbbbb2",
+       open: {critical: 2, high: 0, medium: 0, low: 0, info: 0, total: 2}, trend: []},
+    ]}});
+    console.log(JSON.stringify(collectAll(_els["sec-pj-branches"], [])));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    texts = [r["text"] for r in out]
+    assert "web-admin › develop" in texts and "web › develop" in texts, texts
+    crit = next(r for r in out if r["cls"] == "kpi-card sev-crit")
+    assert crit["text"].startswith("2"), f"both repositories' base, not the first row's: {crit}"
+    covered = next(r for r in out if "Default branch covered" in r["text"]
+                   and r["cls"].startswith("kpi-card"))
+    assert covered["text"].startswith("Partial"), f"one of the two stopped early: {covered}"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_branch_coverage_counts_the_repository_git_listed_the_branches_of(srv, tmp_path):
+    """git's branch list is ONE repository's -- the one the launcher has
+    picked (secGitBranchCount) -- and the rows are one per (repository,
+    branch). With two repositories, "X / Y analyzed" counts the picked
+    repository's rows over its own list, not every repository's rows over
+    it; with one, every row, as before."""
+    block = _security_js(srv)
+    script = tmp_path / "pj-branch-coverage.js"
+    script.write_text(_PROJECT_DOM_HARNESS + _branches_tab_deps(block)
+                      + _plainfn(block, "secBrCoverageCard") + """
+    secGitBranchCount = function(){ return 4; };
+    secGitBranchRepo = function(){ return "web"; };
+    const now = Math.floor(Date.now() / 1000);
+    const line = (card) => collectAll(card, []).find(r => r.cls === "secbr-covcount").text;
+    const two = line(secBrCoverageCard([
+      {repo: "web", branch: "main", last_finished: now - 60},
+      {repo: "web-admin", branch: "main", last_finished: now - 60},
+      {repo: "web-admin", branch: "develop", last_finished: now - 60}]));
+    const one = line(secBrCoverageCard([
+      {repo: "web", branch: "main", last_finished: now - 60},
+      {repo: "web", branch: "develop", last_finished: now - 60}]));
+    console.log(JSON.stringify({two, one}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert out == {"two": "1 / 4 analyzed", "one": "2 / 4 analyzed"}, out
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -6072,7 +6136,7 @@ def test_findings_row_renders_analysed_strings_as_text_never_markup(srv, tmp_pat
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
                      ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
-                      "secFindDecisionControls", "secFindActionsCell"))
+                      "secFindDecisionControls", "secFindActionsCell", "secScopeName"))
     script = tmp_path / "find-row.js"
     script.write_text(_INDEX_DOM_HARNESS + """
     function fmtWhen(t){ return "w" + String(t); }
@@ -6119,7 +6183,7 @@ def test_a_fixed_finding_gets_no_decision_controls(srv, tmp_path):
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
                      ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
-                      "secFindDecisionControls", "secFindActionsCell"))
+                      "secFindDecisionControls", "secFindActionsCell", "secScopeName"))
     script = tmp_path / "find-row-fixed.js"
     script.write_text(_INDEX_DOM_HARNESS + """
     function fmtWhen(t){ return "w" + String(t); }
@@ -6147,7 +6211,7 @@ def test_a_fixed_finding_gets_no_decision_controls(srv, tmp_path):
 _FIND_ROW_CONSTS = ("SEC_STATE_LABEL", "SEC_STATE_HELP", "SEV_ORDER", "SEC_STATES",
                     "ICON_HYGIENE", "SEC_CATEGORY_LABEL", "SEC_CATEGORY_ICON")
 _FIND_ROW_DEPS = ("secEl", "secIcon", "_secCap", "secCategoryMeta", "secConfidenceChip",
-                  "secFindRow", "secFindDecisionControls", "secFindActionsCell")
+                  "secFindRow", "secFindDecisionControls", "secFindActionsCell", "secScopeName")
 
 
 def _find_row_script(block):
@@ -6214,6 +6278,56 @@ def test_the_fixed_elsewhere_badge_names_the_branch_it_speaks_about(srv, tmp_pat
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_finding_read_in_two_repositories_names_each_member_s_repository(srv, tmp_path):
+    """queries.finding_rows reads every (repository, branch), and one
+    fingerprint in two repositories analysed on main is one row with two
+    members. Named by branch alone its Branch cell read "main, main". Each
+    member names its repository -- only because the project has two: the
+    single-repository rows above read exactly as they always did."""
+    script = tmp_path / "find-row-repos.js"
+    script.write_text(_find_row_script(_security_js(srv)) + """
+    fs.data.analyses = [{id: 12, profile: "quick", repo: "web", branch: "main", started: 1},
+                        {id: 14, profile: "deep", repo: "web-admin", branch: "main", started: 2}];
+    const row = secFindRow(fs, Object.assign({}, base, {state: "open", repo: "web-admin",
+      branch: "main", analysis_id: 14, fixed_elsewhere: {branch: "develop",
+      commit: "abcdef0123456789", in_this_branch: false}, branches: [
+        {repo: "web", branch: "main", analysis_id: 12, state: "open", severity: "high"},
+        {repo: "web-admin", branch: "main", analysis_id: 14, state: "open", severity: "high"}]}));
+    console.log(JSON.stringify(collectAll(row, [])));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert "web › main, web-admin › main" in [r["text"] for r in out], out
+    more = [r for r in out if r["text"].strip() == "+1"]
+    assert more and more[0]["title"] == "#12 web › main", out
+    badge = next(r for r in out if "fixed-elsewhere" in r["cls"])
+    assert "Fixed on web-admin › develop" in badge["title"], badge
+    assert "NOT in web-admin › main" in badge["title"], badge
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_analysis_run_picker_names_the_repository_when_there_are_two(srv, tmp_path):
+    """One run per (repository, branch) -- two repositories analysed on main
+    are two options, and "#14 (Deep) — main" beside "#12 (Quick) — main"
+    does not say which checkout either one read. One repository: unchanged."""
+    block = _security_js(srv)
+    deps = "\n".join(_plainfn(block, n) for n in ("_secCap", "secScopeName", "secFindRunOptions"))
+    script = tmp_path / "find-run-options.js"
+    script.write_text(deps + """
+    const two = secFindRunOptions([
+      {id: 14, profile: "deep", repo: "web-admin", branch: "main", started: 2},
+      {id: 12, profile: "quick", repo: "web", branch: "main", started: 1}]);
+    const one = secFindRunOptions([{id: 12, profile: "quick", repo: "web", branch: "main"}]);
+    console.log(JSON.stringify({two, one}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert out["two"] == [{"v": "14", "label": "#14 (Deep) — web-admin › main"},
+                          {"v": "12", "label": "#12 (Quick) — web › main"}], out
+    assert out["one"] == [{"v": "12", "label": "#12 (Quick) — main"}], out
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_the_strip_counts_each_finding_once_and_the_floor_from_the_whole_filtered_set(
         srv, tmp_path):
     """One row per finding (queries.finding_rows groups by fingerprint), so
@@ -6264,7 +6378,8 @@ def test_the_table_excludes_rows_below_the_floor_on_this_page(srv, tmp_path):
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
                      ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
-                      "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible"))
+                      "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible",
+                      "secScopeName"))
     script = tmp_path / "find-table-floor.js"
     script.write_text(_INDEX_DOM_HARNESS + """
     function fmtWhen(t){ return "w" + String(t); }
@@ -6319,7 +6434,7 @@ def test_a_fixed_finding_stays_visible_and_uncounted_below_the_floor(srv, tmp_pa
     deps = "\n".join(_plainfn(block, n) for n in
                      ("secEl", "secIcon", "_secCap", "secCategoryMeta",
                       "secFindHiddenByFloor", "secFindStrip", "secConfidenceChip", "secFindRow", "secFindDecisionControls", "secFindActionsCell",
-                      "secFindTableSection", "secVisible"))
+                      "secFindTableSection", "secVisible", "secScopeName"))
     script = tmp_path / "find-fixed-floor.js"
     script.write_text(_INDEX_DOM_HARNESS + _KPI_CARD_STUB + """
     function fmtWhen(t){ return "w" + String(t); }
@@ -6376,7 +6491,8 @@ def test_clicking_a_sort_header_toggles_direction_then_switching_column_resets_i
              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
     deps = "\n".join(_plainfn(block, n) for n in
                      ("secEl", "secIcon", "secCategoryMeta", "secConfidenceChip", "secFindRow",
-                      "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible"))
+                      "secFindDecisionControls", "secFindActionsCell", "secFindTableSection", "secVisible",
+                      "secScopeName"))
     script = tmp_path / "find-sort-click.js"
     script.write_text(_INDEX_DOM_HARNESS + """
     function fmtWhen(t){ return "w" + String(t); }

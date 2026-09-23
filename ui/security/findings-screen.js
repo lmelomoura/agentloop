@@ -97,7 +97,8 @@ import { api, toast, fmtWhen, tableFooter, closeMenus, kpiCard } from "./page.js
 import { secEl, secIcon, secFetch, secPlaceMenu } from "./dom.js";
 import { SEC_CONFIDENCE, secConfidenceChip } from "./candidate.js";
 import { SEC_STATES, SEC_STATE_LABEL, SEC_STATE_HELP, SEV_ORDER, SEC_NEVER,
-         secMinSeverity, secSevKey, secStateKey, secVisible, secCategoryMeta } from "./vocabulary.js";
+         secMinSeverity, secSevKey, secStateKey, secVisible, secCategoryMeta,
+         secScopeName } from "./vocabulary.js";
 import { SEV_KPI_ICON, SEV_KPI_TONE } from "./overview-tab.js";
 import { secAskReason } from "./reason.js";
 import { secInvalidateProject, secSwitchProjectTab } from "./project-screen.js";
@@ -858,6 +859,16 @@ function secFindSavedFilters(fs, data){
   return details;
 }
 
+/* The Analysis run picker's options: one run per (repository, branch)
+   (queries.finding_rows's `analyses`), each labelled with the branch it read
+   -- and with its repository too once the project has more than one, or two
+   runs of `main` are two options that both say "main". */
+function secFindRunOptions(analyses){
+  const runs = analyses || [];
+  return runs.map(a => ({v: String(a.id),
+    label: "#" + a.id + " (" + _secCap(a.profile) + ") — " + secScopeName(a, runs)}));
+}
+
 function secFindFilterBar(fs, data){
   const wrap = secEl("div", "secfind-filters");
 
@@ -892,8 +903,7 @@ function secFindFilterBar(fs, data){
     (v) => { secFindToggleIn(fs.filters.state, v); fs.page = 1; secFindRefresh(fs); }));
 
   row1.appendChild(secFindSinglePicker("Analysis run",
-    (data.analyses || []).map(a => ({v: String(a.id),
-      label: "#" + a.id + " (" + _secCap(a.profile) + ") — " + a.branch})),
+    secFindRunOptions(data.analyses),
     fs.filters.analysis,
     (v) => { fs.filters.analysis = v || ""; fs.page = 1; secFindRefresh(fs); }));
 
@@ -1060,7 +1070,10 @@ function secFindRow(fs, f){
   // would otherwise stack them.
   const tdRun = document.createElement("td");
   const runWrap = secEl("div", "secfind-run");
-  const runInfo = ((fs.data || {}).analyses || []).find(a => a.id === f.analysis_id);
+  // Every run the page was drawn from -- one per (repository, branch) -- is
+  // also what says whether a branch name needs its repository beside it.
+  const runs = (fs.data || {}).analyses || [];
+  const runInfo = runs.find(a => a.id === f.analysis_id);
   const runLine = secEl("div");
   if(f.analysis_id != null){
     const runBtn = document.createElement("button");
@@ -1078,7 +1091,7 @@ function secFindRow(fs, f){
   const otherRuns = (f.branches || []).filter(b => b.analysis_id !== f.analysis_id);
   if(otherRuns.length){
     const more = secEl("span", "secmeta", " +" + otherRuns.length);
-    more.title = otherRuns.map(b => "#" + b.analysis_id + " " + b.branch).join(", ");
+    more.title = otherRuns.map(b => "#" + b.analysis_id + " " + secScopeName(b, runs)).join(", ");
     runLine.appendChild(more);
   }
   runWrap.appendChild(runLine);
@@ -1093,19 +1106,20 @@ function secFindRow(fs, f){
   // the Status beside this cell is the reading that needs attention first,
   // and this is where the others are said. A row without `branches` is its
   // own branch, as it always was. Each branch's run and state are one hover
-  // away.
+  // away. A project with more than one repository names each branch's
+  // repository too (secScopeName): two `main`s are two members.
   const tdBranch = document.createElement("td");
   const onBranches = (f.branches && f.branches.length) ? f.branches
-    : [{branch: f.branch || "", analysis_id: f.analysis_id, state: f.state}];
+    : [{repo: f.repo, branch: f.branch || "", analysis_id: f.analysis_id, state: f.state}];
   const stateWord = (s) => SEC_STATE_LABEL[s] || s;
   if(onBranches.some(b => b.state !== onBranches[0].state)){
     onBranches.forEach(b => tdBranch.appendChild(
-      secEl("div", null, b.branch + " · " + stateWord(b.state))));
+      secEl("div", null, secScopeName(b, runs) + " · " + stateWord(b.state))));
   }else{
-    tdBranch.textContent = onBranches.map(b => b.branch).join(", ");
+    tdBranch.textContent = onBranches.map(b => secScopeName(b, runs)).join(", ");
   }
   if(onBranches.length > 1){
-    tdBranch.title = onBranches.map(b => b.branch + " — #" + b.analysis_id
+    tdBranch.title = onBranches.map(b => secScopeName(b, runs) + " — #" + b.analysis_id
       + " — " + stateWord(b.state)).join("\n");
   }
   tr.appendChild(tdBranch);
@@ -1129,14 +1143,18 @@ function secFindRow(fs, f){
   // anywhere fixed it.
   const fe = f.fixed_elsewhere;
   if(fe && fe.branch){
-    const where = fe.branch + (fe.commit ? " @ " + String(fe.commit).slice(0, 12) : "");
+    // The proof is always in the row's own repository (fixed_elsewhere never
+    // crosses one), so it is named with the row's repository when the page
+    // names repositories at all.
+    const where = secScopeName({repo: f.repo, branch: fe.branch}, runs)
+      + (fe.commit ? " @ " + String(fe.commit).slice(0, 12) : "");
     const merged = fe.in_this_branch === true, pending = fe.in_this_branch === false;
     const feBadge = secEl("span", "secstate fixed-elsewhere " + (merged ? "merged" : pending ? "pending" : "unknown"),
                           merged ? "fix already here" : pending ? "fixed on " + fe.branch : "fixed on " + fe.branch + " (?)");
     // NAMED, not "this branch": a row can stand for several branches now,
     // and the ancestry git was asked about is the representative's -- the
-    // branch in this row's own `branch` field.
-    const here = f.branch || "this branch";
+    // branch in this row's own `branch` field, of its own `repo`.
+    const here = secScopeName(f, runs) || "this branch";
     feBadge.title = merged
       ? "Fixed on " + where + ", and that commit is already in " + here + " — very likely resolved there too. Re-analyse " + here + " to confirm; nothing is marked fixed until somebody looks again."
       : pending

@@ -91,6 +91,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   representative's run with `+N` for the others; the *Unique issues* card is
   gone, since it could only repeat the total.
 
+- **Every repository of a project is read, not one analysis per branch
+  name.** A project can hold several repositories, routinely analysed on the
+  same branch name — and the findings browser read one analysis per branch
+  NAME, the newest, whichever repository it came from: with `web` and
+  `web-admin` both analysed on `main`, only the one analysed last was listed,
+  and the other's findings vanished from the browser and from the
+  consolidated export alike. Every reading that picked "the latest finished
+  analysis of a branch" had the same key, and each now reads every
+  (repository, branch) on its own: the browser and its export, the Analysis
+  run picker (one run per repository), the partial-read cue, the sidebar
+  donut, the category ranking and the analysed-branch count beside them, the
+  Branches tab (one row per repository and branch, its default-branch cards
+  over all of them), and `fixed_elsewhere`, which could prove a fix in one
+  repository out of another's newer run of the same branch, or miss its own.
+  The Overview's "vs. previous analysis" delta and trend, and the index
+  sparkline, now stay in the repository of the one reading they are built on
+  instead of zigzagging between two. The export has a section per repository
+  and branch, each at its own commit; it names the repository — on the
+  headings and on every finding — only when there is more than one, and its
+  JSON always carries `repo`. A screen listing branches of more than one
+  repository names each one's (`web-admin › main`); a single-repository
+  project reads as before. The index row and the Overview still describe one
+  analysis, the newest reading of the declared branch in any repository, as
+  they always did.
+
 - **A `sast` finding the operator ruled on no longer comes back as `new` when
   another branch's analysis finds it.** The agent mints a `sast` fingerprint
   from the rule, path and snippet it chose, and reuses one only when the

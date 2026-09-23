@@ -126,7 +126,7 @@ def test_a_deterministic_finding_with_no_classification_carries_empty_strings(co
 def test_posture_counts_open_findings_of_the_latest_finished_analysis(conn):
     _analysis(conn, "main", findings=[("critical", "secret"), ("low", "hygiene")])
     _analysis(conn, "main", findings=[("critical", "secret")])
-    p = queries.posture(conn, "web", "main")
+    p = queries.posture(conn, "web", "web", "main")
     assert p["critical"] == 1
     assert p["low"] == 0, "the older analysis must not be counted"
 
@@ -144,7 +144,7 @@ def test_pending_counts_as_open(conn):
 def test_a_running_analysis_is_never_the_posture(conn):
     _analysis(conn, "main", findings=[("high", "sast")])
     _analysis(conn, "main", state="running", findings=[])
-    assert queries.posture(conn, "web", "main")["high"] == 1
+    assert queries.posture(conn, "web", "web", "main")["high"] == 1
 
 
 def test_the_default_branch_falls_back_and_says_so(conn):
@@ -393,7 +393,7 @@ def test_trend_query_carries_the_id_tiebreak_in_its_order_by(conn):
     statements = []
     conn.set_trace_callback(statements.append)
     try:
-        queries.trend(conn, "web", "main")
+        queries.trend(conn, "web", "web", "main")
     finally:
         conn.set_trace_callback(None)
     select = next(s for s in statements
@@ -409,7 +409,7 @@ def test_trend_points_carry_a_per_severity_breakdown_that_sums_to_open(conn):
     more or less than the Total line at the same point."""
     _analysis(conn, "main", findings=[("critical", "secret"), ("high", "sast"),
                                       ("high", "sast2")])
-    points = queries.trend(conn, "web", "main")
+    points = queries.trend(conn, "web", "web", "main")
     assert len(points) == 1
     p = points[0]
     assert p["by_severity"]["critical"] == 1
@@ -426,10 +426,10 @@ def test_previous_finished_returns_the_next_older_done_or_capped_row(conn):
     a1 = _analysis(conn, "main", findings=[("high", "sast")])
     failed = _analysis(conn, "main", findings=[], state="failed")
     a3 = _analysis(conn, "main", findings=[("critical", "secret")])
-    prev = queries.previous_finished(conn, "web", "main", a3)
+    prev = queries.previous_finished(conn, "web", "web", "main", a3)
     assert prev is not None and prev["id"] == a1, \
         f"expected {a1} (skipping failed {failed}), got {prev}"
-    assert queries.previous_finished(conn, "web", "main", a1) is None
+    assert queries.previous_finished(conn, "web", "web", "main", a1) is None
 
 
 # ---- Task 2 (Phase 4): the trend series comes back, this time served and
@@ -546,19 +546,23 @@ def test_trend_series_reuses_the_checklist_already_cached_by_posture(tmp_path):
     Uses `queries.read_only`, not the plain `conn` fixture: the fixture is
     `ledger.connect`'s own writable connection, which carries no
     `_checklist_cache` at all (see `checklist`'s own docstring) -- asserting
-    a cache hit through it would pass for the wrong reason, or not at all."""
+    a cache hit through it would pass for the wrong reason, or not at all.
+
+    Driven the way `project_rows` drives it: `default_branch_posture` first,
+    and its reading handed to `trend_series`, which then needs no query of
+    its own to know which repository's history to plot."""
     db = tmp_path / "security.db"
     conn = ledger.connect(db)
     _analysis(conn, "main", findings=[("high", "sast")])
     conn.close()
 
     ro = queries.read_only(db)
-    queries.posture(ro, "web", "main")
+    _branch, _posture, _fell_back, latest = queries.default_branch_posture(ro, "web", "main")
 
     statements = []
     ro.set_trace_callback(statements.append)
     try:
-        series = queries.trend_series(ro, {"name": "web", "base": "main"})
+        series = queries.trend_series(ro, {"name": "web", "base": "main"}, latest=latest)
     finally:
         ro.set_trace_callback(None)
     ro.close()
@@ -1229,11 +1233,12 @@ def test_group_off_is_one_row_per_branch_as_it_was(conn):
     assert grouped["total"] == 1 and grouped["unique"] == 1
 
 
-def _on(conn, branch, fp=None, severity="critical", title="t", file="k.py"):
+def _on(conn, branch, fp=None, severity="critical", title="t", file="k.py", repo="web"):
     """One finished analysis of `branch` holding `fp` -- or nothing, which is
     how a finding the branch held last time becomes `fixed` there: its minter
-    is deterministic (no producer, a `secret`), so `prepared` proves it gone."""
-    aid = ledger.start_analysis(conn, "web", "web", branch, "s", "quick", "r")
+    is deterministic (no producer, a `secret`), so `prepared` proves it gone.
+    `repo` is the repository of project `web` the analysis is filed under."""
+    aid = ledger.start_analysis(conn, "web", repo, branch, "s", "quick", "r")
     if fp:
         ledger.record_finding(conn, aid, {
             "fingerprint": fp, "category": "secret", "rule": "aws-access-token",
@@ -1377,6 +1382,155 @@ def test_every_state_has_a_place_in_the_grouping_order():
     exists to prevent. A state added to either vocabulary has to be placed."""
     assert set(queries.GROUP_STATE_ORDER) == \
         set(diff.DERIVED_STATES) | set(ledger.DECISION_STATES)
+
+
+# ------------------------------------ every repository, not every branch name
+# A project can hold several repositories (`analysis.repo`), and two of them
+# are routinely analysed on the same branch name. A reading keyed by
+# (project, branch) alone picks ONE analysis per branch NAME -- the newest,
+# whichever repository it came from -- and the other repository's findings
+# vanish from whatever that reading feeds. Found in the final review of
+# fix/security-findings-one-row (2026-09-23), in the findings browser; the
+# probes below hold every reader that had the same key.
+
+def test_the_browser_reads_every_repository_on_a_shared_branch_name(conn):
+    in_web = _on(conn, "main", "1" * 64, title="in web")
+    in_admin = _on(conn, "main", "2" * 64, title="in web-admin", repo="web-admin")
+    got = queries.finding_rows(conn, "web")
+    assert {(r["repo"], r["title"], r["analysis_id"]) for r in got["rows"]} == \
+        {("web", "in web", in_web), ("web-admin", "in web-admin", in_admin)}
+    # the export's read: the same union, one row per finding per branch
+    per_branch = queries.finding_rows(conn, "web", group=False)
+    assert {(r["repo"], r["title"]) for r in per_branch["rows"]} == \
+        {("web", "in web"), ("web-admin", "in web-admin")}
+
+
+def test_each_repository_s_latest_analysis_is_read_not_every_analysis(conn):
+    """The containment side of the scope: widened to every repository, the
+    browser still reads each one's LATEST finished analysis -- `web`'s older
+    run, which still held the secret, must not bring it back as `new`."""
+    fp = "3" * 64
+    _on(conn, "main", fp)
+    _on(conn, "main")                                  # gone from web: fixed
+    _on(conn, "main", "4" * 64, repo="web-admin")
+    got = queries.finding_rows(conn, "web", {"show_resolved": True}, group=False)
+    assert {(r["repo"], r["fingerprint"], r["state"]) for r in got["rows"]} == \
+        {("web", fp, "fixed"), ("web-admin", "4" * 64, "new")}
+
+
+def test_one_fingerprint_in_two_repositories_is_one_row_naming_both(conn):
+    """Grouping spans the repositories, as the decision key does -- and each
+    member says which repository it was read in, or two `main`s are two
+    indistinguishable names on the screen."""
+    fp = "5" * 64
+    _on(conn, "main", fp)
+    _on(conn, "main", fp, repo="web-admin")
+    (row,) = queries.finding_rows(conn, "web")["rows"]
+    assert [(b.get("repo"), b["branch"]) for b in row["branches"]] == \
+        [("web", "main"), ("web-admin", "main")]
+
+
+def test_the_pickers_offer_each_repository_s_run_and_one_name_per_branch(conn):
+    """The Analysis run picker offers one run per (repository, branch), each
+    saying its repository, and every one of them matches its own rows. The
+    Branch picker offers the NAME once: "Branch: main" reads main in every
+    repository that has one."""
+    in_web = _on(conn, "main", "1" * 64, title="in web")
+    in_admin = _on(conn, "main", "2" * 64, title="in web-admin", repo="web-admin")
+    got = queries.finding_rows(conn, "web")
+    assert {(a.get("repo"), a["branch"], a["id"]) for a in got["analyses"]} == \
+        {("web", "main", in_web), ("web-admin", "main", in_admin)}
+    assert got["branches"] == ["main"]
+    for aid, title in ((in_web, "in web"), (in_admin, "in web-admin")):
+        (only,) = queries.finding_rows(conn, "web", {"analysis": [aid]})["rows"]
+        assert only["title"] == title
+    named = queries.finding_rows(conn, "web", {"branch": ["main"]})["rows"]
+    assert {r["title"] for r in named} == {"in web", "in web-admin"}
+
+
+def test_a_capped_repository_is_counted_when_another_finished_the_branch_later(conn):
+    """The strip's partial-read cue, the sidebar's and the sidebar's own count
+    of what the donut spans: all three count (repository, branch) scopes, the
+    unit the donut and the browser now read."""
+    capped = ledger.start_analysis(conn, "web", "web", "main", "s", "quick", "r")
+    ledger.mark_prepared(conn, capped)
+    ledger.finish_analysis(conn, capped, "capped")
+    _on(conn, "main", "2" * 64, repo="web-admin")      # newer, and done
+    assert queries.finding_rows(conn, "web")["capped_branches"] == 1
+    assert queries.capped_branch_count(conn, "web") == 1
+    assert queries.analysed_branch_count(conn, "web") == 2
+
+
+def test_the_donut_and_the_categories_count_every_repository(conn):
+    _on(conn, "main", "1" * 64)                        # critical, in web
+    _on(conn, "main", "2" * 64, severity="high", repo="web-admin")
+    totals = queries.severity_totals(conn, "web")
+    assert (totals["critical"], totals["high"], totals["total"]) == (1, 1, 2)
+    assert queries.top_categories(conn, "web") == \
+        [{"rule": "aws-access-token", "count": 2, "category": "secret"}]
+
+
+def test_the_donut_still_counts_one_fingerprint_in_two_repositories_once(conn):
+    """The containment side: every repository is read, and a fingerprint
+    open in two of them is still ONE problem -- the donut's rule and the
+    browser's, which groups it into one row."""
+    fp = "6" * 64
+    _on(conn, "main", fp)
+    _on(conn, "main", fp, repo="web-admin")
+    assert queries.severity_totals(conn, "web")["total"] == 1
+    assert queries.finding_rows(conn, "web")["total"] == 1
+
+
+def test_the_branches_tab_has_one_row_per_repository_and_branch(conn):
+    """Each row IS one analysis reading -- its drill-down, its commit, its
+    trend -- so its unit is (repository, branch). One row per branch NAME
+    counted both repositories' runs and read one repository's posture."""
+    in_web = _on(conn, "main", "1" * 64)
+    in_admin = _on(conn, "main", "2" * 64, severity="high", repo="web-admin")
+    rows = {(r.get("repo"), r["branch"]): r for r in queries.branch_rows(conn, "web")}
+    assert set(rows) == {("web", "main"), ("web-admin", "main")}
+    web, admin = rows[("web", "main")], rows[("web-admin", "main")]
+    assert (web["analysis_id"], web["analyses"], web["open"]["critical"]) == (in_web, 1, 1)
+    assert (admin["analysis_id"], admin["analyses"], admin["open"]["high"]) == (in_admin, 1, 1)
+    assert [p["analysis_id"] for p in web["trend"]] == [in_web]
+
+
+def _open_in(conn, repo, branch, n):
+    """A finished analysis of `repo`/`branch` with `n` distinct open findings,
+    the same `n` fingerprints every time for the same repository."""
+    aid = ledger.start_analysis(conn, "web", repo, branch, "s", "quick", "r")
+    for i in range(n):
+        ledger.record_finding(conn, aid, {
+            "fingerprint": f"{repo}-{i}".ljust(64, "0"), "category": "secret",
+            "rule": "aws-access-token", "severity": "high", "title": "t",
+            "occurrences": [{"file": "k.py", "line": 1, "snippet_hash": ""}]})
+    ledger.mark_prepared(conn, aid)
+    ledger.finish_analysis(conn, aid, "done")
+    return aid
+
+
+def test_the_index_sparkline_plots_one_repository_s_branch(conn):
+    """The sparkline is the history of the reading the project row shows --
+    one analysis, the newest finished reading of the declared branch -- and
+    so of THAT reading's repository. Read by branch name alone it zigzagged
+    between the repositories' counts."""
+    _open_in(conn, "web", "main", 1)
+    _open_in(conn, "web-admin", "main", 3)
+    _open_in(conn, "web", "main", 2)
+    assert queries.trend_series(conn, {"name": "web", "base": "main"}) == [1, 2]
+
+
+def test_the_project_row_reads_the_newest_reading_of_the_declared_branch(conn):
+    """A pin, not a probe: the index row and the Overview are built on ONE
+    analysis on purpose -- the newest finished reading of the declared
+    branch, in whichever repository it was taken -- and the repository it
+    comes from is now carried with it. Showing every repository's base
+    branch there is a design change of its own, not this fix."""
+    _open_in(conn, "web", "main", 1)
+    newest = _open_in(conn, "web-admin", "main", 3)
+    branch, posture, fell_back, latest = queries.default_branch_posture(conn, "web", "main")
+    assert (branch, fell_back, latest["id"], latest["repo"]) == ("main", False, newest, "web-admin")
+    assert posture["total"] == 3
 
 
 def test_finding_rows_carries_a_findings_cwe_and_owasp_class(conn):

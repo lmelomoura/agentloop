@@ -5243,6 +5243,32 @@ def test_project_data_previous_is_none_not_zeros_without_a_prior_analysis(tmp_pa
     assert out["tabs"]["overview"]["trend"] != []
 
 
+def test_project_data_compares_the_overview_with_its_own_repository(tmp_path):
+    """The Overview reads ONE analysis -- here `web`'s newest run of main --
+    and its "vs. previous" delta and its trend are that reading's history.
+    Picked by branch name alone, the previous analysis was `web-admin`'s run
+    of main in between, and the delta compared two repositories."""
+    db = tmp_path / "security.db"
+
+    def run_of(repo, names):
+        aid = prepared_analysis(db, tmp_path, project="web", repo=repo, branch="main")
+        for name in names:
+            run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
+                "fingerprint": fingerprint_for(repo, name), "category": "hygiene",
+                "rule": "r", "severity": "high", "title": name, "rationale": "r"}))
+        run(db, "finish", "--analysis", str(aid), "--state", "done", "--spend", "0.1")
+        return aid
+
+    first = run_of("web", ["a"])
+    run_of("web-admin", ["b", "c", "d"])
+    latest = run_of("web", ["a", "e"])
+    ov = run(db, "project-data", "--project", "web", "--base", "main",
+             "--default-profile", "")["tabs"]["overview"]
+    assert ov["posture"]["total"] == 2
+    assert ov["previous"]["total"] == 1, "web's own previous run, not web-admin's"
+    assert [p["analysis_id"] for p in ov["trend"]] == [first, latest]
+
+
 def test_project_data_overview_cards_follow_the_fallen_back_branch(tmp_path):
     """The trend/categories/top_findings scope is the SHOWN branch -- the
     one the header names, fallen back or not -- unlike the index sparkline
