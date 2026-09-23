@@ -26,6 +26,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the word of the agent that found it, and nothing in the ledger could tell a
   read claim from an unread one.
 
+- **`finding.verdict`, `verdict_reason` and `verified_by` columns**, additive
+  and '' on every existing row, written once per finding per analysis and
+  never cleared by a re-report; a verdict is not inherited between analyses.
+
 ### Changed
 
 - **The security-analysis skill has a criterion for what qualifies as a
