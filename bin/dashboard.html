@@ -726,6 +726,13 @@ document.documentElement.dataset.theme =
         <div class="platcard-ic" id="pf-halo"></div>
         <div class="platcard-t"><b>Your profile</b><span>The one account on this install</span></div>
       </div>
+      <!-- A form of its own, for the password managers' sake: Chrome and the
+           extensions read every input outside a <form> as ONE synthetic
+           form, so three formless password fields here made the whole page
+           a sign-in form, and a saved sign-in was filled into the first text
+           field on the page -- the Jobs search box, which then filtered the
+           table by the operator's own name, again after every redraw. -->
+      <form id="pf-form" novalidate>
       <div class="pf-b">
         <div class="pf-photo">
           <div class="pf-face" id="pf-face"></div>
@@ -741,7 +748,7 @@ document.documentElement.dataset.theme =
         <label for="pf-name">Name<span class="req" aria-hidden="true">*</span></label>
         <input id="pf-name" type="text" autocomplete="name">
         <label for="pf-email">Email<span class="req" aria-hidden="true">*</span></label>
-        <input id="pf-email" type="email" autocomplete="email">
+        <input id="pf-email" type="email" autocomplete="username">
         <label for="pf-current">Change password</label>
         <input id="pf-current" type="password" autocomplete="current-password" placeholder="Current password">
         <input id="pf-pw" type="password" autocomplete="new-password" placeholder="New password">
@@ -752,8 +759,9 @@ document.documentElement.dataset.theme =
       </div>
       <div class="pf-f">
         <div class="dlg-err" id="pf-err" hidden></div>
-        <button type="button" class="btn primary" id="pf-save">Save profile</button>
+        <button type="submit" class="btn primary" id="pf-save">Save profile</button>
       </div>
+      </form>
     </section>
   </div>
   </div><!-- /view-settings -->
@@ -5761,7 +5769,9 @@ $("pj-cancel").addEventListener("click", ()=>pjWiz.close());
    the block and the inner button stops its own click from reaching it. */
 $("pf-halo").innerHTML=I.user;
 $("side-user").addEventListener("click", openProfile);
-$("pf-save").addEventListener("click", saveProfile);
+// Save is the profile form's submit button, so Enter in a field saves too --
+// and the submit never navigates: saveProfile posts it.
+$("pf-form").addEventListener("submit",(e)=>{ e.preventDefault(); saveProfile(); });
 $("pf-pick").addEventListener("click", ()=>$("pf-file").click());
 $("pf-drop").addEventListener("click", ()=>{ pfAvatar=""; $("pf-file").value=""; pfFace(); });
 $("st-profile").addEventListener("input", ()=>{ pfError(""); pfFace(); });

@@ -167,6 +167,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The Jobs search box no longer fills itself with the operator's name.**
+  Since the profile moved from its dialog into Settings › Profile, its three
+  password fields sat outside any `<form>`, and Chrome and the
+  password-manager extensions read every formless input on the page as one
+  sign-in form: a saved sign-in went into the first text field they found —
+  the Jobs search — so the table filtered itself by the operator's own name
+  (*Search: "…" · 0 of 3 jobs*), and the value came back every time the page
+  redrew. The profile has a form of its own again, its email is the sign-in
+  identifier (`autocomplete="username"`, as on the login form), and Enter in
+  a field saves it.
+
 - **An analysis of one repository of a multi-repo project reads that
   repository, at the branch it names.** Every analysis ran in the project's
   `cwd` — the primary repository — so an analysis of any other repository

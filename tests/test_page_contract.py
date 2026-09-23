@@ -3562,6 +3562,40 @@ def test_the_sidebar_photo_opens_settings_profile(srv):
         "paintSettings must fill the Profile tab on arrival, and refuse to while it is being typed into"
 
 
+def test_every_password_field_sits_in_a_form_of_its_own(srv):
+    """Chrome and the password-manager extensions treat every input outside a
+    <form> as ONE synthetic form. When the profile moved out of its dialog's
+    <form> into Settings › Profile, its three password fields became part of
+    that synthetic form, the whole page read as a sign-in form, and the
+    manager filled a saved sign-in into the first text field it found -- the
+    Jobs search box. The table then filtered itself by the operator's own
+    name (Search: "Felipe Reis", 0 of 3 jobs), and the value came back every
+    time the page redrew. A password field inside a form of its own keeps
+    every other input on the page out of that guess."""
+    page = srv.render_page("boot-authed")
+    fields = list(re.finditer(r'<input[^>]*type="password"[^>]*>', page))
+    assert fields, "no password field in the page -- did the markup move?"
+    for m in fields:
+        before = page[:m.start()]
+        assert before.rfind("<form") > before.rfind("</form>"), \
+            f"a password field outside any <form>: {m.group(0)}"
+    pane = _profile_pane(page)
+    assert '<form id="pf-form"' in pane, "the profile's fields need a form of their own"
+    # The sign-in identifier is the email, as on the login form: a manager
+    # that saves or fills a credential here pairs it with this field, never
+    # with the name above it.
+    assert 'id="pf-email" type="email" autocomplete="username"' in pane
+    assert '<button type="submit" class="btn primary" id="pf-save">Save profile</button>' in pane, \
+        "Save is the form's submit button, so Enter in a field saves too"
+    js = _js(srv)
+    assert '$("pf-form").addEventListener("submit",' in js, "the profile form must handle its own submit"
+    handler = js[js.index('$("pf-form").addEventListener("submit",'):][:200]
+    assert "preventDefault()" in handler and "saveProfile()" in handler, \
+        "a submit must save through saveProfile and never navigate the page"
+    assert '$("pf-save").addEventListener("click", saveProfile);' not in js, \
+        "Save is the form's submit button now; a click handler as well would save twice"
+
+
 def test_saving_the_profile_leaves_the_page_up_and_empties_the_passwords(srv):
     body = _fn(_js(srv), "saveProfile")
     assert ".close()" not in body, "a page has nothing to close"
