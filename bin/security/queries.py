@@ -167,6 +167,71 @@ def checklist(conn, analysis_id):
     return result
 
 
+def decided_sast(conn, analysis_id):
+    """The agent's own `sast` findings the operator has already ruled on that
+    this analysis's checklist does not list -- handed to the agent beside the
+    checklist (`cmd_checklist`) so the same hole found again is re-reported
+    under the decided identity instead of minted a second time.
+
+    WHY THIS EXISTS. The agent mints a `sast` fingerprint from the rule, the
+    path and the snippet IT chose, and the skill has it reuse one only when a
+    row it can see already lists the weakness. `checklist` compares with the
+    same branch only, so a finding decided on develop was invisible from main
+    and was minted again there, without its decision -- measured on one
+    project (2026-09-23): one access-control hole accepted twice, under two
+    fingerprints, once per branch. A decision is recorded against the
+    project; this is what lets the identity it is keyed to survive the
+    branch.
+
+    WHICH FINDINGS. Every fingerprint with a decision in this project whose
+    most recent record -- in the finished (`done`/`capped`) analysis of this
+    project and repository with the highest id, whatever its branch -- is a
+    `sast` the AGENT minted. Semgrep's rows are left out: their identity is
+    built from its own check id and does not drift. Another repository is
+    left out: there the same fingerprint is another thing with the same name
+    (the rule `fixed_elsewhere` keeps). And what the checklist of this
+    analysis already lists -- this analysis and its baseline -- is left out,
+    because the agent already sees those, with the decision's state.
+
+    Each entry carries what the agent needs to RECOGNISE the finding and
+    nothing it would have to read at length: rule, title, severity,
+    occurrences, where it was last seen, and the decision with its reason.
+    Ordered by (rule, fingerprint), so two runs over the same ledger hand the
+    agent the same list.
+    """
+    analysis = dict(_analysis_row(conn, analysis_id))
+    decisions = ledger.decisions_for(conn, analysis["project"])
+    if not decisions:
+        return []
+    _an, listed = checklist(conn, analysis_id)
+    listed_fps = {f["fingerprint"] for f in listed}
+    out = []
+    for fp, decision in decisions.items():
+        if fp in listed_fps:
+            continue
+        row = conn.execute(
+            "SELECT f.id, f.category, f.producer, f.rule, f.title, f.severity,"
+            " a.id AS analysis_id, a.branch FROM finding f"
+            " JOIN analysis a ON a.id = f.analysis_id"
+            " WHERE f.fingerprint=? AND a.project=? AND a.repo=?"
+            " AND a.state IN ('done','capped')"
+            " ORDER BY a.id DESC LIMIT 1",
+            (fp, analysis["project"], analysis["repo"])).fetchone()
+        if row is None or row["category"] != "sast" or row["producer"] != diff.AGENT:
+            continue
+        occurrences = [{"file": o["file"], "line": o["line"]} for o in conn.execute(
+            "SELECT file, line FROM occurrence WHERE finding_id=? ORDER BY id",
+            (row["id"],))]
+        out.append({"fingerprint": fp, "rule": row["rule"], "title": row["title"],
+                    "severity": row["severity"], "occurrences": occurrences,
+                    "last_seen": {"branch": row["branch"],
+                                  "analysis_id": row["analysis_id"]},
+                    "decision": {"state": decision["state"],
+                                 "reason": decision["reason"]}})
+    out.sort(key=lambda e: (e["rule"], e["fingerprint"]))
+    return out
+
+
 def fixed_elsewhere(conn, project, repo, branch, fingerprints):
     """For each of `fingerprints`, open on `branch`: where else in the same
     repository the same fingerprint is `fixed`, if anywhere.

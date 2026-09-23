@@ -91,6 +91,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   representative's run with `+N` for the others; the *Unique issues* card is
   gone, since it could only repeat the total.
 
+- **A `sast` finding the operator ruled on no longer comes back as `new` when
+  another branch's analysis finds it.** The agent mints a `sast` fingerprint
+  from the rule, path and snippet it chose, and reuses one only when the
+  checklist lists the weakness — and the checklist compares with the same
+  branch only. So a finding decided on `develop` was minted again on `main`,
+  without its decision: one access-control hole was accepted twice, under two
+  identities. `agentloop security checklist` now also prints `decided_sast` —
+  every agent-minted `sast` of the same project and repository with an
+  operator decision the checklist does not already list, with its rule,
+  title, occurrences, where it was last seen and the decision — and the
+  skill's Job 3 tells the agent to re-report the same flaw in the same place
+  under that fingerprint. Semgrep's rows are left out: their identity is
+  deterministic and does not drift.
+
 - **A job with no schedule window is launched by the tick again.** The
   tick's plan was one tab-separated line per enabled job, read back with
   `IFS=tab` -- and a tab is IFS whitespace, which bash folds: a run of it

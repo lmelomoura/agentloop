@@ -1519,6 +1519,20 @@ finding does not either. Change what the code actually *says* and it is
 different code, which deserves a fresh judgement rather than an inherited one.
 Surprising the first time it happens; correct.
 
+**The agent's own finding keeps its identity across branches.** A `sast`
+fingerprint the agent mints is built from the rule, the path and the snippet
+it chose, and it reuses one only when the checklist it works from lists the
+weakness — a checklist that compares with the same branch alone. So a finding
+decided on `develop` was minted again on `main`, without its decision: one
+access-control hole was accepted twice on one project, once per branch.
+`agentloop security checklist` now also prints `decided_sast` — every `sast`
+the agent minted in this project and repository that carries a decision the
+checklist does not already list, with its rule, title, occurrences, where it
+was last seen and the decision — and the skill tells the agent to re-report
+the same flaw in the same place under that fingerprint, so the decision
+applies instead of the finding coming back as `new`. Semgrep's rows are left
+out: their identity comes from Semgrep's own check id and does not drift.
+
 ### A secret's value is never stored, and never shown
 
 Not in the ledger, and not in any of the report formats it renders from it.

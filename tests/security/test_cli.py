@@ -816,6 +816,30 @@ def test_a_decision_wins_over_the_derived_state(tmp_path):
     assert checklist["findings"][0]["state"] == "false_positive"
 
 
+def test_the_checklist_hands_the_agent_the_sast_decided_on_another_branch(tmp_path):
+    """`decided_sast` rides BESIDE the checklist: an agent-minted `sast` the
+    operator ruled on while another branch's analysis held it, which this
+    analysis's checklist cannot list -- see queries.decided_sast."""
+    db = tmp_path / "security.db"
+    fp = "c" * 64
+    dev = prepared_analysis(db, tmp_path, branch="develop", run_id="r-dev")
+    run(db, "report-finding", "--analysis", str(dev), stdin=json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": "broken-access-control",
+        "severity": "low", "title": "the drawer proxies any candidate",
+        "rationale": "any id reaches the upstream", "remediation": "scope the id",
+        "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 54}]}))
+    run(db, "finish", "--analysis", str(dev), "--state", "done")
+    run(db, "decide", "--project", "web", "--fingerprint", fp, "--state", "accepted",
+        "--reason", "product decision RP-217", "--by", "me")
+    main = prepared_analysis(db, tmp_path, branch="main", run_id="r-main")
+    out = run(db, "checklist", "--analysis", str(main))
+    assert [e["fingerprint"] for e in out["decided_sast"]] == [fp]
+    assert out["decided_sast"][0]["decision"]["state"] == "accepted"
+    assert all(f["fingerprint"] != fp for f in out["findings"]), \
+        "beside the checklist, never inside it"
+
+
 def test_findings_lists_what_the_deterministic_phase_left_for_the_agent(tmp_path):
     """PINNED to the built-in scanner, because the fixture is one only it
     reports: a PEM header and one body line, with no footer. Gitleaks is

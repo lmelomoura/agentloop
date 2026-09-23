@@ -108,6 +108,10 @@ So: if `checklist` or this analysis's `findings` already carries a row for this 
 
 Fold in only what is genuinely the same weakness in the same place. Two different problems in one file are two findings — the pre-pass keeps them apart by check id — and collapsing them onto one row loses whichever one you did not describe.
 
+**`checklist` also prints `decided_sast`: the `sast` findings the operator has already ruled on — accepted or false positive — that this checklist does not list,** because they were recorded on another branch, or in an older analysis of this one. Your own pass mints a `sast` fingerprint from the rule, the path and the snippet you chose, so the same hole found from another branch comes out under a new identity that no decision reaches: the operator rules on it a second time, or watches a finding they already dismissed come back as `new`. One access-control hole was accepted twice on one project that way, once per branch.
+
+So before you mint a fingerprint with `--snippet`, read `decided_sast` too. If the weakness you are about to report is one of its entries — the same flaw, in the same place — re-report it under **that entry's fingerprint, copied exactly**, with your own rationale, occurrences and `candidate`; the operator's decision then applies here as well. The list is for folding into and nothing else: an entry you did not find yourself in this run is not re-reported, because it is not work carried over — nobody asked you to check it — and an entry that only resembles what you found, another flaw in the same file, is not one to fold into.
+
 ## Rules that are not negotiable
 
 **Report through the CLI, never by writing the database.** One finding at a time, as JSON on stdin. For a weakness nothing already lists, get the fingerprint from `agentloop security fingerprint`, never invent one — that is the whole next rule. For a row that is already on the checklist, copy the fingerprint it printed (all three jobs above do this — Job 2 does it for every deterministic row it reads):

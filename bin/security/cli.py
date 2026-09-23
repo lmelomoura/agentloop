@@ -2399,7 +2399,13 @@ def cmd_checklist(args):
         analysis, findings = queries.checklist(conn, args.analysis)
     except queries.AnalysisNotFound as e:
         sys.exit(str(e))
-    print(json.dumps({"analysis": analysis, "findings": findings}, indent=2))
+    # `decided_sast` rides BESIDE the checklist, never inside it: `findings`
+    # is this analysis and its baseline, which every screen and report reads,
+    # while the list describes no state of this analysis at all -- it is for
+    # the agent's fold-before-you-mint rule (SKILL.md, Job 3).
+    print(json.dumps({"analysis": analysis, "findings": findings,
+                      "decided_sast": queries.decided_sast(conn, args.analysis)},
+                     indent=2))
 
 
 def _sbom_document(conn, analysis_id):
