@@ -69,6 +69,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Two writers of `config/models.json` at once no longer lose an update.**
+  Every writer rewrites the file whole — jq into a temporary file, then
+  `mv` — and two do run at once: the tick's detached pass, and a launch
+  whose family has expired, which resolves inline outside that pass. When
+  both read before either wrote, the second `mv` dropped the first one's
+  update — a family's fresh resolution, a release waiting for `claude
+  update`, a failed probe's `failed_at` — until the next pass. Every write
+  of the file now takes one lock, `data/locks/.models.lock`: the families'
+  records, both catalogs and their `stale_at` stamps, and the seed of a
+  missing or unreadable file. It is held for the read-modify-write alone,
+  never for a probe or a catalog command, so a launch waits milliseconds
+  for it, not the minute the pass holds `_models` for. The wait is bounded
+  (`MODELS_LOCK_WAIT`, 10 s): a writer that cannot have the lock by then
+  writes nothing and says in `tick.log` what it gave up on and which pid
+  held the lock. A dead holder's lock is taken at once, as everywhere here,
+  and a bounded wait also takes a lock left with no pid once it is older
+  than `LOCK_GRACE_SECONDS` — a writer killed between creating the lock and
+  writing its pid would otherwise turn every later writer away for good.
+  `lock_take` takes the bound as an optional second argument; its other
+  callers are unchanged. The selftest races two real writers through a jq
+  that answers a second late, and holds every write path to the lock.
+
 - **A model probe that gets no verdict no longer reads as "this model does
   not exist", and its pass is no longer trusted for a day.** A CLI with no
   session answers every probe with `Not logged in · Please run /login`

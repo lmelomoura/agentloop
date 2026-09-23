@@ -103,6 +103,9 @@ MODELS_RETRY=600            # 10 min — how soon a family's pass is tried again
                             # when a probe had no verdict (no session, an API
                             # error), doubling with each such pass in a row,
                             # never longer than MODELS_TTL
+MODELS_LOCK_WAIT=10         # s — how long a write of models.json waits for
+                            # the one writer it lets in at a time before it
+                            # gives up, and says so in tick.log (models_lock)
 STATE_FILE="$DATA_DIR/state.json"
 RUNS_FILE="$DATA_DIR/runs.ndjson"
 LOG_DIR="$DATA_DIR/logs"
@@ -1135,8 +1138,10 @@ state_get() { # state_get <id> <field> [default]
 # only break the lock when that pid is gone); this generalises it to the rest.
 LOCK_GRACE_SECONDS="${AGENTLOOP_LOCK_GRACE:-30}"
 
-lock_take() { # lock_take <lockdir> — blocks until held; always succeeds
-  local d="${1:-}" hold i=0
+lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with <seconds>, gives up (1) once they have passed
+  local d="${1:-}" hold i=0 deadline="" born
+  # A bound is counted on the shell's own clock, whole seconds, no fork.
+  [ -z "${2:-}" ] || deadline=$(( SECONDS + $2 ))
   while ! mkdir "$d" 2>/dev/null; do
     hold="$(cat "$d/pid" 2>/dev/null || true)"
     # slot_alive, not a bare `kill -0`: this is the identical defect Task 1
@@ -1151,12 +1156,26 @@ lock_take() { # lock_take <lockdir> — blocks until held; always succeeds
     if [ -n "$hold" ] && ! slot_alive "$d"; then
       rm -rf "$d"; continue          # the owner is gone: genuinely stale
     fi
-    # A live owner is WAITED for, however long it takes. An unreadable owner is
-    # the narrow race between mkdir and writing the pid — give that, and only
-    # that, a time-based escape.
+    # A live owner is WAITED for, however long it takes -- unless the caller
+    # bounded the wait (below). An unreadable owner is the narrow race between
+    # mkdir and writing the pid — give that, and only that, a time-based escape.
     i=$(( i + 1 ))
     if [ -z "$hold" ] && [ "$i" -ge $(( LOCK_GRACE_SECONDS * 100 )) ]; then
       rm -rf "$d"; i=0; continue
+    fi
+    # A bounded wait (the models.json lock, models_lock) gives up on a live
+    # owner once its time is up -- and never waits long enough for the grace
+    # above, so an owner that has still not written its pid is judged by the
+    # lock itself: a directory older than the grace was left by a writer
+    # killed between mkdir and its pid, and would otherwise turn away every
+    # bounded writer for good; a younger one may be a writer inside that very
+    # gap, and is given up on like a live one.
+    if [ -n "$deadline" ] && [ "$SECONDS" -ge "$deadline" ]; then
+      if [ -z "$hold" ]; then
+        born="$(num "$(stat -f %m "$d" 2>/dev/null)" "$(now_epoch)")"
+        if [ $(( $(now_epoch) - born )) -ge "$LOCK_GRACE_SECONDS" ]; then rm -rf "$d"; continue; fi
+      fi
+      return 1
     fi
     sleep 0.01
   done
@@ -2353,16 +2372,51 @@ openai_catalog_all_efforts() { # the union of every VISIBLE model's efforts, fir
     | .[]' "$MODELS_FILE" 2>/dev/null
 }
 
+# --- config/models.json, one writer at a time ---------------------------------
+# Every writer rewrites config/models.json whole -- jq into a temporary file,
+# then mv over it -- and two of them do run at once: the detached pass the tick
+# starts (_resolve_models, which holds the "_models" lock for the whole of its
+# probing, a minute on the usual day) and a launch whose family expired, which
+# resolves inline (effective_model -> family_refresh) outside that pass. Both
+# read the same file and the second mv dropped the first one's update: a
+# family's fresh resolution, a release waiting for claude update, a failed_at
+# stamp, lost until the next pass. This lock is held for the read-modify-write
+# alone -- one jq and one mv, never a probe or a catalog command -- so a writer
+# waits milliseconds for another, not the minute a pass holds "_models" for.
+# It is bounded all the same: a writer that cannot have it within
+# MODELS_LOCK_WAIT seconds gives up and says in tick.log what it did not
+# write, rather than hang a launch behind a holder that stopped.
+models_lock() { # models_lock <who> <what> -- 0 held; 1 gave up, and tick.log names what was not written
+  local p holder="another writer"
+  lock_take "$LOCK_DIR/.models.lock" "$MODELS_LOCK_WAIT" && return 0
+  p="$(cat "$LOCK_DIR/.models.lock/pid" 2>/dev/null || true)"
+  [ -z "$p" ] || holder="pid $p"
+  log_tick "models: $1 — gave up writing $2: $holder held the lock on models.json for more than $MODELS_LOCK_WAIT s"
+  return 1
+}
+models_unlock() { lock_drop "$LOCK_DIR/.models.lock"; }
+
+_models_rmw() { # _models_rmw <jq args…> -- one read-modify-write of config/models.json; the caller holds models_lock
+  local tmp
+  tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
+  "$JQ" "$@" "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE" && return 0
+  rm -f "$tmp"
+  return 1
+}
+
+models_write() { # models_write <who> <what> <jq args…> -- _models_rmw under models_lock, over a seeded file; 1 = not written
+  local rc
+  models_lock "$1" "$2" || return 1
+  shift 2
+  [ -f "$MODELS_FILE" ] || echo '{"resolved":{}}' > "$MODELS_FILE"
+  _models_rmw "$@"; rc=$?
+  models_unlock
+  return "$rc"
+}
+
 # --- the OpenAI catalog, write side ------------------------------------------
 resolve_models_openai() { # refresh config/models.json's `openai` block from `codex debug models`
-  local raw source block tmp kept
-  tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
-  if [ ! -f "$MODELS_FILE" ]; then
-    echo '{"resolved":{}}' > "$MODELS_FILE"
-  elif ! "$JQ" -e . "$MODELS_FILE" >/dev/null 2>&1; then
-    echo "models.json was not valid JSON — reseeded"
-    echo '{"resolved":{}}' > "$MODELS_FILE"
-  fi
+  local raw source block kept="" rc=0
   if [ ! -x "$(platform_bin openai)" ]; then
     block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"codex not installed"}')"
   else
@@ -2386,6 +2440,16 @@ resolve_models_openai() { # refresh config/models.json's `openai` block from `co
           deprecated_by:(.upgrade.model // ""), retires_at:(.upgrade.retirement_at // "")}]}')"
     fi
   fi
+  # From here to the write, one writer at a time (models_lock): the seed, the
+  # choice between keeping the catalog and replacing it -- read from the file
+  # as it is now, not as it was before codex answered -- and the write itself.
+  models_lock openai "the catalog" || { echo "openai -> could not write $MODELS_FILE"; return 1; }
+  if [ ! -f "$MODELS_FILE" ]; then
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  elif ! "$JQ" -e . "$MODELS_FILE" >/dev/null 2>&1; then
+    echo "models.json was not valid JSON — reseeded"
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  fi
   # A refresh that failed -- no codex, an empty answer -- must not replace a
   # catalog that still resolves real jobs: the launch gate reads
   # .openai.models and would refuse every openai run until the next
@@ -2398,21 +2462,13 @@ resolve_models_openai() { # refresh config/models.json's `openai` block from `co
   # {available:false} stub is written only when there is nothing to keep.
   if openai_catalog_available && printf '%s' "$block" | "$JQ" -e '.available == false' >/dev/null 2>&1; then
     kept="$(printf '%s' "$block" | "$JQ" -r .reason)"
-    if ! { "$JQ" --argjson at "$(now_epoch)" --arg r "$kept" '.openai.stale_at = $at | .openai.stale_reason = $r' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
-      rm -f "$tmp"
-      echo "openai -> could not write $MODELS_FILE"
-      return 1
-    fi
-    rm -f "$tmp"
-    echo "openai -> kept the previous catalog ($kept)"
-    return 0
+    _models_rmw --argjson at "$(now_epoch)" --arg r "$kept" '.openai.stale_at = $at | .openai.stale_reason = $r' || rc=1
+  else
+    _models_rmw --argjson b "$block" '.openai = $b' || rc=1
   fi
-  if ! { "$JQ" --argjson b "$block" '.openai = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
-    rm -f "$tmp"
-    echo "openai -> could not write $MODELS_FILE"
-    return 1
-  fi
-  rm -f "$tmp"
+  models_unlock
+  if [ "$rc" -ne 0 ]; then echo "openai -> could not write $MODELS_FILE"; return 1; fi
+  if [ -n "$kept" ]; then echo "openai -> kept the previous catalog ($kept)"; return 0; fi
   if openai_catalog_available; then
     echo "openai -> $(openai_catalog_visible | tr '\n' ' ')($(printf '%s' "$block" | "$JQ" -r .source))"
   else
@@ -2479,14 +2535,7 @@ opencode_catalog_tools() { # opencode_catalog_tools <id> -> 0 unless the catalog
 }
 
 resolve_models_opencode() { # refresh config/models.json's `opencode` block from `opencode models --verbose`
-  local block tmp kept version rc raw_tmp
-  tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")" || return 1
-  if [ ! -f "$MODELS_FILE" ]; then
-    echo '{"resolved":{}}' > "$MODELS_FILE"
-  elif ! "$JQ" -e . "$MODELS_FILE" >/dev/null 2>&1; then
-    echo "models.json was not valid JSON — reseeded"
-    echo '{"resolved":{}}' > "$MODELS_FILE"
-  fi
+  local block kept="" version rc raw_tmp wrc=0
   if [ ! -x "$(platform_bin opencode)" ]; then
     block="$("$JQ" -nc --argjson at "$(now_epoch)" '{at:$at, available:false, reason:"opencode not installed"}')"
   else
@@ -2507,7 +2556,7 @@ resolve_models_opencode() { # refresh config/models.json's `opencode` block from
     # bytes for 13 models is safe, but a catalog of 55+ models crosses it), so
     # this capture goes through a file too, the same fix as
     # opencode_export_model above, never `$( )`.
-    raw_tmp="$(mktemp "$CONFIG_DIR/.models-verbose.XXXXXX")" || { rm -f "$tmp"; return 1; }
+    raw_tmp="$(mktemp "$CONFIG_DIR/.models-verbose.XXXXXX")" || return 1
     run_bounded "$((OPENCODE_DEADLINE * 2))" "$(platform_bin opencode)" models --verbose --pure > "$raw_tmp" 2>/dev/null; rc=$?
     if [ "$rc" -eq 124 ]; then
       # Past its deadline, the CLI hung (measured 34b): report a timeout, not
@@ -2579,6 +2628,14 @@ PY
     fi
     rm -f "$raw_tmp"
   fi
+  # One writer at a time from here, as in resolve_models_openai.
+  models_lock opencode "the catalog" || { echo "opencode -> could not write $MODELS_FILE"; return 1; }
+  if [ ! -f "$MODELS_FILE" ]; then
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  elif ! "$JQ" -e . "$MODELS_FILE" >/dev/null 2>&1; then
+    echo "models.json was not valid JSON — reseeded"
+    echo '{"resolved":{}}' > "$MODELS_FILE"
+  fi
   # A refresh that failed -- no opencode, an empty list -- must not replace a
   # catalog that still resolves real jobs: keep the block it had, stamped
   # with when and why, exactly as resolve_models_openai does; `platform
@@ -2587,21 +2644,13 @@ PY
   # nothing to keep.
   if opencode_catalog_available && printf '%s' "$block" | "$JQ" -e '.available == false' >/dev/null 2>&1; then
     kept="$(printf '%s' "$block" | "$JQ" -r .reason)"
-    if ! { "$JQ" --argjson at "$(now_epoch)" --arg r "$kept" '.opencode.stale_at = $at | .opencode.stale_reason = $r' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
-      rm -f "$tmp"
-      echo "opencode -> could not write $MODELS_FILE"
-      return 1
-    fi
-    rm -f "$tmp"
-    echo "opencode -> kept the previous catalog ($kept)"
-    return 0
+    _models_rmw --argjson at "$(now_epoch)" --arg r "$kept" '.opencode.stale_at = $at | .opencode.stale_reason = $r' || wrc=1
+  else
+    _models_rmw --argjson b "$block" '.opencode = $b' || wrc=1
   fi
-  if ! { "$JQ" --argjson b "$block" '.opencode = $b' "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE"; }; then
-    rm -f "$tmp"
-    echo "opencode -> could not write $MODELS_FILE"
-    return 1
-  fi
-  rm -f "$tmp"
+  models_unlock
+  if [ "$wrc" -ne 0 ]; then echo "opencode -> could not write $MODELS_FILE"; return 1; fi
+  if [ -n "$kept" ]; then echo "opencode -> kept the previous catalog ($kept)"; return 0; fi
   if opencode_catalog_available; then
     echo "opencode -> $(opencode_catalog_visible | tr '\n' ' ')(opencode models --verbose)"
   else
@@ -3972,14 +4021,11 @@ models_cache_get() { # models_cache_get <family> -> cached id while fresh (MODEL
 }
 
 models_cache_set() { # models_cache_set <family> <id> [<newer id> <needs> <installed> <cli>] -- a finished pass: the family's whole entry is replaced
-  local tmp; tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")"
-  [ -f "$MODELS_FILE" ] || echo '{"resolved":{}}' > "$MODELS_FILE"
   # A .resolved that is not an object (a hand edit) is started over: nothing
   # could be written into it, and it would keep models_stale due for ever.
-  "$JQ" --arg f "$1" --arg id "$2" --arg nid "${3:-}" --arg needs "${4:-}" --arg inst "${5:-}" --arg cli "${6:-}" --argjson at "$(now_epoch)" '
+  models_write "$1" "$2" --arg f "$1" --arg id "$2" --arg nid "${3:-}" --arg needs "${4:-}" --arg inst "${5:-}" --arg cli "${6:-}" --argjson at "$(now_epoch)" '
     .resolved |= (if type == "object" then . else {} end)
-    | .resolved[$f] = ({id:$id, at:$at} + (if $nid == "" then {} else {newer:{id:$nid, needs:$needs, installed:$inst, cli:$cli, at:$at}} end))' \
-    "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE" || rm -f "$tmp"
+    | .resolved[$f] = ({id:$id, at:$at} + (if $nid == "" then {} else {newer:{id:$nid, needs:$needs, installed:$inst, cli:$cli, at:$at}} end))'
 }
 
 # A pass cut short is never written as fresh: .at stays what the last finished
@@ -3989,19 +4035,17 @@ models_cache_set() { # models_cache_set <family> <id> [<newer id> <needs> <insta
 # brings back is often the one that fails), never below what a finished pass
 # already found. A release met before the cut is noted too: the 400 was a real
 # answer. Prints "<id> <seconds until the retry>", <retry> being the one the
-# tick applies (models_stale).
+# tick applies (models_stale) -- and nothing when nothing was written, so the
+# caller runs on the id its own pass found.
 models_cache_fail() { # models_cache_fail <family> <best id found> <why> <retry> [<newer id> <needs> <installed> <cli>] -> "<id> <seconds>"
-  local tmp; tmp="$(mktemp "$CONFIG_DIR/.models.XXXXXX")"
-  [ -f "$MODELS_FILE" ] || echo '{"resolved":{}}' > "$MODELS_FILE"
-  "$JQ" --arg f "$1" --arg id "$2" --arg why "$3" --arg nid "${5:-}" --arg needs "${6:-}" --arg inst "${7:-}" --arg cli "${8:-}" \
+  models_write "$1" "the failed probe" --arg f "$1" --arg id "$2" --arg why "$3" --arg nid "${5:-}" --arg needs "${6:-}" --arg inst "${7:-}" --arg cli "${8:-}" \
         --argjson now "$(now_epoch)" "$CLAUDE_ID_JQ"'
     .resolved |= (if type == "object" then . else {} end)
     | .resolved[$f] = ((.resolved[$f] | if type == "object" then . else {} end)
         | .id = ([.id, $id] | map(select(type == "string" and . != "")) | sort_by(newest_first) | .[0] // $id)
         | .at = (.at | if type == "number" then . else 0 end) | .failed_at = $now | .failed = $why
         | .failures = ((.failures | if type == "number" then . else 0 end) + 1)
-        | if $nid == "" then . else .newer = {id:$nid, needs:$needs, installed:$inst, cli:$cli, at:$now} end)' \
-    "$MODELS_FILE" > "$tmp" && mv "$tmp" "$MODELS_FILE" || rm -f "$tmp"
+        | if $nid == "" then . else .newer = {id:$nid, needs:$needs, installed:$inst, cli:$cli, at:$now} end)' || return 1
   "$JQ" -r --arg f "$1" --argjson now "$(now_epoch)" --argjson ttl "$MODELS_TTL" --argjson retry "$4" "$MODELS_FRESH_JQ"'
     .resolved[$f] | objects | select(.id | type == "string") | "\(.id) \(fresh_until($ttl; $retry) - $now | floor)"' "$MODELS_FILE" 2>/dev/null
 }
