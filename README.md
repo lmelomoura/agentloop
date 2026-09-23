@@ -1532,11 +1532,13 @@ was last seen and the decision — and the skill tells the agent to re-report
 the same flaw in the same place under that fingerprint, so the decision
 applies instead of the finding coming back as `new`. Semgrep's rows are left
 out: their identity comes from Semgrep's own check id and does not drift. A
-fold is held to the entry's rule — the door refuses one that changes it,
-since the rule is part of the identity — and the agent's final summary lists
-every fold, where it found it and whether its reading agrees with the
-decision's reason: a finding that takes an old ruling the moment it lands is
-otherwise invisible.
+decided finding keeps its identity at the door — `report-finding` refuses
+any report that lands on a decided fingerprint under another category or
+rule, whether a fold, a second report re-labelling one, or a carried-over
+row, since both are what the ruling was made about — and the agent's final
+summary lists every fold, where it found it and whether its reading agrees
+with the decision's reason: a finding that takes an old ruling the moment it
+lands is otherwise invisible.
 
 ### A secret's value is never stored, and never shown
 

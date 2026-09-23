@@ -105,11 +105,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   under that fingerprint. Semgrep's rows are left out: their identity is
   deterministic and does not drift. The list is built from the checklist the
   verb has already read, not from a second reading of it on a connection
-  that does not memoise one. A fold is held to the entry's rule —
-  `report-finding` refuses one that changes it — and the agent's final
-  summary lists every fold, with where it was found and whether the reading
-  agrees with the decision's reason. The checklist prints `decided_sast`
-  ahead of the findings, so an output cut for length keeps it.
+  that does not memoise one. A decided finding keeps its category and rule
+  at the door — `report-finding` refuses any report that lands on a decided
+  fingerprint under others, a fold, a re-labelled fold or a carried-over row
+  alike — and the agent's final summary lists every fold, with where it was
+  found and whether the reading agrees with the decision's reason. The
+  checklist prints `decided_sast` ahead of the findings, so an output cut
+  for length keeps it.
 
 - **A job with no schedule window is launched by the tick again.** The
   tick's plan was one tab-separated line per enabled job, read back with

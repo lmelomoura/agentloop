@@ -1692,34 +1692,49 @@ def _candidate_requirements(conn, analysis_id, payload):
     return (["confidence"] if triage else []), category == "dependency"
 
 
-def _decided_fold_refusal(conn, analysis_id, payload) -> str:
-    """Why this `sast` payload may not land on the fingerprint it names --
-    '' when it may.
+def _decided_identity_refusal(conn, analysis_id, payload) -> str:
+    """Why this payload may not land on the fingerprint it names -- '' when
+    it may.
 
-    A fold into a `decided_sast` entry (SKILL.md, Job 3) turns the agent's
-    finding into the operator's `accepted`/`false_positive` the moment it
-    lands: hidden by default, out of the posture, out of the triage count.
-    That is right for the same flaw in the same place, and a way to hide a
-    different flaw under an old ruling when it is not. The rule is part of
-    the identity being reused -- the fingerprint was minted from it -- so a
-    fold that changes the rule is not the same flaw by construction, and is
-    refused. One query decides the common case: a fingerprint nobody ruled on
-    never reaches `decided_sast` at all.
+    A DECIDED FINDING KEEPS ITS IDENTITY AT THE DOOR. A fingerprint the
+    operator ruled on takes that ruling wherever it lands: accepted or
+    false_positive, hidden by default, out of the posture and the triage
+    count. The ruling was made about a finding of one category under one
+    rule -- both are inputs to its fingerprint -- so a report landing on it
+    under another category or rule is a different flaw taking an old
+    ruling, whichever way it arrives: a fold into a `decided_sast` entry
+    (SKILL.md, Job 3), a second report re-labelling a fold that already
+    landed, or a carried-over decided row re-labelled. The first version of
+    this check held only the first of those, and only for `sast`.
+
+    The comparison is with the fingerprint's own RECORD -- this analysis's
+    row when it holds one, otherwise the newest record the project has, in
+    any analysis -- never with anything the payload says. One query decides
+    the common case: a fingerprint nobody ruled on is held to nothing here,
+    exactly as before this door existed. A decided fingerprint with no
+    record at all has nothing to compare with and is let through; the agent
+    cannot target one without inventing its 64 hex digits.
     """
-    analysis = _analysis(conn, analysis_id)
+    project = _analysis(conn, analysis_id)["project"]
     if conn.execute("SELECT 1 FROM decision WHERE project=? AND fingerprint=?",
-                    (analysis["project"], payload["fingerprint"])).fetchone() is None:
+                    (project, payload["fingerprint"])).fetchone() is None:
         return ""
-    entry = next((e for e in queries.decided_sast(conn, analysis_id)
-                  if e["fingerprint"] == payload["fingerprint"]), None)
-    if entry is None or entry["rule"] == payload["rule"]:
+    held = conn.execute(
+        "SELECT f.category, f.rule FROM finding f"
+        " JOIN analysis a ON a.id = f.analysis_id"
+        " WHERE f.fingerprint=? AND a.project=?"
+        " ORDER BY (f.analysis_id = ?) DESC, a.id DESC LIMIT 1",
+        (payload["fingerprint"], project, analysis_id)).fetchone()
+    if held is None or (held["category"], held["rule"]) == (payload["category"], payload["rule"]):
         return ""
-    return (f"report-finding: {payload['fingerprint'][:12]}… is a decided_sast "
-            f"entry recorded under rule {entry['rule']!r}, and this report says "
-            f"{payload['rule']!r}. A fold is the same flaw in the same place, and "
-            "the rule is part of what makes it the same: re-report it under the "
-            "entry's own rule, or, if what you found is a different flaw, mint its "
-            "own fingerprint with `fingerprint --snippet`. Nothing was recorded")
+    return (f"report-finding: {payload['fingerprint'][:12]}… carries an operator "
+            f"decision, taken on a {held['category']} finding under rule "
+            f"{held['rule']!r}, and this report says {payload['category']} / "
+            f"{payload['rule']!r}. A decided finding keeps its category and rule "
+            "-- both are part of its identity, and the ruling was made about "
+            "them: re-report it under the recorded ones, or, if what you found "
+            "is a different flaw, mint its own fingerprint with `fingerprint "
+            "--snippet`. Nothing was recorded")
 
 
 def cmd_report_finding(args):
@@ -1875,10 +1890,9 @@ def cmd_report_finding(args):
                  "at all")
     conn = _conn(args)
     _running(conn, args.analysis)
-    if payload["category"] == "sast":
-        refusal = _decided_fold_refusal(conn, args.analysis, payload)
-        if refusal:
-            sys.exit(refusal)
+    refusal = _decided_identity_refusal(conn, args.analysis, payload)
+    if refusal:
+        sys.exit(refusal)
     # THE CANDIDATE, after every text field above has been through the same
     # gates -- so a rationale that quotes a key is still refused as
     # `rationale`, never as a missing candidate -- and before the producer is

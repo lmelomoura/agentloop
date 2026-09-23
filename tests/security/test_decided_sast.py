@@ -193,3 +193,5 @@ def test_the_skill_carries_the_rule_across_and_puts_every_fold_in_the_summary():
     assert summary, "SKILL.md no longer asks for a final summary this test can read"
     assert "`decided_sast`" in summary[0] and "file:line" in summary[0], \
         "the final summary must list every fold and where it was found"
+    assert "agrees" in summary[0], \
+        "the final summary must ask whether the reading agrees with the decision's reason"

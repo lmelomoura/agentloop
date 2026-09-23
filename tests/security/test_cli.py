@@ -855,7 +855,26 @@ def test_the_checklist_hands_the_agent_the_sast_decided_on_another_branch(tmp_pa
         "beside the checklist, never inside it"
 
 
-def test_a_fold_into_a_decided_sast_under_another_rule_is_refused(tmp_path):
+def _decided_carried_over(db, tmp_path, fp, rule="broken-access-control"):
+    """An agent `sast` on main, finished, accepted by the operator -- and a
+    SECOND prepared analysis of the same branch, where nobody has re-reported
+    the fingerprint yet and the checklist carries the decided row over from
+    its baseline (`diff.classify`'s `previous`-only loop). Returns the second
+    analysis's id."""
+    first = prepared_analysis(db, tmp_path, branch="main", run_id="r1")
+    run(db, "report-finding", "--analysis", str(first), stdin=json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": rule,
+        "severity": "low", "title": "the drawer proxies any candidate",
+        "rationale": "any id reaches the upstream", "remediation": "scope the id",
+        "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 54}]}))
+    run(db, "finish", "--analysis", str(first), "--state", "done")
+    run(db, "decide", "--project", "web", "--fingerprint", fp, "--state", "accepted",
+        "--reason", "product decision RP-217", "--by", "me")
+    return prepared_analysis(db, tmp_path, branch="main", run_id="r2")
+
+
+def test_a_decided_fingerprint_is_refused_under_another_rule(tmp_path):
     """A fold turns the agent's finding into the operator's ruling the moment
     it lands. The rule is part of the identity being reused, so a fold that
     changes it is a different flaw hidden under an old decision -- refused,
@@ -865,9 +884,64 @@ def test_a_fold_into_a_decided_sast_under_another_rule_is_refused(tmp_path):
     main = _decided_on_develop(db, tmp_path, fp)
     out = fails(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "xss"))
     assert out.returncode != 0
+    assert "carries an operator decision" in out.stderr
     assert "broken-access-control" in out.stderr and "xss" in out.stderr
     listed = run(db, "checklist", "--analysis", str(main))
     assert all(f["fingerprint"] != fp for f in listed["findings"]), "nothing was recorded"
+
+
+def test_a_decided_fingerprint_is_refused_under_another_category(tmp_path):
+    """The old guard ran only for `category == "sast"`, so the same decided
+    fingerprint reported under a DIFFERENT CATEGORY altogether -- not merely
+    a different rule -- reached the ledger untouched and took the operator's
+    ruling (R2)."""
+    db = tmp_path / "security.db"
+    fp = "c" * 64
+    main = _decided_on_develop(db, tmp_path, fp)
+    out = fails(db, "report-finding", "--analysis", str(main), stdin=json.dumps({
+        "fingerprint": fp, "category": "hygiene", "rule": "xss",
+        "severity": "low", "title": "unrelated hygiene finding"}))
+    assert out.returncode != 0
+    assert "carries an operator decision" in out.stderr
+    listed = run(db, "checklist", "--analysis", str(main))
+    assert all(f["fingerprint"] != fp for f in listed["findings"]), "nothing was recorded"
+
+
+def test_a_fold_that_landed_cannot_be_relabelled_by_a_second_report(tmp_path):
+    """A fold takes the decision the moment it lands, so the fingerprint is
+    now on THIS analysis's own checklist and `decided_sast` stops listing
+    it -- which the old guard's `entry is None` branch read as nothing left
+    to check, letting a second report relabel the very row it had just
+    accepted (R3)."""
+    db = tmp_path / "security.db"
+    fp = "c" * 64
+    main = _decided_on_develop(db, tmp_path, fp)
+    run(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "broken-access-control"))
+    out = fails(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "xss"))
+    assert out.returncode != 0
+    assert "carries an operator decision" in out.stderr
+    listed = run(db, "checklist", "--analysis", str(main))
+    (row,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert row["rule"] == "broken-access-control"
+    assert row["state"] == "accepted"
+
+
+def test_a_carried_over_decided_row_cannot_be_relabelled(tmp_path):
+    """`decided_sast` excludes what the checklist already carries over from
+    its own baseline, exactly as it excludes a fold just landed -- so a
+    decided row surviving from a PRIOR analysis of the SAME branch was just
+    as invisible to the old guard, and just as reachable by a second report
+    under another rule (R4)."""
+    db = tmp_path / "security.db"
+    fp = "e" * 64
+    second = _decided_carried_over(db, tmp_path, fp)
+    out = fails(db, "report-finding", "--analysis", str(second), stdin=_fold(fp, "xss"))
+    assert out.returncode != 0
+    assert "carries an operator decision" in out.stderr
+    listed = run(db, "checklist", "--analysis", str(second))
+    (row,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert row["rule"] == "broken-access-control"
+    assert row["state"] == "accepted"
 
 
 def test_a_fold_under_the_entrys_own_rule_takes_the_decision(tmp_path):
@@ -879,6 +953,51 @@ def test_a_fold_under_the_entrys_own_rule_takes_the_decision(tmp_path):
     (row,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
     assert row["state"] == "accepted"
     assert listed["decided_sast"] == [], "folded: the checklist lists it now"
+
+
+def test_a_carried_over_decided_row_re_reported_under_its_own_rule_is_accepted(tmp_path):
+    """Job 1's "still present, as reported" path: re-finding a carried-over
+    decided row under its OWN rule, with a narrower occurrence list, is a
+    legitimate confirmation and must stay accepted -- the nearest case the
+    widened door must not swallow."""
+    db = tmp_path / "security.db"
+    fp = "e" * 64
+    second = _decided_carried_over(db, tmp_path, fp)
+    run(db, "report-finding", "--analysis", str(second), stdin=json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": "broken-access-control",
+        "severity": "low", "title": "the drawer proxies any candidate, still",
+        "rationale": "re-read on main: the id is still unscoped",
+        "remediation": "scope the id", "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 61}]}))
+    listed = run(db, "checklist", "--analysis", str(second))
+    (row,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert row["state"] == "accepted"
+    assert row["occurrences"] == [{"file": "app/queue.php", "line": 61, "snippet_hash": ""}]
+
+
+def test_a_decided_row_of_another_category_echoed_under_its_own_identity_is_accepted(tmp_path):
+    """The containment probe for widening the door to every category: a
+    decided `hygiene` finding, re-reported on another branch under its OWN
+    category and rule, must stay accepted -- the door compares identity, and
+    an unchanged identity is not a route it exists to close."""
+    db = tmp_path / "security.db"
+    fp = "f" * 64
+    hygiene_payload = {
+        "fingerprint": fp, "category": "hygiene", "rule": "missing_gitignore",
+        "severity": "info", "title": "no .gitignore",
+        "rationale": "nothing stops the first .env from being committed",
+        "remediation": "add a .gitignore covering .env files and key material",
+        "occurrences": [{"file": ".gitignore", "line": 0}]}
+    dev = prepared_analysis(db, tmp_path, branch="develop", run_id="r-dev")
+    run(db, "report-finding", "--analysis", str(dev), stdin=json.dumps(hygiene_payload))
+    run(db, "finish", "--analysis", str(dev), "--state", "done")
+    run(db, "decide", "--project", "web", "--fingerprint", fp, "--state", "false_positive",
+        "--reason", "the operator will add one before the next release", "--by", "me")
+    main = prepared_analysis(db, tmp_path, branch="main", run_id="r-main")
+    run(db, "report-finding", "--analysis", str(main), stdin=json.dumps(hygiene_payload))
+    listed = run(db, "checklist", "--analysis", str(main))
+    (row,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert row["state"] == "false_positive"
 
 
 def test_a_sast_nobody_ruled_on_is_held_to_no_rule(tmp_path):
