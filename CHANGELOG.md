@@ -103,7 +103,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   title, occurrences, where it was last seen and the decision — and the
   skill's Job 3 tells the agent to re-report the same flaw in the same place
   under that fingerprint. Semgrep's rows are left out: their identity is
-  deterministic and does not drift.
+  deterministic and does not drift. The list is built from the checklist the
+  verb has already read, not from a second reading of it on a connection
+  that does not memoise one.
 
 - **A job with no schedule window is launched by the tick again.** The
   tick's plan was one tab-separated line per enabled job, read back with
