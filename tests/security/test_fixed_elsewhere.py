@@ -54,6 +54,11 @@ def _analysis(db, tmp_path, branch, commit, findings, repo="web", project="web")
                    "candidate": SAST_CANDIDATE,
                    "occurrences": [{"file": "app/x.py", "line": 1}]}
         _run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
+        # Verified, because since block 4.2 an unverified `sast` finding lowers
+        # the close to `capped` -- and a fixture whose whole point is a
+        # finished `done` analysis must not trip over a guard it is not about.
+        _run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", fp,
+             stdin=json.dumps({"verdict": "confirmed", "reason": "read it end to end"}))
     _run(db, "finish", "--analysis", str(aid), "--state", "done")
     return aid
 
