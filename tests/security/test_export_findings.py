@@ -141,3 +141,20 @@ def test_the_header_reports_what_the_screen_was_showing_when_asked(tmp_path):
     # and without the flag it still says the filters were not applied
     plain = _run(db, "export-findings", "--project", "web", "--format", "md").stdout
     assert "carries everything recorded" in plain
+
+
+def test_the_document_stays_one_row_per_branch(tmp_path):
+    # The screen groups a finding on two branches into one row; this document
+    # does not -- a fix is applied on a branch, and each branch's section has
+    # to list what there is to fix on it.
+    db = tmp_path / "l.db"
+    a1 = _prepared(db, tmp_path, "web", "main", "1111111111111111")
+    _finding(db, a1, "f" * 64, title="on both")
+    _close(db, a1)
+    a2 = _prepared(db, tmp_path, "web", "develop", "2222222222222222")
+    _finding(db, a2, "f" * 64, title="on both")
+    _close(db, a2)
+    doc = json.loads(_run(db, "export-findings", "--project", "web",
+                          "--format", "json").stdout)
+    on = {b["branch"]: [f["fingerprint"] for f in b["open"]] for b in doc["branches"]}
+    assert on == {"develop": ["f" * 64], "main": ["f" * 64]}

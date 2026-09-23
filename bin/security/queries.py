@@ -1022,12 +1022,92 @@ def first_seen_map(conn, project):
         " AND a.state IN ('done','capped') GROUP BY f.fingerprint", (project,))}
 
 
+# The order a grouped row's state is chosen in -- see `_group_by_fingerprint`.
+# The first state any branch holds wins: open anywhere outranks a decision,
+# and a decision outranks `fixed`, so a finding reads `fixed` only once every
+# branch it is on says so -- the "open on one branch is still exposure" rule
+# `_open_findings_by_fingerprint` already gives the donut. A decision is
+# recorded per project, so decided and open states never meet in one group;
+# the two real contests are open-versus-fixed and decided-versus-fixed, and
+# this order settles both. Among the open states `regressed` leads: fixed
+# once and back is the worst news the checklist can give.
+GROUP_STATE_ORDER = ("regressed", "new", "open", "partial", "pending",
+                     "accepted", "false_positive", "fixed")
+
+
+def _search_text(row) -> str:
+    """What the `q` filter searches in one finding row, lower-cased: title,
+    rule, rationale, every occurrence's file, and the candidate's own prose
+    -- a trace step's sentence, the intended control, a reason."""
+    return " ".join([
+        row.get("title", ""), row.get("rule", ""), row.get("rationale", ""),
+        " ".join(o["file"] for o in row.get("occurrences", [])),
+        candidate.search_text(row.get("candidate"))]).lower()
+
+
+def _group_by_fingerprint(rows, started):
+    """One row per fingerprint out of `finding_rows`'s per-branch rows.
+
+    THE ROW IS ITS REPRESENTATIVE'S ROW: among the branches holding the
+    group's state (GROUP_STATE_ORDER), the newest reading -- `started` maps
+    each branch's latest analysis id to its `started`, the id breaking a tie.
+    Its title, occurrences, candidate, analysis and branch all describe the
+    one reading that decides the Status, never a patchwork of two branches.
+
+    TWO FIELDS ARE THE GROUP'S OWN. `severity` is the worst of the open
+    members, or of all of them when none is open -- the donut's rule
+    (`_open_findings_by_fingerprint`), so the strip and the donut cannot
+    disagree about one finding. `branches` lists every member's branch,
+    analysis, state and severity, by branch name: the screen says there what
+    each branch reads when they disagree.
+
+    `_members` rides along for the `path` and `q` filters, which keep a group
+    when ANY member matches -- a file can move on one branch and not on the
+    other -- and is dropped before a row leaves `finding_rows`.
+    """
+    rank = {s: i for i, s in enumerate(GROUP_STATE_ORDER)}
+    by_fp = {}
+    for r in rows:
+        by_fp.setdefault(r["fingerprint"], []).append(r)
+    out = []
+    for members in by_fp.values():
+        state = min((m["state"] for m in members),
+                    key=lambda s: rank.get(s, len(GROUP_STATE_ORDER)))
+        rep = max((m for m in members if m["state"] == state),
+                  key=lambda m: (started.get(m["analysis_id"], 0), m["analysis_id"]))
+        pool = [m for m in members if is_open(m["state"])] or members
+        row = dict(rep)
+        row["severity"] = min((m["severity"] for m in pool),
+                              key=lambda s: _SEV_RANK.get(s, 9))
+        row["branches"] = [{"branch": m["branch"], "analysis_id": m["analysis_id"],
+                            "state": m["state"], "severity": m["severity"]}
+                           for m in sorted(members, key=lambda m: m["branch"])]
+        row["_members"] = members
+        out.append(row)
+    return out
+
+
 def finding_rows(conn, project, filters=None, sort="severity",
-                 direction="desc", page=1, per_page=25, repo_paths=None):
+                 direction="desc", page=1, per_page=25, repo_paths=None,
+                 group=True):
     """The findings browser: one checklist per branch -- the latest finished
-    analysis of each -- unioned. That union is what lets the browser show a
-    state at all: it is the state that branch's newest analysis gives the
-    finding, not a column stored anywhere.
+    analysis of each -- unioned, and then, unless `group` is off, ONE ROW PER
+    FINDING. That union is what lets the browser show a state at all: it is
+    the state a branch's newest analysis gives the finding, not a column
+    stored anywhere.
+
+    ONE ROW PER FINDING, because a decision is recorded against the project
+    (`decision`, ledger._SCHEMA) and a list with one row per branch put every
+    finding the operator had already ruled on back in front of them, as a
+    second row, each time another branch was analysed -- measured on one
+    project (2026-09-23): 46 secrets on develop and main, every one decided,
+    every one listed twice. `_group_by_fingerprint` builds the rows and says
+    which branch's reading each field comes from. The `branch` and `analysis`
+    filters pick which branches are grouped at all, BEFORE the grouping;
+    every other filter reads the grouped row. `group=False` is the union as
+    it was, one row per finding per branch, and is what `cmd_export_findings`
+    asks for: its document is organised by branch on purpose, because a fix
+    is applied on a branch.
 
     Filtering happens here in Python, after `checklist()`, rather than as SQL
     predicates. That is deliberate, not laziness: a finding's state is not a
@@ -1145,6 +1225,21 @@ def finding_rows(conn, project, filters=None, sort="severity",
         # reach `rows` at all.
         r["first_seen"] = first_seen.get(r["fingerprint"], 0)
 
+    # WHICH BRANCHES' READINGS, chosen BEFORE anything is grouped: "Branch:
+    # main" asks for the finding as main reads it, and a filter applied after
+    # the grouping would put main's name on a row whose state develop
+    # decided. A branch holds one row per fingerprint, so under either of
+    # these two the grouping below changes nothing -- and with `group` off,
+    # running them ahead of the others changes nothing either: every filter
+    # here is a predicate on a row, and predicates commute.
+    if f.get("branch"):
+        rows = [r for r in rows if r["branch"] in f["branch"]]
+    if f.get("analysis"):
+        rows = [r for r in rows if r["analysis_id"] in f["analysis"]]
+    if group:
+        rows = _group_by_fingerprint(
+            rows, {a["id"]: a["started"] for a in analyses_available})
+
     # `show_resolved` off hides resolved findings BY DEFAULT -- it is a
     # convenience, not a veto. A Status filter that names a resolved state is
     # an explicit request for exactly those rows, and used to lose to this
@@ -1152,10 +1247,12 @@ def finding_rows(conn, project, filters=None, sort="severity",
     # was applied to what was left, which by construction held no fixed row.
     # Status: Fixed showed "No findings match these filters" on a project with
     # dozens of them. A state the operator asked for by name passes the gate.
+    # On a grouped row the state is the group's, so the gate hides a finding
+    # only when it is resolved on every branch it is on.
     asked_for = set(f.get("state") or ())
     if not f.get("show_resolved"):
         rows = [r for r in rows if is_open(r["state"]) or r["state"] in asked_for]
-    for key in ("severity", "state", "category", "branch", "confidence"):
+    for key in ("severity", "state", "category", "confidence"):
         if f.get(key):
             rows = [r for r in rows if r.get(key) in f[key]]
     if f.get("fingerprint"):
@@ -1166,20 +1263,20 @@ def finding_rows(conn, project, filters=None, sort="severity",
         # 64-character string.
         needle = f["fingerprint"]
         rows = [r for r in rows if r["fingerprint"].startswith(needle)]
-    if f.get("analysis"):
-        rows = [r for r in rows if r["analysis_id"] in f["analysis"]]
+    # `path` and `q` keep a group when ANY of its branches matches: a file can
+    # move on one branch and not on the other, and the finding is still the
+    # one being looked for. With `group` off there is no `_members`, and the
+    # row is its own only member.
     if f.get("path"):
         needle = f["path"].lower()
         rows = [r for r in rows
-                if any(needle in o["file"].lower() for o in r.get("occurrences", []))]
+                if any(needle in o["file"].lower()
+                       for m in r.get("_members") or [r]
+                       for o in m.get("occurrences", []))]
     if f.get("q"):
         needle = f["q"].lower()
-        rows = [r for r in rows if needle in " ".join([
-            r.get("title", ""), r.get("rule", ""), r.get("rationale", ""),
-            " ".join(o["file"] for o in r.get("occurrences", [])),
-            # The candidate's own prose -- a trace step's sentence, the
-            # intended control, a reason -- is searchable text too.
-            candidate.search_text(r.get("candidate"))]).lower()]
+        rows = [r for r in rows
+                if any(needle in _search_text(m) for m in r.get("_members") or [r])]
 
     by_severity = {s: 0 for s in _SEV_RANK}
     # A FIXED finding below the floor is exempted from being hidden by
@@ -1236,7 +1333,12 @@ def finding_rows(conn, project, filters=None, sort="severity",
     # function did not already have in hand, and it is a single EXISTS.
     attempted = conn.execute(
         "SELECT 1 FROM analysis WHERE project=? LIMIT 1", (project,)).fetchone()
-    return {"rows": rows[start:start + per_page], "total": total,
+    # `_members` is the grouping's working state, never payload: every member
+    # is already summarised in `branches`, and shipping them would send each
+    # finding's whole text once per branch it is on.
+    served = [{k: v for k, v in r.items() if k != "_members"}
+              for r in rows[start:start + per_page]]
+    return {"rows": served, "total": total,
             "unique": unique, "by_severity": by_severity,
             "fixed_by_severity": fixed_by_severity,
             "attempted": attempted is not None, "analysed": bool(branches),

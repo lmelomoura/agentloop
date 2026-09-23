@@ -69,6 +69,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A finding on several branches is one row in the findings browser, and a
+  decision no longer seems to come undone when another branch is analysed.**
+  `queries.finding_rows` united one checklist per branch, so a finding on
+  `develop` and on `main` was two rows — and every finding the operator had
+  already ruled on came back in front of them, as a second row, each time the
+  other branch was analysed: on one project, 46 secrets decided once and
+  listed twice. The decisions were never lost (they are recorded against the
+  project); the rows were duplicated. The browser now groups by fingerprint:
+  one row, whose state is the reading that needs attention first across the
+  branches (open anywhere, then a decision, then `fixed` only once every
+  branch says so), whose severity is the worst open reading — the donut's
+  rule — and which lists each branch's analysis, state and severity in
+  `branches`. The `branch` and `analysis` filters choose which branches are
+  grouped at all; every other filter reads the grouped row. The consolidated
+  export stays one row per branch (`group=False`), and its header now
+  measures the count the screen was showing against distinct open findings,
+  not rows.
+
 - **A job with no schedule window is launched by the tick again.** The
   tick's plan was one tab-separated line per enabled job, read back with
   `IFS=tab` -- and a tab is IFS whitespace, which bash folds: a run of it

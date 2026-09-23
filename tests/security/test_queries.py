@@ -1210,9 +1210,10 @@ def test_fixed_by_severity_lets_the_hidden_count_exempt_a_fixed_finding(conn):
     assert got["fixed_by_severity"]["high"] == 0, "the still-open high finding must not"
 
 
-def test_unique_counts_fingerprints_not_rows(conn):
-    """189 findings across branches can be 93 problems. The two numbers answer
-    different questions and the screen shows both."""
+def test_group_off_is_one_row_per_branch_as_it_was(conn):
+    """`group=False` is the union one row per finding per branch -- what the
+    consolidated export reads, because a fix is applied on a branch. Two rows
+    and one fingerprint there; one of each on the screen."""
     fp = "d" * 64
     for br in ("main", "develop"):
         aid = ledger.start_analysis(conn, "web", "web", br, "s", "quick", "r")
@@ -1221,9 +1222,153 @@ def test_unique_counts_fingerprints_not_rows(conn):
             "severity": "critical", "title": "t", "occurrences": []})
         ledger.mark_prepared(conn, aid)
         ledger.finish_analysis(conn, aid, "done")
+    per_branch = queries.finding_rows(conn, "web", group=False)
+    assert per_branch["total"] == 2 and per_branch["unique"] == 1
+    assert all("branches" not in r for r in per_branch["rows"])
+    grouped = queries.finding_rows(conn, "web")
+    assert grouped["total"] == 1 and grouped["unique"] == 1
+
+
+def _on(conn, branch, fp=None, severity="critical", title="t", file="k.py"):
+    """One finished analysis of `branch` holding `fp` -- or nothing, which is
+    how a finding the branch held last time becomes `fixed` there: its minter
+    is deterministic (no producer, a `secret`), so `prepared` proves it gone."""
+    aid = ledger.start_analysis(conn, "web", "web", branch, "s", "quick", "r")
+    if fp:
+        ledger.record_finding(conn, aid, {
+            "fingerprint": fp, "category": "secret", "rule": "aws-access-token",
+            "severity": severity, "title": title,
+            "occurrences": [{"file": file, "line": 3, "snippet_hash": ""}]})
+    ledger.mark_prepared(conn, aid)
+    ledger.finish_analysis(conn, aid, "done")
+    return aid
+
+
+def test_one_finding_on_two_branches_is_one_row_naming_both(conn):
+    fp = "1" * 64
+    _on(conn, "main", fp)
+    _on(conn, "develop", fp)
     got = queries.finding_rows(conn, "web")
-    assert got["total"] == 2
-    assert got["unique"] == 1
+    assert got["total"] == 1 and got["unique"] == 1
+    (row,) = got["rows"]
+    assert [b["branch"] for b in row["branches"]] == ["develop", "main"]
+    assert {b["state"] for b in row["branches"]} == {"new"}
+
+
+def test_a_decision_taken_once_is_one_resolved_row_not_one_per_branch(conn):
+    """The screen the operator sent (2026-09-23): the same false positive,
+    decided once, listed under develop AND main -- which read as the decision
+    coming undone every time the other branch was analysed."""
+    fp = "2" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    ledger.set_decision(conn, "web", fp, "false_positive", "synthetic fixture", "me")
+    assert queries.finding_rows(conn, "web")["total"] == 0, \
+        "resolved on every branch: hidden by default"
+    (row,) = queries.finding_rows(conn, "web", {"state": ["false_positive"]})["rows"]
+    assert row["state"] == "false_positive"
+    assert [b["branch"] for b in row["branches"]] == ["develop", "main"]
+
+
+def test_open_on_one_branch_outranks_fixed_on_another(conn):
+    fp = "3" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    _on(conn, "main")                      # gone from main: fixed there
+    (row,) = queries.finding_rows(conn, "web")["rows"]
+    assert row["state"] == "new" and row["branch"] == "develop"
+    assert {b["branch"]: b["state"] for b in row["branches"]} == \
+        {"develop": "new", "main": "fixed"}
+
+
+def test_a_decision_outranks_fixed_and_fixed_needs_every_branch(conn):
+    fp = "4" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    _on(conn, "main")                      # fixed on main
+    ledger.set_decision(conn, "web", fp, "accepted", "tracked in RP-1", "me")
+    (row,) = queries.finding_rows(conn, "web", {"show_resolved": True})["rows"]
+    assert row["state"] == "accepted", "still on develop, and the decision covers it"
+    _on(conn, "develop")                   # and now gone from develop too
+    (row,) = queries.finding_rows(conn, "web", {"show_resolved": True})["rows"]
+    assert row["state"] == "fixed"
+
+
+def test_the_row_reads_the_newest_holder_and_the_worst_open_severity(conn):
+    fp = "5" * 64
+    older = _on(conn, "develop", fp, severity="critical", title="the older reading")
+    newer = _on(conn, "main", fp, severity="high", title="the newer reading")
+    conn.execute("UPDATE analysis SET started=100 WHERE id=?", (older,))
+    conn.execute("UPDATE analysis SET started=200 WHERE id=?", (newer,))
+    conn.commit()
+    (row,) = queries.finding_rows(conn, "web")["rows"]
+    assert row["title"] == "the newer reading" and row["analysis_id"] == newer
+    assert row["severity"] == "critical", "the donut's rule: the worst open reading"
+    assert {b["branch"]: b["severity"] for b in row["branches"]} == \
+        {"develop": "critical", "main": "high"}
+
+
+def test_the_branch_filter_reads_the_finding_as_that_branch_sees_it(conn):
+    fp = "6" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    _on(conn, "main")                      # fixed on main, still new on develop
+    got = queries.finding_rows(conn, "web", {"branch": ["main"], "show_resolved": True})
+    (row,) = got["rows"]
+    assert row["state"] == "fixed", "main's reading, not the group across branches"
+    assert [b["branch"] for b in row["branches"]] == ["main"]
+
+
+def test_a_state_filter_reads_the_group_not_one_branch(conn):
+    fp = "7" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    _on(conn, "main")                      # fixed on main, still new on develop
+    assert queries.finding_rows(conn, "web", {"state": ["fixed"]})["total"] == 0, \
+        "fixed on main but open on develop is not a fixed finding"
+    assert queries.finding_rows(conn, "web", {"state": ["new"]})["total"] == 1
+
+
+def test_path_and_q_find_a_group_through_any_branch(conn):
+    fp = "8" * 64
+    older = _on(conn, "develop", fp, file="legacy/keys.py")
+    newer = _on(conn, "main", fp, file="config/keys.py")
+    conn.execute("UPDATE analysis SET started=100 WHERE id=?", (older,))
+    conn.execute("UPDATE analysis SET started=200 WHERE id=?", (newer,))
+    conn.commit()
+    # main's reading is the row; develop's file lives only in its member
+    assert queries.finding_rows(conn, "web", {"path": "legacy/"})["total"] == 1
+    assert queries.finding_rows(conn, "web", {"q": "legacy/keys"})["total"] == 1
+    assert queries.finding_rows(conn, "web", {"path": "nowhere/"})["total"] == 0
+
+
+def test_counts_and_pages_are_of_findings_not_rows(conn):
+    fps = [c * 64 for c in "abc"]
+    for br in ("develop", "main"):
+        aid = ledger.start_analysis(conn, "web", "web", br, "s", "quick", "r")
+        for fp in fps:
+            ledger.record_finding(conn, aid, {
+                "fingerprint": fp, "category": "secret", "rule": "aws-access-token",
+                "severity": "high", "title": "t",
+                "occurrences": [{"file": "k.py", "line": 1, "snippet_hash": ""}]})
+        ledger.mark_prepared(conn, aid)
+        ledger.finish_analysis(conn, aid, "done")
+    first = queries.finding_rows(conn, "web", per_page=2, page=1)
+    second = queries.finding_rows(conn, "web", per_page=2, page=2)
+    assert first["total"] == 3 and first["unique"] == 3
+    assert first["by_severity"]["high"] == 3
+    assert len(first["rows"]) == 2 and len(second["rows"]) == 1
+    assert {r["fingerprint"] for r in first["rows"] + second["rows"]} == set(fps)
+
+
+def test_the_grouping_state_never_leaves_the_function(conn):
+    fp = "9" * 64
+    _on(conn, "develop", fp)
+    _on(conn, "main", fp)
+    (row,) = queries.finding_rows(conn, "web")["rows"]
+    assert "_members" not in row
+    assert all("_members" not in r
+               for r in queries.finding_rows(conn, "web", group=False)["rows"])
 
 
 def test_finding_rows_carries_a_findings_cwe_and_owasp_class(conn):

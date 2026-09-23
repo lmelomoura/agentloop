@@ -2465,6 +2465,11 @@ def cmd_export_findings(args):
     a second answer to the same question, which is how this repository has
     been bitten before.
 
+    The screen asks for it grouped, one row per finding; this asks for
+    `group=False` -- the same union, one row per finding per BRANCH --
+    because a fix is applied on a branch, and each branch's section has to
+    list what there is to fix on it.
+
     NO FILTERS. Not "the filters are ignored": the arguments do not exist, so
     there is no room for the question of whether they were applied. The page
     already promises a download carries every recorded finding whatever the
@@ -2492,7 +2497,7 @@ def cmd_export_findings(args):
         payload = queries.finding_rows(conn, args.project,
                                        filters={"show_resolved": True},
                                        page=page, per_page=queries.MAX_PER_PAGE,
-                                       repo_paths=repo_paths)
+                                       repo_paths=repo_paths, group=False)
         rows.extend(payload["rows"])
         if len(rows) >= payload["total"] or not payload["rows"]:
             break

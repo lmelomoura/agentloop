@@ -172,3 +172,15 @@ def test_the_json_and_html_carry_the_same_annotation():
     assert doc["branches"][0]["open"][0]["fixed_elsewhere"] == fe
     html_doc = report.consolidated_as_html("P", groups, {})
     assert "ALREADY in this branch" in html_doc
+
+
+def test_a_finding_open_on_two_branches_is_one_on_the_screen_and_the_header_says_so():
+    # The screen counts findings -- one row per fingerprint across branches --
+    # while this document lists a finding once per branch it is on. Measured
+    # against rows, a screen showing its one finding read as a screen that
+    # had hidden another.
+    rows = [_f("a" * 16, "high"), _f("a" * 16, "high", branch="main")]
+    md = report.consolidated_as_markdown("P", report._consolidated_groups(rows, META),
+                                         {"shown_on_screen": 1})
+    assert "**Findings:** 2 open (1 distinct across branches)" in md
+    assert "The screen was showing" not in md

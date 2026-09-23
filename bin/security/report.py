@@ -393,11 +393,21 @@ def _consolidated_meta_lines(project, groups, meta):
     whether to trust the list, before the list."""
     total = sum(len(g["open"]) + len(g["resolved"]) for g in groups)
     open_n = sum(len(g["open"]) for g in groups)
+    # THE SCREEN COUNTS FINDINGS, THIS DOCUMENT COUNTS ROWS. The browser shows
+    # one row per fingerprint across branches (queries.finding_rows, grouped);
+    # this document lists a finding once per branch it is on, because a fix is
+    # applied on a branch. Both numbers are said when they differ, and the
+    # screen's own count below is measured against the distinct one -- against
+    # rows, a screen showing its one finding read as a screen that had hidden
+    # another.
+    open_distinct = len({f["fingerprint"] for g in groups for f in g["open"]})
     res_n = total - open_n
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(meta.get("at") or time.time()))
     out = [f"- **Exported:** {when}",
            f"- **Branches:** {len(groups)}",
-           f"- **Findings:** {open_n} open" + (f", {res_n} resolved (listed last)" if res_n else "")]
+           f"- **Findings:** {open_n} open"
+           + (f" ({open_distinct} distinct across branches)" if open_distinct != open_n else "")
+           + (f", {res_n} resolved (listed last)" if res_n else "")]
     # THE FILTERS THE SCREEN HAD ON, SAID OUT LOUD. Someone who narrowed the
     # page to Critical and then exported gets every severity in the file; the
     # page already promises that ("Downloads always contain every recorded
@@ -428,7 +438,7 @@ def _consolidated_meta_lines(project, groups, meta):
             bits.append(f"{pending} fixed on another branch but not yet in this one")
         out.append("- **Fixed elsewhere:** " + "; ".join(bits))
     shown = meta.get("shown_on_screen")
-    if shown is not None and shown != open_n:
+    if shown is not None and shown != open_distinct:
         out.append(f"- **The screen was showing {shown} of these.** Filters and the"
                    " project's severity floor are NOT applied to this document:"
                    " it carries everything recorded.")
