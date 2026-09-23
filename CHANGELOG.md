@@ -161,6 +161,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   branch and reads where the agent was launched from the agent's own side
   (`FAKE_CWD_OUT` in `test/fake-claude`).
 
+- **Two waiters that judge the same stale lock break it once.** Breaking a
+  lock was check-then-act: two waiters that both found the owner dead — or
+  a lock with no pid abandoned, or the models.json lock too old — each
+  removed "it", and the slower one removed the lock the faster one had just
+  taken in its place, so both held it: two rewrites of the journal at once,
+  two writers of models.json, two refreshes. Reproduced every time with the
+  second waiter held right after its judgement. A lock is now judged as one
+  directory — its inode and birth, read before anything else about it — and
+  removed only while it is still that directory naming the same owner, under
+  its breaker: a hidden sibling taken by `mkdir`, so no other breaker looks
+  between that check and the removal; a breaker left by one killed mid-break
+  goes after five seconds. The same in `lock_take` (dead owner, abandoned,
+  bounded), `acquire_lock` and the server's `journal_lock`, which also counts
+  its grace for a lock with no pid per lock: a lock broken and taken again by
+  an owner still before its pid used to inherit the waiter's patience with
+  the first one, and was broken in the instant after.
+
 - **A waiter that has queued for a while no longer breaks the next holder's
   lock.** Every serialized write — the state file, the journal, port
   blocks, a resume, the tick — takes a mkdir lock and then writes its pid

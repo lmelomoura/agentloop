@@ -1211,8 +1211,44 @@ lock_abandoned() { # lock_abandoned <lockdir> — 0 = older than the grace; aske
   [ $(( now - born )) -gt "$LOCK_GRACE_SECONDS" ]
 }
 
+# The bounded wait's own measure: a lock at least <seconds> old, whoever it
+# names. LOCK_AGE carries the age read, for the caller to say.
+lock_older_than() { # lock_older_than <lockdir> <seconds> — 0 = at least that old
+  local now born
+  now="$(now_epoch)"; born="$(num "$(stat -f %m "$1" 2>/dev/null)" "$now")"
+  LOCK_AGE=$(( now - born ))
+  [ "$LOCK_AGE" -ge "$2" ]
+}
+
+# Breaking a lock is check-then-act. Two waiters that judged the same stale
+# lock each removed "it", and the slower one removed the lock the faster one
+# had just taken in its place: both then held it -- two rewrites of the
+# journal, two writers of models.json, two refreshes at once. So a lock is
+# judged as ONE directory: which one (lock_id) travels with the judgement, and
+# lock_break removes it only while it is still that directory naming the same
+# owner, under the lock's breaker -- a hidden sibling taken by mkdir, so no
+# other breaker looks between that check and the rm. The server's
+# journal_lock takes the same breaker by the same name. A breaker lives for a
+# stat, a cat and an rm; one older than LOCK_BREAKER_STALE seconds was left by
+# a breaker killed there, and goes.
+LOCK_BREAKER_STALE=5
+lock_id() { stat -f '%i:%B' "$1" 2>/dev/null; }   # inode and birth: a directory made again never reads the same
+lock_break() { # lock_break <lockdir> <lock_id> <pid it named, empty for none> — 0 = the lock is gone
+  local d="$1" b="${1%/*}/.${1##*/}.break" now born
+  if mkdir "$b" 2>/dev/null; then
+    if [ -n "$2" ] && [ "$(lock_id "$d")" = "$2" ] && [ "$(cat "$d/pid" 2>/dev/null || true)" = "$3" ]; then
+      rm -rf "$d" 2>/dev/null
+    fi
+    rmdir "$b" 2>/dev/null
+  else
+    now="$(now_epoch)"; born="$(num "$(stat -f %m "$b" 2>/dev/null)" "$now")"
+    [ $(( now - born )) -le "$LOCK_BREAKER_STALE" ] || rmdir "$b" 2>/dev/null
+  fi
+  [ ! -e "$d" ]
+}
+
 lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with <seconds>, for a lock only ever held a moment: gives up (1) once they have passed
-  local d="${1:-}" hold deadline="" stale="" aged="" now born
+  local d="${1:-}" hold deadline="" stale="" aged="" lid
   # A bound counts on the shell's own clock, in whole seconds and with no
   # fork; the extra second makes the wait at least <seconds>, never less. A
   # lock is old enough to take once it is older than the grace AND twice the
@@ -1238,9 +1274,12 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
     # earlier boot, which a bare kill -0 cannot express at all. A lock that
     # will not go (a read-only directory) falls through to the wait below
     # rather than straight back to mkdir, so a bound still ends it: it used
-    # to spin on rm for ever.
+    # to spin on rm for ever. The break goes through lock_break, which
+    # removes the lock only while it still names the owner judged gone: a
+    # lock another waiter has broken and taken meanwhile names somebody else,
+    # or nobody yet.
     if [ -n "$hold" ] && ! slot_alive "$d"; then
-      rm -rf "$d" 2>/dev/null; [ -e "$d" ] || continue   # the owner is gone: genuinely stale
+      lock_break "$d" "$(lock_id "$d")" "$hold" && continue   # the owner is gone: genuinely stale
     fi
     if [ -z "$deadline" ]; then
       # A live owner is WAITED for, however long it takes. An owner with no
@@ -1248,9 +1287,11 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
       # a second, never by how long this wait has lasted: counting its own
       # polls, a waiter that had queued past the grace behind live owners broke
       # the NEXT owner's lock in the instant before its pid, and both held it.
+      # Which lock was judged is read before its age, so a lock broken and
+      # taken again after that reading is never the one removed.
       if [ -z "$hold" ] && [ "$SECONDS" != "$aged" ]; then
-        aged=$SECONDS
-        if lock_abandoned "$d"; then rm -rf "$d" 2>/dev/null; [ -e "$d" ] || continue; fi
+        aged=$SECONDS; lid="$(lock_id "$d")"
+        if lock_abandoned "$d"; then lock_break "$d" "$lid" "" && continue; fi
       fi
     else
       # Bounded: the models.json lock (models_lock), held for a few jq calls
@@ -1262,12 +1303,15 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
       # younger one is waited for until the time is up, and a writer inside
       # the gap before its pid is never robbed. The age is read once a
       # second, not on every poll: it costs two forks.
+      # Here the owner may well be alive and name this very pid, so which
+      # directory was judged (lock_id, read before its age) is all that tells
+      # a lock taken over already from the one this wait judged.
       if [ "$SECONDS" != "$aged" ]; then
-        aged=$SECONDS; now="$(now_epoch)"; born="$(num "$(stat -f %m "$d" 2>/dev/null)" "$now")"
-        if [ $(( now - born )) -ge "$stale" ]; then
+        aged=$SECONDS; lid="$(lock_id "$d")"
+        if lock_older_than "$d" "$stale"; then
           LOCK_TAKEN_OVER="${hold:+pid $hold}"; LOCK_TAKEN_OVER="${LOCK_TAKEN_OVER:-a writer that never wrote its pid}"
-          LOCK_TAKEN_AGE=$(( now - born ))
-          rm -rf "$d" 2>/dev/null; [ -e "$d" ] || continue
+          LOCK_TAKEN_AGE="$LOCK_AGE"
+          lock_break "$d" "$lid" "$hold" && continue
         fi
       fi
       [ "$SECONDS" -lt "$deadline" ] || return 1
@@ -3227,22 +3271,25 @@ acquire_lock() { # 0 = acquired
   # Two statements on purpose: `local a="$1" b="…$a"` expands every word BEFORE
   # assigning any of them, so under `set -u` the second one sees $a unset. It
   # only ever worked because callers happened to have their own `id` in scope.
-  local id="$1" pid
+  local id="$1" pid lid
   local lock="$LOCK_DIR/$id"
   if mkdir "$lock" 2>/dev/null; then
     echo $$ > "$lock/pid"; boot_id > "$lock/boot"; return 0
   fi
-  # Its pid, read once. A lock without one is another taker between its mkdir
-  # and its pid, refused like a live one, unless it is older than the grace
-  # (lock_abandoned): it used to be broken on sight, and both takers then ran.
-  # One gone meanwhile falls through, to be taken again.
+  # Which lock, then its pid, read once. A lock without one is another taker
+  # between its mkdir and its pid, refused like a live one, unless it is older
+  # than the grace (lock_abandoned): it used to be broken on sight, and both
+  # takers then ran. One gone meanwhile falls through, to be taken again.
+  lid="$(lock_id "$lock")"
   pid="$(cat "$lock/pid" 2>/dev/null || true)"
   if [ -n "$pid" ]; then
     slot_alive "$lock" && return 1   # a previous run is still going
   elif [ -d "$lock" ]; then
     lock_abandoned "$lock" || return 1
   fi
-  rm -rf "$lock"                  # stale lock from a killed run, or an old boot
+  # Stale: from a killed run, or an old boot. Removed only while it is still
+  # the lock judged here -- another taker may have broken and taken it since.
+  lock_break "$lock" "$lid" "$pid"
   mkdir "$lock" 2>/dev/null && { echo $$ > "$lock/pid"; boot_id > "$lock/boot"; return 0; }
   return 1
 }

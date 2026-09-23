@@ -4647,6 +4647,100 @@ NASTY
     || bad "acquire_lock on an old lock with no pid: exit $rold, the lock names pid [$(cat "$tmp/acq/_old/pid" 2>/dev/null)]"
   rm -rf "$tmp/acq"
 
+  echo "lock_take()/acquire_lock() — two waiters that judged the same stale lock break it once"
+  # Breaking a lock is check-then-act. Two waiters that both found the owner
+  # gone each removed "it" -- and the slower one removed the lock the faster
+  # one had just taken in its place, so both held it: two journal rewrites,
+  # two state writes, two refreshes at once. Here the slower waiter (B) is held
+  # right after its judgement of the stale lock until the faster one (A) has
+  # broken it, taken it and left a mark in it; a second later A checks its
+  # mark is still there. Both are subshells, where $$ is this suite's own pid
+  # for either, so the mark says whose lock it is, not the pid.
+  local rdead=99999; if kill -0 "$rdead" 2>/dev/null; then rdead=99998; fi
+  eval "orig_slot_alive() $(declare -f slot_alive | tail -n +2)"
+  eval "orig_lock_abandoned() $(declare -f lock_abandoned | tail -n +2)"
+  race_a() { # race_a <case> <take-command...> -- waits for B's judgement, then takes, marks, holds 1 s, checks
+    local c="$tmp/$1" i=0; shift
+    while [ ! -e "$c.B-judged" ] && [ "$i" -lt 500 ]; do sleep 0.01; i=$(( i + 1 )); done
+    "$@" || return 1
+    : > "$c.lock/A-mark"; : > "$c.A-holds"; sleep 1
+    [ -e "$c.lock/A-mark" ] && : > "$c.A-kept"
+    : > "$c.A-done"
+  }
+  race_wait() { # race_wait <case> <pids...> -- until A is done and B has an answer, 6 s at most
+    local c="$tmp/$1" i=0; shift
+    while { [ ! -e "$c.A-done" ] || [ ! -e "$c.B-rc" ]; } && [ "$i" -lt 60 ]; do sleep 0.1; i=$(( i + 1 )); done
+    kill "$@" 2>/dev/null; wait "$@" 2>/dev/null
+  }
+  # 1. lock_take, the owner dead.
+  mkdir -p "$tmp/race1.lock"; echo "$rdead" > "$tmp/race1.lock/pid"; boot_id > "$tmp/race1.lock/boot"
+  ( slot_alive() { orig_slot_alive "$@" && return 0; : > "$tmp/race1.B-judged"
+                   while [ ! -e "$tmp/race1.A-holds" ]; do command sleep 0.01; done; return 1; }
+    lock_take "$tmp/race1.lock"; r=$?; [ -e "$tmp/race1.A-done" ] && w=after || w=during
+    echo "$r $w" > "$tmp/race1.B-rc" ) >/dev/null 2>&1 & local rb1=$!
+  ( race_a race1 lock_take "$tmp/race1.lock" && lock_drop "$tmp/race1.lock" ) >/dev/null 2>&1 & local ra1=$!
+  race_wait race1 "$rb1" "$ra1"
+  [ -e "$tmp/race1.A-kept" ] && [ "$(cat "$tmp/race1.B-rc" 2>/dev/null)" = "0 after" ] \
+    && ok "lock_take: a dead owner's lock is broken once -- the waiter that judged it too is left waiting, and takes it after" \
+    || bad "lock_take on a dead owner's lock, two waiters: the first one's mark kept [$([ -e "$tmp/race1.A-kept" ] && echo yes || echo no)], the second one [$(cat "$tmp/race1.B-rc" 2>/dev/null)] (exit, while or after the first held it)"
+  # 2. lock_take, an old lock with no pid (abandoned). A holds the new lock
+  # as a taker does between its mkdir and its pid -- with no pid either --
+  # so only which directory was judged tells the two locks apart.
+  mkdir -p "$tmp/race2.lock"; touch -t 202001010000 "$tmp/race2.lock"
+  take_before_its_pid() { lock_take "$1" && rm -f "$1/pid" "$1/boot"; }
+  ( lock_abandoned() { orig_lock_abandoned "$@" || return 1; : > "$tmp/race2.B-judged"
+                       while [ ! -e "$tmp/race2.A-holds" ]; do command sleep 0.01; done; return 0; }
+    LOCK_GRACE_SECONDS=30; lock_take "$tmp/race2.lock"; r=$?; [ -e "$tmp/race2.A-done" ] && w=after || w=during
+    echo "$r $w" > "$tmp/race2.B-rc" ) >/dev/null 2>&1 & local rb2=$!
+  ( LOCK_GRACE_SECONDS=30; race_a race2 take_before_its_pid "$tmp/race2.lock" && lock_drop "$tmp/race2.lock" ) >/dev/null 2>&1 & local ra2=$!
+  race_wait race2 "$rb2" "$ra2"
+  [ -e "$tmp/race2.A-kept" ] && [ "$(cat "$tmp/race2.B-rc" 2>/dev/null)" = "0 after" ] \
+    && ok "lock_take: an abandoned lock is broken once, never the fresh one the first waiter took in its place" \
+    || bad "lock_take on an abandoned lock, two waiters: the first one's mark kept [$([ -e "$tmp/race2.A-kept" ] && echo yes || echo no)], the second one [$(cat "$tmp/race2.B-rc" 2>/dev/null)] (exit, while or after the first held it)"
+  # 3. acquire_lock, which does not wait: the second taker is refused.
+  mkdir -p "$tmp/race3/_job"; echo "$rdead" > "$tmp/race3/_job/pid"; boot_id > "$tmp/race3/_job/boot"
+  ln -s "$tmp/race3/_job" "$tmp/race3.lock"
+  ( slot_alive() { orig_slot_alive "$@" && return 0; : > "$tmp/race3.B-judged"
+                   while [ ! -e "$tmp/race3.A-holds" ]; do command sleep 0.01; done; return 1; }
+    LOCK_DIR="$tmp/race3"; acquire_lock _job; r=$?; [ -e "$tmp/race3.A-done" ] && w=after || w=during
+    echo "$r $w" > "$tmp/race3.B-rc" ) >/dev/null 2>&1 & local rb3=$!
+  ( LOCK_DIR="$tmp/race3"; race_a race3 acquire_lock _job && release_lock _job ) >/dev/null 2>&1 & local ra3=$!
+  race_wait race3 "$rb3" "$ra3"
+  [ -e "$tmp/race3.A-kept" ] && [ "$(cat "$tmp/race3.B-rc" 2>/dev/null)" = "1 during" ] \
+    && ok "acquire_lock: a dead owner's lock is taken once -- the other taker that judged it too is refused, not handed the same lock" \
+    || bad "acquire_lock on a dead owner's lock, two takers: the first one's mark kept [$([ -e "$tmp/race3.A-kept" ] && echo yes || echo no)], the second one [$(cat "$tmp/race3.B-rc" 2>/dev/null)] (exit, while or after the first held it)"
+  # 4. The bounded wait (models_lock), which takes a lock for its age alone,
+  # whoever it names.
+  eval "orig_lock_older_than() $(declare -f lock_older_than | tail -n +2)"
+  mkdir -p "$tmp/race4.lock"; echo $$ > "$tmp/race4.lock/pid"; boot_id > "$tmp/race4.lock/boot"; touch -t 202001010000 "$tmp/race4.lock"
+  ( lock_older_than() { orig_lock_older_than "$@" || return 1; : > "$tmp/race4.B-judged"
+                        while [ ! -e "$tmp/race4.A-holds" ]; do command sleep 0.01; done; return 0; }
+    LOCK_GRACE_SECONDS=30; lock_take "$tmp/race4.lock" 5; r=$?; [ -e "$tmp/race4.A-done" ] && w=after || w=during
+    echo "$r $w" > "$tmp/race4.B-rc" ) >/dev/null 2>&1 & local rb4=$!
+  ( LOCK_GRACE_SECONDS=30; race_a race4 lock_take "$tmp/race4.lock" 5 && lock_drop "$tmp/race4.lock" ) >/dev/null 2>&1 & local ra4=$!
+  race_wait race4 "$rb4" "$ra4"
+  [ -e "$tmp/race4.A-kept" ] && [ "$(cat "$tmp/race4.B-rc" 2>/dev/null)" = "0 after" ] \
+    && ok "lock_take, bounded: a lock taken for its age is taken once, never the fresh one the first writer took in its place" \
+    || bad "a bounded lock_take on an old lock, two writers: the first one's mark kept [$([ -e "$tmp/race4.A-kept" ] && echo yes || echo no)], the second one [$(cat "$tmp/race4.B-rc" 2>/dev/null)] (exit, while or after the first held it)"
+  rm -rf "$tmp"/race1.* "$tmp"/race2.* "$tmp"/race3 "$tmp"/race3.* "$tmp"/race4.*
+  # The breaker itself. While another breaker holds it nothing is removed --
+  # that one checks and removes, the rest take their turn -- and one left by
+  # a breaker killed mid-break is cleared once older than LOCK_BREAKER_STALE,
+  # so the stale lock is still broken after it. The server's journal_lock
+  # takes the breaker by the same name, a hidden sibling of the lock.
+  mkdir -p "$tmp/brk/.x.break" "$tmp/brk/x"; echo "$rdead" > "$tmp/brk/x/pid"
+  lock_break "$tmp/brk/x" "$(lock_id "$tmp/brk/x")" "$rdead"; local rbusy=$?
+  [ "$rbusy" = 1 ] && [ -d "$tmp/brk/x" ] && [ -d "$tmp/brk/.x.break" ] \
+    && ok "lock_break removes nothing while another breaker holds the breaker" \
+    || bad "lock_break with the breaker held elsewhere: exit $rbusy, the lock [$([ -d "$tmp/brk/x" ] && echo kept || echo removed)]"
+  touch -t 202001010000 "$tmp/brk/.x.break"
+  lock_break "$tmp/brk/x" "$(lock_id "$tmp/brk/x")" "$rdead"
+  lock_break "$tmp/brk/x" "$(lock_id "$tmp/brk/x")" "$rdead"; local rnext=$?
+  [ "$rnext" = 0 ] && [ ! -e "$tmp/brk/x" ] && [ ! -e "$tmp/brk/.x.break" ] \
+    && ok "and one left behind by a killed breaker is cleared, so the stale lock is broken after all" \
+    || bad "lock_break past a stale breaker: exit $rnext, the lock [$([ -e "$tmp/brk/x" ] && echo kept || echo removed)], the breaker [$([ -e "$tmp/brk/.x.break" ] && echo kept || echo cleared)]"
+  rm -rf "$tmp/brk"
+
   echo "backoff_multiplier() — a job that only ever fails must stop costing full price"
   # Nothing slowed a failing job down: it relaunched every interval, at full
   # budget, for as long as it kept failing. 14 dev/review jobs on a 5-minute

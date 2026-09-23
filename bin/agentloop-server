@@ -1386,6 +1386,51 @@ class journal_lock:
             return True          # it exists, it is just not ours
         return True
 
+    # A breaker lives for a stat, a read and a removal; one older than this was
+    # left by a breaker killed there -- the engine's LOCK_BREAKER_STALE.
+    BREAKER_STALE = 5.0
+
+    def _identity(self):
+        """Which directory the lock is right now -- (inode, birth) -- or None
+        when there is none. A lock broken and made again never reads the same."""
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return (st.st_ino, getattr(st, "st_birthtime", st.st_ctime))
+
+    def _break_if(self, ident, owner):
+        """Break the lock only while it is still the one judged stale: the same
+        directory (`ident`, read before anything else about it), naming the
+        same owner (None: no pid). Breaking is check-then-act, and two waiters
+        that judged the same stale lock each removed "it" -- the slower one
+        removing the lock the faster one had just taken in its place, so both
+        held it. The check and the removal therefore happen under the lock's
+        breaker, the hidden sibling the engine's lock_break takes by the same
+        name, so that no other breaker looks in between. True when the lock is
+        gone afterwards."""
+        breaker = self.path.parent / ("." + self.path.name + ".break")
+        try:
+            breaker.mkdir()
+        except FileExistsError:
+            try:
+                if time.time() - breaker.stat().st_mtime > self.BREAKER_STALE:
+                    breaker.rmdir()
+            except OSError:
+                pass
+            return not self.path.exists()
+        except OSError:
+            return not self.path.exists()
+        try:
+            if ident is not None and self._identity() == ident and self._owner() == owner:
+                self._break()
+        finally:
+            try:
+                breaker.rmdir()
+            except OSError:
+                pass
+        return not self.path.exists()
+
     def _break(self):
         """Remove a lock we have decided is stale — pid file and all.
 
@@ -1403,7 +1448,7 @@ class journal_lock:
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.time() + self.timeout
-        ownerless_since = None
+        ownerless_since = ownerless_ident = None
         while True:
             try:
                 self.path.mkdir()
@@ -1418,20 +1463,26 @@ class journal_lock:
                 self.held = True
                 return self
 
+            ident = self._identity()          # which lock is judged below, read first
             owner = self._owner()
             if owner is not None and not self._alive(owner, self._owner_boot()):
-                self._break()                 # the owner is gone, or from an earlier boot
-                continue
-            if owner is None:
-                # The narrow race between mkdir and writing the pid. Only this
-                # case gets a time-based escape.
-                ownerless_since = ownerless_since or time.time()
-                if time.time() - ownerless_since > self.GRACE:
-                    self._break()
-                    ownerless_since = None
+                # the owner is gone, or from an earlier boot
+                if self._break_if(ident, owner):
                     continue
+            elif owner is None:
+                # The narrow race between mkdir and writing the pid. Only this
+                # case gets a time-based escape, counted for THIS lock: a lock
+                # broken and taken again by an owner still before its pid is
+                # a new lock, and gets the whole grace -- counted from the first
+                # one, it was broken in the instant after, and both held it.
+                if ident != ownerless_ident:
+                    ownerless_ident, ownerless_since = ident, time.time()
+                if time.time() - ownerless_since > self.GRACE:
+                    ownerless_since = ownerless_ident = None
+                    if self._break_if(ident, None):
+                        continue
             else:
-                ownerless_since = None
+                ownerless_since = ownerless_ident = None
             if time.time() > deadline:
                 raise TimeoutError(
                     f"the journal lock is held by live pid {owner} — try again in a moment")

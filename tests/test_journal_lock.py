@@ -176,6 +176,82 @@ def test_a_lock_that_never_had_a_pid_is_broken_after_the_grace(srv, monkeypatch)
         _drop(lock)
 
 
+def test_two_waiters_that_judged_the_same_dead_owner_break_its_lock_once(srv, monkeypatch):
+    """Breaking a lock is check-then-act. Two waiters that both found the owner
+    dead each removed "it" -- and the slower one removed the lock the faster one
+    had just taken in its place, so both held it: two rewrites of the journal at
+    once, and a run record lost between them. B is held right after its
+    judgement until A holds the lock and has marked it; B must leave A's lock
+    alone and take it only once A lets go. Both threads share one pid, so the
+    mark says whose lock it is."""
+    import threading
+    lock = _made_without_pid(srv)
+    dead = 99999
+    while _alive(dead):
+        dead -= 1
+    (lock / "pid").write_text(str(dead))
+    (lock / "boot").write_text(srv.boot_id())
+    b_judged, a_holds, a_done = threading.Event(), threading.Event(), threading.Event()
+    real_alive = srv.journal_lock._alive
+
+    def alive(pid, boot):
+        verdict = real_alive(pid, boot)
+        if threading.current_thread().name == "B" and not verdict and not b_judged.is_set():
+            b_judged.set()
+            a_holds.wait(5)
+        return verdict
+
+    monkeypatch.setattr(srv.journal_lock, "_alive", staticmethod(alive))
+    out = {}
+
+    def b():
+        with srv.journal_lock(timeout=10):
+            out["b_after_a"] = a_done.is_set()
+
+    def a():
+        b_judged.wait(5)
+        with srv.journal_lock(timeout=10) as lk:
+            (lk.path / "a-mark").write_text("A")
+            a_holds.set()
+            time.sleep(1)
+            out["a_kept"] = (lk.path / "a-mark").exists()
+            a_done.set()
+
+    threads = [threading.Thread(target=b, name="B"), threading.Thread(target=a, name="A")]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(15)
+        assert out == {"a_kept": True, "b_after_a": True}, out
+    finally:
+        _drop(lock)
+
+
+def test_a_waiter_judges_each_lock_with_no_pid_on_its_own(srv, monkeypatch):
+    """The grace an owner with no pid is given belongs to THAT lock. The waiter
+    below starts counting on a lock nobody ever wrote a pid into; just before
+    the grace, that lock is broken (by the engine, which judges by its age) and
+    taken by an owner still between its mkdir and its pid. Counted from the
+    first lock, the waiter broke the second in the instant after, and both
+    held it. It waits the whole grace on the new lock instead."""
+    grace = srv.journal_lock.GRACE
+    lock = _made_without_pid(srv)
+
+    def replaced_before_its_pid():
+        _drop(lock)
+        lock.mkdir()
+
+    clock = _Clock((grace - 1, replaced_before_its_pid))
+    monkeypatch.setattr(srv, "time", clock)
+    try:
+        with srv.journal_lock(timeout=3 * grace):
+            waited = clock.now - clock.start
+        assert waited > 2 * grace - 1, waited
+    finally:
+        _drop(lock)
+
+
 def _alive(pid):
     try:
         os.kill(pid, 0)
