@@ -43,15 +43,21 @@ def _worst_first(findings):
 def _summary(findings):
     by_state = {s: 0 for s in STATES}
     by_severity = {s: 0 for s in SEVERITIES}
+    # Always all three keys, whatever this analysis recorded: a consumer has to
+    # be able to tell "none were rejected" from "this report predates verdicts"
+    # without special-casing a missing key -- the rule `scope` already follows.
+    by_verdict = {"confirmed": 0, "needs_validation": 0, "rejected": 0}
     accepted_in_severity = 0
     for f in findings:
         by_state[f["state"]] = by_state.get(f["state"], 0) + 1
+        if f.get("verdict") in by_verdict:
+            by_verdict[f["verdict"]] += 1
         if f["state"] not in ("fixed", "false_positive") and f.get("verdict") != "rejected":
             by_severity[f["severity"]] = by_severity.get(f["severity"], 0) + 1
             if f["state"] == "accepted":
                 accepted_in_severity += 1
-    return {"by_state": by_state, "by_severity": by_severity, "total": len(findings),
-            "accepted_in_severity": accepted_in_severity}
+    return {"by_state": by_state, "by_severity": by_severity, "by_verdict": by_verdict,
+            "total": len(findings), "accepted_in_severity": accepted_in_severity}
 
 
 def _unknown_states(by_state):
@@ -143,6 +149,36 @@ def _candidate_html(f) -> str:
         parts.append("<p>" + " · ".join(scored) + "</p>")
     parts.append("</div>")
     return "".join(parts)
+
+
+# A verdict under the finding, and nothing when there is none -- the same
+# contract `_candidate_md` keeps, so a report over a ledger nobody verified is
+# byte for byte what it was.
+def _verdict_md(f) -> list:
+    if not f.get("verdict"):
+        return []
+    return [f"**Verdict:** {f['verdict']} — {_md_cell(f.get('verdict_reason', ''))}"]
+
+
+def _verdict_html(f) -> str:
+    if not f.get("verdict"):
+        return ""
+    e = html.escape
+    return (f'<p class="verdict {e(f["verdict"])}"><strong>Verdict:</strong> '
+            f'{e(f["verdict"])} — {e(f.get("verdict_reason", ""))}</p>')
+
+
+def _split_disproved(findings):
+    """(what is still exposure, what a verifier disproved). Two lists in one
+    pass, so no renderer can put a finding in both or in neither."""
+    live = [f for f in findings if f.get("verdict") != "rejected"]
+    return live, [f for f in findings if f.get("verdict") == "rejected"]
+
+
+# Said above the disproved section, once: a reader who meets a list of
+# findings under a security report assumes they are work.
+DISPROVED_LEAD = ("A verifier read the code and disproved these. They are "
+                  "recorded, and they are not counted as exposure.")
 
 
 def _coverage(analysis, coverage_note):
@@ -267,8 +303,9 @@ def as_markdown(analysis, findings, coverage_note):
     if s["accepted_in_severity"]:
         n = s["accepted_in_severity"]
         out += ["", f"_(includes {n} accepted risk{'s' if n != 1 else ''})_"]
+    live, disproved = _split_disproved(findings)
     out += ["", "## Findings", ""]
-    for f in _worst_first(findings):
+    for f in _worst_first(live):
         out += [f"### [{f['severity']}] {f['title']} — `{f['state']}`", "",
                 f"**Rule:** `{f['rule']}` ({f['category']})"]
         if f.get("cwe"):
@@ -284,6 +321,16 @@ def as_markdown(analysis, findings, coverage_note):
         if block:
             out += block + [""]
         out += [f"**Remediation:** {f['remediation']}", ""]
+        out += _verdict_md(f) + ([""] if f.get("verdict") else [])
+    if disproved:
+        out += ["## Disproved in verification", "", DISPROVED_LEAD, ""]
+        for f in _worst_first(disproved):
+            out += [f"### [{f['severity']}] {f['title']}", "",
+                    f"**Rule:** `{f['rule']}` ({f['category']})", ""]
+            out += [f"- `{o['file']}`" + (f":{o['line']}" if o["line"] else "")
+                    for o in f["occurrences"]]
+            out += ["", f"**Why it was disproved:** "
+                    f"{_md_cell(f.get('verdict_reason', ''))}", ""]
     return "\n".join(out)
 
 
@@ -302,7 +349,9 @@ border-radius:3px}@media print{.f{break-inside:avoid}}
 .cov th{background:#f4f4f5;font-weight:600}
 .cov .cov-ok{color:#15803d}.cov .cov-warn{color:#b45309}.cov .cov-gap{color:#b91c1c}
 .cand{margin:.5rem 0;padding:.5rem .75rem;border-left:3px solid #d4d4d8;background:#fafafa}
-.cand ol,.cand ul{margin:.25rem 0 .5rem 1.25rem}"""
+.cand ol,.cand ul{margin:.25rem 0 .5rem 1.25rem}
+.verdict{margin:.35rem 0;font-size:.95em}
+.verdict.rejected{color:#6b7280}"""
 
 # The CSS class a status cell carries, DELIBERATELY NOT SPELLED LIKE THE
 # STATUS. The class used to be the status word itself, and the test that
@@ -355,8 +404,9 @@ def as_html(analysis, findings, coverage_note):
     if s["accepted_in_severity"]:
         n = s["accepted_in_severity"]
         parts.append(f'<p class="note">Includes {n} accepted risk{"s" if n != 1 else ""}.</p>')
+    live, disproved = _split_disproved(findings)
     parts.append("<h2>Findings</h2>")
-    for f in _worst_first(findings):
+    for f in _worst_first(live):
         locs = "".join(
             f"<li><code>{e(o['file'])}{':' + e(str(o['line'])) if o['line'] else ''}</code></li>"
             for o in f["occurrences"])
@@ -374,7 +424,20 @@ def as_html(analysis, findings, coverage_note):
             f"<p>Rule <code>{e(f['rule'])}</code> ({e(f['category'])})</p>"
             f"{cls}{scope}"
             f"<ul>{locs}</ul><p>{e(f['rationale'])}</p>{_candidate_html(f)}"
-            f"<p><strong>Remediation:</strong> {e(f['remediation'])}</p></div>")
+            f"<p><strong>Remediation:</strong> {e(f['remediation'])}</p>"
+            f"{_verdict_html(f)}</div>")
+    if disproved:
+        parts.append(f"<h2>Disproved in verification</h2><p>{e(DISPROVED_LEAD)}</p>")
+        for f in _worst_first(disproved):
+            locs = "".join(
+                f"<li><code>{e(o['file'])}{':' + e(str(o['line'])) if o['line'] else ''}</code></li>"
+                for o in f["occurrences"])
+            parts.append(
+                f'<div class="f {e(f["severity"])}">'
+                f"<h3>[{e(f['severity'])}] {e(f['title'])}</h3>"
+                f"<p>Rule <code>{e(f['rule'])}</code> ({e(f['category'])})</p>"
+                f"<ul>{locs}</ul><p><strong>Why it was disproved:</strong> "
+                f"{e(f.get('verdict_reason', ''))}</p></div>")
     return "".join(parts)
 
 
@@ -487,6 +550,9 @@ def _consolidated_finding_md(f, branch):
     block = _candidate_md(f)
     if block:
         out += [""] + block
+    verdict_line = _verdict_md(f)
+    if verdict_line:
+        out += [""] + verdict_line
     if f.get("remediation"):
         out += ["", f"**Remediation:** {f['remediation']}"]
     out.append("")
@@ -578,6 +644,8 @@ def _consolidated_finding_json(f, branch):
             "rationale": f.get("rationale", ""),
             "remediation": f.get("remediation", ""),
             "candidate": f.get("candidate"),
+            "verdict": f.get("verdict", ""),
+            "verdict_reason": f.get("verdict_reason", ""),
             "first_seen": f.get("first_seen", 0),
             "analysis_id": f.get("analysis_id"),
             "fixed_elsewhere": f.get("fixed_elsewhere")}
@@ -630,7 +698,7 @@ def consolidated_as_html(project, groups, meta):
                     f"{cls}{scope}{fe}"
                     + (f"<ul>{locs}</ul>" if locs else "")
                     + (f"<p>{e(f['rationale'])}</p>" if f.get("rationale") else "")
-                    + _candidate_html(f)
+                    + _candidate_html(f) + _verdict_html(f)
                     + (f"<p><strong>Remediation:</strong> {e(f['remediation'])}</p>"
                        if f.get("remediation") else "")
                     + "</div>")

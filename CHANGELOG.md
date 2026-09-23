@@ -20,6 +20,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Reports print the verdict** under each verified finding, and the ones a
+  verifier disproved move to their own section at the end — *Disproved in
+  verification* — with the reason. They are recorded and not counted; a report
+  over a ledger nobody verified renders byte for byte as before.
+
 - **The close verifies that the verification happened**, with three facts the
   ledger and the run's stream hold between them: findings in scope nobody
   verified, subagents that produced no verdict, and verdicts with no subagent
