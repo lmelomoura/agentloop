@@ -1012,6 +1012,97 @@ def test_a_sast_nobody_ruled_on_is_held_to_no_rule(tmp_path):
     run(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "xss"))
 
 
+def test_a_decided_row_re_reported_as_its_branch_shows_it_is_accepted_after_another_branch_relabelled_it(tmp_path):
+    """THE BUG THIS BRANCH FIXES. A re-report made exactly as THIS branch's
+    own checklist shows the fingerprint must be accepted, even when a NEWER
+    record on another branch relabelled it under a different rule. The old
+    `held` query compared with the project's newest record ANYWHERE -- any
+    branch, any repository, failed runs included -- so it read develop's
+    later relabelling instead of main's own accepted row and refused the
+    exact re-report the checklist told the agent to make."""
+    db = tmp_path / "security.db"
+    fp = "b" * 64
+    main1 = prepared_analysis(db, tmp_path, branch="main", run_id="r-main-1")
+    run(db, "report-finding", "--analysis", str(main1), stdin=json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": "broken-access-control",
+        "severity": "low", "title": "the drawer proxies any candidate",
+        "rationale": "any id reaches the upstream", "remediation": "scope the id",
+        "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 54}]}))
+    run(db, "finish", "--analysis", str(main1), "--state", "done")
+    dev = prepared_analysis(db, tmp_path, branch="develop", run_id="r-dev")
+    run(db, "report-finding", "--analysis", str(dev), stdin=json.dumps({
+        # Undecided at this point -- the door has nothing to compare with
+        # yet, so the same fingerprint lands here under a DIFFERENT rule.
+        "fingerprint": fp, "category": "sast", "rule": "xss",
+        "severity": "low", "title": "the drawer proxies any candidate",
+        "rationale": "read on develop: looks like a reflected value",
+        "remediation": "escape the output", "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 54}]}))
+    run(db, "finish", "--analysis", str(dev), "--state", "done")
+    run(db, "decide", "--project", "web", "--fingerprint", fp, "--state", "accepted",
+        "--reason", "product decision RP-217", "--by", "me")
+    # No analysis is running at this point: both main1 and dev are closed,
+    # and main2 (below) has not been opened yet.
+    main2 = prepared_analysis(db, tmp_path, branch="main", run_id="r-main-2")
+    shown = run(db, "checklist", "--analysis", str(main2))
+    (row,) = [f for f in shown["findings"] if f["fingerprint"] == fp]
+    assert row["rule"] == "broken-access-control", "what the agent was shown"
+    # Re-reported exactly as main2's own checklist showed it -- the rule read
+    # back off `row`, not a literal -- must be accepted, not refused.
+    run(db, "report-finding", "--analysis", str(main2), stdin=json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": row["rule"],
+        "severity": "low", "title": "the drawer proxies any candidate, still",
+        "rationale": "re-read on main: the id is still unscoped",
+        "remediation": "scope the id", "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 61}]}))
+    listed = run(db, "checklist", "--analysis", str(main2))
+    (after,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert after["rule"] == "broken-access-control"
+    assert after["state"] == "accepted"
+
+
+def test_a_triage_of_a_decided_scanner_row_under_its_own_identity_is_accepted(tmp_path):
+    """CONTROL for Job 2: a scanner-minted row the operator has already
+    decided, triaged again under its own identity once the scanner re-mints
+    it on a later analysis, must stay accepted -- the door's narrower
+    comparison must not swallow the ordinary scanner-row triage the
+    checklist and `decided_sast` both exist to serve."""
+    db = tmp_path / "security.db"
+    aid1 = open_analysis(db, branch="main", run_id="r1")
+    root1 = tmp_path / f"repo-{aid1}"
+    root1.mkdir(parents=True, exist_ok=True)
+    (root1 / ".env").write_text("DB_HOST=localhost\n")
+    run(db, "prepare", "--analysis", str(aid1), "--root", str(root1), "--offline")
+    listed1 = run(db, "checklist", "--analysis", str(aid1))
+    (scanner_row,) = [f for f in listed1["findings"] if f["rule"] == "committed_env_file"]
+    assert scanner_row["category"] == "hygiene"
+    fp = scanner_row["fingerprint"]
+    # Whatever the close gives -- `done` or `capped` -- both are finished,
+    # and either is a valid baseline for the second analysis below.
+    run(db, "finish", "--analysis", str(aid1), "--state", "done")
+    run(db, "decide", "--project", "web", "--fingerprint", fp, "--state", "false_positive",
+        "--reason", "fixture only, nothing to rotate", "--by", "me")
+
+    aid2 = open_analysis(db, branch="main", run_id="r2")
+    root2 = tmp_path / f"repo-{aid2}"
+    root2.mkdir(parents=True, exist_ok=True)
+    (root2 / ".env").write_text("DB_HOST=localhost\n")
+    run(db, "prepare", "--analysis", str(aid2), "--root", str(root2), "--offline")
+    listed2 = run(db, "checklist", "--analysis", str(aid2))
+    (rerecorded,) = [f for f in listed2["findings"] if f["fingerprint"] == fp]
+    assert rerecorded["state"] == "false_positive", "the scanner re-recorded the row"
+    run(db, "report-finding", "--analysis", str(aid2), stdin=json.dumps({
+        "fingerprint": fp, "category": rerecorded["category"], "rule": rerecorded["rule"],
+        "severity": rerecorded["severity"], "title": rerecorded["title"],
+        "remediation": rerecorded["remediation"],
+        "rationale": "confirmed at the call site: a local fixture, not a real secret",
+        "occurrences": rerecorded["occurrences"], "candidate": TRIAGE_CANDIDATE}))
+    final = run(db, "checklist", "--analysis", str(aid2))
+    (row,) = [f for f in final["findings"] if f["fingerprint"] == fp]
+    assert row["state"] == "false_positive"
+
+
 def test_findings_lists_what_the_deterministic_phase_left_for_the_agent(tmp_path):
     """PINNED to the built-in scanner, because the fixture is one only it
     reports: a PEM header and one body line, with no footer. Gitleaks is

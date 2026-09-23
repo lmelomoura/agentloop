@@ -195,3 +195,13 @@ def test_the_skill_carries_the_rule_across_and_puts_every_fold_in_the_summary():
         "the final summary must list every fold and where it was found"
     assert "agrees" in summary[0], \
         "the final summary must ask whether the reading agrees with the decision's reason"
+
+
+def test_the_skill_states_that_a_decided_finding_keeps_its_category_and_rule():
+    """The rule the door enforces has to be stated where every re-report
+    route reads it -- Job 1's carry-over, Job 2's triage and Job 3's fold
+    alike -- not only implied by what the door refuses."""
+    text = SKILL.read_text()
+    rules = text.split("## Rules that are not negotiable", 1)
+    assert len(rules) == 2, "SKILL.md no longer has this section this test can read"
+    assert "A decided finding keeps its category and rule" in rules[1]

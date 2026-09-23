@@ -1707,28 +1707,45 @@ def _decided_identity_refusal(conn, analysis_id, payload) -> str:
     landed, or a carried-over decided row re-labelled. The first version of
     this check held only the first of those, and only for `sast`.
 
-    The comparison is with the fingerprint's own RECORD -- this analysis's
-    row when it holds one, otherwise the newest record the project has, in
-    any analysis -- never with anything the payload says. One query decides
-    the common case: a fingerprint nobody ruled on is held to nothing here,
-    exactly as before this door existed. A decided fingerprint with no
-    record at all has nothing to compare with and is let through; the agent
-    cannot target one without inventing its 64 hex digits.
+    THE COMPARISON IS WITH THE RECORD THE AGENT WAS SHOWN, in the order it
+    was shown it: this analysis's own row first; otherwise its BASELINE's
+    -- the checklist's `previous`, same project, repository and branch;
+    otherwise the newest `done`/`capped` record of this project AND
+    repository on ANY branch -- the record `decided_sast` hands over
+    beside the checklist; and only then the project's newest record
+    anywhere, whatever its repository, branch or state -- a fingerprint the
+    agent was never shown. The first version of this comparison stopped at
+    the first step and fell straight through to the last one: a
+    fingerprint re-labelled by a newer analysis on another branch, another
+    repository, or a run that failed was never something the agent saw,
+    and comparing with it refused the exact re-reports the checklist told
+    the agent to make -- pushing it to either re-label the row its own
+    checklist showed as decided, or mint a fresh fingerprint and bring the
+    finding back as `new`. One query decides the common case: a
+    fingerprint nobody ruled on is held to nothing here, exactly as before
+    this door existed. A decided fingerprint with no record at all has
+    nothing to compare with and is let through; the agent cannot target
+    one without inventing its 64 hex digits.
     """
-    project = _analysis(conn, analysis_id)["project"]
+    analysis = _analysis(conn, analysis_id)
+    project = analysis["project"]
     if conn.execute("SELECT 1 FROM decision WHERE project=? AND fingerprint=?",
                     (project, payload["fingerprint"])).fetchone() is None:
         return ""
+    baseline = ledger.latest_analysis(conn, project, analysis["repo"],
+                                      analysis["branch"], before=analysis_id)
     held = conn.execute(
         "SELECT f.category, f.rule FROM finding f"
         " JOIN analysis a ON a.id = f.analysis_id"
         " WHERE f.fingerprint=? AND a.project=?"
-        " ORDER BY (f.analysis_id = ?) DESC, a.id DESC LIMIT 1",
-        (payload["fingerprint"], project, analysis_id)).fetchone()
+        " ORDER BY (f.analysis_id = ?) DESC, (f.analysis_id = ?) DESC,"
+        " (a.repo = ? AND a.state IN ('done','capped')) DESC, a.id DESC LIMIT 1",
+        (payload["fingerprint"], project, analysis_id,
+         baseline["id"] if baseline else -1, analysis["repo"])).fetchone()
     if held is None or (held["category"], held["rule"]) == (payload["category"], payload["rule"]):
         return ""
     return (f"report-finding: {payload['fingerprint'][:12]}… carries an operator "
-            f"decision, taken on a {held['category']} finding under rule "
+            f"decision, recorded as a {held['category']} finding under rule "
             f"{held['rule']!r}, and this report says {payload['category']} / "
             f"{payload['rule']!r}. A decided finding keeps its category and rule "
             "-- both are part of its identity, and the ruling was made about "

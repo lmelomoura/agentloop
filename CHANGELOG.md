@@ -109,9 +109,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   at the door — `report-finding` refuses any report that lands on a decided
   fingerprint under others, a fold, a re-labelled fold or a carried-over row
   alike — and the agent's final summary lists every fold, with where it was
-  found and whether the reading agrees with the decision's reason. The
-  checklist prints `decided_sast` ahead of the findings, so an output cut
-  for length keeps it.
+  found and whether the reading agrees with the decision's reason. It
+  compares with the record the agent was shown — the checklist's row, then
+  the one `decided_sast` handed over — so a re-label on another branch does
+  not refuse a re-report made exactly as shown. The checklist prints
+  `decided_sast` ahead of the findings, so an output cut for length keeps it.
 
 - **A job with no schedule window is launched by the tick again.** The
   tick's plan was one tab-separated line per enabled job, read back with

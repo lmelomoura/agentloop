@@ -137,6 +137,8 @@ cat <<'JSON' | agentloop security report-finding --analysis <id>
 JSON
 ```
 
+**A decided finding keeps its category and rule.** Whatever route you re-report it by — Job 1's carry-over, Job 2's triage, a fold into a row the checklist lists or into a `decided_sast` entry — send the category and the rule the row was shown to you with. The operator's ruling was made about them, and the door refuses a report that lands on a decided fingerprint under others.
+
 `candidate` is what *What qualifies as a finding* above describes; at `low` and `info` only `confidence` is required, and a triage re-report of a scanner's row carries `confidence` alone unless you have more to say.
 
 Each text field — `title`, `rationale`, `remediation`, `partial_note` — is capped at 10,000 characters; longer is refused at the door, not truncated. A finding is a paragraph the report page renders, not a file to paste into the ledger.
