@@ -2325,7 +2325,7 @@
     });
     return n;
   }
-  var ROW_PILL_TITLE = "Rows matching the current filters \u2014 the same finding open on two branches counts twice here.";
+  var ROW_PILL_TITLE = "Findings matching the current filters \u2014 one row per finding, so the same finding on two branches counts once here.";
   function _secCap(s) {
     s = String(s || "");
     return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
@@ -2388,14 +2388,6 @@
       ));
       strip.appendChild(card);
     });
-    const uniqueCard = kpiCard({
-      icon: "diamond",
-      value: String(data.unique || 0),
-      label: "Unique issues",
-      title: "Distinct problems (fingerprints) \u2014 the same finding open on two branches counts once here."
-    });
-    uniqueCard.className += " secfind-stat unique";
-    strip.appendChild(uniqueCard);
     box.appendChild(strip);
     if (!any && data.analysed !== false) {
       box.appendChild(secEl("span", "sevpill clean", "Nothing matches"));
@@ -2847,6 +2839,7 @@
     const tdRun = document.createElement("td");
     const runWrap = secEl("div", "secfind-run");
     const runInfo = ((fs.data || {}).analyses || []).find((a) => a.id === f.analysis_id);
+    const runLine = secEl("div");
     if (f.analysis_id != null) {
       const runBtn = document.createElement("button");
       runBtn.type = "button";
@@ -2858,15 +2851,33 @@
         secSwitchProjectTab("runs");
         secShowAnalysis(f.analysis_id, true);
       };
-      runWrap.appendChild(runBtn);
+      runLine.appendChild(runBtn);
     }
+    const otherRuns = (f.branches || []).filter((b) => b.analysis_id !== f.analysis_id);
+    if (otherRuns.length) {
+      const more = secEl("span", "secmeta", " +" + otherRuns.length);
+      more.title = otherRuns.map((b) => "#" + b.analysis_id + " " + b.branch).join(", ");
+      runLine.appendChild(more);
+    }
+    runWrap.appendChild(runLine);
     if (runInfo && runInfo.started) {
       runWrap.appendChild(secEl("div", "secmeta", fmtWhen(runInfo.started)));
     }
     tdRun.appendChild(runWrap);
     tr.appendChild(tdRun);
     const tdBranch = document.createElement("td");
-    tdBranch.textContent = f.branch || "";
+    const onBranches = f.branches && f.branches.length ? f.branches : [{ branch: f.branch || "", analysis_id: f.analysis_id, state: f.state }];
+    const stateWord = (s) => SEC_STATE_LABEL[s] || s;
+    if (onBranches.some((b) => b.state !== onBranches[0].state)) {
+      onBranches.forEach((b) => tdBranch.appendChild(
+        secEl("div", null, b.branch + " \xB7 " + stateWord(b.state))
+      ));
+    } else {
+      tdBranch.textContent = onBranches.map((b) => b.branch).join(", ");
+    }
+    if (onBranches.length > 1) {
+      tdBranch.title = onBranches.map((b) => b.branch + " \u2014 #" + b.analysis_id + " \u2014 " + stateWord(b.state)).join("\n");
+    }
     tr.appendChild(tdBranch);
     const tdState = document.createElement("td");
     const stBadge = secEl("span", "secstate " + secStateKey(f), SEC_STATE_LABEL[f.state] || f.state);
@@ -2881,7 +2892,8 @@
         "secstate fixed-elsewhere " + (merged ? "merged" : pending ? "pending" : "unknown"),
         merged ? "fix already here" : pending ? "fixed on " + fe.branch : "fixed on " + fe.branch + " (?)"
       );
-      feBadge.title = merged ? "Fixed on " + where + ", and that commit is already in this branch \u2014 very likely resolved here too. Re-analyse this branch to confirm; nothing is marked fixed until somebody looks again." : pending ? "Fixed on " + where + ", and that commit is NOT in this branch yet \u2014 the hole is real here; read that fix before writing a new one." : "Fixed on " + where + "; whether that fix is in this branch could not be determined (" + (fe.unknown_reason || "unknown") + ").";
+      const here = f.branch || "this branch";
+      feBadge.title = merged ? "Fixed on " + where + ", and that commit is already in " + here + " \u2014 very likely resolved there too. Re-analyse " + here + " to confirm; nothing is marked fixed until somebody looks again." : pending ? "Fixed on " + where + ", and that commit is NOT in " + here + " yet \u2014 the hole is real there; read that fix before writing a new one." : "Fixed on " + where + "; whether that fix is in " + here + " could not be determined (" + (fe.unknown_reason || "unknown") + ").";
       tdState.appendChild(feBadge);
     }
     tr.appendChild(tdState);
@@ -5346,5 +5358,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: 9f313868c9da7836a352576e6139f3a4cab19b147e1f8e8e1fcae38a02100ff0 */
-/* ui-sources: b7a8fd3a260b7239f6e3980e8467fa5beed7d61e93c6fb1f5fccfe7d40aedcd1 */
+/* ui-bundle: 97cc6dcae94a911f9fc0737e7dd4e5d3ddbd0245c51a83e934a904d0a79143dc */
+/* ui-sources: f6c46428a9a0928d24f8f5ce0253241858c7a4264f9885c1f4f8f856041b6d1f */

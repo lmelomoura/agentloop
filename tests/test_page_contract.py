@@ -6144,16 +6144,83 @@ def test_a_fixed_finding_gets_no_decision_controls(srv, tmp_path):
     assert out["buttons"] == 0, f"a fixed finding must not offer Accept risk / False positive: {out}"
 
 
+_FIND_ROW_CONSTS = ("SEC_STATE_LABEL", "SEC_STATE_HELP", "SEV_ORDER", "SEC_STATES",
+                    "ICON_HYGIENE", "SEC_CATEGORY_LABEL", "SEC_CATEGORY_ICON")
+_FIND_ROW_DEPS = ("secEl", "secIcon", "_secCap", "secCategoryMeta", "secConfidenceChip",
+                  "secFindRow", "secFindDecisionControls", "secFindActionsCell")
+
+
+def _find_row_script(block):
+    consts = "".join(_const(block, n) for n in _FIND_ROW_CONSTS)
+    arrows = (re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
+              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
+    deps = "\n".join(_plainfn(block, n) for n in _FIND_ROW_DEPS)
+    return _INDEX_DOM_HARNESS + """
+    function fmtWhen(t){ return "w" + String(t); }
+    const fs = {project: "web", data: {analyses: [{id: 18, profile: "deep", started: 5}]}};
+    const base = {title: "t", severity: "high", category: "sast", first_seen: 1,
+      occurrences: [], fingerprint: "a".repeat(64)};
+    """ + consts + arrows + deps
+
+
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
-def test_the_strip_labels_total_and_unique_and_counts_the_floor_from_the_whole_filtered_set(
+def test_a_finding_on_two_branches_names_both_and_each_state_when_they_differ(srv, tmp_path):
+    """One row per finding: the Branch cell names every branch the finding is
+    on, and when they read it differently each branch carries its own state --
+    the Status beside it is the reading that needs attention first, and this
+    cell is where the rest is said. The run shown is the representative's;
+    "+N" counts the others, their runs one hover away."""
+    script = tmp_path / "find-row-branches.js"
+    script.write_text(_find_row_script(_security_js(srv)) + """
+    const mixed = secFindRow(fs, Object.assign({}, base, {state: "open", branch: "main",
+      analysis_id: 18, branches: [
+        {branch: "develop", analysis_id: 16, state: "fixed", severity: "high"},
+        {branch: "main", analysis_id: 18, state: "open", severity: "high"}]}));
+    const same = secFindRow(fs, Object.assign({}, base, {state: "false_positive",
+      branch: "main", analysis_id: 18, branches: [
+        {branch: "develop", analysis_id: 16, state: "false_positive", severity: "high"},
+        {branch: "main", analysis_id: 18, state: "false_positive", severity: "high"}]}));
+    console.log(JSON.stringify({mixed: collectAll(mixed, []), same: collectAll(same, [])}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    mixed = " ".join(r["text"] for r in out["mixed"])
+    assert "develop · Fixed" in mixed and "main · Open" in mixed, mixed
+    more = [r for r in out["mixed"] if r["text"].strip() == "+1"]
+    assert more and more[0]["title"] == "#16 develop", out["mixed"]
+    same = [r["text"] for r in out["same"]]
+    assert "develop, main" in same, same
+    assert "develop · False positive" not in " ".join(same), \
+        "branches that agree carry no per-branch state"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_fixed_elsewhere_badge_names_the_branch_it_speaks_about(srv, tmp_path):
+    """On a row that can stand for several branches, "this branch" no longer
+    says which: the badge's title names the representative's branch -- the
+    one whose ancestry git was asked about."""
+    script = tmp_path / "find-row-badge.js"
+    script.write_text(_find_row_script(_security_js(srv)) + """
+    const row = secFindRow(fs, Object.assign({}, base, {state: "open", branch: "develop",
+      analysis_id: 16, fixed_elsewhere: {branch: "main", commit: "abcdef0123456789",
+      in_this_branch: false}}));
+    console.log(JSON.stringify(collectAll(row, [])));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    badge = next(r for r in out if "fixed-elsewhere" in r["cls"])
+    assert "NOT in develop" in badge["title"], badge
+    assert "this branch" not in badge["title"], badge
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_strip_counts_each_finding_once_and_the_floor_from_the_whole_filtered_set(
         srv, tmp_path):
-    """Total vs unique must both appear, labelled distinctly -- 189 findings
-    can be 93 problems, and collapsing the two into one number silently
-    answers whichever question the reader was not asking. And the count of
-    what the severity floor hides has to come from `by_severity` (every row
-    the current filters match, computed by finding_rows BEFORE pagination),
-    not from whatever slice of rows happens to be on THIS page -- a browser
-    with several pages would otherwise undercount how much the floor hides."""
+    """One row per finding (queries.finding_rows groups by fingerprint), so
+    the strip shows one count: the Unique issues card could only ever repeat
+    the total, and is gone. The count of what the severity floor hides still
+    comes from `by_severity` (every row the current filters match, computed
+    BEFORE pagination), not from the slice of rows on THIS page."""
     block = _security_js(srv)
     consts = (_const(block, "SEV_ORDER") + _const(block, "ROW_PILL_TITLE")
               + _const(block, "SEV_KPI_ICON") + _const(block, "SEV_KPI_TONE"))
@@ -6164,29 +6231,19 @@ def test_the_strip_labels_total_and_unique_and_counts_the_floor_from_the_whole_f
     function secMinSeverity(_p){ return "medium"; }
     const fs = {project: "web"};
     """ + consts + deps + """
-    // by_severity describes EVERY row the current filters match, across every
-    // page -- 3 low + 2 info sit below the "medium" floor, even though this
-    // fabricated payload carries no `rows` at all for secFindStrip to look at.
-    const data = {total: 10, unique: 8,
+    const data = {total: 10, unique: 10,
       by_severity: {critical: 1, high: 4, medium: 0, low: 3, info: 2}, page: 1, per_page: 25};
     console.log(JSON.stringify(collectAll(secFindStrip(fs, data), [])));
     """)
     out = json.loads(subprocess.run(["node", str(script)],
                                     capture_output=True, text=True, check=True).stdout)
     joined = " ".join(r["text"] for r in out)
-    # Total and Unique are two of the seven KPI CARDS now
-    # (ProjectFindings.png), each still carrying its marker class -- found
-    # by that marker rather than by a literal wording, each one's own
-    # aggregated text still carrying both its label and its number
-    # together, which is what "distinctly labelled" means.
     total_stat = next(r for r in out if "secfind-stat total" in r["cls"])
-    unique_stat = next(r for r in out if "secfind-stat unique" in r["cls"])
     assert "Total findings" in total_stat["text"] and "10" in total_stat["text"], \
         f"the Total stat must carry both its label and its number: {total_stat}"
-    assert "Unique issues" in unique_stat["text"] and "8" in unique_stat["text"], \
-        f"the Unique stat must carry both its label and its number: {unique_stat}"
-    assert total_stat["text"] != unique_stat["text"], \
-        "total and unique must not collapse into the same number"
+    assert not [r for r in out if "secfind-stat unique" in r["cls"]], \
+        "one row per finding: a Unique card could only repeat the total"
+    assert "Unique issues" not in joined
     assert "5 findings below medium" in joined, \
         f"the hidden count must be 3 low + 2 info = 5, read from by_severity: {joined}"
     assert "every recorded finding" in joined, "the downloads-are-unfiltered sentence is missing"
@@ -7436,10 +7493,11 @@ def test_the_findings_strip_says_when_a_branch_behind_it_stopped_early(srv, tmp_
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_the_two_kinds_of_severity_pill_each_say_what_they_count(srv, tmp_path):
     """IMPORTANT 5(a). The sidebar donut is a flex sibling of the tab panes,
-    so it is on screen DURING the Findings tab: the strip's per-severity
-    pills are ROW counts and the donut's are DISTINCT FINGERPRINTS, four
-    inches apart, in identical markup. The strip labelled `total` vs `unique`
-    and left both sets of per-severity pills bare."""
+    so it is on screen DURING the Findings tab, four inches from the strip,
+    in identical markup. Both count a finding once however many branches it
+    is on (the browser is one row per finding), and they still answer
+    different questions -- the strip, the findings the current filters
+    match; the donut, every open problem -- so each says which."""
     block = _security_js(srv)
     strip_consts = (_const(block, "SEV_ORDER") + _const(block, "SEC_NEVER")
                     + _const(block, "ROW_PILL_TITLE")
@@ -7470,9 +7528,9 @@ def test_the_two_kinds_of_severity_pill_each_say_what_they_count(srv, tmp_path):
                                     capture_output=True, text=True, check=True).stdout)
     assert "2" in out["strip"].get("text", ""), out["strip"]
     assert out["legend"].get("text") == "1 critical", out["legend"]
-    assert "Rows" in out["strip"].get("title", ""), \
-        f"the strip's severity pill does not say it counts rows: {out['strip']}"
-    assert "counts twice" in out["strip"].get("title", ""), out["strip"]
+    assert "matching the current filters" in out["strip"].get("title", ""), \
+        f"the strip's severity pill does not say what it counts: {out['strip']}"
+    assert "counts once" in out["strip"].get("title", ""), out["strip"]
     assert "fingerprint" in out["legend"].get("title", "").lower(), \
         f"the donut's severity pill does not say it counts problems: {out['legend']}"
     assert "counts once" in out["legend"].get("title", ""), out["legend"]
@@ -8399,13 +8457,12 @@ _UNSTYLED_CLASS_ALLOWLIST = {
     # styling. A wrapper that adds nothing of its own is deliberately left
     # unstyled rather than given an empty rule.
     "secidx-categories",
-    # secFindStrip's Total/Unique KPI cards (findings-screen.js): pure
-    # MARKER classes appended to two .kpi-card elements whose whole layout
-    # and colour come from the shared component -- the hooks the pinned
-    # total-vs-unique test finds them by, styled by nothing on purpose.
+    # secFindStrip's Total KPI card (findings-screen.js): pure MARKER classes
+    # appended to a .kpi-card element whose whole layout and colour come from
+    # the shared component -- the hooks the pinned strip test finds it by,
+    # styled by nothing on purpose.
     "secfind-stat",
     "total",
-    "unique",
     # setupBanner's Open Settings button (settings.js): a pure MARKER class
     # -- "btn primary" already carries its whole look -- so a click on it can
     # be delegated by class once this banner is mounted on two views at once

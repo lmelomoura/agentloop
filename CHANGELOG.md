@@ -86,6 +86,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   export stays one row per branch (`group=False`), and its header now
   measures the count the screen was showing against distinct open findings,
   not rows.
+  On the screen, the Branch column names every branch a finding is on and,
+  when they disagree, each one's own state; the Analysis run shows the
+  representative's run with `+N` for the others; the *Unique issues* card is
+  gone, since it could only repeat the total.
 
 - **A job with no schedule window is launched by the tick again.** The
   tick's plan was one tab-separated line per enabled job, read back with

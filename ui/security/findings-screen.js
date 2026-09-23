@@ -37,11 +37,16 @@
    never pass it, so a tab switch away from and back to Findings still keeps
    its filters/sort/page exactly as before this task.
 
-   `total` vs `unique`: the strip shows both, labelled, because they answer
-   different questions -- the same finding open on two branches is one row
-   each time it is open (`total`) but one problem (`unique`, distinct
-   fingerprints). 189 findings can be 93 problems; collapsing the two into one
-   number would silently answer whichever question the reader was not asking.
+   ONE ROW PER FINDING. `queries.finding_rows` groups the branches' checklists
+   by fingerprint: the same finding on `main` and on `develop` is one row
+   naming both, its Status the reading that needs attention first (open on
+   any branch, then a decision, then `fixed` only once every branch says so),
+   and each branch's own state beside its name when they disagree. A decision
+   is recorded against the project, so one row is also the honest shape of
+   what the operator decides on -- one row per branch put every finding
+   already ruled on back in front of them each time another branch was
+   analysed. `total` counts these rows; `unique`, still in the payload, is the
+   same number, so the strip shows one.
 
    The severity floor (`min_severity`) is DISPLAY-ONLY and lives entirely in
    this file -- the server's `by_severity`/`total`/`unique` describe every row
@@ -379,9 +384,9 @@ function secFindHeader(fs, data){
 }
 
 /* ------------------------------------------------------------------ strip
-   total, unique issues, and the five severities -- see this file's own
-   comment for why total and unique are both shown, labelled, rather than
-   collapsed into one number. */
+   the total and the five severities -- one row per finding (see this file's
+   own comment), so there is no second, fingerprint-distinct number to show
+   beside the total. */
 function secFindHiddenByFloor(data, minSeverity){
   const floor = SEV_ORDER.indexOf(minSeverity);
   const bySev = data.by_severity || {}, fixedBySev = data.fixed_by_severity || {};
@@ -398,30 +403,28 @@ function secFindHiddenByFloor(data, minSeverity){
 }
 
 // What the strip's per-severity stats COUNT. Threaded onto every stat's own
-// `.title` -- both this strip and the sidebar donut legend (index-screen.js,
-// see DONUT_PILL_TITLE there) draw the same kind of row/fingerprint split,
-// and both now say which one they answer rather than leave two adjacent
-// numbers to be told apart by guessing.
-const ROW_PILL_TITLE = "Rows matching the current filters — the same finding "
-  + "open on two branches counts twice here.";
+// `.title` -- this strip and the sidebar donut legend (index-screen.js, see
+// DONUT_PILL_TITLE there) both count a finding once however many branches
+// it is on, and still answer different questions: this one, the findings
+// the current filters match; the donut, every open problem, filters or not.
+const ROW_PILL_TITLE = "Findings matching the current filters — one row per "
+  + "finding, so the same finding on two branches counts once here.";
 
 function _secCap(s){
   s = String(s || "");
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
-/* AllFindings.png's own stat strip: Total findings (a doc icon), the five
-   severities (a coloured dot, the count, the share of `total` beneath), a
-   divider, then Unique issues. Its own shape now, not `.sevpills`/`.sevpill`
-   (the pill this file draws everywhere else, including the table's own
-   Severity column below) -- the mockup draws a plain dot beside each label
-   here, a large number under it and a percentage under THAT, closer to a
-   KPI card's own anatomy than to a pill. `secfind-stat total`/`secfind-stat
-   unique` carry their own distinguishing class for exactly the same reason
-   every severity stat carries its own (`.critical`/`.high`/… below) -- so
-   each of the two honesty-critical numbers (this file's own header comment
-   on why total and unique are both shown) stays independently findable,
-   never just "the Nth number in the row". */
+/* AllFindings.png's own stat strip: Total findings (a doc icon) and the five
+   severities (a coloured dot, the count, the share of `total` beneath). Its
+   own shape now, not `.sevpills`/`.sevpill` (the pill this file draws
+   everywhere else, including the table's own Severity column below) -- the
+   mockup draws a plain dot beside each label here, a large number under it
+   and a percentage under THAT, closer to a KPI card's own anatomy than to a
+   pill. `secfind-stat total` carries its own distinguishing class for
+   exactly the same reason every severity stat carries its own
+   (`.critical`/`.high`/… below) -- so the one number that counts findings
+   stays independently findable, never just "the Nth number in the row". */
 function secFindStrip(fs, data){
   const box = secEl("div");
   // FIRST, above everything else the strip says: this project has never been
@@ -459,13 +462,13 @@ function secFindStrip(fs, data){
       + "“Clear filters” below shows this project's whole list."));
   }
 
-  // Seven KPI CARDS (ProjectFindings.png), the house kpi-grid replacing the
-  // one-container stat strip this used to be: Total findings, the five
+  // Six KPI CARDS (ProjectFindings.png), the house kpi-grid replacing the
+  // one-container stat strip this used to be: Total findings and the five
   // severities (each with its share of the total on the same delta line the
-  // Overview's cards use), and Unique issues. Same numbers, same titles --
-  // ROW_PILL_TITLE on everything row-counted, the fingerprint sentence on
-  // Unique -- and the same marker classes on Total/Unique the pinned tests
-  // find them by. The severity cards wear the shared severity icon/tone
+  // Overview's cards use). The seventh, Unique issues, went when the rows
+  // became one per finding: it could only ever repeat the total.
+  // ROW_PILL_TITLE on every card, and the marker class on Total the pinned
+  // tests find it by. The severity cards wear the shared severity icon/tone
   // maps (SEV_KPI_ICON/SEV_KPI_TONE, overview-tab.js), so the two tabs'
   // cards can never drift apart.
   const strip = secEl("div", "kpi-grid");
@@ -490,13 +493,6 @@ function secFindStrip(fs, data){
       total ? ((n / total) * 100).toFixed(1) + "%" : "—"));
     strip.appendChild(card);
   });
-
-  const uniqueCard = kpiCard({icon: "diamond", value: String(data.unique || 0),
-    label: "Unique issues",
-    title: "Distinct problems (fingerprints) — the same finding open "
-      + "on two branches counts once here."});
-  uniqueCard.className += " secfind-stat unique";
-  strip.appendChild(uniqueCard);
 
   box.appendChild(strip);
   // The ok-green "nothing matches" signal (Phase 4: no longer a `.sevpill`
@@ -967,11 +963,12 @@ function secFindFilterBar(fs, data){
 }
 
 /* ------------------------------------------------------------------ table
-   The state a row shows is the state its OWN branch's latest finished
-   analysis gives it -- a list that crosses branches (and so crosses
-   analyses) has to say which one it is speaking about, hence the Branch and
-   Analysis run columns beside Status rather than a bare severity/title
-   pair. */
+   A row is one finding across the branches it is on (queries.finding_rows
+   groups by fingerprint), and the state it shows is the reading that needs
+   attention first among them -- so the row has to say whose reading that
+   is and what the others read: the Analysis run column names the
+   representative's run and counts the rest, the Branch column names every
+   branch and, when they disagree, each one's own state. */
 function secFindRow(fs, f){
   const tr = document.createElement("tr");
   tr.className = "sev-" + secSevKey(f) + " state-" + secStateKey(f);
@@ -1056,9 +1053,15 @@ function secFindRow(fs, f){
   // own per-branch list) by this row's own `branch`/`analysis_id` rather
   // than carried a second time on every one of hundreds of finding rows
   // that can share the same handful of analyses.
+  // The run is the REPRESENTATIVE's -- the branch whose reading decides the
+  // Status (queries._group_by_fingerprint) -- and "+N" beside it counts the
+  // other branches carrying the same finding, their runs one hover away.
+  // Button and count share one line: `.secfind-run` is a flex column and
+  // would otherwise stack them.
   const tdRun = document.createElement("td");
   const runWrap = secEl("div", "secfind-run");
   const runInfo = ((fs.data || {}).analyses || []).find(a => a.id === f.analysis_id);
+  const runLine = secEl("div");
   if(f.analysis_id != null){
     const runBtn = document.createElement("button");
     runBtn.type = "button";
@@ -1070,17 +1073,41 @@ function secFindRow(fs, f){
       secSwitchProjectTab("runs");
       secShowAnalysis(f.analysis_id, true);
     };
-    runWrap.appendChild(runBtn);
+    runLine.appendChild(runBtn);
   }
+  const otherRuns = (f.branches || []).filter(b => b.analysis_id !== f.analysis_id);
+  if(otherRuns.length){
+    const more = secEl("span", "secmeta", " +" + otherRuns.length);
+    more.title = otherRuns.map(b => "#" + b.analysis_id + " " + b.branch).join(", ");
+    runLine.appendChild(more);
+  }
+  runWrap.appendChild(runLine);
   if(runInfo && runInfo.started){
     runWrap.appendChild(secEl("div", "secmeta", fmtWhen(runInfo.started)));
   }
   tdRun.appendChild(runWrap);
   tr.appendChild(tdRun);
 
-  // BRANCH
+  // BRANCH: every branch this finding is on. When they all read it the same,
+  // just their names; when they disagree, each branch with its own state --
+  // the Status beside this cell is the reading that needs attention first,
+  // and this is where the others are said. A row without `branches` is its
+  // own branch, as it always was. Each branch's run and state are one hover
+  // away.
   const tdBranch = document.createElement("td");
-  tdBranch.textContent = f.branch || "";
+  const onBranches = (f.branches && f.branches.length) ? f.branches
+    : [{branch: f.branch || "", analysis_id: f.analysis_id, state: f.state}];
+  const stateWord = (s) => SEC_STATE_LABEL[s] || s;
+  if(onBranches.some(b => b.state !== onBranches[0].state)){
+    onBranches.forEach(b => tdBranch.appendChild(
+      secEl("div", null, b.branch + " · " + stateWord(b.state))));
+  }else{
+    tdBranch.textContent = onBranches.map(b => b.branch).join(", ");
+  }
+  if(onBranches.length > 1){
+    tdBranch.title = onBranches.map(b => b.branch + " — #" + b.analysis_id
+      + " — " + stateWord(b.state)).join("\n");
+  }
   tr.appendChild(tdBranch);
 
   // STATUS: the SAME .secstate pill this table has always drawn -- only the
@@ -1106,11 +1133,15 @@ function secFindRow(fs, f){
     const merged = fe.in_this_branch === true, pending = fe.in_this_branch === false;
     const feBadge = secEl("span", "secstate fixed-elsewhere " + (merged ? "merged" : pending ? "pending" : "unknown"),
                           merged ? "fix already here" : pending ? "fixed on " + fe.branch : "fixed on " + fe.branch + " (?)");
+    // NAMED, not "this branch": a row can stand for several branches now,
+    // and the ancestry git was asked about is the representative's -- the
+    // branch in this row's own `branch` field.
+    const here = f.branch || "this branch";
     feBadge.title = merged
-      ? "Fixed on " + where + ", and that commit is already in this branch — very likely resolved here too. Re-analyse this branch to confirm; nothing is marked fixed until somebody looks again."
+      ? "Fixed on " + where + ", and that commit is already in " + here + " — very likely resolved there too. Re-analyse " + here + " to confirm; nothing is marked fixed until somebody looks again."
       : pending
-        ? "Fixed on " + where + ", and that commit is NOT in this branch yet — the hole is real here; read that fix before writing a new one."
-        : "Fixed on " + where + "; whether that fix is in this branch could not be determined (" + (fe.unknown_reason || "unknown") + ").";
+        ? "Fixed on " + where + ", and that commit is NOT in " + here + " yet — the hole is real there; read that fix before writing a new one."
+        : "Fixed on " + where + "; whether that fix is in " + here + " could not be determined (" + (fe.unknown_reason || "unknown") + ").";
     tdState.appendChild(feBadge);
   }
   tr.appendChild(tdState);

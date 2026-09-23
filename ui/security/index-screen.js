@@ -1393,11 +1393,11 @@ export function secIndexDonutSvg(donut){
    These are distinct fingerprints -- `severity_totals`, which collapses the
    same finding open on two branches into the one problem it is. The findings
    browser's strip, in identical markup and (on the project screen) four
-   inches away on the same page, shows per-severity pills that are ROWS. The
-   strip labels its own `total`/`unique` pair and the donut names its scope in
-   a caption, but the per-severity pills on both sides said only "3 critical"
-   and left the reader to assume the two agreed. They can legitimately
-   differ, so each side now says which question it is answering. */
+   inches away on the same page, counts one row per finding too, but only the
+   findings its current filters match, resolved ones included when asked for.
+   The per-severity pills on both sides used to say only "3 critical" and
+   left the reader to assume the two agreed. They can legitimately differ,
+   so each side says which question it is answering. */
 const DONUT_PILL_TITLE = "Distinct problems (fingerprints) — the same finding "
   + "open on two branches counts once here.";
 

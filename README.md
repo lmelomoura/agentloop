@@ -1257,10 +1257,18 @@ dialog that opens when you click a decision's fingerprint on Activity are the
 same browser, filtered differently, and not two tables to drift apart. Both can
 be open at once, and each keeps its own filters.
 
-`total` and `unique` are shown as two labelled numbers above it, never collapsed
-into one: the same finding open on `main` and on `develop` is two rows and one
-problem, so 189 findings can be 93 problems, and a single number silently
-answers whichever question you were not asking.
+**One row per finding, not one per branch.** The browser unions the latest
+finished analysis of every branch and groups it by fingerprint: the same
+finding on `main` and on `develop` is one row naming both. Its Status is the
+reading that needs attention first — open on any branch outranks a decision,
+and a decision outranks `fixed`, so a finding reads fixed only once every
+branch it is on says so — and when the branches disagree, each one's own
+state is written beside its name. A decision is recorded against the
+project, so one row is also the honest shape of what you decide on: before
+this, every finding already ruled on came back in front of you, as a second
+row, each time another branch was analysed. *Branch: main* shows the finding
+as `main` reads it. The consolidated export stays one row per branch,
+because a fix is applied on a branch.
 
 **Saved filters.** The view somebody works from every day — say critical and
 high, secrets only, resolved hidden, sorted by branch — is saved under a name per
