@@ -18,6 +18,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **A finding can carry a verdict** — `confirmed`, `needs_validation` or
+  `rejected`, each with a reason that is never optional — validated by
+  `bin/security/verdict.py`. Until now the severity of a `sast` finding was
+  the word of the agent that found it, and nothing in the ledger could tell a
+  read claim from an unread one.
+
 ### Changed
 
 - **The security-analysis skill has a criterion for what qualifies as a
