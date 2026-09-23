@@ -20,6 +20,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The verification queue.** `queries.verify_queue` is the one place the
+  scope lives: the agent's own `sast` findings at medium or above, plus any
+  below that whose candidate declares a high or critical impact — the evasion
+  route block 4.1 wrote down as open. Ordered by the **worse of the declared
+  severity and the declared impact**, so the group whose severity is least
+  trustworthy is not the group a budget that runs out never reaches.
+
 - **A finding can carry a verdict** — `confirmed`, `needs_validation` or
   `rejected`, each with a reason that is never optional — validated by
   `bin/security/verdict.py`. Until now the severity of a `sast` finding was
@@ -31,6 +38,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   never cleared by a re-report; a verdict is not inherited between analyses.
 
 ### Changed
+
+- **A disproved finding leaves the posture.** `queries.counted` — open AND
+  not `rejected` — replaces the copies of the open-ness rule across the
+  counters, the reports and the browser: a finding a verifier disproved stops
+  being counted as exposure everywhere at once, is kept off the page by
+  default exactly as a `fixed` one is, and stays a row the reader can still
+  open. The checklist also carries the previous analysis's verdict, shown and
+  never inherited.
 
 - **The security-analysis skill has a criterion for what qualifies as a
   finding** — Cloudflare's boundary requirement and five severity anchors —

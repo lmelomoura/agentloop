@@ -15,7 +15,7 @@ from . import coverage
 # a second copy is how the export and the screen would come to disagree
 # about which findings are still work. queries imports diff and ledger,
 # never report, so this cannot cycle.
-from .queries import RESOLVED_STATES
+from .queries import RESOLVED_STATES, counted
 
 STATES = ("new", "regressed", "open", "partial", "pending", "fixed", "accepted", "false_positive")
 # Ordered most severe first. `info` is last on purpose: it is below the default
@@ -46,7 +46,7 @@ def _summary(findings):
     accepted_in_severity = 0
     for f in findings:
         by_state[f["state"]] = by_state.get(f["state"], 0) + 1
-        if f["state"] not in ("fixed", "false_positive"):
+        if f["state"] not in ("fixed", "false_positive") and f.get("verdict") != "rejected":
             by_severity[f["severity"]] = by_severity.get(f["severity"], 0) + 1
             if f["state"] == "accepted":
                 accepted_in_severity += 1
@@ -456,8 +456,8 @@ def _consolidated_groups(rows, branch_meta):
         items = _worst_first(by_branch.get(br, []))
         m = branch_meta.get(br, {})
         groups.append({"branch": br, "analysis": m,
-                       "open": [r for r in items if r["state"] not in RESOLVED_STATES],
-                       "resolved": [r for r in items if r["state"] in RESOLVED_STATES]})
+                       "open": [r for r in items if counted(r)],
+                       "resolved": [r for r in items if not counted(r)]})
     return groups
 
 

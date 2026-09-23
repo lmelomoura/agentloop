@@ -2987,7 +2987,7 @@ def cmd_project_data(args):
         for f in findings:
             if f["state"] in checklist_counts:
                 checklist_counts[f["state"]] += 1
-        open_findings = [f for f in findings if queries.is_open(f["state"])]
+        open_findings = [f for f in findings if queries.counted(f)]
         buckets = {}
         for f in open_findings:
             b = buckets.setdefault(f.get("rule") or "", {

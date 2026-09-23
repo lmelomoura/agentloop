@@ -28,6 +28,75 @@ def is_open(state) -> bool:
     return state not in RESOLVED_STATES
 
 
+# THE ONE PREDICATE FOR "this finding is exposure somebody still carries".
+# `is_open` answers the half about the state; this answers the whole question,
+# and every counter in this module and in report.py asks it rather than
+# carrying its own copy -- a second copy of a rule is how two screens come to
+# disagree about the same row.
+#
+# A `rejected` finding is not exposure: a verifier read the code and said what
+# disproves it, and the reason is printed in the report. It is still a ROW --
+# in the browser, in the downloads, searchable -- because the record that
+# somebody considered and dismissed it is worth keeping, and because the next
+# analysis puts it back in the queue rather than inheriting the verdict.
+def counted(finding) -> bool:
+    return is_open(finding.get("state", "")) and finding.get("verdict") != "rejected"
+
+
+# Which findings a verifier is asked about, and the whole of it. Two groups:
+#
+#   the core       `sast` the AGENT minted, at medium or above -- the claims
+#                  that exist only because the model made them.
+#   the evasion    the same, at low or info, whose candidate declares an
+#                  impact of high or critical. Block 4.1 left this route open
+#                  and wrote it down: lowering a severity escapes the door's
+#                  demand for a trace. A finding cannot both be minor and
+#                  carry a high impact without somebody looking.
+#
+# The pre-pass's own rows are out: they were not minted by judgement. A
+# resolved finding is out: there is nothing left to verify.
+VERIFY_SEVERITIES = ("critical", "high", "medium")
+HIGH_IMPACT = ("high", "critical")
+
+
+def _impact_of(finding) -> str:
+    impact = (finding.get("candidate") or {}).get("impact")
+    return impact.get("score", "") if isinstance(impact, dict) else ""
+
+
+def in_verify_scope(finding) -> bool:
+    if finding.get("category") != "sast" or finding.get("producer") != diff.AGENT:
+        return False
+    if finding.get("verdict"):
+        return False
+    if not is_open(finding.get("state", "")):
+        return False
+    return (finding.get("severity") in VERIFY_SEVERITIES
+            or _impact_of(finding) in HIGH_IMPACT)
+
+
+def verify_queue(conn, analysis_id) -> list:
+    """The findings of this analysis still waiting for a verifier, worst
+    first, then in the order they were recorded.
+
+    WORST IS THE WORSE OF THE TWO -- the declared severity and the candidate's
+    own impact. Ordering by severity alone puts the evasion route (a `low`
+    claiming a `critical` impact) at the END of the queue, which is exactly
+    where a budget that runs out never reaches: the one group whose severity
+    is least trustworthy would be the one least likely to be checked.
+
+    Read through `checklist` and not by SQL, for the reason `finding_rows`
+    gives: a finding's STATE is derived by comparing two analyses, and the
+    impact lives inside a document `ledger.findings_of` already decodes.
+    Nothing here reads inside JSON in SQL.
+    """
+    _analysis, findings = checklist(conn, analysis_id)
+    rows = [f for f in findings if in_verify_scope(f)]
+    rows.sort(key=lambda f: min(_SEV_RANK.get(f["severity"], 9),
+                                _SEV_RANK.get(_impact_of(f), 9)))
+    return rows
+
+
 class AnalysisNotFound(LookupError):
     """Raised by `_analysis_row` when the id is not in the ledger.
 
@@ -135,10 +204,18 @@ def checklist(conn, analysis_id):
     # nothing at all.
     prev_occurrences = {f["fingerprint"]: {o["file"] for o in f["occurrences"]}
                         for f in previous}
+    # THE VERDICT THE PREVIOUS ANALYSIS REACHED, shown and never inherited.
+    # A verdict is a reading of one day, not a permanent decision (that is
+    # what `decision` is), so this analysis starts with `verdict=''` and puts
+    # the finding back in the queue. What the hunter gains is knowing that
+    # somebody already disproved it once -- and with what -- instead of
+    # re-discovering it from scratch every run.
+    prev_verdicts = {f["fingerprint"]: (f.get("verdict") or "") for f in previous}
     for f in current:
         before = prev_occurrences.get(f["fingerprint"])
         if before is not None:
             f["closed_occurrences"] = len(before - {o["file"] for o in f["occurrences"]})
+        f["previous_verdict"] = prev_verdicts.get(f["fingerprint"], "")
 
     # done/capped only, exactly as `latest_analysis` requires of a baseline. A
     # FAILED analysis is a run that fell over holding a partial set of
@@ -239,7 +316,7 @@ def _annotate_fixed_elsewhere(conn, project, rows, repo_paths):
     handful of times, and a finding count that grew tenfold would not change
     that.
     """
-    open_rows = [r for r in rows if is_open(r["state"])]
+    open_rows = [r for r in rows if counted(r)]
     if not open_rows:
         return
     from . import branchgit
@@ -413,7 +490,7 @@ def posture(conn, project, branch, latest=None):
     _analysis, findings = checklist(conn, a["id"])
     out = _empty_posture()
     for f in findings:
-        if not is_open(f["state"]):
+        if not counted(f):
             continue
         if f["severity"] in out:
             out[f["severity"]] += 1
@@ -600,7 +677,7 @@ def trend(conn, project, branch, days=30):
             # trend line can silently plot them out of order.
             " ORDER BY started, id", (project, branch, since)):
         _an, findings = checklist(conn, a["id"])
-        open_findings = [f for f in findings if is_open(f["state"])]
+        open_findings = [f for f in findings if counted(f)]
         # The same open set, split by severity -- the project Overview's
         # trend chart draws one line per severity behind its Total/Critical/
         # .../Info control, and a chart cannot derive a Critical-only series
@@ -727,7 +804,7 @@ def recent_analyses(conn, limit=5, offset=0, projects=None):
             sev = {"critical": 0, "high": 0, "medium": 0}
             open_n = 0
             for f in findings:
-                if not is_open(f["state"]):
+                if not counted(f):
                     continue
                 open_n += 1
                 if f["severity"] in sev:
@@ -833,7 +910,7 @@ def _open_findings_by_fingerprint(conn, project, since=None):
             continue
         _an, findings = checklist(conn, a["id"])
         for f in findings:
-            if not is_open(f["state"]):
+            if not counted(f):
                 continue
             fp = f["fingerprint"]
             current = by_fingerprint.get(fp)
@@ -1154,8 +1231,8 @@ def finding_rows(conn, project, filters=None, sort="severity",
     # dozens of them. A state the operator asked for by name passes the gate.
     asked_for = set(f.get("state") or ())
     if not f.get("show_resolved"):
-        rows = [r for r in rows if is_open(r["state"]) or r["state"] in asked_for]
-    for key in ("severity", "state", "category", "branch", "confidence"):
+        rows = [r for r in rows if counted(r) or r["state"] in asked_for]
+    for key in ("severity", "state", "category", "branch", "confidence", "verdict"):
         if f.get(key):
             rows = [r for r in rows if r.get(key) in f[key]]
     if f.get("fingerprint"):
@@ -1193,6 +1270,12 @@ def finding_rows(conn, project, filters=None, sort="severity",
     # the same reason `by_severity` itself is: the browser may be showing
     # page 2 of 5, and the count has to be exact regardless.
     fixed_by_severity = {s: 0 for s in _SEV_RANK}
+    # Counted over the rows the filters MATCHED, disproved ones included when
+    # the reader asked for them: this pair answers "how many of what is on
+    # this page does the floor hide", not "how much exposure is there". A
+    # `rejected` finding is kept off the page entirely by `counted` in the
+    # `show_resolved` gate above, exactly as a `fixed` one is; what the
+    # posture counts is `posture`/`trend`'s business, and those ask `counted`.
     for r in rows:
         if r["severity"] in by_severity:
             by_severity[r["severity"]] += 1

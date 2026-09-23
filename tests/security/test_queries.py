@@ -1734,3 +1734,64 @@ def test_checklist_hands_the_guides_over_decoded(tmp_path):
     ledger.set_guides(conn, aid, recommended=["ATTACK-CLASSES"])
     analysis, _ = queries.checklist(conn, aid)
     assert analysis["guides"] == {"recommended": ["ATTACK-CLASSES"]}
+
+
+# ------------------------------------------- what a disproved finding costs
+
+def test_a_rejected_finding_leaves_the_posture_and_stays_in_the_rows(tmp_path):
+    """`counted` is the one predicate: open AND not disproved. A rejected
+    finding is not exposure -- somebody read the code and said so -- but it is
+    still a row, still in the report, and still searchable."""
+    db = tmp_path / "s.db"
+    conn = ledger.connect(db)
+    aid = ledger.start_analysis(conn, "web", "web", "main", "abc", "quick", "r1")
+    ledger.mark_prepared(conn, aid, ["semgrep"])
+    for fp, sev in (("a" * 64, "critical"), ("b" * 64, "high")):
+        ledger.record_finding(conn, aid, {
+            "fingerprint": fp, "category": "sast", "rule": "xss", "severity": sev,
+            "title": "t", "rationale": "r", "producer": "agent",
+            "occurrences": [{"file": "a.py", "line": 1}]})
+    ledger.record_verdict(conn, aid, "a" * 64, "rejected", "the escaping helper at a.py:1")
+    ledger.finish_analysis(conn, aid, "done")
+    ro = queries.read_only(db)
+
+    post = queries.posture(ro, "web", "main")
+    assert post["critical"] == 0, "a rejected finding is not exposure"
+    assert post["high"] == 1
+    assert post["total"] == 1
+
+    # Off the page by default, exactly as a `fixed` finding is -- and there
+    # when the reader asks for the resolved, because the record of what was
+    # dismissed and why is worth reading.
+    default = queries.finding_rows(ro, "web", {})
+    assert [r["fingerprint"][0] for r in default["rows"]] == ["b"]
+    page = queries.finding_rows(ro, "web", {"show_resolved": True})
+    assert {r["fingerprint"][0] for r in page["rows"]} == {"a", "b"}, \
+        "it is still a row: the reader sees what was disproved and why"
+
+    only = queries.finding_rows(ro, "web", {"verdict": ["rejected"], "show_resolved": True})
+    assert [r["fingerprint"][0] for r in only["rows"]] == ["a"]
+
+
+def test_the_checklist_carries_the_previous_analysis_verdict(tmp_path):
+    """Not inherited -- shown. The hunter sees that the last analysis had this
+    disproved, so it does not re-discover it from scratch; the verdict of THIS
+    analysis is still empty until somebody verifies it again."""
+    db = tmp_path / "s.db"
+    conn = ledger.connect(db)
+    row = {"fingerprint": "a" * 64, "category": "sast", "rule": "xss",
+           "severity": "high", "title": "t", "rationale": "r", "producer": "agent",
+           "occurrences": [{"file": "a.py", "line": 1}]}
+    first = ledger.start_analysis(conn, "web", "web", "main", "abc", "quick", "r1")
+    ledger.mark_prepared(conn, first, ["semgrep"])
+    ledger.record_finding(conn, first, row)
+    ledger.record_verdict(conn, first, "a" * 64, "rejected", "the guard at a.py:1")
+    ledger.finish_analysis(conn, first, "done")
+
+    second = ledger.start_analysis(conn, "web", "web", "main", "def", "quick", "r2")
+    ledger.mark_prepared(conn, second, ["semgrep"])
+    ledger.record_finding(conn, second, row)
+    _an, findings = queries.checklist(conn, second)
+    f = findings[0]
+    assert f["verdict"] == "", "this analysis has not verified it"
+    assert f["previous_verdict"] == "rejected"
