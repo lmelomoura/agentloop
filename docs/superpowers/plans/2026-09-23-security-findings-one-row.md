@@ -993,7 +993,7 @@ Em `CHANGELOG.md`, acrescentar ao fim da entrada da Task 1 (a que começa por **
 - Modify: `README.md`, `CHANGELOG.md`
 
 **Interfaces:**
-- Produces: `queries.decided_sast(conn, analysis_id) -> list[dict]`, cada entrada `{"fingerprint": str, "rule": str, "title": str, "severity": str, "occurrences": [{"file": str, "line": int}], "last_seen": {"branch": str, "analysis_id": int}, "decision": {"state": str, "reason": str}}`, ordenada por `(rule, fingerprint)`. A saída de `agentloop security checklist` passa a `{"analysis", "findings", "decided_sast"}`.
+- Produces: `queries.decided_sast(conn, analysis_id, listed=None) -> list[dict]` (`listed`: os findings do checklist desta análise, quando o chamador já os tem — o `cmd_checklist` passa-os, para não calcular o checklist duas vezes numa ligação sem cache; corrigido na revisão, commit 0a84571), cada entrada `{"fingerprint": str, "rule": str, "title": str, "severity": str, "occurrences": [{"file": str, "line": int}], "last_seen": {"branch": str, "analysis_id": int}, "decision": {"state": str, "reason": str}}`, ordenada por `(rule, fingerprint)`. A saída de `agentloop security checklist` passa a `{"analysis", "findings", "decided_sast"}`.
 
 - [ ] **Step 1: escrever os testes que falham**
 
@@ -1126,6 +1126,21 @@ def test_the_list_comes_in_a_stable_order(conn):
         ["broken-access-control", "xss"]
 
 
+def test_a_checklist_the_caller_already_holds_is_not_computed_again(conn, monkeypatch):
+    """`cmd_checklist` has this analysis's checklist in hand already, on a
+    connection that does not memoise it -- handed in, it must be used, not
+    computed a second time (the reason `posture` takes `latest`)."""
+    _analysis(conn, "develop", [{"fingerprint": FP}])
+    ledger.set_decision(conn, "web", FP, "accepted", "why", "me")
+    main = _analysis(conn, "main", state="running")
+    _an, listed = queries.checklist(conn, main)
+
+    def _refuse(*_args, **_kwargs):
+        raise AssertionError("checklist() computed a second time")
+    monkeypatch.setattr(queries, "checklist", _refuse)
+    assert [e["fingerprint"] for e in queries.decided_sast(conn, main, listed=listed)] == [FP]
+
+
 def test_the_skill_tells_the_agent_to_fold_into_a_decided_sast_and_never_to_copy_one():
     """The list is inert without the instruction: an agent that is never told
     to look in `decided_sast` mints the second identity anyway. And an agent
@@ -1178,7 +1193,7 @@ Expected: FAIL — `AttributeError: module 'security.queries' has no attribute '
 Em `bin/security/queries.py`, imediatamente a seguir à função `checklist`, acrescentar:
 
 ```python
-def decided_sast(conn, analysis_id):
+def decided_sast(conn, analysis_id, listed=None):
     """The agent's own `sast` findings the operator has already ruled on that
     this analysis's checklist does not list -- handed to the agent beside the
     checklist (`cmd_checklist`) so the same hole found again is re-reported
@@ -1209,12 +1224,18 @@ def decided_sast(conn, analysis_id):
     occurrences, where it was last seen, and the decision with its reason.
     Ordered by (rule, fingerprint), so two runs over the same ledger hand the
     agent the same list.
+
+    `listed`, when the caller already holds this analysis's checklist --
+    `cmd_checklist` does, on a connection that does not memoise it -- is
+    that checklist's findings, handed in rather than computed a second time:
+    the reason `posture` takes `latest`.
     """
     analysis = dict(_analysis_row(conn, analysis_id))
     decisions = ledger.decisions_for(conn, analysis["project"])
     if not decisions:
         return []
-    _an, listed = checklist(conn, analysis_id)
+    if listed is None:
+        _an, listed = checklist(conn, analysis_id)
     listed_fps = {f["fingerprint"] for f in listed}
     out = []
     for fp, decision in decisions.items():
@@ -1257,7 +1278,8 @@ def cmd_checklist(args):
     # while the list describes no state of this analysis at all -- it is for
     # the agent's fold-before-you-mint rule (SKILL.md, Job 3).
     print(json.dumps({"analysis": analysis, "findings": findings,
-                      "decided_sast": queries.decided_sast(conn, args.analysis)},
+                      "decided_sast": queries.decided_sast(conn, args.analysis,
+                                                           listed=findings)},
                      indent=2))
 ```
 
