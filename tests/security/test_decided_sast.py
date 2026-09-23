@@ -152,3 +152,20 @@ def test_the_skill_tells_the_agent_to_fold_into_a_decided_sast_and_never_to_copy
     assert blocks, "Job 3 never tells the agent about `decided_sast`"
     assert any("copied exactly" in b and "did not find yourself" in b for b in blocks), \
         "no paragraph both says to reuse the entry's fingerprint and not to copy entries"
+
+
+def test_the_skill_carries_the_rule_across_and_puts_every_fold_in_the_summary():
+    """A fold is invisible once it lands -- the finding takes the decision's
+    state -- so the skill has to say both what keeps it honest (the entry's
+    rule, which the door checks) and where it is seen (the final summary)."""
+    text = SKILL.read_text()
+    job3 = re.search(r"\*\*3\. The SAST pass\*\*(.*?)## Rules that are not negotiable",
+                     text, re.DOTALL)
+    assert job3, "SKILL.md no longer has a Job 3 section this test can read"
+    blocks = [b for b in job3.group(1).split("\n\n") if "`decided_sast`" in b]
+    assert any("`rule`" in b and "refuses" in b for b in blocks), \
+        "the fold must carry the entry's rule across, and say the door checks it"
+    summary = [p for p in text.split("\n\n") if "one-paragraph summary" in p]
+    assert summary, "SKILL.md no longer asks for a final summary this test can read"
+    assert "`decided_sast`" in summary[0] and "file:line" in summary[0], \
+        "the final summary must list every fold and where it was found"

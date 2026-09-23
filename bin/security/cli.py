@@ -1692,6 +1692,36 @@ def _candidate_requirements(conn, analysis_id, payload):
     return (["confidence"] if triage else []), category == "dependency"
 
 
+def _decided_fold_refusal(conn, analysis_id, payload) -> str:
+    """Why this `sast` payload may not land on the fingerprint it names --
+    '' when it may.
+
+    A fold into a `decided_sast` entry (SKILL.md, Job 3) turns the agent's
+    finding into the operator's `accepted`/`false_positive` the moment it
+    lands: hidden by default, out of the posture, out of the triage count.
+    That is right for the same flaw in the same place, and a way to hide a
+    different flaw under an old ruling when it is not. The rule is part of
+    the identity being reused -- the fingerprint was minted from it -- so a
+    fold that changes the rule is not the same flaw by construction, and is
+    refused. One query decides the common case: a fingerprint nobody ruled on
+    never reaches `decided_sast` at all.
+    """
+    analysis = _analysis(conn, analysis_id)
+    if conn.execute("SELECT 1 FROM decision WHERE project=? AND fingerprint=?",
+                    (analysis["project"], payload["fingerprint"])).fetchone() is None:
+        return ""
+    entry = next((e for e in queries.decided_sast(conn, analysis_id)
+                  if e["fingerprint"] == payload["fingerprint"]), None)
+    if entry is None or entry["rule"] == payload["rule"]:
+        return ""
+    return (f"report-finding: {payload['fingerprint'][:12]}… is a decided_sast "
+            f"entry recorded under rule {entry['rule']!r}, and this report says "
+            f"{payload['rule']!r}. A fold is the same flaw in the same place, and "
+            "the rule is part of what makes it the same: re-report it under the "
+            "entry's own rule, or, if what you found is a different flaw, mint its "
+            "own fingerprint with `fingerprint --snippet`. Nothing was recorded")
+
+
 def cmd_report_finding(args):
     try:
         stdin_text = sys.stdin.read()
@@ -1845,6 +1875,10 @@ def cmd_report_finding(args):
                  "at all")
     conn = _conn(args)
     _running(conn, args.analysis)
+    if payload["category"] == "sast":
+        refusal = _decided_fold_refusal(conn, args.analysis, payload)
+        if refusal:
+            sys.exit(refusal)
     # THE CANDIDATE, after every text field above has been through the same
     # gates -- so a rationale that quotes a key is still refused as
     # `rationale`, never as a missing candidate -- and before the producer is

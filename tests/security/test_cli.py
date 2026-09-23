@@ -816,15 +816,12 @@ def test_a_decision_wins_over_the_derived_state(tmp_path):
     assert checklist["findings"][0]["state"] == "false_positive"
 
 
-def test_the_checklist_hands_the_agent_the_sast_decided_on_another_branch(tmp_path):
-    """`decided_sast` rides BESIDE the checklist: an agent-minted `sast` the
-    operator ruled on while another branch's analysis held it, which this
-    analysis's checklist cannot list -- see queries.decided_sast."""
-    db = tmp_path / "security.db"
-    fp = "c" * 64
+def _decided_on_develop(db, tmp_path, fp, rule="broken-access-control"):
+    """An agent `sast` on develop, finished, accepted by the operator -- and a
+    prepared analysis of main, where it can be found again. Returns main's id."""
     dev = prepared_analysis(db, tmp_path, branch="develop", run_id="r-dev")
     run(db, "report-finding", "--analysis", str(dev), stdin=json.dumps({
-        "fingerprint": fp, "category": "sast", "rule": "broken-access-control",
+        "fingerprint": fp, "category": "sast", "rule": rule,
         "severity": "low", "title": "the drawer proxies any candidate",
         "rationale": "any id reaches the upstream", "remediation": "scope the id",
         "candidate": TRIAGE_CANDIDATE,
@@ -832,12 +829,68 @@ def test_the_checklist_hands_the_agent_the_sast_decided_on_another_branch(tmp_pa
     run(db, "finish", "--analysis", str(dev), "--state", "done")
     run(db, "decide", "--project", "web", "--fingerprint", fp, "--state", "accepted",
         "--reason", "product decision RP-217", "--by", "me")
-    main = prepared_analysis(db, tmp_path, branch="main", run_id="r-main")
+    return prepared_analysis(db, tmp_path, branch="main", run_id="r-main")
+
+
+def _fold(fp, rule):
+    return json.dumps({
+        "fingerprint": fp, "category": "sast", "rule": rule, "severity": "low",
+        "title": "the review drawer proxies any candidate id",
+        "rationale": "read on main: the id is still unscoped",
+        "remediation": "scope the id", "candidate": TRIAGE_CANDIDATE,
+        "occurrences": [{"file": "app/queue.php", "line": 60}]})
+
+
+def test_the_checklist_hands_the_agent_the_sast_decided_on_another_branch(tmp_path):
+    """`decided_sast` rides BESIDE the checklist: an agent-minted `sast` the
+    operator ruled on while another branch's analysis held it, which this
+    analysis's checklist cannot list -- see queries.decided_sast."""
+    db = tmp_path / "security.db"
+    fp = "c" * 64
+    main = _decided_on_develop(db, tmp_path, fp)
     out = run(db, "checklist", "--analysis", str(main))
     assert [e["fingerprint"] for e in out["decided_sast"]] == [fp]
     assert out["decided_sast"][0]["decision"]["state"] == "accepted"
     assert all(f["fingerprint"] != fp for f in out["findings"]), \
         "beside the checklist, never inside it"
+
+
+def test_a_fold_into_a_decided_sast_under_another_rule_is_refused(tmp_path):
+    """A fold turns the agent's finding into the operator's ruling the moment
+    it lands. The rule is part of the identity being reused, so a fold that
+    changes it is a different flaw hidden under an old decision -- refused,
+    with nothing recorded."""
+    db = tmp_path / "security.db"
+    fp = "c" * 64
+    main = _decided_on_develop(db, tmp_path, fp)
+    out = fails(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "xss"))
+    assert out.returncode != 0
+    assert "broken-access-control" in out.stderr and "xss" in out.stderr
+    listed = run(db, "checklist", "--analysis", str(main))
+    assert all(f["fingerprint"] != fp for f in listed["findings"]), "nothing was recorded"
+
+
+def test_a_fold_under_the_entrys_own_rule_takes_the_decision(tmp_path):
+    db = tmp_path / "security.db"
+    fp = "c" * 64
+    main = _decided_on_develop(db, tmp_path, fp)
+    run(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "broken-access-control"))
+    listed = run(db, "checklist", "--analysis", str(main))
+    (row,) = [f for f in listed["findings"] if f["fingerprint"] == fp]
+    assert row["state"] == "accepted"
+    assert listed["decided_sast"] == [], "folded: the checklist lists it now"
+
+
+def test_a_sast_nobody_ruled_on_is_held_to_no_rule(tmp_path):
+    """The guard is about decisions: an undecided fingerprint reported under
+    another rule is whatever it was before this door existed."""
+    db = tmp_path / "security.db"
+    fp = "d" * 64
+    dev = prepared_analysis(db, tmp_path, branch="develop", run_id="r-dev")
+    run(db, "report-finding", "--analysis", str(dev), stdin=_fold(fp, "broken-access-control"))
+    run(db, "finish", "--analysis", str(dev), "--state", "done")
+    main = prepared_analysis(db, tmp_path, branch="main", run_id="r-main")
+    run(db, "report-finding", "--analysis", str(main), stdin=_fold(fp, "xss"))
 
 
 def test_findings_lists_what_the_deterministic_phase_left_for_the_agent(tmp_path):
