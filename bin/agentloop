@@ -1566,6 +1566,21 @@ PLATFORMS_JQ='
              | {who: .id, on: (.enabled != false), p: $p, m: resolved(effective($p; job_model(.)))} ]
            + [ ($projects.projects // [])[] | select((.security | type) == "object") | sec_platform(.) as $p
              | {who: ("security:" + .name), on: sec_on(.), p: $p, m: resolved(effective($p; (sec(.).model // "")))} ]);
+  # The account a job, a project and a security block run under: their own,
+  # else -- for a job or a block on the project platform -- the project
+  # account, else the Default. job_account (bash) is the same rule for one job.
+  def dflt: if . == null or . == "" then "default" else . end;
+  def project_platform($p): ((($p.platform // "") | if . == "" then "anthropic" else . end) | known);
+  def job_account($j): if (($j.account // "") != "") then $j.account
+                       elif ((($j.project // "") != "") and (job_platform($j) == project_platform(project($j.project))))
+                       then (project($j.project).account | dflt)
+                       else "default" end;
+  def sec_account($p): if ((sec($p).account // "") != "") then sec($p).account
+                       elif (sec_platform($p) == project_platform($p)) then ($p.account | dflt)
+                       else "default" end;
+  def account_uses: ([ ($jobs.jobs // [])[] | {who: .id, p: job_platform(.), a: job_account(.)} ]
+                   + [ ($projects.projects // [])[] | select(type == "object") | {who: ("project:" + (.name // "")), p: project_platform(.), a: (.account | dflt)} ]
+                   + [ ($projects.projects // [])[] | select(type == "object" and (.security | type) == "object") | {who: ("security:" + (.name // "")), p: sec_platform(.), a: sec_account(.)} ]);
 '
 
 platforms_jq() { # platforms_jq <anthropic-default> <openai-default> <opencode-default> <jq-filter> [jq options…] -- runs the filter with $jobs, $projects, $resolved, $adef, $odef, $ocdef, $ocat, $occat bound and PLATFORMS_JQ's defs in scope
@@ -1686,6 +1701,204 @@ platform_jobs_on() { # platform_jobs_on <platform> [model] [only-enabled] -> one
     -r --arg p "$1" --arg m "${2:-}" --argjson only "$only"
 }
 
+# --- accounts: which sign-in a run of a platform uses ---------------------------
+# Claude Code and the Codex CLI keep one signed-in account per config
+# directory; CLAUDE_CONFIG_DIR and CODEX_HOME are how each CLI is told which.
+# A platform's accounts are the install's own -- `default`, never stored: the
+# pin or ~/.claude, the engine's CODEX_HOME or ~/.codex -- plus the ones
+# Settings registers in config/platforms.json under `accounts`, each
+# {id, name, dir}. OpenCode has none: its credentials are the providers the
+# operator configured in opencode itself.
+ACCOUNTS_NONE_OPENCODE="OpenCode has no accounts — its credentials are the providers configured in opencode itself"
+
+account_platform() { case "${1:-}" in anthropic|openai) return 0 ;; *) return 1 ;; esac; }
+account_var() { case "${1:-}" in anthropic) printf 'CLAUDE_CONFIG_DIR' ;; openai) printf 'CODEX_HOME' ;; esac; }
+account_cli_default() { case "${1:-}" in anthropic) printf '%s/.claude\n' "$HOME" ;; openai) printf '%s/.codex\n' "$HOME" ;; esac; }
+
+account_norm_dir() { # account_norm_dir <text> -> the directory with ~ expanded and no trailing slash; rc 1 and nothing printed unless that is an absolute path
+  local d
+  d="$(expand_home "${1:-}")"
+  while [ "${#d}" -gt 1 ] && [ "${d%/}" != "$d" ]; do d="${d%/}"; done
+  case "$d" in /?*) printf '%s\n' "$d" ;; *) return 1 ;; esac
+}
+
+# The value the platform's variable carries for a directory. NOTHING is the
+# CLI's own default directory, and means the variable is left unset: Claude
+# Code names the Keychain entry it reads credentials from after a hash of the
+# directory whenever CLAUDE_CONFIG_DIR is set at all, so an explicit
+# CLAUDE_CONFIG_DIR=$HOME/.claude answers "not signed in" (measured, 2.1.280).
+# Codex treats the two the same; one rule serves both.
+account_env_value() { # account_env_value <platform> <dir> -> the normalized directory, or nothing for the CLI's own default directory (and for nothing given)
+  local d
+  d="$(account_norm_dir "${2:-}")" || return 0
+  [ "$d" = "$(account_cli_default "$1")" ] && return 0
+  printf '%s\n' "$d"
+}
+
+accounts_json() { # accounts_json <platform> -> the registered accounts as a JSON list: only well-formed {id,name,dir}, never one called default; [] for a platform that has none
+  account_platform "${1:-}" || { printf '[]\n'; return 0; }
+  platforms_json | "$JQ" -c --arg p "$1" '
+    [ ((.platforms[$p].accounts // []) | if type == "array" then .[] else empty end)
+      | objects
+      | select((.id | type) == "string" and (.name | type) == "string" and (.dir | type) == "string")
+      | select(.id != "" and .id != "default" and .name != "" and .dir != "")
+      | {id, name, dir} ]'
+}
+
+account_known() { # account_known <platform> <id> -> 0 for `default`, and for an id registered on that platform
+  [ "${2:-}" = "default" ] && return 0
+  account_platform "${1:-}" || return 1
+  accounts_json "$1" | "$JQ" -e --arg id "${2:-}" 'any(.[]; .id == $id)' >/dev/null 2>&1
+}
+
+account_ids_line() { # account_ids_line <platform> -> default and every registered id, comma-separated, for messages
+  { printf 'default\n'; accounts_json "$1" | "$JQ" -r '.[].id'; } | tr '\n' ',' | sed 's/,$//; s/,/, /g'
+}
+
+account_default_dir() { # account_default_dir <platform> -> the Default account's directory: the install's pin or ~/.claude; the engine's own Codex home (CODEX_HOME, else ~/.codex)
+  local d=""
+  case "${1:-}" in
+    anthropic) d="$(installed_config_dir)" ;;
+    openai)    d="$CODEX_HOME_DIR" ;;
+  esac
+  if [ -n "$d" ]; then d="$(account_norm_dir "$d")" || d=""; fi
+  [ -n "$d" ] || d="$(account_cli_default "${1:-}")"
+  printf '%s\n' "$d"
+}
+
+account_field() { # account_field <platform> <id> <name|dir> -> that field; the Default is named Default, and its directory is account_default_dir
+  if [ "${2:-}" = "default" ]; then
+    case "${3:-}" in name) printf 'Default\n' ;; dir) account_default_dir "$1" ;; esac
+    return 0
+  fi
+  accounts_json "$1" | "$JQ" -r --arg id "${2:-}" --arg f "${3:-}" 'first(.[] | select(.id == $id) | .[$f]) // empty'
+}
+
+account_env_dir() { # account_env_dir <platform> <id> -> what the platform's variable carries for a run on that account: nothing for the CLI's own directory
+  account_env_value "$1" "$(account_field "$1" "$2" dir)"
+}
+
+account_slug() { # account_slug <name> -> the id a new account is given: lower case, each run outside [a-z0-9] one dash, no dash at either end, at most 40 characters; account when nothing is left
+  local s
+  s="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//' | cut -c1-40 | sed 's/-$//')"
+  [ -n "$s" ] || s="account"
+  printf '%s\n' "$s"
+}
+
+account_users() { # account_users <platform> <id> -> who is configured on that account, one per line: a job id, project:<name>, security:<name> -- switched on or not
+  platforms_jq "" "" "" 'account_uses[] | select(.p == $p and .a == $a) | .who' -r --arg p "$1" --arg a "$2"
+}
+
+account_refusal() { # account_refusal <platform> <own-id> <name> <dir> -> one sentence when the account cannot be saved as given, nothing when it can; <own-id> is the account being edited ("" for a new one), whose name and directory do not count as taken
+  local p="$1" own="$2" name="$3" dir="$4" nd taken
+  [ -n "$name" ] || { printf 'an account needs a name'; return 0; }
+  if [ "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" = "default" ]; then
+    printf "Default is the install's own account — choose another name"; return 0
+  fi
+  if accounts_json "$p" | "$JQ" -e --arg n "$name" --arg own "$own" \
+       'any(.[]; .id != $own and (.name | ascii_downcase) == ($n | ascii_downcase))' >/dev/null 2>&1; then
+    printf "an account named '%s' already exists on %s" "$name" "$p"; return 0
+  fi
+  [ -n "$dir" ] || { printf 'an account needs a directory'; return 0; }
+  if ! nd="$(account_norm_dir "$dir")"; then
+    printf "the directory must be absolute or start with ~/ (got '%s')" "$dir"; return 0
+  fi
+  if [ ! -d "$nd" ]; then
+    if [ "$p" = "anthropic" ]; then
+      printf '%s does not exist — create it by signing in: CLAUDE_CONFIG_DIR=%s claude auth login' "$nd" "$nd"
+    else
+      printf '%s does not exist — create it and sign in: mkdir -p %s && CODEX_HOME=%s codex login' "$nd" "$nd" "$nd"
+    fi
+    return 0
+  fi
+  if [ "$nd" = "$(account_default_dir "$p")" ]; then
+    printf "%s is the Default account's directory" "$nd"; return 0
+  fi
+  taken="$(accounts_json "$p" | "$JQ" -r --arg own "$own" '.[] | select(.id != $own) | [.name, .dir] | @tsv' \
+    | while IFS="$(printf '\t')" read -r tname tdir; do
+        if [ "$(account_norm_dir "$tdir")" = "$nd" ]; then printf '%s' "$tname"; break; fi
+      done)"
+  if [ -n "$taken" ]; then
+    printf "%s is already the directory of the account '%s'" "$nd" "$taken"; return 0
+  fi
+  return 0
+}
+
+account_add() { # account_add <platform> <name> <dir> -> the new account's id; rc 1 with the refusal on stdout
+  local p="$1" name="$2" dir="$3" why id base n sdir
+  why="$(account_refusal "$p" "" "$name" "$dir")"
+  [ -z "$why" ] || { printf '%s\n' "$why"; return 1; }
+  base="$(account_slug "$name")"; id="$base"; n=2
+  while [ "$id" = "default" ] || account_known "$p" "$id"; do id="$base-$n"; n=$(( n + 1 )); done
+  sdir="$dir"
+  while [ "${#sdir}" -gt 1 ] && [ "${sdir%/}" != "$sdir" ]; do sdir="${sdir%/}"; done
+  write_platforms --arg p "$p" --arg id "$id" --arg n "$name" --arg d "$sdir" '
+    .platforms[$p] = ((.platforms[$p] // {enabled:false, bin:"", models:[]})
+      | .accounts = ((if (.accounts | type) == "array" then .accounts else [] end) + [{id:$id, name:$n, dir:$d}]))'
+  skills_link_into "$(account_norm_dir "$dir")/skills" install >/dev/null 2>&1 || true
+  printf '%s\n' "$id"
+}
+
+account_edit() { # account_edit <platform> <id> <name> <dir> -> rc 1 with the refusal on stdout
+  local p="$1" aid="$2" name="$3" dir="$4" why old sdir
+  if [ "$aid" = "default" ]; then printf "the Default account is the install's own — it is not edited here\n"; return 1; fi
+  account_known "$p" "$aid" || { printf "no account '%s' on %s\n" "$aid" "$p"; return 1; }
+  why="$(account_refusal "$p" "$aid" "$name" "$dir")"
+  [ -z "$why" ] || { printf '%s\n' "$why"; return 1; }
+  old="$(account_norm_dir "$(account_field "$p" "$aid" dir)")"
+  sdir="$dir"
+  while [ "${#sdir}" -gt 1 ] && [ "${sdir%/}" != "$sdir" ]; do sdir="${sdir%/}"; done
+  write_platforms --arg p "$p" --arg id "$aid" --arg n "$name" --arg d "$sdir" '
+    .platforms[$p].accounts = [ .platforms[$p].accounts[] | if (type == "object" and .id == $id) then (. + {name:$n, dir:$d}) else . end ]'
+  if [ "$old" != "$(account_norm_dir "$dir")" ]; then
+    skills_link_into "$(account_norm_dir "$dir")/skills" install >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+account_remove() { # account_remove <platform> <id> -> rc 1 with the refusal on stdout
+  local p="$1" aid="$2" users
+  if [ "$aid" = "default" ]; then printf "the Default account is the install's own — it cannot be removed\n"; return 1; fi
+  account_known "$p" "$aid" || { printf "no account '%s' on %s\n" "$aid" "$p"; return 1; }
+  users="$(account_users "$p" "$aid" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+  if [ -n "$users" ]; then
+    printf "'%s' is used by %s — move them to another account first\n" "$(account_field "$p" "$aid" name)" "$users"; return 1
+  fi
+  write_platforms --arg p "$p" --arg id "$aid" '
+    .platforms[$p].accounts = [ .platforms[$p].accounts[] | select((type == "object" and .id == $id) | not) ]'
+  return 0
+}
+
+account_check_sentence() { # account_check_sentence <platform> <id> -> signed in as <who> on anthropic, the CLI's own words on openai, else the reason it is not ready
+  local j; j="$(platform_check "$1" "$2")"
+  if [ "$(printf '%s' "$j" | "$JQ" -r .ready)" = "true" ]; then
+    if [ "$1" = "anthropic" ]; then printf 'signed in as %s' "$(printf '%s' "$j" | "$JQ" -r .account)"
+    else printf '%s' "$(printf '%s' "$j" | "$JQ" -r .account)"; fi
+  else
+    printf '%s' "$(printf '%s' "$j" | "$JQ" -r .reason)"
+  fi
+}
+
+# Every account of a platform, the Default first, each with its live check and
+# who is configured on it -- what Settings draws. The ids are collected before
+# the loop: a CLI asked for its session inside a `while read` could eat the
+# rest of the list from stdin.
+platform_accounts_json() { # platform_accounts_json <platform> -> a JSON list
+  local aid ids
+  ids="default $(accounts_json "$1" | "$JQ" -r '.[].id' | tr '\n' ' ')"
+  for aid in $ids; do
+    "$JQ" -nc --arg id "$aid" --arg name "$(account_field "$1" "$aid" name)" \
+      --arg dir "$(account_field "$1" "$aid" dir)" --arg adir "$(account_env_dir "$1" "$aid")" \
+      --argjson check "$(platform_check "$1" "$aid" </dev/null)" \
+      --argjson users "$(account_users "$1" "$aid" | "$JQ" -R . | "$JQ" -sc .)" '
+      {id:$id, name:$name, dir:$dir, account_dir:$adir, builtin:($id == "default"),
+       check:{ready:$check.ready, account:$check.account, reason:$check.reason},
+       used_by:{jobs:[$users[] | select((startswith("project:") or startswith("security:")) | not)],
+                projects:[$users[] | select(startswith("project:")) | ltrimstr("project:")],
+                security:[$users[] | select(startswith("security:")) | ltrimstr("security:")]}}'
+  done | "$JQ" -sc .
+}
+
 platform_cli_name() { case "$1" in anthropic) printf 'claude' ;; openai) printf 'codex' ;; opencode) printf 'opencode' ;; esac; }
 platform_install_hint() {
   case "$1" in
@@ -1719,11 +1932,20 @@ platform_bin() { # platform_bin <platform> -> the CLI's path: the environment ov
 # version, is there a session, as whom. Never stored -- it costs 0.04-0.14 s
 # (`codex login status`, `claude auth status --json`, `--version`), so the
 # Settings page, `status` and every launch simply ask again.
-platform_check() { # platform_check <platform> -> one JSON object; always exits 0
+platform_check() { # platform_check <platform> [account-id [account-dir]] -> one JSON object; always exits 0. The session checked is that account's -- the Default when none is named; a third argument is the directory to check exactly as given, empty for the CLI's own (what a resume passes, off the run it continues)
   local p="$1" bin src found=false ver="" vrc=0 acct="" reason="" ready=false supported=true
+  local aid="${2:-default}" adir="" arefusal=""
   if ! platform_listed "$p"; then
     "$JQ" -nc --arg p "$p" '{platform:$p, supported:false, ready:false, bin:"", bin_found:false, bin_source:"", version:"", account:"", reason:("unknown platform " + $p)}'
     return 0
+  fi
+  # Whose session is asked for: the directory given (a resume), else the
+  # account's (account_env_dir: empty is the CLI's own). An id Settings does
+  # not have is not asked about at all -- the answer is that it is not one.
+  if [ "$#" -ge 3 ]; then adir="${3:-}"
+  elif account_platform "$p"; then
+    if [ "$aid" = "default" ] || account_known "$p" "$aid"; then adir="$(account_env_dir "$p" "$aid")"
+    else arefusal="account '$aid' is not an account of $p in Settings"; fi
   fi
   platform_planned "$p" && supported=false
   bin="$(platform_bin "$p")"; src="$(platform_bin_source "$p")"
@@ -1741,28 +1963,46 @@ platform_check() { # platform_check <platform> -> one JSON object; always exits 
   elif [ "$vrc" -eq 124 ]; then
     ver=""
     reason="$(platform_cli_name "$p") --version timed out after ${OPENCODE_DEADLINE} s (the CLI hung)"
+  elif [ -n "$arefusal" ]; then
+    reason="$arefusal"
   else
     case "$p" in
       anthropic)
-        local out cfgdir rc; cfgdir="$(installed_config_dir)"
-        if [ -n "$cfgdir" ]; then out="$(CLAUDE_CONFIG_DIR="$cfgdir" "$bin" auth status --json 2>/dev/null)"; rc=$?
-        else out="$("$bin" auth status --json 2>/dev/null)"; rc=$?; fi
-        if [ "$rc" -eq 0 ] && printf '%s' "$out" | "$JQ" -e '.loggedIn == true' >/dev/null 2>&1; then
-          ready=true
-          acct="$(printf '%s' "$out" | "$JQ" -r '[(.email // ""), ((.subscriptionType // "") | if . == "" then "" else . + " plan" end)] | map(select(. != "")) | join(" · ")' 2>/dev/null)"
-          [ -n "$acct" ] || acct="signed in"
+        local out rc
+        if [ "$aid" != "default" ] && [ -n "$adir" ] && [ ! -d "$adir" ]; then
+          # A registered account whose directory is gone has no session; the
+          # login creates the directory again.
+          reason="claude is not signed in in $adir (run: CLAUDE_CONFIG_DIR=$adir claude auth login)"
         else
-          case "$out" in
-            *loggedIn*)
-              if [ -n "$cfgdir" ]; then reason="claude is not signed in in $cfgdir (run: CLAUDE_CONFIG_DIR=$cfgdir claude auth login)"
-              else reason="claude is not signed in (run: claude auth login)"; fi ;;
-            *) # no `auth status` on this CLI (pre-2.1): the binary counts as ready, as it always did
-               ready=true; acct="unknown — claude auth status needs Claude Code 2.1+" ;;
-          esac
+          # The variable exactly as a run gets it: set to the account's own
+          # directory, or GONE for the CLI's -- never pointed at ~/.claude,
+          # which would read another Keychain entry (see account_env_value).
+          if [ -n "$adir" ]; then out="$(CLAUDE_CONFIG_DIR="$adir" "$bin" auth status --json 2>/dev/null)"; rc=$?
+          else out="$(env -u CLAUDE_CONFIG_DIR "$bin" auth status --json 2>/dev/null)"; rc=$?; fi
+          if [ "$rc" -eq 0 ] && printf '%s' "$out" | "$JQ" -e '.loggedIn == true' >/dev/null 2>&1; then
+            ready=true
+            acct="$(printf '%s' "$out" | "$JQ" -r '[(.email // ""), ((.subscriptionType // "") | if . == "" then "" else . + " plan" end)] | map(select(. != "")) | join(" · ")' 2>/dev/null)"
+            [ -n "$acct" ] || acct="signed in"
+          else
+            case "$out" in
+              *loggedIn*)
+                if [ -n "$adir" ]; then reason="claude is not signed in in $adir (run: CLAUDE_CONFIG_DIR=$adir claude auth login)"
+                else reason="claude is not signed in (run: claude auth login)"; fi ;;
+              *) # no `auth status` on this CLI (pre-2.1): the binary counts as ready, as it always did
+                 ready=true; acct="unknown — claude auth status needs Claude Code 2.1+" ;;
+            esac
+          fi
         fi ;;
       openai)
         local line
-        if line="$("$bin" login status 2>&1)"; then ready=true; acct="$(printf '%s\n' "$line" | head -1)"
+        if [ "$aid" != "default" ] && [ -n "$adir" ] && [ ! -d "$adir" ]; then
+          # The CLI refuses a CODEX_HOME that does not exist (measured, 0.153.4).
+          reason="codex is not signed in in $adir (run: mkdir -p $adir && CODEX_HOME=$adir codex login)"
+        elif [ -n "$adir" ] && line="$(CODEX_HOME="$adir" "$bin" login status 2>&1)"; then
+          ready=true; acct="$(printf '%s\n' "$line" | head -1)"
+        elif [ -z "$adir" ] && line="$(env -u CODEX_HOME "$bin" login status 2>&1)"; then
+          ready=true; acct="$(printf '%s\n' "$line" | head -1)"
+        elif [ -n "$adir" ]; then reason="codex is not signed in in $adir (run: CODEX_HOME=$adir codex login)"
         else reason="codex is not signed in (run: codex login)"; fi ;;
       opencode)
         # A CLI of providers, not of one account: ready when it lists a model
@@ -1803,11 +2043,12 @@ platform_check() { # platform_check <platform> -> one JSON object; always exits 
   fi
   "$JQ" -nc --arg p "$p" --argjson supported "$supported" --argjson ready "$ready" --arg bin "$bin" \
     --argjson found "$found" --arg src "$src" --arg ver "$ver" --arg acct "$acct" --arg reason "$reason" \
-    '{platform:$p, supported:$supported, ready:$ready, bin:$bin, bin_found:$found, bin_source:$src, version:$ver, account:$acct, reason:$reason}'
+    --arg aid "$aid" --arg adisp "${adir:-$(account_cli_default "$p")}" \
+    '{platform:$p, supported:$supported, ready:$ready, bin:$bin, bin_found:$found, bin_source:$src, version:$ver, account:$acct, reason:$reason, account_id:$aid, account_dir:$adisp}'
 }
 
-platform_ready() { # platform_ready <platform> -> 0; or 1 with the reason on stdout (platform_check decides)
-  local j; j="$(platform_check "$1")"
+platform_ready() { # platform_ready <platform> [account-id [account-dir]] -> 0; or 1 with the reason on stdout (platform_check decides)
+  local j; j="$(platform_check "$@")"
   [ "$(printf '%s' "$j" | "$JQ" -r '.ready')" = "true" ] && return 0
   printf '%s' "$(printf '%s' "$j" | "$JQ" -r '.reason')"
   return 1
@@ -1909,10 +2150,10 @@ platform_affected_note() { # platform_affected_note <platform> [model] -> the en
   fi
 }
 
-cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-models> <platform> [path]
+cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-models|accounts|account-add|account-edit|account-remove> <platform> [...]
   local verb="${1:-}" p="${2:-}" j out rc list cur added removed id catalog
-  case "$verb" in check|enable|disable|set-bin|models|set-models) ;;
-    *) die "usage: agentloop platform <check|enable|disable|set-bin|models|set-models> <platform>" ;; esac
+  case "$verb" in check|enable|disable|set-bin|models|set-models|accounts|account-add|account-edit|account-remove) ;;
+    *) die "usage: agentloop platform <check|enable|disable|set-bin|models|set-models|accounts|account-add|account-edit|account-remove> <platform> [...]" ;; esac
   platform_listed "$p" || die "platform: unknown platform '$p' (one of: $PLATFORMS $PLATFORMS_PLANNED)"
   # Every other verb reaches config/platforms.json and so seeds it in passing
   # (enable/disable/set-bin/set-models through write_platforms, models through
@@ -1923,7 +2164,7 @@ cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-m
   # discover it only on its first write.
   platforms_ensure
   case "$verb" in
-    check) platform_check "$p" ;;
+    check) platform_check "$p" ${3:+"$3"} ;;
     enable)
       j="$(platform_check "$p")"
       [ "$(printf '%s' "$j" | "$JQ" -r .ready)" = "true" ] || die "cannot enable $p: $(printf '%s' "$j" | "$JQ" -r .reason)"
@@ -1993,6 +2234,21 @@ cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-m
       write_platforms --arg p "$p" --argjson m "$list" '.platforms[$p] = ((.platforms[$p] // {enabled:false, bin:""}) + {models:$m})'
       echo "$p models: $(printf '%s' "$list" | "$JQ" -r 'join(" ")')"
       for id in $removed; do platform_affected_note "$p" "$id"; done ;;
+    accounts)
+      account_platform "$p" || die "platform accounts: $ACCOUNTS_NONE_OPENCODE"
+      platform_accounts_json "$p" ;;
+    account-add)
+      account_platform "$p" || die "platform account-add: $ACCOUNTS_NONE_OPENCODE"
+      out="$(account_add "$p" "${3:-}" "${4:-}")" || die "platform account-add: $out"
+      echo "account '${3:-}' added on $p (id $out) — $(account_check_sentence "$p" "$out")" ;;
+    account-edit)
+      account_platform "$p" || die "platform account-edit: $ACCOUNTS_NONE_OPENCODE"
+      out="$(account_edit "$p" "${3:-}" "${4:-}" "${5:-}")" || die "platform account-edit: $out"
+      echo "account '${4:-}' saved on $p — $(account_check_sentence "$p" "${3:-}")" ;;
+    account-remove)
+      account_platform "$p" || die "platform account-remove: $ACCOUNTS_NONE_OPENCODE"
+      out="$(account_remove "$p" "${3:-}")" || die "platform account-remove: $out"
+      echo "account '${3:-}' removed from $p" ;;
   esac
 }
 
@@ -4459,6 +4715,36 @@ USER_SKILLS="$HOME/.claude/skills"
 # on OpenAI is ALSO pointed at security-analysis by path (security_prompt), so
 # it never depends on this link.
 CODEX_SKILLS="$CODEX_HOME_DIR/skills"
+# Claude Code reads the user skills of the config directory it runs with
+# (join(CLAUDE_CONFIG_DIR ?? ~/.claude, "skills"), read off the 2.1.280
+# binary), and Codex those of its CODEX_HOME. So the skills are linked into
+# every account directory as well: a run on another account otherwise reads
+# prompts that make skills mandatory which that directory does not have.
+skills_roots() { # skills_roots -> one directory per line: the Claude root, the Codex root when its home exists, then the skills directory of every other account directory that exists -- never one this tool would have to create
+  local p aid d
+  {
+    printf '%s\n' "$USER_SKILLS"
+    [ -d "$CODEX_HOME_DIR" ] && printf '%s\n' "$CODEX_SKILLS"
+    for p in anthropic openai; do
+      for aid in default $(accounts_json "$p" | "$JQ" -r '.[].id' 2>/dev/null); do
+        d="$(account_env_dir "$p" "$aid")"
+        [ -n "$d" ] && [ -d "$d" ] || continue
+        printf '%s/skills\n' "$d"
+      done
+    done
+  } | awk '!seen[$0]++'
+}
+
+skills_missing() { # skills_missing <root> -> how many of this repo's skills are not linked there; reads only, creates nothing
+  local n=0 target name link
+  for target in "$SKILLS_DIR"/*/; do
+    [ -d "$target" ] || continue
+    name="$(basename "$target")"; link="$1/$name"
+    if [ -L "$link" ] && [ "$(readlink "$link")" = "${target%/}" ]; then continue; fi
+    n=$(( n + 1 ))
+  done
+  printf '%s\n' "$n"
+}
 
 skills_link_into() { # skills_link_into <root> <status|install> -> one line per skill; returns how many are still out of place
   local root="$1" action="$2" name target link pending=0
@@ -4490,18 +4776,20 @@ skills_link_into() { # skills_link_into <root> <status|install> -> one line per 
 }
 
 cmd_skills() { # agentloop skills [install]
-  local action="${1:-status}" _skills_pending=0 _n=0
+  local action="${1:-status}" _skills_pending=0 _n root roots
   [ -d "$SKILLS_DIR" ] || die "no skills/ directory in $BASE_DIR"
-  printf '  %s\n' "$USER_SKILLS"
-  skills_link_into "$USER_SKILLS" "$action" || _skills_pending=$?
-  echo "  OpenCode reads ~/.claude/skills too (measured), so the same link serves both CLIs"
-  # Codex only when its home exists: creating ~/.codex on a machine that never
-  # installed that CLI would be this tool inventing another tool's directory.
-  if [ -d "$CODEX_HOME_DIR" ]; then
-    printf '  %s\n' "$CODEX_SKILLS"
-    skills_link_into "$CODEX_SKILLS" "$action" || _n=$?
+  roots="$(skills_roots)"
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    printf '  %s\n' "$root"
+    _n=0; skills_link_into "$root" "$action" || _n=$?
     _skills_pending=$(( _skills_pending + _n ))
-  fi
+    if [ "$root" = "$USER_SKILLS" ]; then
+      echo "  OpenCode reads ~/.claude/skills too (measured), so the same link serves both CLIs"
+    fi
+  done <<EOF
+$roots
+EOF
   # Only nag when something is actually out of place; a clean status that still
   # tells you to run install is noise that trains you to ignore the output.
   if [ "$action" != "install" ] && [ "$_skills_pending" -gt 0 ]; then
@@ -6590,7 +6878,7 @@ PLIST
   # and nothing anywhere says so -- the run just quietly holds a lower bar. So a
   # clone that installs the scheduler installs the skills it depends on, in the
   # same step, rather than leaving it as a documented step somebody skips.
-  echo "Skills (linked into ~/.claude/skills — and into ~/.codex/skills when the Codex CLI has a home):"
+  echo "Skills (linked into ~/.claude/skills, into ~/.codex/skills when the Codex CLI has a home, and into every account directory Settings registers):"
   cmd_skills install
   echo "Open the dashboard with: agentloop dashboard"
   legacy_env_warnings
@@ -7495,6 +7783,11 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop platform check|enable|disable|set-bin|models|set-models <platform> [path]
                             what Settings › Platforms does: probe a CLI, switch a platform on or off,
                             point at its binary, refresh its catalog, choose its models (JSON list on stdin)
+  agentloop platform accounts|account-add|account-edit|account-remove <platform> [id] [name] [dir]
+                            the sign-ins a platform runs under, beside the install's Default:
+                            list them with their sessions, register one (name, directory), rename
+                            or move one, remove one nothing uses; `platform check <platform> <id>`
+                            checks one account's session
   agentloop tick            internal — what launchd calls every minute
 
 Jobs are defined in $JOBS_FILE

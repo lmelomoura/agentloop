@@ -31,6 +31,8 @@
 #   FAKE_CLAUDE_LOGGED_OUT  set to play a CLI with no session: `auth status` exits 1,
 #                      and in the probe world below every model probe gets the
 #                      CLI's not-logged-in answer
+#   $CLAUDE_CONFIG_DIR/.fake-logged-out  that one directory has no session (an account signed out)
+#   $CLAUDE_CONFIG_DIR/.fake-email       the email `auth status` names for that directory
 #   FAKE_CLAUDE_VERSION  the build this stand-in plays (default 2.1.258): what
 #                      `--version` prints and the build the 400 below names
 #
@@ -56,10 +58,15 @@ set -u
 case "${1:-}" in
   --version) echo "${FAKE_CLAUDE_VERSION:-2.1.258} (Claude Code)"; exit 0 ;;
   auth)
-    if [ -n "${FAKE_CLAUDE_LOGGED_OUT:-}" ]; then
+    # One session per config directory, the way the real CLI keeps them: a
+    # directory holding .fake-logged-out has none, and .fake-email names the
+    # account signed in there.
+    if [ -n "${FAKE_CLAUDE_LOGGED_OUT:-}" ] || { [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -f "$CLAUDE_CONFIG_DIR/.fake-logged-out" ]; }; then
       printf '{"loggedIn":false,"authMethod":"none"}\n'; exit 1
     fi
-    printf '{"loggedIn":true,"authMethod":"claude.ai","email":"fake@example.org","subscriptionType":"max"}\n'; exit 0 ;;
+    email="fake@example.org"
+    if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -f "$CLAUDE_CONFIG_DIR/.fake-email" ]; then email="$(cat "$CLAUDE_CONFIG_DIR/.fake-email")"; fi
+    printf '{"loggedIn":true,"authMethod":"claude.ai","email":"%s","subscriptionType":"max"}\n' "$email"; exit 0 ;;
 esac
 
 # THE MODEL PROBES, answered from real captures: the 404 and its stderr line

@@ -20,6 +20,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Accounts per platform.** A client who signs in to several Claude and
+  Codex accounts — one config directory each — registers them in Settings ›
+  Platforms beside the install's own Default: `agentloop platform
+  accounts|account-add|account-edit|account-remove <platform>`, and `platform
+  check <platform> <id>` checks that account's own directory. The agentloop
+  skills are linked into every account directory too, the pinned one
+  included: Claude Code reads the `skills/` of the config directory it runs
+  with, so a run on any other account read prompts naming mandatory skills it
+  could not load.
+
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate
   block, a Verdict filter, and a disproved row drawn dimmed — it is recorded,
