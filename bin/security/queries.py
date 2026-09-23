@@ -167,7 +167,7 @@ def checklist(conn, analysis_id):
     return result
 
 
-def decided_sast(conn, analysis_id):
+def decided_sast(conn, analysis_id, listed=None):
     """The agent's own `sast` findings the operator has already ruled on that
     this analysis's checklist does not list -- handed to the agent beside the
     checklist (`cmd_checklist`) so the same hole found again is re-reported
@@ -198,12 +198,18 @@ def decided_sast(conn, analysis_id):
     occurrences, where it was last seen, and the decision with its reason.
     Ordered by (rule, fingerprint), so two runs over the same ledger hand the
     agent the same list.
+
+    `listed`, when the caller already holds this analysis's checklist --
+    `cmd_checklist` does, on a connection that does not memoise it -- is
+    that checklist's findings, handed in rather than computed a second time:
+    the reason `posture` takes `latest`.
     """
     analysis = dict(_analysis_row(conn, analysis_id))
     decisions = ledger.decisions_for(conn, analysis["project"])
     if not decisions:
         return []
-    _an, listed = checklist(conn, analysis_id)
+    if listed is None:
+        _an, listed = checklist(conn, analysis_id)
     listed_fps = {f["fingerprint"] for f in listed}
     out = []
     for fp, decision in decisions.items():

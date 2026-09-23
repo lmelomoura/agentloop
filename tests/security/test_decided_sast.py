@@ -124,6 +124,21 @@ def test_the_list_comes_in_a_stable_order(conn):
         ["broken-access-control", "xss"]
 
 
+def test_a_checklist_the_caller_already_holds_is_not_computed_again(conn, monkeypatch):
+    """`cmd_checklist` has this analysis's checklist in hand already, on a
+    connection that does not memoise it -- handed in, it must be used, not
+    computed a second time (the reason `posture` takes `latest`)."""
+    _analysis(conn, "develop", [{"fingerprint": FP}])
+    ledger.set_decision(conn, "web", FP, "accepted", "why", "me")
+    main = _analysis(conn, "main", state="running")
+    _an, listed = queries.checklist(conn, main)
+
+    def _refuse(*_args, **_kwargs):
+        raise AssertionError("checklist() computed a second time")
+    monkeypatch.setattr(queries, "checklist", _refuse)
+    assert [e["fingerprint"] for e in queries.decided_sast(conn, main, listed=listed)] == [FP]
+
+
 def test_the_skill_tells_the_agent_to_fold_into_a_decided_sast_and_never_to_copy_one():
     """The list is inert without the instruction: an agent that is never told
     to look in `decided_sast` mints the second identity anyway. And an agent

@@ -2404,7 +2404,7 @@ def cmd_checklist(args):
     # while the list describes no state of this analysis at all -- it is for
     # the agent's fold-before-you-mint rule (SKILL.md, Job 3).
     print(json.dumps({"analysis": analysis, "findings": findings,
-                      "decided_sast": queries.decided_sast(conn, args.analysis)},
+                      "decided_sast": queries.decided_sast(conn, args.analysis, listed=findings)},
                      indent=2))
 
 
