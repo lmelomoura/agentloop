@@ -226,6 +226,20 @@ CREATE TABLE IF NOT EXISTS unit_gone (
   unit_id INTEGER NOT NULL REFERENCES unit(id),
   fingerprint TEXT NOT NULL, reason TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS unit_gone_by_unit ON unit_gone(unit_id);
+
+-- THE DEEP SCOPE OF AN ANALYSIS (security/inventory.py): every file a
+-- line-by-line read has to cover, and every file left out with the rule
+-- that left it out. Kept OUT of `analysis` -- unlike `coverage` or `guides`
+-- above -- because every reader of that table SELECTs * (queries
+-- .recent_analyses, served by the dashboard's index poll; report.as_json;
+-- cmd_analysis, read by the engine) and this document is hundreds of KB of
+-- JSON on a large repository; no reader of `analysis` can carry it by
+-- accident when it is not a column of `analysis` at all. One row per deep
+-- analysis. A NEW table, so IF NOT EXISTS is enough -- the precedent
+-- `history_sweep` and `unit` set above.
+CREATE TABLE IF NOT EXISTS analysis_inventory (
+  analysis_id INTEGER PRIMARY KEY REFERENCES analysis(id),
+  doc TEXT NOT NULL);
 """
 
 DECISION_STATES = ("accepted", "false_positive")
@@ -278,10 +292,6 @@ _ANALYSIS_COLUMNS = (
     # "read": [...]}`, see `set_guides`/`guides_of`. '' for every analysis
     # from before the column; nothing derives a state from it.
     ("guides", "TEXT NOT NULL DEFAULT ''"),
-    # The deep scope (security/inventory.py): every file a line-by-line read
-    # has to cover, and every file left out with the rule that left it out.
-    # '' on every analysis before the column and on every non-deep one.
-    ("inventory", "TEXT NOT NULL DEFAULT ''"),
     # How many times the tick resumed this analysis after its orchestrator
     # died, never an operator's Resume: the automatic ones are capped, so a
     # machine that keeps crashing stops spending.
@@ -1367,20 +1377,29 @@ def close_interrupted(conn, analysis_id, note) -> bool:
 
 def set_inventory(conn, analysis_id, inventory) -> None:
     with conn:
-        conn.execute("UPDATE analysis SET inventory=? WHERE id=?",
-                     (json.dumps(inventory, sort_keys=True, separators=(",", ":")), analysis_id))
+        conn.execute(
+            "INSERT INTO analysis_inventory (analysis_id, doc) VALUES (?, ?)"
+            " ON CONFLICT(analysis_id) DO UPDATE SET doc=excluded.doc",
+            (analysis_id, json.dumps(inventory, sort_keys=True, separators=(",", ":"))))
 
 
-def inventory_of(row) -> dict:
-    """The stored deep inventory, or {} -- for a row before the column, a row
-    with none, and a cell that does not decode. Never raises, on the rule
-    `guides_of` follows: the read-only paths never migrate."""
+def inventory_of(conn, analysis_id) -> dict:
+    """The stored deep inventory for this analysis, or {} -- for an analysis
+    with none recorded, a doc that does not decode or is not an object, and
+    a `analysis_inventory` table that does not exist on THIS connection (a
+    read-only connection opened on a ledger `connect()` never migrated
+    raises `sqlite3.OperationalError: no such table`, caught here). Never
+    raises, on the rule `guides_of` follows: the read-only paths never
+    migrate."""
     try:
-        raw = row["inventory"]
-    except (KeyError, IndexError, TypeError):
+        row = conn.execute("SELECT doc FROM analysis_inventory WHERE analysis_id=?",
+                            (analysis_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if row is None:
         return {}
     try:
-        doc = json.loads(raw) if raw else {}
+        doc = json.loads(row["doc"]) if row["doc"] else {}
     except (ValueError, TypeError):
         return {}
     return doc if isinstance(doc, dict) else {}

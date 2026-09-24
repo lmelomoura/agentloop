@@ -24,9 +24,10 @@ def _state(conn, aid):
 
 def test_a_fresh_ledger_has_the_unit_table_and_the_new_columns(conn):
     tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"unit", "unit_read", "unit_gone"} <= tables
+    assert {"unit", "unit_read", "unit_gone", "analysis_inventory"} <= tables
     analysis = {r["name"] for r in conn.execute("PRAGMA table_info(analysis)")}
-    assert {"inventory", "resumes"} <= analysis
+    assert "resumes" in analysis
+    assert "inventory" not in analysis, "the deep scope lives in its own table now"
     finding = {r["name"] for r in conn.execute("PRAGMA table_info(finding)")}
     assert "unit" in finding
 
@@ -35,14 +36,16 @@ def test_a_ledger_from_before_the_columns_gains_them_on_connect(tmp_path):
     path = tmp_path / "old.db"
     ledger.connect(path).close()
     raw = sqlite3.connect(path)
-    raw.execute("ALTER TABLE analysis DROP COLUMN inventory")
     raw.execute("ALTER TABLE analysis DROP COLUMN resumes")
     raw.execute("ALTER TABLE finding DROP COLUMN unit")
+    raw.execute("DROP TABLE analysis_inventory")
     raw.commit()
     raw.close()
     conn = ledger.connect(path)
-    assert {"inventory", "resumes"} <= {r["name"] for r in conn.execute("PRAGMA table_info(analysis)")}
+    assert "resumes" in {r["name"] for r in conn.execute("PRAGMA table_info(analysis)")}
     assert "unit" in {r["name"] for r in conn.execute("PRAGMA table_info(finding)")}
+    assert "analysis_inventory" in {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
 
 
 def test_units_are_numbered_per_analysis_and_keep_their_payload(conn):
@@ -100,6 +103,16 @@ def test_a_continuation_names_its_parent_and_its_attempt(conn):
     assert (unit["attempt"], unit["parent"], unit["seq"]) == (2, first, 2)
 
 
+def test_a_unit_whose_payload_or_evidence_does_not_decode_reads_empty(conn):
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "hunt", {})
+    conn.execute("UPDATE unit SET payload='{not json', evidence='[1,2]' WHERE id=?", (uid,))
+    unit = ledger.get_unit(conn, uid)
+    assert (unit["payload"], unit["evidence"]) == ({}, {})
+    listed = ledger.units_of(conn, aid)[0]
+    assert (listed["payload"], listed["evidence"]) == ({}, {})
+
+
 def test_interrupting_and_resuming_move_only_between_running_and_interrupted(conn):
     aid = _analysis(conn)
     assert ledger.interrupt_analysis(conn, aid) is True
@@ -130,16 +143,36 @@ def test_closing_an_interrupted_analysis_fails_it_with_the_reason(conn):
     assert ledger.close_interrupted(conn, aid, "again") is False
 
 
-def test_the_inventory_round_trips_and_a_missing_or_broken_one_reads_empty(conn):
+def test_the_inventory_round_trips_in_its_own_table_and_a_missing_or_broken_one_reads_empty(conn):
     aid = _analysis(conn)
-    row = conn.execute("SELECT * FROM analysis WHERE id=?", (aid,)).fetchone()
-    assert ledger.inventory_of(row) == {}
+    assert ledger.inventory_of(conn, aid) == {}
     ledger.set_inventory(conn, aid, {"totals": {"files": 2}, "files": []})
+    assert ledger.inventory_of(conn, aid)["totals"] == {"files": 2}
+    ledger.set_inventory(conn, aid, {"totals": {"files": 3}, "files": []})
+    assert ledger.inventory_of(conn, aid)["totals"] == {"files": 3}
+    assert conn.execute("SELECT COUNT(*) FROM analysis_inventory WHERE analysis_id=?",
+                         (aid,)).fetchone()[0] == 1, "a second set_inventory upserts, not inserts"
+    conn.execute("UPDATE analysis_inventory SET doc='{not json' WHERE analysis_id=?", (aid,))
+    assert ledger.inventory_of(conn, aid) == {}
+    conn.execute("UPDATE analysis_inventory SET doc='[1,2]' WHERE analysis_id=?", (aid,))
+    assert ledger.inventory_of(conn, aid) == {}, "JSON that is not an object is not an inventory"
     row = conn.execute("SELECT * FROM analysis WHERE id=?", (aid,)).fetchone()
-    assert ledger.inventory_of(row)["totals"] == {"files": 2}
-    conn.execute("UPDATE analysis SET inventory='{not json' WHERE id=?", (aid,))
-    assert ledger.inventory_of(conn.execute("SELECT * FROM analysis WHERE id=?", (aid,)).fetchone()) == {}
-    assert ledger.inventory_of({}) == {}
+    assert "inventory" not in row.keys()
+
+
+def test_a_read_only_connection_on_a_ledger_missing_the_inventory_table_reads_empty(tmp_path):
+    path = tmp_path / "ro.db"
+    conn = ledger.connect(path)
+    aid = _analysis(conn)
+    conn.close()
+    raw = sqlite3.connect(path)
+    raw.execute("DROP TABLE analysis_inventory")
+    raw.commit()
+    raw.close()
+    ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    ro.row_factory = sqlite3.Row
+    assert ledger.inventory_of(ro, aid) == {}
+    ro.close()
 
 
 def test_the_reads_served_to_a_unit_are_kept_per_unit(conn):
