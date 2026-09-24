@@ -927,7 +927,7 @@ def test_re_picking_the_project_s_platform_keeps_its_account_a_real_change_clear
     js = _js(srv)
     app = _app_js(srv)
     deps = (_const(app, "ACCOUNT_GONE_SUFFIX") + _const(app, "KNOWN_PLATFORMS")
-            + "\n".join(_plainfn(app, n) for n in ("platformKey", "accountsOf", "accountChoice", "accountNoneLabel", "accountOptions")))
+            + "\n".join(_plainfn(app, n) for n in ("platformKey", "accountsOf", "accountGone", "accountChoice", "accountNoneLabel", "accountOptions")))
     onpick_stmt = _stmt(js, "pjPlatformCombo=createCombo({")
     script = tmp_path / "pj-platform-repick.js"
     script.write_text(deps + "\n"
@@ -11583,12 +11583,16 @@ def test_the_findings_browser_declares_the_verdict_filter(srv, tmp_path):
 def test_account_options_and_what_an_empty_one_resolves_to(srv, tmp_path):
     js = _app_js(srv)
     deps = (_const(js, "KNOWN_PLATFORMS") + _const(js, "ACCOUNT_GONE_SUFFIX")
-            + "\n".join(_plainfn(js, n) for n in ("platformKey", "accountsOf", "accountChoice", "accountName",
-                                                   "inheritedAccountName", "accountNoneLabel", "accountOptions")))
+            + "\n".join(_plainfn(js, n) for n in ("platformKey", "accountsOf", "accountGone", "accountChoice",
+                                                   "accountName", "inheritedAccountName", "accountNoneLabel",
+                                                   "accountOptions")))
     script = tmp_path / "accounts.js"
     script.write_text(deps + """
     const P = {anthropic: {accounts: [{id: "a", name: "Client A", dir: "~/.claude-a"}, {id: "", name: "x", dir: "/x"}]},
                openai: {accounts: []}, opencode: {}};
+    // anthropic IS known here, just without "a" registered -- the "truly
+    // gone" half of the not-yet-loaded ({}) case fix round 2 adds below.
+    const PKnownWithoutA = {anthropic: {accounts: []}};
     console.log(JSON.stringify({
       choiceA: accountChoice("anthropic", P), choiceO: accountChoice("openai", P), choiceOC: accountChoice("opencode", P),
       opts: accountOptions("anthropic", P, ""),
@@ -11598,6 +11602,15 @@ def test_account_options_and_what_an_empty_one_resolves_to(srv, tmp_path):
       projectDefault: inheritedAccountName("anthropic", {platform: "anthropic", account: "default"}, P),
       labels: [accountNoneLabel("Client A"), accountNoneLabel("")],
       names: [accountName("anthropic", "default", P), accountName("anthropic", "a", P), accountName("anthropic", "zz", P)],
+      // Fix round 2: a stored id must never read as gone before /api/models
+      // has answered (platforms {}) -- only once the platform itself is
+      // known does a missing id actually mean gone.
+      goneUnknownPlatforms: accountGone("anthropic", "a", {}),
+      goneKnownMissing: accountGone("anthropic", "a", PKnownWithoutA),
+      goneKnownPresent: accountGone("anthropic", "a", P),
+      optUnknownPlatforms: accountOptions("anthropic", {}, "a").slice(-1)[0],
+      choiceUnknownPlatforms: accountChoice("anthropic", {}, "a"),
+      choiceKeptFlaggedValue: accountChoice("openai", P, "zz"),
     }));
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
@@ -11608,6 +11621,15 @@ def test_account_options_and_what_an_empty_one_resolves_to(srv, tmp_path):
     assert out["inherit"] == "Client A" and out["otherPlatform"] == "" and out["projectDefault"] == ""
     assert out["labels"] == ["— Project's account (Client A) —", "— Default —"]
     assert out["names"] == ["Default", "Client A", "zz"]
+    assert out["goneUnknownPlatforms"] is False, "the registry has not answered yet: nothing can be gone"
+    assert out["goneKnownMissing"] is True, "anthropic IS known, and does not have this id: truly gone"
+    assert out["goneKnownPresent"] is False
+    assert out["optUnknownPlatforms"] == {"v": "a", "label": "a"}, \
+        "unflagged, under its bare id -- accountOptions must not invent a (not in Settings) before it knows"
+    assert out["choiceUnknownPlatforms"] is True, \
+        "the combo still shows: the current value is kept as its own option even though the registry is unknown"
+    assert out["choiceKeptFlaggedValue"] is True, \
+        "a platform with nothing registered but a current value kept (flagged, here) still has something to show"
 
 
 def test_the_job_editor_saves_the_account_after_the_platform(srv):
@@ -11629,12 +11651,25 @@ def test_the_run_dialog_names_the_account_and_the_reopen_line_carries_it(srv, tm
     script = tmp_path / "reopen.js"
     script.write_text("""
     const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
-    const PLATFORMS = {anthropic: {accounts: [{id: "a", name: "Client A", dir: "~/.claude-a"}]}};
+    let PLATFORMS = {anthropic: {accounts: [{id: "a", name: "Client A", dir: "~/.claude-a"}]}};
     const ALApp = {
       accountsOf: (p, P) => ((P[p] || {}).accounts || []),
       accountName: (p, id, P) => id === "default" ? "Default" : (((P[p] || {}).accounts || []).find(a => a.id === id) || {name: id}).name,
+      // Fix round 2: gone only once the platform itself is a known key of P --
+      // never while the registry has not answered (or errored), the same
+      // rule the real accountGone (ui/app/editor-domain.js) states.
+      accountGone: (p, id, P) => !!id && id !== "default" && !!P[p] && !(P[p].accounts || []).some(a => a.id === id),
     };
     """ + deps + """
+    // A perfectly good account, read before /api/models has answered: PLATFORMS
+    // is {} then, same as at boot or after a failed fetch -- must NOT show gone.
+    const unknownRegistryCell = (() => {
+      const saved = PLATFORMS;
+      PLATFORMS = {};
+      const cell = accountCell({platform: "anthropic", account: "a", account_dir: "/Users/me/.claude-a"});
+      PLATFORMS = saved;
+      return cell;
+    })();
     console.log(JSON.stringify({
       plain: reopenCommand({platform: "anthropic", session: "s1"}, {}),
       claude: reopenCommand({platform: "anthropic", session: "s1", account_dir: "/Users/me/.claude-a"}, {}),
@@ -11645,6 +11680,7 @@ def test_the_run_dialog_names_the_account_and_the_reopen_line_carries_it(srv, tm
       named: accountCell({platform: "anthropic", account: "a", account_dir: "/Users/me/.claude-a"}),
       gone: accountCell({platform: "anthropic", account: "zz", account_dir: "/Users/me/.claude-z"}),
       pinned: accountCell({platform: "anthropic", account: "default", account_dir: "/Users/me/.claude-pin"}),
+      unknownRegistry: unknownRegistryCell,
     }));
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
@@ -11658,6 +11694,9 @@ def test_the_run_dialog_names_the_account_and_the_reopen_line_carries_it(srv, tm
     assert "Client A" in out["named"] and "/Users/me/.claude-a" in out["named"]
     assert "zz" in out["gone"] and "no longer in Settings" in out["gone"]
     assert "Default" in out["pinned"] and "/Users/me/.claude-pin" in out["pinned"]
+    assert "no longer in Settings" not in out["unknownRegistry"], \
+        f"the registry has not answered yet: a real account must not read as gone: {out['unknownRegistry']!r}"
+    assert "/Users/me/.claude-a" in out["unknownRegistry"], "the row itself must still draw, just not flagged"
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -11712,7 +11751,7 @@ def test_paint_account_combo_hides_only_when_there_is_nothing_but_the_default(sr
     js = _js(srv)
     app = _app_js(srv)
     deps = (_const(app, "ACCOUNT_GONE_SUFFIX") + _const(app, "KNOWN_PLATFORMS")
-            + "\n".join(_plainfn(app, n) for n in ("platformKey", "accountsOf", "accountChoice", "accountNoneLabel", "accountOptions")))
+            + "\n".join(_plainfn(app, n) for n in ("platformKey", "accountsOf", "accountGone", "accountChoice", "accountNoneLabel", "accountOptions")))
     script = tmp_path / "paint-account-combo.js"
     script.write_text(deps + "\n" + _plainfn(js, "paintAccountCombo") + """
     const ALApp = {accountChoice, accountNoneLabel, accountOptions};
@@ -11936,20 +11975,34 @@ def test_reopening_an_editor_redraws_the_stored_account_with_keep(srv):
     already pins for the model combo, and for the same reason: an account
     Settings no longer has must show flagged, not silently rewritten to the
     Default, the moment the editor opens -- not only after the next re-apply.
+    Pins all three steps in order, not just the last two: the keep=false
+    apply has to run BEFORE the stored value is written and read back, or it
+    would repaint the combo over the value just set and erase the account on
+    every open -- the same failure mode the platform re-pick guard
+    (test_re_picking_the_project_s_platform_keeps_its_account_a_real_change_clears_it)
+    fixes for a pick, pinned here for an open.
     A full execution harness for fill()/openProjectEditor() is not cheap --
     each pulls in a dozen-plus other combos and DOM ids -- so, like that
-    precedent, this pins the two lines and their order rather than running
-    them; Task 7's browser acceptance exercises the real thing end to end."""
+    precedent, this pins the lines and their order rather than running them;
+    Task 7's browser acceptance exercises the real thing end to end."""
     js = _js(srv)
     fill = _plainfn(js, "fill")
     assert '$("ed-account").value=j.account||"";' in fill
-    assert fill.index('$("ed-account").value=j.account||"";') < fill.index("paintJobAccount(true);"), \
-        "the stored account must be written onto the hidden input before the keep=true redraw reads it back"
+    i_apply = fill.index("applyPlatformToJobEditor(plat, false);")
+    i_set = fill.index('$("ed-account").value=j.account||"";')
+    i_keep = fill.index("paintJobAccount(true);")
+    assert i_apply < i_set < i_keep, \
+        "the keep=false apply must run first (or it would repaint the combo empty over the value just set), " \
+        "then the stored account is written onto the hidden input, then the keep=true redraw reads it back -- " \
+        "a reorder here would erase the account on every open, the same bug the platform re-pick had"
 
     ope = _plainfn(js, "openProjectEditor")
     assert '$("pj-account").value=(p&&p.account)||"";' in ope
     assert ope.index('$("pj-account").value=(p&&p.account)||"";') < ope.index("paintProjectAccount(true);"), \
         "same for the project's own account"
-    assert '$("sec-account").value=sec.account||"";' in ope
-    assert ope.index('$("sec-account").value=sec.account||"";') < ope.index('paintSecurityAccount(true);'), \
-        "same for the Security block's account"
+    i_sec_apply = ope.index("applyPlatformToSecurity(splat, false);")
+    i_sec_set = ope.index('$("sec-account").value=sec.account||"";')
+    i_sec_keep = ope.index('paintSecurityAccount(true);')
+    assert i_sec_apply < i_sec_set < i_sec_keep, \
+        "same three-step order for the Security block's account: apply(keep=false), then set the stored " \
+        "value, then the keep=true redraw"

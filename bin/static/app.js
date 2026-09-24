@@ -394,8 +394,10 @@
     const list = p && Array.isArray(p.accounts) ? p.accounts : [];
     return list.filter((a) => a && typeof a.id === "string" && a.id && a.id !== "default" && typeof a.name === "string" && typeof a.dir === "string");
   }
-  function accountChoice(platform, platforms) {
-    return accountsOf(platform, platforms).length > 0;
+  function accountGone(platform, id, platforms) {
+    if (!id || id === "default") return false;
+    const known = !!(platforms || {})[platformKey(platform)];
+    return known && !accountsOf(platform, platforms).some((a) => a.id === id);
   }
   function accountName(platform, id, platforms) {
     if (!id || id === "default") return "Default";
@@ -418,9 +420,12 @@
     const list = accountsOf(platform, platforms);
     const opts = [{ v: "default", label: "Default" }].concat(list.map((a) => ({ v: a.id, label: a.name + " \u2014 " + a.dir })));
     if (current && current !== "default" && !list.some((a) => a.id === current)) {
-      opts.push({ v: current, label: current + ACCOUNT_GONE_SUFFIX, flagged: true });
+      opts.push(accountGone(platform, current, platforms) ? { v: current, label: current + ACCOUNT_GONE_SUFFIX, flagged: true } : { v: current, label: current });
     }
     return opts;
+  }
+  function accountChoice(platform, platforms, current) {
+    return accountOptions(platform, platforms, current).length > 1;
   }
   function hiddenModelCount(platform, platforms) {
     const key = platformKey(platform);
@@ -3210,7 +3215,14 @@
     // Task 6's (the platforms UI plan): the Account combo's own read
     // of what Settings registered on a platform, the same shape
     // platformOptions above already gives the Platform combo.
+    // accountGone is Task 6's fix round 2: the one rule for whether a
+    // stored id is truly gone -- never while the platform itself has
+    // not loaded yet -- that accountOptions and accountCell
+    // (bin/dashboard.html) both read, instead of each guessing it from
+    // accountsOf on its own and reading an empty, not-yet-fetched
+    // registry as "everything is gone".
     accountsOf,
+    accountGone,
     accountChoice,
     accountName,
     inheritedAccountName,
@@ -3259,5 +3271,5 @@
     newerModelNotes
   };
 })();
-/* ui-bundle: fc575a3181da9a36a004f8420388e453f1b1d2970009ee49ec87c5de25ccca5c */
-/* ui-sources: 84ec16060aa1881b3815f3cf78e472cff4c2712760a6e1eed3fffc9011b304ef */
+/* ui-bundle: e69e7302b59cd75f3bb9e0c7c206b26879eda95ea440d7ce6b1994632a3a5d3f */
+/* ui-sources: 07de7283ba56edb0ea96d6e98b947251f24ecd224fd4cb0775a5a99485f0263d */

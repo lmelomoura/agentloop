@@ -3714,21 +3714,18 @@ function paintLimitsNote(p, model){
   n.textContent=t; n.hidden=false;
 }
 // One editor's Account combo, rebuilt for platform `p`: hidden while the
-// platform has nothing to pick besides the Default, the empty row saying
-// what it resolves to, and the value kept only while it is still one of p's
-// (`keep`) -- or flagged when Settings dropped it (accountOptions).
+// platform has nothing to pick besides the Default (accountChoice -- a
+// registered account, or `cur` kept as its own option, flagged or not), the
+// empty row saying what it resolves to, and the value kept only while it is
+// still one of p's (`keep`) -- or flagged when accountOptions' own
+// accountGone says Settings truly dropped it, never while the platform
+// simply has not loaded yet.
 function paintAccountCombo(prefix, combo, cfg, p, keep, inheritName){
   if(!combo) return;
   cfg.noneLabel=ALApp.accountNoneLabel(inheritName);
   const cur=keep ? $(prefix+"-account").value : "";
-  // The option list decides the row's visibility, not accountChoice -- that
-  // only counts REGISTERED accounts, so a platform with none of its own but a
-  // STORED value Settings no longer has (a flagged trailing option,
-  // accountOptions' own doing) would hide the row under a value saveProject
-  // always sends: the one field blocking every save, with nothing on screen
-  // to fix it.
+  $(prefix+"-account-row").hidden=!ALApp.accountChoice(p, PLATFORMS, cur);
   const opts=ALApp.accountOptions(p, PLATFORMS, cur);
-  $(prefix+"-account-row").hidden=opts.length<2;
   combo.set(opts.some(o=>o.v===cur) ? cur : "", opts);
 }
 function paintJobAccount(keep){
@@ -4307,7 +4304,10 @@ function accountCell(rec){
   const id=rec.account||"", dir=rec.account_dir||"";
   if((!id || id==="default") && !dir) return "";
   const name=ALApp.accountName(rec.platform, id||"default", PLATFORMS);
-  const gone=!!id && id!=="default" && !ALApp.accountsOf(rec.platform, PLATFORMS).some(a=>a.id===id);
+  // accountGone, not a bare accountsOf lookup: before /api/models answers
+  // (or if it errored) PLATFORMS is {}, and a bare lookup would flag every
+  // run's perfectly good account as no longer in Settings.
+  const gone=ALApp.accountGone(rec.platform, id, PLATFORMS);
   return esc(name)+(gone?' <span class="muted">(no longer in Settings)</span>':'')+(dir?' · <code>'+esc(dir)+'</code>':'');
 }
 

@@ -70,6 +70,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   project and Security editors pick Platform → Account → Model, the Account
   combo showing only where there is a choice; the run dialog names the
   account, and its reopen line carries the variable.
+  Re-picking a platform already showing leaves its account alone, Settings
+  edits one account at a time, and an account Settings no longer has stays
+  visible and flagged — never hidden, and never flagged before Settings has
+  actually answered — rather than disappearing behind a save the engine
+  would refuse.
 
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate

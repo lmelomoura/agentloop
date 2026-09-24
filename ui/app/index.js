@@ -44,7 +44,7 @@ import { changedKeys, EFFORTS, FALLBACK_EFFORTS, effortIndex, effortFromIndex, e
          modelOptionsFor, platformOf, platformLabel, PLATFORM_LABELS, KNOWN_PLATFORMS,
          platformKey, registryKnown, securitySlug, derivedSecurityJob,
          platformOptions, hiddenModelCount, modelEnabled, DISABLED_SUFFIX,
-         accountsOf, accountChoice, accountName, inheritedAccountName, accountNoneLabel,
+         accountsOf, accountGone, accountChoice, accountName, inheritedAccountName, accountNoneLabel,
          ACCOUNT_GONE_SUFFIX, accountOptions,
          costParts, tokensText,
          dayNumbers, shapeRepoRows, projectStepError } from "./editor-domain.js";
@@ -230,7 +230,13 @@ window.ALApp = { init, visibleJobs, jobFilters, bulkOn,
                  // Task 6's (the platforms UI plan): the Account combo's own read
                  // of what Settings registered on a platform, the same shape
                  // platformOptions above already gives the Platform combo.
-                 accountsOf, accountChoice, accountName, inheritedAccountName, accountNoneLabel,
+                 // accountGone is Task 6's fix round 2: the one rule for whether a
+                 // stored id is truly gone -- never while the platform itself has
+                 // not loaded yet -- that accountOptions and accountCell
+                 // (bin/dashboard.html) both read, instead of each guessing it from
+                 // accountsOf on its own and reading an empty, not-yet-fetched
+                 // registry as "everything is gone".
+                 accountsOf, accountGone, accountChoice, accountName, inheritedAccountName, accountNoneLabel,
                  ACCOUNT_GONE_SUFFIX, accountOptions,
                  platformState, platformChip,
                  // modelEnabled and DISABLED_SUFFIX are Task 7's fix wave 1:
