@@ -25,14 +25,18 @@ function _doc(f){
   return c && typeof c === "object" ? c : null;
 }
 
-export function secConfidenceChip(f){
+export function secConfidenceChip(f, named){
   // Self-contained on purpose: tests/test_page_contract.py lifts this one
   // function out of the bundle by name and runs it beside secFindRow, with
   // no `_doc` in scope.
+  // `named` wherever no column header says what the chip is. The score is one
+  // of the three words a severity uses, so a bare "high" beside a card's
+  // "[medium]" title reads as a second severity contradicting the first. The
+  // Findings table leaves it off: its Confidence column already names the chip.
   const c = f && f.candidate && typeof f.candidate === "object" ? f.candidate : null;
   const score = (f && f.confidence) || (c && c.confidence && c.confidence.score) || "";
   if(!score) return null;
-  const chip = secEl("span", "secconf " + score, score);
+  const chip = secEl("span", "secconf " + score, named ? score + " confidence" : score);
   if(c && c.confidence && c.confidence.reason) chip.title = c.confidence.reason;
   return chip;
 }

@@ -272,6 +272,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The confidence chip on an analysis's finding card says it is
+  confidence.** The chip beside the state pill held only the candidate's
+  score, which CSS uppercases, and the score uses the same three words as a
+  severity. The card gives its severity only in the title, so a medium
+  finding the hunter was sure of read `[medium] … NEW HIGH CONFIRMED`: two
+  severities contradicting each other, and a low one did the same. The chip
+  now reads `high confidence`. The Findings table keeps the bare score,
+  because its Confidence column already names it.
 - **A command past its deadline reads as 124, never as a traceback.**
   `run_bounded` (the deadline around `opencode models` and `opencode export`)
   ends the command's whole process group, and macOS answers `EPERM`, not
