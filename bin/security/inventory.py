@@ -189,9 +189,10 @@ def _classify(root: Path, mode: str, rel: str, patterns, defaults: bool):
 
 
 def build(root, patterns=()) -> dict:
-    """The deep scope of the checkout at `root`, as `analysis.inventory`
-    stores it. `files` is sorted by path; a file with no lines is listed
-    with no ranges, because there is nothing in it to read."""
+    """The deep scope of the checkout at `root`, as the ledger's
+    `analysis_inventory` table stores it. `files` is sorted by path; a
+    file with no lines is listed with no ranges, because there is
+    nothing in it to read."""
     root = Path(root)
     patterns = tuple(p for p in (patterns or ()) if p)
     defaults = ignores.defaults_apply(patterns)

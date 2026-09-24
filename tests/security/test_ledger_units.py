@@ -175,6 +175,15 @@ def test_a_read_only_connection_on_a_ledger_missing_the_inventory_table_reads_em
     ro.close()
 
 
+def test_an_operational_error_that_is_not_a_missing_table_propagates():
+    class _LockedConn:
+        def execute(self, *args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError):
+        ledger.inventory_of(_LockedConn(), 1)
+
+
 def test_the_reads_served_to_a_unit_are_kept_per_unit(conn):
     aid = _analysis(conn)
     u1 = ledger.add_unit(conn, aid, "read", {"ranges": []})

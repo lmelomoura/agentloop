@@ -50,7 +50,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cost, and the attempt it was — with a retry recorded as a new row that
   names its parent, never as an overwrite. The deep scope an analysis has to
   cover is kept in a table of its own, so no reader of the analysis table
-  ever carries it; an analysis gains a count of automatic resumes and a
+  ever carries it — a ledger an older version never migrated reads as
+  having no inventory, while any other database error is reported rather
+  than hidden; an analysis gains a count of automatic resumes and a
   resumable `interrupted` state that no baseline or posture ever reads; a
   finding records which unit wrote it, and every chunk `security read`
   serves a unit is kept as proof of what it read.

@@ -1384,17 +1384,20 @@ def set_inventory(conn, analysis_id, inventory) -> None:
 
 
 def inventory_of(conn, analysis_id) -> dict:
-    """The stored deep inventory for this analysis, or {} -- for an analysis
-    with none recorded, a doc that does not decode or is not an object, and
-    a `analysis_inventory` table that does not exist on THIS connection (a
-    read-only connection opened on a ledger `connect()` never migrated
-    raises `sqlite3.OperationalError: no such table`, caught here). Never
-    raises, on the rule `guides_of` follows: the read-only paths never
-    migrate."""
+    """The stored deep inventory for this analysis. Returns {} for an
+    analysis with no row, a doc that does not decode or is not an object,
+    and a ledger whose `analysis_inventory` table does not exist on THIS
+    connection (a read-only connection opened on a ledger `connect()`
+    never migrated raises `sqlite3.OperationalError: no such table`,
+    caught here and only here). Any other database error -- a lock, a
+    disk I/O failure, ... -- propagates instead of reading as no
+    inventory."""
     try:
         row = conn.execute("SELECT doc FROM analysis_inventory WHERE analysis_id=?",
                             (analysis_id,)).fetchone()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
         return {}
     if row is None:
         return {}
