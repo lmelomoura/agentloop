@@ -71,6 +71,19 @@ export function wireLaunchDialog(){
 
 let secTimer = null;
 export function secStopPoll(){ if(secTimer){ clearInterval(secTimer); secTimer = null; } }
+
+/* Whether the run behind an analysis of this project still holds its slot.
+   An analysis is closed TWICE: by the agent (`finish`), and again by the
+   engine once the agent's process has exited -- with the run's real cost,
+   the guides it read, the subagents it launched, and possibly a lower
+   verdict (bin/agentloop, security_close_analysis). The slot is let go only
+   after that second close (run_job closes the analysis before run_cleanup
+   releases it), so while it is held the row on screen is not final. */
+function secRunStillHeld(){
+  const slots = AL.DATA.active_runs || {};
+  return secState.analyses.some(a => a.run_id && (slots[a.run_id] || []).length > 0);
+}
+
 export function secSyncPoll(){
   // Polling exists for one reason — an analysis in flight — but WHERE the
   // operator is looking is part of that reason, and leaving the view has to end
@@ -78,13 +91,29 @@ export function secSyncPoll(){
   // the air when the view was left re-armed the interval a moment after
   // secLeave() had cleared it: two subprocess-backed GETs every four seconds,
   // from the Overview or the Jobs page, for as long as the analysis ran.
-  const running = AL.currentView === "security" && secState.project
-                  && secState.analyses.some(a => a.state === "running");
+  //
+  // "In flight" lasts until the ENGINE's close, not the agent's. The poll
+  // stopped the moment the agent's own `finish` took the row out of
+  // `running`, so the page never read the engine's close 45 s later: on
+  // 2026-09-24 analysis 20 showed Cost "—" and the agent's duration until a
+  // reload, over $19.29 already recorded -- and an agent's `done` the engine
+  // lowered to `capped` would have stayed on screen as Done.
+  const here = AL.currentView === "security" && secState.project;
+  const watch = here && (secState.analyses.some(a => a.state === "running")
+                         || secRunStillHeld());
   // The poll tick itself must not force a full header/tabs/sidebar refetch
   // (see secReload's own comment) -- every OTHER caller of secReload still
   // does, by leaving its argument at the default.
-  if(running && !secTimer) secTimer = setInterval(() => secReload(false), SEC_POLL_MS);
-  if(!running) secStopPoll();
+  if(watch && !secTimer) secTimer = setInterval(() => secReload(false), SEC_POLL_MS);
+  if(!watch && secTimer){
+    secStopPoll();
+    // One last read on the way out. The slot was judged gone on the page's
+    // live-run list, which can be five seconds older than the rows this
+    // tick fetched; the engine's close lands before the slot is let go, so
+    // only a read started NOW is certain to carry it. Its own secSyncPoll
+    // finds no timer to stop, so it is one read, not a loop.
+    if(here) secReload(false);
+  }
 }
 
 /* Coming back to a project screen re-reads it and picks the poll back up: what

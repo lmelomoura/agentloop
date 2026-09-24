@@ -272,6 +272,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The Security page no longer freezes an analysis at the agent's own
+  close.** An analysis is closed twice — by the agent, then by the engine
+  once the agent's process has exited, with the run's real cost, the guides
+  it read, the subagents it launched and possibly a lower verdict — and the
+  page polled only while an analysis said `running`, so it stopped at the
+  first close and never read the second. On 2026-09-24 analysis 20 showed
+  Cost *—* and the agent's own duration until a reload, 45 s after which
+  the engine had written $19.29; an agent's `done` that the engine lowered
+  to `capped` would have stayed on screen as *Done*. The page now keeps
+  watching while the project's analysis job still holds its run slot —
+  released only after the engine's close — and reads once more when it
+  lets go.
+
 - **A stopped run says where the stop came from, instead of saying it was
   you.** Every stop was recorded as *"you ended this run from the
   dashboard"*, and the dashboard labelled it *Stopped by you* — whether the
