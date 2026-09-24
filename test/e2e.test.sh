@@ -1548,6 +1548,26 @@ wait
   && ok "and after the stop the CLI is gone, not orphaned" \
   || { bad "the CLI (pid ${cli53:-unrecorded}) outlived the stop"; [ -z "$cli53" ] || kill "$cli53" 2>/dev/null; }
 [ "$(lastrun | jq -r .status)" = "stopped" ] && ok "and the run is recorded stopped" || bad "status $(lastrun | jq -r .status)"
+# WHERE THE STOP CAME FROM. That same analysis was recorded as "you ended
+# this run from the dashboard" -- every stop was, typed anywhere -- and its
+# operator had not stopped it. This one was typed here, outside the
+# dashboard, and the record and tick.log have to say so, naming the process
+# that ran the command.
+lastrun | jq -r .note | grep -qF 'STOPPED: ended from outside the dashboard (`agentloop stop`, run by ' \
+  && ok "the note says the stop came from outside the dashboard, and what ran it" \
+  || bad "note: $(lastrun | jq -r .note)"
+grep -F 'j53: stop asked for run ' "$ROOT/data/tick.log" | grep -qF 'from outside the dashboard (`agentloop stop`, run by ' \
+  && ok "and tick.log said so the moment the stop was asked" \
+  || bad "tick.log: $(grep -F 'j53:' "$ROOT/data/tick.log" | tail -2)"
+# The control server's own stop sets AL_STOP_SOURCE (bin/agentloop-server
+# stop_run, tests/test_stop_origin.py); the engine's half is here.
+FAKE_MODE=hang FAKE_SESSION=sess-53b "$AL" run j53 >/dev/null 2>&1 &
+w=0; while [ "$w" -lt 20 ] && ! ls "$ROOT"/data/locks/j53/*/child >/dev/null 2>&1; do sleep 1; w=$((w + 1)); done
+AL_STOP_SOURCE=dashboard "$AL" stop j53 >/dev/null 2>&1
+wait
+[ "$(lastrun | jq -r .session)" = "sess-53b" ] && lastrun | jq -r .note | grep -qF 'STOPPED: ended from the dashboard. ' \
+  && ok "a stop the dashboard makes is recorded as from the dashboard" \
+  || bad "record: $(lastrun | jq -c '{session,note}')"
 
 echo
 }

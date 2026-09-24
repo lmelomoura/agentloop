@@ -1233,7 +1233,9 @@ def test_an_api_failure_outranks_the_protocol_stop_reason(srv, tmp_path):
     # DID hit a stop sequence, which is the reading this fix could have broken.
     assert "Normal end" in out["turn"]
     assert "Stop sequence" in out["seq"] and "API error" not in out["seq"]
-    assert "Stopped by you" in out["note"]
+    # "Stopped", never "Stopped by you": the note says where a stop came from,
+    # and the old label put every one down to the reader (2026-09-24).
+    assert "Stopped" in out["note"] and "by you" not in out["note"]
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")

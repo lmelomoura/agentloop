@@ -4044,10 +4044,11 @@ run_record_stopped_early() { # <id> <slot-dir>
   # disk, unclassified: claiming "nothing was spent" invited an operator to
   # Discard a tree that might hold real work, on the strength of a record that
   # was simply wrong about what happened.
+  local origin; origin="$(stop_origin_of "$slot")"
   if [ -f "$slot/child" ]; then
-    note="STOPPED: ended from the dashboard after its agent had already been at work; its outcome was never classified. The run directory is kept, not deleted, until you resume it or drop it by hand."
+    note="STOPPED: ended $origin after its agent had already been at work; its outcome was never classified. The run directory is kept, not deleted, until you resume it or drop it by hand."
   else
-    note="STOPPED: ended from the dashboard before its agent started, so no work was done and nothing was spent."
+    note="STOPPED: ended $origin before its agent started, so no work was done and nothing was spent."
   fi
   # What this stop actually has to resume WITH. $slot/child alone answers "did
   # an agent run" — it says nothing about whether that agent got far enough to
@@ -4091,7 +4092,7 @@ run_record_stopped_early() { # <id> <slot-dir>
   fi
   "$JQ" -nc --arg r "$note" --arg sid "$sid" '{is_error:false, subtype:"stopped_by_user", num_turns:0,
     session_id:$sid, stop_reason:"stopped_by_user",
-    result:("**Stopped by you.**\n\n"+$r)}' > "$logf" 2>/dev/null || logf=""
+    result:("**Stopped.**\n\n"+$r)}' > "$logf" 2>/dev/null || logf=""
   state_set_many "$id" "$("$JQ" -nc --argjson end "$end" --argjson start "$start" \
     '{last_end:$end, last_status:"stopped", last_run_start:$start, last_run_status:"stopped"}')"
   account="$(cat "$slot/account" 2>/dev/null || true)"
@@ -5188,18 +5189,52 @@ cmd_runs() { # <id> — one active run per line: <run-pid>\t<agent-pid>\t<logfil
   done
 }
 
+# WHERE A STOP CAME FROM, as the words the run's record says it in ("ended
+# <this>"). Every stop used to be recorded as "you ended this run from the
+# dashboard" -- the Stop button and `agentloop stop` typed anywhere else
+# reach the same function, and nothing told them apart. On 2026-09-24 an
+# analysis was stopped 28 s in that its operator had not stopped, and the
+# record named them. The dashboard vouches for itself (the control server
+# sets AL_STOP_SOURCE on the one call it makes); for anything else, the two
+# processes above this one are the only witness to who asked.
+stop_origin() { # -> "from the dashboard" | "from outside the dashboard (...)"
+  if [ "${AL_STOP_SOURCE:-}" = "dashboard" ]; then
+    printf 'from the dashboard\n'
+    return 0
+  fi
+  local p2 c1 c2
+  c1="$(ps -o comm= -p "$PPID" 2>/dev/null)"
+  p2="$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')"
+  c2="$(ps -o comm= -p "${p2:-0}" 2>/dev/null)"
+  printf 'from outside the dashboard (`agentloop stop`, run by %s under %s)\n' \
+    "$(basename "${c1:-unknown}")" "$(basename "${c2:-unknown}")"
+}
+
+# The origin a stop marker carries, for the record. Empty -- a marker left by
+# an engine from before the origin was recorded -- says exactly that rather
+# than guessing.
+stop_origin_of() { # <slot-dir>
+  local o
+  o="$(head -1 "$1/stopped" 2>/dev/null)"
+  printf '%s\n' "${o:-by a stop whose origin was not recorded}"
+}
+
 # Stop ONE run by its slot. Leaves the watchdog breadcrumb so the run explains
 # itself, then TERMs the agent (or clears a dead slot).
 _stop_slot() { # <id> <slot-dir>
-  local id="$1" slot="$2" child logf rpid midclaim
+  local id="$1" slot="$2" child logf rpid midclaim origin
   [ -d "$slot" ] || { echo "no such run for $id"; return 1; }
   logf="$(cat "$slot/logfile" 2>/dev/null || true)"
   # The marker the classifier reads. A run the OPERATOR ended is not a failure,
   # and the difference has to survive into the record: `stopped` is a decision,
   # `error` is a fault, and filing one as the other is how a deliberate stop ends
-  # up in the error count and drives the failure backoff.
-  : > "$slot/stopped" 2>/dev/null || true
-  [ -n "$logf" ] && printf 'STOPPED: ended on purpose from the dashboard, not by a failure.\n' \
+  # up in the error count and drives the failure backoff. It carries where the
+  # stop came from (stop_origin), and so does a tick.log line written NOW, the
+  # moment it is asked -- before any record exists that could be lost.
+  origin="$(stop_origin)"
+  printf '%s\n' "$origin" > "$slot/stopped" 2>/dev/null || true
+  log_tick "$id: stop asked for run $(basename "$slot") $origin"
+  [ -n "$logf" ] && printf 'STOPPED: ended on purpose %s, not by a failure.\n' "$origin" \
     > "$logf.watchdog" 2>/dev/null
   child="$(cat "$slot/child" 2>/dev/null || true)"
   # Same danger as the rpid guard below, reached through a different file:
@@ -5927,7 +5962,7 @@ run_classify() {
   # written stay exactly where they are — only the verdict changes.
   if [ -f "$slot/stopped" ]; then
     status="stopped"
-    wdreason="STOPPED: you ended this run from the dashboard. Anything it had already done is in the log below and on disk; it was interrupted, not undone."
+    wdreason="STOPPED: ended $(stop_origin_of "$slot"). Anything it had already done is in the log below and on disk; it was interrupted, not undone."
   fi
 
   # "Ran fine, but there was nothing to do" — a resumed task already finished, or

@@ -272,6 +272,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A stopped run says where the stop came from, instead of saying it was
+  you.** Every stop was recorded as *"you ended this run from the
+  dashboard"*, and the dashboard labelled it *Stopped by you* — whether the
+  Stop button was pressed or `agentloop stop` was typed anywhere else, since
+  both reach the same function and nothing told them apart. On 2026-09-24
+  an analysis was stopped 28 seconds in that its operator had not stopped,
+  and the record named them. The control server now tells the engine a stop
+  is its own (`AL_STOP_SOURCE=dashboard`, on the one call it makes), and
+  the engine writes the origin into the run's stop marker, into the run's
+  note — *ended from the dashboard*, or *ended from outside the dashboard
+  (`agentloop stop`, run by zsh under claude)*, naming the two processes
+  above the command — and into a `tick.log` line the moment the stop is
+  asked, so the next unexplained stop has a witness. A marker left by an
+  older engine is recorded as a stop whose origin was not recorded. The
+  label is *Stopped*.
+
 - **`prepare` no longer writes into an analysis that closed while it ran.**
   It checked that its analysis was open only on the way in, and the
   deterministic phases are minutes of wall-clock — 679 s on a real one, most
