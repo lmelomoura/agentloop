@@ -2651,11 +2651,20 @@ def _installed_config_dir():
     """The engine's installed_config_dir: the pin the install carries --
     AGENTLOOP_CLAUDE_CONFIG_DIR, else the one the tick's launchd plist names
     (under the engine's own key, or the CLI's for an install older than it).
-    "" when neither names one; never an ambient CLAUDE_CONFIG_DIR."""
+    "" when neither names one; never an ambient CLAUDE_CONFIG_DIR.
+
+    The plist lives under LAUNCH_AGENTS_DIR, mirroring the engine's own
+    (AGENTLOOP_LAUNCH_AGENTS_DIR, else ~/Library/LaunchAgents) -- a test
+    suite that runs the server in-process points this at a sandbox, so it
+    never reads a developer machine's own pinned install. The fallback
+    re-reads HOME (os.path.expanduser, not the HOME constant above, which
+    is fixed at import time) so a test that only ever redirects HOME --
+    never this variable -- keeps working unchanged."""
     v = _env("CLAUDE_CONFIG_DIR") or ""
     if v:
         return v
-    plist = Path(os.path.expanduser("~")) / "Library" / "LaunchAgents" / (PLIST_LABEL + ".plist")
+    agents_dir = _env("LAUNCH_AGENTS_DIR") or os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents")
+    plist = Path(agents_dir) / (PLIST_LABEL + ".plist")
     try:
         with open(plist, "rb") as f:
             env = plistlib.load(f).get("EnvironmentVariables", {})

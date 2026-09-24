@@ -887,6 +887,12 @@ def test_api_models_names_each_account_platform_s_default_directory(srv, tmp_pat
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    # srv's own fixture points AGENTLOOP_LAUNCH_AGENTS_DIR at a fixed,
+    # session-wide empty directory (so no test that forgets this leaks the
+    # real ~/Library/LaunchAgents) -- this test's own plists, written under
+    # `home` by _tick_plist below, need this override or _installed_config_dir
+    # would keep reading that empty directory instead and never see them.
+    monkeypatch.setenv("AGENTLOOP_LAUNCH_AGENTS_DIR", str(home / "Library" / "LaunchAgents"))
     monkeypatch.delenv("CODEX_HOME", raising=False)
     _write_platforms(srv, {"anthropic": {"enabled": True, "bin": "", "models": []},
                            "openai": {"enabled": True, "bin": "", "models": []},
@@ -921,12 +927,19 @@ def test_the_default_directory_is_the_engines_own(srv, tmp_path, monkeypatch, pi
     home = tmp_path / "home"
     home.mkdir()
     fill = lambda s: s.replace("{home}", str(home)).replace("{tmp}", str(tmp_path))   # noqa: E731
+    # AGENTLOOP_LAUNCH_AGENTS_DIR held to `home`'s own LaunchAgents on BOTH
+    # sides, engine subprocess and server in-process alike -- the fixed,
+    # session-wide directory srv's own fixture points it at by default would
+    # otherwise win on both sides too (consistently empty), so this test
+    # would keep "passing" while no longer exercising _tick_plist at all.
     env = dict(os.environ, HOME=str(home), AGENTLOOP_CONFIG=str(tmp_path / "config"), AGENTLOOP_DATA=str(tmp_path / "data"),
+               AGENTLOOP_LAUNCH_AGENTS_DIR=str(home / "Library" / "LaunchAgents"),
                AGENTLOOP_CLAUDE_BIN=str(REPO / "test" / "fake-claude"), AGENTLOOP_CODEX_BIN=str(FAKE_CODEX),
                AGENTLOOP_OPENCODE_BIN="/nonexistent/opencode")
     env.pop("AGENTLOOP_CLAUDE_CONFIG_DIR", None)
     env.pop("CODEX_HOME", None)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("AGENTLOOP_LAUNCH_AGENTS_DIR", str(home / "Library" / "LaunchAgents"))
     monkeypatch.delenv("AGENTLOOP_CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CODEX_HOME", raising=False)
     if pin is not None:
@@ -951,3 +964,40 @@ def test_the_default_directory_is_the_engines_own(srv, tmp_path, monkeypatch, pi
     a, o, _ = _default_dirs(srv)
     assert expanded(a) == engine_default("anthropic")
     assert expanded(o) == engine_default("openai")
+
+
+def test_the_default_directory_agrees_with_the_engine_through_launch_agents_dir_alone(srv, tmp_path, monkeypatch):
+    """Round 5: the parity above goes through HOME on both sides -- this one
+    goes through AGENTLOOP_LAUNCH_AGENTS_DIR alone, with HOME left ambient,
+    the shape srv's own session-wide fixture and a real subprocess both rely
+    on. A plist pinned inside that directory (never under HOME, so neither
+    side's ~-relative shortening applies) must read as the very same
+    directory on both: the server's default_dir, in-process, and the
+    engine's own account_default_dir anthropic, out of a real subprocess."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    pinned = tmp_path / "pinned-acct"
+    pinned.mkdir()
+    with open(agents_dir / "com.agentloop.tick.plist", "wb") as f:
+        plistlib.dump({"Label": "com.agentloop.tick",
+                        "EnvironmentVariables": {"AGENTLOOP_CLAUDE_CONFIG_DIR": str(pinned)}}, f)
+    monkeypatch.setenv("AGENTLOOP_LAUNCH_AGENTS_DIR", str(agents_dir))
+    monkeypatch.delenv("AGENTLOOP_CLAUDE_CONFIG_DIR", raising=False)
+    _write_platforms(srv, {"anthropic": {"enabled": True, "bin": "", "models": []},
+                           "openai": {"enabled": True, "bin": "", "models": []}})
+    server_dir = srv.list_models()["platforms"]["anthropic"]["default_dir"]
+
+    config_dir, data_dir = tmp_path / "config2", tmp_path / "data2"
+    config_dir.mkdir(); data_dir.mkdir()
+    env = dict(os.environ, AGENTLOOP_CONFIG=str(config_dir), AGENTLOOP_DATA=str(data_dir),
+               AGENTLOOP_LAUNCH_AGENTS_DIR=str(agents_dir),
+               AGENTLOOP_CLAUDE_BIN=str(REPO / "test" / "fake-claude"),
+               AGENTLOOP_CODEX_BIN=str(FAKE_CODEX), AGENTLOOP_OPENCODE_BIN="/nonexistent/opencode")
+    env.pop("AGENTLOOP_CLAUDE_CONFIG_DIR", None)
+    out = subprocess.run(["/bin/bash", str(ENGINE), "platform", "accounts", "anthropic"],
+                         capture_output=True, text=True, env=env, check=True).stdout
+    engine_dir = json.loads(out)[0]["dir"]
+
+    assert server_dir == str(pinned)
+    assert engine_dir == str(pinned)
+    assert server_dir == engine_dir

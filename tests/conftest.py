@@ -24,12 +24,27 @@ SERVER = REPO / "bin" / "agentloop-server"
 
 @pytest.fixture(scope="session")
 def srv(tmp_path_factory):
-    """The server module, bound to a throwaway config/data tree."""
+    """The server module, bound to a throwaway config/data tree.
+
+    Two more things every test in the session shares, set before import for
+    the same reason CONFIG/DATA are: an empty AGENTLOOP_LAUNCH_AGENTS_DIR, so
+    _installed_config_dir (and the engine subprocesses al() launches) never
+    read a developer machine's own ~/Library/LaunchAgents -- a test that
+    wants a REAL plist points this at one of its own (see
+    test_platforms_api.py's default_dir tests); and the three AGENTLOOP_*_BIN
+    stand-ins test/e2e.test.sh already uses, so `platform check` and the
+    catalog resolves this module and the engine subprocesses it launches both
+    run never reach a real claude, codex or opencode."""
     root = tmp_path_factory.mktemp("al")
     (root / "config").mkdir()
     (root / "data").mkdir()
+    (root / "launch-agents").mkdir()
     os.environ["AGENTLOOP_CONFIG"] = str(root / "config")
     os.environ["AGENTLOOP_DATA"] = str(root / "data")
+    os.environ["AGENTLOOP_LAUNCH_AGENTS_DIR"] = str(root / "launch-agents")
+    os.environ["AGENTLOOP_CLAUDE_BIN"] = str(REPO / "test" / "fake-claude")
+    os.environ["AGENTLOOP_CODEX_BIN"] = str(REPO / "test" / "fake-codex")
+    os.environ["AGENTLOOP_OPENCODE_BIN"] = str(REPO / "test" / "fake-opencode")
     spec = importlib.util.spec_from_loader(
         "al_server", importlib.machinery.SourceFileLoader("al_server", str(SERVER)))
     mod = importlib.util.module_from_spec(spec)
