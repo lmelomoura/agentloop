@@ -835,8 +835,9 @@ function secFindingRow(f){
   st.textContent = SEC_STATE_LABEL[f.state] || f.state;
   h.appendChild(st);
   // The candidate's own confidence, beside the state -- it qualifies the
-  // finding, it does not classify it (see candidate.js).
-  const chip = secConfidenceChip(f);
+  // finding, it does not classify it (see candidate.js). Named, because this
+  // card has no column header and says its severity only in the title.
+  const chip = secConfidenceChip(f, true);
   if(chip) h.appendChild(chip);
   const vchip = secVerdictChip(f);
   if(vchip) h.appendChild(vchip);

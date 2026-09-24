@@ -351,11 +351,11 @@
     const c = f && f.candidate;
     return c && typeof c === "object" ? c : null;
   }
-  function secConfidenceChip(f) {
+  function secConfidenceChip(f, named) {
     const c = f && f.candidate && typeof f.candidate === "object" ? f.candidate : null;
     const score = f && f.confidence || c && c.confidence && c.confidence.score || "";
     if (!score) return null;
-    const chip = secEl("span", "secconf " + score, score);
+    const chip = secEl("span", "secconf " + score, named ? score + " confidence" : score);
     if (c && c.confidence && c.confidence.reason) chip.title = c.confidence.reason;
     return chip;
   }
@@ -1008,7 +1008,7 @@
     st.title = SEC_STATE_HELP[f.state] || "";
     st.textContent = SEC_STATE_LABEL[f.state] || f.state;
     h.appendChild(st);
-    const chip = secConfidenceChip(f);
+    const chip = secConfidenceChip(f, true);
     if (chip) h.appendChild(chip);
     const vchip = secVerdictChip(f);
     if (vchip) h.appendChild(vchip);
@@ -5440,5 +5440,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: 31c71a4c2dba799805b1a5d53ad16656ffaf2f176e6111c48d6be1b160db8839 */
-/* ui-sources: 303ead1be8b8fc9661215e0c8145e093e9cffbff0e6f69b2956ccff86d5cb470 */
+/* ui-bundle: d954216d75dee850158dc0b6b80666efc654cfc374d7e6df8992ecf5b13defea */
+/* ui-sources: 9f0d0af7605d7ba3f6b3a63f863ef62df4cce8ca5e1a31de72a498d126f232bf */
