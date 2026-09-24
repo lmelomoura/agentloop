@@ -329,7 +329,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   watchdog signals is the agent's own. `test/fake-claude` records its pid
   (`FAKE_PID_OUT`) and its `hang` mode execs its sleep, so the end-to-end
   suite checks the process that has to end (scenario 53 for a stop, 41b for
-  the watchdog) and no longer leaves orphans of its own behind.
+  the watchdog) and no longer leaves orphans of its own behind. Scenario
+  53's launches wait the way scenario 44's do: bounded at 90 s, and for the
+  previous launch's slot to be gone before the next one starts.
 
 - **A command past its deadline reads as 124, never as a traceback.**
   `run_bounded` (the deadline around `opencode models` and `opencode export`)

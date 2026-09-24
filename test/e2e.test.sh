@@ -1568,8 +1568,10 @@ echo "53. a stop ends the Claude CLI itself, not only the shell that launched it
 mkjob j53
 pid53="$ROOT/pid-53"; rm -f "$pid53"
 FAKE_MODE=hang FAKE_PID_OUT="$pid53" FAKE_SESSION=sess-53 "$AL" run j53 >/dev/null 2>&1 &
+# Bounded at 90 s, as scenario 44's waits are: a launch that takes seconds on
+# a laptop took past 20 s on a loaded CI runner.
 w=0
-while [ "$w" -lt 20 ] && ! { ls "$ROOT"/data/locks/j53/*/child >/dev/null 2>&1 && [ -s "$pid53" ]; }; do
+while [ "$w" -lt 90 ] && ! { ls "$ROOT"/data/locks/j53/*/child >/dev/null 2>&1 && [ -s "$pid53" ]; }; do
   sleep 1; w=$((w + 1))
 done
 cli53="$(cat "$pid53" 2>/dev/null)"
@@ -1595,9 +1597,18 @@ grep -F 'j53: stop asked for run ' "$ROOT/data/tick.log" | grep -qF 'from outsid
   && ok "and tick.log said so the moment the stop was asked" \
   || bad "tick.log: $(grep -F 'j53:' "$ROOT/data/tick.log" | tail -2)"
 # The control server's own stop sets AL_STOP_SOURCE (bin/agentloop-server
-# stop_run, tests/test_stop_origin.py); the engine's half is here.
-FAKE_MODE=hang FAKE_SESSION=sess-53b "$AL" run j53 >/dev/null 2>&1 &
-w=0; while [ "$w" -lt 20 ] && ! ls "$ROOT"/data/locks/j53/*/child >/dev/null 2>&1; do sleep 1; w=$((w + 1)); done
+# stop_run, tests/test_stop_origin.py); the engine's half is here. The first
+# launch's slot has to be gone before the second starts -- scenario 44's
+# lesson: a slot a teardown has not finished removing reads, to a glob, as
+# the new launch's own, and the stop below would be aimed at it.
+w=0; while [ "$w" -lt 90 ] && [ -n "$(ls "$ROOT/data/locks/j53" 2>/dev/null)" ]; do sleep 1; w=$((w + 1)); done
+[ -z "$(ls "$ROOT/data/locks/j53" 2>/dev/null)" ] || bad "the first launch's slot is still there after ${w}s: $(ls "$ROOT/data/locks/j53")"
+pid53b="$ROOT/pid-53b"; rm -f "$pid53b"
+FAKE_MODE=hang FAKE_PID_OUT="$pid53b" FAKE_SESSION=sess-53b "$AL" run j53 >/dev/null 2>&1 &
+w=0
+while [ "$w" -lt 90 ] && ! { ls "$ROOT"/data/locks/j53/*/child >/dev/null 2>&1 && [ -s "$pid53b" ]; }; do
+  sleep 1; w=$((w + 1))
+done
 AL_STOP_SOURCE=dashboard "$AL" stop j53 >/dev/null 2>&1
 wait
 [ "$(lastrun | jq -r .session)" = "sess-53b" ] && lastrun | jq -r .note | grep -qF 'STOPPED: ended from the dashboard. ' \
