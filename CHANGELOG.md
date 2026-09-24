@@ -294,6 +294,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rewrite, no FTS touch. Any other resync reason, or a bump not on the list,
   still takes the full resync exactly as before.
 
+- **Until the server answers, or while it is busy, the dashboard says it is
+  waiting instead of drawing an empty install.** `render()` used to run
+  synchronously at boot — before `loadSession()`/`refresh()` had even
+  started — against the page's own placeholder `DATA`, and `refresh()` only
+  fetched `/api/config` (the job and project definitions) after `/api/data`
+  had already answered: a slow or failed first `/api/data` (the schema
+  resync above, or a dropped connection) left the page showing "No jobs
+  yet — create one", "launchd off" and "Nothing to run" for real, over an
+  install the server had not actually described yet. `render()` now stays
+  on a neutral wait state ("Loading…", the launchd pill neutral) until
+  `DATA_LOADED` — set only by the first successful `/api/data` — is true;
+  `/api/config` is now requested at boot in parallel with the first
+  `/api/data`, not gated behind it, so jobs and projects are ready the
+  moment the (usually fast) config read lands; and a refresh that fails, or
+  one that has not answered in ~10s, shows a banner ("Waiting for the
+  server — it may be busy updating its run index; this page keeps
+  retrying.") without discarding whatever the page already had, cleared by
+  the next success. A refresh already in flight is never joined by a second
+  one — the 5s poll simply skips a tick that finds one still running.
+
 - **A pin that names the CLI's own `~/.claude` no longer signs the install
   out.** A pin of `$HOME/.claude`, trailing slash or not, was exported as
   written, and Claude Code names the Keychain entry it reads after the
