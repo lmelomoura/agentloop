@@ -302,6 +302,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a live pipe, and stops with `break` the moment it finds one, so there is
   never a second write racing an already-closed reader.
 
+- **Two end-to-end scenarios no longer read a run's files before they
+  exist.** Scenario 8 read a detached analysis's precheck note the instant
+  its ledger row closed `done`, but the run's own journal record — a
+  separate write, `run_job`'s `record_run` — could still be a moment away;
+  it now waits, bounded, until `run_of` actually has a `.log` before
+  reading the note. Scenario 44 waited for `data/locks/j44/*/child` and
+  then read `*/forced` across every slot dir under it, which a stale
+  sibling left by the PREVIOUS launch's own teardown (carrying `child` but
+  no `forced`) could make it read instead of the launch it just started; it
+  now waits for an empty directory before each launch, then reads `forced`
+  from the one slot that actually carries both files.
+
 - **A schema bump that only adds journal-sourced columns fills them in
   place, instead of re-indexing every run.** PR #77's `account`/
   `account_dir` columns bumped the index's `SCHEMA_VERSION`, and `ingest()`
