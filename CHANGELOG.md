@@ -20,6 +20,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The deep scope is cut into readings a single session can hold.** The
+  inventory is packed, in path order, into slices of at most 300 KB of
+  source (~85k tokens); a range bigger than that is a slice of its own.
+  However large the repository, no session is asked to hold more than one
+  slice — the single agent before this read until its context was full and
+  then stopped.
+
 - **A deep analysis lists its scope before it reads anything.** `prepare`
   now records every versioned file a line-by-line read has to cover, with
   its lines and bytes — a file over 300 KB as consecutive line ranges — and
