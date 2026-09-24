@@ -143,17 +143,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `AGENTLOOP_DATA` and `CODEX_HOME`. On a developer machine whose live
   install is pinned, the local suites would have picked up that real
   account as the Default, shifting expectations, and a fake run would have
-  exported the real directory; CI has no plist, so this stayed invisible
-  there regardless of which developer machine actually ran the suite.
-  Defaults to the real directory (`~/Library/LaunchAgents`, so production
-  is unaffected); the e2e sandbox, the selftest suite and the pytest
-  fixture that binds the control server for its own tests each now point
-  it at an empty directory of their own. The control server mirrors the
-  engine's own reading of it (`bin/agentloop-server`'s `_installed_config_dir`
-  used to hardcode the real directory regardless). The same pytest fixture
-  now also points the engine subprocesses it launches at the repository's
-  own stand-in `claude`, `codex` and `opencode` — before, an unauthenticated
-  local machine answered those calls for real.
+  exported the real directory; CI has no plist. Defaults to the real
+  directory (`~/Library/LaunchAgents`, so production is unaffected).
+  Against the last release: `AGENTLOOP_LAUNCH_AGENTS_DIR`, the pytest
+  fixture that binds the control server for its own tests, and the
+  server's own mirror of `installed_config_dir` together keep all three
+  suites — e2e, selftest and pytest — off a real `launchd` plist, and the
+  suites give a fake `claude`, `codex` and `opencode` to any test that
+  does not already name its own stand-in.
 
 ### Changed
 

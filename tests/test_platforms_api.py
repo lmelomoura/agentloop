@@ -365,9 +365,23 @@ def test_the_bin_precedence_matches_the_engine(srv, tmp_path, monkeypatch):
     `agentloop platform check`, which is what a launch actually obeys."""
     cfg = tmp_path / "config"; cfg.mkdir()
     fake = tmp_path / "mycodex"; fake.write_text("#!/bin/sh\necho codex-cli 1.0\n"); fake.chmod(0o755)
+    # The "auto" case below (bin="") is this test's own leftover gap: both
+    # sides' detection falls through to a PATH search for a binary literally
+    # named "codex" -- command -v on the engine's side, shutil.which on the
+    # server's -- before EITHER ever reaches the hardcoded
+    # /opt/homebrew/bin/codex fallback. On a machine with the real Codex CLI
+    # installed (on PATH, or at that exact fallback path), "auto" landed on
+    # it. A fake named exactly "codex", in a directory put first on PATH on
+    # both sides, is what "auto" is actually allowed to find here -- the
+    # detection itself still runs, it just cannot land on a real CLI.
+    codex_path_dir = tmp_path / "codex-on-path"; codex_path_dir.mkdir()
+    fake_codex_on_path = codex_path_dir / "codex"
+    fake_codex_on_path.write_text(f'#!/bin/sh\nexec "{FAKE_CODEX}" "$@"\n')
+    fake_codex_on_path.chmod(0o755)
+    path_with_fake = str(codex_path_dir) + os.pathsep + os.environ.get("PATH", "")
     env = dict(os.environ, AGENTLOOP_CONFIG=str(cfg), AGENTLOOP_DATA=str(tmp_path / "data"),
                AGENTLOOP_CLAUDE_BIN=str(REPO / "test" / "fake-claude"), AGENTLOOP_CLAUDE_CONFIG_DIR="",
-               CODEX_HOME=str(tmp_path / "codex-home"))
+               CODEX_HOME=str(tmp_path / "codex-home"), PATH=path_with_fake)
     env.pop("AGENTLOOP_CODEX_BIN", None)
 
     def engine_bin():
@@ -378,11 +392,13 @@ def test_the_bin_precedence_matches_the_engine(srv, tmp_path, monkeypatch):
 
     monkeypatch.setattr(srv, "PLATFORMS_FILE", cfg / "platforms.json")
     monkeypatch.delenv("AGENTLOOP_CODEX_BIN", raising=False)
+    monkeypatch.setenv("PATH", path_with_fake)
     (cfg / "platforms.json").write_text(json.dumps({"platforms": {"openai": {"enabled": True, "bin": str(fake), "models": []}}}))
     assert srv.platform_bin("openai", {"bin": str(fake)}) == (str(fake), "file") == engine_bin()
     (cfg / "platforms.json").write_text(json.dumps({"platforms": {"openai": {"enabled": True, "bin": "", "models": []}}}))
-    assert srv.platform_bin("openai", {"bin": ""}) == engine_bin()
-    assert srv.platform_bin("openai", {"bin": ""})[1] == "auto"
+    auto = srv.platform_bin("openai", {"bin": ""})
+    assert auto == engine_bin()
+    assert auto == (str(fake_codex_on_path), "auto")
     env["AGENTLOOP_CODEX_BIN"] = str(fake)
     monkeypatch.setenv("AGENTLOOP_CODEX_BIN", str(fake))
     assert srv.platform_bin("openai", {"bin": "/elsewhere"}) == (str(fake), "env") == engine_bin()
