@@ -318,7 +318,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sibling left by the PREVIOUS launch's own teardown (carrying `child` but
   no `forced`) could make it read instead of the launch it just started; it
   now waits for an empty directory before each launch, then reads `forced`
-  from the one slot that actually carries both files.
+  from the one slot that actually carries both files. Every one of these
+  waits is bounded at 90 s: a launch that takes 6–7 s on a laptop running the
+  four e2e workers took past the old 20 s on a loaded CI runner.
 
 - **A schema bump that only adds journal-sourced columns fills them in
   place, instead of re-indexing every run.** PR #77's `account`/
