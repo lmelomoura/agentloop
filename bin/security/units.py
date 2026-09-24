@@ -111,7 +111,11 @@ def plan(conn, analysis_id, slice_guides=None) -> list:
     specs = []
     items = triage_items(conn, analysis_id)
     for start in range(0, len(items), TRIAGE_BATCH):
-        batch = [{"fingerprint": i["fingerprint"], "kind": i["kind"], "category": i["category"]}
+        # Each item keeps the severity its row had when planned -- for a
+        # scanner row, the one its scanner filed, which the triage floor is
+        # judged by (`_judge_triage`) whatever is written over the row later.
+        batch = [{"fingerprint": i["fingerprint"], "kind": i["kind"], "category": i["category"],
+                  "severity": i["severity"]}
                  for i in items[start:start + TRIAGE_BATCH]]
         specs.append(("triage", {"items": batch}))
     specs.append(("hunt", {"profile": profile}))
@@ -212,11 +216,12 @@ def _judge_triage(conn, unit):
     """Which of its rows this unit settled, by ITS OWN writes alone.
 
     A scanner row counts once this unit's re-report marked it triaged
-    (`finding.unit` names the unit), or when it sits below the floor at the
-    severity its scanner gave it. A carried row counts once this unit
-    re-reported it into this analysis, or -- a `sast` one -- said it is gone
-    (`report-gone`, ledger.gone_by). Either counts when the operator decided
-    it: a human's ruling needs nobody's reading.
+    (`finding.unit` names the unit), or when it sits below the floor both at
+    the severity its scanner filed and at the one it holds now. A carried
+    row counts once this unit re-reported it into this analysis, or -- a
+    `sast` one -- said it is gone (`report-gone`, ledger.gone_by). Either
+    counts when the operator decided it: a human's ruling needs nobody's
+    reading.
 
     FAIL-CLOSED ON A RACE, KNOWINGLY. Another unit that re-reports one of
     these rows after this one moves `finding.unit` to itself, and this
@@ -246,13 +251,25 @@ def _judge_triage(conn, unit):
                 continue
             if row["triaged"] and mine:
                 continue
-            if not row["triaged"] and row["severity"] not in BLOCKING:
-                # Below the floor at the severity its SCANNER gave it: the
-                # close never asks for its reading. A severity an agent's
-                # re-report wrote (`triaged`) is that writer's reading --
-                # an attempt disqualified for a subagent lowering a `high`
-                # to `low` included -- and counts for the writer alone,
-                # through the line above.
+            if "severity" in item:
+                if item["severity"] not in BLOCKING and row["severity"] not in BLOCKING:
+                    # BELOW THE FLOOR AT BOTH SEVERITIES, whoever wrote on
+                    # the row: the close never asks for its reading. At the
+                    # SCANNER's (kept in the item by `plan`), so a re-report
+                    # that lowered a `high` to `low` -- a disqualified
+                    # attempt's included -- counts for its writer alone,
+                    # through the line above; at the row's own now, so a row
+                    # somebody raised into the floor is read. Asked of
+                    # `triaged` instead, as it first was, a read unit folding
+                    # a finding into a `low` scanner row -- as its prompt
+                    # tells it to -- made that row the debt of the triage
+                    # unit that skipped it, as ITS prompt allows.
+                    continue
+            elif not row["triaged"] and row["severity"] not in BLOCKING:
+                # An item with no severity of its own -- built by hand, or
+                # planned before `plan` kept it -- cannot tell the scanner's
+                # severity from an agent's: the row holds the scanner's
+                # only while no re-report has written over it (`triaged`).
                 continue
         elif mine:
             continue
@@ -261,7 +278,9 @@ def _judge_triage(conn, unit):
             # (`report-gone`): its absence from this analysis is a reading,
             # not a silence, and it closes `fixed`.
             continue
-        left.append({k: item[k] for k in ("fingerprint", "kind", "category") if k in item})
+        # The continuation's item carries the severity on: its floor is
+        # judged by the scanner's, however the row has been rewritten since.
+        left.append({k: item[k] for k in ("fingerprint", "kind", "category", "severity") if k in item})
     ev = {"items": len(owed), "missing": [i["fingerprint"] for i in left]}
     if not left:
         return True, None, ev, f"Triaged: {len(owed)} row(s)."
@@ -329,10 +348,14 @@ def judge(conn, unit, session, status, reason=""):
     return done, remaining, ev, note
 
 
-def conclude(conn, unit, *, done, evidence, note, spend_usd, remaining=None, stopped=False):
+def conclude(conn, unit, *, done, evidence, note, spend_usd, remaining=None, stopped=False,
+             clear_verdict=None):
     """Settle `unit` and plan what it left, in ONE transaction
     (ledger.conclude_unit). Returns the unit's state and the id of its
-    continuation, if one was planned.
+    continuation, if one was planned. `clear_verdict`, `(analysis_id,
+    fingerprint, by)`, takes that verdict off its row in the same
+    transaction, and only if the settle takes effect (`close` passes it for
+    a verify attempt disqualified for a subagent).
 
     THE LEDGER'S ANSWER, NOT THE CALLER'S INTENT. A unit already settled --
     by another close, or by an earlier call holding the same copy of it --
@@ -352,7 +375,7 @@ def conclude(conn, unit, *, done, evidence, note, spend_usd, remaining=None, sto
             payload = remaining if remaining is not None else unit["payload"]
             state, continuation = "incomplete", (unit["kind"], payload, attempt, unit["id"])
     settled, cid = ledger.conclude_unit(conn, unit["id"], state, spend_usd, evidence, note,
-                                        continuation)
+                                        continuation, clear_verdict)
     if not settled:
         return {"state": ledger.get_unit(conn, unit["id"])["state"], "continuation": None}
     return {"state": state, "continuation": cid}
@@ -498,6 +521,7 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     # launch either.
     session = evidence.with_served(session, ledger.unit_reads(conn, unit["id"], since=unit["started"]))
     done, remaining, ev, note = judge(conn, unit, session, status, reason)
+    clear = None
     if session.tasks and unit["kind"] == "verify":
         # A VERDICT NOBODY CAN PROVE THIS UNIT REASONED MUST NOT STAND. The
         # session launched a subagent, so `judge` credits it with nothing --
@@ -506,9 +530,17 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
         # `record_verdict` writes a row's verdict once, so the continuation
         # could never write its own and the lineage never finish, and a
         # `rejected` would drop the finding from the exposure for good.
-        # Cleared BEFORE the conclude, so a kill in between leaves the unit
-        # running with nothing credited, to be judged again.
-        ledger.clear_verdict(conn, unit["analysis_id"], unit["payload"].get("fingerprint", ""),
-                             f"unit:{unit['id']}")
+        # CLEARED BY THE SETTLE, IN ITS TRANSACTION (ledger.conclude_unit),
+        # and only if the settle takes effect. Cleared here on its own, as it
+        # first was, a second close of this unit with no stream -- which sees
+        # no subagent -- could settle it `done` on the verdict in between,
+        # and the clear then left a `done` verify unit with no verdict. One
+        # transaction also keeps what clearing first bought: no kill lands
+        # between the two, so the unit is never settled with the verdict
+        # still standing. (A kill before the commit leaves the unit running
+        # with its verdict: the next close given the stream clears it; one
+        # without the stream cannot see the subagent at all -- the limit
+        # every close has on a run whose stream is lost.)
+        clear = (unit["analysis_id"], unit["payload"].get("fingerprint", ""), f"unit:{unit['id']}")
     return conclude(conn, unit, done=done, evidence=ev, note=note, spend_usd=spend_usd,
-                    remaining=remaining, stopped=status == "stopped")
+                    remaining=remaining, stopped=status == "stopped", clear_verdict=clear)

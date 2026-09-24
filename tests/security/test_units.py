@@ -1,5 +1,6 @@
 # tests/security/test_units.py
 """The pipeline's units: what the plan holds, what runs next, and how a unit is judged."""
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -31,11 +32,16 @@ def _scanner(conn, aid, fp, severity="high", producer="semgrep"):
         "occurrences": [{"file": "a.py", "line": 3}]})
 
 
-def _agent(conn, aid, fp, severity="medium", unit=0):
+def _agent(conn, aid, fp, severity="medium", unit=0, rationale="the agent read it"):
     ledger.record_finding(conn, aid, {
         "fingerprint": fp, "category": "sast", "rule": "xss", "severity": severity,
-        "title": "t", "rationale": "the agent read it", "producer": "agent", "unit": unit,
+        "title": "t", "rationale": rationale, "producer": "agent", "unit": unit,
         "occurrences": [{"file": "a.py", "line": 3}]})
+
+
+def _verdict(conn, fp):
+    return tuple(conn.execute("SELECT verdict, verified_by FROM finding WHERE fingerprint=?",
+                              (fp,)).fetchone())
 
 
 def _inventory(conn, aid, files):
@@ -103,6 +109,9 @@ def test_the_plan_is_triage_batches_one_hunt_and_a_read_per_slice(conn, monkeypa
              for u in ledger.units_of(conn, aid)]
     assert kinds == [("triage", 2), ("triage", 2), ("triage", 1), ("hunt", 0), ("read", 1), ("read", 1)]
     assert len(ids) == 6
+    assert ledger.units_of(conn, aid)[0]["payload"]["items"][0] == \
+        {"fingerprint": "a" * 64, "kind": "scanner", "category": "sast", "severity": "high"}, \
+        "each item keeps the severity its scanner filed: the triage floor is judged by it too"
     assert units.plan(conn, aid) == [], "a second plan of the same analysis adds nothing"
     reads = [u for u in ledger.units_of(conn, aid) if u["kind"] == "read"]
     assert reads[0]["payload"]["guides"] == ["ATTACK-CLASSES"]
@@ -400,27 +409,97 @@ def test_a_re_report_an_attempt_with_a_subagent_wrote_does_not_count_for_its_con
     _agent(conn, aid, "a" * 64, "high", unit=first)
     second = _fanned_out(conn, first, tmp_path)
     assert units.judge(conn, second, _session(), "success")[:2] == (False, {"items": [item]})
-    _agent(conn, aid, "a" * 64, "high", unit=second["id"])
+    _agent(conn, aid, "a" * 64, "high", unit=second["id"], rationale="attempt 2 read the handler itself")
     assert units.judge(conn, second, _session(), "success")[:2] == (True, None)
 
 
 def test_a_severity_an_attempt_with_a_subagent_lowered_below_the_floor_settles_nothing(conn, tmp_path):
     """C1's neighbour. A scanner row below the floor needs no reading -- at
-    the severity its SCANNER gave it. Attempt 1 re-reporting a `high` as
+    the severity its SCANNER gave it, which the plan keeps in the item, as
+    well as at the one it holds now. Attempt 1 re-reporting a `high` as
     `low` is a reading like any other, and letting it through the floor
     would credit attempt 2 with it. (The row the scanner itself filed low,
     and nobody touched, stays settled: see the triage test above.)"""
     aid = _analysis(conn)
     _scanner(conn, aid, "a" * 64, "high")
-    item = {"fingerprint": "a" * 64, "kind": "scanner", "category": "sast"}
+    item = {"fingerprint": "a" * 64, "kind": "scanner", "category": "sast", "severity": "high"}
     first = ledger.add_unit(conn, aid, "triage", {"items": [item]})
     ledger.start_unit(conn, first)
     _agent(conn, aid, "a" * 64, "low", unit=first)
     second = _fanned_out(conn, first, tmp_path)
-    assert units.judge(conn, second, _session(), "success")[:2] == (False, {"items": [item]})
-    _agent(conn, aid, "a" * 64, "low", unit=second["id"])
+    assert units.judge(conn, second, _session(), "success")[:2] == (False, {"items": [item]}), \
+        "owed, and the continuation's item still carries the scanner's severity"
+    _agent(conn, aid, "a" * 64, "low", unit=second["id"], rationale="attempt 2 read the handler itself")
     assert units.judge(conn, second, _session(), "success")[:2] == (True, None), \
         "its own re-report at `low` settles it"
+
+
+@pytest.mark.parametrize("folded, owed", [("low", False), ("high", True)],
+                         ids=["left below the floor", "raised into it"])
+def test_a_scanner_row_another_unit_folded_into_is_owed_only_at_the_floor_or_above(
+        conn, tmp_path, folded, owed):
+    """I1 (round 2). A read unit folds what it finds into a known
+    fingerprint, as its prompt tells it to. Judged by `triaged` alone, that
+    made the `low` row the triage unit skipped -- as ITS prompt allows --
+    that unit's debt, and the lineage ran again for a row nothing blocks
+    on. Below the floor at BOTH severities -- the one its scanner filed
+    (kept in the item) and the one it holds now -- a row needs nobody's
+    reading, whoever wrote on it; raised into the floor, it is owed."""
+    aid = _analysis(conn)
+    _inventory(conn, aid, [_file("a.py", (1, 10, 100))])
+    _scanner(conn, aid, "a" * 64, "high")
+    _scanner(conn, aid, "b" * 64, "low")
+    units.plan(conn, aid)
+    by_kind = {u["kind"]: u for u in ledger.units_of(conn, aid)}
+    triage, read = by_kind["triage"], by_kind["read"]
+    ledger.start_unit(conn, triage["id"])
+    ledger.start_unit(conn, read["id"])
+    _agent(conn, aid, "a" * 64, "high", unit=triage["id"], rationale="the triage unit read it")
+    _agent(conn, aid, "b" * 64, folded, unit=read["id"], rationale="the read unit folded its finding here")
+    out = units.close(conn, ledger.get_unit(conn, triage["id"]), root=str(tmp_path), status="success")
+    if not owed:
+        assert out == {"state": "done", "continuation": None}
+        return
+    assert out["state"] == "incomplete"
+    assert ledger.get_unit(conn, out["continuation"])["payload"] == {"items": [
+        {"fingerprint": "b" * 64, "kind": "scanner", "category": "sast", "severity": "low"}]}
+
+
+def test_an_item_planned_without_its_scanner_s_severity_keeps_the_rule_it_had(conn):
+    """The item's severity is what lets the floor look past who wrote on a
+    row. An item without one -- built by hand, or planned before the plan
+    kept it -- cannot tell the scanner's severity from an agent's, so it
+    keeps the committed rule: the floor holds only while no re-report has
+    written over the row (`triaged`)."""
+    aid = _analysis(conn)
+    _scanner(conn, aid, "c" * 64, "low")
+    hunt = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    _agent(conn, aid, "c" * 64, "low", unit=hunt, rationale="the hunt came across it")
+    item = {"fingerprint": "c" * 64, "kind": "scanner", "category": "sast"}
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    assert units.judge(conn, ledger.get_unit(conn, uid), _session(), "success")[:2] == (False, {"items": [item]})
+
+
+def test_a_continuation_cannot_hand_back_the_sentence_its_disqualified_attempt_left(conn, tmp_path):
+    """M2. The rubber-stamp gate armed only when `triaged` went 0 -> 1, so
+    once a disqualified attempt had marked the row, its continuation could
+    re-report it with that attempt's rationale -- its subagent's, for all
+    anyone can prove -- byte for byte, and be credited: `finding.unit` then
+    named the continuation. A write that moves a scanner's row to another
+    unit is gated like a first one."""
+    aid = _analysis(conn)
+    _scanner(conn, aid, "a" * 64, "high")
+    item = {"fingerprint": "a" * 64, "kind": "scanner", "category": "sast", "severity": "high"}
+    first = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    ledger.start_unit(conn, first)
+    _agent(conn, aid, "a" * 64, "high", unit=first, rationale="the subagent's reading of it")
+    second = _fanned_out(conn, first, tmp_path)
+    with pytest.raises(ValueError, match="another session left on this row, handed back byte for byte"):
+        _agent(conn, aid, "a" * 64, "high", unit=second["id"], rationale="the subagent's reading of it")
+    assert units.judge(conn, second, _session(), "success")[:2] == (False, {"items": [item]}), \
+        "the echo recorded nothing, so the row is still owed"
+    _agent(conn, aid, "a" * 64, "high", unit=second["id"], rationale="attempt 2 read the handler itself")
+    assert units.judge(conn, second, _session(), "success")[:2] == (True, None)
 
 
 def test_a_report_gone_an_attempt_with_a_subagent_made_does_not_count_for_its_continuation(conn, tmp_path):
@@ -661,3 +740,90 @@ def test_a_close_over_a_unit_settled_elsewhere_touches_nothing_not_even_its_verd
     assert tuple(conn.execute("SELECT verdict, verified_by FROM finding WHERE fingerprint=?",
                               ("a" * 64,)).fetchone()) == ("confirmed", f"unit:{uid}")
     assert [u["id"] for u in ledger.units_of(conn, aid)] == [uid]
+
+
+@pytest.mark.parametrize("lands", ["before this close judges", "after this close judged"])
+def test_two_closes_of_one_verify_unit_interleaved_never_leave_it_done_without_its_verdict(
+        tmp_path, monkeypatch, lands):
+    """M1. The close of a session that launched a subagent clears the
+    verdict its unit wrote -- and it used to clear it on its own, before the
+    settle. A second close of the same unit with no stream (which sees no
+    subagent) settled it `done` on that verdict in between, and the first
+    then took the verdict away: a `done` verify unit with no verdict. The
+    clear now lands inside the settle's transaction, and only if the settle
+    takes effect: the first close finds the unit settled and touches
+    nothing. (A close that lands whole first is the sequential case the
+    tests above cover: `incomplete`, the verdict cleared, a continuation.)"""
+    db = tmp_path / "security.db"
+    mine, other = ledger.connect(db), ledger.connect(db)
+    aid = _analysis(mine)
+    _agent(mine, aid, "a" * 64, "high")
+    uid = ledger.add_unit(mine, aid, "verify", {"fingerprint": "a" * 64})
+    ledger.start_unit(mine, uid)
+    ledger.record_verdict(mine, aid, "a" * 64, "rejected", "a subagent's reading", by=f"unit:{uid}")
+    stream = tmp_path / "fanned.ndjson"
+    stream.write_text(LAUNCH + "\n")
+    theirs = []
+
+    def the_other_close_lands():
+        theirs.append(units.close(other, ledger.get_unit(other, uid), root=str(tmp_path), status="success"))
+
+    if lands == "before this close judges":
+        real_read = evidence.read_session
+
+        def read_session(path, root):
+            if not theirs and path:
+                the_other_close_lands()
+            return real_read(path, root)
+        monkeypatch.setattr(evidence, "read_session", read_session)
+    else:
+        real_judge, landed = units.judge, []
+
+        def judge(*args, **kwargs):
+            judged = real_judge(*args, **kwargs)
+            if not landed:
+                landed.append(True)
+                the_other_close_lands()
+            return judged
+        monkeypatch.setattr(units, "judge", judge)
+    try:
+        ours = units.close(mine, ledger.get_unit(mine, uid), stream=str(stream), root=str(tmp_path),
+                           status="success")
+        assert theirs == [{"state": "done", "continuation": None}], "the close with no stream saw no subagent"
+        assert ours == {"state": "done", "continuation": None}, "and this one found the unit settled"
+        assert _verdict(mine, "a" * 64) == ("rejected", f"unit:{uid}"), \
+            "a verify unit settled `done` keeps the verdict it was credited with"
+        assert [u["id"] for u in ledger.units_of(mine, aid)] == [uid]
+    finally:
+        mine.close()
+        other.close()
+
+
+def test_a_close_cut_short_inside_its_settle_takes_the_clear_back_with_it(conn, tmp_path):
+    """M1, and the kill-safety clearing first used to buy. The clear and the
+    settle are one transaction now, so a close cut short anywhere in it --
+    here, at the insert of the continuation -- leaves both undone: the unit
+    still running, its verdict as it was. Never a unit settled while its
+    disqualified verdict still stands (a continuation the write-once guard
+    would lock out), never a verdict cleared under a unit that stays
+    unsettled. The next close does both."""
+    aid = _analysis(conn)
+    _agent(conn, aid, "a" * 64, "high")
+    uid = ledger.add_unit(conn, aid, "verify", {"fingerprint": "a" * 64})
+    ledger.start_unit(conn, uid)
+    ledger.record_verdict(conn, aid, "a" * 64, "rejected", "a subagent's reading", by=f"unit:{uid}")
+    stream = tmp_path / "fanned.ndjson"
+    stream.write_text(LAUNCH + "\n")
+    conn.execute("CREATE TEMP TRIGGER cut_short BEFORE INSERT ON unit"
+                 " BEGIN SELECT RAISE(ABORT, 'killed mid-close'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="killed mid-close"):
+        units.close(conn, ledger.get_unit(conn, uid), stream=str(stream), root=str(tmp_path), status="success")
+    conn.execute("DROP TRIGGER cut_short")
+    assert ledger.get_unit(conn, uid)["state"] == "running"
+    assert _verdict(conn, "a" * 64) == ("rejected", f"unit:{uid}"), "the clear rolled back with the settle"
+    assert [u["id"] for u in ledger.units_of(conn, aid)] == [uid]
+    out = units.close(conn, ledger.get_unit(conn, uid), stream=str(stream), root=str(tmp_path), status="success")
+    assert (out["state"], _verdict(conn, "a" * 64)) == ("incomplete", ("", ""))
+    cont = ledger.get_unit(conn, out["continuation"])
+    assert ledger.record_verdict(conn, aid, "a" * 64, "confirmed", "read it", by=f"unit:{cont['id']}")
+    assert units.judge(conn, cont, _session(), "success")[0] is True

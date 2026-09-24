@@ -1072,6 +1072,47 @@ def test_a_repeat_of_a_re_report_that_already_counted_is_not_refused(conn):
     assert got[0]["triaged"] == 1
 
 
+@pytest.mark.parametrize("reader", [5, 0], ids=["read by a unit", "read outside any unit"])
+def test_a_re_report_that_moves_the_row_to_another_unit_is_gated_like_a_first_one(conn, reader):
+    """The pipeline credits a triage unit with a row by the unit its re-report
+    carries (`finding.unit`, security/units.py), so the write that moves the
+    row to a unit is that unit's claim to have read it. Gated at 0 -> 1 only,
+    a second unit could hand back the sentence the first reader left -- a
+    disqualified attempt's, whose subagent may have written it -- byte for
+    byte, and be credited. The same reader writing again, and a write from
+    outside any unit (which leaves `unit` alone), are still the retries the
+    test above protects."""
+    aid = ledger.start_analysis(conn, "web", "web", "main", "abc", "standard", "r")
+    _scanner_row(conn, aid)
+    read = _finding(
+        category="dependency", rule="CVE-1", severity="low",
+        producer=ledger.AGENT, rationale="not reachable from any request",
+        occurrences=[{"file": "yarn.lock", "line": 4, "snippet_hash": ""}], unit=reader)
+
+    def unit_of_row():
+        return conn.execute("SELECT unit FROM finding WHERE fingerprint=?", ("a" * 64,)).fetchone()[0]
+
+    with pytest.raises(ValueError) as first:
+        ledger.record_finding(conn, aid, dict(read, rationale="Trivy read the lockfile"))
+    assert "the producer's own sentence" in str(first.value), "a first reading's echo is still the producer's"
+
+    ledger.record_finding(conn, aid, read)
+    ledger.record_finding(conn, aid, read)
+    ledger.record_finding(conn, aid, dict(read, unit=0))
+    assert unit_of_row() == reader
+
+    with pytest.raises(ValueError) as exc:
+        ledger.record_finding(conn, aid, dict(read, unit=6))
+    assert "byte for byte" in str(exc.value)
+    assert "another session" in str(exc.value), \
+        "the refusal names whose sentence came back: not the producer's, which the row no longer holds"
+    assert unit_of_row() == reader, "nothing was recorded: the row still names who read it"
+
+    ledger.record_finding(conn, aid, dict(read, unit=6, rationale="read the call site: the input is a literal"))
+    assert unit_of_row() == 6
+    assert ledger.findings_of(conn, aid)[0]["triaged"] == 1
+
+
 def test_a_bare_write_onto_a_row_already_marked_is_refused_and_the_evidence_survives_it(conn):
     """The erasure route, the second time round. The stamp test gates the
     0 -> 1 transition only (the test above is why), so once a real reading had

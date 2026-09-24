@@ -59,8 +59,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   written in one transaction, all of it or none, so a plan cut short can
   never leave slices no unit will read. A unit is judged by what it left:
   the ranges its own stream proves it read (kept on the unit, whatever its
-  outcome, as the lines it covered), the rows the ledger shows it triaged,
-  the verdict it wrote. What it left undone becomes a new unit carrying
+  outcome, as the lines it covered), the rows the ledger shows it triaged
+  (a scanner's row below the close's floor needs none — judged at the
+  severity its scanner filed as well as at the one it holds now), the
+  verdict it wrote. What it left undone becomes a new unit carrying
   only what is missing, up to three attempts; a session that launched a
   subagent does not count, whatever kind of unit it was. A unit is credited
   only with what carries its own id — the rows it re-reported, what it said

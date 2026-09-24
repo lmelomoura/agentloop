@@ -241,6 +241,42 @@ def test_a_triage_prompt_lists_every_location_of_its_row(tmp_path):
         assert place in text
 
 
+def test_a_triage_prompt_shows_the_severity_the_scanner_filed_beside_a_lowered_one(tmp_path):
+    """The plan keeps the scanner's severity in each triage item, and the
+    judge owes the row at it as well as at the one the row holds now -- so
+    the prompt carries it through: a row another unit lowered to `low` is
+    shown with the `high` its scanner filed, the reason it is still owed.
+    A carried item's severity is no scanner's, and is never shown as one."""
+    db = tmp_path / "security.db"
+    conn = ledger.connect(db)
+    try:
+        prev = ledger.start_analysis(conn, "web", "web", "main", "c0", "deep", "security-web")
+        ledger.record_finding(conn, prev, {
+            "fingerprint": "c" * 64, "category": "sast", "rule": "xss", "severity": "high",
+            "title": "t", "rationale": "an earlier reading", "producer": "agent",
+            "occurrences": [{"file": "src/a.py", "line": 1}]})
+        ledger.finish_analysis(conn, prev, "done")
+    finally:
+        conn.close()
+    aid, _root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    conn = ledger.connect(db)
+    try:
+        scanner = {"fingerprint": "f" * 64, "category": "sast", "rule": "r", "severity": "high",
+                   "title": "t", "rationale": "scanner text", "producer": "semgrep",
+                   "occurrences": [{"file": "src/a.py", "line": 1}]}
+        ledger.record_finding(conn, aid, scanner)
+        ledger.record_finding(conn, aid, dict(scanner, severity="low", producer="agent",
+                                              rationale="another unit read it", unit=_unit(db, aid, "hunt")["id"]))
+        uid = ledger.add_unit(conn, aid, "triage", {"items": [
+            {"fingerprint": "f" * 64, "kind": "scanner", "category": "sast", "severity": "high"},
+            {"fingerprint": "c" * 64, "kind": "carried", "category": "sast", "severity": "medium"}]})
+    finally:
+        conn.close()
+    text = _prompt(db, aid, uid)
+    assert "[scanner] " + "f" * 64 + " · sast/r · low (scanner: high) · src/a.py:1 · by semgrep" in text
+    assert "[carried] " + "c" * 64 + " · sast/xss · high · src/a.py:1 · by agent" in text
+
+
 def test_a_read_prompt_names_a_decision_by_its_category_and_its_state(tmp_path):
     """`queries.decided_sast` entries carry neither `category` nor `state` --
     the real shape, produced here by a real decision on another branch, not a

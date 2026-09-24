@@ -61,6 +61,19 @@ def test_a_triage_unit_lists_each_row_with_what_it_is():
     assert "agentloop security report-gone" in out and "no `candidate`" in out
 
 
+def test_a_scanner_row_whose_severity_changed_shows_the_scanner_s_too():
+    """The judge owes a scanner row at medium or above at the severity its
+    scanner filed OR at the one it holds now (security/units.py). A row
+    another unit lowered to `low` is still owed -- and the unit sees why."""
+    lowered = dict(ROW, severity="low", scanner_severity="high")
+    kept = dict(ROW, fingerprint="b" * 64, scanner_severity="high")
+    out = _p("triage", {"rows": [lowered, kept]})
+    assert "[scanner] " + "a" * 64 + " · dependency/CVE-2024-0001 · low (scanner: high) · composer.lock · by trivy" in out
+    assert "[scanner] " + "b" * 64 + " · dependency/CVE-2024-0001 · high · composer.lock · by trivy" in out, \
+        "a severity nobody changed is shown once"
+    assert "Either severity counts" in out
+
+
 def test_a_triage_row_shows_every_location_it_has():
     """A re-report REPLACES the stored locations (ledger.record_finding), so a
     row shown by its first location alone and re-reported "exactly as shown"

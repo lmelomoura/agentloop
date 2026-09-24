@@ -176,9 +176,23 @@ def _header(analysis, label, platform, kind):
     ]
 
 
+def _severity(row):
+    """A row's severity as its line shows it: the operator's decision when
+    there is one; otherwise its severity, and -- on a triage row whose
+    scanner filed it at another (`scanner_severity`) -- that one beside it.
+    The unit owes a scanner row at the floor or above at EITHER
+    (security/units.py): a row another unit lowered to `low` is still owed,
+    and the line says why."""
+    if row.get("state") in ("accepted", "false_positive"):
+        return row["state"]
+    filed = row.get("scanner_severity") or ""
+    if filed and filed != row["severity"]:
+        return f"{row['severity']} (scanner: {filed})"
+    return row["severity"]
+
+
 def _row(row, with_producer=False):
-    text = (f"{row['fingerprint']} · {row['category']}/{row['rule']} · "
-            f"{row.get('state') if row.get('state') in ('accepted', 'false_positive') else row['severity']} · {_where(row)}")
+    text = f"{row['fingerprint']} · {row['category']}/{row['rule']} · {_severity(row)} · {_where(row)}"
     return text + (f" · by {row.get('producer') or 'unknown'}" if with_producer else "")
 
 
@@ -191,7 +205,9 @@ def _triage(context):
         "- A [scanner] row: re-report it under the fingerprint given, with your own",
         "  severity, rationale and `candidate.confidence`, and every location still",
         "  affected. A row at medium or above that you do not re-report keeps this",
-        "  unit open, and another session is sent for it.",
+        "  unit open, and another session is sent for it. Either severity counts --",
+        "  the one its scanner filed and the one it holds now; a row where they",
+        "  differ shows both, e.g. `low (scanner: high)`.",
         "- A [carried] row is one the previous analysis recorded and nothing re-found",
         "  this time. If it is NOT `sast` (secret, dependency, hygiene, iac), its",
         "  producer did not run: re-report it exactly as shown -- same fingerprint,",

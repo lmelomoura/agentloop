@@ -490,19 +490,26 @@ def _locates(finding: dict) -> bool:
     return any(names_a_file(o) for o in finding.get("occurrences") or ())
 
 
-def _not_a_reading(existing_rationale: str, finding: dict) -> str:
+def _not_a_reading(existing_rationale: str, finding: dict, marked: bool = False) -> str:
     """Why this re-report is a rubber stamp -- '' when it is a real reading.
 
     Three payloads, each one a way of stamping a scanner's finding `triaged`
     without having read it. The sentence returned is quoted straight into the
     refusal, so it says which of the three arrived and what a reading would
-    have carried instead.
+    have carried instead. `marked`: the row already carries a reading (the
+    write is gated because it moves the row to another unit), so the sentence
+    it holds is the session's that wrote it, not the producer's.
     """
     rationale = _rationale_of(finding)
     if not rationale:
         return ("it carries no rationale, and a finding nobody explained is a "
                 "finding nobody read")
     if rationale == (existing_rationale or "").strip():
+        if marked:
+            return ("its rationale is the sentence another session left on this "
+                    "row, handed back byte for byte, which is what a rubber stamp "
+                    "looks like from here -- your own reading, not that "
+                    "session's, is what was missing")
         return ("its rationale is the producer's own sentence handed back "
                 "byte for byte, which is what a rubber stamp looks like from "
                 "here -- your reading, not the scanner's, is what was missing")
@@ -591,6 +598,18 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
     a correction that happens to repeat its own earlier sentence -- is not a
     stamp on unread work, and refusing it would punish the analyses that did
     the job.
+
+    UNLESS THE WRITE MOVES THE ROW TO ANOTHER UNIT: that one is gated like a
+    first. The pipeline credits a triage unit with a row by the unit its
+    re-report carries (`unit`, security/units.py), so the write that moves
+    `unit` is the new unit's own claim to have read the finding -- not a
+    retry of anybody's. Gated at 0 -> 1 alone, the continuation of an
+    attempt disqualified for launching a subagent could hand back the
+    sentence that attempt left -- its subagent's, for all anyone can prove --
+    byte for byte, and be credited with a reading it never did. The same
+    unit writing again, and a write from outside any unit (`unit` 0, which
+    leaves the column as it is), are the retries the paragraph above keeps
+    ungated.
 
     ONE WRITE IS REFUSED WHATEVER THE MARK SAYS, AND WHOEVER MINTED THE ROW: an
     agent payload carrying no rationale and no occurrence naming a file.
@@ -695,17 +714,22 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
     # qualify must not erase the reading that already happened.
     with conn:
         existing = conn.execute(
-            "SELECT id, producer, rationale, triaged FROM finding"
+            "SELECT id, producer, rationale, triaged, unit FROM finding"
             " WHERE analysis_id=? AND fingerprint=?",
             (analysis_id, finding["fingerprint"])).fetchone()
         if existing is not None:
             fid = existing["id"]
             minted_by = (existing["producer"] or "").strip()
             written_by = (finding.get("producer") or "").strip()
+            unit = int(finding.get("unit") or 0)
+            # A new writer's claim to have read the row: see "UNLESS THE
+            # WRITE MOVES THE ROW TO ANOTHER UNIT" in the docstring.
+            moves_unit = unit > 0 and unit != int(existing["unit"] or 0)
             triaged = 0
             if written_by == AGENT:
-                if minted_by not in ("", AGENT) and not existing["triaged"]:
-                    stamp = _not_a_reading(existing["rationale"], finding)
+                if minted_by not in ("", AGENT) and (not existing["triaged"] or moves_unit):
+                    stamp = _not_a_reading(existing["rationale"], finding,
+                                           marked=bool(existing["triaged"]))
                     if stamp:
                         # Inside `with conn:`, so this rolls back: "nothing
                         # was recorded" is a statement about the database,
@@ -720,7 +744,8 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
                     triaged = 1
                 else:
                     # Every other agent write onto an existing row -- one
-                    # already marked, the agent's own, or an unknown minter's.
+                    # already marked (by this same unit, or from outside any
+                    # unit), the agent's own, or an unknown minter's.
                     # The stamp test above is a superset of this on the rows it
                     # gates, so this is the erasure alone, whole or by half:
                     # see the docstring's last two paragraphs. The stored
@@ -752,7 +777,7 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
                  finding.get("rationale", ""), finding.get("remediation", ""),
                  finding.get("partial_note", ""), finding.get("cwe", ""),
                  finding.get("owasp", ""), finding.get("candidate", ""), triaged,
-                 int(finding.get("unit") or 0), int(finding.get("unit") or 0), fid))
+                 unit, unit, fid))
             conn.execute("DELETE FROM occurrence WHERE finding_id=?", (fid,))
         else:
             cur = conn.execute(
@@ -797,8 +822,9 @@ def record_verdict(conn, analysis_id, fingerprint, verdict, reason,
     or a hunter overwriting the answer it did not like -- and the caller is
     told (False), rather than the row quietly changing. The same reason
     `record_finding` refuses a rubber stamp instead of ignoring it. The one
-    way back is `clear_verdict`, and only for the writer the row names: the
-    close of a verify unit whose own session disqualified it.
+    way back is `conclude_unit`'s `clear_verdict`, and only for the writer
+    the row names: the close of a verify unit whose own session
+    disqualified it, in the transaction that settles the unit.
 
     `verified_by` is this function's own record of who arrived, never a field
     a payload can set -- the rule `producer` already follows.
@@ -816,26 +842,17 @@ def record_verdict(conn, analysis_id, fingerprint, verdict, reason,
     return cur.rowcount > 0
 
 
-def clear_verdict(conn, analysis_id, fingerprint, by) -> bool:
+def _clear_verdict(conn, analysis_id, fingerprint, by) -> bool:
     """Take the verdict off one finding of one analysis -- only when `by`
-    wrote it. True when a verdict was cleared; False when the row carries
-    none, or one somebody else wrote.
-
-    FOR ONE CASE: the close of a verify unit whose session launched a
-    subagent (security/units.py, `close`). The judge disqualifies that
-    attempt, and its verdict must go with it: nobody can prove the unit
-    reasoned it rather than what it fanned out to, and the `verdict=''`
-    guard of `record_verdict` writes a row's verdict ONCE -- left standing,
-    the unit's continuation could never write its own, the lineage could
-    never finish, and a `rejected` would drop the finding from the exposure
-    for good. `verified_by = by` in the WHERE makes it only ever the
-    caller's own: another unit's verdict, the operator's, or a verifier's
-    from before the pipeline is never touched."""
-    with conn:
-        cur = conn.execute(
-            "UPDATE finding SET verdict='', verdict_reason='', verified_by=''"
-            " WHERE analysis_id=? AND fingerprint=? AND verified_by=? AND verdict<>''",
-            (analysis_id, fingerprint, by))
+    wrote it -- inside the CALLER's transaction: `conclude_unit` is the one
+    caller, and its docstring says why nothing else may clear a verdict.
+    `verified_by = by` in the WHERE makes it only ever the caller's own:
+    another unit's verdict, the operator's, or a verifier's from before the
+    pipeline is never touched. True when a verdict was cleared."""
+    cur = conn.execute(
+        "UPDATE finding SET verdict='', verdict_reason='', verified_by=''"
+        " WHERE analysis_id=? AND fingerprint=? AND verified_by=? AND verdict<>''",
+        (analysis_id, fingerprint, by))
     return cur.rowcount > 0
 
 
@@ -1418,7 +1435,7 @@ def settle_unit(conn, unit_id, state, spend_usd=0.0, evidence=None, note="") -> 
 
 
 def conclude_unit(conn, unit_id, state, spend_usd=0.0, evidence=None, note="",
-                  continuation=None) -> tuple:
+                  continuation=None, clear_verdict=None) -> tuple:
     """Settle a unit AND plan its continuation, in ONE transaction. `(True,
     the continuation's id or None)`, or `(False, None)` with nothing written
     when the unit was no longer `pending` or `running`. `continuation` is
@@ -1433,9 +1450,31 @@ def conclude_unit(conn, unit_id, state, spend_usd=0.0, evidence=None, note="",
     refused the second and nobody read its answer. Here that answer decides:
     a unit already settled changes nothing, gets no continuation, and the
     caller is told. The spend is ADDED, as `settle_unit` adds it;
-    `settle_unit` stays for the callers with nothing to continue."""
+    `settle_unit` stays for the callers with nothing to continue.
+
+    `clear_verdict` -- `(analysis_id, fingerprint, by)` -- takes the verdict
+    `by` wrote off that finding in the same transaction, ONLY once the settle
+    has taken effect. For one case: the close of a verify unit whose session
+    launched a subagent (security/units.py, `close`). The judge disqualifies
+    that attempt, and its verdict must go with it: nobody can prove the unit
+    reasoned it rather than what it fanned out to, and the `verdict=''`
+    guard of `record_verdict` writes a row's verdict ONCE -- left standing,
+    the continuation could never write its own, the lineage could never
+    finish, and a `rejected` would drop the finding from the exposure for
+    good. WHY HERE, AND NOWHERE ELSE: cleared on its own before the settle,
+    as it first was, a second close of the same unit with no stream -- which
+    sees no subagent -- could settle it `done` on that verdict in between,
+    and the clear then left a `done` verify unit with no verdict. Behind the
+    settle's guard, the clear happens only to a unit this call settled, and
+    never apart from its settle: a kill in the middle undoes both, so the
+    unit is never settled with its disqualified verdict still standing. And
+    never with a `done`: that is the very state -- a verify unit done with no
+    verdict -- the clear must not be able to write."""
     if state not in UNIT_SETTLED:
         raise ValueError(f"bad unit state: {state}")
+    if clear_verdict is not None and state == "done":
+        raise ValueError("a unit settled done keeps its verdict: clear_verdict is for an attempt "
+                         "that was disqualified")
     if continuation is not None:
         _refuse_bad_kinds([continuation[:2]])
     conn.execute("BEGIN IMMEDIATE")
@@ -1448,6 +1487,8 @@ def conclude_unit(conn, unit_id, state, spend_usd=0.0, evidence=None, note="",
         if cur.rowcount == 0:
             conn.rollback()
             return False, None
+        if clear_verdict is not None:
+            _clear_verdict(conn, *clear_verdict)
         cid = None
         if continuation is not None:
             kind, payload, attempt, parent = continuation

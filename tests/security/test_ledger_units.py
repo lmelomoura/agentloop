@@ -236,21 +236,55 @@ def _verdict(conn, fp):
                               " WHERE fingerprint=?", (fp,)).fetchone())
 
 
-def test_a_verdict_is_cleared_only_by_the_writer_it_names(conn):
-    """Never someone else's verdict: a unit's close clears what its own
-    disqualified session wrote, and nothing another unit, the operator or a
-    verifier from before the pipeline wrote."""
+def test_a_verdict_is_cleared_with_its_unit_s_settle_and_only_by_the_writer_it_names(conn):
+    """The close of a verify unit disqualified for a subagent takes the
+    verdict off its row IN THE SETTLE'S TRANSACTION (`conclude_unit`'s
+    `clear_verdict`): never someone else's verdict -- another unit's, the
+    operator's, a verifier's from before the pipeline -- and never when the
+    settle does not take effect, so a unit another close already settled
+    keeps what it was credited with."""
     aid = _analysis(conn)
     ledger.record_finding(conn, aid, _finding("a" * 64))
-    ledger.record_verdict(conn, aid, "a" * 64, "rejected", "a subagent's reading", by="unit:3")
-    for other in ("unit:4", "operator", "subagent", ""):
-        assert ledger.clear_verdict(conn, aid, "a" * 64, other) is False
-    assert _verdict(conn, "a" * 64) == ("rejected", "a subagent's reading", "unit:3")
-    assert ledger.clear_verdict(conn, aid, "a" * 64, "unit:3") is True
-    assert _verdict(conn, "a" * 64) == ("", "", "")
-    assert ledger.clear_verdict(conn, aid, "a" * 64, "unit:3") is False, "nothing left to clear"
-    assert ledger.record_verdict(conn, aid, "a" * 64, "confirmed", "read it", by="unit:4") is True, \
-        "and the row takes a verdict again"
+    uid = ledger.add_unit(conn, aid, "verify", {"fingerprint": "a" * 64})
+    mine = f"unit:{uid}"
+    ledger.record_verdict(conn, aid, "a" * 64, "rejected", "a subagent's reading", by=mine)
+    for other in ("unit:99", "operator", "subagent", ""):
+        attempt = ledger.add_unit(conn, aid, "verify", {"fingerprint": "a" * 64})
+        assert ledger.conclude_unit(conn, attempt, "incomplete", clear_verdict=(aid, "a" * 64, other))[0] is True
+    assert _verdict(conn, "a" * 64) == ("rejected", "a subagent's reading", mine), "nobody else's is cleared"
+    settled = ledger.add_unit(conn, aid, "verify", {"fingerprint": "a" * 64})
+    ledger.settle_unit(conn, settled, "done")
+    assert ledger.conclude_unit(conn, settled, "incomplete", clear_verdict=(aid, "a" * 64, mine)) == (False, None)
+    assert _verdict(conn, "a" * 64) == ("rejected", "a subagent's reading", mine), \
+        "a settle that does not take effect clears nothing"
+    with pytest.raises(ValueError, match="keeps its verdict"):
+        ledger.conclude_unit(conn, uid, "done", clear_verdict=(aid, "a" * 64, mine))
+    assert (ledger.get_unit(conn, uid)["state"], _verdict(conn, "a" * 64)[0]) == ("pending", "rejected"), \
+        "never a unit settled done by the call that clears its verdict"
+    took, cid = ledger.conclude_unit(conn, uid, "incomplete", clear_verdict=(aid, "a" * 64, mine),
+                                     continuation=("verify", {"fingerprint": "a" * 64}, 2, uid))
+    assert (took, _verdict(conn, "a" * 64)) == (True, ("", "", ""))
+    assert ledger.record_verdict(conn, aid, "a" * 64, "confirmed", "read it", by=f"unit:{cid}") is True, \
+        "and the row takes the continuation's verdict"
+
+
+def test_a_clear_and_its_settle_land_together_or_not_at_all(conn):
+    """One transaction: a continuation that cannot be written (here, a
+    payload JSON cannot encode) rolls back the settle AND the clear -- the
+    unit still pending, the verdict still on its row."""
+    aid = _analysis(conn)
+    ledger.record_finding(conn, aid, _finding("a" * 64))
+    uid = ledger.add_unit(conn, aid, "verify", {"fingerprint": "a" * 64})
+    ledger.record_verdict(conn, aid, "a" * 64, "rejected", "a subagent's reading", by=f"unit:{uid}")
+
+    class NotJson:
+        pass
+    with pytest.raises(TypeError, match="JSON serializable"):
+        ledger.conclude_unit(conn, uid, "incomplete", clear_verdict=(aid, "a" * 64, f"unit:{uid}"),
+                             continuation=("verify", {"fingerprint": NotJson()}, 2, uid))
+    assert ledger.get_unit(conn, uid)["state"] == "pending"
+    assert _verdict(conn, "a" * 64) == ("rejected", "a subagent's reading", f"unit:{uid}")
+    assert [u["id"] for u in ledger.units_of(conn, aid)] == [uid]
 
 
 def test_several_units_are_added_in_one_transaction_numbered_after_the_last(conn):

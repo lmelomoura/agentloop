@@ -1807,11 +1807,13 @@ def _unit_of(conn, analysis_id, unit_id):
     return unit
 
 
-def _finding_row(f, kind=None):
+def _finding_row(f, kind=None, scanner_severity=""):
     """One ledger row as a unit's prompt shows it: its first location on its
     own line, and EVERY location beside it. A re-report REPLACES the stored
     list (ledger.record_finding), so a triage unit shown one location of
-    five, and told to re-report the row as shown, would narrow it to one."""
+    five, and told to re-report the row as shown, would narrow it to one.
+    `scanner_severity` is the one a triage item says its scanner filed: the
+    prompt shows it beside a severity that has changed since."""
     places = [{"file": o.get("file", ""), "line": o.get("line", 0)}
               for o in f.get("occurrences") or []]
     first = places[0] if places else {}
@@ -1822,6 +1824,8 @@ def _finding_row(f, kind=None):
            "producer": f.get("producer", ""), "occurrences": places}
     if kind:
         row["kind"] = kind
+    if scanner_severity:
+        row["scanner_severity"] = scanner_severity
     return row
 
 
@@ -1837,7 +1841,12 @@ def cmd_unit_prompt(args):
     by_fp = {f["fingerprint"]: f for f in findings}
     kind = unit["kind"]
     if kind == "triage":
-        context = {"rows": [_finding_row(by_fp[i["fingerprint"]], i["kind"])
+        # A scanner item carries the severity its scanner filed (units.plan),
+        # and the unit owes the row at the floor or above at that one as well
+        # as at the row's own now: passed through, so a row another unit
+        # lowered to `low` is shown with the reason it is still owed.
+        context = {"rows": [_finding_row(by_fp[i["fingerprint"]], i["kind"],
+                                         i.get("severity", "") if i["kind"] == "scanner" else "")
                             for i in unit["payload"].get("items", []) if i["fingerprint"] in by_fp]}
     elif kind == "hunt":
         context = {"guides": ledger.guides_of(row).get("recommended") or [guides.ALWAYS]}
