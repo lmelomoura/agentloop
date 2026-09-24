@@ -35,10 +35,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reading — the only proof there is on Codex. A line wider than one whole
   chunk is shown but never recorded: `read` never records more than the
   chunk it actually showed. The repository being analysed is not trusted
-  input: `read` quotes every path it prints, so the command it hands back
-  is exactly what the next call accepts, and refuses a name that carries a
-  control character rather than risk it forging a fake line of the verb's
-  own output.
+  input: `read` quotes every path it prints (`--path=<path>`, so a name
+  starting with `-` still parses), its byte budget bounds everything a
+  call prints — the header and the `-- next:` footer included, not only
+  the numbered lines — refusing outright a path whose own overhead would
+  leave no room for a chunk, and refuses a name carrying a control
+  character (any Unicode Cc, or the U+2028/U+2029 line separators) rather
+  than risk it forging a fake line of the verb's own output.
 
 - **Each unit of an analysis is given one job, and told how it is checked.**
   The CLI mints the prompt of every unit from the ledger: a triage unit's

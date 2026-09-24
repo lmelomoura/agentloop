@@ -244,7 +244,7 @@ def _read(platform, context):
     total = sum(int(r.get("bytes") or 0) for r in ranges)
     if platform == "openai":
         how = [
-            "HOW READING IS PROVEN: read with `agentloop security read --path <path> --from <line>`,",
+            "HOW READING IS PROVEN: read with `agentloop security read --path=<path> --from <line>`,",
             "one call per chunk. It prints up to 200 numbered lines and the command for the",
             "next chunk, and it is the only reading this analysis can prove on this",
             "platform. A `cat` or `sed` of a file proves nothing. Run each call alone -- piped",
@@ -256,7 +256,7 @@ def _read(platform, context):
             "HOW READING IS PROVEN: use your Read tool. A range counts when your Read",
             "results show every one of its lines -- a read cut short by the tool (a token",
             "cap, an offset past the end) counts only what came back, so continue from",
-            "where it stopped. `agentloop security read --path <path> --from <line>`",
+            "where it stopped. `agentloop security read --path=<path> --from <line>`",
             "counts too.",
         ]
     lines = [

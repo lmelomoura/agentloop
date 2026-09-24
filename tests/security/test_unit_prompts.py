@@ -100,11 +100,15 @@ def test_a_read_unit_lists_its_ranges_and_says_how_reading_is_proven():
     assert "d" * 64 + " · sast/open-redirect · accepted · src/Auth/Reset.php:7 — next param" in out
     assert str(prompts.SKILL_DIR / "references" / "WEB-PROTOCOL-AND-AUTH.md") in out
     assert "sink" in out
+    # Minor 1: `--path=<path>`, not a space -- the same reason `cmd_read`'s
+    # own footer uses it: a path starting with `-` is not an option argparse
+    # can be told apart from otherwise.
+    assert "agentloop security read --path=<path> --from <line>" in out
 
 
 def test_on_codex_a_read_unit_reads_through_security_read_only():
     out = _p("read", {"ranges": RANGES, "guides": [], "known": [], "decided": []}, platform="openai")
-    assert "agentloop security read --path <path> --from <line>" in out
+    assert "agentloop security read --path=<path> --from <line>" in out
     assert "A `cat` or `sed` of a file proves nothing" in out
     assert "Run each call alone" in out and "recorded as read in full" in out
     assert "Read tool" not in out

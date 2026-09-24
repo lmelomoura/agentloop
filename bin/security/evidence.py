@@ -53,8 +53,10 @@ def relative_path(path, root):
     must always agree on what counts as inside a run's checkout, because
     `with_served` joins their two accounts of one run by this exact string.
     `None` when `path` is not a non-empty string, or resolves outside
-    `root` -- a `..` escape, or a symlink (inside `root`, or `root` itself)
-    whose target is not."""
+    `root` -- a `..` escape, or an inside symlink whose target is not.
+    `root` ITSELF being a symlink is never the reason: it is resolved first,
+    through the same `os.path.realpath`, so everything else is measured
+    against what it points to, not against its own name."""
     if not isinstance(path, str) or not path:
         return None
     root_real = os.path.realpath(str(root))

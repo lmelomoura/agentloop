@@ -447,16 +447,19 @@ def owed(conn, analysis_id, all_units=None, inventory=None) -> list:
                     covered.setdefault(path, []).append((int(pair[0]), int(pair[1])))
                 except (TypeError, ValueError, IndexError):
                     continue    # a cell nobody could have written: it proves nothing
-    merged = {path: evidence.merge_spans(spans) for path, spans in covered.items()}
     # THE SAME GAP COMPUTATION `evidence.missing` runs for one unit's own
     # ranges against its session's reads (I2): the inventory's ranges are
     # its "wanted", the union of every read unit's covered spans is its
-    # "reads". Only the "bytes" key `missing` adds to each gap is not part
-    # of `owed`'s own return shape, so it is dropped below.
+    # "reads". `covered` is passed RAW (unmerged) -- `missing` already runs
+    # every path's spans through `evidence.merge_spans` itself before
+    # walking them, so merging here first would only sort and coalesce the
+    # same list twice for no different answer. Only the "bytes" key
+    # `missing` adds to each gap is not part of `owed`'s own return shape,
+    # so it is dropped below.
     ranges = [{"path": f["path"], "first": int(rng[0]), "last": int(rng[1])}
              for f in inventory.get("files") or [] for rng in f.get("ranges") or []]
     return [{"path": g["path"], "first": g["first"], "last": g["last"]}
-           for g in evidence.missing(ranges, merged)]
+           for g in evidence.missing(ranges, covered)]
 
 
 def summary(conn, analysis_id):
@@ -519,6 +522,16 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     # `read` itself also now refuses to serve a unit that is not `running`
     # (cli.cmd_read), so nothing new can land between a reset and the next
     # launch either.
+    #
+    # A BACKSTOP, NOT THE PRIMARY DEFENCE. The orchestrator's own rule
+    # (Task 10) resets a unit only when its launch failed BEFORE any agent
+    # ran; a unit whose agent ran -- and so could have called `security
+    # read` -- is never reset, its close is retried instead. That rule alone
+    # already makes "a dead run's chunk inherited by its relaunch" and "a
+    # reset and a relaunch inside the same wall-clock second" (`unit_read.at`
+    # has one-second resolution) unreachable in the real pipeline; `since`
+    # guards the case anyway, for whatever calls `reset_unit` outside that
+    # rule -- a test, a future caller -- rather than leaning on the rule alone.
     session = evidence.with_served(session, ledger.unit_reads(conn, unit["id"], since=unit["started"]))
     done, remaining, ev, note = judge(conn, unit, session, status, reason)
     clear = None

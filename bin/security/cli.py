@@ -38,6 +38,7 @@ import shlex
 import sqlite3
 import sys
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -1799,6 +1800,17 @@ def _session_unit() -> int:
 READ_LINES = 200
 READ_BYTES = 8000
 
+# Minor 3 (of the first fix; unchanged since): piping a chunk (`| head`),
+# filtering it, or chaining a second read in the same call records a chunk
+# the model never saw whole, and `read` has no way to detect any of that from
+# here. Printed as the second line of every ordinary chunk (never the
+# oversized-single-line one, which explains itself) -- a MODULE CONSTANT, not
+# a literal at each print site, because I1 (below) also has to count its
+# exact bytes into the budget's own overhead, and a second copy is a second
+# copy that can drift from what is actually printed.
+_RUN_ALONE = ("-- run this command alone: piped into another command, filtered, or chained with "
+             "a second read in the same call, this chunk is still recorded as read in full")
+
 
 def _unit_of(conn, analysis_id, unit_id):
     unit = ledger.get_unit(conn, unit_id)
@@ -1945,7 +1957,15 @@ def cmd_units(args):
     print(json.dumps(units.summary(conn, args.analysis), indent=2))
 
 
-_CONTROL_CHAR = re.compile(r"[\x00-\x1f\x7f]")
+# Minor 3: not only the C0 controls and DEL the previous `[\x00-\x1f\x7f]`
+# regex caught, but every Unicode category Cc character -- which also reaches
+# the C1 controls, \x80-\x9f, including U+0085 NEL -- plus U+2028 and U+2029,
+# the line and paragraph separators that are not Cc at all (they are Zl/Zp)
+# but that `str.splitlines` still treats as a line break, the same as `\n`.
+# Any of these, in a path this verb would otherwise print on a line of its
+# own, could forge a second line of its own output.
+def _carries_a_forbidden_char(rel: str) -> bool:
+    return any(unicodedata.category(ch) == "Cc" or ch in "  " for ch in rel)
 
 
 def cmd_read(args):
@@ -1972,12 +1992,36 @@ def cmd_read(args):
     header, the "nothing at line N" notice, and the `-- next:` command --
     goes through `shlex.quote`, so what is shown is exactly what the next
     command accepts, never a shell fragment a model could copy and have
-    expanded. A name carrying a control character (below 0x20, or 0x7f)
-    cannot be shown on a line of its own without risking a forged line of
-    this verb's own output -- a fake `-- next:`, a fake `-- end of file`, a
-    header for a chunk never printed -- so it is refused outright: nothing
-    is printed from the file and nothing is recorded. The close names it
-    owed, the same as any other slice nobody could read.
+    expanded (`--path=<path>`, one token, so a name starting with `-` is
+    never mistaken for another option). A name carrying a control character
+    (any Unicode category Cc, or the U+2028/U+2029 line separators) cannot be
+    shown on a line of its own without risking a forged line of this verb's
+    own output -- a fake `-- next:`, a fake `-- end of file`, a header for a
+    chunk never printed -- so it is refused outright: nothing is printed
+    from the file and nothing is recorded. The close names it owed, the same
+    as any other slice nobody could read.
+
+    THE BUDGET BOUNDS THE WHOLE CALL, NOT ONLY THE NUMBERED LINES (I1, round
+    2). The header, the piping warning above and the `-- next:` footer are
+    not free -- each carries the quoted path -- and sizing the numbered
+    lines off READ_BYTES alone, as this used to, let their combined cost go
+    uncounted: a hostile enough name (hundreds of `'`, each costing several
+    bytes once `shlex.quote` escapes it) could push the WHOLE call's printed
+    output well past what the Codex CLI actually shows the model, while the
+    ledger still recorded the full chunk as read -- the exact failure this
+    budget exists to prevent, since that ledger record is the only proof of
+    reading there is on that platform, and a record may only ever claim what
+    actually fit on the screen. So the header and the footer are built FIRST,
+    at the largest size either could ever be for this file -- substituting
+    the file's own `total` for `last`, since `last` never exceeds it, and the
+    `--from N` footer (the longer of its two forms) is only ever printed when
+    `last < total`, so N = last + 1 is bounded by `total` too -- and only
+    what is left of READ_BYTES after them and the (fixed-length) piping
+    warning is given to the numbered lines. A path whose own overhead already
+    exceeds half of READ_BYTES is refused before anything is read from the
+    file: nothing this verb could ever show of it would leave room for a
+    chunk, so it cannot be proven read through `read` at all, and the close
+    names it owed -- the same debt as a control character or an outside path.
     """
     aid, uid, run_cwd = (_agent_env("SECURITY_ANALYSIS_ID"), _agent_env("SECURITY_UNIT_ID"),
                          _agent_env("RUN_CWD"))
@@ -2002,8 +2046,14 @@ def cmd_read(args):
     # proves it read (evidence.parse) -- see evidence.relative_path.
     rel = evidence.relative_path(args.path, root)
     if rel is None:
-        sys.exit(f"read: {args.path} is outside this run's checkout ({root})")
-    if _CONTROL_CHAR.search(rel):
+        # Minor 2 (of the second review): decided by `relative_path` alone,
+        # BEFORE the control-character check below ever sees `rel` -- so,
+        # alone among every message here, this one has nothing upstream
+        # filtering what it echoes. `!r` escapes a control character or a
+        # newline (a fake `-- next:` line, forged into `args.path` itself)
+        # instead of ever printing it raw.
+        sys.exit(f"read: {args.path!r} is outside this run's checkout ({root})")
+    if _carries_a_forbidden_char(rel):
         sys.exit(f"read: {rel!r} carries a character this verb cannot show on a line of its own "
                  "-- nothing was printed or recorded; the close will name it owed")
     quoted = shlex.quote(rel)
@@ -2023,6 +2073,28 @@ def cmd_read(args):
     if lines and lines[-1] == "":
         lines.pop()
     total, first = len(lines), max(1, args.start)
+
+    # I1: THE WHOLE CALL, not only the numbered lines below, has to fit
+    # inside READ_BYTES -- see the docstring. `last` maxes out at `total` (a
+    # chunk that reaches EOF), in the header as much as in the footer, so
+    # substituting `total` for it here is a true upper bound on either one's
+    # length, never a guess: real `last` only ever has as many digits, or
+    # fewer.
+    header_upper = f"== {quoted} lines {first}-{total} of {total} =="
+    footer_upper = f"-- next: agentloop security read --path={quoted} --from {total}"
+    overhead = (len(header_upper.encode("utf-8")) + 1
+               + len(_RUN_ALONE.encode("utf-8")) + 1
+               + len(footer_upper.encode("utf-8")) + 1)
+    if overhead > READ_BYTES // 2:
+        # Refused before the "nothing at line N" branch below too: this is a
+        # judgment about the PATH, not about where `--from` landed in it --
+        # nothing printed from the file, nothing recorded, whichever branch
+        # would otherwise have run.
+        sys.exit(f"read: {quoted} is too long to show with a chunk of this verb's own budget "
+                 f"({READ_BYTES} bytes) -- it cannot be proven read through `read`; the close "
+                 "will name it owed")
+    budget = READ_BYTES - overhead
+
     if first > total:
         print(f"== {quoted} has {total} line{'s' if total != 1 else ''}; nothing at line {first} ==")
         return
@@ -2031,15 +2103,18 @@ def cmd_read(args):
     # the docstring. `out` empty is what tells apart a line too wide for a
     # whole chunk on its own from one that merely does not fit beside lines
     # already collected: the first never breaks the loop before it is judged
-    # (so it always gets a verdict below), the second always does.
+    # (so it always gets a verdict below), the second always does. Judged
+    # against `budget` -- READ_BYTES minus the header/warning/footer overhead
+    # above -- never against READ_BYTES itself: that would leave the body
+    # free to spend what the header and the footer already own.
     out, size, last = [], 0, first - 1
     oversized = None
     for number in range(first, total + 1):
         piece = f"{number}\t{lines[number - 1]}"
         cost = len(piece.encode("utf-8")) + 1
-        if out and (len(out) >= READ_LINES or size + cost > READ_BYTES):
+        if out and (len(out) >= READ_LINES or size + cost > budget):
             break
-        if not out and cost > READ_BYTES:
+        if not out and cost > budget:
             # A single line wider than the whole budget -- only possible
             # under `!defaults`, since the default inventory already leaves
             # out any file with a line over 5,000 bytes (security/inventory.py
@@ -2056,16 +2131,14 @@ def cmd_read(args):
     if oversized is not None:
         print(oversized)
         print(f"-- line {last} is {len(oversized.encode('utf-8'))} bytes, wider than one chunk "
-              f"({READ_BYTES} bytes) can show -- it cannot be proven read here")
+              f"({budget} bytes) can show -- it cannot be proven read here")
     else:
-        # Minor 3: the budget above protects one call's own output -- piping
-        # it (`| head`), filtering it, or chaining a second read in the same
-        # command records a chunk the model never saw whole, and `read` has
-        # no way to detect any of that from here.
-        print("-- run this command alone: piped into another command, filtered, or chained with "
-              "a second read in the same call, this chunk is still recorded as read in full")
+        print(_RUN_ALONE)
         print("\n".join(out))
-    print(f"-- next: agentloop security read --path {quoted} --from {last + 1}" if last < total
+    # Minor 1: `--path=`, not a space -- a name starting with `-` (a root
+    # file `-lead.py`, a top directory `-src/`) is what argparse takes for
+    # another option, not this one's value, under the two-token form.
+    print(f"-- next: agentloop security read --path={quoted} --from {last + 1}" if last < total
           else "-- end of file")
     sys.stdout.flush()
     if out:
