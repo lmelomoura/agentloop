@@ -98,7 +98,12 @@ legacy_config_dir_warning() { # one line per project or security block still car
 accounts_migrate_legacy() { # accounts_migrate_legacy [project [project-account security-account]] -> one line per level converted or left; a project name limits it to that project alone, and the two accounts are what a save of it is about to set on each level ("" for none)
   local only="${1:-}" set_p="${2:-}" set_s="${3:-}"
   [ -f "$PROJECTS_FILE" ] || return 0
-  local rows name level dir plat nd aid nm existing
+  local rows name level dir plat nd aid nm existing sent in_save=false
+  # A save always passes both account arguments, "" included when its level
+  # clears to the Default -- a bare call (install, or a plain migration pass)
+  # passes neither. $# tells the two apart even when the sent value itself is
+  # empty, which a save context reads very differently from no save at all.
+  [ "$#" -ge 2 ] && in_save=true
   rows="$("$JQ" -r --arg only "$only" '.projects[]? | select(type == "object") | .name as $n
       | select($only == "" or $n == $only)
       | ( ((.claude_config_dir // "") | select(type == "string" and . != "") | [$n, "project", .]),
@@ -113,8 +118,12 @@ accounts_migrate_legacy() { # accounts_migrate_legacy [project [project-account 
     # account would be false: the level still runs on the one it already had.
     # The same for a level the save converting it is about to set: the
     # account that save sends is the one the level ends on.
-    if [ "$level" = "project" ]; then existing="$set_p"; [ -n "$existing" ] || existing="$(project_get "$name" '.account' '')"
-    else existing="$set_s"; [ -n "$existing" ] || existing="$(security_get "$name" '.account' '')"
+    if [ "$level" = "project" ]; then sent="$set_p"; else sent="$set_s"; fi
+    existing="$sent"
+    if [ -z "$existing" ]; then
+      if [ "$level" = "project" ]; then existing="$(project_get "$name" '.account' '')"
+      else existing="$(security_get "$name" '.account' '')"
+      fi
     fi
     if [ -n "$existing" ]; then
       if [ "$level" = "project" ]; then
@@ -122,7 +131,26 @@ accounts_migrate_legacy() { # accounts_migrate_legacy [project [project-account 
       else
         write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n and (.security | type) == "object" then .security |= del(.claude_config_dir) else . end]'
       fi
-      echo "projects.json: claude_config_dir on $name ($level) dropped — it already runs on the account '$existing'"
+      # Worded after what this call actually is, never after $existing alone
+      # (Fix: that used to read "it already runs on" both when this very save
+      # is what sets the account -- too early -- and when the operator just
+      # CLEARED a stored one, naming the account the save is removing).
+      # $sent non-empty: this save sets the level's account, whatever it had
+      # before. $sent empty inside a save: the level ends on the Default (or,
+      # for security, inherits). Outside a save (install, a bare pass):
+      # $existing is only ever the level's own pre-existing account, and
+      # saying so is simply true.
+      if [ -n "$sent" ]; then
+        echo "projects.json: claude_config_dir on $name ($level) dropped — this save sets the account '$sent'"
+      elif [ "$in_save" = true ]; then
+        if [ "$level" = "project" ]; then
+          echo "projects.json: claude_config_dir on $name ($level) dropped — this save leaves the project on the Default account"
+        else
+          echo "projects.json: claude_config_dir on $name ($level) dropped — this save clears the account, the analysis inherits"
+        fi
+      else
+        echo "projects.json: claude_config_dir on $name ($level) dropped — it already runs on the account '$existing'"
+      fi
       continue
     fi
     if [ "$level" = "project" ]; then plat="$(project_get "$name" '.platform' 'anthropic')"
@@ -7150,7 +7178,33 @@ if v:
 PY
 }
 
+# A pin can be any byte a filesystem allows, and both plists splice it
+# straight into a <string>...</string> element's text -- an unescaped "&" or
+# "<" is invalid XML there, and plistlib's reader (installed_config_dir) then
+# raises, caught, and answers as though nothing were pinned at all: an
+# ordinary directory name (Clients & Co) silently lost the account. Order
+# matters, "&" first, so escaping "<" and ">" never re-escapes the "&" just
+# introduced; a standard XML parser reverses all three on the way back in, so
+# installed_config_dir reads the original path unchanged.
+xml_escape_text() { # xml_escape_text <text> -> the text, safe inside a plist <string>
+  local s="${1:-}"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  printf '%s\n' "$s"
+}
+
 cmd_install() {
+  # A pin that survives ~ expansion but still is not an absolute path is no
+  # pin at all once anything reads it back (account_norm_dir, and every rule
+  # built on it) -- refusing it here, before a byte is written, beats
+  # installing something the engine will then silently treat as unset.
+  # Consistent with the pin never falling back to an ambient CLAUDE_CONFIG_DIR
+  # (see the top of the file): only the explicit setting is judged, and named
+  # by its own variable, never the one it is deliberately not read from.
+  if [ -n "${AGENTLOOP_CLAUDE_CONFIG_DIR:-}" ] && ! account_norm_dir "$AGENTLOOP_CLAUDE_CONFIG_DIR" >/dev/null; then
+    die "AGENTLOOP_CLAUDE_CONFIG_DIR must be absolute or start with ~/ (got '$AGENTLOOP_CLAUDE_CONFIG_DIR')"
+  fi
   # A global default account, carried into launchd — which inherits nothing from
   # the shell, so without this every run signs in as ~/.claude however the
   # scheduler was installed. Taken ONLY from the explicit variable, never from an
@@ -7179,8 +7233,8 @@ cmd_install() {
     # everything else launchd starts that reads the CLI's own name (the
     # control server, and the CLI itself when nothing overrides it).
     plist_cfgdir="
-    <key>AGENTLOOP_CLAUDE_CONFIG_DIR</key><string>$cfgdir</string>
-    <key>CLAUDE_CONFIG_DIR</key><string>$cfgdir</string>"
+    <key>AGENTLOOP_CLAUDE_CONFIG_DIR</key><string>$(xml_escape_text "$cfgdir")</string>
+    <key>CLAUDE_CONFIG_DIR</key><string>$(xml_escape_text "$cfgdir")</string>"
   fi
 
   # 1) the tick agent — fires the scheduler once a minute
@@ -7263,7 +7317,10 @@ PLIST
   echo "  $PLIST_LABEL   — ticks every 60s (survives logout and reboot)"
   echo "  $SERVER_LABEL  — control dashboard on http://127.0.0.1:$PORT/"
   if [ -n "$cfgdir" ]; then
-    echo "Claude account : $cfgdir"
+    # The Default's directory as the engine actually resolves it (~ expanded,
+    # no trailing slash) -- never $cfgdir raw, which a pin such as ~/.claude/
+    # would otherwise print as though it were a distinct account.
+    echo "Claude account : $(account_default_dir anthropic)"
   else
     echo "Claude account : the CLI default (~/.claude) — set AGENTLOOP_CLAUDE_CONFIG_DIR and re-run to change it"
   fi
@@ -7355,7 +7412,11 @@ status_platforms_block() { # one line per listed platform: enabled or not, versi
     # The pin the INSTALL carries (the variable, then the plist), not this
     # process's CLAUDE_CONFIG_DIR: `agentloop status` typed in a plain shell
     # has none, and would call a pinned install the CLI default.
-    if [ "$p" = "anthropic" ]; then cfg="$(installed_config_dir)"; [ -z "$cfg" ] || acct="$acct (in $cfg)"; fi
+    # Gated on whether a pin exists at all (installed_config_dir, raw); the
+    # directory NAMED is what the engine resolves it to (account_default_dir,
+    # normalized) -- never the raw pin, which a trailing slash or an
+    # unnormalized spelling would otherwise show as written.
+    if [ "$p" = "anthropic" ]; then cfg="$(installed_config_dir)"; [ -z "$cfg" ] || acct="$acct (in $(account_default_dir anthropic))"; fi
     printf '%-9s : %s — %s, %s; %s of %s models enabled' "$p" "$state" "${ver:-$(platform_cli_name "$p")}" "$acct" "$n_on" "$n_all"
     if [ "$p" = "openai" ]; then
       local n u

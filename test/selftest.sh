@@ -1299,12 +1299,39 @@ JSON
   out="$( ( ccd_env; ccd_page_save Old13 "old-acct" "" | cmd_project_set ) 2>&1 )"; rc=$?
   case "$out" in
     *registered*|*"is now the account"*) bad "Old13: a level whose save picks its own account still had its directory registered: $out" ;;
-    *"claude_config_dir on Old13 (project) dropped — it already runs on the account 'old-acct'"*)
+    *"claude_config_dir on Old13 (project) dropped — this save sets the account 'old-acct'"*)
       [ "$rc" -eq 0 ] && [ "$("$JQ" -c '.projects[] | select(.name=="Old13") | {a: .account, c: has("claude_config_dir")}' "$ccd/cfg/projects.json")" = '{"a":"old-acct","c":false}' ] \
         && [ "$("$JQ" '[.platforms.anthropic.accounts[] | select(.name == "old-acct6")] | length' "$ccd/cfg/platforms.json")" = "0" ] \
-        && ok "a save that picks an account of its own wins, and its leftover directory is dropped, never registered as an orphan" \
+        && ok "a save that picks an account of its own wins, and its leftover directory is dropped, never registered as an orphan -- worded as THIS save setting it, not as already running on it" \
         || bad "Old13 after a page save: rc=$rc out=$out now=$("$JQ" -c '.projects[] | select(.name=="Old13")' "$ccd/cfg/projects.json") accounts=$("$JQ" -c '.platforms.anthropic.accounts' "$ccd/cfg/platforms.json")" ;;
     *) bad "Old13 page save: rc=$rc $out" ;;
+  esac
+
+  # Old14 is the other misleading case the same message used to have: the
+  # operator CLEARS a stored account (the page sends "" for a level that
+  # already had one) -- not this save's own doing, and not what Old7 tests
+  # (no save at all). The old wording named the account being removed as
+  # though it still ran on it; the level actually ends on the Default (or,
+  # for security, inherits), and never registers a fresh orphan for the
+  # leftover directory either.
+  mkdir -p "$ccd/old-acct9" "$ccd/old-acct10"
+  "$JQ" --arg c "$ccd" --arg d9 "$ccd/old-acct9" --arg d10 "$ccd/old-acct10" \
+      '.projects += [{"name":"Old14","cwd":$c,"account":"old-clear-p","claude_config_dir":$d9,
+                       "security":{"enabled":false,"account":"old-clear-s","claude_config_dir":$d10}}]' \
+      "$ccd/cfg/projects.json" > "$ccd/cfg/projects.json.next" && mv "$ccd/cfg/projects.json.next" "$ccd/cfg/projects.json"
+  out="$( ( ccd_env; ccd_page_save Old14 "" "" | cmd_project_set ) 2>&1 )"; rc=$?
+  case "$out" in
+    *registered*|*"is now the account"*|*"already runs on"*) bad "Old14: a cleared account should not be named as still running, nor its directory registered: $out" ;;
+    *"claude_config_dir on Old14 (project) dropped — this save leaves the project on the Default account"*)
+      ok "clearing a stored project account is worded as landing on the Default, not as still running on the account being removed" ;;
+    *) bad "Old14 project wording: rc=$rc $out" ;;
+  esac
+  case "$out" in
+    *"claude_config_dir on Old14 (security) dropped — this save clears the account, the analysis inherits"*)
+      [ "$rc" -eq 0 ] && [ "$("$JQ" -c '.projects[] | select(.name=="Old14") | {a: .account, c: has("claude_config_dir"), s: .security.account, sc: (.security | has("claude_config_dir"))}' "$ccd/cfg/projects.json")" = '{"a":"","c":false,"s":"","sc":false}' ] \
+        && ok "and the same for its security block, worded as inheriting, and both leftover directories dropped, neither registered" \
+        || bad "Old14 after clearing: rc=$rc out=$out now=$("$JQ" -c '.projects[] | select(.name=="Old14")' "$ccd/cfg/projects.json")" ;;
+    *) bad "Old14 security wording: rc=$rc $out" ;;
   esac
 
   # Fix round 3: accounts_migrate_legacy now runs only after every refusal
@@ -1760,6 +1787,13 @@ JSON
     printf '%s\n' "$_b" | grep -q '(in /plist/home); 1 of 1 models enabled$' \
       && ok "status_platforms_block: the account a previous install wrote into the plist is named" \
       || bad "plist-pinned anthropic line: $(printf '%s\n' "$_b" | sed -n 1p)"
+    # A pin that IS the CLI default account, just spelled with a trailing
+    # slash, is the same account either way -- named as the engine resolves
+    # it (account_default_dir), never as written.
+    _b="$(AGENTLOOP_CLAUDE_CONFIG_DIR=/pinned/home/ status_platforms_block)"
+    printf '%s\n' "$_b" | grep -q '(in /pinned/home); 1 of 1 models enabled$' \
+      && ok "status_platforms_block: a pin with a trailing slash is named normalized, not raw" \
+      || bad "trailing-slash anthropic line: $(printf '%s\n' "$_b" | sed -n 1p)"
     # A table with no stamp at all (hand-written), and one visible slug dropped.
     # Captured first, never piped straight into grep -q: under pipefail a grep
     # that stops at its match hands the block a SIGPIPE on the lines still to
@@ -1802,8 +1836,8 @@ JSON
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_spout" | grep -v '^RESULT '
-  printf '%s\n' "$_spout" | grep -qx 'RESULT ok=11 bad=0' \
-    && ok "status_platforms_block over the stand-ins: all 11 assertions reach the gate" \
+  printf '%s\n' "$_spout" | grep -qx 'RESULT ok=12 bad=0' \
+    && ok "status_platforms_block over the stand-ins: all 12 assertions reach the gate" \
     || bad "status_platforms_block did not: $(printf '%s\n' "$_spout" | tail -1)"
   got="$(age_label "$(( $(now_epoch) + 600 ))")"
   [ "$got" = "0m ago" ] \
@@ -6114,11 +6148,56 @@ PY
     [ "$("$JQ" -c '.projects[0] | {a: .account, c: has("claude_config_dir")}' "$PROJECTS_FILE")" = '{"a":"old-acct","c":false}' ] \
       && ok "install itself converts a leftover claude_config_dir into an account" \
       || bad "InstP after install: $("$JQ" -c '.projects[0]' "$PROJECTS_FILE")"
+    # A relative pin is refused before it reaches either plist --
+    # account_norm_dir already treats it as no pin at runtime (see above), so
+    # honouring it here would install a home nothing later run signs in as,
+    # while this very command printed it as though it were in force.
+    _tick_before="$(cat "$PLIST_PATH")"; _server_before="$(cat "$SERVER_PLIST")"
+    _relrc=0
+    _relout="$(AGENTLOOP_CLAUDE_CONFIG_DIR="relative/pin" cmd_install 2>&1)" || _relrc=$?
+    [ "$_relrc" -ne 0 ] && ok "a relative AGENTLOOP_CLAUDE_CONFIG_DIR is refused" \
+      || bad "relative pin rc=$_relrc out=$_relout"
+    if printf '%s' "$_relout" | grep -q "AGENTLOOP_CLAUDE_CONFIG_DIR" \
+       && printf '%s' "$_relout" | grep -q "relative/pin" \
+       && printf '%s' "$_relout" | grep -q "absolute"; then
+      ok "and the refusal names the value and says to give an absolute path"
+    else
+      bad "refusal text: [$_relout]"
+    fi
+    [ "$(cat "$PLIST_PATH")" = "$_tick_before" ] && [ "$(cat "$SERVER_PLIST")" = "$_server_before" ] \
+      && ok "and nothing is written -- both plists are exactly as the last successful install left them" \
+      || bad "a plist changed after the refused install"
+    # A pin with characters a plist XML must escape round-trips through
+    # both plists to installed_config_dir unchanged -- an unescaped & or <
+    # used to make the plistlib read fail on the file this wrote, silently
+    # answering no pin at all.
+    _ampdir="$tmp/inst/al-pinned & <special>"
+    mkdir -p "$_ampdir"
+    AGENTLOOP_CLAUDE_CONFIG_DIR="$_ampdir" cmd_install >/dev/null 2>&1
+    got="$(plist_key "$PLIST_PATH" AGENTLOOP_CLAUDE_CONFIG_DIR)"
+    [ "$got" = "$_ampdir" ] \
+      && ok "a pin with & and < round-trips through the tick plist unchanged" \
+      || bad "tick plist with & and < -> got=[$got] want=[$_ampdir]"
+    got="$( AGENTLOOP_CLAUDE_CONFIG_DIR="" installed_config_dir )"
+    [ "$got" = "$_ampdir" ] && ok "and installed_config_dir reads it back exactly" \
+      || bad "installed_config_dir with & and < -> got=[$got] want=[$_ampdir]"
+    plist_raw_line="$(grep -o '<key>AGENTLOOP_CLAUDE_CONFIG_DIR</key><string>[^<]*' "$PLIST_PATH")"
+    grep -q '&amp;' "$PLIST_PATH" \
+      && ok "the plist file itself carries the escaped ampersand, never a raw one" \
+      || bad "no &amp; found in $PLIST_PATH: $plist_raw_line"
+    # The Claude account line install prints shows the directory as the
+    # engine resolves it -- ~ expanded, no trailing slash -- never the raw pin.
+    mkdir -p "$tmp/inst/fakehome/.claude-x"
+    _normout="$(AGENTLOOP_CLAUDE_CONFIG_DIR='~/.claude-x/' cmd_install 2>&1)"
+    normline="$(printf '%s\n' "$_normout" | grep 'Claude account')"
+    printf '%s\n' "$_normout" | grep -qxF "Claude account : $tmp/inst/fakehome/.claude-x" \
+      && ok "a ~/.claude-x/ pin prints its normalized directory: tilde expanded, no trailing slash" \
+      || bad "Claude account line: $normline"
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_instout" | grep -v '^RESULT '
-  printf '%s\n' "$_instout" | grep -qx 'RESULT ok=7 bad=0' \
-    && ok "cmd_install over a shadowed home: all 7 assertions reach the gate" \
+  printf '%s\n' "$_instout" | grep -qx 'RESULT ok=14 bad=0' \
+    && ok "cmd_install over a shadowed home: all 14 assertions reach the gate" \
     || bad "cmd_install over a shadowed home did not: $(printf '%s\n' "$_instout" | tail -1)"
 
   echo "spent_today() — today's spend is summed without reading all of history"
