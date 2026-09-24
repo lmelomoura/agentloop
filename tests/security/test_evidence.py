@@ -98,3 +98,54 @@ def test_a_relative_root_path_and_a_symlinked_root_resolve_to_the_same_files(tmp
             '"content":"1\\tx\\n"}]},"parent_tool_use_id":null}\n') % real
     session = evidence.parse(line.splitlines(), str(link))
     assert session.reads == {"src/x.py": [(1, 1)]}
+
+
+def test_a_non_dict_message_is_skipped_and_the_real_read_still_counts():
+    lines = [
+        '{"type":"assistant","message":{"role":"assistant","content":'
+        '[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/ok.py"}}]},'
+        '"parent_tool_use_id":null}',
+        '{"type":"user","message":"a string","parent_tool_use_id":null}',
+        '{"type":"assistant","message":["x"],"parent_tool_use_id":null}',
+        '{"type":"assistant","message":7}',
+        '{"type":"user","message":{"role":"user","content":'
+        '[{"type":"tool_result","tool_use_id":"t1","content":"1\\tok\\n"}]},'
+        '"parent_tool_use_id":null}',
+    ]
+    assert evidence.parse(lines, ROOT).reads == {"src/ok.py": [(1, 1)]}
+
+
+def test_two_tool_results_in_one_event_each_fall_back_to_their_own_numbered_lines():
+    lines = [
+        '{"type":"assistant","message":{"role":"assistant","content":'
+        '[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/a.py"}},'
+        '{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"src/b.py"}}]},'
+        '"parent_tool_use_id":null}',
+        '{"type":"user","message":{"role":"user","content":'
+        '[{"type":"tool_result","tool_use_id":"t1","content":"1\\ta\\n2\\tb\\n"},'
+        '{"type":"tool_result","tool_use_id":"t2","content":"5\\tx\\n"}]},'
+        '"parent_tool_use_id":null,'
+        '"tool_use_result":{"type":"text","file":{"filePath":"src/a.py","startLine":1,"numLines":100}}}',
+    ]
+    session = evidence.parse(lines, ROOT)
+    assert session.reads["src/a.py"] == [(1, 2)]
+    assert session.reads["src/b.py"] == [(5, 5)], "never (1, 100) from the event-level result"
+
+
+def test_a_relative_file_path_resolves_against_the_run_root_and_one_that_escapes_it_counts_nothing():
+    lines = [
+        '{"type":"assistant","message":{"role":"assistant","content":'
+        '[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/rel.py"}}]},'
+        '"parent_tool_use_id":null}',
+        '{"type":"user","message":{"role":"user","content":'
+        '[{"type":"tool_result","tool_use_id":"t1","content":"1\\tx\\n"}]},'
+        '"parent_tool_use_id":null}',
+        '{"type":"assistant","message":{"role":"assistant","content":'
+        '[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"../outside.py"}}]},'
+        '"parent_tool_use_id":null}',
+        '{"type":"user","message":{"role":"user","content":'
+        '[{"type":"tool_result","tool_use_id":"t2","content":"1\\ty\\n"}]},'
+        '"parent_tool_use_id":null}',
+    ]
+    session = evidence.parse(lines, ROOT)
+    assert session.reads == {"src/rel.py": [(1, 1)]}

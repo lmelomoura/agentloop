@@ -98,7 +98,8 @@ def parse(lines, root) -> Session:
             continue
         if not isinstance(event, dict) or event.get("parent_tool_use_id"):
             continue
-        blocks = ((event.get("message") or {}).get("content")) or []
+        message = event.get("message")
+        blocks = message.get("content") if isinstance(message, dict) else None
         if not isinstance(blocks, list):
             continue
         if event.get("type") == "assistant":

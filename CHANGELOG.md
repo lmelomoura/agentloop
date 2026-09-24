@@ -26,7 +26,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   no limit can come back cut by a token cap, and one past the end of a file
   returns nothing without being an error. Errors, reads outside the run's
   root and a subagent's reads count nothing; a subagent's launch is counted
-  instead.
+  instead. A line that is not an event of the expected shape — invalid
+  JSON, or valid JSON of the wrong shape — is skipped, never taken as proof
+  and never fatal to the rest of the stream.
 
 - **The deep scope is cut into readings a single session can hold.** The
   inventory is packed, in path order, into slices of at most 300 KB of
