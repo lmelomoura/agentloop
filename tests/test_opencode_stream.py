@@ -557,3 +557,15 @@ def test_an_api_error_after_a_compaction_is_the_runs_verdict():
     assert last["type"] == "result" and last["is_error"] is True
     assert last["api_error_status"] == 401
     assert [e["type"] for e in out].count("result") == 2
+
+
+def test_a_read_keeps_the_range_it_showed_in_the_claude_shape():
+    """The proof of reading (bin/security/evidence.py) counts the lines a read
+    returned. OpenCode reports them in `state.metadata.display`, which the
+    normaliser used to drop -- and the output itself is capped at 8 KB, so the
+    numbered lines alone cannot prove a long read."""
+    events = normalize("02-tool-use-bash-and-read.jsonl")   # the helper this file already uses
+    result = next(e for e in events if e.get("type") == "user"
+                  and e["message"]["content"][0].get("tool_use_id", "").startswith("call_3439"))
+    assert result["tool_use_result"] == {"type": "text", "file": {
+        "filePath": "/tmp/probe/p/a.txt", "startLine": 1, "numLines": 1, "totalLines": 1}}

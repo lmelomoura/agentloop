@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","session_id":"ses_x","model":"m","platform":"opencode","permissionMode":"auto","cwd":"/Users/me/run","tools":[]}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{"filePath":"/Users/me/run/src/a.txt"}}]},"session_id":"ses_x"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"<path>/Users/me/run/src/a.txt</path>\n<type>file</type>\n<content>\n1: alpha\n2: beta\n\n(End of file - total 2 lines)\n</content>","is_error":false}]},"session_id":"ses_x","tool_use_result":{"type":"text","file":{"filePath":"/Users/me/run/src/a.txt","startLine":1,"numLines":2,"totalLines":2}}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"call_2","name":"Read","input":{"filePath":"/Users/me/run/src/b.txt"}}]},"session_id":"ses_x"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"<path>/Users/me/run/src/b.txt</path>\n<type>file</type>\n<content>\n4: d\n5: e\n</content>","is_error":false}]},"session_id":"ses_x"}
+{"type":"result","subtype":"success","is_error":false,"session_id":"ses_x"}

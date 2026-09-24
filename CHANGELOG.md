@@ -20,6 +20,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **What a unit read is proven from its own stream.** A read counts only
+  the lines its result carried — Claude Code's `tool_use_result` range, or
+  the numbered lines of the content — never what it asked for: a read with
+  no limit can come back cut by a token cap, and one past the end of a file
+  returns nothing without being an error. Errors, reads outside the run's
+  root and a subagent's reads count nothing; a subagent's launch is counted
+  instead.
+
 - **The deep scope is cut into readings a single session can hold.** The
   inventory is packed, in path order, into slices of at most 300 KB of
   source (~85k tokens); a range bigger than that is a slice of its own.
@@ -183,6 +191,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   own three stand-ins instead — checked block by block, not assumed.
 
 ### Changed
+
+- **OpenCode's normalised stream keeps the range a read showed.** The
+  `metadata.display` line range is copied onto the result in Claude Code's
+  `tool_use_result.file` shape; the output itself is capped at 8 KB, so the
+  numbered lines alone could never prove a long read.
 
 - **The security-analysis skill has a fourth job: verification** — the queue,
   the minted prompt, one subagent per finding, and the fact that the close
