@@ -236,16 +236,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   refusal over anything else — no binary, a CLI that hung — reads as
   before.
 
-- **`install` refuses a pin that is not an absolute directory.** A
-  relative `AGENTLOOP_CLAUDE_CONFIG_DIR` used to be written into both
-  plists and printed as though it were in force, though a run already
-  treats it as no pin at all (`account_norm_dir`); `install` now names the
-  value and says to give an absolute path, before a byte is written. The
-  `Claude account :` line `install` prints, and the `(in …)` `status`
-  adds, now name the Default's directory the way the engine actually
-  resolves it (`account_default_dir`) — `~` expanded, no trailing slash —
-  instead of the raw pin, which a spelling such as `~/.claude/` printed as
-  though it were a distinct account from the Default it already is.
+- **`install` refuses a pin that is not an absolute directory, and drops
+  one it finds already pinned.** A relative `AGENTLOOP_CLAUDE_CONFIG_DIR`
+  used to be written into both plists and printed as though it were in
+  force; `install` now names the value and says to give an absolute path,
+  before a byte is written — and when a pin already sitting in an existing
+  plist (this install's own, or the pre-rename agent's) is not absolute,
+  that pin is dropped instead of carried into the new plist, with a line
+  naming it and why. The `Claude account :` line `install` prints, and the
+  `(in …)` `status` adds, now name the Default's directory the way the
+  engine actually resolves it (`account_default_dir`) — `~` expanded, no
+  trailing slash — instead of the raw pin, which a spelling such as
+  `~/.claude/` printed as though it were a distinct account from the
+  Default it already is.
 
 ### Fixed
 
@@ -260,24 +263,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   one (the model probes, the `on-run-end` hook); a pin that is not an
   absolute directory counts as no pin.
 
-- **A pin with `&` or `<` in its directory no longer loses the account.**
+- **A pin with `&` or `<` in its directory silently lost the account.**
   `install` spliced the pin straight into both plists' `<string>` text, so
-  a directory such as `Clients & Co` was invalid XML; the plist reader
-  (`installed_config_dir`, Python's `plistlib`) then raised, caught the
-  error, and answered as though nothing were pinned at all — every run
-  silently fell back to the CLI default. The pin is now XML-escaped on the
-  way in (`&`, `<`, `>`) and reads back exactly as given.
-
-- **A project-set message named the account a save was removing as though
-  it still ran on it.** Converting a leftover `claude_config_dir` into an
-  account, when the level already has one, drops the field instead of
-  registering an orphan, and says so — but the account it named was wrong
-  in two cases: it read "already runs on" when THIS save is what sets the
-  account, and, when an operator cleared a stored account, it named the
-  very account the save was removing. The message is now worded after
-  what the save actually does: it names the account this save sets, or
-  says the project lands on the Default account (or, for a security
-  block, that the analysis inherits) when the save clears it instead.
+  a directory such as `Clients & Co` made the plist invalid XML (`plutil
+  -lint` on it: *Encountered unknown ampersand-escape sequence* — the same
+  parser launchd itself uses, so launchd most likely never loaded a plist
+  like this at all). What actually failed silently was the READ side:
+  `installed_config_dir` (Python's `plistlib`) raised on the malformed XML,
+  caught the error, and answered as though nothing were pinned — so a
+  repeated `install` with the variable unset lost the account it had
+  pinned, and a hand-typed command reading the plist saw no pin either.
+  The pin is now XML-escaped on the way in (`&`, `<`, `>`) and reads back
+  exactly as given.
 
 - **`agentloop help` prints its own text only.** Its heredoc expands, and
   three words quoted in backticks ran as commands: `repos` and `sbom`

@@ -95,10 +95,10 @@ legacy_config_dir_warning() { # one line per project or security block still car
 # after the directory -- and sets it on the level that carried it. A level
 # that does not run on Anthropic, or a directory that is gone, keeps the
 # field, said here and warned about by status.
-accounts_migrate_legacy() { # accounts_migrate_legacy [project [project-account security-account]] -> one line per level converted or left; a project name limits it to that project alone, and the two accounts are what a save of it is about to set on each level ("" for none)
-  local only="${1:-}" set_p="${2:-}" set_s="${3:-}"
+accounts_migrate_legacy() { # accounts_migrate_legacy [project [project-account security-account [project-sent security-sent]]] -> one line per level converted or left; a project name limits it to that project alone, the two accounts are what a save of it is about to set on each level ("" for none), and the two -sent flags ("1"/"") say whether the save's JSON actually carried that level's account key at all -- "" sent for a key that was never there means the save never touched that level
+  local only="${1:-}" set_p="${2:-}" set_s="${3:-}" has_p="${4:-}" has_s="${5:-}"
   [ -f "$PROJECTS_FILE" ] || return 0
-  local rows name level dir plat nd aid nm existing sent in_save=false
+  local rows name level dir plat nd aid nm existing sent sent_key in_save=false
   # A save always passes both account arguments, "" included when its level
   # clears to the Default -- a bare call (install, or a plain migration pass)
   # passes neither. $# tells the two apart even when the sent value itself is
@@ -118,7 +118,7 @@ accounts_migrate_legacy() { # accounts_migrate_legacy [project [project-account 
     # account would be false: the level still runs on the one it already had.
     # The same for a level the save converting it is about to set: the
     # account that save sends is the one the level ends on.
-    if [ "$level" = "project" ]; then sent="$set_p"; else sent="$set_s"; fi
+    if [ "$level" = "project" ]; then sent="$set_p"; sent_key="$has_p"; else sent="$set_s"; sent_key="$has_s"; fi
     existing="$sent"
     if [ -z "$existing" ]; then
       if [ "$level" = "project" ]; then existing="$(project_get "$name" '.account' '')"
@@ -136,13 +136,19 @@ accounts_migrate_legacy() { # accounts_migrate_legacy [project [project-account 
       # is what sets the account -- too early -- and when the operator just
       # CLEARED a stored one, naming the account the save is removing).
       # $sent non-empty: this save sets the level's account, whatever it had
-      # before. $sent empty inside a save: the level ends on the Default (or,
-      # for security, inherits). Outside a save (install, a bare pass):
-      # $existing is only ever the level's own pre-existing account, and
-      # saying so is simply true.
+      # before. $sent empty inside a save AND $sent_key set: the save's JSON
+      # carried the key (an empty string the level's editor sent on purpose),
+      # so the level truly ends on the Default (or, for security, inherits).
+      # Everything else -- no save at all, or a save whose JSON never
+      # mentioned this level (a CLI project-set touching only other fields,
+      # `.account // ""` reading a MISSING key the same as an empty one) --
+      # leaves the level exactly as it was, and $existing is only ever its
+      # own pre-existing account: saying so is simply true (round 2, finding
+      # 1 -- a CLI save without the account keys used to print "leaves … on
+      # the Default" while the stored account was left untouched).
       if [ -n "$sent" ]; then
         echo "projects.json: claude_config_dir on $name ($level) dropped — this save sets the account '$sent'"
-      elif [ "$in_save" = true ]; then
+      elif [ "$in_save" = true ] && [ -n "$sent_key" ]; then
         if [ "$level" = "project" ]; then
           echo "projects.json: claude_config_dir on $name ($level) dropped — this save leaves the project on the Default account"
         else
@@ -7222,6 +7228,18 @@ cmd_install() {
   if [ -z "$cfgdir" ] && [ -n "$legacy_cfgdir" ]; then
     cfgdir="$legacy_cfgdir"
   fi
+  # A pin already sitting in an existing plist (this install's own, or the
+  # old agent's) can be relative -- from an install older than the refusal
+  # above, or a plist edited by hand. Carrying it forward would rewrite the
+  # very value a run already treats as no pin at all (account_norm_dir), so
+  # every later install would just read it back and repeat the cycle; it is
+  # dropped here instead, with a line naming it and why, and $cfgdir becomes
+  # empty -- exactly like a fresh install with nothing pinned, so the plist
+  # this run writes is finally clean of it.
+  if [ -n "$cfgdir" ] && ! account_norm_dir "$cfgdir" >/dev/null; then
+    echo "the account pinned in the existing install ('$cfgdir') is not an absolute directory — dropped, not carried into this install"
+    cfgdir=""
+  fi
   if [ -n "$cfgdir" ]; then
     # BOTH names, and the engine's own first. launchd hands the tick exactly
     # what this block says, and the engine reads AGENTLOOP_CLAUDE_CONFIG_DIR
@@ -8150,11 +8168,17 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
   # and wins -- and the conversion, told about it, registers nothing for a
   # level whose save picks an account of its own.
   if platforms_valid; then
-    local sent_pa sent_sa had_pa had_sa
+    local sent_pa sent_sa had_pa had_sa has_pa has_sa
     sent_pa="$(echo "$partial" | "$JQ" -r '.account // ""')"
     sent_sa="$(echo "$partial" | "$JQ" -r '((.security | objects) // {}).account // ""')"
+    # A CLI project-set that never mentions .account at all (`.account //
+    # ""`, above) reads identically to one that sends an explicit "" --
+    # accounts_migrate_legacy needs the two told apart (round 2, finding 1),
+    # so this says whether the key was actually there.
+    has_pa="$(echo "$partial" | "$JQ" -r 'if has("account") then "1" else "" end')"
+    has_sa="$(echo "$partial" | "$JQ" -r '((.security | objects) // {}) | if has("account") then "1" else "" end')"
     had_pa="$(project_get "$name" '.account' '')"; had_sa="$(security_get "$name" '.account' '')"
-    accounts_migrate_legacy "$name" "$sent_pa" "$sent_sa"
+    accounts_migrate_legacy "$name" "$sent_pa" "$sent_sa" "$has_pa" "$has_sa"
     if [ -z "$had_pa" ] && [ -n "$(project_get "$name" '.account' '')" ]; then
       partial="$(echo "$partial" | "$JQ" -c 'if (.account // "") == "" then del(.account) else . end')"
     fi

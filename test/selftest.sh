@@ -1334,6 +1334,35 @@ JSON
     *) bad "Old14 security wording: rc=$rc $out" ;;
   esac
 
+  # Old15 (round 2, finding 1): a CLI project-set that never mentions
+  # .account or security.account at all -- `.account // ""` upstream reads a
+  # MISSING key exactly like an empty one, which used to print the Old14
+  # wording ("this save leaves the project on the Default account") even
+  # though this save never touches the account and the stored one survives
+  # untouched. "keep-p"/"keep-s" are registered first so the UNRELATED
+  # unknown-account cleanup further down in project-set has nothing to do.
+  mkdir -p "$ccd/keep-p-dir" "$ccd/keep-s-dir" "$ccd/old-acct11" "$ccd/old-acct12"
+  ( ccd_env; account_add anthropic "keep-p" "$ccd/keep-p-dir" ) >/dev/null
+  ( ccd_env; account_add anthropic "keep-s" "$ccd/keep-s-dir" ) >/dev/null
+  "$JQ" --arg c "$ccd" --arg d11 "$ccd/old-acct11" --arg d12 "$ccd/old-acct12" \
+      '.projects += [{"name":"Old15","cwd":$c,"account":"keep-p","claude_config_dir":$d11,
+                       "security":{"enabled":false,"account":"keep-s","claude_config_dir":$d12}}]' \
+      "$ccd/cfg/projects.json" > "$ccd/cfg/projects.json.next" && mv "$ccd/cfg/projects.json.next" "$ccd/cfg/projects.json"
+  out="$( ( ccd_env; printf '{"name":"Old15","description":"cli-touch"}' | cmd_project_set ) 2>&1 )"; rc=$?
+  case "$out" in
+    *registered*|*"is now the account"*|*"leaves the project"*|*"clears the account"*) bad "Old15: a save that never sent the account keys should not reword or touch them: $out" ;;
+    *"claude_config_dir on Old15 (project) dropped — it already runs on the account 'keep-p'"*)
+      ok "a CLI save that never sends .account keeps the old, still-true wording for the project level" ;;
+    *) bad "Old15 project wording: rc=$rc $out" ;;
+  esac
+  case "$out" in
+    *"claude_config_dir on Old15 (security) dropped — it already runs on the account 'keep-s'"*)
+      [ "$rc" -eq 0 ] && [ "$("$JQ" -c '.projects[] | select(.name=="Old15") | {a: .account, c: has("claude_config_dir"), s: .security.account, sc: (.security | has("claude_config_dir")), d: .description}' "$ccd/cfg/projects.json")" = '{"a":"keep-p","c":false,"s":"keep-s","sc":false,"d":"cli-touch"}' ] \
+        && ok "and the same for security -- both accounts survive exactly as stored, only the leftover directories and the rest of the save applied" \
+        || bad "Old15 after a keyless save: rc=$rc out=$out now=$("$JQ" -c '.projects[] | select(.name=="Old15")' "$ccd/cfg/projects.json")" ;;
+    *) bad "Old15 security wording: rc=$rc $out" ;;
+  esac
+
   # Fix round 3: accounts_migrate_legacy now runs only after every refusal
   # gate has cleared, only for the project actually being saved, and only
   # when platforms.json is valid -- before this fix it ran first, unscoped,
@@ -6193,11 +6222,36 @@ PY
     printf '%s\n' "$_normout" | grep -qxF "Claude account : $tmp/inst/fakehome/.claude-x" \
       && ok "a ~/.claude-x/ pin prints its normalized directory: tilde expanded, no trailing slash" \
       || bad "Claude account line: $normline"
+    # Round 2, finding 4: a pin already sitting in the plist can be relative
+    # -- an install from before the refusal above, or a hand edit -- and a
+    # re-run with the variable unset must not just read it back and write it
+    # forward again, unchanged and still useless.
+    "$PYTHON" - "$PLIST_PATH" <<'PY'
+import plistlib, sys
+p = plistlib.load(open(sys.argv[1], "rb"))
+p["EnvironmentVariables"]["AGENTLOOP_CLAUDE_CONFIG_DIR"] = "relative/leftover"
+p["EnvironmentVariables"]["CLAUDE_CONFIG_DIR"] = "relative/leftover"
+plistlib.dump(p, open(sys.argv[1], "wb"))
+PY
+    _leftout="$(cmd_install 2>&1)"
+    printf '%s\n' "$_leftout" | grep -qF "the account pinned in the existing install ('relative/leftover') is not an absolute directory" \
+      && ok "a relative pin already in the plist is named and dropped, not silently carried forward" \
+      || bad "leftover-pin drop line: $(printf '%s\n' "$_leftout" | grep 'pinned in the existing install')"
+    got="$(plist_key "$PLIST_PATH" AGENTLOOP_CLAUDE_CONFIG_DIR)"
+    [ -z "$got" ] && ok "and the new tick plist does not carry it forward" \
+      || bad "tick plist still names AGENTLOOP_CLAUDE_CONFIG_DIR='$got' after the drop"
+    got="$(plist_key "$SERVER_PLIST" AGENTLOOP_CLAUDE_CONFIG_DIR)"
+    [ -z "$got" ] && ok "nor does the server's" \
+      || bad "server plist still names AGENTLOOP_CLAUDE_CONFIG_DIR='$got' after the drop"
+    normline="$(printf '%s\n' "$_leftout" | grep 'Claude account')"
+    printf '%s\n' "$_leftout" | grep -qxF "Claude account : the CLI default (~/.claude) — set AGENTLOOP_CLAUDE_CONFIG_DIR and re-run to change it" \
+      && ok "and the Claude account line reads the CLI default, not the dropped value" \
+      || bad "Claude account line after the drop: $normline"
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_instout" | grep -v '^RESULT '
-  printf '%s\n' "$_instout" | grep -qx 'RESULT ok=14 bad=0' \
-    && ok "cmd_install over a shadowed home: all 14 assertions reach the gate" \
+  printf '%s\n' "$_instout" | grep -qx 'RESULT ok=18 bad=0' \
+    && ok "cmd_install over a shadowed home: all 18 assertions reach the gate" \
     || bad "cmd_install over a shadowed home did not: $(printf '%s\n' "$_instout" | tail -1)"
 
   echo "spent_today() — today's spend is summed without reading all of history"
