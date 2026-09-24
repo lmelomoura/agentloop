@@ -252,6 +252,31 @@ def test_a_waiter_judges_each_lock_with_no_pid_on_its_own(srv, monkeypatch):
         _drop(lock)
 
 
+def test_a_lock_released_as_a_waiter_looks_at_it_is_simply_taken(srv, monkeypatch):
+    """The holder can let go in the instant between a waiter's failed mkdir and
+    its first look at the lock: the directory is gone, so there is no identity
+    and no owner to judge -- a free lock, taken on the next pass. It used to
+    fall into the no-pid grace arithmetic with no start time and raise
+    TypeError, which is how the two-waiters test above failed now and then."""
+    lock = _made_without_pid(srv)
+    real_identity = srv.journal_lock._identity
+    looked = []
+
+    def released_as_looked_at(self):
+        if not looked:
+            looked.append(1)
+            _drop(lock)            # the holder lets go right now
+        return real_identity(self)
+
+    monkeypatch.setattr(srv.journal_lock, "_identity", released_as_looked_at)
+    try:
+        with srv.journal_lock(timeout=2) as lk:
+            assert (lk.path / "pid").read_text().strip() == str(os.getpid())
+        assert looked == [1]
+    finally:
+        _drop(lock)
+
+
 def _alive(pid):
     try:
         os.kill(pid, 0)

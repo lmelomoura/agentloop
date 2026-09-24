@@ -285,7 +285,7 @@ t1=$(date +%s)
 aid8="$(secid "$out8")"
 [ -n "$aid8" ] && ok "and prints the analysis id it opened: $aid8" || bad "no analysis id in: $out8"
 w=0
-while [ "$w" -lt 20 ] && [ "$(secstate sandbox "$aid8")" = "running" ]; do sleep 1; w=$((w + 1)); done
+while [ "$w" -lt 90 ] && [ "$(secstate sandbox "$aid8")" = "running" ]; do sleep 1; w=$((w + 1)); done
 [ "$(secstate sandbox "$aid8")" = "done" ] \
   && ok "and the row closes done once the detached run actually finishes (waited ${w}s)" \
   || bad "left '$(secstate sandbox "$aid8")' after ${w}s"
@@ -293,10 +293,17 @@ while [ "$w" -lt 20 ] && [ "$(secstate sandbox "$aid8")" = "running" ]; do sleep
 # precheck configured — every due tick runs the agent)" for this run: both
 # false for a derived job, which no tick ever launches and nobody pressed
 # Run now for -- see scenario 44 for the rest of the rule.
+# secstate above reads the ledger, which the analysis itself closes the
+# moment it ends; run_of reads runs.ndjson, written separately by run_job's
+# own record_run -- the two are not one atomic step, so a row already "done"
+# can still be a moment away from having a journal record at all. Bounded,
+# not a fixed sleep: wait only as long as it actually takes.
+wlog=0
+while [ "$wlog" -lt 90 ] && [ -z "$(run_of security-sandbox | jq -r '.log // empty')" ]; do sleep 1; wlog=$((wlog + 1)); done
 pc8="$(run_of security-sandbox | jq -r .log)"; pc8="${pc8%.json}.precheck.txt"
 grep -q "^SECURITY ANALYSIS $aid8 — launched by" "$pc8" 2>/dev/null && ! grep -q 'every due tick' "$pc8" 2>/dev/null \
   && ok "and the run's precheck note names analysis $aid8 and the command that launched it, never a tick" \
-  || bad "note: $(cat "$pc8" 2>/dev/null)"
+  || bad "note (waited ${wlog}s for the journal record): $(cat "$pc8" 2>/dev/null)"
 sleep 1   # let run_job's own teardown release the derived job's slot before the next scenario
 
 echo
@@ -1171,6 +1178,27 @@ sleep 2
 echo
 }
 
+# The one slot dir under data/locks/j44 that carries BOTH `child` and
+# `forced` -- a bare glob across data/locks/j44/*/forced used to read a
+# STALE sibling a previous launch's teardown left behind (it still has
+# `child`; the teardown had not gone as far as removing the dir yet, and
+# `forced` -- written once, at slot creation -- was already gone) instead of
+# the launch actually being waited for. Callers wait for an EMPTY directory
+# before starting their own launch (see scenario_44 below), so once this
+# finds a dir at all, it is that launch's own -- and requiring `forced`
+# specifically, not just `child`, also covers the ordinary case where a slot
+# writes its own `forced` a moment after its own `child`.
+j44_wait_slot() {
+  local w2=0 d
+  while [ "$w2" -lt 90 ]; do
+    for d in "$ROOT"/data/locks/j44/*/; do
+      [ -f "${d}child" ] && [ -f "${d}forced" ] && { printf '%s\n' "${d%/}"; return 0; }
+    done
+    sleep 1; w2=$((w2 + 1))
+  done
+  return 1
+}
+
 scenario_44() {
 echo "44. what launched a run is on its slot from the first second, and on its precheck note after"
 # The dialog's Trigger row read every live run as "scheduled — precheck
@@ -1182,11 +1210,16 @@ echo "44. what launched a run is on its slot from the first second, and on its p
 # was: Run now here, the resumed session in scenario 3, the analysis and the
 # command in scenario 8, and nothing at all for a tick.
 mkjob j44 hang
+# A slot dir the PREVIOUS scenario's own teardown has not finished removing
+# yet would otherwise be read as THIS launch's -- wait for a clean directory
+# before starting it, not just before reading it.
+w=0; while [ "$w" -lt 90 ] && [ -n "$(ls "$ROOT/data/locks/j44" 2>/dev/null)" ]; do sleep 1; w=$((w + 1)); done
+[ -z "$(ls "$ROOT/data/locks/j44" 2>/dev/null)" ] || bad "a slot from an earlier run is still there after ${w}s: $(ls "$ROOT/data/locks/j44")"
 FAKE_MODE=hang FAKE_SESSION=sess-44-now "$AL" run j44 >/dev/null 2>&1 &
-w=0; while [ "$w" -lt 20 ] && ! ls "$ROOT"/data/locks/j44/*/child >/dev/null 2>&1; do sleep 1; w=$((w + 1)); done
-[ "$(cat "$ROOT"/data/locks/j44/*/forced 2>/dev/null)" = "true" ] \
-  && ok "Run now, still going: the slot says forced (waited ${w}s for the slot)" \
-  || bad "slot forced='$(cat "$ROOT"/data/locks/j44/*/forced 2>/dev/null)'"
+j44s="$(j44_wait_slot)"
+[ -n "$j44s" ] && [ "$(cat "$j44s/forced" 2>/dev/null)" = "true" ] \
+  && ok "Run now, still going: the slot says forced" \
+  || bad "slot forced='$(cat "$j44s/forced" 2>/dev/null)' (slot: ${j44s:-none found in time})"
 "$AL" stop j44 >/dev/null 2>&1
 wait
 pc44="$(lastrun | jq -r .log)"; pc44="${pc44%.json}.precheck.txt"
@@ -1198,11 +1231,13 @@ grep -q '^RUN FORCED (Run now)' "$pc44" 2>/dev/null && ok "and its precheck note
 # verdict to carry.
 jq '.jobs[0].enabled = true | .jobs[0].precheck = "exit 0"' \
   "$ROOT/config/jobs.json" > "$ROOT/config/jobs.next" && mv "$ROOT/config/jobs.next" "$ROOT/config/jobs.json"
+w=0; while [ "$w" -lt 90 ] && [ -n "$(ls "$ROOT/data/locks/j44" 2>/dev/null)" ]; do sleep 1; w=$((w + 1)); done
+[ -z "$(ls "$ROOT/data/locks/j44" 2>/dev/null)" ] || bad "a slot from the previous launch is still there after ${w}s: $(ls "$ROOT/data/locks/j44")"
 FAKE_MODE=hang FAKE_SESSION=sess-44-tick "$AL" _exec j44 >/dev/null 2>&1 &
-w=0; while [ "$w" -lt 20 ] && ! ls "$ROOT"/data/locks/j44/*/child >/dev/null 2>&1; do sleep 1; w=$((w + 1)); done
-[ "$(cat "$ROOT"/data/locks/j44/*/forced 2>/dev/null)" = "false" ] \
-  && ok "a tick's launch, still going: the slot says not forced (waited ${w}s for the slot)" \
-  || bad "slot forced='$(cat "$ROOT"/data/locks/j44/*/forced 2>/dev/null)'"
+j44s="$(j44_wait_slot)"
+[ -n "$j44s" ] && [ "$(cat "$j44s/forced" 2>/dev/null)" = "false" ] \
+  && ok "a tick's launch, still going: the slot says not forced" \
+  || bad "slot forced='$(cat "$j44s/forced" 2>/dev/null)' (slot: ${j44s:-none found in time})"
 "$AL" stop j44 >/dev/null 2>&1
 wait
 [ "$(lastrun | jq -r .session)" = "sess-44-tick" ] && [ "$(lastrun | jq -r .forced)" = "false" ] \

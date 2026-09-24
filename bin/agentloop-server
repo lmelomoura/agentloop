@@ -641,6 +641,21 @@ def db_conn():
 
 
 SCHEMA_VERSION = "7"   # account and account_dir columns: the account each run signed in as
+# A schema bump listed here adds ONLY columns copied straight off a journal
+# record -- no artifact read, no doc/content rebuild -- so ingest() can fill
+# them in place (_backfill_light_bump) instead of paying for a full resync.
+# Maps (stored schema, SCHEMA_VERSION) -> the journal fields to backfill.
+#
+# A bump belongs here ONLY when every new column's value comes straight off
+# `rec` (the parsed journal line) with no further work -- model_id's own
+# stream-derived fallback (_model_id_from_stream) would NOT qualify, for
+# instance, because it has to read the stored stream, not just the record.
+# When in doubt, leave the bump OUT: the full resync below is always
+# correct, just slower, and a column silently left NULL forever is a much
+# quieter bug than a slow first request.
+LIGHT_SCHEMA_BUMPS = {
+    ("6", "7"): ("account", "account_dir"),
+}
 STREAM_CAP = 2_000_000
 
 
@@ -989,10 +1004,42 @@ def _finish_prune(conn, pending):
         conn.execute("UPDATE runs SET pruned=1 WHERE key=?", (key,))
 
 
+def _backfill_light_bump(conn, fields):
+    """Fill journal-sourced columns a light schema bump left NULL (see
+    LIGHT_SCHEMA_BUMPS) without a full resync: one UPDATE per journal record
+    that carries any of `fields`, keyed by the same _rec_key a full resync
+    would use. No artifact read, no doc/content rewrite, no FTS touch, no
+    _upsert -- this is the entire point of the light path.
+
+    A record carrying none of `fields` (written before they existed) is left
+    alone; its columns already read NULL -- and every reader already treats
+    NULL the same as "" (see load_run_detail's own `row["account"] or ""`) --
+    from the ALTER TABLE block above."""
+    if not RUNS_FILE.exists():
+        return
+    for ln in RUNS_FILE.read_text().splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        values = {f: rec[f] for f in fields if rec.get(f)}
+        if not values:
+            continue
+        set_clause = ", ".join(f"{f}=?" for f in values)
+        conn.execute("UPDATE runs SET " + set_clause + " WHERE key=?",
+                     (*values.values(), _rec_key(rec)))
+
+
 def ingest():
     """Absorb runs.ndjson into the DB. Incremental via byte offset; a rewritten
-    journal (shrunk file, changed head, schema bump) triggers a full resync
-    that preserves the stored content of already-pruned rows."""
+    journal (shrunk file, changed head, schema bump not listed in
+    LIGHT_SCHEMA_BUMPS) triggers a full resync that preserves the stored
+    content of already-pruned rows. A schema bump alone, journal otherwise
+    unchanged, and listed in LIGHT_SCHEMA_BUMPS backfills in place instead --
+    see _backfill_light_bump and the resync/light_fields split below."""
     conn = db_conn()
     try:
         # Schema migration: ADDITIVE ONLY — never DROP the runs table. It stores
@@ -1044,8 +1091,23 @@ def ingest():
                 flag.unlink()
             except OSError:
                 pass
-        resync = (forced or size < offset or sig != _meta_get(conn, "sig", "")
-                  or _meta_get(conn, "schema", "") != SCHEMA_VERSION)
+        stored_schema = _meta_get(conn, "schema", "")
+        schema_changed = stored_schema != SCHEMA_VERSION
+        # forced/shrunk/rewritten: the journal itself may not be what it was,
+        # so only these three ever justify a full resync on their own. A
+        # schema change by itself does NOT -- see light_fields below.
+        full_resync_reason = (forced or size < offset
+                               or sig != _meta_get(conn, "sig", ""))
+        # None unless the ONLY resync reason is the schema change AND that
+        # exact (stored, current) pair is a listed light bump -- any other
+        # resync reason means the journal may have been rewritten underneath
+        # the schema change, so it always takes the full path below instead,
+        # whether or not the schema also changed.
+        light_fields = (None if full_resync_reason or not schema_changed
+                         else LIGHT_SCHEMA_BUMPS.get((stored_schema, SCHEMA_VERSION)))
+        resync = full_resync_reason or (schema_changed and light_fields is None)
+        if light_fields:
+            _backfill_light_bump(conn, light_fields)
         if resync:
             existing = {row["key"]: row for row in conn.execute("SELECT * FROM runs")}
             seen, pending = set(), []
@@ -1470,6 +1532,15 @@ class journal_lock:
                 return self
 
             ident = self._identity()          # which lock is judged below, read first
+            if ident is None:
+                # Released by its holder in the instant since the failed mkdir:
+                # there is nothing to judge, and no ownerless start time to
+                # measure a grace from. A free lock -- taken on the next pass,
+                # still under the deadline.
+                ownerless_since = ownerless_ident = None
+                if time.time() > deadline:
+                    raise TimeoutError("the journal lock could not be taken — try again in a moment")
+                continue
             owner = self._owner()
             if owner is not None and not self._alive(owner, self._owner_boot()):
                 # the owner is gone, or from an earlier boot

@@ -188,6 +188,14 @@ document.documentElement.dataset.theme =
   </div>
 </header>
 <main class="wrap">
+  <!-- A refresh that failed, or has not answered in ~10s -- paintWaiting()
+       (bin/dashboard.html) shows this above whatever view is open, so a slow
+       start (the index rebuilding after a schema bump — see
+       bin/agentloop-server's ingest()) or a dropped connection never look
+       like an empty install. Sits OUTSIDE every .view -- see setView()'s own
+       `hidden` toggle -- so a view switch never hides it. Reuses the
+       .setup-banner look (ui/app/settings.js's own setupBanner()). -->
+  <div id="waiting-banner" hidden></div>
   <div class="view" id="view-overview">
   <!-- Icon, title and the one sentence written from the numbers the loop
        actually produced, with Refresh and New job trailing on the right.
@@ -1570,6 +1578,17 @@ applyTheme(themePref());
 
 /* ---------------------------------------------------------------- utils */
 let DATA={jobs:[],state:{},runs:[],launchd_loaded:false};
+// True from the first successful /api/data on. render() is called
+// synchronously at boot (initViews() -> setView() -> render(), well before
+// loadSession()/refresh() have even started -- see boot() below), and again
+// on every 5s poll after. Until this is true, DATA above is just the
+// placeholder it was born with, not anything the server has said -- so
+// render() must draw a neutral wait state instead of "no jobs"/"launchd
+// off"/etc, which would be a real install's data if DATA_LOADED were true.
+// See bin/agentloop-server's ingest(): a schema bump can hold the first
+// /api/data for minutes, and this flag is what keeps that from painting as
+// an empty install for all of it.
+let DATA_LOADED=false;
 let editingId=null, creating=false;
 const esc=(s)=>String(s ?? "").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 // `long` (Phase 4 Task 5, Security index only): "2 hours ago"/"1 day ago"
@@ -1698,7 +1717,35 @@ async function loadConfig(){
   CFG = await r.json();
 }
 
+/* A refresh that failed outright, or one still waiting past ~10s -- see
+   refresh() below. Mounted into #waiting-banner, which sits above every
+   view (bin/dashboard.html's static markup), so it shows regardless of
+   which page is open and never hides the last good DATA underneath it. */
+function paintWaiting(show){
+  const h=$("waiting-banner");
+  if(!h) return;
+  if(!show){ h.hidden=true; h.innerHTML=""; return; }
+  h.hidden=false;
+  h.innerHTML='<div class="setup-banner"><div class="bic">'+I.alert+'</div><div class="btxt">'
+    +'<b>Waiting for the server</b>'
+    +'<span>it may be busy updating its run index; this page keeps retrying.</span>'
+    +'</div></div>';
+}
+
+// setInterval(refresh, 5000) must never pile a second fetch onto one still in
+// flight -- a slow request (a schema-bump resync, see agentloop-server's
+// ingest()) used to leave every OTHER request racing it for the same SQLite
+// write lock. One flag, checked and set first thing, is enough: the tick that
+// finds it already true simply skips itself, exactly like a debounced click.
+let refreshInFlight=false;
+let waitTimer=null;
 async function refresh(){
+  if(refreshInFlight) return;
+  refreshInFlight=true;
+  clearTimeout(waitTimer);
+  // Not answered within ~10s -- say so, without giving up on it. The fetch
+  // below keeps running; this only changes what the page shows meanwhile.
+  waitTimer=setTimeout(()=>paintWaiting(true), 10000);
   try{
     const r = await fetch("/api/data", {headers:{"X-AL-Token":TOKEN}});
     // The session ran out, or was signed out from another tab. Not an error to
@@ -1719,8 +1766,20 @@ async function refresh(){
     // Everything downstream still reads DATA.jobs / DATA.projects, so the split
     // stays invisible to the rest of the page.
     DATA = Object.assign(d, {jobs:CFG.jobs, projects:CFG.projects});
+    DATA_LOADED=true;
     render();
-  }catch(e){ $("updated").textContent = "server unreachable — "+e.message; }
+    paintWaiting(false);
+  }catch(e){
+    $("updated").textContent = "server unreachable — "+e.message;
+    // A network error, or the non-OK/non-401/428 throw above -- the page keeps
+    // whatever DATA it already had (render() is simply not called again) and
+    // says it is still trying, rather than going quiet on a small status line
+    // nobody is watching.
+    paintWaiting(true);
+  }finally{
+    clearTimeout(waitTimer);
+    refreshInFlight=false;
+  }
 }
 
 // jobProjectFilter/jobStatusFilter/jobQuery moved to ui/app/jobs-domain.js's
@@ -2853,7 +2912,28 @@ function renderRetained(){
    (tests/test_page_contract.py), which scan render() and the functions it
    calls directly -- not their callees in turn; see those tests' own
    docstrings for the exact, honestly-stated limit of what they can catch. */
+// The neutral wait state render() draws while DATA_LOADED is false -- reused
+// on every call until the first successful /api/data, starting with the
+// very first one, synchronous at boot (initViews() -> setView() -> render(),
+// before loadSession()/refresh() have even run). Every host it touches would
+// otherwise show a genuine "empty install" claim -- no jobs, launchd off,
+// nothing to run, the loop has not checked anything -- built from the
+// placeholder DATA the page opens with, not from anything the server has
+// said. Reuses the .card.empty placeholder style already used for "no jobs
+// match" (renderOverviewJobs) rather than inventing a new one.
+function renderLoadingState(){
+  $("pill-launchd").innerHTML='<span class="pill disabled">'+I.refresh+'launchd</span>';
+  const loading='<div class="card empty">'+I.refresh+'Loading…</div>';
+  $("jobs").innerHTML=loading;
+  $("ov-head").innerHTML=loading;
+  $("ov-kpis").innerHTML="";
+  $("stats").innerHTML=loading;
+}
+
 function render(){
+  // Nothing has answered yet -- see renderLoadingState's own comment. render()
+  // runs again for real, with every host below, the moment refresh() succeeds.
+  if(!DATA_LOADED){ renderLoadingState(); return; }
   const _g=DATA.generated?new Date(DATA.generated):null;
   $("updated").textContent=(_g&&!isNaN(_g))?_g.toLocaleString(undefined,{dateStyle:"medium",timeStyle:"medium"}):"";
   // Genuinely a fault when "off" -- the scheduler service failed to load --
@@ -3505,8 +3585,12 @@ function groupModels(ids){
   return out;
 }
 // The most recent /api/models round trip, and whether it is still in flight.
-// refresh() fires one on every config_sig change -- the first read included,
-// so boot() and enterDashboard() fire none of their own, and
+// refresh() fires one on every config_sig change -- so enterDashboard(),
+// which resets CFG.sig to force that branch, fires none of its own.
+// boot() is the one exception: it fires the FIRST load itself, chained off
+// its own early loadConfig() (see boot()'s own comment on why that read
+// cannot wait for refresh()) -- by the time refresh()'s sig check runs,
+// CFG.sig already matches and that branch has nothing left to do here.
 // retryModelsIfMissing() stands down while one is pending (list_models reads
 // and scans the CLI binary: not a GET to make twice for one answer).
 // enterDashboard hands the promise to submitSetup, which has to see
@@ -5400,6 +5484,7 @@ function sessionLost(){
   SESSION.authenticated = false;
   stopPolling();
   applyGates();
+  paintWaiting(false);
 }
 async function doLogout(){
   const yes = await showConfirm({title:"Sign out?", icon:"power", tone:"danger",
@@ -6119,8 +6204,21 @@ $("jobsearchbox").insertAdjacentHTML("afterbegin", I.search);
     return;
   }
   applyGates();
-  // The first refresh() reads the config AND fires /api/models (see loadModels).
-  if(SESSION.authenticated){ await refresh(); startPolling(); }
+  if(SESSION.authenticated){
+    // Fired alongside refresh(), not gated behind it: /api/data can take
+    // minutes the one time the index needs a schema resync (see
+    // agentloop-server's ingest()), and job/project definitions have nothing
+    // to do with that wait -- Settings, the job editor and the New job
+    // dialog all read CFG straight, none of them through DATA_LOADED. This
+    // IS now the first /api/models read too, in place of the one that used
+    // to ride refresh()'s own sig branch below -- loadConfig() sets CFG.sig
+    // for real, so that branch sees it already matches and does not fetch a
+    // second time. A failure here is harmless: refresh()'s sig check still
+    // sees the mismatch (CFG.sig stays null) and retries both the normal way.
+    loadConfig().then(loadModels).catch(()=>{});
+    await refresh();
+    startPolling();
+  }
 })();
 </script>
 </body></html>

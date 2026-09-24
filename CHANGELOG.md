@@ -272,6 +272,104 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A command past its deadline reads as 124, never as a traceback.**
+  `run_bounded` (the deadline around `opencode models` and `opencode export`)
+  ends the command's whole process group, and macOS answers `EPERM`, not
+  `ESRCH`, to a `killpg` that reaches a group whose members are all on their
+  way out: the helper only caught the second, so it died with a traceback
+  and rc 1 instead of answering 124. Both mean nothing is left to signal.
+- **The journal lock no longer raises when its holder lets go at the
+  instant a waiter looks.** A waiter whose mkdir failed and then found the
+  lock already gone had no identity and no owner to judge, and fell into the
+  no-pid grace arithmetic with no start time: a `TypeError` in the request
+  that was waiting (a run delete or rename from the dashboard). A lock that
+  vanished is now simply taken on the next pass, still under the deadline.
+- **The selftest's guard rail recognises a project save's account cleanup,
+  which reads its jobs from jobs.json, as project-scoped.**
+  `cmd_project_set` and `cmd_project_delete`'s own account cleanup (#77)
+  clears a now-invalid `.account` off every job of the project being saved
+  or deleted, its id read straight off `$JOBS_FILE` itself (`.jobs[]? |
+  select(.project == $n)`) — the SAME shape (`write_jobs` selecting `.id
+  ==`) the `cmd_*` guard rail looks for to catch a by-id mutation that
+  forgot to refuse a derived id, so it started finding 10 sites instead of
+  8, two of them "missing" `security_refuse_derived`. Adding that call
+  would have been wrong here: a derived job never lives in `$JOBS_FILE` at
+  all (this cleanup can never reach one), and a real job that predates the
+  `security-` prefix's reservation, legitimately in `$JOBS_FILE`, still has
+  to be cleared — `cmd_project_delete`'s own pass also runs inside a
+  pipeline, where a `die` would not even stop the write. The guard rail now
+  strips this one exact, already-reviewed filter out of those two
+  functions' bodies before the shape match runs, by its own text, not by
+  excluding either function outright — so any OTHER by-id write later
+  added to either command is still caught.
+
+- **A security analysis on OpenCode no longer prints `write error: Broken
+  pipe` while picking a tools-capable model.** The fallback that skips a
+  model the catalog marks `tools: false` (`security_derived_jobs`) piped a
+  `while` loop's candidates into `head -1`: `head` closed its end the
+  moment it had one line, and a SECOND tools-capable model's `printf`, a
+  beat later, wrote into a reader that was already gone — harmless (the
+  right id still came out) but noisy, ~24 lines of it in one CI run, and
+  predates #77. The loop now reads its candidates from a heredoc instead of
+  a live pipe, and stops with `break` the moment it finds one, so there is
+  never a second write racing an already-closed reader.
+
+- **Two end-to-end scenarios no longer read a run's files before they
+  exist.** Scenario 8 read a detached analysis's precheck note the instant
+  its ledger row closed `done`, but the run's own journal record — a
+  separate write, `run_job`'s `record_run` — could still be a moment away;
+  it now waits, bounded, until `run_of` actually has a `.log` before
+  reading the note. Scenario 44 waited for `data/locks/j44/*/child` and
+  then read `*/forced` across every slot dir under it, which a stale
+  sibling left by the PREVIOUS launch's own teardown (carrying `child` but
+  no `forced`) could make it read instead of the launch it just started; it
+  now waits for an empty directory before each launch, then reads `forced`
+  from the one slot that actually carries both files. Every one of these
+  waits is bounded at 90 s: a launch that takes 6–7 s on a laptop running the
+  four e2e workers took past the old 20 s on a loaded CI runner.
+
+- **A schema bump that only adds journal-sourced columns fills them in
+  place, instead of re-indexing every run.** PR #77's `account`/
+  `account_dir` columns bumped the index's `SCHEMA_VERSION`, and `ingest()`
+  read any schema change as a reason to re-upsert every journal record and
+  rebuild the whole FTS table — including the preserved content of every
+  already-pruned run. On the operator's own install (`index.db` 606 MB, 464
+  runs, most pruned) that full resync ran inside the first `/api/data`
+  request: ~7 minutes at 88% CPU, ~1.3 GB written to the WAL, the write lock
+  held throughout. The first request's own client gave up
+  (`ConnectionResetError`); every other request's `ingest()` failed with
+  *database is locked*, so the dashboard drew 0 jobs, 0 projects, launchd
+  off — an install that looked wiped, while the data underneath was intact
+  the whole time. `LIGHT_SCHEMA_BUMPS` now lists which bumps add ONLY
+  columns copied straight off a journal record (`("6","7"):
+  ("account","account_dir")` is the first); when the stored schema and the
+  current one are such a pair, and the journal itself has not changed (not
+  forced, not shrunk, its signature unchanged), `ingest()` backfills those
+  columns in place with one `UPDATE` per record that carries them and
+  continues with its normal incremental tail — no artifact read, no content
+  rewrite, no FTS touch. Any other resync reason, or a bump not on the list,
+  still takes the full resync exactly as before.
+
+- **Until the server answers, or while it is busy, the dashboard says it is
+  waiting instead of drawing an empty install.** `render()` used to run
+  synchronously at boot — before `loadSession()`/`refresh()` had even
+  started — against the page's own placeholder `DATA`, and `refresh()` only
+  fetched `/api/config` (the job and project definitions) after `/api/data`
+  had already answered: a slow or failed first `/api/data` (the schema
+  resync above, or a dropped connection) left the page showing "No jobs
+  yet — create one", "launchd off" and "Nothing to run" for real, over an
+  install the server had not actually described yet. `render()` now stays
+  on a neutral wait state ("Loading…", the launchd pill neutral) until
+  `DATA_LOADED` — set only by the first successful `/api/data` — is true;
+  `/api/config` is now requested at boot in parallel with the first
+  `/api/data`, not gated behind it, so jobs and projects are ready the
+  moment the (usually fast) config read lands; and a refresh that fails, or
+  one that has not answered in ~10s, shows a banner ("Waiting for the
+  server — it may be busy updating its run index; this page keeps
+  retrying.") without discarding whatever the page already had, cleared by
+  the next success. A refresh already in flight is never joined by a second
+  one — the 5s poll simply skips a tick that finds one still running.
+
 - **A pin that names the CLI's own `~/.claude` no longer signs the install
   out.** A pin of `$HOME/.claude`, trailing slash or not, was exported as
   written, and Claude Code names the Keychain entry it reads after the
