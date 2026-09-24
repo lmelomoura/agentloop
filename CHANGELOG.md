@@ -27,13 +27,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `unit-prompt` prints a unit's minted prompt — a triage row with every
   location it has, a read unit's files with what is already recorded or
   decided in them — `unit-close` judges a unit's run from its stream and
-  the ledger and plans what it left undone, `units` prints the progress (per
-  kind, and how much of a deep scope has been read, counted against the
-  inventory itself), and `read` serves a file to a unit in numbered chunks
-  of 200 lines or 8 KB, recording each chunk as proof of reading — the only
-  proof there is on Codex. A line wider than one whole chunk is shown but
-  never recorded: `read` never records more than the chunk it actually
-  showed.
+  the ledger and plans what it left undone, `report-gone` lets a triage
+  unit say a carried finding is gone, with the reason, `units` prints the
+  progress (per kind, and how much of a deep scope has been read, counted
+  against the inventory itself), and `read` serves a file to a unit in
+  numbered chunks of 200 lines or 8 KB, recording each chunk as proof of
+  reading — the only proof there is on Codex. A line wider than one whole
+  chunk is shown but never recorded: `read` never records more than the
+  chunk it actually showed. The repository being analysed is not trusted
+  input: `read` quotes every path it prints, so the command it hands back
+  is exactly what the next call accepts, and refuses a name that carries a
+  control character rather than risk it forging a fake line of the verb's
+  own output.
 
 - **Each unit of an analysis is given one job, and told how it is checked.**
   The CLI mints the prompt of every unit from the ledger: a triage unit's

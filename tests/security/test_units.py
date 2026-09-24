@@ -593,6 +593,42 @@ def test_owed_is_the_inventory_minus_every_span_a_read_unit_proved(conn):
     assert units.owed(conn, _analysis(conn)) == [], "no inventory, no debt"
 
 
+def test_unit_reads_since_keeps_only_rows_recorded_at_or_after_it(conn):
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 1, "last": 9, "bytes": 1}]})
+    conn.execute("INSERT INTO unit_read (unit_id, path, first, last, at) VALUES (?,?,?,?,?)",
+                 (uid, "a.py", 1, 3, 100))
+    conn.execute("INSERT INTO unit_read (unit_id, path, first, last, at) VALUES (?,?,?,?,?)",
+                 (uid, "a.py", 4, 9, 200))
+    conn.commit()
+    assert ledger.unit_reads(conn, uid) == [("a.py", 1, 3), ("a.py", 4, 9)]
+    assert ledger.unit_reads(conn, uid, since=200) == [("a.py", 4, 9)]
+    assert ledger.unit_reads(conn, uid, since=150) == [("a.py", 4, 9)]
+
+
+def test_close_counts_only_reads_recorded_since_this_run_started(conn):
+    """Minor 1. `reset_unit` sends a unit whose run died back to `pending`
+    without clearing its id or its `started` -- so a chunk `security read`
+    recorded for that dead run is still on `unit_read` under the same unit
+    id once it is relaunched. `close` must credit only what was served
+    since THIS run's own `started`, set fresh by `start_unit` on every
+    launch."""
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 1, "last": 9, "bytes": 1}]})
+    conn.execute("INSERT INTO unit_read (unit_id, path, first, last, at) VALUES (?,?,?,?,?)",
+                 (uid, "a.py", 1, 3, 100))                  # served to the run that died
+    conn.execute("UPDATE unit SET state='running', started=200 WHERE id=?", (uid,))   # relaunched
+    conn.execute("INSERT INTO unit_read (unit_id, path, first, last, at) VALUES (?,?,?,?,?)",
+                 (uid, "a.py", 4, 9, 250))                  # what THIS run actually served
+    conn.commit()
+    out = units.close(conn, ledger.get_unit(conn, uid), status="success")
+    assert out["state"] == "incomplete", "lines 1-3 are still owed, not credited to this run"
+    assert ledger.get_unit(conn, uid)["evidence"]["covered"] == {"a.py": [[4, 9]]}, \
+        "lines 1-3 were served to the run that died, not to this one"
+    cont = ledger.get_unit(conn, out["continuation"])
+    assert cont["payload"]["ranges"] == [{"path": "a.py", "first": 1, "last": 3, "bytes": 0}]
+
+
 def test_close_judges_a_run_and_settles_its_unit_once(conn):
     aid = _analysis(conn)
     uid = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 1, "last": 3, "bytes": 9}]})

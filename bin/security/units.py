@@ -424,23 +424,16 @@ def owed(conn, analysis_id, all_units=None, inventory=None) -> list:
                     covered.setdefault(path, []).append((int(pair[0]), int(pair[1])))
                 except (TypeError, ValueError, IndexError):
                     continue    # a cell nobody could have written: it proves nothing
-    merged = {path: [list(s) for s in evidence.merge_spans(spans)] for path, spans in covered.items()}
-    out = []
-    for f in inventory.get("files") or []:
-        for rng in f.get("ranges") or []:
-            first, last = int(rng[0]), int(rng[1])
-            cursor = first
-            for a, b in merged.get(f["path"], []):
-                if b < cursor or a > last:
-                    continue
-                if a > cursor:
-                    out.append({"path": f["path"], "first": cursor, "last": a - 1})
-                cursor = max(cursor, b + 1)
-                if cursor > last:
-                    break
-            if cursor <= last:
-                out.append({"path": f["path"], "first": cursor, "last": last})
-    return out
+    merged = {path: evidence.merge_spans(spans) for path, spans in covered.items()}
+    # THE SAME GAP COMPUTATION `evidence.missing` runs for one unit's own
+    # ranges against its session's reads (I2): the inventory's ranges are
+    # its "wanted", the union of every read unit's covered spans is its
+    # "reads". Only the "bytes" key `missing` adds to each gap is not part
+    # of `owed`'s own return shape, so it is dropped below.
+    ranges = [{"path": f["path"], "first": int(rng[0]), "last": int(rng[1])}
+             for f in inventory.get("files") or [] for rng in f.get("ranges") or []]
+    return [{"path": g["path"], "first": g["first"], "last": g["last"]}
+           for g in evidence.missing(ranges, merged)]
 
 
 def summary(conn, analysis_id):
@@ -495,7 +488,15 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     if unit["state"] not in ("pending", "running"):
         return {"state": unit["state"], "continuation": None}
     session = evidence.read_session(stream or None, root or ".")
-    session = evidence.with_served(session, ledger.unit_reads(conn, unit["id"]))
+    # ONLY THIS RUN'S OWN READS (minor 1). A unit `reset_unit` sends back to
+    # `pending` after its run died keeps its id and its `started`, so a
+    # chunk `security read` recorded for that dead run is still on
+    # `unit_read` under the same unit id -- `since` (set fresh by
+    # `start_unit` on every launch) keeps only what THIS run was served.
+    # `read` itself also now refuses to serve a unit that is not `running`
+    # (cli.cmd_read), so nothing new can land between a reset and the next
+    # launch either.
+    session = evidence.with_served(session, ledger.unit_reads(conn, unit["id"], since=unit["started"]))
     done, remaining, ev, note = judge(conn, unit, session, status, reason)
     if session.tasks and unit["kind"] == "verify":
         # A VERDICT NOBODY CAN PROVE THIS UNIT REASONED MUST NOT STAND. The

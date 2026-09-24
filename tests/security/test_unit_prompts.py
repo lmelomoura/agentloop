@@ -93,6 +93,7 @@ def test_on_codex_a_read_unit_reads_through_security_read_only():
     out = _p("read", {"ranges": RANGES, "guides": [], "known": [], "decided": []}, platform="openai")
     assert "agentloop security read --path <path> --from <line>" in out
     assert "A `cat` or `sed` of a file proves nothing" in out
+    assert "Run each call alone" in out and "recorded as read in full" in out
     assert "Read tool" not in out
 
 

@@ -231,7 +231,9 @@ def _read(platform, context):
             "HOW READING IS PROVEN: read with `agentloop security read --path <path> --from <line>`,",
             "one call per chunk. It prints up to 200 numbered lines and the command for the",
             "next chunk, and it is the only reading this analysis can prove on this",
-            "platform. A `cat` or `sed` of a file proves nothing.",
+            "platform. A `cat` or `sed` of a file proves nothing. Run each call alone -- piped",
+            "into another command, filtered, or chained with a second read in the same shell",
+            "call, the chunk is still recorded as read in full.",
         ]
     else:
         how = [

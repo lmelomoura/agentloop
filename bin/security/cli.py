@@ -34,6 +34,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sqlite3
 import sys
 import time
@@ -42,7 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, inventory, ledger, osv, prompts, queries, report, secrets, taxonomy, units, verdict  # noqa: E402
+from security import adapters, candidate, coverage, deps, diff, engines, evidence, fingerprint, guides, hygiene, ignores, inventory, ledger, osv, prompts, queries, report, secrets, taxonomy, units, verdict  # noqa: E402
 
 REQUIRED_FINDING_KEYS = ("fingerprint", "category", "rule", "severity", "title")
 
@@ -1250,7 +1251,9 @@ def _slice_guides(root, ignore, components):
     ATTACK-CLASSES alone, and only a real planning failure fails `prepare`."""
     try:
         sig = guides.signals(root, ignore, components)
-    except Exception:  # noqa: BLE001 -- advice must not fail the phase
+    except Exception as exc:  # noqa: BLE001 -- advice must not fail the phase
+        print(f"prepare: the read units' guides could not be chosen ({type(exc).__name__}: {exc}); "
+             "every one gets ATTACK-CLASSES alone", file=sys.stderr)
         return None
 
     def pick(ranges):
@@ -1258,7 +1261,9 @@ def _slice_guides(root, ignore, components):
         try:
             return guides.select({"deps": sig["deps"], "paths": paths, "inventory": False},
                                  "standard")[:3]
-        except Exception:  # noqa: BLE001 -- advice must not fail the plan
+        except Exception as exc:  # noqa: BLE001 -- advice must not fail the plan
+            print(f"prepare: a read unit's guides could not be chosen ({type(exc).__name__}: {exc}); "
+                 "it gets ATTACK-CLASSES alone", file=sys.stderr)
             return [guides.ALWAYS]
     return pick
 
@@ -1383,7 +1388,8 @@ def cmd_prepare(args):
     started = time.perf_counter()
     def _progress(text):
         print(f"prepare: {text}", file=sys.stderr, flush=True)
-    _progress("started secrets, hygiene, dependencies, sbom, iac, sast-prepass")
+    _progress("started secrets, hygiene, dependencies, sbom, iac, sast-prepass" +
+             (", deep-inventory" if row["profile"] == "deep" else ""))
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {
             "secrets": pool.submit(_scan_secrets, root, ignore, sweeps),
@@ -1394,6 +1400,17 @@ def cmd_prepare(args):
             "sbom": pool.submit(_scan_sbom, root, components),
             "sast-prepass": pool.submit(_scan_sast, root, args.offline, ignore),
         }
+        if row["profile"] == "deep":
+            # I7. THE DEEP SCOPE'S OWN WALK, folded into the same pool as
+            # every other phase instead of running afterwards on its own.
+            # It reads every file this analysis will ever be asked to read,
+            # which costs real wall-clock on a large repository -- run
+            # after the pool, that cost used to land entirely inside the
+            # window between the re-check below and this function's first
+            # write, stretching exactly the gap that check exists to keep
+            # short. Here its wall-clock overlaps every other phase's
+            # instead of adding to them, same as any other phase.
+            futures["deep-inventory"] = pool.submit(inventory.build, root, ignore)
         for done in as_completed(futures.values()):
             name = next(n for n, f in futures.items() if f is done)
             _progress(f"{name} done ({int(time.perf_counter() - started)}s)"
@@ -1406,6 +1423,7 @@ def cmd_prepare(args):
         (iac_findings, iac_notes, iac_producer, iac_status) = futures["dependencies+iac"].result()
     sbom_document, sbom_notes, sbom_status = futures["sbom"].result()
     sast_findings, sast_notes, sast_producer, sast_status = futures["sast-prepass"].result()
+    deep_inventory = futures["deep-inventory"].result() if "deep-inventory" in futures else None
     _progress(f"all phases done ({int(time.perf_counter() - started)}s)")
 
     # ASKED AGAIN, NOW, BEFORE THE FIRST WRITE. `_running` above answered for
@@ -1486,10 +1504,10 @@ def cmd_prepare(args):
         print(f"prepare: {guides_note}", file=sys.stderr)
     # THE DEEP SCOPE, listed before any unit reads a line of it -- see
     # security/inventory.py. Filed under `scope` like the guides: it is what
-    # this analysis was set up to read.
-    deep_inventory = None
-    if row["profile"] == "deep":
-        deep_inventory = inventory.build(root, ignore)
+    # this analysis was set up to read. `deep_inventory` itself was already
+    # BUILT inside the phase pool above (I7) -- only the cheap, pure summary
+    # of it happens here, where the rest of the scope note is assembled.
+    if deep_inventory is not None:
         inventory_note = inventory.summary(deep_inventory)
         notes.insert(len(scope_notes), inventory_note)
         scope_notes.append(inventory_note)
@@ -1876,17 +1894,29 @@ def cmd_report_gone(args):
     SAID, with the reason -- the one way such a finding leaves the report
     without a silence the unit's proof could not tell from a skipped row."""
     uid = _session_unit()
+    if not uid:
+        # Minor 8: named on its own, before the generic fingerprint refusal
+        # below -- with no unit id there is no session to check a carried
+        # row against, and saying "the fingerprint is wrong" about a call
+        # that could never have succeeded points at the wrong thing.
+        sys.exit("report-gone: AL_SECURITY_UNIT_ID is not set in this session -- report-gone runs "
+                 "only inside a triage unit's own session. Nothing was recorded")
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except ValueError as exc:
         sys.exit(f"report-gone: stdin is not valid JSON: {exc}")
-    reason = (payload.get("reason") or "").strip() if isinstance(payload, dict) else ""
+    # Minor 8: a `reason` that is JSON but not a STRING (5, ["x"], null, an
+    # object) must be refused with the same "a reason is required" message
+    # as an empty one, never an AttributeError from calling `.strip()` on
+    # whatever it actually was.
+    raw_reason = payload.get("reason") if isinstance(payload, dict) else None
+    reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
     if not reason:
         sys.exit("report-gone: a reason is required -- what you read that shows it is gone. Nothing was recorded")
     _refuse_if_secret("report-gone: reason", reason)
     conn = _conn(args)
     _running(conn, args.analysis)
-    unit = ledger.get_unit(conn, uid) if uid else None
+    unit = ledger.get_unit(conn, uid)
     carried = [] if unit is None else [i for i in unit["payload"].get("items", [])
                                        if i.get("kind") == "carried" and i.get("category") == "sast"]
     if (unit is None or unit["kind"] != "triage" or unit["analysis_id"] != args.analysis
@@ -1906,13 +1936,16 @@ def cmd_units(args):
     print(json.dumps(units.summary(conn, args.analysis), indent=2))
 
 
+_CONTROL_CHAR = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def cmd_read(args):
     """A chunk of a file, numbered, for a unit that must PROVE it read it --
     the only proof on the Codex CLI, whose shell reads the stream cannot carry
     (security/evidence.py). Records the chunk only after printing it: the
     record says what was put in front of the session, never what it asked
-    for. Served to a unit of a running analysis only, and only inside the
-    unit's own run.
+    for. Served to a `running` unit of a running analysis only, and only
+    inside the unit's own run.
 
     THE BUDGET COUNTS WHAT IS ACTUALLY PRINTED, byte for byte -- each line's
     "N\\t" prefix included, encoded as UTF-8 -- never the bare text alone. On
@@ -1923,29 +1956,66 @@ def cmd_read(args):
     double the true cost of every line, and two hundred line-number prefixes
     add on the order of 1.4 KB by themselves -- and the ledger would then
     record lines nobody read.
+
+    THE REPOSITORY BEING ANALYSED IS NOT TRUSTED INPUT (I1). Git allows a
+    space, `;`, `$( )`, a backtick or a newline in a file name, and the
+    inventory lists whatever the tree holds. Every path this prints -- the
+    header, the "nothing at line N" notice, and the `-- next:` command --
+    goes through `shlex.quote`, so what is shown is exactly what the next
+    command accepts, never a shell fragment a model could copy and have
+    expanded. A name carrying a control character (below 0x20, or 0x7f)
+    cannot be shown on a line of its own without risking a forged line of
+    this verb's own output -- a fake `-- next:`, a fake `-- end of file`, a
+    header for a chunk never printed -- so it is refused outright: nothing
+    is printed from the file and nothing is recorded. The close names it
+    owed, the same as any other slice nobody could read.
     """
-    aid, uid = _agent_env("SECURITY_ANALYSIS_ID"), _agent_env("SECURITY_UNIT_ID")
-    if not (aid.isdigit() and uid.isdigit()):
-        sys.exit("read: serves only a unit of an analysis -- AL_SECURITY_ANALYSIS_ID and "
-                 "AL_SECURITY_UNIT_ID are not set in this session")
+    aid, uid, run_cwd = (_agent_env("SECURITY_ANALYSIS_ID"), _agent_env("SECURITY_UNIT_ID"),
+                         _agent_env("RUN_CWD"))
+    if not (aid.isdigit() and uid.isdigit() and run_cwd):
+        # Minor 2: no silent `os.getcwd()` fallback for a missing AL_RUN_CWD
+        # -- a unit's shell that ran `cd src` first would otherwise serve
+        # `a.py` and record it as `src/a.py`, one directory short of where
+        # it actually is.
+        sys.exit("read: serves only a unit of an analysis -- AL_SECURITY_ANALYSIS_ID, "
+                 "AL_SECURITY_UNIT_ID and AL_RUN_CWD are not set in this session")
     conn = _conn(args)
     _running(conn, int(aid))
-    _unit_of(conn, int(aid), int(uid))
-    root = os.path.realpath(_agent_env("RUN_CWD") or os.getcwd())
-    full = os.path.realpath(args.path if os.path.isabs(args.path) else os.path.join(root, args.path))
-    if full != root and not full.startswith(root + os.sep):
+    unit = _unit_of(conn, int(aid), int(uid))
+    if unit["state"] != "running":
+        # Minor 1: a unit `reset_unit` sent back to `pending` after its run
+        # died must not go on being served under the same id -- see
+        # `ledger.unit_reads`'s own `since` and `units.close`'s use of it.
+        sys.exit(f"read: unit {uid} is not running in analysis {aid} (state: {unit['state']}) -- "
+                 "a unit reads only during its own run")
+    root = os.path.realpath(run_cwd)
+    # I2: the one containment rule, shared with what a unit's own stream
+    # proves it read (evidence.parse) -- see evidence.relative_path.
+    rel = evidence.relative_path(args.path, root)
+    if rel is None:
         sys.exit(f"read: {args.path} is outside this run's checkout ({root})")
-    rel = os.path.relpath(full, root).replace(os.sep, "/")
+    if _CONTROL_CHAR.search(rel):
+        sys.exit(f"read: {rel!r} carries a character this verb cannot show on a line of its own "
+                 "-- nothing was printed or recorded; the close will name it owed")
+    quoted = shlex.quote(rel)
+    full = os.path.join(root, rel)
     try:
         data = Path(full).read_bytes()
     except OSError as exc:
-        sys.exit(f"read: cannot read {rel}: {exc.strerror or exc}")
+        sys.exit(f"read: cannot read {quoted}: {exc.strerror or exc}")
+    # Minor 4: the count below is UTF-8; `print` alone uses whatever
+    # encoding the process's locale gives a non-interactive session (ascii,
+    # under a bare `LC_ALL=C`), and would raise on the very bytes just
+    # counted. Guarded: a stdout that cannot reconfigure (piped through
+    # something that already replaced it) is left as it is.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     lines = data.decode("utf-8", errors="replace").split("\n")
     if lines and lines[-1] == "":
         lines.pop()
     total, first = len(lines), max(1, args.start)
     if first > total:
-        print(f"== {rel} has {total} line{'s' if total != 1 else ''}; nothing at line {first} ==")
+        print(f"== {quoted} has {total} line{'s' if total != 1 else ''}; nothing at line {first} ==")
         return
     # Each line's cost is the UTF-8 bytes of what is actually PRINTED for it
     # -- "N\tTEXT" -- plus one for its newline, never `len(text)` alone: see
@@ -1973,14 +2043,20 @@ def cmd_read(args):
         out.append(piece)
         size += cost
         last = number
-    print(f"== {rel} lines {first}-{last} of {total} ==")
+    print(f"== {quoted} lines {first}-{last} of {total} ==")
     if oversized is not None:
         print(oversized)
         print(f"-- line {last} is {len(oversized.encode('utf-8'))} bytes, wider than one chunk "
               f"({READ_BYTES} bytes) can show -- it cannot be proven read here")
     else:
+        # Minor 3: the budget above protects one call's own output -- piping
+        # it (`| head`), filtering it, or chaining a second read in the same
+        # command records a chunk the model never saw whole, and `read` has
+        # no way to detect any of that from here.
+        print("-- run this command alone: piped into another command, filtered, or chained with "
+              "a second read in the same call, this chunk is still recorded as read in full")
         print("\n".join(out))
-    print(f"-- next: agentloop security read --path {rel} --from {last + 1}" if last < total
+    print(f"-- next: agentloop security read --path {quoted} --from {last + 1}" if last < total
           else "-- end of file")
     sys.stdout.flush()
     if out:
@@ -3990,7 +4066,12 @@ def main(argv=None):
     uc.add_argument("--unit", type=int, required=True)
     uc.add_argument("--stream", default="")
     uc.add_argument("--root", default="")
-    uc.add_argument("--status", default="error")
+    # `run_classify` in bin/agentloop -- the run's own close classifier --
+    # assigns exactly these four strings to RJ_STATUS: success | warning |
+    # error (a non-zero exit, a denied tool, an API error) | stopped (the
+    # operator ended it). Task 8 wires `run_job` to call this verb with
+    # RJ_STATUS unchanged; nothing engine-side calls it with any other value.
+    uc.add_argument("--status", default="error", choices=("success", "warning", "error", "stopped"))
     uc.add_argument("--reason", default="")
     uc.add_argument("--spend", default="0")
 

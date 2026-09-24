@@ -1541,9 +1541,22 @@ def record_unit_read(conn, unit_id, path, first, last) -> None:
                      (unit_id, path, int(first), int(last), int(time.time())))
 
 
-def unit_reads(conn, unit_id) -> list:
+def unit_reads(conn, unit_id, since=None) -> list:
+    """This unit's own recorded reads (`security read`), oldest first --
+    only those at or after `since` (a unix timestamp) when it is given.
+
+    `reset_unit` sends a unit whose run died back to `pending` WITHOUT
+    clearing `started` or its id, so a row `security read` recorded for
+    that dead run is still here under the same unit id when the unit is
+    relaunched. `units.close` passes `since=unit["started"]` -- set fresh by
+    `start_unit` on every launch, this run's included -- so only what was
+    served since the run now being judged actually began is counted."""
+    if since is None:
+        return [(r["path"], r["first"], r["last"]) for r in conn.execute(
+            "SELECT path, first, last FROM unit_read WHERE unit_id=? ORDER BY rowid", (unit_id,))]
     return [(r["path"], r["first"], r["last"]) for r in conn.execute(
-        "SELECT path, first, last FROM unit_read WHERE unit_id=? ORDER BY rowid", (unit_id,))]
+        "SELECT path, first, last FROM unit_read WHERE unit_id=? AND at>=? ORDER BY rowid",
+        (unit_id, int(since)))]
 
 
 def record_gone(conn, unit_id, fingerprint, reason) -> None:

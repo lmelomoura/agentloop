@@ -2,6 +2,7 @@
 """The CLI of the pipeline's units: the plan prepare writes, the prompt, the close, the progress, the reader."""
 import json
 import os
+import shlex
 import subprocess
 import sys
 
@@ -49,6 +50,18 @@ def _unit(db, aid, kind):
     """The first unit of `kind`. Never by position: an offline prepare can
     still record hygiene rows, and their triage units come first."""
     return next(u for u in _units(db, aid) if u["kind"] == kind)
+
+
+def _start(db, unit_id):
+    """A plan leaves every unit `pending` until the engine launches it --
+    `security read` now refuses to serve anything else (minor 1), so any
+    test that reads through it has to start the unit first, the way a real
+    run would."""
+    conn = ledger.connect(db)
+    try:
+        ledger.start_unit(conn, unit_id)
+    finally:
+        conn.close()
 
 
 def test_a_deep_prepare_lists_the_scope_and_plans_a_hunt_and_the_reads(tmp_path):
@@ -109,6 +122,71 @@ def test_a_plan_that_fails_fails_prepare_loudly_and_leaves_no_unit(tmp_path, mon
     assert capsys.readouterr().out == "", "no JSON: a failed plan is not an analysis ready to run"
     assert _units(db, aid) == []
     assert run(db, "analysis", "--id", str(aid))["prepared"] == 1
+
+
+def test_slice_guides_narrows_by_the_slice_s_own_files(tmp_path):
+    """Minor 5. Each read unit's guides come from ITS OWN files, not the
+    whole repository's -- a slice of `.tsx` files calls for CLIENT-SIDE and
+    a slice of plain files does not, using the real `guides.signals` /
+    `guides.select` this analysis's own recommendation reads (guides.py)."""
+    root = tmp_path / "repo"
+    (root / "web").mkdir(parents=True)
+    (root / "docs").mkdir()
+    (root / "web" / "a.tsx").write_text("const x = 1;\n")
+    (root / "docs" / "notes.md").write_text("# t\n")
+    pick = security_cli._slice_guides(str(root), [], [])
+    assert pick is not None
+    assert pick([{"path": "web/a.tsx"}]) == ["ATTACK-CLASSES", "CLIENT-SIDE"]
+    assert pick([{"path": "docs/notes.md"}]) == ["ATTACK-CLASSES"]
+
+
+def test_slice_guides_falls_back_to_attack_classes_and_says_why_on_stderr(tmp_path, monkeypatch, capsys):
+    """Minor 5. `_slice_guides` used to swallow `guides.signals` failing with
+    no trace at all."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    def broken_signals(*_a, **_k):
+        raise RuntimeError("the tree could not be walked")
+    monkeypatch.setattr(security_cli.guides, "signals", broken_signals)
+    pick = security_cli._slice_guides(str(root), [], [])
+    assert pick is None
+    assert "RuntimeError: the tree could not be walked" in capsys.readouterr().err
+
+
+def test_slice_guides_falls_back_for_one_slice_and_says_why_on_stderr(tmp_path, monkeypatch, capsys):
+    """Minor 5's other fallback: one slice's own `guides.select` failing
+    must not silence itself either, and must not take down the plan."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n")
+    def broken_select(*_a, **_k):
+        raise RuntimeError("the guide table could not be read")
+    monkeypatch.setattr(security_cli.guides, "select", broken_select)
+    pick = security_cli._slice_guides(str(root), [], [])
+    assert pick([{"path": "a.py"}]) == ["ATTACK-CLASSES"]
+    assert "RuntimeError: the guide table could not be read" in capsys.readouterr().err
+
+
+def test_the_guides_note_is_inserted_with_the_scope_notes_not_appended_after_them(tmp_path, monkeypatch, capsys):
+    """Minor 6. `guides.recommend` fails here on purpose, so `guides_note` is
+    not empty and this ordering actually runs -- dormant otherwise, since
+    `recommend` almost never fails in practice. Reverting the
+    `notes.insert(...)` this row uses back to `notes.append(...)` would put
+    this sentence at the very END of the paragraph, after every phase's own
+    notes, instead of beside the scope sentences it is filed under."""
+    db = tmp_path / "security.db"
+    aid = open_analysis(db, profile="quick")
+    root = _repo(tmp_path, {"src/a.py": "x = 1\n"})
+    def broken_signals(*_a, **_k):
+        raise RuntimeError("the tree could not be walked")
+    monkeypatch.setattr(security_cli.guides, "signals", broken_signals)
+    security_cli.main(["prepare", "--analysis", str(aid), "--root", str(root), "--offline", "--db", str(db)])
+    out = json.loads(capsys.readouterr().out)
+    phases = json.loads(run(db, "analysis", "--id", str(aid))["coverage"])["phases"]
+    scope_note = next(p["note"] for p in phases if p["name"] == "scope")
+    assert "hunting-guide selection did not run" in scope_note
+    assert out["coverage_note"].startswith(scope_note), (
+        "the guides note must be part of the scope row's own contiguous prose")
 
 
 def test_the_deep_scope_sentence_keeps_the_scope_row_a_substring_of_the_paragraph(tmp_path):
@@ -258,6 +336,17 @@ def test_unit_close_refuses_a_unit_of_another_analysis(tmp_path):
     assert _unit(db, aid, "hunt")["state"] == "pending"
 
 
+def test_unit_close_status_is_one_of_the_engine_s_own_run_statuses(tmp_path):
+    """Minor 8. `--status` chokes on anything `run_classify` (bin/agentloop)
+    could never actually produce, argparse's own door rather than a value
+    reaching `units.judge` unnoticed."""
+    db = tmp_path / "security.db"
+    aid, _root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    hunt = _unit(db, aid, "hunt")
+    out = fails(db, "unit-close", "--analysis", str(aid), "--unit", str(hunt["id"]), "--status", "bogus")
+    assert out.returncode != 0 and "invalid choice" in out.stderr
+
+
 def _reader_env(aid, uid, root):
     return {**os.environ, "AL_SECURITY_AGENT": "1", "AL_SECURITY_ANALYSIS_ID": str(aid),
             "AL_SECURITY_UNIT_ID": str(uid), "AL_RUN_CWD": str(root)}
@@ -268,11 +357,16 @@ def test_security_read_serves_numbered_chunks_and_records_them(tmp_path):
     body = "".join(f"line {n}\n" for n in range(1, 251))
     aid, root, _ = _deep(db, tmp_path, {"src/big.py": body})
     read = _unit(db, aid, "read")
+    _start(db, read["id"])
     out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/big.py", "--db", str(db)],
                          capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
     assert out.returncode == 0, out.stderr
-    assert out.stdout.splitlines()[0] == "== src/big.py lines 1-200 of 250 =="
-    assert out.stdout.splitlines()[1] == "1\tline 1"
+    lines = out.stdout.splitlines()
+    assert lines[0] == "== src/big.py lines 1-200 of 250 =="
+    # Minor 3: the second line, ahead of the numbered body, says this call
+    # must be run alone.
+    assert lines[1].startswith("-- run this command alone")
+    assert lines[2] == "1\tline 1"
     assert "-- next: agentloop security read --path src/big.py --from 201" in out.stdout
     nxt = subprocess.run([sys.executable, str(CLI), "read", "--path", str(root / "src/big.py"), "--from", "201",
                           "--db", str(db)], capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
@@ -286,6 +380,7 @@ def test_security_read_stops_at_the_byte_budget(tmp_path):
     body = "".join("y" * 199 + "\n" for _ in range(100))   # 200 bytes a line
     aid, root, _ = _deep(db, tmp_path, {"src/wide.py": body})
     read = _unit(db, aid, "read")
+    _start(db, read["id"])
     out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/wide.py", "--db", str(db)],
                          capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
     # The budget is counted in what is actually PRINTED, "N\tTEXT", never the
@@ -295,6 +390,9 @@ def test_security_read_stops_at_the_byte_budget(tmp_path):
     # = 1,818 + 6,090 = 7,908 <= 8,000, and adding line 40 (203 more) would
     # reach 8,111 > 8,000 -- so the chunk stops at line 39.
     assert out.stdout.splitlines()[0] == "== src/wide.py lines 1-39 of 100 =="
+    # Minor 6: the recorded range must equal what was actually printed.
+    conn = ledger.connect(db)
+    assert ledger.unit_reads(conn, read["id"]) == [("src/wide.py", 1, 39)]
 
 
 def test_security_read_counts_multi_byte_characters_by_their_utf8_bytes(tmp_path):
@@ -306,13 +404,26 @@ def test_security_read_counts_multi_byte_characters_by_their_utf8_bytes(tmp_path
     body = "".join("é" * 150 + "\n" for _ in range(100))
     aid, root, _ = _deep(db, tmp_path, {"src/multibyte.py": body, "src/a.py": "x = 1\n"})
     read = _unit(db, aid, "read")
+    _start(db, read["id"])
     out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/multibyte.py", "--db", str(db)],
                          capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
     assert out.returncode == 0, out.stderr
     lines = out.stdout.splitlines()
-    footer = next(n for n, line in enumerate(lines) if line.startswith("--"))
-    body_text = "\n".join(lines[1:footer])
-    assert len(body_text.encode("utf-8")) <= security_cli.READ_BYTES
+    # Minor 6: pinned, not just bounded -- 9 lines at "N\t" + 300 + 1 = 303
+    # bytes each (2,727), then 2-digit lines at 304 each: 17 more fit
+    # (5,168, total 7,895); the 27th would reach 8,199 > 8,000. Line 1 is the
+    # header, line 2 the piping warning (minor 3), so the body starts at 2.
+    assert lines[0] == "== src/multibyte.py lines 1-26 of 100 =="
+    footer = next(n for n, line in enumerate(lines) if line.startswith("-- next") or line == "-- end of file")
+    body_text = "\n".join(lines[2:footer])
+    # THE FINAL NEWLINE COUNTS TOO: `print("\n".join(out))` emits one more
+    # byte after the body than `"\n".join` alone holds -- the loop's own
+    # `cost` charges it per line (`join` gives n-1 interior newlines, print's
+    # own terminator is the nth) -- so the tight bound adds it back rather
+    # than just checking the joined text alone stays under budget.
+    assert len(body_text.encode("utf-8")) + 1 <= security_cli.READ_BYTES
+    conn = ledger.connect(db)
+    assert ledger.unit_reads(conn, read["id"]) == [("src/multibyte.py", 1, 26)]
 
 
 def test_security_read_shows_a_line_wider_than_the_budget_but_never_records_it(tmp_path):
@@ -324,6 +435,7 @@ def test_security_read_shows_a_line_wider_than_the_budget_but_never_records_it(t
     body = "z" * 9000 + "\n" + "short\n"
     aid, root, _ = _deep(db, tmp_path, {"src/huge.py": body, "src/a.py": "x = 1\n"})
     read = _unit(db, aid, "read")
+    _start(db, read["id"])
     out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/huge.py", "--db", str(db)],
                          capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
     assert out.returncode == 0, out.stderr
@@ -338,6 +450,7 @@ def test_security_read_refuses_outside_a_unit_and_outside_the_run(tmp_path):
     db = tmp_path / "security.db"
     aid, root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
     read = _unit(db, aid, "read")
+    _start(db, read["id"])
     no_unit = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--db", str(db)],
                              capture_output=True, text=True,
                              env={k: v for k, v in _reader_env(aid, read["id"], root).items()
@@ -348,10 +461,153 @@ def test_security_read_refuses_outside_a_unit_and_outside_the_run(tmp_path):
     assert outside.returncode != 0 and "outside this run" in outside.stderr
 
 
+def test_security_read_prints_multibyte_output_even_under_a_narrow_locale(tmp_path):
+    """Minor 4. The count is UTF-8; `print` alone uses the process's own
+    locale encoding, which `PYTHONIOENCODING=ascii` narrows to ascii here --
+    and would raise on the very bytes just counted without
+    `sys.stdout.reconfigure`."""
+    db = tmp_path / "security.db"
+    aid, root, _ = _deep(db, tmp_path, {"src/a.py": "café\n"})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    env = {**_reader_env(aid, read["id"], root), "PYTHONIOENCODING": "ascii"}
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--db", str(db)],
+                         capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stderr
+    assert "café" in out.stdout
+    conn = ledger.connect(db)
+    assert ledger.unit_reads(conn, read["id"]) == [("src/a.py", 1, 1)]
+
+
+def test_security_read_refuses_with_no_run_cwd_rather_than_a_silent_getcwd(tmp_path):
+    """Minor 2. `AL_RUN_CWD` missing used to fall back to `os.getcwd()`
+    silently -- a unit's shell that ran `cd src` first would then serve
+    `a.py` and record it as `src/a.py`, one directory short of where it
+    actually is."""
+    db = tmp_path / "security.db"
+    aid, root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    env = {k: v for k, v in _reader_env(aid, read["id"], root).items() if k != "AL_RUN_CWD"}
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--db", str(db)],
+                         capture_output=True, text=True, env=env)
+    assert out.returncode != 0 and "AL_RUN_CWD" in out.stderr
+
+
+def test_security_read_refuses_a_unit_that_is_not_running(tmp_path):
+    """Minor 1. A plan leaves every unit `pending` until the engine starts
+    it, and a settled unit is done being read from either -- serving either
+    would let a `reset_unit` after a dead run go on inheriting lines served
+    to the run that actually died."""
+    db = tmp_path / "security.db"
+    aid, root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    read = _unit(db, aid, "read")
+    pending = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--db", str(db)],
+                             capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert pending.returncode != 0 and "is not running" in pending.stderr
+    conn = ledger.connect(db)
+    ledger.start_unit(conn, read["id"])
+    ledger.settle_unit(conn, read["id"], "done", 0, {})
+    done = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--db", str(db)],
+                          capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert done.returncode != 0 and "is not running" in done.stderr
+
+
+def test_security_read_quotes_a_path_with_a_space_and_the_footer_command_serves_the_next_chunk(tmp_path):
+    """I1. The footer names the exact next command, quoted the way a shell
+    that runs it back would need -- proven by actually running it, split
+    the way a shell would split it, rather than trusting the string alone."""
+    db = tmp_path / "security.db"
+    name = "src/my file.py"
+    body = "".join(f"line {n}\n" for n in range(1, 251))
+    aid, root, _ = _deep(db, tmp_path, {name: body})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", name, "--db", str(db)],
+                         capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert out.returncode == 0, out.stderr
+    footer = next(line for line in out.stdout.splitlines() if line.startswith("-- next:"))
+    assert footer == f"-- next: agentloop security read --path {shlex.quote(name)} --from 201"
+    words = shlex.split(footer[len("-- next: "):])
+    flags = words[3:]   # drop "agentloop", "security", "read" -- this suite's CLI is bin/security/cli.py
+    nxt = subprocess.run([sys.executable, str(CLI), "read", *flags, "--db", str(db)],
+                         capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert nxt.returncode == 0, nxt.stderr
+    assert "-- end of file" in nxt.stdout
+
+
+def test_security_read_quotes_a_path_with_shell_metacharacters_in_the_next_command(tmp_path):
+    db = tmp_path / "security.db"
+    name = "src/$(echo pwned).py"
+    body = "".join(f"line {n}\n" for n in range(1, 251))
+    aid, root, _ = _deep(db, tmp_path, {name: body})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", name, "--db", str(db)],
+                         capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert out.returncode == 0, out.stderr
+    # shlex.quote wraps the whole name in single quotes, under which a POSIX
+    # shell expands nothing -- not `$( )`, not a backtick.
+    assert f"-- next: agentloop security read --path {shlex.quote(name)} --from 201" in out.stdout
+
+
+def test_security_read_refuses_a_path_with_a_control_character(tmp_path):
+    """I1. A name that cannot be shown on a line of its own is refused
+    outright: printing it raw could forge a fake `-- next:` or `-- end of
+    file` line, or a header for a chunk never actually printed."""
+    db = tmp_path / "security.db"
+    aid, root, _ = _deep(db, tmp_path, {"src/a.py": "x = 1\n"})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a\nb.py", "--db", str(db)],
+                         capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert out.returncode != 0
+    assert out.stdout == "", "nothing is printed from the file"
+    assert "cannot show" in out.stderr
+    conn = ledger.connect(db)
+    assert ledger.unit_reads(conn, read["id"]) == [], "nothing is recorded"
+
+
+def test_security_read_refuses_a_dot_dot_path(tmp_path):
+    db = tmp_path / "security.db"
+    aid, root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    (root.parent / "outside.py").write_text("z\n")
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", "../outside.py", "--db", str(db)],
+                         capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert out.returncode != 0 and "outside this run" in out.stderr
+
+
+def test_security_read_refuses_an_inside_symlink_pointing_outside(tmp_path):
+    db = tmp_path / "security.db"
+    aid, root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    outside = root.parent / "secret.py"
+    outside.write_text("z\n")
+    (root / "src" / "escape.py").symlink_to(outside)
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/escape.py", "--db", str(db)],
+                         capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert out.returncode != 0 and "outside this run" in out.stderr
+
+
+def test_security_read_refuses_a_closed_analysis(tmp_path):
+    db = tmp_path / "security.db"
+    aid, root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    run(db, "finish", "--analysis", str(aid), "--state", "capped", "--spend", "0")
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--db", str(db)],
+                         capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert out.returncode != 0 and "closed" in out.stderr
+
+
 def test_what_security_read_served_counts_at_the_close(tmp_path):
     db = tmp_path / "security.db"
     aid, root, _ = _deep(db, tmp_path, {"src/a.py": "a\nb\n"})
     read = _unit(db, aid, "read")
+    _start(db, read["id"])
     subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--db", str(db)],
                    capture_output=True, text=True, env=_reader_env(aid, read["id"], root), check=True)
     out = run(db, "unit-close", "--analysis", str(aid), "--unit", str(read["id"]), "--root", str(root),
@@ -379,6 +635,105 @@ def test_report_gone_is_accepted_only_for_a_carried_sast_row_of_the_session_s_tr
                               "--fingerprint", fp, "--db", str(db)], env=env, capture_output=True,
                              text=True, input=json.dumps({"reason": reason}))
         assert bad.returncode != 0
+
+
+def test_report_gone_refuses_a_unit_that_is_not_running(tmp_path):
+    db = tmp_path / "security.db"
+    aid, _root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    conn = ledger.connect(db)
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [
+        {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}]})
+    # never started: still pending
+    env = {**os.environ, "AL_SECURITY_AGENT": "1", "AL_SECURITY_ANALYSIS_ID": str(aid),
+           "AL_SECURITY_UNIT_ID": str(uid)}
+    out = subprocess.run([sys.executable, str(CLI), "report-gone", "--analysis", str(aid),
+                          "--fingerprint", "c" * 64, "--db", str(db)], env=env, capture_output=True,
+                         text=True, input=json.dumps({"reason": "the handler was deleted"}))
+    assert out.returncode != 0 and "is not a carried sast finding" in out.stderr
+
+
+def test_report_gone_refuses_a_unit_that_is_not_a_triage_unit(tmp_path):
+    db = tmp_path / "security.db"
+    aid, _root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    hunt = _unit(db, aid, "hunt")
+    conn = ledger.connect(db)
+    ledger.start_unit(conn, hunt["id"])
+    env = {**os.environ, "AL_SECURITY_AGENT": "1", "AL_SECURITY_ANALYSIS_ID": str(aid),
+           "AL_SECURITY_UNIT_ID": str(hunt["id"])}
+    out = subprocess.run([sys.executable, str(CLI), "report-gone", "--analysis", str(aid),
+                          "--fingerprint", "c" * 64, "--db", str(db)], env=env, capture_output=True,
+                         text=True, input=json.dumps({"reason": "r"}))
+    assert out.returncode != 0 and "is not a carried sast finding" in out.stderr
+
+
+def test_report_gone_refuses_a_unit_of_another_analysis(tmp_path):
+    db = tmp_path / "security.db"
+    aid, _root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    other = open_analysis(db, profile="deep", commit="def", run_id="r2")
+    conn = ledger.connect(db)
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [
+        {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}]})
+    ledger.start_unit(conn, uid)
+    env = {**os.environ, "AL_SECURITY_AGENT": "1", "AL_SECURITY_ANALYSIS_ID": str(other),
+           "AL_SECURITY_UNIT_ID": str(uid)}
+    out = subprocess.run([sys.executable, str(CLI), "report-gone", "--analysis", str(other),
+                          "--fingerprint", "c" * 64, "--db", str(db)], env=env, capture_output=True,
+                         text=True, input=json.dumps({"reason": "r"}))
+    assert out.returncode != 0 and "is not a carried sast finding" in out.stderr
+
+
+def test_report_gone_refuses_a_scanner_item_even_of_category_sast(tmp_path):
+    """A `carried` sast row a triage unit read and found gone is one thing;
+    a `scanner` row of THIS analysis at that same category is a different
+    debt (re-report it, or leave it triaged) that `report-gone` never
+    settles, whatever its category."""
+    db = tmp_path / "security.db"
+    aid, _root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    conn = ledger.connect(db)
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [
+        {"fingerprint": "s" * 64, "kind": "scanner", "category": "sast"}]})
+    ledger.start_unit(conn, uid)
+    env = {**os.environ, "AL_SECURITY_AGENT": "1", "AL_SECURITY_ANALYSIS_ID": str(aid),
+           "AL_SECURITY_UNIT_ID": str(uid)}
+    out = subprocess.run([sys.executable, str(CLI), "report-gone", "--analysis", str(aid),
+                          "--fingerprint", "s" * 64, "--db", str(db)], env=env, capture_output=True,
+                         text=True, input=json.dumps({"reason": "r"}))
+    assert out.returncode != 0 and "is not a carried sast finding" in out.stderr
+
+
+def test_report_gone_refuses_with_no_unit_id_naming_that_not_the_fingerprint(tmp_path):
+    """Minor 8. With no AL_SECURITY_UNIT_ID there is no session to check a
+    carried row against -- the message must say that, not accuse the
+    fingerprint of being wrong."""
+    db = tmp_path / "security.db"
+    aid, _root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    env = {**os.environ, "AL_SECURITY_AGENT": "1", "AL_SECURITY_ANALYSIS_ID": str(aid)}
+    out = subprocess.run([sys.executable, str(CLI), "report-gone", "--analysis", str(aid),
+                          "--fingerprint", "c" * 64, "--db", str(db)], env=env, capture_output=True,
+                         text=True, input=json.dumps({"reason": "r"}))
+    assert out.returncode != 0
+    assert "AL_SECURITY_UNIT_ID is not set" in out.stderr
+    assert "is not a carried sast finding" not in out.stderr
+
+
+@pytest.mark.parametrize("bad_reason", [5, ["x"], None, {}])
+def test_report_gone_refuses_a_non_string_reason_with_the_reason_message_not_a_crash(tmp_path, bad_reason):
+    """Minor 8. `(payload.get("reason") or "").strip()` raised AttributeError
+    on a non-string, truthy `reason` (5, ["x"]) -- refused the same way an
+    empty one is, never a crash."""
+    db = tmp_path / "security.db"
+    aid, _root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    conn = ledger.connect(db)
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [
+        {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}]})
+    ledger.start_unit(conn, uid)
+    env = {**os.environ, "AL_SECURITY_AGENT": "1", "AL_SECURITY_ANALYSIS_ID": str(aid),
+           "AL_SECURITY_UNIT_ID": str(uid)}
+    out = subprocess.run([sys.executable, str(CLI), "report-gone", "--analysis", str(aid),
+                          "--fingerprint", "c" * 64, "--db", str(db)], env=env, capture_output=True,
+                         text=True, input=json.dumps({"reason": bad_reason}))
+    assert out.returncode != 0
+    assert "a reason is required" in out.stderr
 
 
 def test_units_prints_the_progress_and_a_unit_s_label(tmp_path):

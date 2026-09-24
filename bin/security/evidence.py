@@ -46,9 +46,18 @@ class Session:
 EMPTY = Session()
 
 
-def _relative(path, root_real):
+def relative_path(path, root):
+    """`path` relative to `root`, both resolved with `os.path.realpath` --
+    THE ONE CONTAINMENT RULE, used by `parse` below (a stream's own reads)
+    and by `cli.cmd_read` (what a unit asked `security read` for): the two
+    must always agree on what counts as inside a run's checkout, because
+    `with_served` joins their two accounts of one run by this exact string.
+    `None` when `path` is not a non-empty string, or resolves outside
+    `root` -- a `..` escape, or a symlink (inside `root`, or `root` itself)
+    whose target is not."""
     if not isinstance(path, str) or not path:
         return None
+    root_real = os.path.realpath(str(root))
     full = path if os.path.isabs(path) else os.path.join(root_real, path)
     real = os.path.realpath(full)
     if real != root_real and not real.startswith(root_real + os.sep):
@@ -93,7 +102,6 @@ def merge_spans(spans):
 
 
 def parse(lines, root) -> Session:
-    root_real = os.path.realpath(str(root))
     asked, reads, guides, tasks = {}, {}, set(), 0
     for line in lines:
         try:
@@ -125,7 +133,7 @@ def parse(lines, root) -> Session:
                 span = _structured_range(event) if len(results) == 1 else None
                 if span is None:
                     span = _numbered_range(block.get("content"))
-                rel = _relative(path, root_real)
+                rel = relative_path(path, root)
                 if span and rel:
                     reads.setdefault(rel, []).append(span)
     return Session(reads={p: merge_spans(s) for p, s in reads.items()}, tasks=tasks, guides=guides)

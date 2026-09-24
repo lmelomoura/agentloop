@@ -140,6 +140,45 @@ def test_two_tool_results_in_one_event_each_fall_back_to_their_own_numbered_line
     assert session.reads["src/b.py"] == [(5, 5)], "never (1, 100) from the event-level result"
 
 
+def test_relative_path_resolves_an_absolute_path_inside_the_root(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x\n")
+    assert evidence.relative_path(str(tmp_path / "src" / "a.py"), tmp_path) == "src/a.py"
+
+
+def test_relative_path_resolves_a_relative_path_against_the_root(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x\n")
+    assert evidence.relative_path("src/a.py", tmp_path) == "src/a.py"
+
+
+def test_relative_path_resolves_the_same_way_through_a_symlinked_root(tmp_path):
+    real = tmp_path / "real"
+    (real / "src").mkdir(parents=True)
+    (real / "src" / "a.py").write_text("x\n")
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert evidence.relative_path(str(link / "src" / "a.py"), link) == "src/a.py"
+    assert evidence.relative_path("src/a.py", link) == "src/a.py"
+
+
+def test_relative_path_refuses_a_dot_dot_escape(tmp_path):
+    (tmp_path / "root").mkdir()
+    (tmp_path / "outside.py").write_text("x\n")
+    assert evidence.relative_path("../outside.py", tmp_path / "root") is None
+
+
+def test_relative_path_refuses_an_inside_symlink_pointing_outside(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("x\n")
+    link = root / "escape.py"
+    link.symlink_to(outside)
+    assert evidence.relative_path("escape.py", root) is None
+    assert evidence.relative_path(str(link), root) is None
+
+
 def test_a_relative_file_path_resolves_against_the_run_root_and_one_that_escapes_it_counts_nothing():
     lines = [
         '{"type":"assistant","message":{"role":"assistant","content":'
