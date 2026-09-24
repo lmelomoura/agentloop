@@ -6247,11 +6247,78 @@ PY
     printf '%s\n' "$_leftout" | grep -qxF "Claude account : the CLI default (~/.claude) — set AGENTLOOP_CLAUDE_CONFIG_DIR and re-run to change it" \
       && ok "and the Claude account line reads the CLI default, not the dropped value" \
       || bad "Claude account line after the drop: $normline"
+    # Round 3: install_migrate_legacy no longer announces the carry itself --
+    # it only ever knew a legacy pin EXISTED, never whether cmd_install would
+    # go on to actually use it (the variable or the new plist can both beat
+    # it, and it still has to be absolute). The announcement now comes from
+    # cmd_install, once that is decided. The tick plist carries no pin at
+    # this point (the drop just above cleared it), so a fresh legacy plist is
+    # the only candidate for case A.
+    write_legacy_plist() { # write_legacy_plist <dir> -- (re)creates the pre-rename tick plist, pinned to <dir>; install_migrate_legacy consumes (and deletes) it on every cmd_install call
+      mkdir -p "$tmp/inst/fakehome/Library/LaunchAgents"
+      "$PYTHON" - "$tmp/inst/fakehome/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist" "$1" <<'PY'
+import plistlib, sys
+plistlib.dump({"EnvironmentVariables": {"CLAUDE_CONFIG_DIR": sys.argv[2]}}, open(sys.argv[1], "wb"))
+PY
+    }
+    # A: an absolute legacy pin, nothing else naming one -- it is the account
+    # this install carries forward, so the notice is true, and the pin
+    # reaches both new plists.
+    mkdir -p "$tmp/inst/legacy-acct"
+    write_legacy_plist "$tmp/inst/legacy-acct"
+    _legouta="$(cmd_install 2>&1)"
+    printf '%s\n' "$_legouta" | grep -qxF "carrying the account pinned in $LEGACY_PLIST_LABEL: $tmp/inst/legacy-acct" \
+      && ok "a legacy pin that is actually used is announced, naming the directory" \
+      || bad "legacy-carry line (used): $(printf '%s\n' "$_legouta" | grep 'carrying the account pinned')"
+    got="$(plist_key "$PLIST_PATH" AGENTLOOP_CLAUDE_CONFIG_DIR)"
+    [ "$got" = "$tmp/inst/legacy-acct" ] && ok "and the legacy pin reaches the new tick plist" \
+      || bad "tick plist AGENTLOOP_CLAUDE_CONFIG_DIR after a used legacy carry: '$got'"
+    got="$(plist_key "$SERVER_PLIST" AGENTLOOP_CLAUDE_CONFIG_DIR)"
+    [ "$got" = "$tmp/inst/legacy-acct" ] && ok "and the server plist too" \
+      || bad "server plist AGENTLOOP_CLAUDE_CONFIG_DIR after a used legacy carry: '$got'"
+    # B: a legacy pin AND the variable naming another absolute directory --
+    # the variable wins (it is checked first), so the legacy pin is never
+    # used and must never be announced as carried.
+    mkdir -p "$tmp/inst/legacy-acct2" "$tmp/inst/var-wins"
+    write_legacy_plist "$tmp/inst/legacy-acct2"
+    _legoutb="$(AGENTLOOP_CLAUDE_CONFIG_DIR="$tmp/inst/var-wins" cmd_install 2>&1)"
+    if printf '%s\n' "$_legoutb" | grep -q "carrying the account pinned"; then
+      bad "a legacy pin the variable already beat must not be announced: $(printf '%s\n' "$_legoutb" | grep 'carrying the account pinned')"
+    else
+      ok "no carry line when the variable already names a pin"
+    fi
+    got="$(plist_key "$PLIST_PATH" AGENTLOOP_CLAUDE_CONFIG_DIR)"
+    [ "$got" = "$tmp/inst/var-wins" ] && ok "and the variable's directory is what actually reaches the plist, not the legacy one" \
+      || bad "tick plist AGENTLOOP_CLAUDE_CONFIG_DIR when the variable wins over a legacy pin: '$got'"
+    # Reset: case B left the tick plist pinned to var-wins, which would beat
+    # a legacy pin in case C too -- installed_config_dir reads the plist
+    # before ever asking install_migrate_legacy -- so case C needs to start
+    # from no pin at all, exactly like case A did.
+    "$PYTHON" - "$PLIST_PATH" <<'PY'
+import plistlib, sys
+p = plistlib.load(open(sys.argv[1], "rb"))
+p["EnvironmentVariables"].pop("AGENTLOOP_CLAUDE_CONFIG_DIR", None)
+p["EnvironmentVariables"].pop("CLAUDE_CONFIG_DIR", None)
+plistlib.dump(p, open(sys.argv[1], "wb"))
+PY
+    # C: a relative legacy pin -- it is the only candidate (like A), but is
+    # not usable, so it must be dropped (as any other unusable pin is) and
+    # never announced as carried.
+    write_legacy_plist "relative/legacy"
+    _legoutc="$(cmd_install 2>&1)"
+    if printf '%s\n' "$_legoutc" | grep -q "carrying the account pinned"; then
+      bad "a relative legacy pin must never be announced as carried: $(printf '%s\n' "$_legoutc" | grep 'carrying the account pinned')"
+    else
+      ok "no carry line for a relative legacy pin"
+    fi
+    printf '%s\n' "$_legoutc" | grep -qF "the account pinned in the existing install ('relative/legacy') is not an absolute directory" \
+      && ok "and it is named and dropped instead, exactly like any other unusable pin" \
+      || bad "relative-legacy drop line: $(printf '%s\n' "$_legoutc" | grep 'not an absolute directory')"
     echo "RESULT ok=$_upass bad=$_ufail"
   )"
   printf '%s\n' "$_instout" | grep -v '^RESULT '
-  printf '%s\n' "$_instout" | grep -qx 'RESULT ok=18 bad=0' \
-    && ok "cmd_install over a shadowed home: all 18 assertions reach the gate" \
+  printf '%s\n' "$_instout" | grep -qx 'RESULT ok=25 bad=0' \
+    && ok "cmd_install over a shadowed home: all 25 assertions reach the gate" \
     || bad "cmd_install over a shadowed home did not: $(printf '%s\n' "$_instout" | tail -1)"
 
   echo "spent_today() — today's spend is summed without reading all of history"

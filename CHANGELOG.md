@@ -276,6 +276,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The pin is now XML-escaped on the way in (`&`, `<`, `>`) and reads back
   exactly as given.
 
+- **`install`'s notice that it is carrying a pre-rename install's pinned
+  account is now true.** It printed as soon as that old plist named one,
+  whether or not this install actually went on to use it — the explicit
+  variable, or a pin already in the new plist, both win over it, and it
+  still has to be an absolute directory. The notice is now printed by
+  `install` itself, once the legacy pin is known to be the one actually
+  carried forward, never on sight of it alone.
+
 - **`agentloop help` prints its own text only.** Its heredoc expands, and
   three words quoted in backticks ran as commands: `repos` and `sbom`
   printed *command not found*, and `security` ran the macOS Keychain tool,

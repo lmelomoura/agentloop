@@ -7124,8 +7124,11 @@ if v:
     print(v)
 PY
 )"
+    # Printed on stdout only -- this is a candidate, not yet a fact: cmd_install
+    # decides whether it is actually used (the variable and the new plist both
+    # win over it, and it still has to be an absolute directory), and is the
+    # one that announces it, only when it really is carried forward.
     [ -n "$pinned" ] && printf '%s\n' "$pinned"
-    [ -n "$pinned" ] && echo "carrying the account pinned in $LEGACY_PLIST_LABEL: $pinned" >&2
     launchctl unload "$old_tick" 2>/dev/null
     rm -f "$old_tick"
     echo "retired $LEGACY_PLIST_LABEL" >&2
@@ -7218,7 +7221,7 @@ cmd_install() {
   # otherwise silently pin that session's account for every job, forever.
   # An install that predates the rename is retired first, and the account it
   # had pinned is read out of it before it goes.
-  local legacy_cfgdir cfgdir plist_cfgdir=""
+  local legacy_cfgdir cfgdir plist_cfgdir="" from_legacy=false
   legacy_cfgdir="$(install_migrate_legacy)"
   # Re-running the installer must not quietly drop an account pinned earlier:
   # the variable, else the one already in the plist.
@@ -7227,6 +7230,7 @@ cmd_install() {
   # variable nor the new plist named one.
   if [ -z "$cfgdir" ] && [ -n "$legacy_cfgdir" ]; then
     cfgdir="$legacy_cfgdir"
+    from_legacy=true
   fi
   # A pin already sitting in an existing plist (this install's own, or the
   # old agent's) can be relative -- from an install older than the refusal
@@ -7239,6 +7243,18 @@ cmd_install() {
   if [ -n "$cfgdir" ] && ! account_norm_dir "$cfgdir" >/dev/null; then
     echo "the account pinned in the existing install ('$cfgdir') is not an absolute directory — dropped, not carried into this install"
     cfgdir=""
+    from_legacy=false
+  fi
+  # The legacy pin is announced here, and only here -- once it is known to
+  # actually be the one this install carries forward: it filled an
+  # otherwise-empty $cfgdir (the variable and the new plist both lost to it,
+  # above) AND it survived the absolute-directory check just above.
+  # install_migrate_legacy used to say so on sight, before either of those
+  # was decided -- true when the legacy pin was the only one and usable,
+  # false the rest of the time (the variable or the new plist already named
+  # one, or the legacy pin itself was not absolute).
+  if [ "$from_legacy" = true ]; then
+    echo "carrying the account pinned in $LEGACY_PLIST_LABEL: $cfgdir" >&2
   fi
   if [ -n "$cfgdir" ]; then
     # BOTH names, and the engine's own first. launchd hands the tick exactly
