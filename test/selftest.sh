@@ -100,6 +100,16 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   # subprocess explicitly (cfg_al). An AGENTLOOP_*_BIN exported by the
   # invoking shell must not reach platform_bin() here.
   AGENTLOOP_CLAUDE_BIN=""; AGENTLOOP_CODEX_BIN=""; AGENTLOOP_OPENCODE_BIN=""
+  # installed_config_dir / account_default_dir read $PLIST_PATH, which is
+  # derived from this: unlike CONFIG/DATA (redirected per block below, each
+  # block wants its own) this needs no per-block isolation, only to never be
+  # the operator's own ~/Library/LaunchAgents. Exported once, for the whole
+  # suite, so it reaches every block that calls the engine in-process AND
+  # every one that shells out to a real `agentloop` subprocess (pc_al and
+  # its kin) alike -- a developer machine whose live install is pinned must
+  # never leak that account into a fake run here.
+  mkdir -p "$tmp/LaunchAgents"
+  export AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents"
   ok()   { pass=$(( pass + 1 )); printf '  ok    %s\n' "$1"; }
   bad()  { fail=$(( fail + 1 )); printf '  FAIL  %s\n' "$1"; }
   want() { # want <label> <expected 0|1> <actual-rc>
@@ -781,6 +791,23 @@ JSON
   pc_al_nocodex() { AGENTLOOP_CONFIG="$pc/config" AGENTLOOP_DATA="$pc/data" AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" \
             AGENTLOOP_CODEX_BIN=/nonexistent/codex AGENTLOOP_CLAUDE_CONFIG_DIR="" CODEX_HOME="$pc/codex-home" \
             FAKE_CODEX_MODELS_JSON="$pc/catalog.json" "$BIN_DIR/agentloop" "$@"; }
+  # Round 4: pc_al is exactly the shape "the problem" names -- a real
+  # subprocess, HOME left ambient -- so it is the block that proves
+  # AGENTLOOP_LAUNCH_AGENTS_DIR actually isolates one. platform_check
+  # computes account_dir (the Default's, here) before it ever touches the
+  # binary, so neither case below needs the fake claude to answer anything.
+  la_pin="$pc/la-pin"; mkdir -p "$la_pin" "$pc/la-acct"
+  "$PYTHON" - "$la_pin/$PLIST_LABEL.plist" "$pc/la-acct" <<'PY'
+import plistlib, sys
+plistlib.dump({"EnvironmentVariables": {"AGENTLOOP_CLAUDE_CONFIG_DIR": sys.argv[2]}}, open(sys.argv[1], "wb"))
+PY
+  got="$(AGENTLOOP_LAUNCH_AGENTS_DIR="$la_pin" pc_al platform check anthropic 2>/dev/null | "$JQ" -r .account_dir)"
+  [ "$got" = "$pc/la-acct" ] && ok "a plist pinned inside AGENTLOOP_LAUNCH_AGENTS_DIR is what a real agentloop subprocess reads" \
+    || bad "platform check account_dir with a pinned knob dir: '$got' (want '$pc/la-acct')"
+  la_empty="$pc/la-empty"; mkdir -p "$la_empty"
+  got="$(AGENTLOOP_LAUNCH_AGENTS_DIR="$la_empty" pc_al platform check anthropic 2>/dev/null | "$JQ" -r .account_dir)"
+  [ -z "$got" ] && ok "and an empty AGENTLOOP_LAUNCH_AGENTS_DIR directory reads no pin at all -- never the developer machine's own ~/Library/LaunchAgents" \
+    || bad "platform check account_dir with an empty knob dir: '$got' (want empty)"
   # The help is a heredoc that expands: a backticked word in it ran as a
   # command -- `security` is the macOS Keychain tool, whose own usage landed
   # in ours -- and a shell error went to stderr with the text it stood for gone.
@@ -6115,6 +6142,11 @@ NASTY
     HOME="$tmp/inst/fakehome"; PATH="$tmp/inst/fakebin:$PATH"
     PLIST_PATH="$tmp/inst/fakehome/Library/LaunchAgents/tick.plist"
     SERVER_PLIST="$tmp/inst/fakehome/Library/LaunchAgents/server.plist"
+    # install_migrate_legacy reads the pre-rename plists through this, not
+    # through $HOME directly -- shadowed to the same fake directory PLIST_PATH
+    # and SERVER_PLIST already use, or the write_legacy_plist fixtures below
+    # would land somewhere install_migrate_legacy never looks.
+    LAUNCH_AGENTS_DIR="$tmp/inst/fakehome/Library/LaunchAgents"
     DATA_DIR="$tmp/inst/data"; CONFIG_DIR="$tmp/inst/config"
     MODELS_FILE="$tmp/inst/config/models.json"; PRICING_FILE="$tmp/inst/config/pricing.json"
     TICK_LOG="$tmp/inst/data/tick.log"
@@ -8588,7 +8620,7 @@ PLIST
   : > "$tmp/mig/fakehome/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist"
   ln -s "$BASE_DIR/bin/$LEGACY_CLI_NAME" "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME"
   ln -s "/somewhere/else/$LEGACY_CLI_NAME-server" "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME-server"
-  got="$( HOME="$tmp/mig/fakehome" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
+  got="$( HOME="$tmp/mig/fakehome" LAUNCH_AGENTS_DIR="$tmp/mig/fakehome/Library/LaunchAgents" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
   [ "$got" = "/tmp/pinned-account" ] && ok "the account pinned in the old agent is handed on" || bad "install_migrate_legacy printed '$got'"
   [ ! -e "$tmp/mig/fakehome/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist" ] \
     && [ ! -e "$tmp/mig/fakehome/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist" ] \
@@ -8599,7 +8631,7 @@ PLIST
   [ ! -L "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME" ] && ok "the old symlink into this folder is removed" || bad "the old symlink was kept"
   [ -L "$tmp/mig/fakehome/.local/bin/$LEGACY_CLI_NAME-server" ] && ok "a symlink pointing elsewhere is left alone" || bad "somebody else's symlink was removed"
   loglines_before="$(num "$(wc -l < "$tmp/mig/log" 2>/dev/null)")"
-  got="$( HOME="$tmp/mig/fakehome" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
+  got="$( HOME="$tmp/mig/fakehome" LAUNCH_AGENTS_DIR="$tmp/mig/fakehome/Library/LaunchAgents" MIG_LOG="$tmp/mig/log" PATH="$tmp/mig/fakebin:$PATH" install_migrate_legacy 2>/dev/null )"
   loglines_after="$(num "$(wc -l < "$tmp/mig/log" 2>/dev/null)")"
   [ -z "$got" ] && [ "$loglines_after" -eq "$loglines_before" ] \
     && ok "a second run finds nothing to migrate" \

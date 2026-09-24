@@ -135,6 +135,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and '' on every existing row, written once per finding per analysis and
   never cleared by a re-report; a verdict is not inherited between analyses.
 
+- **`AGENTLOOP_LAUNCH_AGENTS_DIR` sandboxes the two `launchd` plists a test
+  suite reads.** `installed_config_dir` (and, through it, `account_default_dir`
+  and `install`'s own retirement of a pre-rename install) read the Default's
+  pin from `$HOME/Library/LaunchAgents` — a directory neither the e2e suite
+  nor the selftest suite ever redirected, unlike `AGENTLOOP_CONFIG`,
+  `AGENTLOOP_DATA` and `CODEX_HOME`. On a developer machine whose live
+  install is pinned, the local suites would have picked up that real
+  account as the Default, shifting expectations, and a fake run would have
+  exported the real directory; CI has no plist and this machine's own has
+  no pin, so both stayed green while depending on the machine underneath
+  them. Defaults to the real directory (`~/Library/LaunchAgents`, so
+  production is unaffected); the e2e sandbox and the selftest suite each
+  now point it at an empty directory of their own.
+
 ### Changed
 
 - **The security-analysis skill has a fourth job: verification** — the queue,

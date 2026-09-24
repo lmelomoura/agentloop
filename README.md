@@ -2289,6 +2289,9 @@ agentloop install | uninstall
 
 Environment overrides: `AGENTLOOP_PORT`, `AGENTLOOP_CONFIG`,
 `AGENTLOOP_DATA`, `AGENTLOOP_CLAUDE_BIN`, `AGENTLOOP_CLAUDE_CONFIG_DIR`,
+`AGENTLOOP_LAUNCH_AGENTS_DIR` (where the two `launchd` plists live; default
+`~/Library/LaunchAgents` — a test suite that runs the CLI as a real process
+points this at a sandbox, so it never reads or writes a real install's own),
 `AGENTLOOP_CODEX_BIN`, `AGENTLOOP_OPENCODE_BIN` (the three `_BIN` variables
 win over the path set in Settings; a stand-in for the tests, or one specific
 binary for the scheduled runs), `CODEX_HOME` (this one is the Codex CLI's own),

@@ -32,12 +32,13 @@ REPO="$(cd "$E2E/.." && pwd)"
 # helper and scenario in between as file content. bash -n does not notice.
 e2e_sandbox() { # e2e_sandbox <root>
 ROOT="$1"
-rm -rf "$ROOT"; mkdir -p "$ROOT"/{config,data,remote,work}
+rm -rf "$ROOT"; mkdir -p "$ROOT"/{config,data,remote,work,LaunchAgents}
 export AGENTLOOP_CONFIG="$ROOT/config"
 export AGENTLOOP_DATA="$ROOT/data"
 export AGENTLOOP_CLAUDE_BIN="$E2E/fake-claude"
 export AGENTLOOP_CODEX_BIN="$E2E/fake-codex"
 export CODEX_HOME="$ROOT/codex-home"        # the stand-in's rollouts; never ~/.codex
+export AGENTLOOP_LAUNCH_AGENTS_DIR="$ROOT/LaunchAgents"   # an empty dir: installed_config_dir must never read a developer machine's real pinned install
 export AGENTLOOP_OPENCODE_BIN="$E2E/fake-opencode"
 export AGENTLOOP_PRICING_URL="file://$REPO/test/fixtures/pricing/litellm-sample.json"
 mkdir -p "$CODEX_HOME"

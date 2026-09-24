@@ -243,10 +243,19 @@ RATE_LIMIT_FILE="$DATA_DIR/rate-limits.json"   # last usage window the API repor
 # ceiling with its work uncommitted.
 RL_STOP_AT="${AGENTLOOP_RATE_LIMIT_STOP_AT:-0.95}"
 
+# Where the two launchd agent plists live -- real production machines only
+# ever want the real directory, but a test suite that runs `agentloop` as a
+# real process (an e2e scenario, a selftest block that shells out) must never
+# read or write the DEVELOPER's own ~/Library/LaunchAgents: a pinned live
+# install would leak its real account into the suite as the Default, and a
+# fake run would export the real directory. Every reader of the pin
+# (installed_config_dir, account_default_dir) goes through PLIST_PATH below,
+# so this one knob sandboxes all of them at once.
+LAUNCH_AGENTS_DIR="${AGENTLOOP_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 PLIST_LABEL="com.agentloop.tick"
-PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+PLIST_PATH="$LAUNCH_AGENTS_DIR/$PLIST_LABEL.plist"
 SERVER_LABEL="com.agentloop.server"
-SERVER_PLIST="$HOME/Library/LaunchAgents/$SERVER_LABEL.plist"
+SERVER_PLIST="$LAUNCH_AGENTS_DIR/$SERVER_LABEL.plist"
 # The names this install had until 2026-09-06. A machine installed under them
 # still carries two launchd agents and two symlinks so named; `install`
 # retires them (install_migrate_legacy). These three lines are the only place
@@ -7107,8 +7116,8 @@ cmd_tick() {
 PLIST_PATH_ENV="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 install_migrate_legacy() { # retire the pre-rename agents and symlinks; prints the account they had pinned, if any
-  local old_tick="$HOME/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist"
-  local old_server="$HOME/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist"
+  local old_tick="$LAUNCH_AGENTS_DIR/$LEGACY_PLIST_LABEL.plist"
+  local old_server="$LAUNCH_AGENTS_DIR/$LEGACY_SERVER_LABEL.plist"
   local link
   if [ -f "$old_tick" ]; then
     # The account pinned into the old agent has to reach the new one: dropping
