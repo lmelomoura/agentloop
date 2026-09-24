@@ -203,6 +203,15 @@ def test_a_carried_finding_reported_gone_is_known_to_its_analysis(conn):
     assert ledger.gone_in(conn, other) == set()
 
 
+def test_what_a_unit_reported_gone_is_known_by_that_unit_alone(conn):
+    """The judge's question (security/units.py): what did THIS unit say is
+    gone -- never what some unit of the analysis said."""
+    aid = _analysis(conn)
+    said, silent = ledger.add_unit(conn, aid, "triage", {"items": []}), ledger.add_unit(conn, aid, "triage", {"items": []})
+    ledger.record_gone(conn, said, "c" * 64, "the handler was deleted")
+    assert (ledger.gone_by(conn, said), ledger.gone_by(conn, silent)) == ({"c" * 64}, set())
+
+
 def _finding(fp, **extra):
     return {"fingerprint": fp, "category": "sast", "rule": "xss", "severity": "medium",
             "title": "t", "rationale": "r", "producer": "agent",
@@ -220,6 +229,28 @@ def test_a_finding_remembers_the_unit_that_wrote_it(conn):
         "a re-report from outside any unit keeps who wrote it"
     ledger.record_finding(conn, aid, _finding("a" * 64, rationale="r3", unit=9))
     assert conn.execute("SELECT unit FROM finding WHERE fingerprint=?", ("a" * 64,)).fetchone()[0] == 9
+
+
+def _verdict(conn, fp):
+    return tuple(conn.execute("SELECT verdict, verdict_reason, verified_by FROM finding"
+                              " WHERE fingerprint=?", (fp,)).fetchone())
+
+
+def test_a_verdict_is_cleared_only_by_the_writer_it_names(conn):
+    """Never someone else's verdict: a unit's close clears what its own
+    disqualified session wrote, and nothing another unit, the operator or a
+    verifier from before the pipeline wrote."""
+    aid = _analysis(conn)
+    ledger.record_finding(conn, aid, _finding("a" * 64))
+    ledger.record_verdict(conn, aid, "a" * 64, "rejected", "a subagent's reading", by="unit:3")
+    for other in ("unit:4", "operator", "subagent", ""):
+        assert ledger.clear_verdict(conn, aid, "a" * 64, other) is False
+    assert _verdict(conn, "a" * 64) == ("rejected", "a subagent's reading", "unit:3")
+    assert ledger.clear_verdict(conn, aid, "a" * 64, "unit:3") is True
+    assert _verdict(conn, "a" * 64) == ("", "", "")
+    assert ledger.clear_verdict(conn, aid, "a" * 64, "unit:3") is False, "nothing left to clear"
+    assert ledger.record_verdict(conn, aid, "a" * 64, "confirmed", "read it", by="unit:4") is True, \
+        "and the row takes a verdict again"
 
 
 def test_several_units_are_added_in_one_transaction_numbered_after_the_last(conn):
@@ -246,3 +277,42 @@ def test_a_batch_that_fails_half_way_writes_nothing(conn):
     with pytest.raises(TypeError):
         ledger.add_units(conn, aid, [("hunt", {}), ("read", {"ranges": NotJson()})])
     assert ledger.units_of(conn, aid) == [], "the hunt written before the failure is rolled back"
+
+
+def test_a_guard_decides_inside_the_transaction_what_is_written(conn):
+    """The check and the write of a plan in ONE transaction: the guard runs
+    after BEGIN IMMEDIATE, so no other writer can land between what it saw
+    and what is written, and only what it returns is written."""
+    aid = _analysis(conn)
+    seen = []
+
+    def no_hunt(c, specs):
+        seen.append(c.in_transaction)
+        return [s for s in specs if s[0] != "hunt"]
+    ids = ledger.add_units(conn, aid, [("hunt", {}), ("read", {"ranges": []})], guard=no_hunt)
+    assert seen == [True]
+    assert [ledger.get_unit(conn, i)["kind"] for i in ids] == ["read"]
+    assert ledger.add_units(conn, aid, [("hunt", {})], guard=lambda c, specs: []) == []
+    with pytest.raises(ValueError):
+        ledger.add_units(conn, aid, [("hunt", {})], guard=lambda c, specs: [("explore", {})])
+    assert [u["kind"] for u in ledger.units_of(conn, aid)] == ["read"], \
+        "a guard's empty answer writes nothing, and a kind it hands back is checked like any other"
+
+
+def test_concluding_settles_a_unit_and_adds_its_continuation_together_and_only_once(conn):
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "read", {"ranges": []})
+    ledger.start_unit(conn, uid)
+    settled, cid = ledger.conclude_unit(conn, uid, "incomplete", 0.5, {"missing": [1]}, "short",
+                                        continuation=("read", {"ranges": [1]}, 2, uid))
+    assert settled is True
+    unit, cont = ledger.get_unit(conn, uid), ledger.get_unit(conn, cid)
+    assert (unit["state"], unit["spend_usd"], unit["evidence"], unit["note"]) == \
+        ("incomplete", 0.5, {"missing": [1]}, "short")
+    assert (cont["state"], cont["kind"], cont["payload"], cont["attempt"], cont["parent"], cont["seq"]) == \
+        ("pending", "read", {"ranges": [1]}, 2, uid, 2)
+    assert ledger.conclude_unit(conn, uid, "done", continuation=("read", {}, 3, uid)) == (False, None)
+    assert len(ledger.units_of(conn, aid)) == 2, "a settled unit is not continued again"
+    assert ledger.conclude_unit(conn, cid, "done") == (True, None)
+    with pytest.raises(ValueError):
+        ledger.conclude_unit(conn, uid, "running")

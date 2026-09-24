@@ -47,17 +47,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   read unit reads through `agentloop security read`.
 
 - **An analysis is planned as units the engine runs and judges.** The plan
-  is triage batches of 25 rows (the scanners' findings and the agent
-  findings the last analysis left open), one reachability pass, and — in a
-  deep analysis — one read unit per slice; verification units are planned
-  once the rest has settled, one per finding of the analysis. The plan is
+  is triage batches of 25 rows (the scanners' findings and the findings the
+  last analysis left open), one reachability pass, and — in a deep
+  analysis — one read unit per slice; verification units are planned once
+  the rest has settled, one per finding of the analysis. The plan is
   written in one transaction, all of it or none, so a plan cut short can
   never leave slices no unit will read. A unit is judged by what it left:
   the ranges its own stream proves it read (kept on the unit, whatever its
   outcome, as the lines it covered), the rows the ledger shows it triaged,
   the verdict it wrote. What it left undone becomes a new unit carrying
   only what is missing, up to three attempts; a session that launched a
-  subagent does not count, whatever kind of unit it was.
+  subagent does not count, whatever kind of unit it was. A unit is credited
+  only with what carries its own id — the rows it re-reported, what it said
+  is gone, the verdict it wrote — so nothing a disqualified attempt wrote
+  closes the attempt after it, and a disqualified verification's verdict is
+  cleared at its close. A unit is settled and its continuation planned in
+  one transaction, two callers can never both write a plan, and a deep
+  analysis is never planned without its inventory.
 
 - **What a unit read is proven from its own stream.** A read counts only
   the lines its result carried — Claude Code's `tool_use_result` range, or

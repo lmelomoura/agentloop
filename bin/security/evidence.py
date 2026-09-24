@@ -78,7 +78,11 @@ def _structured_range(event):
     return (start, start + count - 1) if count > 0 else ()
 
 
-def _merge(spans):
+def merge_spans(spans):
+    """[(first, last)] line spans, sorted, with the overlapping and the
+    adjacent joined into one. The package's one merge of spans: the proof of
+    reading here, and what a read unit covered and what the deep scope still
+    owes (security/units.py), all join theirs with it."""
     out = []
     for first, last in sorted(spans):
         if out and first <= out[-1][1] + 1:
@@ -124,7 +128,7 @@ def parse(lines, root) -> Session:
                 rel = _relative(path, root_real)
                 if span and rel:
                     reads.setdefault(rel, []).append(span)
-    return Session(reads={p: _merge(s) for p, s in reads.items()}, tasks=tasks, guides=guides)
+    return Session(reads={p: merge_spans(s) for p, s in reads.items()}, tasks=tasks, guides=guides)
 
 
 def read_session(stream_path, root) -> Session:
@@ -141,7 +145,7 @@ def with_served(session, served) -> Session:
     reads = {p: list(s) for p, s in session.reads.items()}
     for path, first, last in served:
         reads.setdefault(path, []).append((int(first), int(last)))
-    return Session(reads={p: _merge(s) for p, s in reads.items()},
+    return Session(reads={p: merge_spans(s) for p, s in reads.items()},
                    tasks=session.tasks, guides=set(session.guides))
 
 
@@ -153,7 +157,7 @@ def missing(ranges, reads) -> list:
     for wanted in ranges:
         first, last = int(wanted["first"]), int(wanted["last"])
         cursor, gaps = first, []
-        for a, b in _merge(reads.get(wanted["path"], [])):
+        for a, b in merge_spans(reads.get(wanted["path"], [])):
             if b < cursor or a > last:
                 continue
             if a > cursor:

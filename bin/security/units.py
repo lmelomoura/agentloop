@@ -10,7 +10,7 @@ engine (security/orchestrator.py) and judged by what it left behind --
 never by what it said.
 
   triage  up to TRIAGE_BATCH rows: the scanners' findings (Job 2) and the
-          agent findings the previous analysis left open (Job 1)
+          findings the previous analysis left open (Job 1)
   hunt    the profile's reachability pass (in deep bounded to standard's
           scope: the exhaustive read belongs to the read units)
   read    deep only: one slice of the inventory (security/slices.py)
@@ -23,6 +23,15 @@ A UNIT IS NEVER REWRITTEN. What it left undone becomes a NEW unit whose
 lineage gets MAX_ATTEMPTS, and what the last one still left is a gap the
 close names. A stop is not the unit's failure: its continuation keeps the
 same attempt.
+
+A UNIT IS CREDITED ONLY WITH ITS OWN WORK. Every write a session makes is
+stamped with its unit -- `finding.unit` on a re-report, `verified_by =
+"unit:<id>"` on a verdict, its own rows in `unit_gone` -- and the judge
+counts nothing else. The ledger's state alone cannot say whose work it is:
+a row marked triaged, a verdict, a `report-gone` all look the same whether
+this unit wrote them, another unit did, or an attempt disqualified for
+launching a subagent did -- and counting that last one would close its
+continuation with no work done.
 """
 
 import sqlite3
@@ -43,7 +52,7 @@ _TRUNCATED = ("BUDGET LIMITED", "UNDECLARED ENDING", "UNDELIVERED")
 
 def triage_items(conn, analysis_id) -> list:
     """What Jobs 1 and 2 owe, worst first: every open scanner row of this
-    analysis, and every open agent finding a previous analysis left."""
+    analysis, and every open finding a previous analysis left."""
     _analysis, findings = queries.checklist(conn, analysis_id)
     items = []
     for f in findings:
@@ -52,11 +61,14 @@ def triage_items(conn, analysis_id) -> list:
         producer = f.get("producer") or ""
         if f.get("analysis_id") == analysis_id and producer not in ("", diff.AGENT):
             kind = "scanner"
-        elif f.get("analysis_id") != analysis_id and producer:
+        elif f.get("analysis_id") != analysis_id:
             # CARRIED, of any producer: an agent finding the last analysis left
-            # open, and a deterministic row whose producer did not run this time
+            # open, a deterministic row whose producer did not run this time
             # (`pending`) -- which vanishes from the next baseline unless it is
-            # re-reported, and comes back as `regressed` when the engine returns.
+            # re-reported, and comes back as `regressed` when the engine returns
+            # -- and a row from before the `producer` column (''), which closes
+            # `fixed` on this analysis's `done` (diff._proven) unless somebody
+            # re-checks it.
             kind = "carried"
         else:
             continue
@@ -78,7 +90,20 @@ def plan(conn, analysis_id, slice_guides=None) -> list:
     COMPUTED WHOLE, THEN WRITTEN IN ONE TRANSACTION (ledger.add_units). The
     refusal above makes a partial plan permanent, so nothing is written until
     every unit is known: a failure anywhere -- the checklist, a slice's
-    guides -- leaves the analysis with no unit at all, to be planned again."""
+    guides -- leaves the analysis with no unit at all, to be planned again.
+
+    AND THE REFUSAL IS DECIDED WHERE THE PLAN IS WRITTEN. The check on entry
+    only spares the work of computing a plan nobody will write; the one that
+    counts runs inside that transaction (the guard): asked only before it, a
+    second caller that planned the analysis in between left two plans --
+    every slice read twice, every row triaged twice.
+
+    A DEEP ANALYSIS IS NEVER PLANNED WITHOUT ITS INVENTORY. `inventory_of`
+    reads a missing row and one that does not decode as {} -- which, taken
+    for a scope, is an empty repository: a plan with no read unit, and a
+    debt (`owed`) of nothing, so the close would name no line unread. The
+    refusal raises before anything is written, and `prepare --plan` fails
+    loudly on it."""
     if ledger.units_of(conn, analysis_id):
         return []
     profile = conn.execute("SELECT profile FROM analysis WHERE id=?",
@@ -91,25 +116,43 @@ def plan(conn, analysis_id, slice_guides=None) -> list:
         specs.append(("triage", {"items": batch}))
     specs.append(("hunt", {"profile": profile}))
     if profile == "deep":
-        for piece in slices.pack(ledger.inventory_of(conn, analysis_id).get("files", [])):
+        files = ledger.inventory_of(conn, analysis_id).get("files")
+        if not isinstance(files, list):
+            raise ValueError(
+                f"analysis {analysis_id} is deep and has no inventory to plan its reads from: "
+                "its scope was never listed, or the list stored for it could not be read")
+        for piece in slices.pack(files):
             chosen = slice_guides(piece) if slice_guides else ["ATTACK-CLASSES"]
             specs.append(("read", {"ranges": piece, "guides": chosen}))
-    return ledger.add_units(conn, analysis_id, specs)
+
+    def no_units_yet(c, planned):
+        return [] if ledger.units_of(c, analysis_id) else planned
+    return ledger.add_units(conn, analysis_id, specs, guard=no_units_yet)
 
 
 def plan_verification(conn, analysis_id) -> list:
     """One verify unit per finding OF THIS ANALYSIS in the queue that has none
     yet. A carried row belongs to another analysis and cannot take a verdict
-    here -- its re-check is the triage units' debt."""
-    have = {u["payload"].get("fingerprint") for u in ledger.units_of(conn, analysis_id)
-            if u["kind"] == "verify"}
-    ids = []
-    for f in queries.verify_queue(conn, analysis_id):
-        if f.get("analysis_id") != analysis_id or f["fingerprint"] in have:
-            continue
-        ids.append(ledger.add_unit(conn, analysis_id, "verify", {"fingerprint": f["fingerprint"]}))
-        have.add(f["fingerprint"])
-    return ids
+    here -- its re-check is the triage units' debt.
+
+    Which findings already have one is asked INSIDE the transaction that
+    writes the new ones (ledger.add_units' guard). Read before the queue, as
+    it was, the answer was stale by the write: a second caller that planned
+    in between doubled every verification."""
+    specs = [("verify", {"fingerprint": f["fingerprint"]})
+             for f in queries.verify_queue(conn, analysis_id)
+             if f.get("analysis_id") == analysis_id]
+
+    def not_planned_yet(c, wanted):
+        have = {u["payload"].get("fingerprint") for u in ledger.units_of(c, analysis_id)
+                if u["kind"] == "verify"}
+        out = []
+        for kind, payload in wanted:
+            if payload["fingerprint"] not in have:
+                have.add(payload["fingerprint"])
+                out.append((kind, payload))
+        return out
+    return ledger.add_units(conn, analysis_id, specs, guard=not_planned_yet)
 
 
 def launchable(conn, analysis_id, capacity) -> list:
@@ -122,25 +165,14 @@ def launchable(conn, analysis_id, capacity) -> list:
 
 
 def unsettled(all_units, kinds=None) -> list:
+    """The units of `all_units` still owed a run or in one -- `pending` or
+    `running` -- and only of `kinds` when given. Asked of a list the caller
+    already holds, never of the ledger: the orchestrator reads its units once
+    a pass, and asks this whether every triage, hunt and read has settled
+    (the verification queue is final only then) and whether a spent budget
+    left any unit unrun."""
     return [u for u in all_units if u["state"] in ("pending", "running")
             and (kinds is None or u["kind"] in kinds)]
-
-
-def _decided(conn, project, fingerprint) -> bool:
-    return conn.execute("SELECT 1 FROM decision WHERE project=? AND fingerprint=?",
-                        (project, fingerprint)).fetchone() is not None
-
-
-def _merge_spans(spans) -> list:
-    """[first, last] spans, sorted, with the overlapping and the adjacent
-    joined into one."""
-    out = []
-    for first, last in sorted((int(a), int(b)) for a, b in spans):
-        if out and first <= out[-1][1] + 1:
-            out[-1][1] = max(out[-1][1], last)
-        else:
-            out.append([first, last])
-    return out
 
 
 def _covered(wanted, reads) -> dict:
@@ -160,7 +192,7 @@ def _covered(wanted, reads) -> dict:
             lo, hi = max(int(a), first), min(int(b), last)
             if lo <= hi:
                 out.setdefault(r["path"], []).append((lo, hi))
-    return {path: _merge_spans(spans) for path, spans in out.items()}
+    return {path: [list(s) for s in evidence.merge_spans(spans)] for path, spans in out.items()}
 
 
 def _judge_read(unit, session):
@@ -177,24 +209,55 @@ def _judge_read(unit, session):
 
 
 def _judge_triage(conn, unit):
-    aid = unit["analysis_id"]
+    """Which of its rows this unit settled, by ITS OWN writes alone.
+
+    A scanner row counts once this unit's re-report marked it triaged
+    (`finding.unit` names the unit), or when it sits below the floor at the
+    severity its scanner gave it. A carried row counts once this unit
+    re-reported it into this analysis, or -- a `sast` one -- said it is gone
+    (`report-gone`, ledger.gone_by). Either counts when the operator decided
+    it: a human's ruling needs nobody's reading.
+
+    FAIL-CLOSED ON A RACE, KNOWINGLY. Another unit that re-reports one of
+    these rows after this one moves `finding.unit` to itself, and this
+    unit's lineage then owes the row again and re-reports it. A reading done
+    twice costs a run; one credited to a unit that never did it costs the
+    analysis its word."""
+    aid, uid = unit["analysis_id"], unit["id"]
     project = conn.execute("SELECT project FROM analysis WHERE id=?", (aid,)).fetchone()["project"]
+    decided = ledger.decisions_for(conn, project)
+    gone = ledger.gone_by(conn, uid)
     owed = unit["payload"].get("items") or []
-    gone = ledger.gone_in(conn, aid)
     left = []
     for item in owed:
         fp = item["fingerprint"]
-        if _decided(conn, project, fp):
+        if fp in decided:
             continue
-        row = conn.execute("SELECT triaged, severity, producer FROM finding"
+        row = conn.execute("SELECT triaged, severity, unit FROM finding"
                            " WHERE analysis_id=? AND fingerprint=?", (aid, fp)).fetchone()
+        mine = row is not None and row["unit"] == uid
         if item["kind"] == "scanner":
-            if row is None or row["triaged"] or row["severity"] not in BLOCKING:
+            if row is None:
+                # UNREACHABLE, and settled if it is ever reached: nothing
+                # deletes a finding, and `migrate-rules` -- the one verb that
+                # moves a row to another fingerprint -- is refused while an
+                # analysis is open (cli.cmd_migrate_rules). A row that is not
+                # there leaves nothing for a unit to read.
                 continue
-        elif row is not None:
+            if row["triaged"] and mine:
+                continue
+            if not row["triaged"] and row["severity"] not in BLOCKING:
+                # Below the floor at the severity its SCANNER gave it: the
+                # close never asks for its reading. A severity an agent's
+                # re-report wrote (`triaged`) is that writer's reading --
+                # an attempt disqualified for a subagent lowering a `high`
+                # to `low` included -- and counts for the writer alone,
+                # through the line above.
+                continue
+        elif mine:
             continue
         elif item.get("category") == "sast" and fp in gone:
-            # A carried sast finding the unit read and SAID is gone
+            # A carried sast finding this unit read and SAID is gone
             # (`report-gone`): its absence from this analysis is a reading,
             # not a silence, and it closes `fixed`.
             continue
@@ -202,16 +265,25 @@ def _judge_triage(conn, unit):
     ev = {"items": len(owed), "missing": [i["fingerprint"] for i in left]}
     if not left:
         return True, None, ev, f"Triaged: {len(owed)} row(s)."
-    return False, {"items": left}, ev, f"{len(left)} of {len(owed)} row(s) not triaged."
+    return False, {"items": left}, ev, f"{len(left)} of {len(owed)} row(s) not triaged by this unit."
 
 
 def _judge_verify(conn, unit):
+    """Done on a verdict THIS unit wrote: `verified_by` names it
+    (`unit:<id>`). A verdict on the row from anybody else -- the hunter that
+    minted the finding verifying it itself, another unit, the operator, a
+    verifier from before the pipeline -- is not this unit's reading, and
+    counting it would credit the unit with a verification it never did."""
     fp = unit["payload"].get("fingerprint", "")
-    row = conn.execute("SELECT verdict FROM finding WHERE analysis_id=? AND fingerprint=?",
+    row = conn.execute("SELECT verdict, verified_by FROM finding WHERE analysis_id=? AND fingerprint=?",
                        (unit["analysis_id"], fp)).fetchone()
-    if row is not None and row["verdict"]:
-        return True, None, {"verdict": row["verdict"]}, f"Verdict: {row['verdict']}."
-    return False, None, {"verdict": ""}, "No verdict was recorded."
+    if row is None or not row["verdict"]:
+        return False, None, {"verdict": ""}, "No verdict was recorded."
+    if row["verified_by"] != f"unit:{unit['id']}":
+        return False, None, {"verdict": "", "verified_by": row["verified_by"]}, (
+            f"The verdict on this finding was written by {row['verified_by'] or 'an unnamed writer'}, "
+            "not by this unit.")
+    return True, None, {"verdict": row["verdict"]}, f"Verdict: {row['verdict']}."
 
 
 def _judge_hunt(status, reason):
@@ -233,7 +305,9 @@ def judge(conn, unit, session, status, reason=""):
     subagent produced is not this unit's work any more than a subagent's
     reads are (security/evidence.py counts only the unit's own), so nothing
     this attempt did counts and the whole payload runs again, one attempt up.
-    A read unit records no `covered` span for it: its slice stays owed."""
+    A read unit records no `covered` span for it: its slice stays owed. Nor
+    does what it wrote count for the continuation, which is credited with
+    its own writes alone; a verify attempt's verdict is cleared at its close."""
     if session.tasks:
         ev = {"tasks": session.tasks, "guides": sorted(session.guides)}
         if unit["kind"] == "read":
@@ -256,21 +330,32 @@ def judge(conn, unit, session, status, reason=""):
 
 
 def conclude(conn, unit, *, done, evidence, note, spend_usd, remaining=None, stopped=False):
-    """Settle `unit` and plan what it left. Returns the unit's final state and
-    the id of its continuation, if one was planned."""
+    """Settle `unit` and plan what it left, in ONE transaction
+    (ledger.conclude_unit). Returns the unit's state and the id of its
+    continuation, if one was planned.
+
+    THE LEDGER'S ANSWER, NOT THE CALLER'S INTENT. A unit already settled --
+    by another close, or by an earlier call holding the same copy of it --
+    is left as it is, gets no continuation, and the state returned is the
+    one the ledger holds. Two closes of one unit used to continue it twice,
+    a close over a unit settled `done` elsewhere answered "incomplete" and
+    planned more work, and a kill between the settle and the continuation
+    lost the continuation for good."""
     if done:
-        ledger.settle_unit(conn, unit["id"], "done", spend_usd, evidence, note)
-        return {"state": "done", "continuation": None}
-    attempt = unit["attempt"] if stopped else unit["attempt"] + 1
-    if attempt > MAX_ATTEMPTS:
-        ledger.settle_unit(conn, unit["id"], "failed", spend_usd, evidence,
-                           f"{note} Gave up after {MAX_ATTEMPTS} attempts.".strip())
-        return {"state": "failed", "continuation": None}
-    ledger.settle_unit(conn, unit["id"], "incomplete", spend_usd, evidence, note)
-    payload = remaining if remaining is not None else unit["payload"]
-    cid = ledger.add_unit(conn, unit["analysis_id"], unit["kind"], payload,
-                          attempt=attempt, parent=unit["id"])
-    return {"state": "incomplete", "continuation": cid}
+        state, continuation = "done", None
+    else:
+        attempt = unit["attempt"] if stopped else unit["attempt"] + 1
+        if attempt > MAX_ATTEMPTS:
+            state, continuation = "failed", None
+            note = f"{note} Gave up after {MAX_ATTEMPTS} attempts.".strip()
+        else:
+            payload = remaining if remaining is not None else unit["payload"]
+            state, continuation = "incomplete", (unit["kind"], payload, attempt, unit["id"])
+    settled, cid = ledger.conclude_unit(conn, unit["id"], state, spend_usd, evidence, note,
+                                        continuation)
+    if not settled:
+        return {"state": ledger.get_unit(conn, unit["id"])["state"], "continuation": None}
+    return {"state": state, "continuation": cid}
 
 
 def lineage_root(conn, unit):
@@ -339,7 +424,7 @@ def owed(conn, analysis_id, all_units=None, inventory=None) -> list:
                     covered.setdefault(path, []).append((int(pair[0]), int(pair[1])))
                 except (TypeError, ValueError, IndexError):
                     continue    # a cell nobody could have written: it proves nothing
-    merged = {path: _merge_spans(spans) for path, spans in covered.items()}
+    merged = {path: [list(s) for s in evidence.merge_spans(spans)] for path, spans in covered.items()}
     out = []
     for f in inventory.get("files") or []:
         for rng in f.get("ranges") or []:
@@ -402,11 +487,27 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     the orchestrator (a run that died without closing, security/orchestrator.py)
     both come here, so a unit is judged the same way whichever of them saw its
     run end. A unit already settled is left exactly as it is: the orchestrator
-    closes a unit whose run died before its own close could."""
+    closes a unit whose run died before its own close could. Settled is asked
+    of the LEDGER, not of the caller's copy: a close holding an old copy of a
+    unit another close has settled must not judge it again -- least of all
+    clear the verdict it was credited with (below)."""
+    unit = ledger.get_unit(conn, unit["id"])
     if unit["state"] not in ("pending", "running"):
         return {"state": unit["state"], "continuation": None}
     session = evidence.read_session(stream or None, root or ".")
     session = evidence.with_served(session, ledger.unit_reads(conn, unit["id"]))
     done, remaining, ev, note = judge(conn, unit, session, status, reason)
+    if session.tasks and unit["kind"] == "verify":
+        # A VERDICT NOBODY CAN PROVE THIS UNIT REASONED MUST NOT STAND. The
+        # session launched a subagent, so `judge` credits it with nothing --
+        # but the verdict on its finding, stamped with this unit's id by
+        # whoever in the session wrote it, would outlive the attempt:
+        # `record_verdict` writes a row's verdict once, so the continuation
+        # could never write its own and the lineage never finish, and a
+        # `rejected` would drop the finding from the exposure for good.
+        # Cleared BEFORE the conclude, so a kill in between leaves the unit
+        # running with nothing credited, to be judged again.
+        ledger.clear_verdict(conn, unit["analysis_id"], unit["payload"].get("fingerprint", ""),
+                             f"unit:{unit['id']}")
     return conclude(conn, unit, done=done, evidence=ev, note=note, spend_usd=spend_usd,
                     remaining=remaining, stopped=status == "stopped")

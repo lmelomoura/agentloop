@@ -1,9 +1,16 @@
 # tests/security/test_units.py
 """The pipeline's units: what the plan holds, what runs next, and how a unit is judged."""
+from pathlib import Path
+
 import pytest
 
 from security import cli as security_cli
-from security import evidence, ledger, units
+from security import evidence, ledger, queries, units
+
+ENGINE = Path(__file__).resolve().parent.parent.parent / "bin" / "agentloop"
+# The subagent launch of a real captured Claude Code stream (test_evidence.py's fixture).
+LAUNCH = next(line for line in (Path(__file__).parent / "fixtures" / "streams" / "claude-reads.ndjson")
+              .read_text().splitlines() if '"name":"Agent"' in line)
 
 
 @pytest.fixture
@@ -70,6 +77,21 @@ def test_triage_owes_every_open_scanner_row_and_every_agent_finding_left_open(co
     assert [(i["fingerprint"][0], i["kind"]) for i in items] == [("b", "scanner"), ("c", "carried"), ("a", "scanner")]
 
 
+def test_a_carried_finding_from_before_the_producer_column_is_still_owed(conn):
+    """A row written before `producer` existed carries ''. Left out of the
+    triage, nobody re-checked it -- and a `sast` row nobody can name the
+    producer of closes `fixed` on the analysis's `done` (diff._proven), the
+    very silence the carried items exist to break."""
+    prev = _analysis(conn, commit="c0")
+    ledger.record_finding(conn, prev, {
+        "fingerprint": "e" * 64, "category": "sast", "rule": "xss", "severity": "medium",
+        "title": "t", "rationale": "an older engine's reading", "producer": "",
+        "occurrences": [{"file": "a.py", "line": 1}]})
+    ledger.finish_analysis(conn, prev, "done")
+    aid = _analysis(conn)
+    assert [(i["fingerprint"], i["kind"]) for i in units.triage_items(conn, aid)] == [("e" * 64, "carried")]
+
+
 def test_the_plan_is_triage_batches_one_hunt_and_a_read_per_slice(conn, monkeypatch):
     monkeypatch.setattr(units, "TRIAGE_BATCH", 2)
     aid = _analysis(conn)
@@ -116,6 +138,55 @@ def test_a_plan_that_fails_part_way_leaves_no_unit_and_can_be_planned_again(conn
         "and the analysis is planned again, whole: triage, hunt and a read per slice"
 
 
+def test_two_plans_of_one_analysis_racing_leave_exactly_one_plan(tmp_path):
+    """I1. "No units yet" is asked INSIDE the transaction that writes the
+    plan (ledger.add_units' guard). Asked before it, a second caller that
+    planned the analysis whole between that check and this write left two
+    plans: every slice read twice, every row triaged twice."""
+    first, other = ledger.connect(tmp_path / "security.db"), ledger.connect(tmp_path / "security.db")
+    aid = _analysis(first)
+    _inventory(first, aid, [_file("a.py", (1, 10, 100))])
+    raced = []
+
+    def guides_while_another_plan_lands(ranges):
+        if not raced:
+            raced.append(units.plan(other, aid))
+        return ["ATTACK-CLASSES"]
+    try:
+        assert units.plan(first, aid, slice_guides=guides_while_another_plan_lands) == []
+        assert len(raced[0]) == 2, "the other caller planned it: a hunt and a read"
+        assert [u["kind"] for u in ledger.units_of(first, aid)] == ["hunt", "read"]
+    finally:
+        first.close()
+        other.close()
+
+
+def test_a_deep_analysis_is_never_planned_without_its_inventory(conn):
+    """I3. `inventory_of` reads a missing row and one that does not decode as
+    {} -- to a planner, an empty repository: a deep plan with no read unit,
+    and a debt (`owed`) of nothing. Refused instead, and the refusal writes
+    nothing, so `prepare --plan` fails loudly."""
+    aid = _analysis(conn)
+    with pytest.raises(ValueError, match="no inventory"):
+        units.plan(conn, aid)
+    assert ledger.units_of(conn, aid) == []
+    _inventory(conn, aid, [_file("a.py", (1, 10, 100))])
+    conn.execute("UPDATE analysis_inventory SET doc='{not json' WHERE analysis_id=?", (aid,))
+    conn.commit()
+    with pytest.raises(ValueError, match="no inventory"):
+        units.plan(conn, aid)
+    assert ledger.units_of(conn, aid) == []
+
+
+def test_a_deep_analysis_whose_inventory_lists_no_file_is_planned_without_reads(conn):
+    """The nearest case the refusal above must not swallow: an inventory
+    that was listed and holds no file is a scope, not a missing one."""
+    aid = _analysis(conn)
+    _inventory(conn, aid, [])
+    units.plan(conn, aid)
+    assert [u["kind"] for u in ledger.units_of(conn, aid)] == ["hunt"]
+
+
 def test_a_profile_other_than_deep_plans_no_reads(conn):
     aid = _analysis(conn, profile="standard")
     _inventory(conn, aid, [_file("a.py", (1, 10, 100))])
@@ -148,6 +219,32 @@ def test_verification_is_planned_once_per_finding_of_this_analysis(conn):
     assert [ledger.get_unit(conn, i)["payload"] for i in ids] == [{"fingerprint": "a" * 64}], \
         "a low finding is out of scope, and a carried one belongs to its own analysis"
     assert units.plan_verification(conn, aid) == []
+
+
+def test_two_verification_plans_racing_write_one_verify_unit_per_finding(tmp_path, monkeypatch):
+    """I1. Which findings already have a verify unit is asked inside the
+    transaction that writes the new ones. Read before the queue, a second
+    caller that planned in between doubled every verification."""
+    first, other = ledger.connect(tmp_path / "security.db"), ledger.connect(tmp_path / "security.db")
+    aid = _analysis(first)
+    _agent(first, aid, "a" * 64, "high")
+    _agent(first, aid, "b" * 64, "medium")
+    real, raced = queries.verify_queue, []
+
+    def queue_while_another_plan_lands(c, analysis_id):
+        if not raced:
+            raced.append(None)
+            raced.append(units.plan_verification(other, analysis_id))
+        return real(c, analysis_id)
+    monkeypatch.setattr(queries, "verify_queue", queue_while_another_plan_lands)
+    try:
+        assert units.plan_verification(first, aid) == []
+        assert len(raced[1]) == 2, "the other caller planned both"
+        fps = [u["payload"]["fingerprint"] for u in ledger.units_of(first, aid) if u["kind"] == "verify"]
+        assert sorted(fps) == ["a" * 64, "b" * 64]
+    finally:
+        first.close()
+        other.close()
 
 
 def _session(reads=None, tasks=0, guides=()):
@@ -221,8 +318,8 @@ def test_triage_is_done_when_every_blocking_row_was_triaged_or_decided(conn):
     assert remaining == {"items": [{"fingerprint": "a" * 64, "kind": "scanner"},
                                    {"fingerprint": "c" * 64, "kind": "carried"}]}, \
         "items built by hand without a category keep the keys they had"
-    _agent(conn, aid, "a" * 64, "high")   # the agent's re-report marks the scanner row triaged
-    _agent(conn, aid, "c" * 64)           # the carried finding is re-checked in this analysis
+    _agent(conn, aid, "a" * 64, "high", unit=uid)   # this unit's re-report marks the scanner row triaged
+    _agent(conn, aid, "c" * 64, unit=uid)           # this unit re-checks the carried finding here
     done, remaining, ev, note = units.judge(conn, unit, _session(), "success")
     assert (done, remaining) == (True, None)
 
@@ -237,11 +334,118 @@ def test_verify_is_done_only_with_a_verdict_on_its_finding(conn):
     assert units.judge(conn, unit, _session(), "success")[0] is True
 
 
+@pytest.mark.parametrize("writer", ["another unit", "operator", "subagent"])
+def test_a_verify_unit_is_not_done_by_a_verdict_it_did_not_write(conn, writer):
+    """C1. The hunter that minted the finding verifying it itself, the
+    operator, a verifier from before the pipeline: a verdict on the row is
+    this unit's work only when it carries this unit's id."""
+    aid = _analysis(conn)
+    hunt = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    _agent(conn, aid, "a" * 64, "high", unit=hunt)
+    uid = ledger.add_unit(conn, aid, "verify", {"fingerprint": "a" * 64})
+    by = {"another unit": f"unit:{hunt}", "operator": "operator", "subagent": "subagent"}[writer]
+    ledger.record_verdict(conn, aid, "a" * 64, "rejected", "not this unit's reading", by=by)
+    done, remaining, ev, note = units.judge(conn, ledger.get_unit(conn, uid), _session(), "success")
+    assert (done, ev["verdict"]) == (False, "")
+    assert by in note, "the note says whose verdict it is, never that none was recorded"
+
+
+def _fanned_out(conn, uid, tmp_path):
+    """Close attempt `uid` as its engine would after a session that launched
+    a subagent, and return the continuation it left."""
+    stream = tmp_path / f"stream-{uid}.ndjson"
+    stream.write_text(LAUNCH + "\n")
+    out = units.close(conn, ledger.get_unit(conn, uid), stream=str(stream), root=str(tmp_path),
+                      status="success")
+    assert out["state"] == "incomplete"
+    return ledger.get_unit(conn, out["continuation"])
+
+
+def test_the_verdict_of_an_attempt_that_launched_a_subagent_is_cleared_at_its_close(conn, tmp_path):
+    """C1. A verdict is written once (record_verdict's `verdict=''`), so the
+    disqualified attempt's -- the subagent's, for all anyone can prove --
+    left standing would close its continuation with no work done, and a
+    `rejected` one would drop the finding from the exposure for good. Its
+    close clears it; the continuation is done on the verdict IT writes."""
+    aid = _analysis(conn)
+    _agent(conn, aid, "a" * 64, "high")
+    first = ledger.add_unit(conn, aid, "verify", {"fingerprint": "a" * 64})
+    ledger.start_unit(conn, first)
+    ledger.record_verdict(conn, aid, "a" * 64, "rejected", "a subagent's reading", by=f"unit:{first}")
+    second = _fanned_out(conn, first, tmp_path)
+    row = conn.execute("SELECT verdict, verdict_reason, verified_by FROM finding WHERE fingerprint=?",
+                       ("a" * 64,)).fetchone()
+    assert tuple(row) == ("", "", ""), "a verdict nobody can prove this unit reasoned does not stand"
+    assert units.judge(conn, second, _session(), "success")[0] is False
+    assert ledger.record_verdict(conn, aid, "a" * 64, "confirmed", "read it", by=f"unit:{second['id']}")
+    assert units.judge(conn, second, _session(), "success")[0] is True
+
+
+@pytest.mark.parametrize("kind", ["scanner", "carried"])
+def test_a_re_report_an_attempt_with_a_subagent_wrote_does_not_count_for_its_continuation(conn, tmp_path, kind):
+    """C1. A re-report carries the unit whose session wrote it
+    (`finding.unit`), and a unit is credited only with what carries its own
+    id: what attempt 1 wrote while a subagent ran in its session leaves
+    attempt 2 owing the row, until attempt 2 re-reports it itself."""
+    if kind == "carried":
+        prev = _analysis(conn, commit="c0")
+        _agent(conn, prev, "a" * 64, "high")
+        ledger.finish_analysis(conn, prev, "done")
+    aid = _analysis(conn)
+    if kind == "scanner":
+        _scanner(conn, aid, "a" * 64, "high")
+    item = {"fingerprint": "a" * 64, "kind": kind, "category": "sast"}
+    first = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    ledger.start_unit(conn, first)
+    _agent(conn, aid, "a" * 64, "high", unit=first)
+    second = _fanned_out(conn, first, tmp_path)
+    assert units.judge(conn, second, _session(), "success")[:2] == (False, {"items": [item]})
+    _agent(conn, aid, "a" * 64, "high", unit=second["id"])
+    assert units.judge(conn, second, _session(), "success")[:2] == (True, None)
+
+
+def test_a_severity_an_attempt_with_a_subagent_lowered_below_the_floor_settles_nothing(conn, tmp_path):
+    """C1's neighbour. A scanner row below the floor needs no reading -- at
+    the severity its SCANNER gave it. Attempt 1 re-reporting a `high` as
+    `low` is a reading like any other, and letting it through the floor
+    would credit attempt 2 with it. (The row the scanner itself filed low,
+    and nobody touched, stays settled: see the triage test above.)"""
+    aid = _analysis(conn)
+    _scanner(conn, aid, "a" * 64, "high")
+    item = {"fingerprint": "a" * 64, "kind": "scanner", "category": "sast"}
+    first = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    ledger.start_unit(conn, first)
+    _agent(conn, aid, "a" * 64, "low", unit=first)
+    second = _fanned_out(conn, first, tmp_path)
+    assert units.judge(conn, second, _session(), "success")[:2] == (False, {"items": [item]})
+    _agent(conn, aid, "a" * 64, "low", unit=second["id"])
+    assert units.judge(conn, second, _session(), "success")[:2] == (True, None), \
+        "its own re-report at `low` settles it"
+
+
+def test_a_report_gone_an_attempt_with_a_subagent_made_does_not_count_for_its_continuation(conn, tmp_path):
+    """C1. `report-gone` is kept per unit (`unit_gone`), and the judge reads
+    this unit's alone (ledger.gone_by): attempt 1's word is not attempt 2's."""
+    prev = _analysis(conn, commit="c0")
+    _agent(conn, prev, "c" * 64)
+    ledger.finish_analysis(conn, prev, "done")
+    aid = _analysis(conn)
+    item = {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}
+    first = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    ledger.start_unit(conn, first)
+    ledger.record_gone(conn, first, "c" * 64, "a subagent said so")
+    second = _fanned_out(conn, first, tmp_path)
+    assert units.judge(conn, second, _session(), "success")[:2] == (False, {"items": [item]})
+    ledger.record_gone(conn, second["id"], "c" * 64, "the handler was deleted in this commit")
+    assert units.judge(conn, second, _session(), "success")[:2] == (True, None)
+
+
 @pytest.mark.parametrize("status, reason, done", [
     ("success", "", True),
     ("warning", "stderr had 3 bytes", True),
     ("warning", "UNDECLARED ENDING: no run-ending line", False),
     ("warning", "BUDGET LIMITED: spent $1 of a $1 cap", False),
+    ("warning", "UNDELIVERED: the run made changes that exist on no remote", False),
     ("error", "", False),
     ("stopped", "", False),
 ])
@@ -249,6 +453,15 @@ def test_a_hunt_is_done_when_its_run_worked(conn, status, reason, done):
     aid = _analysis(conn)
     uid = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
     assert units.judge(conn, ledger.get_unit(conn, uid), _session(), status, reason)[0] is done
+
+
+def test_every_mark_that_truncates_a_hunt_is_one_the_engine_s_close_reads():
+    """`_TRUNCATED` mirrors how `security_close_analysis` (bin/agentloop)
+    reads a `warning`: a mark renamed there and not here would judge a
+    truncated hunt done, so the suite reads the engine's own case pattern."""
+    engine = ENGINE.read_text()
+    for mark in units._TRUNCATED:
+        assert f'*"{mark}"*' in engine, f"{mark!r} is not a truncation mark of the engine's close"
 
 
 def test_conclude_settles_done_and_plans_nothing(conn):
@@ -282,6 +495,51 @@ def test_a_stop_continues_at_the_same_attempt(conn):
                          spend_usd=0, stopped=True)
     cont = ledger.get_unit(conn, out["continuation"])
     assert (cont["attempt"], cont["payload"]) == (1, {"profile": "deep"})
+
+
+def test_a_second_conclude_of_one_unit_plans_no_second_continuation(conn):
+    """I2. Two closes of one unit -- its engine's and the orchestrator's --
+    used to settle it once and continue it twice: the settle's own guard
+    refused the second, and nobody read what it said."""
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    ledger.start_unit(conn, uid)
+    unit = ledger.get_unit(conn, uid)
+    first = units.conclude(conn, unit, done=False, evidence={}, note="n", spend_usd=0)
+    again = units.conclude(conn, unit, done=False, evidence={}, note="n", spend_usd=0)
+    assert first["state"] == "incomplete" and first["continuation"]
+    assert again == {"state": "incomplete", "continuation": None}
+    assert len(ledger.units_of(conn, aid)) == 2, "the unit and ONE continuation"
+
+
+def test_a_conclude_over_a_unit_settled_elsewhere_reports_what_the_ledger_holds(conn):
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    ledger.start_unit(conn, uid)
+    unit = ledger.get_unit(conn, uid)
+    ledger.settle_unit(conn, uid, "done", 0, {}, "settled by another close")
+    assert units.conclude(conn, unit, done=False, evidence={}, note="n", spend_usd=0) == \
+        {"state": "done", "continuation": None}
+    assert [u["id"] for u in ledger.units_of(conn, aid)] == [uid], "nothing planned over a done unit"
+
+
+def test_a_unit_is_settled_and_its_continuation_planned_together_or_not_at_all(conn):
+    """I2. Two commits used to do it: a kill between them left the unit
+    `incomplete` with no continuation -- nothing relaunched it and no gap
+    named it. One transaction now: a continuation that cannot be written
+    (here, a payload JSON cannot encode) leaves the unit as it was."""
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 1, "last": 9, "bytes": 1}]})
+    ledger.start_unit(conn, uid)
+
+    class NotJson:
+        pass
+    with pytest.raises(TypeError):
+        units.conclude(conn, ledger.get_unit(conn, uid), done=False, evidence={}, note="n",
+                       spend_usd=1.0, remaining={"ranges": NotJson()})
+    unit = ledger.get_unit(conn, uid)
+    assert (unit["state"], unit["spend_usd"]) == ("running", 0.0), "the settle rolled back with it"
+    assert [u["id"] for u in ledger.units_of(conn, aid)] == [uid]
 
 
 def test_the_label_names_the_kind_its_place_and_the_attempt(conn):
@@ -346,3 +604,24 @@ def test_close_judges_a_run_and_settles_its_unit_once(conn):
     again = units.close(conn, ledger.get_unit(conn, uid), status="error", spend_usd=9)
     assert again == {"state": "done", "continuation": None}
     assert ledger.get_unit(conn, uid)["spend_usd"] == 0.5, "a settled unit is never closed twice"
+
+
+def test_a_close_over_a_unit_settled_elsewhere_touches_nothing_not_even_its_verdict(conn, tmp_path):
+    """The nearest case the clearing of a disqualified verdict must not
+    reach: a close holding an old copy of a unit another close already
+    settled `done`. It reports what the ledger holds, and the verdict that
+    unit was credited with stays."""
+    aid = _analysis(conn)
+    _agent(conn, aid, "a" * 64, "high")
+    uid = ledger.add_unit(conn, aid, "verify", {"fingerprint": "a" * 64})
+    ledger.start_unit(conn, uid)
+    stale = ledger.get_unit(conn, uid)
+    ledger.record_verdict(conn, aid, "a" * 64, "confirmed", "read it", by=f"unit:{uid}")
+    ledger.settle_unit(conn, uid, "done", 0, {"verdict": "confirmed"}, "Verdict: confirmed.")
+    stream = tmp_path / "late.ndjson"
+    stream.write_text(LAUNCH + "\n")
+    out = units.close(conn, stale, stream=str(stream), root=str(tmp_path), status="success")
+    assert out == {"state": "done", "continuation": None}
+    assert tuple(conn.execute("SELECT verdict, verified_by FROM finding WHERE fingerprint=?",
+                              ("a" * 64,)).fetchone()) == ("confirmed", f"unit:{uid}")
+    assert [u["id"] for u in ledger.units_of(conn, aid)] == [uid]

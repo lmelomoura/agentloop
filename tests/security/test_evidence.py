@@ -87,6 +87,14 @@ def test_adjacent_reads_cover_a_range_together():
                             {"a.py": [(5, 9), (1, 4)]}) == []
 
 
+def test_spans_are_merged_sorted_with_the_overlapping_and_the_adjacent_joined():
+    """The package's one merge of line spans -- the proof of reading here, and
+    what a read unit covered and the deep scope still owes (units.py)."""
+    assert evidence.merge_spans([(20, 30), (1, 4), (5, 9), (8, 12), (40, 40)]) == \
+        [(1, 12), (20, 30), (40, 40)]
+    assert evidence.merge_spans([]) == []
+
+
 def test_a_relative_root_path_and_a_symlinked_root_resolve_to_the_same_files(tmp_path):
     real = tmp_path / "real"
     (real / "src").mkdir(parents=True)
