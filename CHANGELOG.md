@@ -20,6 +20,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **An analysis is planned as units the engine runs and judges.** The plan
+  is triage batches of 25 rows (the scanners' findings and the agent
+  findings the last analysis left open), one reachability pass, and — in a
+  deep analysis — one read unit per slice; verification units are planned
+  once the rest has settled, one per finding of the analysis. The plan is
+  written in one transaction, all of it or none, so a plan cut short can
+  never leave slices no unit will read. A unit is judged by what it left:
+  the ranges its own stream proves it read (kept on the unit, whatever its
+  outcome, as the lines it covered), the rows the ledger shows it triaged,
+  the verdict it wrote. What it left undone becomes a new unit carrying
+  only what is missing, up to three attempts; a session that launched a
+  subagent does not count, whatever kind of unit it was.
+
 - **What a unit read is proven from its own stream.** A read counts only
   the lines its result carried — Claude Code's `tool_use_result` range, or
   the numbered lines of the content — never what it asked for: a read with

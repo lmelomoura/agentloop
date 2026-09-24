@@ -1304,6 +1304,42 @@ def add_unit(conn, analysis_id, kind, payload, attempt=1, parent=None) -> int:
     return cur.lastrowid
 
 
+def add_units(conn, analysis_id, specs) -> list:
+    """Several new `pending` units in ONE transaction, numbered one after the
+    other from the analysis's last `seq` -- all of them, or none.
+
+    WHY ALL OR NONE. `units.plan` refuses to plan an analysis that already has
+    units (a resume, a second prepare must not run the work twice), so a plan
+    written unit by unit and cut off half way -- an exception, a kill -- left
+    the analysis with the first half of its plan and nobody to write the rest:
+    the slices without a unit were never read, and nothing said so. One BEGIN
+    IMMEDIATE for the whole plan makes that state impossible to write. Every
+    kind is checked before the transaction opens, so a bad one writes nothing
+    either."""
+    specs = list(specs)
+    for kind, _payload in specs:
+        if kind not in UNIT_KINDS:
+            raise ValueError(f"bad unit kind: {kind}")
+    if not specs:
+        return []
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM unit WHERE analysis_id=?",
+                           (analysis_id,)).fetchone()[0]
+        ids = []
+        for kind, payload in specs:
+            seq += 1
+            cur = conn.execute(
+                "INSERT INTO unit (analysis_id, seq, kind, payload) VALUES (?,?,?,?)",
+                (analysis_id, seq, kind, json.dumps(payload, sort_keys=True)))
+            ids.append(cur.lastrowid)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return ids
+
+
 def get_unit(conn, unit_id):
     row = conn.execute("SELECT * FROM unit WHERE id=?", (unit_id,)).fetchone()
     return _unit_row(row) if row else None

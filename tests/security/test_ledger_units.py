@@ -220,3 +220,29 @@ def test_a_finding_remembers_the_unit_that_wrote_it(conn):
         "a re-report from outside any unit keeps who wrote it"
     ledger.record_finding(conn, aid, _finding("a" * 64, rationale="r3", unit=9))
     assert conn.execute("SELECT unit FROM finding WHERE fingerprint=?", ("a" * 64,)).fetchone()[0] == 9
+
+
+def test_several_units_are_added_in_one_transaction_numbered_after_the_last(conn):
+    aid = _analysis(conn)
+    ledger.add_unit(conn, aid, "hunt", {})
+    ids = ledger.add_units(conn, aid, [("triage", {"items": []}), ("read", {"ranges": []})])
+    assert [ledger.get_unit(conn, i)["seq"] for i in ids] == [2, 3]
+    assert [ledger.get_unit(conn, i)["kind"] for i in ids] == ["triage", "read"]
+    assert ledger.add_units(conn, aid, []) == []
+
+
+def test_a_batch_with_one_kind_outside_the_vocabulary_writes_nothing(conn):
+    aid = _analysis(conn)
+    with pytest.raises(ValueError):
+        ledger.add_units(conn, aid, [("hunt", {}), ("explore", {})])
+    assert ledger.units_of(conn, aid) == []
+
+
+def test_a_batch_that_fails_half_way_writes_nothing(conn):
+    aid = _analysis(conn)
+
+    class NotJson:
+        pass
+    with pytest.raises(TypeError):
+        ledger.add_units(conn, aid, [("hunt", {}), ("read", {"ranges": NotJson()})])
+    assert ledger.units_of(conn, aid) == [], "the hunt written before the failure is rolled back"
