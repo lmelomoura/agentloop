@@ -4142,6 +4142,184 @@ def test_a_stuck_models_fetch_does_not_silence_the_retry_forever(srv):
         "the retry must age out a pending load past 60s, or a hung fetch silences every retry for the rest of the session"
 
 
+# render() runs synchronously at boot (initViews() -> setView() -> render(),
+# before loadSession()/refresh() have even started) and again on every 5s
+# poll. Before DATA_LOADED is true, DATA is still the placeholder the page
+# opened with -- {jobs:[],state:{},runs:[],launchd_loaded:false} -- so every
+# "empty install" claim render() would otherwise draw (no jobs, launchd off,
+# nothing to run) is not true, it is just that nothing has answered yet. See
+# bin/agentloop-server's ingest(): a schema bump can hold the first /api/data
+# for minutes, and this is what used to be on screen for all of it.
+def test_render_draws_a_neutral_wait_state_before_data_loaded(srv):
+    js = _js(srv)
+    render_src = _plainfn(js, "render")
+    guard = "if(!DATA_LOADED){ renderLoadingState(); return; }"
+    assert guard in render_src, "render() must refuse to draw anything until DATA_LOADED is true"
+    for later_call in ("renderJobsArea()", "ALApp.renderOverviewHead(", "ALApp.renderProjectsPage()"):
+        assert render_src.index(guard) < render_src.index(later_call), (
+            f"the DATA_LOADED guard must come before {later_call} -- that call is one of the "
+            "ones that draws an empty-install claim from placeholder DATA"
+        )
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_wait_state_itself_carries_none_of_the_empty_install_phrases(srv, tmp_path):
+    """renderLoadingState() executed for real, not just grepped -- proof of
+    what actually lands in the DOM: none of the phrases a real empty install
+    would show, and the launchd pill reads neither on nor off (it reuses the
+    existing grey .pill.disabled look, the same one a switched-off job card
+    already draws from)."""
+    js = _js(srv)
+    script = tmp_path / "loading-state.js"
+    script.write_text("""
+const _els = {};
+function elStub(id){
+  if(!_els[id]) _els[id] = {hidden:true, innerHTML:"", textContent:""};
+  return _els[id];
+}
+const $ = elStub;
+const I = {refresh:"<refresh-icon>"};
+""" + _plainfn(js, "renderLoadingState") + """
+renderLoadingState();
+const hosts = ["pill-launchd","jobs","ov-head","ov-kpis","stats"];
+const out = {};
+hosts.forEach(id => out[id] = $(id).innerHTML);
+console.log(JSON.stringify(out));
+""")
+    p = subprocess.run(["node", str(script)], capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    out = json.loads(p.stdout)
+    joined = " ".join(out.values())
+    for phrase in ("No jobs yet", "Nothing to run", "launchd off", "has not checked anything"):
+        assert phrase not in joined, f"the wait state still carries the empty-install phrase {phrase!r}"
+    assert 'class="pill disabled"' in out["pill-launchd"], \
+        "the launchd pill must be neutral (grey), not on/off, before data has loaded"
+    assert "Loading" in out["jobs"] and "Loading" in out["ov-head"] and "Loading" in out["stats"]
+
+
+def test_a_slow_refresh_warns_after_ten_seconds_without_aborting_it(srv):
+    """The fetch itself is never cancelled -- only what the page SHOWS while
+    it is still waiting changes, past this deadline."""
+    body = _fn(_js(srv), "refresh")
+    assert "waitTimer=setTimeout(()=>paintWaiting(true), 10000);" in body
+    assert "clearTimeout(waitTimer);" in body, \
+        "the timer must be cleared once the request settles, or a fast refresh right after a slow one warns anyway"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_failed_or_slow_refresh_shows_the_waiting_banner_and_a_success_clears_it(srv, tmp_path):
+    """The incident this is for: the operator's first /api/data after the
+    schema bump took ~7 minutes, and other requests in the meantime hit
+    "database is locked" -- a dropped connection is not exotic either. Either
+    must show the banner without discarding whatever DATA the page already
+    had, and the very next success must clear it. A refresh already in
+    flight must not let a second one (the 5s poll firing again) start a
+    second fetch racing it for the same request."""
+    js = _js(srv)
+    script = tmp_path / "refresh-banner.js"
+    script.write_text("""
+const _els = {};
+function elStub(id){
+  if(!_els[id]) _els[id] = {hidden:true, innerHTML:"", textContent:""};
+  return _els[id];
+}
+const $ = elStub;
+const I = {alert:"<alert-icon>", refresh:"<refresh-icon>"};
+const TOKEN = "tok";
+const BUILD = "build-1";
+const sessionStorage = {};
+let CFG = {sig:null, jobs:[], projects:[]};
+let DATA = {};
+let DATA_LOADED = false;
+let renderCalls = 0;
+function render(){ renderCalls++; }
+function sessionLost(){}
+function retryModelsIfMissing(){}
+async function loadConfig(){}
+async function loadModels(){}
+
+let fetchCalls = 0;
+let fetchImpl = null;
+global.fetch = (...args) => { fetchCalls++; return fetchImpl(...args); };
+
+""" + _plainfn(js, "paintWaiting") + """
+let refreshInFlight=false;
+let waitTimer=null;
+""" + _fn(js, "refresh") + """
+
+(async () => {
+  const out = {};
+
+  fetchImpl = () => Promise.reject(new Error("network down"));
+  await refresh();
+  out.afterFailure = {hidden: $("waiting-banner").hidden, dataLoaded: DATA_LOADED,
+                       bannerText: $("waiting-banner").innerHTML, renderCalls, refreshInFlight};
+
+  fetchImpl = () => Promise.resolve({ok:true, status:200, json: async () => ({config_sig:null})});
+  await refresh();
+  out.afterSuccess = {hidden: $("waiting-banner").hidden, dataLoaded: DATA_LOADED, renderCalls};
+
+  DATA.marker = "kept";
+  fetchImpl = () => Promise.reject(new Error("down again"));
+  await refresh();
+  out.afterSecondFailure = {hidden: $("waiting-banner").hidden, dataLoaded: DATA_LOADED,
+                             keptMarker: DATA.marker, renderCalls};
+
+  let releaseFirst;
+  fetchImpl = () => new Promise(res => { releaseFirst = () => res({ok:true, status:200,
+    json: async () => ({config_sig:null})}); });
+  const fetchesBefore = fetchCalls;
+  const p1 = refresh();
+  const p2 = refresh();
+  out.duringOverlap = {fetchCallsMade: fetchCalls - fetchesBefore};
+  releaseFirst();
+  await p1; await p2;
+  out.afterOverlap = {hidden: $("waiting-banner").hidden, renderCalls};
+
+  console.log(JSON.stringify(out));
+})();
+""")
+    p = subprocess.run(["node", str(script)], capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    out = json.loads(p.stdout)
+
+    assert out["afterFailure"]["hidden"] is False, "a failed refresh must show the waiting banner"
+    assert "Waiting for the server" in out["afterFailure"]["bannerText"]
+    assert out["afterFailure"]["dataLoaded"] is False
+    assert out["afterFailure"]["refreshInFlight"] is False, \
+        "refreshInFlight must be cleared even when the fetch fails, or every later refresh becomes a no-op"
+
+    assert out["afterSuccess"]["hidden"] is True, "a success must clear the waiting banner"
+    assert out["afterSuccess"]["dataLoaded"] is True
+    assert out["afterSuccess"]["renderCalls"] == 1
+
+    assert out["afterSecondFailure"]["hidden"] is False, "a LATER failure must show the banner again"
+    assert out["afterSecondFailure"]["dataLoaded"] is True, "DATA_LOADED must not revert once it is true"
+    assert out["afterSecondFailure"]["keptMarker"] == "kept", "the last good DATA must survive a failed refresh"
+    assert out["afterSecondFailure"]["renderCalls"] == 1, "render() must not run again on a failed refresh"
+
+    assert out["duringOverlap"]["fetchCallsMade"] == 1, \
+        "a refresh already in flight must not let a second call start another fetch"
+    assert out["afterOverlap"]["hidden"] is True
+    assert out["afterOverlap"]["renderCalls"] == 2, "only the in-flight call's own eventual success renders"
+
+
+def test_config_is_requested_at_boot_without_waiting_for_data(srv):
+    """/api/data can take minutes the one time the index needs a schema
+    resync (bin/agentloop-server's ingest()) -- job/project definitions, read
+    by Settings, the job editor and the New job dialog, must not wait behind
+    it. loadConfig() must be fired before refresh() is awaited, not serially
+    after it -- and it stays the SAME loadConfig(), so refresh()'s own sig
+    check (unchanged) still re-fetches it later if it moves."""
+    js = _js(srv)
+    boot_src = _anyfn(js, "boot")
+    assert "loadConfig().then(loadModels).catch(()=>{});" in boot_src
+    assert boot_src.index("loadConfig()") < boot_src.index("await refresh();"), \
+        "the config load must be fired before refresh() is awaited, not serially after it resolves"
+    assert "await loadConfig(); loadModels();" in _fn(js, "refresh"), \
+        "refresh()'s own sig-triggered re-fetch must still be there for a LATER config change"
+
+
 def test_the_settings_modules_own_posts_answer_a_lost_session_like_the_poll(srv):
     """The Settings page's calls go through settings.js's own post(), not the
     page's api(): a session that ran out, or was signed out from another tab,
