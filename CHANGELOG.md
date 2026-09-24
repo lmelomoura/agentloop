@@ -23,48 +23,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Accounts per platform: a job, a project and an analysis run under the
   Claude or Codex account they pick.** A client who signs in to several
   Claude and Codex accounts — one config directory each — registers them in
-  Settings › Platforms beside the install's own Default: Settings lists
+  Settings › Platforms beside the install's own Default. Settings lists
   every account of Anthropic and OpenAI with its directory, who runs on it
   and its session — each on a line of its own, so a long directory never
   hides who uses the account — and adds, edits and removes them, one at a
-  time — an account Settings
-  no longer has stays visible and flagged, never hidden and never flagged
-  before Settings has actually answered, rather than disappearing behind a
-  save the engine would refuse — the same from the terminal: `agentloop
-  platform accounts|account-add|account-edit|account-remove <platform>`,
-  and `platform check <platform> <id>` for that account's own directory.
-  Removing an account is refused while jobs.json or projects.json cannot be
+  time; the same from the terminal: `agentloop platform
+  accounts|account-add|account-edit|account-remove <platform>`, and
+  `platform check <platform> <id>` checks one account's session. Removing
+  an account is refused while a job, a project or an analysis is on it —
+  the refusal names them — and while jobs.json or projects.json cannot be
   parsed, rather than assuming nobody uses it; an account whose skills
   could not be linked says so on its own add/edit line; the login a refusal
   or a check suggests quotes a directory a shell would split or cut short
   (`CLAUDE_CONFIG_DIR='/Users/me/My Accounts/.claude' claude auth login`),
-  so it can be pasted as it is. The dashboard's
-  server relays the account actions and carries the account on every run —
-  finished, from the journal, and live, from the run's slot — the run
-  dialog names the account, and its reopen line carries the variable.
+  so it can be pasted as it is.
   A job, a project and a security block pick one (`account`): the job,
   project and Security editors pick Platform → Account → Model, the
   Account combo showing only where there is a choice and naming the Default
   with its directory (*Default — ~/.claude*, the pin when there is one,
   from `default_dir` in `/api/models`), and re-picking a platform already
-  showing leaves its account alone. A job inherits its
-  project's when both run on the same platform, an analysis its project's
-  on the same terms; `set-field`, `create` and `project-set` refuse an
-  account the platform does not have, and a job whose effective platform
-  changes by any route — `set-field platform`, `set-field project`, a
-  project's own platform change, or the project being deleted — loses an
-  account that platform does not have, and says so.
+  showing leaves its account alone; an account Settings no longer has stays
+  on screen, flagged once the page has the list of accounts to judge it
+  by, rather than disappearing behind a save the engine would refuse. A job
+  inherits its project's account when both run on the same platform, an
+  analysis its project's on the same terms; `set-field`, `create` and
+  `project-set` refuse an account the platform does not have, and a job
+  whose effective platform changes by any route — `set-field platform`,
+  `set-field project`, a project's own platform change, or the project
+  being deleted — loses an account that platform does not have, and says
+  so. The dashboard's server relays the account actions and carries the
+  account on every run — finished, from the journal, and live, from the
+  run's slot — the run dialog names the account, and its reopen line
+  carries the variable.
   What follows the account: a run signs in with its account's directory —
   the agent and its precheck, `agentloop precheck` and `check` included —
   and is refused in `tick.log`, before a slot is taken, when the account is
   not in Settings, its directory is gone, or it has no session; standalone,
-  `agentloop precheck` and `check` refuse the unregistered case the same
-  way, before the precheck script runs at all. The journal records the
-  account and the directory each run used, a resume signs in where its
-  session was created whatever the job says today — refused by a platform
-  mismatch, never by asking the OTHER platform's own account whether it is
-  signed in — and the Codex rollout is read from the run's own
-  `CODEX_HOME`. The usage-window gate is per account
+  `agentloop precheck` and `check` refuse an account not in Settings, or an
+  OpenCode job naming an account other than the Default, before the
+  precheck script runs — `check` even for a job with no precheck at all,
+  which exits 1. The journal records the account and the directory each
+  run used, and a resume signs in where its session was created, whatever
+  the job says today (a job that has moved to another platform since is
+  refused for that mismatch, as before); the Codex rollout is read from the
+  run's own `CODEX_HOME`. The usage-window gate is per account
   (`<platform>@<directory>` in `data/rate-limits.json`, the platform's own
   key for the CLI's default directory), so one account's spent five hours
   no longer holds another's runs back; the statusline feeds the account
@@ -79,11 +81,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   project's own field — never another project's, and never on a refused
   save — so the field can no longer be lost between updating the code and
   running install: the project keeps the account the conversion gives it,
-  whether it is saved from the dashboard or with `project-set`; a level
-  the save itself puts on an account registers none; what neither can
-  place (a platform that is not Anthropic, or a directory that is gone) is
-  dropped; and the field is left alone while `platforms.json` cannot be
-  read, rather than losing the only record of the account.
+  whether it is saved from the dashboard or with `project-set`, and a
+  level the save itself puts on an account registers none; the save drops
+  only what neither can place (a platform that is not Anthropic, or a
+  directory that is gone), and leaves the field alone while
+  `platforms.json` cannot be read, rather than losing the only record of
+  the account.
 
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate
@@ -209,16 +212,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   — one run, or the next interactive turn of a session wired to the
   statusline in that account. An engine whose `CODEX_HOME` is not `~/.codex`
   moves its own Default the same way, from `openai` to `openai@<home>`, and
-  is blind for the same stretch. `check` and `precheck` already refused an
-  account not in Settings, or an OpenCode job naming an account at all,
-  before ever touching the precheck script; `check` now runs that same
-  refusal before its own "has no precheck" shortcut too, so a job with no
-  precheck at all now exits 1 over a bad account, where it used to exit 0
-  and say there was nothing to check.
+  is blind for the same stretch.
+
+- **A run you type yourself signs in where a scheduled one does.**
+  `agentloop run`, `check` and `precheck`, typed in a shell that does not
+  set `AGENTLOOP_CLAUDE_CONFIG_DIR`, put a job on the Default account on
+  the pin the tick's launchd plist carries — the account its scheduled runs
+  use; on a pinned install they used to run on `~/.claude`.
 
 - **`claude_config_dir` in `projects.json` is converted, not ignored.**
-  `install` turns it into an account; the warning in `status` and `install`
-  now names only what it could not convert, and why.
+  `install` turns it into an account, and saving the project does too, on
+  the level that carried it. For each level it leaves in place `install`
+  says why (such as a level that does not run on Anthropic, or a directory
+  that is gone), and the warning `status` and `install` print names each
+  project that still carries the field, and how to clear it.
 
 - **`platform enable` says how to lift its refusal.** A refusal over the
   session now adds what enable checks — the Default account, the one the
