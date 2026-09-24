@@ -2902,6 +2902,16 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 .mrow.offrow .mmeta .price{color:var(--muted);font-weight:500}
 .mmeta .jobs{display:inline-flex;align-items:center;font-size:11px;font-weight:600;color:var(--accent);background:var(--accent-soft);border-radius:20px;padding:0 8px;line-height:18px}
 .mempty{padding:16px 20px 18px;border-top:1px solid var(--line2);font-size:12.5px;color:var(--muted)}
+/* Settings › Platforms, Accounts: read like Models -- one row per account;
+   under the name, the directory (it may ellipsize, like a model's line),
+   then who runs on the account and its state, each a line of its own that
+   wraps instead (a long directory must never hide who uses the account, and
+   a reason names a directory and a command); the add/edit form is a row too. */
+.mname .acct-users{white-space:normal;overflow:visible}
+.mname .acct-st{display:flex;align-items:center;gap:6px;white-space:normal;margin-top:2px}
+.mname .acct-st .ic{width:13px;height:13px;flex:none}
+.mname .acct-st.ok{color:var(--ok)} .mname .acct-st.err{color:var(--err)}
+.acctform .ctrl{flex:1 1 auto;margin-top:0}
 /* the strip Overview and Jobs show while nothing is configured */
 .setup-banner{display:flex;align-items:center;gap:14px;padding:14px 18px;margin:0 0 20px;
   background:var(--warn-soft);border:1px solid color-mix(in srgb,var(--warn) 35%,var(--line));border-radius:13px}
@@ -2945,5 +2955,5 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 /* cover, not fill: a photo that is not square is cropped rather than stretched */
 .pf-face img{width:100%;height:100%;object-fit:cover;display:block}
 .pf-photo-a{display:flex;gap:8px;flex-wrap:wrap}
-/* ui-bundle: f23736f2dca0ef85e3926a673ce813361ea2ded7085ba3ed8469367a0d7ac85e */
-/* ui-sources: 921ad9161b3324699171abac8807904b91ef2844429ae5d73598058f5208dcd3 */
+/* ui-bundle: bcc4e56cfafa095e21e7d5ad11f3cce2a9e70c13bced373d97051fe635d6eb23 */
+/* ui-sources: 303ead1be8b8fc9661215e0c8145e093e9cffbff0e6f69b2956ccff86d5cb470 */

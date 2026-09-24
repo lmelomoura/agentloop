@@ -22,7 +22,12 @@
 # in Claude Code during the day, and the fleet learns how full the window is
 # without spending a token to find out.
 #
-# INSTALL — add to ~/.claude/settings.json (adjust the path to your checkout):
+# INSTALL — add to ~/.claude/settings.json (adjust the path to your checkout).
+# Each Claude account keeps its OWN settings.json — the pin's, or a
+# registered account's own directory — and feeds only that account's window
+# (CLAUDE_CONFIG_DIR decides which, see KEY below): wire this into every
+# account's settings.json whose usage should reach the gate, not ~/.claude's
+# alone.
 #   "statusLine": { "type": "command",
 #                   "command": "/path/to/agentloop/bin/statusline-rate-limits.sh" }
 #
@@ -33,6 +38,13 @@ set -u
 
 DATA_DIR="${AGENTLOOP_DATA:-${CLAUDE_CRON_DATA:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/data}}"
 OUT="$DATA_DIR/rate-limits.json"
+# The account this session runs as is its CLAUDE_CONFIG_DIR, and the windows
+# are that account's: the reading goes to the engine's key for it (rl_key) --
+# anthropic for the CLI's own directory, anthropic@<dir> for any other, the
+# directory without trailing slashes.
+acct="${CLAUDE_CONFIG_DIR:-}"
+while [ "${#acct}" -gt 1 ] && [ "${acct%/}" != "$acct" ]; do acct="${acct%/}"; done
+if [ -z "$acct" ] || [ "$acct" = "$HOME/.claude" ]; then KEY="anthropic"; else KEY="anthropic@$acct"; fi
 JQ="${AGENTLOOP_JQ:-${CLAUDE_CRON_JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}}"
 
 # The statusline is invoked several times a second while a turn streams. Writing
@@ -57,7 +69,8 @@ printf '%s' "$payload" | "$JQ" -e '.rate_limits | (.five_hour? // .seven_day?) !
 
 now="$(date +%s)"
 if [ -s "$OUT" ]; then
-  last="$("$JQ" -r '[(.anthropic // {})[]?.seen_at // 0, .[]?.seen_at // 0] | max // 0' "$OUT" 2>/dev/null || echo 0)"
+  # the floor is per account: another account's fresh write must not hold this one's back
+  last="$("$JQ" -r --arg k "$KEY" '[((.[$k] // {})[]?.seen_at // 0), (if $k == "anthropic" then (.[]?.seen_at // 0) else 0 end)] | max // 0' "$OUT" 2>/dev/null || echo 0)"
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
   [ "$(( now - last ))" -lt "$MIN_WRITE_SECONDS" ] && exit 0
 fi
@@ -71,7 +84,7 @@ tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX" 2>/dev/null)" || exit 0
 # forward while `resets_at` says it is still the same window, and dropped the
 # moment it is not. Keeping a spent window's `status` against a fresh window
 # would hold the whole fleet back on a fact that expired.
-printf '%s' "$payload" | "$JQ" --slurpfile prev "$OUT" --argjson now "$now" '
+printf '%s' "$payload" | "$JQ" --slurpfile prev "$OUT" --argjson now "$now" --arg k "$KEY" '
   # A file from before platforms held the windows at the top level; they are
   # the anthropic block now, and move there on this write. A file carrying BOTH
   # shapes is merged per window, greater seen_at wins — the same rule, and for
@@ -92,9 +105,9 @@ printf '%s' "$payload" | "$JQ" --slurpfile prev "$OUT" --argjson now "$now" '
       ($rl[$w] // null) as $new
       | if $new == null or $new.used_percentage == null then .
         else
-          (.anthropic[$w] // {}) as $old
+          (.[$k][$w] // {}) as $old
           | (if $old.resets_at == ($new.resets_at // null) then $old else {} end) as $keep
-          | .anthropic[$w] = {
+          | .[$k][$w] = {
               status:      ($keep.status // null),
               utilization: (($new.used_percentage) / 100),
               resets_at:   ($new.resets_at // null),

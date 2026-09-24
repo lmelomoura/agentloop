@@ -20,6 +20,74 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Accounts per platform: a job, a project and an analysis run under the
+  Claude or Codex account they pick.** A client who signs in to several
+  Claude and Codex accounts — one config directory each — registers them in
+  Settings › Platforms beside the install's own Default. Settings lists
+  every account of Anthropic and OpenAI with its directory, who runs on it
+  and its session — each on a line of its own, so a long directory never
+  hides who uses the account — and adds, edits and removes them, one at a
+  time; the same from the terminal: `agentloop platform
+  accounts|account-add|account-edit|account-remove <platform>`, and
+  `platform check <platform> <id>` checks one account's session. Removing
+  an account is refused while a job, a project or an analysis is on it —
+  the refusal names them — and while jobs.json or projects.json cannot be
+  parsed, rather than assuming nobody uses it; an account whose skills
+  could not be linked says so on its own add/edit line; the login a refusal
+  or a check suggests quotes a directory a shell would split or cut short
+  (`CLAUDE_CONFIG_DIR='/Users/me/My Accounts/.claude' claude auth login`),
+  so it can be pasted as it is.
+  A job, a project and a security block pick one (`account`): the job,
+  project and Security editors pick Platform → Account → Model, the
+  Account combo showing only where there is a choice and naming the Default
+  with its directory (*Default — ~/.claude*, the pin when there is one,
+  from `default_dir` in `/api/models`), and re-picking a platform already
+  showing leaves its account alone; an account Settings no longer has stays
+  on screen, flagged once the page has the list of accounts to judge it
+  by, rather than disappearing behind a save the engine would refuse. A job
+  inherits its project's account when both run on the same platform, an
+  analysis its project's on the same terms; `set-field`, `create` and
+  `project-set` refuse an account the platform does not have, and a job
+  whose effective platform changes by any route — `set-field platform`,
+  `set-field project`, a project's own platform change, or the project
+  being deleted — loses an account that platform does not have, and says
+  so. The dashboard's server relays the account actions and carries the
+  account on every run — finished, from the journal, and live, from the
+  run's slot — the run dialog names the account, and its reopen line
+  carries the variable.
+  What follows the account: a run signs in with its account's directory —
+  the agent and its precheck, `agentloop precheck` and `check` included —
+  and is refused in `tick.log`, before a slot is taken, when the account is
+  not in Settings, its directory is gone, or it has no session; standalone,
+  `agentloop precheck` and `check` refuse an account not in Settings, or an
+  OpenCode job naming an account other than the Default, before the
+  precheck script runs — `check` even for a job with no precheck at all,
+  which exits 1. The journal records the account and the directory each
+  run used, and a resume signs in where its session was created, whatever
+  the job says today (a job that has moved to another platform since is
+  refused for that mismatch, as before); the Codex rollout is read from the
+  run's own `CODEX_HOME`. The usage-window gate is per account
+  (`<platform>@<directory>` in `data/rate-limits.json`, the platform's own
+  key for the CLI's default directory), so one account's spent five hours
+  no longer holds another's runs back; the statusline feeds the account
+  its session runs as, and `agentloop usage` and `status` list every
+  account. The agentloop skills are linked into every account directory
+  too, the pinned one included: Claude Code reads the `skills/` of the
+  config directory it runs with, so a run on any other account read
+  prompts naming mandatory skills it could not load.
+  The model probes and the catalog refreshes always run on the Default.
+  `install` turns a `claude_config_dir` still in `projects.json` into an
+  account, and saving a project now runs the same conversion on that
+  project's own field — never another project's, and never on a refused
+  save — so the field can no longer be lost between updating the code and
+  running install: the project keeps the account the conversion gives it,
+  whether it is saved from the dashboard or with `project-set`, and a
+  level the save itself puts on an account registers none; the save drops
+  only what neither can place (a platform that is not Anthropic, or a
+  directory that is gone), and leaves the field alone while
+  `platforms.json` cannot be read, rather than losing the only record of
+  the account.
+
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate
   block, a Verdict filter, and a disproved row drawn dimmed — it is recorded,
@@ -66,6 +134,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`finding.verdict`, `verdict_reason` and `verified_by` columns**, additive
   and '' on every existing row, written once per finding per analysis and
   never cleared by a re-report; a verdict is not inherited between analyses.
+
+- **`AGENTLOOP_LAUNCH_AGENTS_DIR` sandboxes the two `launchd` plists a test
+  suite reads.** `installed_config_dir` (and, through it, `account_default_dir`
+  and `install`'s own retirement of a pre-rename install) read the Default's
+  pin from `$HOME/Library/LaunchAgents` — a directory neither the e2e suite
+  nor the selftest suite ever redirected, unlike `AGENTLOOP_CONFIG`,
+  `AGENTLOOP_DATA` and `CODEX_HOME`. On a developer machine whose live
+  install is pinned, the local suites would have picked up that real
+  account as the Default, shifting expectations, and a fake run would have
+  exported the real directory; CI has no plist. Defaults to the real
+  directory (`~/Library/LaunchAgents`, so production is unaffected).
+  Against the last release: `AGENTLOOP_LAUNCH_AGENTS_DIR`, the pytest
+  fixture that binds the control server for its own tests, and the
+  server's own mirror of `installed_config_dir` together keep all three
+  suites — e2e, selftest and pytest — off a real `launchd` plist. The e2e
+  sandbox and the pytest fixture also give every engine subprocess a fake
+  `claude`, `codex` and `opencode`, once, for the whole suite; the
+  selftest suite has no such single switch, so each block that shells out
+  to the engine or drives `cmd_install`/`status_platforms_block` names its
+  own three stand-ins instead — checked block by block, not assumed.
 
 ### Changed
 
@@ -138,7 +226,100 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   three in the e2e). Whoever changes how a run is launched now opens a
   function of 230 lines whose inputs are listed at the top.
 
+- **An install pinned to a Claude account keys that account's usage windows
+  by its directory.** `anthropic@<pin>` replaces the bare `anthropic` block
+  for pinned runs, so the gate is blind for them until the next reading lands
+  — one run, or the next interactive turn of a session wired to the
+  statusline in that account. An engine whose `CODEX_HOME` is not `~/.codex`
+  moves its own Default the same way, from `openai` to `openai@<home>`, and
+  is blind for the same stretch.
+
+- **A run you type yourself signs in where a scheduled one does.**
+  `agentloop run`, `check` and `precheck`, typed in a shell that does not
+  set `AGENTLOOP_CLAUDE_CONFIG_DIR`, put a job on the Default account on
+  the pin the tick's launchd plist carries — the account its scheduled runs
+  use; on a pinned install they used to run on `~/.claude`.
+
+- **`claude_config_dir` in `projects.json` is converted, not ignored.**
+  `install` turns it into an account, and saving the project does too, on
+  the level that carried it. For each level it leaves in place `install`
+  says why (such as a level that does not run on Anthropic, or a directory
+  that is gone), and the warning `status` and `install` print names each
+  project that still carries the field, and how to clear it.
+
+- **`platform enable` says how to lift its refusal.** A refusal over the
+  session now adds what enable checks — the Default account, the one the
+  model probes (Claude) or the catalog refreshes (Codex) run on, so an
+  account registered in Settings being signed in does not count — and the
+  ways out: sign it in, or, on Claude, pin the install to another account
+  (`AGENTLOOP_CLAUDE_CONFIG_DIR=<its directory> agentloop install`). A
+  refusal over anything else — no binary, a CLI that hung — reads as
+  before.
+
+- **`install` refuses a pin that is not an absolute directory, and drops
+  one it finds already pinned.** A relative `AGENTLOOP_CLAUDE_CONFIG_DIR`
+  used to be written into both plists and printed as though it were in
+  force; `install` now names the value and says to give an absolute path,
+  before a byte is written — and when a pin already sitting in an existing
+  plist (this install's own, or the pre-rename agent's) is not absolute,
+  that pin is dropped instead of carried into the new plist, with a line
+  naming it and why. The `Claude account :` line `install` prints, and the
+  `(in …)` `status` adds, now name the Default's directory the way the
+  engine actually resolves it (`account_default_dir`) — `~` expanded, no
+  trailing slash — instead of the raw pin, which a spelling such as
+  `~/.claude/` printed as though it were a distinct account from the
+  Default it already is.
+
 ### Fixed
+
+- **A pin that names the CLI's own `~/.claude` no longer signs the install
+  out.** A pin of `$HOME/.claude`, trailing slash or not, was exported as
+  written, and Claude Code names the Keychain entry it reads after the
+  directory whenever the variable is set at all (measured, 2.1.280): every
+  run, check, model probe and hook on that install answered *not signed
+  in*. The pin is now exported the way every account directory is — `~`
+  expanded, no trailing slash, and no variable at all when it is the CLI's
+  own `~/.claude` — both into a run and into what the engine starts outside
+  one (the model probes, the `on-run-end` hook); a pin that is not an
+  absolute directory counts as no pin.
+
+- **A pin with `&` or `<` in its directory silently lost the account.**
+  `install` spliced the pin straight into both plists' `<string>` text, so
+  a directory such as `Clients & Co` made the plist invalid XML (`plutil
+  -lint` on it: *Encountered unknown ampersand-escape sequence* — the same
+  parser launchd itself uses, so launchd most likely never loaded a plist
+  like this at all). What actually failed silently was the READ side:
+  `installed_config_dir` (Python's `plistlib`) raised on the malformed XML,
+  caught the error, and answered as though nothing were pinned — so a
+  repeated `install` with the variable unset lost the account it had
+  pinned, and a hand-typed command reading the plist saw no pin either.
+  The pin is now XML-escaped on the way in (`&`, `<`, `>`) and reads back
+  exactly as given.
+
+- **`install`'s notice that it is carrying a pre-rename install's pinned
+  account is now true.** It printed as soon as that old plist named one,
+  whether or not this install actually went on to use it — the explicit
+  variable, or a pin already in the new plist, both win over it, and it
+  still has to be an absolute directory. The notice is now printed by
+  `install` itself, once the legacy pin is known to be the one actually
+  carried forward, never on sight of it alone.
+
+- **`agentloop help` prints its own text only.** Its heredoc expands, and
+  three words quoted in backticks ran as commands: `repos` and `sbom`
+  printed *command not found*, and `security` ran the macOS Keychain tool,
+  whose usage landed in the middle of ours. The platform verbs are listed
+  one shape per line, each with the arguments it takes.
+
+- **The Jobs search box no longer fills itself with the operator's name.**
+  Since the profile moved from its dialog into Settings › Profile, its three
+  password fields sat outside any `<form>`, and Chrome and the
+  password-manager extensions read every formless input on the page as one
+  sign-in form: a saved sign-in went into the first text field they found —
+  the Jobs search — so the table filtered itself by the operator's own name
+  (*Search: "…" · 0 of 3 jobs*), and the value came back every time the page
+  redrew. The profile has a form of its own again, its email is the sign-in
+  identifier (`autocomplete="username"`, as on the login form), and Enter in
+  a field saves it.
 
 - **An analysis of one repository of a multi-repo project reads that
   repository, at the branch it names.** Every analysis ran in the project's

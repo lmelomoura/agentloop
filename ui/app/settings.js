@@ -20,7 +20,11 @@ export const REGISTRY = [
   {id: "opencode", name: "OpenCode", cli: "opencode", sub: "OpenCode — opencode run --format json", mark: "OC"},
 ];
 
-const live = {checks: {}, checkedAt: {}, catalogs: {}, busy: {}, notes: {}, typedBin: {}};
+// The two platforms whose CLI keeps one signed-in account per directory --
+// CLAUDE_CONFIG_DIR, CODEX_HOME. OpenCode's credentials are its providers.
+export const ACCOUNT_PLATFORMS = ["anthropic", "openai"];
+
+const live = {checks: {}, checkedAt: {}, catalogs: {}, busy: {}, notes: {}, typedBin: {}, accounts: {}, acctForm: {}};
 let ctx = null;   // {platforms, configured, error, onChange}
 let probed = false;   // the three live checks have been fired once, on the first paint with a real payload
 // True while paint() tears #st-platforms down and rebuilds it. The Binary
@@ -139,6 +143,7 @@ async function runCheck(id){
   if(j && j.check){ live.checks[id] = j.check; live.checkedAt[id] = Date.now(); }
   live.busy[id] = false; paint();
   if(j && j.check && j.check.ready && !live.catalogs[id]) await loadCatalog(id);
+  await loadAccounts(id);
 }
 
 async function loadCatalog(id){
@@ -146,6 +151,138 @@ async function loadCatalog(id){
   const j = await post("platform_models", {platform: id});
   if(j && j.catalog) live.catalogs[id] = j.catalog;
   live.busy[id] = false; paint();
+}
+
+async function loadAccounts(id){
+  if(!ACCOUNT_PLATFORMS.includes(id)) return;
+  live.busy[id] = true; paint();
+  const j = await post("platform_accounts", {platform: id});
+  if(j && Array.isArray(j.accounts)){
+    live.accounts[id] = j.accounts;
+    // A fresh list that no longer has the account an edit form names (removed
+    // from another tab, or by the CLI) must drop that form -- otherwise "Add
+    // account" stays disabled (an open form already disables it, see
+    // accountsSection) with no Cancel left on screen to close it, since the
+    // row it belonged to is gone too.
+    const f = live.acctForm[id];
+    if(f && f.mode === "edit" && !j.accounts.some(a => a.id === f.id)) delete live.acctForm[id];
+  }
+  live.busy[id] = false;
+  paint();
+}
+
+// One account's state in words: whom it is signed in as -- the prefix only
+// on Anthropic, like the Session line, since Codex phrases its own answer --
+// or why it is not; `ok` null until it has been checked.
+export function accountStatusText(platform, check){
+  if(!check) return {ok: null, text: "— not checked"};
+  if(check.ready) return {ok: true, text: platform === "anthropic" ? "Signed in as " + (check.account || "unknown") : (check.account || "signed in")};
+  return {ok: false, text: check.reason || "not signed in"};
+}
+
+// Who is configured on an account, counted the way `platform accounts`
+// splits it: jobs, projects, analyses.
+export function accountUsersText(used){
+  const u = used || {}, parts = [];
+  const add = (list, one, many) => { const n = (list || []).length; if(n) parts.push(n + " " + (n === 1 ? one : many)); };
+  add(u.jobs, "job", "jobs"); add(u.projects, "project", "projects"); add(u.security, "analysis", "analyses");
+  return parts.length ? "used by " + parts.join(", ") : "nothing runs on it yet";
+}
+
+function accountRow(r, a){
+  const row = el("div", "mrow");
+  const name = el("div", "mname");
+  name.appendChild(el("b", null, a.builtin ? "Default — the install's own" : a.name));
+  // The directory may ellipsize (`.mname span`); who runs on the account is
+  // a line of its own that wraps instead -- the one fact Remove is refused
+  // over, so a long directory must never be able to push it out of sight.
+  name.appendChild(el("span", null, a.dir));
+  name.appendChild(el("span", "acct-users", accountUsersText(a.used_by)));
+  const st = accountStatusText(r.id, a.check);
+  const sl = el("span", "acct-st" + (st.ok === true ? " ok" : st.ok === false ? " err" : ""));
+  // ok is null until the account has been checked -- neither the green
+  // checkmark nor the red xcircle is true yet, so neither icon should draw.
+  sl.appendChild(icon(st.ok === false ? "xcircle" : st.ok === true ? "check" : "clock"));
+  sl.appendChild(document.createTextNode(st.text));
+  name.appendChild(sl);
+  row.appendChild(name);
+  const meta = el("div", "mmeta");
+  if(!a.builtin){
+    // One form at a time per platform: while ANY form is open here (this
+    // account's own edit form is never reached through this branch, but
+    // another account's edit, or the Add row, is), Edit/Remove lock the same
+    // way "Add account" already does -- acctForm's two fields are read back
+    // by a PLATFORM-scoped id (acct-name-<pid>), not an account-scoped one,
+    // so letting a second form open let its stale DOM text land on whichever
+    // account's Edit was clicked last (see accountsSection/paint()).
+    const locked = live.busy[r.id] || !!live.acctForm[r.id];
+    meta.appendChild(button("Edit", "pencil", () => { live.acctForm[r.id] = {mode: "edit", id: a.id, name: a.name, dir: a.dir}; paint(); }, locked));
+    meta.appendChild(button("Remove", "trash", () => removeAccount(r.id, a), locked));
+  }
+  row.appendChild(meta);
+  return row;
+}
+
+// Add or edit, as a row of its own. The directory field reuses the page's
+// folder picker (a [data-cwd-target] button, delegated on the document),
+// which sets .value with no event -- paint() reads both fields back into
+// live.acctForm before every teardown, so a repaint never loses them.
+function accountForm(r){
+  const f = live.acctForm[r.id];
+  const row = el("div", "mrow acctform");
+  const ctrl = el("div", "ctrl");
+  const nm = el("input"); nm.type = "text"; nm.id = "acct-name-" + r.id; nm.value = f.name || "";
+  nm.placeholder = "Name — e.g. Client A";
+  const dir = el("input"); dir.type = "text"; dir.id = "acct-dir-" + r.id; dir.value = f.dir || "";
+  dir.placeholder = r.id === "anthropic" ? "~/.claude-client-a — the CLAUDE_CONFIG_DIR it signs in with" : "~/.codex-client-a — the CODEX_HOME it signs in with";
+  const browse = el("button", "btn"); browse.type = "button"; browse.dataset.cwdTarget = dir.id;
+  browse.appendChild(document.createTextNode("Browse…"));
+  ctrl.appendChild(nm); ctrl.appendChild(dir); ctrl.appendChild(browse);
+  ctrl.appendChild(button(f.mode === "edit" ? "Save" : "Add", "check", () => saveAccount(r.id), live.busy[r.id]));
+  ctrl.appendChild(button("Cancel", null, () => { delete live.acctForm[r.id]; paint(); }, live.busy[r.id]));
+  row.appendChild(ctrl);
+  return row;
+}
+
+async function saveAccount(pid){
+  const f = live.acctForm[pid]; if(!f) return;
+  const n = $("acct-name-" + pid), d = $("acct-dir-" + pid);
+  if(n) f.name = n.value; if(d) f.dir = d.value;
+  const ok = f.mode === "edit"
+    ? await change("platform_account_edit", {platform: pid, id: f.id, name: (f.name || "").trim(), dir: (f.dir || "").trim()})
+    : await change("platform_account_add", {platform: pid, name: (f.name || "").trim(), dir: (f.dir || "").trim()});
+  if(!ok) return;
+  delete live.acctForm[pid];
+  await loadAccounts(pid);
+}
+
+async function removeAccount(pid, a){
+  const ok = await change("platform_account_remove", {platform: pid, id: a.id});
+  if(ok) await loadAccounts(pid);
+}
+
+// Every account of an account platform, the Default first -- drawn like the
+// Models section: a header strip, then one row each.
+function accountsSection(r){
+  const frag = document.createDocumentFragment();
+  const head = el("div", "models-h");
+  head.appendChild(el("h3", null, "Accounts"));
+  head.appendChild(el("span", "age", r.id === "anthropic"
+    ? "one per Claude config directory (CLAUDE_CONFIG_DIR) — jobs, projects and analyses pick one"
+    : "one per Codex home (CODEX_HOME) — jobs, projects and analyses pick one"));
+  head.appendChild(el("span", "sp"));
+  head.appendChild(button("Add account", "plus", () => { live.acctForm[r.id] = {mode: "add", name: "", dir: ""}; paint(); },
+    live.busy[r.id] || !!live.acctForm[r.id]));
+  frag.appendChild(head);
+  const list = live.accounts[r.id];
+  const form = live.acctForm[r.id];
+  if(!list){
+    frag.appendChild(el("div", "mempty", live.busy[r.id] ? "Checking the accounts…" : "The accounts have not been checked yet — Test checks them."));
+  } else {
+    list.forEach(a => frag.appendChild(form && form.mode === "edit" && form.id === a.id ? accountForm(r) : accountRow(r, a)));
+  }
+  if(form && form.mode === "add") frag.appendChild(accountForm(r));
+  return frag;
 }
 
 async function change(op, extra){
@@ -195,6 +332,7 @@ function binaryBlock(r, entry, check){
   box.appendChild(sub);
   const ctrl = el("div", "ctrl");
   const inp = el("input"); inp.type = "text";
+  inp.id = "bin-" + r.id;
   // A refused save keeps what was typed on screen (live.typedBin) instead of
   // snapping back to the last saved entry.bin -- a bad path should not have
   // to be retyped from scratch.
@@ -403,6 +541,7 @@ function platformCard(r, entry, check, catalog){
     card.appendChild(nd);
   });
   const g = el("div", "platcard-g"); g.appendChild(binaryBlock(r, entry, check)); g.appendChild(sessionBlock(r, entry, check)); card.appendChild(g);
+  if(ACCOUNT_PLATFORMS.includes(r.id) && entry.supported !== false) card.appendChild(accountsSection(r));
   card.appendChild(modelsSection(r, entry, check, catalog));
   return card;
 }
@@ -425,10 +564,19 @@ function paint(){
   // from one of those, or a toggle would overwrite it with the checkbox's
   // own value ("on").
   const active = document.activeElement;
+  // The account form's two fields, typed into or filled by the folder picker
+  // (which sets .value with no event): read back into live.acctForm before
+  // the teardown below, so a repaint never loses them.
+  ACCOUNT_PLATFORMS.forEach(pid => {
+    const f = live.acctForm[pid]; if(!f) return;
+    const n = $("acct-name-" + pid), d = $("acct-dir-" + pid);
+    if(n) f.name = n.value;
+    if(d) f.dir = d.value;
+  });
   let savedFocus = null;
   if(active && active.tagName === "INPUT" && active.type === "text" && host.contains(active)){
     const card = active.closest("section.platcard");
-    if(card) savedFocus = {cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd};
+    if(card) savedFocus = {cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd, inputId: active.id || ""};
   }
   repainting = true;   // see binaryBlock: an input torn out below must not save on the blur this causes
   try{
@@ -446,7 +594,7 @@ function paint(){
   }
   if(savedFocus){
     const card = $(savedFocus.cardId);
-    const inp = card && card.querySelector(".ctrl input");
+    const inp = savedFocus.inputId ? $(savedFocus.inputId) : (card && card.querySelector(".ctrl input"));
     if(inp){
       inp.value = savedFocus.value;
       inp.setSelectionRange(savedFocus.selectionStart, savedFocus.selectionEnd);

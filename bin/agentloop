@@ -77,15 +77,138 @@ legacy_scripts_warnings() { # one line per personal script under config/ still r
     done
 }
 
-legacy_config_dir_warning() { # one line per project or security block still naming an account: the field is ignored since this version
+legacy_config_dir_warning() { # one line per project or security block still carrying claude_config_dir: install converts what it can, and this names the rest
   [ -f "$PROJECTS_FILE" ] || return 0
   "$JQ" -r '
     .projects[]? | select(type == "object")
     | (.claude_config_dir // "") as $a | (((.security | objects) // {}).claude_config_dir // "") as $b
     | select($a != "" or $b != "") | .name' "$PROJECTS_FILE" 2>/dev/null \
   | while IFS= read -r n; do
-      printf "WARNING: projects.json: claude_config_dir on %s is ignored since this version — the account is the platform's, see Settings\n" "$n"
+      printf "WARNING: projects.json: claude_config_dir on %s is not read — accounts live in Settings › Platforms; pick one in the project editor (saving the project drops the field)\n" "$n"
     done
+}
+
+# The per-project account before accounts: a directory written into
+# projects.json, read by no version since the account became the platform's.
+# install turns each one into an account -- the Default when it is the
+# Default's directory, the registered account that has it, or a new one named
+# after the directory -- and sets it on the level that carried it. A level
+# that does not run on Anthropic, or a directory that is gone, keeps the
+# field, said here and warned about by status.
+accounts_migrate_legacy() { # accounts_migrate_legacy [project [project-account security-account [project-sent security-sent]]] -> one line per level converted or left; a project name limits it to that project alone, the two accounts are what a save of it is about to set on each level ("" for none), and the two -sent flags ("1"/"") say whether the save's JSON actually carried that level's account key at all -- "" sent for a key that was never there means the save never touched that level
+  local only="${1:-}" set_p="${2:-}" set_s="${3:-}" has_p="${4:-}" has_s="${5:-}"
+  [ -f "$PROJECTS_FILE" ] || return 0
+  local rows name level dir plat nd aid nm existing sent sent_key in_save=false
+  # A save always passes both account arguments, "" included when its level
+  # clears to the Default -- a bare call (install, or a plain migration pass)
+  # passes neither. $# tells the two apart even when the sent value itself is
+  # empty, which a save context reads very differently from no save at all.
+  [ "$#" -ge 2 ] && in_save=true
+  rows="$("$JQ" -r --arg only "$only" '.projects[]? | select(type == "object") | .name as $n
+      | select($only == "" or $n == $only)
+      | ( ((.claude_config_dir // "") | select(type == "string" and . != "") | [$n, "project", .]),
+          ((((.security | objects) // {}).claude_config_dir // "") | select(type == "string" and . != "") | [$n, "security", .]) )
+      | @tsv' "$PROJECTS_FILE" 2>/dev/null)"
+  [ -n "$rows" ] || return 0
+  while IFS="$(printf '\t')" read -r name level dir; do
+    [ -n "$name" ] || continue
+    # A level that already picked an account (in Settings, or by hand) never
+    # needed this directory turned into one -- registering it anyway would
+    # leave an orphan account nobody points at, and claiming it "is now" that
+    # account would be false: the level still runs on the one it already had.
+    # The same for a level the save converting it is about to set: the
+    # account that save sends is the one the level ends on.
+    if [ "$level" = "project" ]; then sent="$set_p"; sent_key="$has_p"; else sent="$set_s"; sent_key="$has_s"; fi
+    existing="$sent"
+    if [ -z "$existing" ]; then
+      if [ "$level" = "project" ]; then existing="$(project_get "$name" '.account' '')"
+      else existing="$(security_get "$name" '.account' '')"
+      fi
+    fi
+    if [ -n "$existing" ]; then
+      if [ "$level" = "project" ]; then
+        write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n then del(.claude_config_dir) else . end]'
+      else
+        write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n and (.security | type) == "object" then .security |= del(.claude_config_dir) else . end]'
+      fi
+      # Worded after what this call actually is, never after $existing alone
+      # (Fix: that used to read "it already runs on" both when this very save
+      # is what sets the account -- too early -- and when the operator just
+      # CLEARED a stored one, naming the account the save is removing).
+      # $sent non-empty: this save sets the level's account, whatever it had
+      # before. $sent empty inside a save AND $sent_key set: the save's JSON
+      # carried the key (an empty string the level's editor sent on purpose),
+      # so the level truly ends on the Default (or, for security, inherits).
+      # Everything else -- no save at all, or a save whose JSON never
+      # mentioned this level (a CLI project-set touching only other fields,
+      # `.account // ""` reading a MISSING key the same as an empty one) --
+      # leaves the level exactly as it was, and $existing is only ever its
+      # own pre-existing account: saying so is simply true (round 2, finding
+      # 1 -- a CLI save without the account keys used to print "leaves … on
+      # the Default" while the stored account was left untouched).
+      if [ -n "$sent" ]; then
+        echo "projects.json: claude_config_dir on $name ($level) dropped — this save sets the account '$sent'"
+      elif [ "$in_save" = true ] && [ -n "$sent_key" ]; then
+        if [ "$level" = "project" ]; then
+          echo "projects.json: claude_config_dir on $name ($level) dropped — this save leaves the project on the Default account"
+        else
+          echo "projects.json: claude_config_dir on $name ($level) dropped — this save clears the account, the analysis inherits"
+        fi
+      else
+        echo "projects.json: claude_config_dir on $name ($level) dropped — it already runs on the account '$existing'"
+      fi
+      continue
+    fi
+    if [ "$level" = "project" ]; then plat="$(project_get "$name" '.platform' 'anthropic')"
+    else
+      plat="$(security_get "$name" '.platform' '')"
+      [ -n "$plat" ] || plat="$(project_get "$name" '.platform' 'anthropic')"
+    fi
+    case "$plat" in ''|null) plat="anthropic" ;; esac
+    platform_known "$plat" || plat="anthropic"
+    if [ "$plat" != "anthropic" ]; then
+      echo "projects.json: claude_config_dir on $name ($level) left in place — that level runs on $plat, and a Claude account signs in Anthropic runs only"
+      continue
+    fi
+    if ! nd="$(account_norm_dir "$dir")"; then
+      echo "projects.json: claude_config_dir on $name ($level) left in place — '$dir' is not an absolute directory"; continue
+    fi
+    if [ "$nd" = "$(account_default_dir anthropic)" ]; then aid="default"
+    else
+      aid="$(accounts_json anthropic | "$JQ" -r '.[] | [.id, .dir] | @tsv' \
+        | while IFS="$(printf '\t')" read -r i d; do
+            if [ "$(account_norm_dir "$d")" = "$nd" ]; then printf '%s' "$i"; break; fi
+          done)"
+      if [ -z "$aid" ]; then
+        if [ ! -d "$nd" ]; then
+          echo "projects.json: claude_config_dir on $name ($level) left in place — $nd does not exist"; continue
+        fi
+        nm="$(basename "$nd" | sed 's/^\.//')"
+        # The directory is registered as projects.json WROTE it (the operator's
+        # own ~-relative or absolute spelling) -- account_add trims trailing
+        # slashes itself, but never expands it. $nd stays the normalized form
+        # for comparing and for the messages, per account_norm_dir's contract.
+        if ! aid="$(account_add anthropic "$nm" "$dir")"; then
+          if ! aid="$(account_add anthropic "$nd" "$dir")"; then
+            echo "projects.json: claude_config_dir on $name ($level) left in place — $aid"; continue
+          fi
+        fi
+        echo "registered the Claude account '$(account_field anthropic "$aid" name)' ($nd) from projects.json"
+      fi
+    fi
+    if [ "$level" = "project" ]; then
+      write_projects --arg n "$name" --arg a "$aid" '.projects = [.projects[] | if .name == $n
+          then ((if ((.account // "") == "" and $a != "default") then .account = $a else . end) | del(.claude_config_dir))
+          else . end]'
+    else
+      write_projects --arg n "$name" --arg a "$aid" '.projects = [.projects[] | if .name == $n and (.security | type) == "object"
+          then .security |= ((if ((.account // "") == "" and $a != "default") then .account = $a else . end) | del(.claude_config_dir))
+          else . end]'
+    fi
+    echo "projects.json: claude_config_dir on $name ($level) is now the account '$aid'"
+  done <<EOF
+$rows
+EOF
 }
 
 CONFIG_DIR="${AGENTLOOP_CONFIG:-$BASE_DIR/config}"
@@ -120,10 +243,19 @@ RATE_LIMIT_FILE="$DATA_DIR/rate-limits.json"   # last usage window the API repor
 # ceiling with its work uncommitted.
 RL_STOP_AT="${AGENTLOOP_RATE_LIMIT_STOP_AT:-0.95}"
 
+# Where the two launchd agent plists live -- real production machines only
+# ever want the real directory, but a test suite that runs `agentloop` as a
+# real process (an e2e scenario, a selftest block that shells out) must never
+# read or write the DEVELOPER's own ~/Library/LaunchAgents: a pinned live
+# install would leak its real account into the suite as the Default, and a
+# fake run would export the real directory. Every reader of the pin
+# (installed_config_dir, account_default_dir) goes through PLIST_PATH below,
+# so this one knob sandboxes all of them at once.
+LAUNCH_AGENTS_DIR="${AGENTLOOP_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 PLIST_LABEL="com.agentloop.tick"
-PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+PLIST_PATH="$LAUNCH_AGENTS_DIR/$PLIST_LABEL.plist"
 SERVER_LABEL="com.agentloop.server"
-SERVER_PLIST="$HOME/Library/LaunchAgents/$SERVER_LABEL.plist"
+SERVER_PLIST="$LAUNCH_AGENTS_DIR/$SERVER_LABEL.plist"
 # The names this install had until 2026-09-06. A machine installed under them
 # still carries two launchd agents and two symlinks so named; `install`
 # retires them (install_migrate_legacy). These three lines are the only place
@@ -161,13 +293,13 @@ OPENCODE_DEADLINE="${AGENTLOOP_OPENCODE_DEADLINE:-30}"
 # A non-numeric OPENCODE_DEADLINE, or 0, must fall back to the default instead
 # of reaching python as a bad float() or a deadline that always fires.
 case "$OPENCODE_DEADLINE" in ''|*[!0-9]*|0) OPENCODE_DEADLINE=30 ;; esac
-# Which Claude account every run signs in as. Claude Code keeps credentials,
-# settings, plugins, MCP servers and past sessions per config directory — one
-# signed-in account each — so this variable is the only thing that chooses
-# between two accounts on the same Mac. Set here it is the default for
-# everything, model probes included -- a project or a security block has no
-# pin of its own any more; the Anthropic card in Settings shows whom it is
-# signed in as. Empty leaves the CLI's own default (~/.claude), which is
+# The install's pin: the Claude account the Default runs on. Claude Code
+# keeps credentials, settings, plugins, MCP servers and past sessions per
+# config directory — one signed-in account each — and a run signs in with
+# its OWN account's directory (run_env; the Default's is this pin, else the
+# CLI's own ~/.claude). What this process exports is what everything else it
+# starts inherits: the model probes, which always run on the Default, and the
+# on-run-end hook. Empty leaves the CLI's own default (~/.claude), which is
 # what this tool used before the setting existed.
 #
 # Taken ONLY from the explicit variable — an ambient CLAUDE_CONFIG_DIR is
@@ -178,8 +310,12 @@ case "$OPENCODE_DEADLINE" in ''|*[!0-9]*|0) OPENCODE_DEADLINE=30 ;; esac
 # terminal — different billing, different plugins, different MCP servers — with
 # nothing in the run record saying which. Unsetting instead is the safe answer:
 # it lands on the CLI default, which is where a run with no setting belongs.
-CLAUDE_CONFIG_DIR="${AGENTLOOP_CLAUDE_CONFIG_DIR:-}"
-if [ -n "$CLAUDE_CONFIG_DIR" ]; then export CLAUDE_CONFIG_DIR; else unset CLAUDE_CONFIG_DIR; fi
+#
+# Dropped here, at once. The pin itself is exported just before the dispatch
+# at the end of this file, through account_env_value -- the rule a run's own
+# environment follows, and defined further down: normalized, and no variable
+# at all when it names the CLI's own ~/.claude.
+unset CLAUDE_CONFIG_DIR
 PYTHON="${AGENTLOOP_PYTHON:-$(command -v python3 2>/dev/null || echo /usr/bin/python3)}"
 # /usr/bin/jq is only guaranteed on macOS 15 and later; before that jq comes
 # from Homebrew, at a path that differs between Apple Silicon and Intel. The
@@ -413,6 +549,54 @@ security_derived_jobs() {
       security_warn "security: project '$project' has a permission_mode the CLI does not know ('$perm') -- using $(platform_default_permission "$splat" security)"
       perm="$(platform_default_permission "$splat" security)"
     fi
+    # The account the analysis signs in as: the block's own, else the
+    # project's when the analysis runs on the project's platform, else the
+    # Default -- job_account's rule, settled here because the derived job is
+    # the only place it can travel, and always written ON the job, so the job
+    # never re-inherits the project's when the block said Default. One the
+    # platform does not have falls back to the Default, with the warning the
+    # other fallbacks give.
+    #
+    # One jq reads all three fields this needs (the block own account, the
+    # project platform, the project own account) -- this runs once per
+    # security-enabled project on every jobs_json call, and used to fork a jq
+    # per field, up to three of them, through security_get/project_get.
+    # $PROJECTS_FILE is read directly, not through projects_json: the gate
+    # above already proved it exists and parses.
+    #
+    # Joined on U+001F (the ASCII Unit Separator), not a comma. Collapsing a
+    # field that is empty and adjacent to another separator is POSIX
+    # behaviour of IFS whitespace (space, tab, newline) in every shell, not a
+    # bash 3.2 quirk -- sacct is empty on most projects (no block of its own
+    # sets one), so with a whitespace separator a real field such as pacct
+    # could land in sacct instead. A comma avoids that particular failure,
+    # since an account id never leaves the alphabet account_slug builds it
+    # from and a platform is one of three fixed words -- neither should ever
+    # carry one. But a hand edit of projects.json can put anything in a
+    # value, including a comma, and that shifts every field after it right
+    # back into the same misreading (a block account of "b,a" read as the
+    # real, registered account "b", silently, no warning). U+001F is not
+    # IFS whitespace and is not a character any value here can hold, typed
+    # by account_slug or by hand, so the read lines up no matter what the
+    # file contains.
+    local sacct pplat pacct row
+    row="$("$JQ" -r --arg n "$project" '
+        (.projects[] | select(.name == $n)) as $p
+        | (($p.security | objects) // {}) as $s
+        | [ ($s.account // ""), ($p.platform // ""), ($p.account // "") ] | join("\u001f")' "$PROJECTS_FILE" 2>/dev/null)"
+    IFS="$(printf '\037')" read -r sacct pplat pacct <<EOF
+$row
+EOF
+    case "$pplat" in ''|null) pplat="anthropic" ;; esac
+    platform_known "$pplat" || pplat="anthropic"
+    if [ -z "$sacct" ] && [ "$splat" = "$pplat" ]; then
+      sacct="$pacct"
+    fi
+    [ -n "$sacct" ] || sacct="default"
+    if [ "$sacct" != "default" ] && ! account_known "$splat" "$sacct"; then
+      security_warn "security: project '$project' names an account $splat does not have ('$sacct') -- using the Default account"
+      sacct="default"
+    fi
     # The prompt is built AFTER the platform is settled: its two platform
     # paragraphs read $splat, and $splat is only final here.
     prompt="$(security_prompt "$project" "$repo" "$branch" "$profile" "$aid" "$ignore" "$splat")"
@@ -432,8 +616,10 @@ security_derived_jobs() {
       --arg budget "$budget" \
       --arg daily "$daily" \
       --arg perm "$perm" \
+      --arg account "$sacct" \
       --arg notools "$SECURITY_DISALLOWED_TOOLS" \
       '{id:$id, project:$project, prompt:$prompt, model:$model, platform:$platform,
+        account:$account,
         description:"Security analysis (derived from the project, not a job you created).",
         enabled:false, precheck:"", permission_mode:$perm,
         disallowed_tools:$notools,
@@ -1514,6 +1700,27 @@ job_platform() { # job_platform <id>
   printf '%s\n' "$p"
 }
 
+# job_account <id> -> the account a run of the job signs in as (see the
+# accounts block): its own `account`, else its project's when the job runs on
+# the project's platform -- whether or not the job names that platform itself
+# -- else default. PLATFORMS_JQ's job_account is the same rule, for counting.
+job_account() { # job_account <id>
+  local a proj pp
+  a="$(job_get "$1" '.account' '')"
+  case "$a" in ''|null) ;; *) printf '%s\n' "$a"; return 0 ;; esac
+  proj="$(job_get "$1" '.project' '')"
+  case "$proj" in ''|null) printf 'default\n'; return 0 ;; esac
+  pp="$(project_get "$proj" '.platform' 'anthropic')"
+  case "$pp" in ''|null) pp="anthropic" ;; esac
+  platform_known "$pp" || pp="anthropic"
+  if [ "$(job_platform "$1")" = "$pp" ]; then
+    a="$(project_get "$proj" '.account' '')"
+    case "$a" in ''|null) a="default" ;; esac
+    printf '%s\n' "$a"; return 0
+  fi
+  printf 'default\n'
+}
+
 # --- config/platforms.json: what the operator enabled ---------------------------
 # One object per listed platform: `enabled`, `bin` ("" = detect) and `models`,
 # the exact ids a job may pick, in the order they were switched on. The
@@ -1566,6 +1773,21 @@ PLATFORMS_JQ='
              | {who: .id, on: (.enabled != false), p: $p, m: resolved(effective($p; job_model(.)))} ]
            + [ ($projects.projects // [])[] | select((.security | type) == "object") | sec_platform(.) as $p
              | {who: ("security:" + .name), on: sec_on(.), p: $p, m: resolved(effective($p; (sec(.).model // "")))} ]);
+  # The account a job, a project and a security block run under: their own,
+  # else -- for a job or a block on the project platform -- the project
+  # account, else the Default. job_account (bash) is the same rule for one job.
+  def dflt: if . == null or . == "" then "default" else . end;
+  def project_platform($p): ((($p.platform // "") | if . == "" then "anthropic" else . end) | known);
+  def job_account($j): if (($j.account // "") != "") then $j.account
+                       elif ((($j.project // "") != "") and (job_platform($j) == project_platform(project($j.project))))
+                       then (project($j.project).account | dflt)
+                       else "default" end;
+  def sec_account($p): if ((sec($p).account // "") != "") then sec($p).account
+                       elif (sec_platform($p) == project_platform($p)) then ($p.account | dflt)
+                       else "default" end;
+  def account_uses: ([ ($jobs.jobs // [])[] | {who: .id, p: job_platform(.), a: job_account(.)} ]
+                   + [ ($projects.projects // [])[] | select(type == "object") | {who: ("project:" + (.name // "")), p: project_platform(.), a: (.account | dflt)} ]
+                   + [ ($projects.projects // [])[] | select(type == "object" and (.security | type) == "object") | {who: ("security:" + (.name // "")), p: sec_platform(.), a: sec_account(.)} ]);
 '
 
 platforms_jq() { # platforms_jq <anthropic-default> <openai-default> <opencode-default> <jq-filter> [jq options…] -- runs the filter with $jobs, $projects, $resolved, $adef, $odef, $ocdef, $ocat, $occat bound and PLATFORMS_JQ's defs in scope
@@ -1686,6 +1908,260 @@ platform_jobs_on() { # platform_jobs_on <platform> [model] [only-enabled] -> one
     -r --arg p "$1" --arg m "${2:-}" --argjson only "$only"
 }
 
+# --- accounts: which sign-in a run of a platform uses ---------------------------
+# Claude Code and the Codex CLI keep one signed-in account per config
+# directory; CLAUDE_CONFIG_DIR and CODEX_HOME are how each CLI is told which.
+# A platform's accounts are the install's own -- `default`, never stored: the
+# pin or ~/.claude, the engine's CODEX_HOME or ~/.codex -- plus the ones
+# Settings registers in config/platforms.json under `accounts`, each
+# {id, name, dir}. OpenCode has none: its credentials are the providers the
+# operator configured in opencode itself.
+ACCOUNTS_NONE_OPENCODE="OpenCode has no accounts — its credentials are the providers configured in opencode itself"
+
+account_platform() { case "${1:-}" in anthropic|openai) return 0 ;; *) return 1 ;; esac; }
+account_var() { case "${1:-}" in anthropic) printf 'CLAUDE_CONFIG_DIR' ;; openai) printf 'CODEX_HOME' ;; esac; }
+account_cli_default() { case "${1:-}" in anthropic) printf '%s/.claude\n' "$HOME" ;; openai) printf '%s/.codex\n' "$HOME" ;; esac; }
+
+# A directory inside a command the operator is told to run (the login a
+# refusal or a check suggests) has to survive being pasted into a shell. Left
+# bare only when every character is one a shell reads literally -- the set
+# the dashboard's reopen line leaves bare too (reopenCommand) -- so a plain
+# path reads exactly as typed; anything else goes in single quotes, a quote
+# inside written as the usual close-escape-reopen. The set is spelled out
+# rather than written as ranges: a range in a bracket expression follows the
+# locale's collation, and this has to mean ASCII whatever the locale is.
+shell_word() { # shell_word <text> -> the text, quoted for a POSIX shell only when it needs to be
+  local s="${1:-}" sq="'" out="" rest
+  case "$s" in
+    ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./~@+-]*) ;;
+    *) printf '%s' "$s"; return 0 ;;
+  esac
+  rest="$s"
+  while :; do
+    case "$rest" in
+      *"$sq"*) out="$out${rest%%"$sq"*}$sq\\$sq$sq"; rest="${rest#*"$sq"}" ;;
+      *) out="$out$rest"; break ;;
+    esac
+  done
+  printf "'%s'" "$out"
+}
+
+account_trim_dir() { # account_trim_dir <text> -> the text without trailing slashes; a lone "/" is kept as is
+  local d="${1:-}"
+  while [ "${#d}" -gt 1 ] && [ "${d%/}" != "$d" ]; do d="${d%/}"; done
+  printf '%s\n' "$d"
+}
+
+account_norm_dir() { # account_norm_dir <text> -> the directory with ~ expanded and no trailing slash; rc 1 and nothing printed unless that is an absolute path
+  local d
+  d="$(account_trim_dir "$(expand_home "${1:-}")")"
+  case "$d" in /?*) printf '%s\n' "$d" ;; *) return 1 ;; esac
+}
+
+# The value the platform's variable carries for a directory. NOTHING is the
+# CLI's own default directory, and means the variable is left unset: Claude
+# Code names the Keychain entry it reads credentials from after a hash of the
+# directory whenever CLAUDE_CONFIG_DIR is set at all, so an explicit
+# CLAUDE_CONFIG_DIR=$HOME/.claude answers "not signed in" (measured, 2.1.280).
+# Codex treats the two the same; one rule serves both.
+account_env_value() { # account_env_value <platform> <dir> -> the normalized directory, or nothing for the CLI's own default directory (and for nothing given)
+  local d
+  d="$(account_norm_dir "${2:-}")" || return 0
+  [ "$d" = "$(account_cli_default "$1")" ] && return 0
+  printf '%s\n' "$d"
+}
+
+accounts_json() { # accounts_json <platform> -> the registered accounts as a JSON list: only well-formed {id,name,dir} whose id is account_slug's own alphabet, never one called default; [] for a platform that has none
+  account_platform "${1:-}" || { printf '[]\n'; return 0; }
+  platforms_json | "$JQ" -c --arg p "$1" '
+    [ ((.platforms[$p].accounts // []) | if type == "array" then .[] else empty end)
+      | objects
+      | select((.id | type) == "string" and (.name | type) == "string" and (.dir | type) == "string")
+      | select(.id != "" and .id != "default" and .name != "" and .dir != "")
+      | select(.id | test("^[a-z0-9-]+$"))
+      | {id, name, dir} ]'
+}
+
+account_known() { # account_known <platform> <id> -> 0 for `default`, and for an id registered on that platform
+  [ "${2:-}" = "default" ] && return 0
+  account_platform "${1:-}" || return 1
+  accounts_json "$1" | "$JQ" -e --arg id "${2:-}" 'any(.[]; .id == $id)' >/dev/null 2>&1
+}
+
+account_ids_line() { # account_ids_line <platform> -> default and every registered id, comma-separated, for messages
+  { printf 'default\n'; accounts_json "$1" | "$JQ" -r '.[].id'; } | tr '\n' ',' | sed 's/,$//; s/,/, /g'
+}
+
+account_default_dir() { # account_default_dir <platform> -> the Default account's directory: the install's pin or ~/.claude; the engine's own Codex home (CODEX_HOME, else ~/.codex)
+  local d=""
+  case "${1:-}" in
+    anthropic) d="$(installed_config_dir)" ;;
+    openai)    d="$CODEX_HOME_DIR" ;;
+  esac
+  if [ -n "$d" ]; then d="$(account_norm_dir "$d")" || d=""; fi
+  [ -n "$d" ] || d="$(account_cli_default "${1:-}")"
+  printf '%s\n' "$d"
+}
+
+account_field() { # account_field <platform> <id> <name|dir> -> that field; the Default is named Default, and its directory is account_default_dir
+  if [ "${2:-}" = "default" ]; then
+    case "${3:-}" in name) printf 'Default\n' ;; dir) account_default_dir "$1" ;; esac
+    return 0
+  fi
+  accounts_json "$1" | "$JQ" -r --arg id "${2:-}" --arg f "${3:-}" 'first(.[] | select(.id == $id) | .[$f]) // empty'
+}
+
+account_env_dir() { # account_env_dir <platform> <id> -> what the platform's variable carries for a run on that account: nothing for the CLI's own directory
+  account_env_value "$1" "$(account_field "$1" "$2" dir)"
+}
+
+account_export() { # account_export <platform> <account-dir> -- in the calling shell: the platform's account variable unset, then exported when the account has a directory of its own (run_env's rule, for a precheck)
+  local v
+  account_platform "${1:-}" || return 0
+  v="$(account_var "$1")"
+  unset "$v"
+  [ -z "${2:-}" ] || export "$v=$2"
+}
+
+account_slug() { # account_slug <name> -> the id a new account is given: lower case, each run outside [a-z0-9] one dash, no dash at either end, at most 40 characters; account when nothing is left. Pinned to LC_ALL=C so the alphabet is the same regardless of the operator's own locale.
+  local s
+  s="$(export LC_ALL=C; printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//' | cut -c1-40 | sed 's/-$//')"
+  [ -n "$s" ] || s="account"
+  printf '%s\n' "$s"
+}
+
+account_users() { # account_users <platform> <id> -> who is configured on that account, one per line: a job id, project:<name>, security:<name> -- switched on or not
+  platforms_jq "" "" "" 'account_uses[] | select(.p == $p and .a == $a) | .who' -r --arg p "$1" --arg a "$2"
+}
+
+account_refusal() { # account_refusal <platform> <own-id> <name> <dir> -> one sentence when the account cannot be saved as given, nothing when it can; <own-id> is the account being edited ("" for a new one), whose name and directory do not count as taken
+  local p="$1" own="$2" name="$3" dir="$4" nd taken
+  [ -n "$name" ] || { printf 'an account needs a name'; return 0; }
+  if [ "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" = "default" ]; then
+    printf "Default is the install's own account — choose another name"; return 0
+  fi
+  if accounts_json "$p" | "$JQ" -e --arg n "$name" --arg own "$own" \
+       'any(.[]; .id != $own and (.name | ascii_downcase) == ($n | ascii_downcase))' >/dev/null 2>&1; then
+    printf "an account named '%s' already exists on %s" "$name" "$p"; return 0
+  fi
+  [ -n "$dir" ] || { printf 'an account needs a directory'; return 0; }
+  if ! nd="$(account_norm_dir "$dir")"; then
+    printf "the directory must be absolute or start with ~/ (got '%s')" "$dir"; return 0
+  fi
+  if [ ! -d "$nd" ]; then
+    # The directory as prose first, then inside the command to paste, where
+    # shell_word quotes it when a shell would otherwise split or end it.
+    if [ "$p" = "anthropic" ]; then
+      printf '%s does not exist — create it by signing in: CLAUDE_CONFIG_DIR=%s claude auth login' "$nd" "$(shell_word "$nd")"
+    else
+      printf '%s does not exist — create it and sign in: mkdir -p %s && CODEX_HOME=%s codex login' "$nd" "$(shell_word "$nd")" "$(shell_word "$nd")"
+    fi
+    return 0
+  fi
+  if [ "$nd" = "$(account_default_dir "$p")" ]; then
+    printf "%s is the Default account's directory" "$nd"; return 0
+  fi
+  taken="$(accounts_json "$p" | "$JQ" -r --arg own "$own" '.[] | select(.id != $own) | [.name, .dir] | @tsv' \
+    | while IFS="$(printf '\t')" read -r tname tdir; do
+        if [ "$(account_norm_dir "$tdir")" = "$nd" ]; then printf '%s' "$tname"; break; fi
+      done)"
+  if [ -n "$taken" ]; then
+    printf "%s is already the directory of the account '%s'" "$nd" "$taken"; return 0
+  fi
+  return 0
+}
+
+account_add() { # account_add <platform> <name> <dir> -> the new account's id; rc 1 with the refusal on stdout
+  local p="$1" name="$2" dir="$3" why id base n sdir
+  why="$(account_refusal "$p" "" "$name" "$dir")"
+  [ -z "$why" ] || { printf '%s\n' "$why"; return 1; }
+  base="$(account_slug "$name")"; id="$base"; n=2
+  while [ "$id" = "default" ] || account_known "$p" "$id"; do id="$base-$n"; n=$(( n + 1 )); done
+  sdir="$(account_trim_dir "$dir")"
+  write_platforms --arg p "$p" --arg id "$id" --arg n "$name" --arg d "$sdir" '
+    .platforms[$p] = ((.platforms[$p] // {enabled:false, bin:"", models:[]})
+      | .accounts = ((if (.accounts | type) == "array" then .accounts else [] end) + [{id:$id, name:$n, dir:$d}]))'
+  skills_link_into "$(account_norm_dir "$dir")/skills" install >/dev/null 2>&1 || true
+  printf '%s\n' "$id"
+}
+
+account_edit() { # account_edit <platform> <id> <name> <dir> -> rc 1 with the refusal on stdout
+  local p="$1" aid="$2" name="$3" dir="$4" why old sdir
+  if [ "$aid" = "default" ]; then printf "the Default account is the install's own — it is not edited here\n"; return 1; fi
+  account_known "$p" "$aid" || { printf "no account '%s' on %s\n" "$aid" "$p"; return 1; }
+  why="$(account_refusal "$p" "$aid" "$name" "$dir")"
+  [ -z "$why" ] || { printf '%s\n' "$why"; return 1; }
+  old="$(account_norm_dir "$(account_field "$p" "$aid" dir)")"
+  sdir="$(account_trim_dir "$dir")"
+  write_platforms --arg p "$p" --arg id "$aid" --arg n "$name" --arg d "$sdir" '
+    .platforms[$p].accounts = [ .platforms[$p].accounts[] | if (type == "object" and .id == $id) then (. + {name:$n, dir:$d}) else . end ]'
+  if [ "$old" != "$(account_norm_dir "$dir")" ]; then
+    skills_link_into "$(account_norm_dir "$dir")/skills" install >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+account_remove() { # account_remove <platform> <id> -> rc 1 with the refusal on stdout
+  local p="$1" aid="$2" users f
+  if [ "$aid" = "default" ]; then printf "the Default account is the install's own — it cannot be removed\n"; return 1; fi
+  account_known "$p" "$aid" || { printf "no account '%s' on %s\n" "$aid" "$p"; return 1; }
+  # account_users reads jobs.json/projects.json through platforms_jq, which
+  # treats a file that does not parse as though it were empty -- so a broken
+  # file would otherwise read as "nobody uses it" and the account would be
+  # removed out from under whoever it is actually wired to.
+  for f in "$JOBS_FILE" "$PROJECTS_FILE"; do
+    if [ -f "$f" ] && ! "$JQ" -e . "$f" >/dev/null 2>&1; then
+      printf "cannot tell who uses '%s': %s does not parse — fix it first\n" "$(account_field "$p" "$aid" name)" "$f"
+      return 1
+    fi
+  done
+  users="$(account_users "$p" "$aid" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+  if [ -n "$users" ]; then
+    printf "'%s' is used by %s — move them to another account first\n" "$(account_field "$p" "$aid" name)" "$users"; return 1
+  fi
+  write_platforms --arg p "$p" --arg id "$aid" '
+    .platforms[$p].accounts = [ .platforms[$p].accounts[] | select((type == "object" and .id == $id) | not) ]'
+  return 0
+}
+
+account_check_sentence() { # account_check_sentence <platform> <id> -> signed in as <who> on anthropic, the CLI's own words on openai, else the reason it is not ready
+  local j; j="$(platform_check "$1" "$2")"
+  if [ "$(printf '%s' "$j" | "$JQ" -r .ready)" = "true" ]; then
+    if [ "$1" = "anthropic" ]; then printf 'signed in as %s' "$(printf '%s' "$j" | "$JQ" -r .account)"
+    else printf '%s' "$(printf '%s' "$j" | "$JQ" -r .account)"; fi
+  else
+    printf '%s' "$(printf '%s' "$j" | "$JQ" -r .reason)"
+  fi
+}
+
+account_skills_suffix() { # account_skills_suffix <dir-as-typed> -> "" when every skill is linked into that directory's skills/, else "; <n> skill(s) could not be linked into <dir>/skills (agentloop skills install)". A saved account's own skills_link_into call swallows its result (an account is registered whether or not the link worked), so this is what makes a failed link visible on the success line.
+  local nd n
+  nd="$(account_norm_dir "${1:-}")" || return 0
+  n="$(skills_missing "$nd/skills")"
+  [ "${n:-0}" -gt 0 ] || return 0
+  printf '; %s skill(s) could not be linked into %s/skills (agentloop skills install)' "$n" "$nd"
+}
+
+# Every account of a platform, the Default first, each with its live check and
+# who is configured on it -- what Settings draws. The ids are collected before
+# the loop: a CLI asked for its session inside a `while read` could eat the
+# rest of the list from stdin.
+platform_accounts_json() { # platform_accounts_json <platform> -> a JSON list
+  local aid ids
+  ids="default $(accounts_json "$1" | "$JQ" -r '.[].id' | tr '\n' ' ')"
+  for aid in $ids; do
+    "$JQ" -nc --arg id "$aid" --arg name "$(account_field "$1" "$aid" name)" \
+      --arg dir "$(account_field "$1" "$aid" dir)" --arg adir "$(account_env_dir "$1" "$aid")" \
+      --argjson check "$(platform_check "$1" "$aid" </dev/null)" \
+      --argjson users "$(account_users "$1" "$aid" | "$JQ" -R . | "$JQ" -sc .)" '
+      {id:$id, name:$name, dir:$dir, account_dir:$adir, builtin:($id == "default"),
+       check:{ready:$check.ready, account:$check.account, reason:$check.reason},
+       used_by:{jobs:[$users[] | select((startswith("project:") or startswith("security:")) | not)],
+                projects:[$users[] | select(startswith("project:")) | ltrimstr("project:")],
+                security:[$users[] | select(startswith("security:")) | ltrimstr("security:")]}}'
+  done | "$JQ" -sc .
+}
+
 platform_cli_name() { case "$1" in anthropic) printf 'claude' ;; openai) printf 'codex' ;; opencode) printf 'opencode' ;; esac; }
 platform_install_hint() {
   case "$1" in
@@ -1719,11 +2195,25 @@ platform_bin() { # platform_bin <platform> -> the CLI's path: the environment ov
 # version, is there a session, as whom. Never stored -- it costs 0.04-0.14 s
 # (`codex login status`, `claude auth status --json`, `--version`), so the
 # Settings page, `status` and every launch simply ask again.
-platform_check() { # platform_check <platform> -> one JSON object; always exits 0
+platform_check() { # platform_check <platform> [account-id [account-dir]] -> one JSON object; always exits 0. The session checked is that account's -- the Default when none is named; a third argument is the directory to check exactly as given, empty for the CLI's own (what a resume passes, off the run it continues)
   local p="$1" bin src found=false ver="" vrc=0 acct="" reason="" ready=false supported=true
+  local aid="${2:-default}" adir="" arefusal=""
   if ! platform_listed "$p"; then
     "$JQ" -nc --arg p "$p" '{platform:$p, supported:false, ready:false, bin:"", bin_found:false, bin_source:"", version:"", account:"", reason:("unknown platform " + $p)}'
     return 0
+  fi
+  # Whose session is asked for: the directory given (a resume), else the
+  # account's (account_env_dir: empty is the CLI's own). An id Settings does
+  # not have is not asked about at all -- the answer is that it is not one.
+  if [ "$#" -ge 3 ]; then adir="${3:-}"
+  elif account_platform "$p"; then
+    if [ "$aid" = "default" ] || account_known "$p" "$aid"; then adir="$(account_env_dir "$p" "$aid")"
+    else arefusal="account '$aid' is not an account of $p in Settings"; fi
+  elif [ "$aid" != "default" ]; then
+    # A platform with no accounts (opencode) has nothing to check per id --
+    # without this, any id at all, valid or not, silently got the same
+    # platform-wide probe back, looking like a real per-account check.
+    arefusal="OpenCode has no accounts (account '$aid')"
   fi
   platform_planned "$p" && supported=false
   bin="$(platform_bin "$p")"; src="$(platform_bin_source "$p")"
@@ -1741,28 +2231,47 @@ platform_check() { # platform_check <platform> -> one JSON object; always exits 
   elif [ "$vrc" -eq 124 ]; then
     ver=""
     reason="$(platform_cli_name "$p") --version timed out after ${OPENCODE_DEADLINE} s (the CLI hung)"
+  elif [ -n "$arefusal" ]; then
+    reason="$arefusal"
   else
     case "$p" in
       anthropic)
-        local out cfgdir rc; cfgdir="$(installed_config_dir)"
-        if [ -n "$cfgdir" ]; then out="$(CLAUDE_CONFIG_DIR="$cfgdir" "$bin" auth status --json 2>/dev/null)"; rc=$?
-        else out="$("$bin" auth status --json 2>/dev/null)"; rc=$?; fi
-        if [ "$rc" -eq 0 ] && printf '%s' "$out" | "$JQ" -e '.loggedIn == true' >/dev/null 2>&1; then
-          ready=true
-          acct="$(printf '%s' "$out" | "$JQ" -r '[(.email // ""), ((.subscriptionType // "") | if . == "" then "" else . + " plan" end)] | map(select(. != "")) | join(" · ")' 2>/dev/null)"
-          [ -n "$acct" ] || acct="signed in"
+        local out rc
+        if [ "$aid" != "default" ] && [ -n "$adir" ] && [ ! -d "$adir" ]; then
+          # A registered account whose directory is gone has no session; the
+          # login creates the directory again. Every login suggested here
+          # carries the directory through shell_word, so it survives a paste.
+          reason="claude is not signed in in $adir (run: CLAUDE_CONFIG_DIR=$(shell_word "$adir") claude auth login)"
         else
-          case "$out" in
-            *loggedIn*)
-              if [ -n "$cfgdir" ]; then reason="claude is not signed in in $cfgdir (run: CLAUDE_CONFIG_DIR=$cfgdir claude auth login)"
-              else reason="claude is not signed in (run: claude auth login)"; fi ;;
-            *) # no `auth status` on this CLI (pre-2.1): the binary counts as ready, as it always did
-               ready=true; acct="unknown — claude auth status needs Claude Code 2.1+" ;;
-          esac
+          # The variable exactly as a run gets it: set to the account's own
+          # directory, or GONE for the CLI's -- never pointed at ~/.claude,
+          # which would read another Keychain entry (see account_env_value).
+          if [ -n "$adir" ]; then out="$(CLAUDE_CONFIG_DIR="$adir" "$bin" auth status --json 2>/dev/null)"; rc=$?
+          else out="$(env -u CLAUDE_CONFIG_DIR "$bin" auth status --json 2>/dev/null)"; rc=$?; fi
+          if [ "$rc" -eq 0 ] && printf '%s' "$out" | "$JQ" -e '.loggedIn == true' >/dev/null 2>&1; then
+            ready=true
+            acct="$(printf '%s' "$out" | "$JQ" -r '[(.email // ""), ((.subscriptionType // "") | if . == "" then "" else . + " plan" end)] | map(select(. != "")) | join(" · ")' 2>/dev/null)"
+            [ -n "$acct" ] || acct="signed in"
+          else
+            case "$out" in
+              *loggedIn*)
+                if [ -n "$adir" ]; then reason="claude is not signed in in $adir (run: CLAUDE_CONFIG_DIR=$(shell_word "$adir") claude auth login)"
+                else reason="claude is not signed in (run: claude auth login)"; fi ;;
+              *) # no `auth status` on this CLI (pre-2.1): the binary counts as ready, as it always did
+                 ready=true; acct="unknown — claude auth status needs Claude Code 2.1+" ;;
+            esac
+          fi
         fi ;;
       openai)
         local line
-        if line="$("$bin" login status 2>&1)"; then ready=true; acct="$(printf '%s\n' "$line" | head -1)"
+        if [ "$aid" != "default" ] && [ -n "$adir" ] && [ ! -d "$adir" ]; then
+          # The CLI refuses a CODEX_HOME that does not exist (measured, 0.153.4).
+          reason="codex is not signed in in $adir (run: mkdir -p $(shell_word "$adir") && CODEX_HOME=$(shell_word "$adir") codex login)"
+        elif [ -n "$adir" ] && line="$(CODEX_HOME="$adir" "$bin" login status 2>&1)"; then
+          ready=true; acct="$(printf '%s\n' "$line" | head -1)"
+        elif [ -z "$adir" ] && line="$(env -u CODEX_HOME "$bin" login status 2>&1)"; then
+          ready=true; acct="$(printf '%s\n' "$line" | head -1)"
+        elif [ -n "$adir" ]; then reason="codex is not signed in in $adir (run: CODEX_HOME=$(shell_word "$adir") codex login)"
         else reason="codex is not signed in (run: codex login)"; fi ;;
       opencode)
         # A CLI of providers, not of one account: ready when it lists a model
@@ -1803,11 +2312,12 @@ platform_check() { # platform_check <platform> -> one JSON object; always exits 
   fi
   "$JQ" -nc --arg p "$p" --argjson supported "$supported" --argjson ready "$ready" --arg bin "$bin" \
     --argjson found "$found" --arg src "$src" --arg ver "$ver" --arg acct "$acct" --arg reason "$reason" \
-    '{platform:$p, supported:$supported, ready:$ready, bin:$bin, bin_found:$found, bin_source:$src, version:$ver, account:$acct, reason:$reason}'
+    --arg aid "$aid" --arg adir "$adir" \
+    '{platform:$p, supported:$supported, ready:$ready, bin:$bin, bin_found:$found, bin_source:$src, version:$ver, account:$acct, reason:$reason, account_id:$aid, account_dir:$adir}'
 }
 
-platform_ready() { # platform_ready <platform> -> 0; or 1 with the reason on stdout (platform_check decides)
-  local j; j="$(platform_check "$1")"
+platform_ready() { # platform_ready <platform> [account-id [account-dir]] -> 0; or 1 with the reason on stdout (platform_check decides)
+  local j; j="$(platform_check "$@")"
   [ "$(printf '%s' "$j" | "$JQ" -r '.ready')" = "true" ] && return 0
   printf '%s' "$(printf '%s' "$j" | "$JQ" -r '.reason')"
   return 1
@@ -1909,10 +2419,10 @@ platform_affected_note() { # platform_affected_note <platform> [model] -> the en
   fi
 }
 
-cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-models> <platform> [path]
+cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-models|accounts|account-add|account-edit|account-remove> <platform> [...]
   local verb="${1:-}" p="${2:-}" j out rc list cur added removed id catalog
-  case "$verb" in check|enable|disable|set-bin|models|set-models) ;;
-    *) die "usage: agentloop platform <check|enable|disable|set-bin|models|set-models> <platform>" ;; esac
+  case "$verb" in check|enable|disable|set-bin|models|set-models|accounts|account-add|account-edit|account-remove) ;;
+    *) die "usage: agentloop platform <check|enable|disable|set-bin|models|set-models|accounts|account-add|account-edit|account-remove> <platform> [...]" ;; esac
   platform_listed "$p" || die "platform: unknown platform '$p' (one of: $PLATFORMS $PLATFORMS_PLANNED)"
   # Every other verb reaches config/platforms.json and so seeds it in passing
   # (enable/disable/set-bin/set-models through write_platforms, models through
@@ -1923,10 +2433,27 @@ cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-m
   # discover it only on its first write.
   platforms_ensure
   case "$verb" in
-    check) platform_check "$p" ;;
+    check) platform_check "$p" ${3:+"$3"} ;;
     enable)
+      # The Default's session, and only its: the model probes and the catalog
+      # refreshes run on it, so an account registered in Settings being
+      # signed in does not count. A refusal over that session says so, and
+      # how it is lifted -- the Default signed in, or (Claude, the one
+      # platform with a pin) the install pinned to another account. A
+      # refusal over anything else (no binary, a CLI that hung) already
+      # names its own fix, and gets nothing added.
       j="$(platform_check "$p")"
-      [ "$(printf '%s' "$j" | "$JQ" -r .ready)" = "true" ] || die "cannot enable $p: $(printf '%s' "$j" | "$JQ" -r .reason)"
+      if [ "$(printf '%s' "$j" | "$JQ" -r .ready)" != "true" ]; then
+        out="$(printf '%s' "$j" | "$JQ" -r .reason)"
+        case "$out" in
+          *" is not signed in"*)
+            case "$p" in
+              anthropic) out="$out — enable checks the Default account, the one the model probes run on: sign it in, or pin the install to another Claude account (AGENTLOOP_CLAUDE_CONFIG_DIR=<its directory> agentloop install)" ;;
+              openai)    out="$out — enable checks the Default account, the one the catalog refreshes run on: sign it in" ;;
+            esac ;;
+        esac
+        die "cannot enable $p: $out"
+      fi
       write_platforms --arg p "$p" '.platforms[$p] = ((.platforms[$p] // {bin:"", models:[]}) + {enabled:true})'
       echo "$p enabled" ;;
     disable)
@@ -1993,6 +2520,21 @@ cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-m
       write_platforms --arg p "$p" --argjson m "$list" '.platforms[$p] = ((.platforms[$p] // {enabled:false, bin:""}) + {models:$m})'
       echo "$p models: $(printf '%s' "$list" | "$JQ" -r 'join(" ")')"
       for id in $removed; do platform_affected_note "$p" "$id"; done ;;
+    accounts)
+      account_platform "$p" || die "platform accounts: $ACCOUNTS_NONE_OPENCODE"
+      platform_accounts_json "$p" ;;
+    account-add)
+      account_platform "$p" || die "platform account-add: $ACCOUNTS_NONE_OPENCODE"
+      out="$(account_add "$p" "${3:-}" "${4:-}")" || die "platform account-add: $out"
+      echo "account '${3:-}' added on $p (id $out) — $(account_check_sentence "$p" "$out")$(account_skills_suffix "${4:-}")" ;;
+    account-edit)
+      account_platform "$p" || die "platform account-edit: $ACCOUNTS_NONE_OPENCODE"
+      out="$(account_edit "$p" "${3:-}" "${4:-}" "${5:-}")" || die "platform account-edit: $out"
+      echo "account '${4:-}' saved on $p — $(account_check_sentence "$p" "${3:-}")$(account_skills_suffix "${5:-}")" ;;
+    account-remove)
+      account_platform "$p" || die "platform account-remove: $ACCOUNTS_NONE_OPENCODE"
+      out="$(account_remove "$p" "${3:-}")" || die "platform account-remove: $out"
+      echo "account '${3:-}' removed from $p" ;;
   esac
 }
 
@@ -2415,9 +2957,9 @@ opencode_export_model() { # opencode_export_model <run_cwd> <session-id> [tmp-ba
 # appends to the same file). Sets PF_MODEL_ID and PF_ROLLOUT; both empty when
 # the rollout is not found, with one line in tick.log saying so.
 PF_MODEL_ID=""; PF_ROLLOUT=""
-platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-id] [run_cwd]
+platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-id] [run_cwd] [codex-home]
   PF_MODEL_ID=""; PF_ROLLOUT=""
-  local tid="${3:-}" id="${4:-run}"
+  local tid="${3:-}" id="${4:-run}" home="${6:-$CODEX_HOME_DIR}"
   case "$1" in
     openai) ;;
     opencode)
@@ -2437,9 +2979,9 @@ platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-
     *) return 0 ;;
   esac
   [ -n "$tid" ] || return 0
-  PF_ROLLOUT="$(openai_rollout_for "$tid")"
+  PF_ROLLOUT="$(openai_rollout_for "$tid" "$home")"
   if [ -z "$PF_ROLLOUT" ]; then
-    log_tick "$id: no codex rollout for thread $tid under $CODEX_HOME_DIR/sessions — model_id stays the requested slug, no rate-limit reading"
+    log_tick "$id: no codex rollout for thread $tid under $home/sessions — model_id stays the requested slug, no rate-limit reading"
     return 0
   fi
   # The LAST turn_context: a resumed thread may have changed model.
@@ -2450,15 +2992,15 @@ platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-
   # failed; this says when the next one may start.
   local refused=""
   [ "$("$JQ" -r '.api_error_status // ""' "$2" 2>/dev/null | tail -1)" = "429" ] && refused="refused"
-  rl_capture_openai "$PF_ROLLOUT" $refused
+  rl_capture_openai "$PF_ROLLOUT" "$refused" "$(rl_key openai "$(account_env_value openai "$home")")"
   return 0
 }
 
-openai_rollout_for() { # openai_rollout_for <thread_id> -> the rollout's path, or nothing
+openai_rollout_for() { # openai_rollout_for <thread_id> [codex-home] -> the rollout's path, or nothing
   local hit
   # A thread id is unique, so the first hit is the only hit; the glob is
   # bounded to the three date levels the CLI uses.
-  hit="$(ls -t "$CODEX_HOME_DIR"/sessions/*/*/*/rollout-*-"$1".jsonl 2>/dev/null | head -1)"
+  hit="$(ls -t "${2:-$CODEX_HOME_DIR}"/sessions/*/*/*/rollout-*-"$1".jsonl 2>/dev/null | head -1)"
   [ -n "$hit" ] && [ -f "$hit" ] && printf '%s' "$hit"
   return 0
 }
@@ -3480,7 +4022,7 @@ port_base_reclaim() { # port_base_reclaim <slot-dir> <base>
 # journaled (it drops `journaled` the moment it does), so a run that reached its
 # own ending is never recorded twice.
 run_record_stopped_early() { # <id> <slot-dir>
-  local id="$1" slot="${2:-}" start end logf project note model model_family wt sid
+  local id="$1" slot="${2:-}" start end logf project note model model_family wt sid account account_dir
   [ -n "$slot" ] || return 0
   [ -f "$slot/stopped" ] || return 0
   [ -f "$slot/journaled" ] && return 0
@@ -3552,8 +4094,10 @@ run_record_stopped_early() { # <id> <slot-dir>
     result:("**Stopped by you.**\n\n"+$r)}' > "$logf" 2>/dev/null || logf=""
   state_set_many "$id" "$("$JQ" -nc --argjson end "$end" --argjson start "$start" \
     '{last_end:$end, last_status:"stopped", last_run_start:$start, last_run_status:"stopped"}')"
+  account="$(cat "$slot/account" 2>/dev/null || true)"
+  account_dir="$(cat "$slot/account_dir" 2>/dev/null || true)"
   record_run "$id" "stopped" "$start" "$end" "0" "0" "$sid" "${logf:-}" "$note" "false" "" "$project" \
-             "${model_family:-$model}" "" "" "" "$(job_platform "$id")" "none" "null"
+             "${model_family:-$model}" "" "" "" "$(job_platform "$id")" "none" "null" "$account" "$account_dir"
   # A derived security job stopped here left its analysis `running` in the
   # ledger with no run behind it: the page said so, refused a second Analyse
   # on the project, and the operator had to close the row by hand. The run's
@@ -3620,7 +4164,7 @@ lock_active() { # 0 = a run is currently holding the lock for <id> (single mutex
 journal_lock()   { lock_take "$LOCK_DIR/.journal.lock"; }
 journal_unlock() { lock_drop "$LOCK_DIR/.journal.lock"; }
 
-record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> <note> <forced> <precheck> <project> <model> <model_id> <resumed_from> <cause> <platform> <cost_basis> <tokens-json>
+record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> <note> <forced> <precheck> <project> <model> <model_id> <resumed_from> <cause> <platform> <cost_basis> <tokens-json> [account] [account-dir]
   "$JQ" -nc \
     --arg id "$1" --arg status "$2" --argjson start "$3" --argjson end "$4" \
     --arg cost "$5" --arg turns "$6" --arg session "$7" --arg logfile "$8" --arg note "$9" \
@@ -3628,6 +4172,7 @@ record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> 
     --arg model "${13:-}" --arg model_id "${14:-}" --arg resumed_from "${15:-}" \
     --arg cause "${16:-}" \
     --arg platform "${17:-anthropic}" --arg cost_basis "${18:-reported}" --argjson tokens "${19:-null}" \
+    --arg account "${20:-}" --arg account_dir "${21:-}" \
     '{id:$id, status:$status, start:$start, end:$end, duration:($end-$start),
       cost:($cost|tonumber? // 0), turns:($turns|tonumber? // 0),
       session:$session, log:$logfile, note:$note,
@@ -3643,7 +4188,11 @@ record_run() { # <id> <status> <start> <end> <cost> <turns> <session> <logfile> 
       # Which CLI ran it; how its cost is known (reported by the CLI,
       # estimated from tokens, or none); its token counts, or null when the
       # run died without a final event -- unknown is not zero.
-      platform:$platform, cost_basis:$cost_basis, tokens:$tokens}' > "$LOCK_DIR/.rec.$$"
+      platform:$platform, cost_basis:$cost_basis, tokens:$tokens}
+      # The account the run signed in as, and the directory its variable
+      # carried (empty: the CLI default) -- what a resume signs in with. Left
+      # out when the caller does not know it, so a record never guesses.
+      + (if $account == "" then {} else {account:$account, account_dir:$account_dir} end)' > "$LOCK_DIR/.rec.$$"
   # Append under the journal lock, so a concurrent rewrite cannot drop this
   # record on the floor (build the line first — the lock is held for the append
   # alone, never across the jq run).
@@ -3659,6 +4208,12 @@ journal_platform_of_session() { # journal_platform_of_session <session-id> -> an
   # platforms existed carries none, and is anthropic by definition.
   grep -F "\"session\":\"$1\"" "$RUNS_FILE" 2>/dev/null | tail -1 \
     | "$JQ" -r 'select(type == "object") | .platform // "anthropic"' 2>/dev/null
+}
+
+journal_account_of_session() { # journal_account_of_session <session-id> -> the account and its directory, joined by U+001F, off the run that recorded the session; nothing when that run predates accounts
+  [ -s "$RUNS_FILE" ] && [ -n "${1:-}" ] || return 0
+  grep -F "\"session\":\"$1\"" "$RUNS_FILE" 2>/dev/null | tail -1 \
+    | "$JQ" -r 'select(type == "object" and has("account")) | [.account, (.account_dir // "")] | join("\u001f")' 2>/dev/null
 }
 
 # How much of the journal the daily-spend scan reads. Records are appended in
@@ -3705,8 +4260,10 @@ spent_today_all() { _spend_since_midnight ""; }
 # merely showing: with no overage to fall through to, hitting the ceiling is a
 # dead stop mid-run, not a slowdown.
 
-# data/rate-limits.json has one block per platform. Before platforms it held
-# the two windows at the top level; that shape is read as anthropic and
+# data/rate-limits.json has one block per ACCOUNT, not per platform: rl_key,
+# just below, is the platform's own key for the CLI's default directory, and
+# <platform>@<dir> for any other. Before platforms existed it held the two
+# windows at the top level; that shape is read as anthropic's block and
 # rewritten the first time anything touches the file, under the same lock the
 # writers take. Every reader and writer below calls this first.
 #
@@ -3732,12 +4289,21 @@ rl_migrate() {
   return 0
 }
 
+# Which block of data/rate-limits.json a run's account reads and writes. The
+# windows are an ACCOUNT's, not a platform's: the platform's own key is the
+# CLI's default directory -- what every install had before accounts, and
+# what the statusline of a session with no CLAUDE_CONFIG_DIR writes -- and
+# any other account directory has a block of its own, <platform>@<dir>.
+rl_key() { # rl_key <platform> <account-dir> -> the block's key
+  if [ -z "${2:-}" ]; then printf '%s\n' "$1"; else printf '%s@%s\n' "$1" "$2"; fi
+}
+
 # Fold every rate_limit_event in a finished run's stream into the shared file,
 # newest per window wins. Never fails a run: this is bookkeeping, and a run that
 # worked must not be reported as broken because a status file could not be
 # written.
-rl_capture() { # rl_capture <streamfile>
-  local sf="${1:-}" tmp lock
+rl_capture() { # rl_capture <streamfile> [key] -- key: rl_key's block (anthropic when none)
+  local sf="${1:-}" key="${2:-anthropic}" tmp lock
   [ -s "$sf" ] || return 0
   grep -q rate_limit_event "$sf" 2>/dev/null || return 0
   lock="$LOCK_DIR/.ratelimit"
@@ -3748,12 +4314,12 @@ rl_capture() { # rl_capture <streamfile>
   # `-R` with `fromjson?` for the same reason every other reader of a stream
   # uses it: a killed run is cut off mid-write and one truncated line must not
   # cost us the other 300.
-  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" '
+  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg k "$key" '
     ($prev[0] // {}) as $was
     | [inputs | fromjson? | select(.type == "rate_limit_event") | .rate_limit_info // empty]
     | map(select(.rateLimitType != null))
     | reduce .[] as $e ($was;
-        .anthropic[$e.rateLimitType] = {
+        .[$k][$e.rateLimitType] = {
           status:      ($e.status // "unknown"),
           utilization: ($e.utilization // null),
           resets_at:   ($e.resetsAt // null),
@@ -3773,8 +4339,8 @@ rl_capture() { # rl_capture <streamfile>
 # run ended on a quota refusal (turn.failed, "hit your usage limit"): the
 # reset time is in the rollout but not which window tripped, so the FULLER
 # one is marked spent until its own reset -- the gate then lifts by itself.
-rl_capture_openai() { # rl_capture_openai <rollout-file> [refused]
-  local roll="${1:-}" refused="${2:-}" tmp lock
+rl_capture_openai() { # rl_capture_openai <rollout-file> [refused] [key] -- key: rl_key's block (openai when none)
+  local roll="${1:-}" refused="${2:-}" key="${3:-openai}" tmp lock
   [ -s "$roll" ] || return 0
   grep -q token_count "$roll" 2>/dev/null || return 0
   lock="$LOCK_DIR/.ratelimit"
@@ -3782,7 +4348,7 @@ rl_capture_openai() { # rl_capture_openai <rollout-file> [refused]
   rl_migrate
   [ -s "$RATE_LIMIT_FILE" ] || echo '{}' > "$RATE_LIMIT_FILE" 2>/dev/null || { lock_drop "$lock"; return 0; }
   tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX")" || { lock_drop "$lock"; return 0; }
-  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg refused "$refused" '
+  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg refused "$refused" --arg k "$key" '
     ($prev[0] // {}) as $was
     | [inputs | fromjson? | select(.type == "event_msg" and .payload.type == "token_count") | .payload.rate_limits // empty]
     | last // empty
@@ -3799,7 +4365,7 @@ rl_capture_openai() { # rl_capture_openai <rollout-file> [refused]
             plan_type: ($rl.plan_type // null) }
         end;
     $was
-    | .openai = ((.openai // {})
+    | .[$k] = ((.[$k] // {})
         + (if $rl.primary   != null then {five_hour: window($rl.primary; "five_hour")} else {} end)
         + (if $rl.secondary != null then {seven_day: window($rl.secondary; "seven_day")} else {} end))
   ' "$roll" > "$tmp" 2>/dev/null && [ -s "$tmp" ] && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
@@ -3816,12 +4382,14 @@ rl_capture_openai() { # rl_capture_openai <rollout-file> [refused]
 # about now. That is what keeps a single bad afternoon from wedging the fleet
 # for ever -- the gate expires by itself, with no operator action and no clock
 # of our own.
-rl_gate() { # rl_gate [platform] -> 0 = hold this run back (reason on stdout); anthropic when unnamed
-  local p="${1:-anthropic}"
+rl_gate() { # rl_gate [key] [account-name] -> 0 = hold this run back (reason on stdout); anthropic when unnamed. The name is said for an account that is not the Default
+  local k="${1:-anthropic}" p of=""
+  p="${k%%@*}"
+  [ -z "${2:-}" ] || of=" of ${2}"
   rl_migrate
   [ -s "$RATE_LIMIT_FILE" ] || return 1
-  "$JQ" -e -r --arg p "$p" --argjson now "$(now_epoch)" --argjson stop "$RL_STOP_AT" '
-    (.[$p] // {}) | to_entries
+  "$JQ" -e -r --arg k "$k" --arg p "$p" --arg of "$of" --argjson now "$(now_epoch)" --argjson stop "$RL_STOP_AT" '
+    (.[$k] // {}) | to_entries
     | map(select(.value.resets_at != null and .value.resets_at > $now))
     | map(. + {mins: (((.value.resets_at - $now) / 60) | floor)})
     # A refusal outranks a number: if the API has stopped saying `allowed`, the
@@ -3829,10 +4397,10 @@ rl_gate() { # rl_gate [platform] -> 0 = hold this run back (reason on stdout); a
     # NO status is not a refusal — the statusline reports utilisation without
     # one, and treating its silence as a refusal would gate every healthy run.
     | ( [ .[] | select(.value.status != null and ((.value.status | startswith("allowed")) | not)) ]
-        | map("the \($p) \(.key) window is spent (API says \(.value.status)) -- it resets in \(.mins) min")
+        | map("the \($p) \(.key) window\($of) is spent (API says \(.value.status)) -- it resets in \(.mins) min")
       ) + (
         [ .[] | select((.value.utilization // 0) >= $stop) ]
-        | map("the \($p) \(.key) window is \((.value.utilization * 100) | floor)% used"
+        | map("the \($p) \(.key) window\($of) is \((.value.utilization * 100) | floor)% used"
               + (if .value.overage == "rejected" then " and overage is off, so the ceiling is a dead stop" else "" end)
               + " -- it resets in \(.mins) min")
       )
@@ -3934,66 +4502,32 @@ fleet_stall_check() {
   return 0
 }
 
-# What the gate can currently see, and whether the thing that feeds it is
-# actually wired up. This exists because the honest answer to "is the statusline
-# working?" was a hand-written one-liner over the JSON — which puts the burden of
-# verifying the product on the person using it. A feature that cannot say whether
-# it is on is a feature nobody can trust.
-cmd_usage() {
-  local now settings cmd
-  now="$(now_epoch)"
+usage_account_label() { # usage_account_label <platform> <account-dir> -> the name a usage block goes by: Default, a registered account, or the directory with a note
+  local aid
+  if [ "$(account_env_dir "$1" default)" = "$2" ]; then printf 'Default'; return 0; fi
+  for aid in $(accounts_json "$1" | "$JQ" -r '.[].id'); do
+    if [ "$(account_env_dir "$1" "$aid")" = "$2" ]; then account_field "$1" "$aid" name | tr -d '\n'; return 0; fi
+  done
+  printf '%s — not an account' "$2"
+}
 
-  rl_migrate
-  if [ ! -s "$RATE_LIMIT_FILE" ]; then
-    echo "No usage window has been recorded yet."
-  else
-    local p reason
-    for p in $PLATFORMS; do
-      if [ "$p" = "opencode" ]; then
-        echo "opencode: no usage windows — each provider has its own API, and nothing on the stream or in the export reports one"
-        continue
-      fi
-      "$JQ" -r --arg p "$p" --argjson now "$now" '
-        (.[$p] // {}) | to_entries[]
-        | .value as $v
-        | (if $v.utilization == null then "  ?" else (($v.utilization * 100) | floor | tostring) + "%" end) as $pct
-        | (if $v.resets_at == null then "reset time unknown"
-           elif $v.resets_at <= $now then "that window has already reset — this reading no longer counts"
-           else "resets in " + (((($v.resets_at - $now) / 60) | floor) | tostring) + " min" end) as $when
-        | (((($now - ($v.seen_at // 0)) / 60) | floor) | tostring) as $age
-        | "\($p) \(.key): \($pct) used, \($when)"
-          + "\n  read \($age) min ago from the \($v.source // "run stream")"
-          + (if $v.plan_type != null then " (\($v.plan_type) plan)" else "" end)
-          + (if $v.status != null then ", API said \($v.status)" else "" end)
-          + (if $v.overage == "rejected" then ", overage off (the ceiling is a dead stop)" else "" end)
-      ' "$RATE_LIMIT_FILE" 2>/dev/null
-      if reason="$(rl_gate "$p")" && [ -n "$reason" ]; then
-        echo
-        echo "SCHEDULED $p RUNS ARE BEING HELD BACK: $reason"
-        echo "  (\`agentloop run <job>\` still overrides this, as it does the budget.)"
-      fi
-    done
-  fi
-
-  # The other half: is the figure going to keep arriving? A window whose only
-  # reading came off a run stream is one the gate cannot see below 75%.
-  echo
-  settings="$HOME/.claude/settings.json"
-  cmd=""
+usage_statusline() { # usage_statusline <settings.json> <rate-limit key> <account name, or empty for the Default> -- whether that account's interactive sessions feed its gate
+  local settings="$1" key="$2" tag="" cmd=""
+  [ -z "${3:-}" ] || tag=" ($3)"
   [ -f "$settings" ] && cmd="$("$JQ" -r '.statusLine.command // ""' "$settings" 2>/dev/null)"
   if [ -z "$cmd" ]; then
-    echo "statusline: not configured — the gate is blind below 0.75 utilisation."
+    echo "statusline$tag: not configured — the gate is blind below 0.75 utilisation."
     echo "  Point statusLine at $BIN_DIR/statusline-rate-limits.sh in $settings."
   elif [ "${cmd%statusline-rate-limits.sh}" = "$cmd" ]; then
-    echo "statusline: configured, but not to this script — nothing feeds the gate."
+    echo "statusline$tag: configured, but not to this script — nothing feeds the gate."
     echo "  It runs: $cmd"
   elif [ ! -x "${cmd%% *}" ]; then
-    echo "statusline: configured but NOT RUNNABLE — every session's status line is failing."
+    echo "statusline$tag: configured but NOT RUNNABLE — every session's status line is failing."
     echo "  Missing or not executable: ${cmd%% *}"
   else
-    echo "statusline: wired to ${cmd%% *}"
+    echo "statusline$tag: wired to ${cmd%% *}"
     if [ -s "$RATE_LIMIT_FILE" ] \
-       && "$JQ" -e 'any(.anthropic[]?; .source == "statusline")' "$RATE_LIMIT_FILE" >/dev/null 2>&1; then
+       && "$JQ" -e --arg k "$key" 'any(.[$k][]?; .source == "statusline")' "$RATE_LIMIT_FILE" >/dev/null 2>&1; then
       echo "  and it has fed the gate — readings above are live."
     else
       echo "  but it has never fed the gate yet. The statusLine is read when a"
@@ -4001,6 +4535,93 @@ cmd_usage() {
       echo "  never call it. Open a new interactive session and re-run this."
     fi
   fi
+}
+
+# What the gate can currently see, and whether the thing that feeds it is
+# actually wired up. This exists because the honest answer to "is the statusline
+# working?" was a hand-written one-liner over the JSON — which puts the burden of
+# verifying the product on the person using it. A feature that cannot say whether
+# it is on is a feature nobody can trust.
+cmd_usage() {
+  local now p key keys who reason aid adir read_keys
+  now="$(now_epoch)"
+
+  rl_migrate
+  if [ ! -s "$RATE_LIMIT_FILE" ]; then
+    echo "No usage window has been recorded yet."
+  else
+    for p in $PLATFORMS; do
+      if [ "$p" = "opencode" ]; then
+        echo "opencode: no usage windows — each provider has its own API, and nothing on the stream or in the export reports one"
+        continue
+      fi
+      # The keys some account's runs actually read: the Default's own, plus
+      # every registered account's. A block nothing here reads any more --
+      # what pinning a previously-unpinned install leaves under the bare
+      # platform key, for up to 7 days -- gets no HOLD line below: no
+      # scheduled run is waiting on it, whatever its own reading says.
+      read_keys="$(
+        rl_key "$p" "$(account_env_dir "$p" default)"
+        accounts_json "$p" | "$JQ" -r '.[].id' | while IFS= read -r aid; do
+          rl_key "$p" "$(account_env_dir "$p" "$aid")"
+        done
+      )"
+      # The platform's own block -- the account on the CLI's own directory --
+      # first, then one per other account directory the file holds.
+      keys="$("$JQ" -r --arg p "$p" '[keys_unsorted[] | select(. == $p or startswith($p + "@"))]
+          | (map(select(. == $p)) + map(select(. != $p)))[]' "$RATE_LIMIT_FILE" 2>/dev/null)"
+      while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        # Labelled through usage_account_label, one lookup for every key that
+        # needs one: the bare key is the Default's plain name ONLY while the
+        # read set says the Default is who actually reads it (the CLI's own
+        # directory); once a pin moves the Default's own runs to their own
+        # key, the bare one falls through to the same lookup as any other,
+        # naming the CLI default dir it no longer stands for.
+        if [ "$key" = "$p" ]; then
+          if printf '%s\n' "$read_keys" | grep -qxF "$key"; then who="$p"
+          else who="$p ($(usage_account_label "$p" "$(account_cli_default "$p")"))"; fi
+        else
+          who="$p ($(usage_account_label "$p" "${key#*@}"))"
+        fi
+        "$JQ" -r --arg k "$key" --arg who "$who" --argjson now "$now" '
+          (.[$k] // {}) | to_entries[]
+          | .value as $v
+          | (if $v.utilization == null then "  ?" else (($v.utilization * 100) | floor | tostring) + "%" end) as $pct
+          | (if $v.resets_at == null then "reset time unknown"
+             elif $v.resets_at <= $now then "that window has already reset — this reading no longer counts"
+             else "resets in " + (((($v.resets_at - $now) / 60) | floor) | tostring) + " min" end) as $when
+          | (((($now - ($v.seen_at // 0)) / 60) | floor) | tostring) as $age
+          | "\($who) \(.key): \($pct) used, \($when)"
+            + "\n  read \($age) min ago from the \($v.source // "run stream")"
+            + (if $v.plan_type != null then " (\($v.plan_type) plan)" else "" end)
+            + (if $v.status != null then ", API said \($v.status)" else "" end)
+            + (if $v.overage == "rejected" then ", overage off (the ceiling is a dead stop)" else "" end)
+        ' "$RATE_LIMIT_FILE" 2>/dev/null
+        if printf '%s\n' "$read_keys" | grep -qxF "$key" \
+           && reason="$(rl_gate "$key")" && [ -n "$reason" ]; then
+          echo
+          echo "SCHEDULED $who RUNS ARE BEING HELD BACK: $reason"
+          echo "  (\`agentloop run <job>\` still overrides this, as it does the budget.)"
+        fi
+      done <<EOF
+$keys
+EOF
+    done
+  fi
+
+  # The other half: is the figure going to keep arriving? A window whose only
+  # reading came off a run stream is one the gate cannot see below 75%. The
+  # statusLine lives in each Claude account's own settings.json.
+  echo
+  for aid in default $(accounts_json anthropic | "$JQ" -r '.[].id'); do
+    adir="$(account_env_dir anthropic "$aid")"
+    if [ "$aid" = "default" ] && [ -z "$adir" ]; then
+      usage_statusline "$HOME/.claude/settings.json" anthropic ""
+    else
+      usage_statusline "${adir:-$HOME/.claude}/settings.json" "$(rl_key anthropic "$adir")" "$(account_field anthropic "$aid" name | tr -d '\n')"
+    fi
+  done
   echo "openai: fed by every run's own rollout (the Codex CLI reports both windows on every turn); nothing to wire."
 }
 
@@ -4459,6 +5080,36 @@ USER_SKILLS="$HOME/.claude/skills"
 # on OpenAI is ALSO pointed at security-analysis by path (security_prompt), so
 # it never depends on this link.
 CODEX_SKILLS="$CODEX_HOME_DIR/skills"
+# Claude Code reads the user skills of the config directory it runs with
+# (join(CLAUDE_CONFIG_DIR ?? ~/.claude, "skills"), read off the 2.1.280
+# binary), and Codex those of its CODEX_HOME. So the skills are linked into
+# every account directory as well: a run on another account otherwise reads
+# prompts that make skills mandatory which that directory does not have.
+skills_roots() { # skills_roots -> one directory per line: the Claude root, the Codex root when its home exists, then the skills directory of every other account directory that exists -- never one this tool would have to create
+  local p aid d
+  {
+    printf '%s\n' "$USER_SKILLS"
+    [ -d "$CODEX_HOME_DIR" ] && printf '%s\n' "$CODEX_SKILLS"
+    for p in anthropic openai; do
+      for aid in default $(accounts_json "$p" | "$JQ" -r '.[].id' 2>/dev/null); do
+        d="$(account_env_dir "$p" "$aid")"
+        [ -n "$d" ] && [ -d "$d" ] || continue
+        printf '%s/skills\n' "$d"
+      done
+    done
+  } | awk '!seen[$0]++'
+}
+
+skills_missing() { # skills_missing <root> -> how many of this repo's skills are not linked there; reads only, creates nothing
+  local n=0 target name link
+  for target in "$SKILLS_DIR"/*/; do
+    [ -d "$target" ] || continue
+    name="$(basename "$target")"; link="$1/$name"
+    if [ -L "$link" ] && [ "$(readlink "$link")" = "${target%/}" ]; then continue; fi
+    n=$(( n + 1 ))
+  done
+  printf '%s\n' "$n"
+}
 
 skills_link_into() { # skills_link_into <root> <status|install> -> one line per skill; returns how many are still out of place
   local root="$1" action="$2" name target link pending=0
@@ -4490,18 +5141,20 @@ skills_link_into() { # skills_link_into <root> <status|install> -> one line per 
 }
 
 cmd_skills() { # agentloop skills [install]
-  local action="${1:-status}" _skills_pending=0 _n=0
+  local action="${1:-status}" _skills_pending=0 _n root roots
   [ -d "$SKILLS_DIR" ] || die "no skills/ directory in $BASE_DIR"
-  printf '  %s\n' "$USER_SKILLS"
-  skills_link_into "$USER_SKILLS" "$action" || _skills_pending=$?
-  echo "  OpenCode reads ~/.claude/skills too (measured), so the same link serves both CLIs"
-  # Codex only when its home exists: creating ~/.codex on a machine that never
-  # installed that CLI would be this tool inventing another tool's directory.
-  if [ -d "$CODEX_HOME_DIR" ]; then
-    printf '  %s\n' "$CODEX_SKILLS"
-    skills_link_into "$CODEX_SKILLS" "$action" || _n=$?
+  roots="$(skills_roots)"
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    printf '  %s\n' "$root"
+    _n=0; skills_link_into "$root" "$action" || _n=$?
     _skills_pending=$(( _skills_pending + _n ))
-  fi
+    if [ "$root" = "$USER_SKILLS" ]; then
+      echo "  OpenCode reads ~/.claude/skills too (measured), so the same link serves both CLIs"
+    fi
+  done <<EOF
+$roots
+EOF
   # Only nag when something is actually out of place; a clean status that still
   # tells you to run install is noise that trains you to ignore the output.
   if [ "$action" != "install" ] && [ "$_skills_pending" -gt 0 ]; then
@@ -4650,7 +5303,23 @@ cmd_precheck() { # <id> — run the job's precheck once and RECORD it, without t
   # A probe reports; it must not claim. See AL_PRECHECK_DRY_RUN in the
   # prechecks: a claim is a write, and spending it here leaves a ticket
   # claimed with no session behind it.
-  pc_out="$( cd "$cwd" && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1 && eval "$precheck" 2>&1 )"; pc_rc=$?
+  # The same account as the run it gates (run_job's precheck): a probe that
+  # asks the CLI itself must answer for the account the job signs in as --
+  # and an id Settings no longer has, or an OpenCode job naming one at all,
+  # must refuse HERE too, exactly as the launch gate does, rather than
+  # quietly asking the CLI's own default.
+  local plat acct adir
+  plat="$(job_platform "$id")"; acct="$(job_account "$id")"
+  if [ "$plat" = "opencode" ] && [ "$acct" != "default" ]; then
+    echo "$id: OpenCode has no accounts (account '$acct')"
+    return 1
+  fi
+  if ! account_known "$plat" "$acct"; then
+    echo "$id: account '$acct' is not an account of $plat in Settings"
+    return 1
+  fi
+  adir="$(account_env_dir "$plat" "$acct")"
+  pc_out="$( cd "$cwd" && account_export "$plat" "$adir" && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1 && eval "$precheck" 2>&1 )"; pc_rc=$?
   state_set "$id" last_precheck "$("$JQ" -nc --arg o "${pc_out:-(no output)}" --argjson rc "$pc_rc" '{output:$o, exit:$rc}')"
   printf '%s\n(exit %s)\n' "$pc_out" "$pc_rc"
 }
@@ -4789,7 +5458,7 @@ undelivered_note() { # undelivered_note <description>
 # inputs are arrays, which bash 3.2 cannot pass by name); each header lists
 # what it reads. They never assign one: what goes back goes back as RJ_*.
 
-# run_refusals <id> <platform> <model> <effort> <permission> <allowed> <disallowed> <interactive>
+# run_refusals <id> <platform> <model> <effort> <permission> <allowed> <disallowed> <interactive> <account> <account-dir> <resume-sid>
 #   -> 0 to go on, 1 to refuse -- the reason already in tick.log, exactly as
 #   before: the caller reconstructs nothing. The operator's gates, then the
 #   CLI's own readiness, then the platform blocks (openai, opencode), then
@@ -4801,6 +5470,7 @@ undelivered_note() { # undelivered_note <description>
 run_refusals() {
   RJ_EFFORT=""; RJ_OPENCODE_CONFIG=""
   local id="$1" platform="$2" model="$3" effort="$4" permission="$5" allowed="$6" disallowed="$7" interactive="$8"
+  local account="${9:-default}" account_dir="${10:-}" resume_sid="${11:-}"
   # A run that cannot start is refused HERE, before a slot, a precheck or a
   # turn is spent, with the reason in tick.log -- the treatment `cwd missing`
   # gets. Each of these would otherwise fail at launch with nothing saying why.
@@ -4821,7 +5491,28 @@ run_refusals() {
   if [ -z "$(platform_models_enabled "$platform" | head -1)" ]; then
     log_tick "$id: no model is enabled for $platform in Settings, skipped"; return 1
   fi
-  if ! not_ready="$(platform_ready "$platform")"; then
+  # The account, before the CLI is asked anything: an id Settings no longer
+  # has, or a registered account whose directory is gone, fails at the login
+  # prompt otherwise. A resume is exempt from the id test -- it signs in with
+  # the directory its session was created under, whatever Settings says
+  # today -- but resume_sid arrives here NON-EMPTY only when run_job actually
+  # took the account off that session's journal record for THIS platform; a
+  # resume whose account is still the job's own (an old record with no
+  # account, or one recorded on another platform) gets no exemption at all,
+  # exactly like a plain run. The Default's directory is the install's (the
+  # pin, CODEX_HOME): the readiness check below speaks for it, as it always
+  # has.
+  if [ "$platform" = "opencode" ] && [ "$account" != "default" ]; then
+    log_tick "$id: OpenCode has no accounts (account '$account'), skipped"; return 1
+  fi
+  if [ -z "$resume_sid" ] && ! account_known "$platform" "$account"; then
+    log_tick "$id: account '$account' is not an account of $platform in Settings, skipped"; return 1
+  fi
+  if [ "$account" != "default" ] && [ -n "$account_dir" ] && [ ! -d "$account_dir" ]; then
+    local _an; _an="$(account_field "$platform" "$account" name)"; [ -n "$_an" ] || _an="$account"
+    log_tick "$id: account '$_an' is missing its directory ($account_dir), skipped"; return 1
+  fi
+  if ! not_ready="$(platform_ready "$platform" "$account" "$account_dir")"; then
     log_tick "$id: $platform is not ready ($not_ready), skipped"; return 1
   fi
   if [ "$platform" = "openai" ]; then
@@ -5401,7 +6092,7 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   local id="$1" force="${2:-}" resume_sid="${3:-}"
   [ -n "$resume_sid" ] && force="--force"
   local cwd prompt model effort budget timeout stall permission allowed disallowed precheck project proj_desc interactive fifo
-  local run_cwd worktree run_dir run_env run_cfgdir _envln slot max_par
+  local run_cwd worktree run_dir run_env account account_dir _envln slot max_par
   # Loop variables for replaying a reattached run's manifest through `up` again
   # (see the isolation branch below). Declared here, not just inside the loop,
   # because `read` happily creates GLOBALS for anything not already local, and
@@ -5414,12 +6105,37 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   local platform
   platform="$(resolve "$id" platform 'anthropic')"
   case "$platform" in ''|null) platform="anthropic" ;; esac
-  # Which account this run signs in as: the install's pin, exported as
-  # CLAUDE_CONFIG_DIR at load time, and nothing else -- a project's or a
-  # security block's own claude_config_dir was removed in this version; the
-  # account is the platform's, shown in Settings. Empty here: the two readers
-  # below (the precheck's env, run_env) then leave the exported variable alone.
-  run_cfgdir=""
+  # Which account this run signs in as (see the accounts block): the job's
+  # own, else its project's when both run on the same platform, else the
+  # Default. account_dir is what the platform's variable carries -- empty is
+  # the CLI's own directory, and means the variable is left unset. A RESUME
+  # signs in where its session was created, off the journal: the session is
+  # stored in that account's directory, whatever the job says today -- but
+  # ONLY when that session ran on the platform this job still runs on
+  # (journal_platform_of_session answers "anthropic" for a record with no
+  # platform of its own, same as everywhere else that field is read). A
+  # platform change leaves the job's own account/account_dir in place, so
+  # run_refusals below is asked about the CURRENT platform's own account
+  # instead of the old session's directory under the new CLI, and the
+  # mismatch check further down (unchanged) is the one that names the real
+  # cause. resume_account_sid feeds run_refusals' 11th argument (resume-sid)
+  # and is left EMPTY unless the account above actually came from the
+  # journal just now -- so the "unknown account" gate is exempted only for a
+  # genuine same-platform resume, never for a job's own (possibly stale)
+  # account riding along on a resume of some other session.
+  account="$(job_account "$id")"
+  account_dir="$(account_env_dir "$platform" "$account")"
+  local resume_account_sid=""
+  if [ -n "$resume_sid" ] && [ "$(journal_platform_of_session "$resume_sid")" = "$platform" ]; then
+    local _ra
+    _ra="$(journal_account_of_session "$resume_sid")"
+    if [ -n "$_ra" ]; then
+      IFS="$(printf '\037')" read -r account account_dir <<EOF
+$_ra
+EOF
+      resume_account_sid="$resume_sid"
+    fi
+  fi
   # cwd, model, permission, budget and timeout inherit from the project when the
   # job doesn't set them (see resolve()).
   cwd="$(resolve "$id" cwd "$HOME")"
@@ -5489,7 +6205,7 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   local _inert; _inert="$(permission_inert_warning "$platform" "$permission" "$allowed")"
   [ -z "$_inert" ] || log_tick "$id: $_inert"
 
-  run_refusals "$id" "$platform" "$model" "$effort" "$permission" "$allowed" "$disallowed" "$interactive" || return 1
+  run_refusals "$id" "$platform" "$model" "$effort" "$permission" "$allowed" "$disallowed" "$interactive" "$account" "$account_dir" "$resume_account_sid" || return 1
   effort="$RJ_EFFORT"
   local _occ1; _occ1="$RJ_OPENCODE_CONFIG"
   # Resolved once, after the gate, so the binary that was checked is the
@@ -5554,8 +6270,12 @@ $(run_ending_contract)" ;;
   # than summing a day of runs. Scheduled runs only — Run now is a deliberate
   # override, exactly as it is for the budget and the precheck.
   if [ "$forced" != "true" ]; then
-    local rl_reason
-    if rl_reason="$(rl_gate "$platform")" && [ -n "$rl_reason" ]; then
+    # The account's own windows (rl_key), named in the hold when it is not the Default.
+    local rl_reason _rl_of=""
+    if [ "$account" != "default" ]; then
+      _rl_of="$(account_field "$platform" "$account" name)"; [ -n "$_rl_of" ] || _rl_of="$account"
+    fi
+    if rl_reason="$(rl_gate "$(rl_key "$platform" "$account_dir")" "$_rl_of")" && [ -n "$rl_reason" ]; then
       state_set "$id" last_status '"rate_limited"'
       state_set "$id" last_rate_limit "$("$JQ" -nc --arg r "$rl_reason" '{reason:$r}')"
       log_tick "$id: usage limit reached — $rl_reason — skipping"
@@ -5607,7 +6327,7 @@ $(run_ending_contract)" ;;
     # so a precheck that takes a ticket would move one out of the queue for a
     # run that is never going to look at it. Same contract as the standalone
     # probes: report, touch nothing.
-    pc_out="$( cd "$cwd" && { [ -n "$run_cfgdir" ] && export CLAUDE_CONFIG_DIR="$run_cfgdir"
+    pc_out="$( cd "$cwd" && { account_export "$platform" "$account_dir"
                               [ -n "$resume_sid" ] && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1
                               eval "$precheck" 2>&1; } )"; pc_rc=$?
     state_set "$id" last_precheck "$("$JQ" -nc --arg o "${pc_out:-(no output)}" --argjson rc "$pc_rc" '{output:$o, exit:$rc}')"
@@ -5677,10 +6397,18 @@ ${prompt}"
   # under set -u; this line makes the safety explicit instead of borrowed.
   run_dir=""
   # The env the agent starts with. It exists whether or not this project is
-  # isolated — the account is a property of the project, not of the worktree —
-  # and the worktree's own venv/vars are appended to it below when there is one.
+  # isolated — the account is not a property of the worktree — and the
+  # worktree's own venv/vars are appended to it below when there is one.
+  # First the account: the platform's variable is cleared, then set when the
+  # account has a directory of its own. The engine's environment may carry
+  # the install's pin, and an account on the CLI's own directory needs the
+  # variable GONE, not pointed at ~/.claude. `env` applies the -u before the
+  # assignments. OpenCode has no such variable.
   run_env=()
-  [ -n "$run_cfgdir" ] && run_env+=("CLAUDE_CONFIG_DIR=$run_cfgdir")
+  if account_platform "$platform"; then
+    run_env+=(-u "$(account_var "$platform")")
+    [ -z "$account_dir" ] || run_env+=("$(account_var "$platform")=$account_dir")
+  fi
   # The agent's own process environment -- not the precheck (it already ran,
   # before run_env existed) and not a provisioning hook (those run before this
   # array is finished and read exported AL_* variables).
@@ -5957,6 +6685,10 @@ ${prompt}"
   # A resume is in flight for that session: recorded here so nothing offers to
   # resume it a second time while this one is still working.
   [ -n "$resume_sid" ] && echo "$resume_sid" > "$slot/resume_of" 2>/dev/null || true
+  # The account, for the dialog while the run is going and for a stop that
+  # records the run before it ends (run_record_stopped_early).
+  printf '%s\n' "$account" > "$slot/account" 2>/dev/null || true
+  printf '%s\n' "$account_dir" > "$slot/account_dir" 2>/dev/null || true
   log_tick "$id: starting run ($stamp)"
 
   # stream-json gives one NDJSON event per message — the per-turn trace the
@@ -6113,7 +6845,7 @@ If the work turns out to be already finished, or it can no longer be done at all
   # here because the stream is open in front of us and this is the only place it
   # is ever parsed in full — and recorded even for a failed run, since a run
   # killed AT the ceiling is exactly the one whose reading matters most.
-  rl_capture "$streamfile"
+  rl_capture "$streamfile" "$(rl_key "$platform" "$account_dir")"
 
   end="$(now_epoch)"
   cost="$("$JQ" -r '.total_cost_usd // 0' "$logfile" 2>/dev/null || echo 0)"
@@ -6156,7 +6888,7 @@ If the work turns out to be already finished, or it can no longer be done at all
   # On openai and opencode the init event carries the slug that was ASKED
   # for; the model that ran is in the rollout (openai) or the export
   # (opencode). platform_finish also feeds the usage gate on openai.
-  platform_finish "$platform" "$streamfile" "$session" "$id" "$run_cwd"
+  platform_finish "$platform" "$streamfile" "$session" "$id" "$run_cwd" "${account_dir:-$(account_cli_default openai)}"
   [ -z "$PF_MODEL_ID" ] || model_id="$PF_MODEL_ID"
 
   run_classify
@@ -6196,7 +6928,7 @@ If the work turns out to be already finished, or it can no longer be done at all
       last_cost:($cost|tonumber? // 0),
       last_session:$session, fail_streak:$streak}')"
   # Record what was CHOSEN (the family, when one was) plus what actually ran.
-  record_run "$id" "$status" "$start" "$end" "${cost:-0}" "${turns:-0}" "$session" "$logfile" "$wdreason" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$model_id" "$resume_sid" "$cause" "$platform" "$cost_basis" "$tokens_json"
+  record_run "$id" "$status" "$start" "$end" "${cost:-0}" "${turns:-0}" "$session" "$logfile" "$wdreason" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$model_id" "$resume_sid" "$cause" "$platform" "$cost_basis" "$tokens_json" "$account" "$account_dir"
   # Tells the EXIT path this run has already filed its record, so a stop that
   # lands while we are finishing here cannot produce a second one.
   : > "$slot/journaled" 2>/dev/null || true
@@ -6384,8 +7116,8 @@ cmd_tick() {
 PLIST_PATH_ENV="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 install_migrate_legacy() { # retire the pre-rename agents and symlinks; prints the account they had pinned, if any
-  local old_tick="$HOME/Library/LaunchAgents/$LEGACY_PLIST_LABEL.plist"
-  local old_server="$HOME/Library/LaunchAgents/$LEGACY_SERVER_LABEL.plist"
+  local old_tick="$LAUNCH_AGENTS_DIR/$LEGACY_PLIST_LABEL.plist"
+  local old_server="$LAUNCH_AGENTS_DIR/$LEGACY_SERVER_LABEL.plist"
   local link
   if [ -f "$old_tick" ]; then
     # The account pinned into the old agent has to reach the new one: dropping
@@ -6401,8 +7133,11 @@ if v:
     print(v)
 PY
 )"
+    # Printed on stdout only -- this is a candidate, not yet a fact: cmd_install
+    # decides whether it is actually used (the variable and the new plist both
+    # win over it, and it still has to be an absolute directory), and is the
+    # one that announces it, only when it really is carried forward.
     [ -n "$pinned" ] && printf '%s\n' "$pinned"
-    [ -n "$pinned" ] && echo "carrying the account pinned in $LEGACY_PLIST_LABEL: $pinned" >&2
     launchctl unload "$old_tick" 2>/dev/null
     rm -f "$old_tick"
     echo "retired $LEGACY_PLIST_LABEL" >&2
@@ -6461,7 +7196,33 @@ if v:
 PY
 }
 
+# A pin can be any byte a filesystem allows, and both plists splice it
+# straight into a <string>...</string> element's text -- an unescaped "&" or
+# "<" is invalid XML there, and plistlib's reader (installed_config_dir) then
+# raises, caught, and answers as though nothing were pinned at all: an
+# ordinary directory name (Clients & Co) silently lost the account. Order
+# matters, "&" first, so escaping "<" and ">" never re-escapes the "&" just
+# introduced; a standard XML parser reverses all three on the way back in, so
+# installed_config_dir reads the original path unchanged.
+xml_escape_text() { # xml_escape_text <text> -> the text, safe inside a plist <string>
+  local s="${1:-}"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  printf '%s\n' "$s"
+}
+
 cmd_install() {
+  # A pin that survives ~ expansion but still is not an absolute path is no
+  # pin at all once anything reads it back (account_norm_dir, and every rule
+  # built on it) -- refusing it here, before a byte is written, beats
+  # installing something the engine will then silently treat as unset.
+  # Consistent with the pin never falling back to an ambient CLAUDE_CONFIG_DIR
+  # (see the top of the file): only the explicit setting is judged, and named
+  # by its own variable, never the one it is deliberately not read from.
+  if [ -n "${AGENTLOOP_CLAUDE_CONFIG_DIR:-}" ] && ! account_norm_dir "$AGENTLOOP_CLAUDE_CONFIG_DIR" >/dev/null; then
+    die "AGENTLOOP_CLAUDE_CONFIG_DIR must be absolute or start with ~/ (got '$AGENTLOOP_CLAUDE_CONFIG_DIR')"
+  fi
   # A global default account, carried into launchd — which inherits nothing from
   # the shell, so without this every run signs in as ~/.claude however the
   # scheduler was installed. Taken ONLY from the explicit variable, never from an
@@ -6469,7 +7230,7 @@ cmd_install() {
   # otherwise silently pin that session's account for every job, forever.
   # An install that predates the rename is retired first, and the account it
   # had pinned is read out of it before it goes.
-  local legacy_cfgdir cfgdir plist_cfgdir=""
+  local legacy_cfgdir cfgdir plist_cfgdir="" from_legacy=false
   legacy_cfgdir="$(install_migrate_legacy)"
   # Re-running the installer must not quietly drop an account pinned earlier:
   # the variable, else the one already in the plist.
@@ -6478,6 +7239,31 @@ cmd_install() {
   # variable nor the new plist named one.
   if [ -z "$cfgdir" ] && [ -n "$legacy_cfgdir" ]; then
     cfgdir="$legacy_cfgdir"
+    from_legacy=true
+  fi
+  # A pin already sitting in an existing plist (this install's own, or the
+  # old agent's) can be relative -- from an install older than the refusal
+  # above, or a plist edited by hand. Carrying it forward would rewrite the
+  # very value a run already treats as no pin at all (account_norm_dir), so
+  # every later install would just read it back and repeat the cycle; it is
+  # dropped here instead, with a line naming it and why, and $cfgdir becomes
+  # empty -- exactly like a fresh install with nothing pinned, so the plist
+  # this run writes is finally clean of it.
+  if [ -n "$cfgdir" ] && ! account_norm_dir "$cfgdir" >/dev/null; then
+    echo "the account pinned in the existing install ('$cfgdir') is not an absolute directory — dropped, not carried into this install"
+    cfgdir=""
+    from_legacy=false
+  fi
+  # The legacy pin is announced here, and only here -- once it is known to
+  # actually be the one this install carries forward: it filled an
+  # otherwise-empty $cfgdir (the variable and the new plist both lost to it,
+  # above) AND it survived the absolute-directory check just above.
+  # install_migrate_legacy used to say so on sight, before either of those
+  # was decided -- true when the legacy pin was the only one and usable,
+  # false the rest of the time (the variable or the new plist already named
+  # one, or the legacy pin itself was not absolute).
+  if [ "$from_legacy" = true ]; then
+    echo "carrying the account pinned in $LEGACY_PLIST_LABEL: $cfgdir" >&2
   fi
   if [ -n "$cfgdir" ]; then
     # BOTH names, and the engine's own first. launchd hands the tick exactly
@@ -6490,8 +7276,8 @@ cmd_install() {
     # everything else launchd starts that reads the CLI's own name (the
     # control server, and the CLI itself when nothing overrides it).
     plist_cfgdir="
-    <key>AGENTLOOP_CLAUDE_CONFIG_DIR</key><string>$cfgdir</string>
-    <key>CLAUDE_CONFIG_DIR</key><string>$cfgdir</string>"
+    <key>AGENTLOOP_CLAUDE_CONFIG_DIR</key><string>$(xml_escape_text "$cfgdir")</string>
+    <key>CLAUDE_CONFIG_DIR</key><string>$(xml_escape_text "$cfgdir")</string>"
   fi
 
   # 1) the tick agent — fires the scheduler once a minute
@@ -6574,7 +7360,10 @@ PLIST
   echo "  $PLIST_LABEL   — ticks every 60s (survives logout and reboot)"
   echo "  $SERVER_LABEL  — control dashboard on http://127.0.0.1:$PORT/"
   if [ -n "$cfgdir" ]; then
-    echo "Claude account : $cfgdir"
+    # The Default's directory as the engine actually resolves it (~ expanded,
+    # no trailing slash) -- never $cfgdir raw, which a pin such as ~/.claude/
+    # would otherwise print as though it were a distinct account.
+    echo "Claude account : $(account_default_dir anthropic)"
   else
     echo "Claude account : the CLI default (~/.claude) — set AGENTLOOP_CLAUDE_CONFIG_DIR and re-run to change it"
   fi
@@ -6590,9 +7379,10 @@ PLIST
   # and nothing anywhere says so -- the run just quietly holds a lower bar. So a
   # clone that installs the scheduler installs the skills it depends on, in the
   # same step, rather than leaving it as a documented step somebody skips.
-  echo "Skills (linked into ~/.claude/skills — and into ~/.codex/skills when the Codex CLI has a home):"
+  echo "Skills (linked into ~/.claude/skills, into ~/.codex/skills when the Codex CLI has a home, and into every account directory Settings registers):"
   cmd_skills install
   echo "Open the dashboard with: agentloop dashboard"
+  accounts_migrate_legacy
   legacy_env_warnings
   legacy_scripts_warnings
   statusline_path_warning
@@ -6619,6 +7409,23 @@ age_label() { # age_label <epoch> [zero-label]
   else                          printf '%sd ago' "$(( d / 86400 ))"; fi
 }
 
+status_account_lines() { # status_account_lines <platform> -> one indented line per registered account: its directory, its session, how many run on it, skills not linked there
+  account_platform "$1" || return 0
+  local aid aname adir ach users miss extra
+  for aid in $(accounts_json "$1" | "$JQ" -r '.[].id'); do
+    aname="$(account_field "$1" "$aid" name)"
+    adir="$(account_env_dir "$1" "$aid")"
+    ach="$(account_check_sentence "$1" "$aid")"
+    users="$(num "$(account_users "$1" "$aid" | grep -c . 2>/dev/null)")"
+    extra=""
+    if [ -n "$adir" ] && [ -d "$adir" ]; then
+      miss="$(skills_missing "$adir/skills")"
+      [ "$miss" -eq 0 ] || extra="; $miss skill(s) not linked there (agentloop skills install)"
+    fi
+    printf '            account %s (%s) — %s; used by %s%s\n' "$aname" "${adir:-$(account_cli_default "$1")}" "$ach" "$users" "$extra"
+  done
+}
+
 # Every listed platform, one line each: whether Settings switched it on, the
 # CLI's version and readiness (platform_check's own sentence when not ready),
 # the account it signs in as, how many of its models are switched on -- and
@@ -6634,7 +7441,7 @@ status_platforms_block() { # one line per listed platform: enabled or not, versi
     acct="$(printf '%s' "$j" | "$JQ" -r .account)"; reason="$(printf '%s' "$j" | "$JQ" -r .reason)"
     if platform_planned "$p"; then printf '%-9s : planned — %s\n' "$p" "$reason"; continue; fi
     if platform_enabled "$p"; then state=enabled; else state=disabled; fi
-    if [ "$ready" != "true" ]; then printf '%-9s : %s — %s\n' "$p" "$state" "$reason"; continue; fi
+    if [ "$ready" != "true" ]; then printf '%-9s : %s — %s\n' "$p" "$state" "$reason"; status_account_lines "$p"; continue; fi
     n_on="$(num "$(platform_models_enabled "$p" | grep -c . 2>/dev/null)")"
     # A listed family (platforms.json can still carry a bare "opus", not yet
     # resolved to an id) is folded to the id the cache holds for it before the
@@ -6648,7 +7455,11 @@ status_platforms_block() { # one line per listed platform: enabled or not, versi
     # The pin the INSTALL carries (the variable, then the plist), not this
     # process's CLAUDE_CONFIG_DIR: `agentloop status` typed in a plain shell
     # has none, and would call a pinned install the CLI default.
-    if [ "$p" = "anthropic" ]; then cfg="$(installed_config_dir)"; [ -z "$cfg" ] || acct="$acct (in $cfg)"; fi
+    # Gated on whether a pin exists at all (installed_config_dir, raw); the
+    # directory NAMED is what the engine resolves it to (account_default_dir,
+    # normalized) -- never the raw pin, which a trailing slash or an
+    # unnormalized spelling would otherwise show as written.
+    if [ "$p" = "anthropic" ]; then cfg="$(installed_config_dir)"; [ -z "$cfg" ] || acct="$acct (in $(account_default_dir anthropic))"; fi
     printf '%-9s : %s — %s, %s; %s of %s models enabled' "$p" "$state" "${ver:-$(platform_cli_name "$p")}" "$acct" "$n_on" "$n_all"
     if [ "$p" = "openai" ]; then
       local n u
@@ -6669,6 +7480,7 @@ status_platforms_block() { # one line per listed platform: enabled or not, versi
         "$(opencode_catalog_visible 2>/dev/null | grep -c . || true)" "${nu:-none}"
     fi
     printf '\n'
+    status_account_lines "$p"
   done
 }
 
@@ -7046,6 +7858,30 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
         dm="$(platform_default_permission "$eff" job)"
         write_jobs --arg id "$id" --arg v "$dm" '.jobs = [.jobs[] | if .id == $id then .permission_mode = $v else . end]'
         echo "permission_mode '$cur' is not a $eff mode — rewritten to $dm"
+      fi
+      # The account is one of a platform's too: an own account the new
+      # platform does not have is cleared, and the job inherits. Guarded by
+      # platforms_valid for the same reason the project) arm below is: an
+      # explicit anthropic/openai/opencode value already died above at
+      # platform_usable when platforms.json cannot be read, but the empty
+      # (inherit) case reaches here regardless, and account_known would
+      # then refuse every id.
+      cur="$(job_get "$id" '.account' '')"
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && platforms_valid && ! account_known "$eff" "$cur"; then
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+        echo "account '$cur' is not an account of $eff — cleared, the job inherits"
+      fi ;;
+    account)
+      # Which of the platform's accounts the job signs in as. Empty clears it:
+      # the job then inherits its project's when it runs on the project's
+      # platform, else the Default (job_account).
+      local p
+      p="$(job_platform "$id")"
+      if [ -z "$value" ]; then
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+      else
+        account_known "$p" "$value" || die "account '$value' is not an account of $p — $p has: $(account_ids_line "$p")"
+        write_jobs --arg id "$id" --arg v "$value" '.jobs = [.jobs[] | if .id == $id then .account = $v else . end]'
       fi ;;
     active_hours|description|cwd)
       write_jobs --arg id "$id" --arg f "$field" --arg v "$value" \
@@ -7056,6 +7892,24 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
       else
         write_jobs --arg id "$id" --arg v "$value" \
           '.jobs = [.jobs[] | if .id == $id then .project = $v else . end]'
+      fi
+      # A job with no platform of its own inherits its project's (job_platform)
+      # -- so moving it to another project can change what it effectively
+      # runs on, exactly like the `platform)` arm's own move does, and an own
+      # account only the OLD platform had is left stranded the same way. Read
+      # the account FIRST: job_platform re-derives the security jobs (see
+      # job_get), and most jobs carry no account of their own, so this only
+      # pays for that when there is one to check. platforms_valid guards the
+      # actual clearing, same reason as the platform) arm above: a
+      # platforms.json this cannot read makes account_known refuse every id.
+      local eff cur
+      cur="$(job_get "$id" '.account' '')"
+      if [ -n "$cur" ] && [ "$cur" != "null" ] && platforms_valid; then
+        eff="$(job_platform "$id")"
+        if ! account_known "$eff" "$cur"; then
+          write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+          echo "account '$cur' is not an account of $eff — cleared, the job inherits"
+        fi
       fi ;;
     permission_mode)
       local p
@@ -7222,6 +8076,11 @@ cmd_create() { # reads a partial job object (JSON) from stdin
   # not switched on before spending a `codex debug models` round trip on it,
   # the same order run_job's launch gates use.
   platform_usable "$cplat" || die "create: $cplat is not enabled in Settings — enable it there, or: agentloop platform enable $cplat"
+  local cacct
+  cacct="$(echo "$partial" | "$JQ" -r '.account // ""')"
+  if [ -n "$cacct" ] && ! account_known "$cplat" "$cacct"; then
+    die "create: account '$cacct' is not an account of $cplat — $cplat has: $(account_ids_line "$cplat")"
+  fi
   if [ "$cplat" = "openai" ] && ! openai_catalog_ensure; then
     die "create: no OpenAI catalog yet: install codex, sign in, and run: agentloop resolve-models openai"
   fi
@@ -7295,17 +8154,137 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
     platform_model_enabled "$eff_sp" "$sm" \
       || die "project-set: security.model '$sm' is not enabled in Settings — $eff_sp enables: $(platform_models_enabled_line "$eff_sp")"
   fi
-  # The account is the platform's now (see Settings): a claude_config_dir sent
-  # at either level is dropped from the partial AND from the stored project, and said.
-  if echo "$partial" | "$JQ" -e '((.claude_config_dir // "") != "") or ((((.security | objects) // {}).claude_config_dir // "") != "")' >/dev/null 2>&1; then
-    echo "note: claude_config_dir is ignored since this version — the account is the platform's, see Settings"
+  # A SENT account or security.account has to be one of the resolved
+  # platform's own, judged against the registry as it stands right now --
+  # BEFORE accounts_migrate_legacy below gets a chance to touch this project,
+  # so a refused save never mutates config, this project's own leftover
+  # claude_config_dir included. A value only STORED (never sent) is judged
+  # again after migration, once a leftover directory has had its chance to
+  # become a real, valid account.
+  local pre_merged pre_mp pre_msp pre_ma pre_msa
+  pre_merged="$(projects_json | "$JQ" -c --arg n "$name" --argjson p "$partial" '([.projects[] | select(.name == $n)] | first // {}) * $p')"
+  pre_mp="$(echo "$pre_merged" | "$JQ" -r '.platform // ""')"; [ -n "$pre_mp" ] || pre_mp="anthropic"; platform_known "$pre_mp" || pre_mp="anthropic"
+  pre_msp="$(echo "$pre_merged" | "$JQ" -r '((.security | objects) // {}).platform // ""')"; [ -n "$pre_msp" ] || pre_msp="$pre_mp"; platform_known "$pre_msp" || pre_msp="anthropic"
+  pre_ma="$(echo "$pre_merged" | "$JQ" -r '.account // ""')"
+  pre_msa="$(echo "$pre_merged" | "$JQ" -r '((.security | objects) // {}).account // ""')"
+  if [ -n "$pre_ma" ] && ! account_known "$pre_mp" "$pre_ma" && echo "$partial" | "$JQ" -e 'has("account")' >/dev/null 2>&1; then
+    die "project-set: account '$pre_ma' is not an account of $pre_mp — $pre_mp has: $(account_ids_line "$pre_mp")"
   fi
-  partial="$(echo "$partial" | "$JQ" -c 'del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end')"
+  if [ -n "$pre_msa" ] && ! account_known "$pre_msp" "$pre_msa" && echo "$partial" | "$JQ" -e '((.security | objects) // {}) | has("account")' >/dev/null 2>&1; then
+    die "project-set: security.account '$pre_msa' is not an account of $pre_msp — $pre_msp has: $(account_ids_line "$pre_msp")"
+  fi
+  # A leftover claude_config_dir this file still carries (from before the
+  # account lived in Settings) is converted to a real account now, exactly as
+  # install does -- only for the project being saved, never any other, and
+  # only now that every refusal above has been decided. Only when
+  # platforms.json is valid: account registration is impossible otherwise,
+  # and a level the migration would have left in place is exactly what the
+  # drop below also leaves alone in that case, so the field survives as the
+  # only record of that account until it can be read again.
+  #
+  # The dashboard's save (saveProject) sends EVERY level's account -- "" for
+  # a level its editor showed none on, which is exactly the level a leftover
+  # directory has not been turned into an account yet. Merged as sent, that
+  # "" landed on the account the conversion had just set: the project back
+  # on the Default, the new account registered with nothing pointing at it,
+  # and "is now the account" printed over it. So a level the conversion
+  # FILLS keeps what it was given, and an empty value sent for that level is
+  # dropped from the save; a value that is not empty is the level's choice
+  # and wins -- and the conversion, told about it, registers nothing for a
+  # level whose save picks an account of its own.
+  if platforms_valid; then
+    local sent_pa sent_sa had_pa had_sa has_pa has_sa
+    sent_pa="$(echo "$partial" | "$JQ" -r '.account // ""')"
+    sent_sa="$(echo "$partial" | "$JQ" -r '((.security | objects) // {}).account // ""')"
+    # A CLI project-set that never mentions .account at all (`.account //
+    # ""`, above) reads identically to one that sends an explicit "" --
+    # accounts_migrate_legacy needs the two told apart (round 2, finding 1),
+    # so this says whether the key was actually there.
+    has_pa="$(echo "$partial" | "$JQ" -r 'if has("account") then "1" else "" end')"
+    has_sa="$(echo "$partial" | "$JQ" -r '((.security | objects) // {}) | if has("account") then "1" else "" end')"
+    had_pa="$(project_get "$name" '.account' '')"; had_sa="$(security_get "$name" '.account' '')"
+    accounts_migrate_legacy "$name" "$sent_pa" "$sent_sa" "$has_pa" "$has_sa"
+    if [ -z "$had_pa" ] && [ -n "$(project_get "$name" '.account' '')" ]; then
+      partial="$(echo "$partial" | "$JQ" -c 'if (.account // "") == "" then del(.account) else . end')"
+    fi
+    if [ -z "$had_sa" ] && [ -n "$(security_get "$name" '.account' '')" ]; then
+      partial="$(echo "$partial" | "$JQ" -c 'if (.security | type) == "object" and ((.security.account // "") == "") then .security |= del(.account) else . end')"
+    fi
+  fi
+  # The account each level signs in as has to be one of that level's own
+  # platform -- judged on the project as it will be once this save merges
+  # (jq `. * $p`), now that any leftover claude_config_dir above has had its
+  # chance to become a real, valid stored account. A value SENT that is not
+  # one already died above; one only STORED that a platform change leaves
+  # behind is cleared after the save, and said.
+  local merged mp msp ma msa drop="" had_ccd=false
+  merged="$(projects_json | "$JQ" -c --arg n "$name" --argjson p "$partial" '([.projects[] | select(.name == $n)] | first // {}) * $p')"
+  if platforms_valid; then
+    echo "$merged" | "$JQ" -e 'has("claude_config_dir") or (((.security | objects) // {}) | has("claude_config_dir"))' >/dev/null 2>&1 \
+      && had_ccd=true
+  fi
+  mp="$(echo "$merged" | "$JQ" -r '.platform // ""')"; [ -n "$mp" ] || mp="anthropic"; platform_known "$mp" || mp="anthropic"
+  msp="$(echo "$merged" | "$JQ" -r '((.security | objects) // {}).platform // ""')"; [ -n "$msp" ] || msp="$mp"; platform_known "$msp" || msp="anthropic"
+  ma="$(echo "$merged" | "$JQ" -r '.account // ""')"
+  msa="$(echo "$merged" | "$JQ" -r '((.security | objects) // {}).account // ""')"
+  if [ -n "$ma" ] && ! account_known "$mp" "$ma"; then
+    # A platforms.json this cannot read makes account_known refuse every id --
+    # not a real platform change, so a value only STORED is left exactly as
+    # it was rather than cleared on a false alarm.
+    platforms_valid && drop="$drop project"
+  fi
+  if [ -n "$msa" ] && ! account_known "$msp" "$msa"; then
+    platforms_valid && drop="$drop security"
+  fi
+  # claude_config_dir is never read (accounts live in Settings) -- the
+  # migration above already converted what it could; this still drops it
+  # unconditionally at both levels on every save, sent or not, so a level
+  # accounts_migrate_legacy left in place does not linger past the next
+  # time this project is saved. Skipped when platforms.json cannot be read,
+  # exactly like the migration above -- dropping the field here would throw
+  # away the only record of that account, with no way to get it back.
+  local keep_ccd=false
+  platforms_valid || keep_ccd=true
   if projects_json | "$JQ" -e --arg n "$name" 'any(.projects[]; .name==$n)' >/dev/null 2>&1; then
-    write_projects --arg n "$name" --argjson p "$partial" \
-      '.projects = [.projects[] | if .name==$n then ((. * $p) | del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end) else . end]'
+    write_projects --arg n "$name" --argjson p "$partial" --argjson keep "$keep_ccd" \
+      '.projects = [.projects[] | if .name==$n
+          then ((. * $p) | if $keep then . else (del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end) end)
+          else . end]'
   else
-    write_projects --argjson p "$partial" '.projects += [$p]'
+    write_projects --argjson p "$partial" --argjson keep "$keep_ccd" \
+      '.projects += [($p | if $keep then . else (del(.claude_config_dir) | if (.security | type) == "object" then .security |= del(.claude_config_dir) else . end) end)]'
+  fi
+  case "$drop" in *project*)
+    write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n then del(.account) else . end]'
+    echo "account '$ma' is not an account of $mp — cleared, the project runs on the Default account" ;;
+  esac
+  case "$drop" in *security*)
+    write_projects --arg n "$name" '.projects = [.projects[] | if .name == $n and (.security | type) == "object" then .security |= del(.account) else . end]'
+    echo "security.account '$msa' is not an account of $msp — cleared, the analysis inherits" ;;
+  esac
+  [ "$had_ccd" = true ] \
+    && echo "claude_config_dir on $name dropped — it is not read; pick the account in the project editor"
+  # A job's own account can be orphaned by a route other than `set-field
+  # <job> platform` too: this save may have just moved the project (or its
+  # security block) onto a platform that leaves a job's own account behind --
+  # job_platform inherits the project's for a job that names no platform of
+  # its own. Read the id and the own account TOGETHER, straight off
+  # $JOBS_FILE (never job_get, which re-derives the security jobs on every
+  # call): only a job that actually carries one pays job_platform/
+  # account_known, instead of every job of the project. A platforms.json
+  # this cannot read makes account_known refuse every id, so the whole pass
+  # is skipped rather than clearing a valid account on a false alarm. One
+  # line per job actually cleared.
+  local jid jacct jeff
+  if platforms_valid; then
+    "$JQ" -r --arg n "$name" '.jobs[]? | select(.project == $n) | select((.account // "") != "") | [.id, .account] | @tsv' "$JOBS_FILE" 2>/dev/null \
+    | while IFS="$(printf '\t')" read -r jid jacct; do
+        [ -n "$jid" ] || continue
+        jeff="$(job_platform "$jid")"
+        account_known "$jeff" "$jacct" && continue
+        write_jobs --arg id "$jid" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+        echo "job $jid: account '$jacct' is not an account of $jeff — cleared, the job inherits"
+      done
   fi
   # Best effort, and never the reason a save fails: the event is a record of
   # what happened, not a gate on whether it is allowed to happen.
@@ -7412,6 +8391,24 @@ cmd_project_rename() { # <old-name> <new-name> — the project and every job poi
 cmd_project_delete() { # <name> — the project is removed; jobs keep .project (just stop inheriting)
   local name="$1"
   write_projects --arg n "$name" '.projects = [.projects[] | select(.name != $n)]'
+  # A job that named this project falls back to anthropic now (job_platform,
+  # with no project left to inherit a platform from) -- an own account only
+  # valid on the platform the project used to run on is left stranded, the
+  # same way a project-set platform change strands one (cmd_project_set's own
+  # save does the identical cleanup, above). Same read, same guard: skip the
+  # whole pass rather than clear a valid account on a platforms.json this
+  # cannot read.
+  local jid jacct jeff
+  if platforms_valid; then
+    "$JQ" -r --arg n "$name" '.jobs[]? | select(.project == $n) | select((.account // "") != "") | [.id, .account] | @tsv' "$JOBS_FILE" 2>/dev/null \
+    | while IFS="$(printf '\t')" read -r jid jacct; do
+        [ -n "$jid" ] || continue
+        jeff="$(job_platform "$jid")"
+        account_known "$jeff" "$jacct" && continue
+        write_jobs --arg id "$jid" '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]'
+        echo "job $jid: account '$jacct' is not an account of $jeff — cleared, the job inherits"
+      done
+  fi
   echo "project '$name' deleted"
 }
 
@@ -7457,7 +8454,7 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop create <id>     create a job from a partial JSON object on stdin
   agentloop set-prompt <id> replace a job's prompt, read from stdin
   agentloop set-field <id> <field>   set interval_seconds|active_hours|active_days|
-                              platform|model|max_budget_usd|timeout_seconds|
+                              platform|account|model|max_budget_usd|timeout_seconds|
                               stall_timeout_seconds, value from stdin
   agentloop set-precheck <id>   replace a job's precheck script, read from stdin
   agentloop provision-set <project> <up|down>   replace a worktree provisioning hook (stdin)
@@ -7468,7 +8465,7 @@ agentloop — durable local scheduler for headless Claude Code runs
                               SBOM, hygiene and infrastructure-as-code
                               misconfigurations run first at no token cost,
                               then a Claude run does the SAST and the triage.
-                              <repo> names one of the project's `repos`; a
+                              <repo> names one of the project's repos; a
                               project with a single checkout has none, and every
                               analysis of it is filed under the PROJECT's name
                               whatever is typed here, so one project always has
@@ -7477,9 +8474,10 @@ agentloop — durable local scheduler for headless Claude Code runs
                               (what the dashboard's Analyse button uses);
                               without it the command stays until the run ends
   agentloop security render --analysis <n> --format <json|md|html|sbom>
-                              the report for one analysis, or (`sbom`) the
-                              stored SBOM document itself (see `security` with
-                              no arguments for the rest of the vocabulary)
+                              the report for one analysis, or (sbom) the
+                              stored SBOM document itself (see agentloop
+                              security with no arguments for the rest of the
+                              vocabulary)
   agentloop security-branches <project> <repo>
                               list the branches of a project's canonical
                               checkout, local and origin's, for a branch picker
@@ -7492,9 +8490,26 @@ agentloop — durable local scheduler for headless Claude Code runs
                               source (daily on its own)
   agentloop platforms       what each platform offers (permission modes,
                               efforts, defaults) and whether it is ready
-  agentloop platform check|enable|disable|set-bin|models|set-models <platform> [path]
-                            what Settings › Platforms does: probe a CLI, switch a platform on or off,
-                            point at its binary, refresh its catalog, choose its models (JSON list on stdin)
+  agentloop platform check <platform> [id]
+                            what Settings › Platforms does, one verb per control: probe a CLI and
+                            the session of one account (the Default without an id)
+  agentloop platform enable|disable <platform>
+                            switch a platform on or off (enable refuses while that check fails)
+  agentloop platform set-bin <platform> [path]
+                            point at its binary (no path: back to detection)
+  agentloop platform models <platform>
+                            refresh its catalog and list it
+  agentloop platform set-models <platform>
+                            choose its models (a JSON list on stdin)
+  agentloop platform accounts <platform>
+                            every sign-in the platform runs under, the install's Default first,
+                            each with its session and who runs on it (anthropic and openai)
+  agentloop platform account-add <platform> <name> <dir>
+                            register an account: a name, and the config directory it signs in with
+  agentloop platform account-edit <platform> <id> <name> <dir>
+                            rename or move one (its id never changes)
+  agentloop platform account-remove <platform> <id>
+                            remove one nothing runs on
   agentloop tick            internal — what launchd calls every minute
 
 Jobs are defined in $JOBS_FILE
@@ -7505,15 +8520,43 @@ cmd_check() {
   local id="$1" precheck cwd
   precheck="$(jobs_json | "$JQ" -r --arg id "$id" '.jobs[] | select(.id==$id) | .precheck // ""')"
   cwd="$(resolve "$id" cwd "$HOME")"   # inherit the project's cwd, like run_job
+  # Read-only, like every standalone probe (see AL_PRECHECK_DRY_RUN). The
+  # same account as the run it gates -- an id Settings no longer has, or an
+  # OpenCode job naming one at all, must refuse HERE too, exactly as the
+  # launch gate does, rather than quietly asking the CLI's own default.
+  # Ahead of the "no precheck" return below: every due tick would be refused
+  # at this same gate regardless, and a job stuck on it deserves better than
+  # a blanket "nothing to do".
+  local plat acct adir
+  plat="$(job_platform "$id")"; acct="$(job_account "$id")"
+  if [ "$plat" = "opencode" ] && [ "$acct" != "default" ]; then
+    echo "$id: OpenCode has no accounts (account '$acct')"
+    return 1
+  fi
+  if ! account_known "$plat" "$acct"; then
+    echo "$id: account '$acct' is not an account of $plat in Settings"
+    return 1
+  fi
   [ -n "$precheck" ] || { echo "$id has no precheck — every due tick spends a session."; return 0; }
-  # Read-only, like every standalone probe (see AL_PRECHECK_DRY_RUN).
-  ( cd "$cwd" && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1 && eval "$precheck" ); local rc=$?
+  adir="$(account_env_dir "$plat" "$acct")"
+  ( cd "$cwd" && account_export "$plat" "$adir" && export AL_PRECHECK_DRY_RUN=1 CC_PRECHECK_DRY_RUN=1 && eval "$precheck" ); local rc=$?
   case "$(precheck_verdict "$rc")" in
     work)  echo "precheck: WORK FOUND — a due tick would start a Claude run" ;;
     idle)  echo "precheck: nothing to do — a due tick would cost nothing" ;;
     *)     echo "precheck: BROKEN (exit $rc) — the probe could not run, so this job is stuck: it will never find work until this is fixed" ; return 1 ;;
   esac
 }
+
+# The install's pin, exported for what this process starts outside a run's
+# own environment (see the top of this file): by account_env_value, the one
+# rule every account directory is exported by -- ~ expanded, no trailing
+# slash, and the variable left UNSET when the pin is the CLI's own
+# ~/.claude. Exported raw, a pin written ~/.claude, or $HOME/.claude/, sent
+# the model probes and the hooks to another Keychain entry (no session),
+# while check, enable and every run called the same account signed in.
+if [ -n "${AGENTLOOP_CLAUDE_CONFIG_DIR:-}" ]; then
+  account_export anthropic "$(account_env_value anthropic "$AGENTLOOP_CLAUDE_CONFIG_DIR")"
+fi
 
 case "${1:-}" in
   install)   cmd_install ;;

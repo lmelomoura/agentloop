@@ -389,6 +389,46 @@
     }
     return out;
   }
+  function accountsOf(platform, platforms) {
+    const p = (platforms || {})[platformKey(platform)];
+    const list = p && Array.isArray(p.accounts) ? p.accounts : [];
+    return list.filter((a) => a && typeof a.id === "string" && a.id && a.id !== "default" && typeof a.name === "string" && typeof a.dir === "string");
+  }
+  function accountGone(platform, id, platforms) {
+    if (!id || id === "default") return false;
+    const known = !!(platforms || {})[platformKey(platform)];
+    return known && !accountsOf(platform, platforms).some((a) => a.id === id);
+  }
+  function accountName(platform, id, platforms) {
+    if (!id || id === "default") return "Default";
+    const hit = accountsOf(platform, platforms).find((a) => a.id === id);
+    return hit ? hit.name : id;
+  }
+  function inheritedAccountName(platform, project, platforms) {
+    if (!project) return "";
+    const pp = KNOWN_PLATFORMS.includes(project.platform) ? project.platform : "anthropic";
+    if (pp !== platformKey(platform)) return "";
+    const a = project.account;
+    if (!a || a === "default") return "";
+    return accountName(platform, a, platforms);
+  }
+  function accountNoneLabel(inheritName) {
+    return inheritName ? "\u2014 Project's account (" + inheritName + ") \u2014" : "\u2014 Default \u2014";
+  }
+  var ACCOUNT_GONE_SUFFIX = " (not in Settings)";
+  function accountOptions(platform, platforms, current) {
+    const list = accountsOf(platform, platforms);
+    const p = (platforms || {})[platformKey(platform)];
+    const ddir = p && typeof p.default_dir === "string" ? p.default_dir : "";
+    const opts = [{ v: "default", label: ddir ? "Default \u2014 " + ddir : "Default" }].concat(list.map((a) => ({ v: a.id, label: a.name + " \u2014 " + a.dir })));
+    if (current && current !== "default" && !list.some((a) => a.id === current)) {
+      opts.push(accountGone(platform, current, platforms) ? { v: current, label: current + ACCOUNT_GONE_SUFFIX, flagged: true } : { v: current, label: current });
+    }
+    return opts;
+  }
+  function accountChoice(platform, platforms, current) {
+    return accountOptions(platform, platforms, current).length > 1;
+  }
   function hiddenModelCount(platform, platforms) {
     const key = platformKey(platform);
     const p = (platforms || {})[key];
@@ -2453,7 +2493,8 @@
     { id: "openai", name: "OpenAI", cli: "codex", sub: "Codex CLI \u2014 codex exec --json", mark: "O" },
     { id: "opencode", name: "OpenCode", cli: "opencode", sub: "OpenCode \u2014 opencode run --format json", mark: "OC" }
   ];
-  var live = { checks: {}, checkedAt: {}, catalogs: {}, busy: {}, notes: {}, typedBin: {} };
+  var ACCOUNT_PLATFORMS = ["anthropic", "openai"];
+  var live = { checks: {}, checkedAt: {}, catalogs: {}, busy: {}, notes: {}, typedBin: {}, accounts: {}, acctForm: {} };
   var ctx = null;
   var probed = false;
   var repainting = false;
@@ -2554,6 +2595,7 @@
     live.busy[id] = false;
     paint();
     if (j && j.check && j.check.ready && !live.catalogs[id]) await loadCatalog(id);
+    await loadAccounts(id);
   }
   async function loadCatalog(id) {
     live.busy[id] = true;
@@ -2562,6 +2604,129 @@
     if (j && j.catalog) live.catalogs[id] = j.catalog;
     live.busy[id] = false;
     paint();
+  }
+  async function loadAccounts(id) {
+    if (!ACCOUNT_PLATFORMS.includes(id)) return;
+    live.busy[id] = true;
+    paint();
+    const j = await post("platform_accounts", { platform: id });
+    if (j && Array.isArray(j.accounts)) {
+      live.accounts[id] = j.accounts;
+      const f = live.acctForm[id];
+      if (f && f.mode === "edit" && !j.accounts.some((a) => a.id === f.id)) delete live.acctForm[id];
+    }
+    live.busy[id] = false;
+    paint();
+  }
+  function accountStatusText(platform, check) {
+    if (!check) return { ok: null, text: "\u2014 not checked" };
+    if (check.ready) return { ok: true, text: platform === "anthropic" ? "Signed in as " + (check.account || "unknown") : check.account || "signed in" };
+    return { ok: false, text: check.reason || "not signed in" };
+  }
+  function accountUsersText(used) {
+    const u = used || {}, parts = [];
+    const add = (list, one, many) => {
+      const n = (list || []).length;
+      if (n) parts.push(n + " " + (n === 1 ? one : many));
+    };
+    add(u.jobs, "job", "jobs");
+    add(u.projects, "project", "projects");
+    add(u.security, "analysis", "analyses");
+    return parts.length ? "used by " + parts.join(", ") : "nothing runs on it yet";
+  }
+  function accountRow(r, a) {
+    const row = el("div", "mrow");
+    const name = el("div", "mname");
+    name.appendChild(el("b", null, a.builtin ? "Default \u2014 the install's own" : a.name));
+    name.appendChild(el("span", null, a.dir));
+    name.appendChild(el("span", "acct-users", accountUsersText(a.used_by)));
+    const st = accountStatusText(r.id, a.check);
+    const sl = el("span", "acct-st" + (st.ok === true ? " ok" : st.ok === false ? " err" : ""));
+    sl.appendChild(icon(st.ok === false ? "xcircle" : st.ok === true ? "check" : "clock"));
+    sl.appendChild(document.createTextNode(st.text));
+    name.appendChild(sl);
+    row.appendChild(name);
+    const meta = el("div", "mmeta");
+    if (!a.builtin) {
+      const locked = live.busy[r.id] || !!live.acctForm[r.id];
+      meta.appendChild(button("Edit", "pencil", () => {
+        live.acctForm[r.id] = { mode: "edit", id: a.id, name: a.name, dir: a.dir };
+        paint();
+      }, locked));
+      meta.appendChild(button("Remove", "trash", () => removeAccount(r.id, a), locked));
+    }
+    row.appendChild(meta);
+    return row;
+  }
+  function accountForm(r) {
+    const f = live.acctForm[r.id];
+    const row = el("div", "mrow acctform");
+    const ctrl = el("div", "ctrl");
+    const nm = el("input");
+    nm.type = "text";
+    nm.id = "acct-name-" + r.id;
+    nm.value = f.name || "";
+    nm.placeholder = "Name \u2014 e.g. Client A";
+    const dir = el("input");
+    dir.type = "text";
+    dir.id = "acct-dir-" + r.id;
+    dir.value = f.dir || "";
+    dir.placeholder = r.id === "anthropic" ? "~/.claude-client-a \u2014 the CLAUDE_CONFIG_DIR it signs in with" : "~/.codex-client-a \u2014 the CODEX_HOME it signs in with";
+    const browse = el("button", "btn");
+    browse.type = "button";
+    browse.dataset.cwdTarget = dir.id;
+    browse.appendChild(document.createTextNode("Browse\u2026"));
+    ctrl.appendChild(nm);
+    ctrl.appendChild(dir);
+    ctrl.appendChild(browse);
+    ctrl.appendChild(button(f.mode === "edit" ? "Save" : "Add", "check", () => saveAccount(r.id), live.busy[r.id]));
+    ctrl.appendChild(button("Cancel", null, () => {
+      delete live.acctForm[r.id];
+      paint();
+    }, live.busy[r.id]));
+    row.appendChild(ctrl);
+    return row;
+  }
+  async function saveAccount(pid) {
+    const f = live.acctForm[pid];
+    if (!f) return;
+    const n = $("acct-name-" + pid), d = $("acct-dir-" + pid);
+    if (n) f.name = n.value;
+    if (d) f.dir = d.value;
+    const ok = f.mode === "edit" ? await change("platform_account_edit", { platform: pid, id: f.id, name: (f.name || "").trim(), dir: (f.dir || "").trim() }) : await change("platform_account_add", { platform: pid, name: (f.name || "").trim(), dir: (f.dir || "").trim() });
+    if (!ok) return;
+    delete live.acctForm[pid];
+    await loadAccounts(pid);
+  }
+  async function removeAccount(pid, a) {
+    const ok = await change("platform_account_remove", { platform: pid, id: a.id });
+    if (ok) await loadAccounts(pid);
+  }
+  function accountsSection(r) {
+    const frag = document.createDocumentFragment();
+    const head = el("div", "models-h");
+    head.appendChild(el("h3", null, "Accounts"));
+    head.appendChild(el("span", "age", r.id === "anthropic" ? "one per Claude config directory (CLAUDE_CONFIG_DIR) \u2014 jobs, projects and analyses pick one" : "one per Codex home (CODEX_HOME) \u2014 jobs, projects and analyses pick one"));
+    head.appendChild(el("span", "sp"));
+    head.appendChild(button(
+      "Add account",
+      "plus",
+      () => {
+        live.acctForm[r.id] = { mode: "add", name: "", dir: "" };
+        paint();
+      },
+      live.busy[r.id] || !!live.acctForm[r.id]
+    ));
+    frag.appendChild(head);
+    const list = live.accounts[r.id];
+    const form = live.acctForm[r.id];
+    if (!list) {
+      frag.appendChild(el("div", "mempty", live.busy[r.id] ? "Checking the accounts\u2026" : "The accounts have not been checked yet \u2014 Test checks them."));
+    } else {
+      list.forEach((a) => frag.appendChild(form && form.mode === "edit" && form.id === a.id ? accountForm(r) : accountRow(r, a)));
+    }
+    if (form && form.mode === "add") frag.appendChild(accountForm(r));
+    return frag;
   }
   async function change(op, extra) {
     live.busy[extra.platform] = true;
@@ -2602,6 +2767,7 @@
     const ctrl = el("div", "ctrl");
     const inp = el("input");
     inp.type = "text";
+    inp.id = "bin-" + r.id;
     inp.value = live.typedBin[r.id] !== void 0 ? live.typedBin[r.id] : entry.bin || "";
     inp.placeholder = "Use another binary\u2026 (leave empty to detect)";
     inp.disabled = !!live.busy[r.id] || entry.supported === false;
@@ -2784,6 +2950,7 @@
     g.appendChild(binaryBlock(r, entry, check));
     g.appendChild(sessionBlock(r, entry, check));
     card.appendChild(g);
+    if (ACCOUNT_PLATFORMS.includes(r.id) && entry.supported !== false) card.appendChild(accountsSection(r));
     card.appendChild(modelsSection(r, entry, check, catalog));
     return card;
   }
@@ -2798,10 +2965,17 @@
       subtitle: "Which agent CLIs this scheduler may run, and which of their models a job may pick."
     }));
     const active = document.activeElement;
+    ACCOUNT_PLATFORMS.forEach((pid) => {
+      const f = live.acctForm[pid];
+      if (!f) return;
+      const n = $("acct-name-" + pid), d = $("acct-dir-" + pid);
+      if (n) f.name = n.value;
+      if (d) f.dir = d.value;
+    });
     let savedFocus = null;
     if (active && active.tagName === "INPUT" && active.type === "text" && host.contains(active)) {
       const card = active.closest("section.platcard");
-      if (card) savedFocus = { cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd };
+      if (card) savedFocus = { cardId: card.id, value: active.value, selectionStart: active.selectionStart, selectionEnd: active.selectionEnd, inputId: active.id || "" };
     }
     repainting = true;
     try {
@@ -2817,7 +2991,7 @@
     }
     if (savedFocus) {
       const card = $(savedFocus.cardId);
-      const inp = card && card.querySelector(".ctrl input");
+      const inp = savedFocus.inputId ? $(savedFocus.inputId) : card && card.querySelector(".ctrl input");
       if (inp) {
         inp.value = savedFocus.value;
         inp.setSelectionRange(savedFocus.selectionStart, savedFocus.selectionEnd);
@@ -3039,6 +3213,25 @@
     registryKnown,
     platformOptions,
     hiddenModelCount,
+    // accountsOf, accountChoice, accountName, inheritedAccountName,
+    // accountNoneLabel, ACCOUNT_GONE_SUFFIX and accountOptions are
+    // Task 6's (the platforms UI plan): the Account combo's own read
+    // of what Settings registered on a platform, the same shape
+    // platformOptions above already gives the Platform combo.
+    // accountGone is Task 6's fix round 2: the one rule for whether a
+    // stored id is truly gone -- never while the platform itself has
+    // not loaded yet -- that accountOptions and accountCell
+    // (bin/dashboard.html) both read, instead of each guessing it from
+    // accountsOf on its own and reading an empty, not-yet-fetched
+    // registry as "everything is gone".
+    accountsOf,
+    accountGone,
+    accountChoice,
+    accountName,
+    inheritedAccountName,
+    accountNoneLabel,
+    ACCOUNT_GONE_SUFFIX,
+    accountOptions,
     platformState,
     platformChip,
     // modelEnabled and DISABLED_SUFFIX are Task 7's fix wave 1:
@@ -3081,5 +3274,5 @@
     newerModelNotes
   };
 })();
-/* ui-bundle: 4e788223f1097169306303297183b6df4eed3073bfac9d730d2ac68867083879 */
-/* ui-sources: 921ad9161b3324699171abac8807904b91ef2844429ae5d73598058f5208dcd3 */
+/* ui-bundle: ae70d7abbcc70ee332cb721bca160073ca2a3f364ab1bcc8a2cacef81673ea91 */
+/* ui-sources: 303ead1be8b8fc9661215e0c8145e093e9cffbff0e6f69b2956ccff86d5cb470 */

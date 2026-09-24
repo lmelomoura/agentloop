@@ -246,6 +246,7 @@ A job is one object in `config/jobs.json`. Fields:
 | `active_days` | `[1..7]`, 1=Mon |
 | `project` | optional group; the job inherits the project's `cwd` (see **Projects**) |
 | `platform` | `anthropic` (Claude Code), `openai` (Codex CLI) or `opencode` (OpenCode CLI); omit to inherit the project's, which defaults to `anthropic`. `model`, `effort` and `permission_mode` keep their names and take that platform's vocabulary — see **Platforms** |
+| `account` | the sign-in the job runs under: the id of an account registered for its platform in Settings › Platforms, or `default`; omit to inherit — the project's account when the job runs on the project's platform, else the platform's Default. `set-field` and `create` refuse an id the platform does not have, and a platform change that leaves the job's own account behind clears it, and says so. OpenCode has no accounts — see [Accounts](#accounts--which-sign-in-a-run-uses) |
 | `model` | an exact model id (`claude-opus-5`, …) or a family (`opus`/`sonnet`/`haiku`/`fable`). On `openai`: a catalog slug (`gpt-5.6-sol`), verbatim. On `opencode`: `provider/model`, the CLI's own id (`pdm_ai/glm-5.3-flash`), verbatim; the first slash separates the provider |
 | `effort` | `low`/`medium`/`high`/`xhigh`/`max` — how hard the model thinks (omit = the CLI decides). On `openai`: the model's own levels (up to `ultra`). On `opencode`: one of the model's `variants` (`high`, `max`, `non-think`, … per model); a model without variants takes none |
 | `max_budget_usd` | hard ceiling per single run |
@@ -1222,45 +1223,80 @@ fixing one field never means walking the other two.
 back to and why that is usually not what you want. Add `repos` only when one
 ticket really does touch several repositories.
 
-### Which Claude account a run signs in as
+### Accounts — which sign-in a run uses
 
-Claude Code keeps credentials, settings, plugins, MCP servers and past sessions
-**per config directory** — one signed-in account each. If you keep two accounts
-on the same Mac (a company one and a personal one, say), the directory is the
-only thing that chooses between them:
+Claude Code keeps credentials, settings, plugins, MCP servers, skills and past
+sessions **per config directory** — one signed-in account each — and the Codex
+CLI does the same per `CODEX_HOME`. If you keep several accounts on one Mac
+(a client's and your own, say), the directory is what chooses between them:
 
 ```bash
-CLAUDE_CONFIG_DIR=~/.claude-work     claude    # work account
-CLAUDE_CONFIG_DIR=~/.claude-personal claude    # personal account
+CLAUDE_CONFIG_DIR=~/.claude-client-a claude auth login
+CODEX_HOME=~/.codex-client-a codex login          # mkdir -p ~/.codex-client-a first
 ```
 
-Shell aliases for that never reach agentloop: `launchd` inherits nothing from
-your shell, so by default every run signs in as the CLI's own `~/.claude`. The
-account is the install's — one pin, set at install time, for every run and every
-model probe:
+Sign in without a trailing slash: Claude Code names the Keychain entry that
+holds the session after the exact directory string it was given.
+
+**Every platform has a Default** — the install's own: the pin below, or the
+CLI's own `~/.claude`; the engine's `CODEX_HOME`, or `~/.codex`. **Settings ›
+Platforms › Accounts** registers the others, one row per directory, each with
+the session it holds (*Signed in as …*, or the login to run) and who runs on
+it; the same from the terminal:
+
+```bash
+agentloop platform accounts anthropic                                   # every account, with its session
+agentloop platform account-add anthropic "Client A" ~/.claude-client-a  # register one
+agentloop platform check anthropic client-a                             # its session, live
+agentloop platform account-edit anthropic client-a "Client A" ~/.claude-a
+agentloop platform account-remove anthropic client-a                    # refused while anything uses it
+```
+
+**Who runs where.** The job editor, the project editor and the Security tab
+pick **Platform → Account → Model** (the Account list appears once a platform
+has an account besides the Default). A job runs on its own account; without
+one, on its project's when the job runs on the project's platform; else on
+the Default. A security analysis follows the same rule against its block. A
+**resume** always signs in where its session was created — the journal
+records the account and the directory of every run — whatever the job says
+today.
+
+**What follows the account.** The agent and its precheck run with the
+account's variable (an account on the CLI's own directory runs with the
+variable *unset*: set, even to `~/.claude`, Claude Code looks for another
+Keychain entry); a run whose account is gone, whose directory is gone, or
+which has no session is refused in `tick.log` before a slot is taken; the
+Codex rollout is read from the run's own `CODEX_HOME`; the usage-window gate
+is the account's own (`data/rate-limits.json` keys every account directory as
+`<platform>@<dir>`), and the statusline feeds the account its session runs as
+— wire it in each account's own `settings.json`; the agentloop skills are
+linked into every account directory. The model probes and the catalog
+refreshes run on the Default. OpenCode has no accounts: its credentials are
+the providers configured in opencode itself.
+
+**The pin.** `launchd` inherits nothing from your shell, so the Default's
+Claude account is set at install time:
 
 ```bash
 AGENTLOOP_CLAUDE_CONFIG_DIR=~/.claude-work bash install.sh
 ```
 
-The value is written into both `launchd` plists — under `AGENTLOOP_CLAUDE_CONFIG_DIR`,
-the name the engine reads, and under `CLAUDE_CONFIG_DIR` beside it for everything
-else those agents start — so it survives logout and reboot; re-running the
-installer without the variable keeps whatever is already pinned. There is no
-account per project: a `claude_config_dir` still sitting in `config/projects.json`
-is ignored, `agentloop status` and `install` say so, and the next save of that
-project drops it. **Settings › Platforms** shows whom the pin is signed in as —
-the Anthropic card's Session line is `claude auth status` run in that directory,
-and a directory with no session says so with the `claude auth login` to run —
-and `agentloop status` prints the same account, with the directory in brackets.
+The value is written into both `launchd` plists — under
+`AGENTLOOP_CLAUDE_CONFIG_DIR`, the name the engine reads, and under
+`CLAUDE_CONFIG_DIR` beside it — and re-running the installer without the
+variable keeps it. A run you type yourself (`agentloop run <id>`, and
+`agentloop check` or `precheck` of a job) puts a job on the Default where
+its scheduled runs go: the variable when your shell sets it, else the pin
+the tick's plist carries — never the `CLAUDE_CONFIG_DIR` your shell
+exports. What else the engine starts outside a run (a model probe, the
+`on-run-end` hook) gets the explicit variable only. Either way the pin
+goes out as every account directory does: `~` expanded, no trailing
+slash, and no variable at all when it names the CLI's own `~/.claude`; a
+pin that is not an absolute directory counts as no pin.
 
-The pin reaches everything `launchd` starts: the tick, and therefore every
-scheduled run, a **Run now** from the dashboard, and the model probes. A run you
-type yourself (`agentloop run <id>`) does **not** pick it up — the engine reads
-only the explicit variable, and never the `CLAUDE_CONFIG_DIR` your shell happens
-to export, so a run typed inside a Claude Code session cannot silently bill that
-session's account. Put the variable in front of the command when you want the
-pinned account by hand: `AGENTLOOP_CLAUDE_CONFIG_DIR=~/.claude-work agentloop run <id>`.
+**From before accounts.** `agentloop install` turns a `claude_config_dir`
+still in `config/projects.json` into an account and sets it on the level that
+carried it; `status` names any it could not convert.
 
 ---
 
@@ -1712,6 +1748,7 @@ presenting a partial read as coverage.
 "security": {
   "enabled": true,
   "platform": "",
+  "account": "",
   "model": "opus",
   "effort": "",
   "permission_mode": "bypassPermissions",
@@ -1726,8 +1763,8 @@ presenting a partial read as coverage.
 The **Security** tab of the project editor writes all of it. A project with no
 block gets no analysis, and no derived job either.
 
-The engine reads `enabled`, `platform`, `model`, `effort`, `permission_mode`,
-`max_budget_usd`, `daily_budget_usd` and `ignore_paths` —
+The engine reads `enabled`, `platform`, `account`, `model`, `effort`,
+`permission_mode`, `max_budget_usd`, `daily_budget_usd` and `ignore_paths` —
 `permission_mode` defaults to `bypassPermissions` when absent (an unrecognised
 value falls back to it too, with a warning) and is carried onto the derived
 job the same way. `default_profile` and `min_severity` belong to the
@@ -1753,9 +1790,18 @@ falls back, with a warning, the way a model switched off in Settings does.
 `model` left empty means the first model switched on for that platform in
 [Settings](#settings), and a model switched off there falls back to the same
 one, with a warning; `effort` left empty leaves the decision to the CLI, as in
-a job. The analysis signs in as the platform's account — the install's pin, see
-[Which Claude account a run signs in as](#which-claude-account-a-run-signs-in-as);
-there is no account of its own to set here.
+a job.
+
+`account` is the sign-in the analysis runs under: the block's own — the id
+of an account registered for the block's platform, or `default` — else the
+project's account, when the analysis runs on the project's platform, else
+that platform's Default (see [Accounts — which sign-in a run
+uses](#accounts--which-sign-in-a-run-uses)). `project-set` refuses a block
+account its platform does not have, and a platform change that leaves one
+behind clears it, and says so. An id that is still not the platform's when
+the analysis is derived — a hand edit of `projects.json` or
+`platforms.json` — runs it on the Default instead, with a warning in
+`tick.log` naming the project and the id.
 
 **Some noise is filtered before you configure anything.** A `fixtures`,
 `__fixtures__` or `testdata` directory — at any depth, and whatever its case —
@@ -2025,6 +2071,17 @@ the order the steps have to be taken.
   checked. All three cards are checked when the page opens; **Test** asks
   again. Nothing from this zone is stored — the engine asks the same question
   before every run.
+- **Accounts** — on the Anthropic and OpenAI cards, one row per account: the
+  Default first (the install's own — the pin or `~/.claude`, the engine's
+  `CODEX_HOME` or `~/.codex`), then every account registered here, each with
+  its directory, who runs on it (jobs, projects, analyses) and its live
+  session. **Add account** opens a row with a name, a directory and
+  **Browse…**; a registered account has **Edit** and **Remove**, and Remove
+  is refused while a job, a project or an analysis is on it — the refusal
+  names them. **Test** checks every account again. The Session line above
+  and the card's chip stay the Default's: it is the account the switch
+  checks and the model probes run on. See
+  [Accounts](#accounts--which-sign-in-a-run-uses).
 - **Models** — the catalog loads on its own once the session test passes:
   on OpenAI that is `codex debug models`, with the price per million tokens
   beside each slug (or *no price*), its effort range and a deprecated slug's
@@ -2083,7 +2140,9 @@ the file, and the engine never writes over it.
 **From the terminal.** Each button on the page is one of these:
 
 ```bash
-agentloop platform check openai            # {platform, supported, ready, bin, bin_found, bin_source, version, account, reason}, live
+agentloop platform check openai            # {platform, supported, ready, bin, bin_found, bin_source, version, account, reason, account_id, account_dir}, live
+agentloop platform check openai client-a   # the same for one registered account: account_id is the id asked about ("default" without one),
+                                           #   account_dir the directory its variable carries ("" for the CLI's own ~/.codex or ~/.claude)
 agentloop platform enable openai           # runs the check first; refused with the reason while it fails
 agentloop platform disable openai          # never refused; names the enabled jobs that will be skipped
 agentloop platform set-bin openai ~/.local/bin/codex    # must be executable; no path = back to detection
@@ -2155,7 +2214,8 @@ skipped at launch with the reason in `tick.log`.
   turns it on. The project editor's Security pane picks the analysis's platform
   (empty inherits the project's); the analysis meta grid says which CLI ran it.
 - **Settings** — the [Platforms](#settings) page: one card per platform, with
-  its binary, its live session test, its catalog and a switch per model.
+  its binary, its live session test, its accounts, its catalog and a switch
+  per model.
   While nothing is switched on, Overview and Jobs carry a strip that says so
   and **New job** lands here; a fresh install opens here right after the
   operator profile. The Profile tab is not built yet.
@@ -2197,7 +2257,7 @@ agentloop create <id>        # JSON object on stdin
 agentloop set-prompt <id>    # prompt on stdin
 agentloop set-precheck <id>  # script on stdin
 agentloop set-field <id> <field>   # value on stdin (interval_seconds, active_hours,
-                               #   active_days, platform, model, effort,
+                               #   active_days, platform, account, model, effort,
                                #   max_budget_usd, daily_budget_usd,
                                #   stall_timeout_seconds, timeout_seconds,
                                #   permission_mode, description, cwd, project)
@@ -2217,6 +2277,11 @@ agentloop platform check|enable|disable|set-bin|models|set-models <platform> [pa
                                #   what Settings › Platforms does: probe a CLI, switch a platform
                                #   on or off, point at its binary, refresh its catalog, choose
                                #   its models (JSON list on stdin) — see Settings
+agentloop platform check <platform> <id>          # one account's session, live
+agentloop platform accounts <platform>            # every account, the Default first, with its session
+agentloop platform account-add <platform> <name> <dir>        # register one — see Accounts
+agentloop platform account-edit <platform> <id> <name> <dir>  # rename or move one; its id never changes
+agentloop platform account-remove <platform> <id>             # refused while anything is on it
 agentloop skills             # show / link the skills the agent prompts require
 agentloop selftest           # offline checks of the logic that can kill a run
 agentloop install | uninstall
@@ -2224,6 +2289,9 @@ agentloop install | uninstall
 
 Environment overrides: `AGENTLOOP_PORT`, `AGENTLOOP_CONFIG`,
 `AGENTLOOP_DATA`, `AGENTLOOP_CLAUDE_BIN`, `AGENTLOOP_CLAUDE_CONFIG_DIR`,
+`AGENTLOOP_LAUNCH_AGENTS_DIR` (where the two `launchd` plists live; default
+`~/Library/LaunchAgents` — a test suite that runs the CLI as a real process
+points this at a sandbox, so it never reads or writes a real install's own),
 `AGENTLOOP_CODEX_BIN`, `AGENTLOOP_OPENCODE_BIN` (the three `_BIN` variables
 win over the path set in Settings; a stand-in for the tests, or one specific
 binary for the scheduled runs), `CODEX_HOME` (this one is the Codex CLI's own),

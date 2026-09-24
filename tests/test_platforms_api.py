@@ -10,6 +10,7 @@ is what keeps the two from drifting, the way the backoff curve test does.
 """
 import json
 import os
+import plistlib
 import subprocess
 import time
 from pathlib import Path
@@ -364,9 +365,23 @@ def test_the_bin_precedence_matches_the_engine(srv, tmp_path, monkeypatch):
     `agentloop platform check`, which is what a launch actually obeys."""
     cfg = tmp_path / "config"; cfg.mkdir()
     fake = tmp_path / "mycodex"; fake.write_text("#!/bin/sh\necho codex-cli 1.0\n"); fake.chmod(0o755)
+    # The "auto" case below (bin="") is this test's own leftover gap: both
+    # sides' detection falls through to a PATH search for a binary literally
+    # named "codex" -- command -v on the engine's side, shutil.which on the
+    # server's -- before EITHER ever reaches the hardcoded
+    # /opt/homebrew/bin/codex fallback. On a machine with the real Codex CLI
+    # installed (on PATH, or at that exact fallback path), "auto" landed on
+    # it. A fake named exactly "codex", in a directory put first on PATH on
+    # both sides, is what "auto" is actually allowed to find here -- the
+    # detection itself still runs, it just cannot land on a real CLI.
+    codex_path_dir = tmp_path / "codex-on-path"; codex_path_dir.mkdir()
+    fake_codex_on_path = codex_path_dir / "codex"
+    fake_codex_on_path.write_text(f'#!/bin/sh\nexec "{FAKE_CODEX}" "$@"\n')
+    fake_codex_on_path.chmod(0o755)
+    path_with_fake = str(codex_path_dir) + os.pathsep + os.environ.get("PATH", "")
     env = dict(os.environ, AGENTLOOP_CONFIG=str(cfg), AGENTLOOP_DATA=str(tmp_path / "data"),
                AGENTLOOP_CLAUDE_BIN=str(REPO / "test" / "fake-claude"), AGENTLOOP_CLAUDE_CONFIG_DIR="",
-               CODEX_HOME=str(tmp_path / "codex-home"))
+               CODEX_HOME=str(tmp_path / "codex-home"), PATH=path_with_fake)
     env.pop("AGENTLOOP_CODEX_BIN", None)
 
     def engine_bin():
@@ -377,11 +392,13 @@ def test_the_bin_precedence_matches_the_engine(srv, tmp_path, monkeypatch):
 
     monkeypatch.setattr(srv, "PLATFORMS_FILE", cfg / "platforms.json")
     monkeypatch.delenv("AGENTLOOP_CODEX_BIN", raising=False)
+    monkeypatch.setenv("PATH", path_with_fake)
     (cfg / "platforms.json").write_text(json.dumps({"platforms": {"openai": {"enabled": True, "bin": str(fake), "models": []}}}))
     assert srv.platform_bin("openai", {"bin": str(fake)}) == (str(fake), "file") == engine_bin()
     (cfg / "platforms.json").write_text(json.dumps({"platforms": {"openai": {"enabled": True, "bin": "", "models": []}}}))
-    assert srv.platform_bin("openai", {"bin": ""}) == engine_bin()
-    assert srv.platform_bin("openai", {"bin": ""})[1] == "auto"
+    auto = srv.platform_bin("openai", {"bin": ""})
+    assert auto == engine_bin()
+    assert auto == (str(fake_codex_on_path), "auto")
     env["AGENTLOOP_CODEX_BIN"] = str(fake)
     monkeypatch.setenv("AGENTLOOP_CODEX_BIN", str(fake))
     assert srv.platform_bin("openai", {"bin": "/elsewhere"}) == (str(fake), "env") == engine_bin()
@@ -805,3 +822,198 @@ def test_price_of_falls_back_to_defaults_row_by_row(srv):
     assert by["gpt-5.6-sol"]["price"]["cache_write"] == 0
     assert by["gpt-5.6-terra"]["price"]["at"] is None
     assert by["gpt-5.4-mini"]["price"] is None
+
+
+def test_account_actions_relay_to_the_engine(srv, monkeypatch):
+    seen = []
+
+    def fake(args, stdin=None):
+        seen.append(args)
+        if args[1] == "accounts":
+            return True, '[{"id":"default","name":"Default","dir":"~/.claude","account_dir":"","builtin":true,"check":{"ready":true,"account":"a","reason":""},"used_by":{"jobs":[],"projects":[],"security":[]}}]'
+        if args[1] == "account-remove":
+            return False, "platform account-remove: 'A' is used by j1 — move them to another account first"
+        return True, "account 'A' added on anthropic (id a) — signed in as a@example.org · max plan"
+    monkeypatch.setattr(srv, "al", fake)
+    code, payload = srv.platform_action("platform_accounts", {"platform": "anthropic"})
+    assert code == 200 and payload["accounts"][0]["id"] == "default"
+    assert srv.platform_action("platform_account_add", {"platform": "anthropic", "name": "A", "dir": "~/.claude-a"})[0] == 200
+    srv.platform_action("platform_account_edit", {"platform": "anthropic", "id": "a", "name": "A2", "dir": "~/.claude-a"})
+    code, payload = srv.platform_action("platform_account_remove", {"platform": "anthropic", "id": "a"})
+    assert code == 500 and "is used by j1" in payload["output"]
+    srv.platform_action("platform_check", {"platform": "anthropic", "account": "a"})
+    srv.platform_action("platform_check", {"platform": "anthropic"})
+    assert seen == [["platform", "accounts", "anthropic"],
+                    ["platform", "account-add", "anthropic", "A", "~/.claude-a"],
+                    ["platform", "account-edit", "anthropic", "a", "A2", "~/.claude-a"],
+                    ["platform", "account-remove", "anthropic", "a"],
+                    ["platform", "check", "anthropic", "a"],
+                    ["platform", "check", "anthropic"]]
+    assert srv.platform_action("platform_account_add", {"platform": "anthropic", "name": 3, "dir": "/x"})[0] == 400
+    assert srv.platform_action("platform_account_remove", {"platform": "anthropic"})[0] == 400
+    assert srv.platform_action("platform_account_edit", {"platform": "anthropic", "name": "A", "dir": "/x"})[0] == 400
+    assert srv.platform_action("platform_check", {"platform": "anthropic", "account": ["a"]})[0] == 400
+
+
+def test_the_account_actions_are_routed(srv):
+    src = (REPO / "bin" / "agentloop-server").read_text()
+    route = src[src.index('if op in ("platform_check"'):][:400]
+    for op in ("platform_accounts", "platform_account_add", "platform_account_edit", "platform_account_remove"):
+        assert f'"{op}"' in route, f"{op} is not routed to platform_action"
+
+
+def test_api_models_lists_the_registered_accounts(srv):
+    _write_platforms(srv, {
+        "anthropic": {"enabled": True, "bin": "", "models": ["claude-opus-5"],
+                      "accounts": [{"id": "a", "name": "A", "dir": "~/.claude-a"}, {"id": "", "name": "x", "dir": "/y"},
+                                   "junk", {"id": "default", "name": "D", "dir": "/z"},
+                                   {"id": "Al_pha", "name": "B", "dir": "/b"}]},
+        "openai": {"enabled": True, "bin": "", "models": [], "accounts": "oops"},
+        "opencode": {"enabled": False, "bin": "", "models": []}})
+    p = srv.list_models()["platforms"]
+    assert p["anthropic"]["accounts"] == [{"id": "a", "name": "A", "dir": "~/.claude-a"}]
+    assert p["openai"]["accounts"] == []
+    assert "accounts" not in p["opencode"]
+
+
+def test_the_server_lets_account_through_set_field():
+    src = (REPO / "bin" / "agentloop-server").read_text()
+    allow = src[src.index('elif op == "set_field"'):][:900]
+    assert '"account"' in allow
+
+
+def _tick_plist(home, env):
+    agents = home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    with open(agents / "com.agentloop.tick.plist", "wb") as f:
+        plistlib.dump({"Label": "com.agentloop.tick", "EnvironmentVariables": env}, f)
+
+
+def _default_dirs(srv):
+    p = srv.list_models()["platforms"]
+    return p["anthropic"].get("default_dir"), p["openai"].get("default_dir"), "default_dir" in p["opencode"]
+
+
+def test_api_models_names_each_account_platform_s_default_directory(srv, tmp_path, monkeypatch):
+    """The editors label the Default "Default — <dir>", and /api/models is
+    all they read. The directory is the engine's account_default_dir: the
+    install's pin -- the variable, else what the tick's plist names -- else
+    ~/.claude; the engine's CODEX_HOME, else ~/.codex. Shown ~-relative under
+    the home, the way a registered account's is typed. OpenCode has none."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    # srv's own fixture points AGENTLOOP_LAUNCH_AGENTS_DIR at a fixed,
+    # session-wide empty directory (so no test that forgets this leaks the
+    # real ~/Library/LaunchAgents) -- this test's own plists, written under
+    # `home` by _tick_plist below, need this override or _installed_config_dir
+    # would keep reading that empty directory instead and never see them.
+    monkeypatch.setenv("AGENTLOOP_LAUNCH_AGENTS_DIR", str(home / "Library" / "LaunchAgents"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _write_platforms(srv, {"anthropic": {"enabled": True, "bin": "", "models": []},
+                           "openai": {"enabled": True, "bin": "", "models": []},
+                           "opencode": {"enabled": False, "bin": "", "models": []}})
+    assert _default_dirs(srv) == ("~/.claude", "~/.codex", False)
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_CONFIG_DIR", "~/.claude-work/")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-x") + "/")
+    assert _default_dirs(srv) == ("~/.claude-work", str(tmp_path / "codex-x"), False)
+    # The variable empty: the pin the last install wrote into the tick's plist.
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_CONFIG_DIR", "")
+    _tick_plist(home, {"AGENTLOOP_CLAUDE_CONFIG_DIR": str(home / ".claude-pinned")})
+    assert _default_dirs(srv)[0] == "~/.claude-pinned"
+    _tick_plist(home, {"CLAUDE_CONFIG_DIR": "/Volumes/Work/.claude-old"})   # an install older than the engine's own key
+    assert _default_dirs(srv)[0] == "/Volumes/Work/.claude-old"
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_CONFIG_DIR", "relative/pin")   # not an absolute directory: no pin
+    assert _default_dirs(srv)[0] == "~/.claude"
+
+
+@pytest.mark.parametrize("pin, plist_env, codex_home", [
+    (None, None, None),
+    ("~/.claude-work/", None, None),
+    ("{home}/.claude", None, "{tmp}/codex-y//"),
+    ("", {"AGENTLOOP_CLAUDE_CONFIG_DIR": "{home}/.claude-pinned/"}, None),
+    ("", {"CLAUDE_CONFIG_DIR": "/Volumes/Work/.claude-old"}, None),
+    ("relative/pin", None, None),
+    ("/", None, None),
+], ids=["nothing", "pin-tilde-slash", "pin-is-cli-default", "plist-own-key", "plist-cli-key", "relative", "root"])
+def test_the_default_directory_is_the_engines_own(srv, tmp_path, monkeypatch, pin, plist_env, codex_home):
+    """Pinned to what `agentloop platform accounts` answers for the Default
+    under the very same environment -- the server mirrors installed_config_dir
+    and account_default_dir, and this is what keeps the two from drifting."""
+    home = tmp_path / "home"
+    home.mkdir()
+    fill = lambda s: s.replace("{home}", str(home)).replace("{tmp}", str(tmp_path))   # noqa: E731
+    # AGENTLOOP_LAUNCH_AGENTS_DIR held to `home`'s own LaunchAgents on BOTH
+    # sides, engine subprocess and server in-process alike -- the fixed,
+    # session-wide directory srv's own fixture points it at by default would
+    # otherwise win on both sides too (consistently empty), so this test
+    # would keep "passing" while no longer exercising _tick_plist at all.
+    env = dict(os.environ, HOME=str(home), AGENTLOOP_CONFIG=str(tmp_path / "config"), AGENTLOOP_DATA=str(tmp_path / "data"),
+               AGENTLOOP_LAUNCH_AGENTS_DIR=str(home / "Library" / "LaunchAgents"),
+               AGENTLOOP_CLAUDE_BIN=str(REPO / "test" / "fake-claude"), AGENTLOOP_CODEX_BIN=str(FAKE_CODEX),
+               AGENTLOOP_OPENCODE_BIN="/nonexistent/opencode")
+    env.pop("AGENTLOOP_CLAUDE_CONFIG_DIR", None)
+    env.pop("CODEX_HOME", None)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("AGENTLOOP_LAUNCH_AGENTS_DIR", str(home / "Library" / "LaunchAgents"))
+    monkeypatch.delenv("AGENTLOOP_CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    if pin is not None:
+        env["AGENTLOOP_CLAUDE_CONFIG_DIR"] = fill(pin)
+        monkeypatch.setenv("AGENTLOOP_CLAUDE_CONFIG_DIR", fill(pin))
+    if codex_home is not None:
+        env["CODEX_HOME"] = fill(codex_home)
+        monkeypatch.setenv("CODEX_HOME", fill(codex_home))
+    if plist_env is not None:
+        _tick_plist(home, {k: fill(v) for k, v in plist_env.items()})
+    _write_platforms(srv, {"anthropic": {"enabled": True, "bin": "", "models": []},
+                           "openai": {"enabled": True, "bin": "", "models": []}})
+
+    def engine_default(p):
+        out = subprocess.run(["/bin/bash", str(ENGINE), "platform", "accounts", p],
+                             capture_output=True, text=True, env=env, check=True).stdout
+        return json.loads(out)[0]["dir"]
+
+    def expanded(d):
+        return str(home) + d[1:] if d == "~" or d.startswith("~/") else d
+
+    a, o, _ = _default_dirs(srv)
+    assert expanded(a) == engine_default("anthropic")
+    assert expanded(o) == engine_default("openai")
+
+
+def test_the_default_directory_agrees_with_the_engine_through_launch_agents_dir_alone(srv, tmp_path, monkeypatch):
+    """Round 5: the parity above goes through HOME on both sides -- this one
+    goes through AGENTLOOP_LAUNCH_AGENTS_DIR alone, with HOME left ambient,
+    the shape srv's own session-wide fixture and a real subprocess both rely
+    on. A plist pinned inside that directory (never under HOME, so neither
+    side's ~-relative shortening applies) must read as the very same
+    directory on both: the server's default_dir, in-process, and the
+    engine's own account_default_dir anthropic, out of a real subprocess."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    pinned = tmp_path / "pinned-acct"
+    pinned.mkdir()
+    with open(agents_dir / "com.agentloop.tick.plist", "wb") as f:
+        plistlib.dump({"Label": "com.agentloop.tick",
+                        "EnvironmentVariables": {"AGENTLOOP_CLAUDE_CONFIG_DIR": str(pinned)}}, f)
+    monkeypatch.setenv("AGENTLOOP_LAUNCH_AGENTS_DIR", str(agents_dir))
+    monkeypatch.delenv("AGENTLOOP_CLAUDE_CONFIG_DIR", raising=False)
+    _write_platforms(srv, {"anthropic": {"enabled": True, "bin": "", "models": []},
+                           "openai": {"enabled": True, "bin": "", "models": []}})
+    server_dir = srv.list_models()["platforms"]["anthropic"]["default_dir"]
+
+    config_dir, data_dir = tmp_path / "config2", tmp_path / "data2"
+    config_dir.mkdir(); data_dir.mkdir()
+    env = dict(os.environ, AGENTLOOP_CONFIG=str(config_dir), AGENTLOOP_DATA=str(data_dir),
+               AGENTLOOP_LAUNCH_AGENTS_DIR=str(agents_dir),
+               AGENTLOOP_CLAUDE_BIN=str(REPO / "test" / "fake-claude"),
+               AGENTLOOP_CODEX_BIN=str(FAKE_CODEX), AGENTLOOP_OPENCODE_BIN="/nonexistent/opencode")
+    env.pop("AGENTLOOP_CLAUDE_CONFIG_DIR", None)
+    out = subprocess.run(["/bin/bash", str(ENGINE), "platform", "accounts", "anthropic"],
+                         capture_output=True, text=True, env=env, check=True).stdout
+    engine_dir = json.loads(out)[0]["dir"]
+
+    assert server_dir == str(pinned)
+    assert engine_dir == str(pinned)
+    assert server_dir == engine_dir
