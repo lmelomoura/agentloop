@@ -282,6 +282,65 @@ export function platformOptions(platforms, current){
   return out;
 }
 
+// The accounts a platform can run under besides its Default: the ones
+// Settings › Platforms registered, as /api/models lists them (`accounts`). The
+// Default is the install's own and never listed -- every platform has it --
+// and OpenCode has none at all.
+export function accountsOf(platform, platforms){
+  const p = (platforms || {})[platformKey(platform)];
+  const list = (p && Array.isArray(p.accounts)) ? p.accounts : [];
+  return list.filter(a => a && typeof a.id === "string" && a.id && a.id !== "default"
+                          && typeof a.name === "string" && typeof a.dir === "string");
+}
+
+// Whether an editor shows its Account combo at all: only when the platform
+// has an account to pick besides the Default.
+export function accountChoice(platform, platforms){
+  return accountsOf(platform, platforms).length > 0;
+}
+
+// The name an account id reads as: Default, a registered account's name, or
+// the id itself once Settings no longer has it.
+export function accountName(platform, id, platforms){
+  if(!id || id === "default") return "Default";
+  const hit = accountsOf(platform, platforms).find(a => a.id === id);
+  return hit ? hit.name : id;
+}
+
+// What an EMPTY account resolves to, the engine's job_account rule: the
+// project's own account when the job -- or the analysis -- runs on the
+// project's platform, else the Default. The account's name, or "" for the
+// Default, so the empty row can say which.
+export function inheritedAccountName(platform, project, platforms){
+  if(!project) return "";
+  const pp = KNOWN_PLATFORMS.includes(project.platform) ? project.platform : "anthropic";
+  if(pp !== platformKey(platform)) return "";
+  const a = project.account;
+  if(!a || a === "default") return "";
+  return accountName(platform, a, platforms);
+}
+
+// The empty row of an Account combo, in words: which account an empty value
+// lands on.
+export function accountNoneLabel(inheritName){
+  return inheritName ? "— Project's account (" + inheritName + ") —" : "— Default —";
+}
+
+// The Account combo's options: the Default by name, then every registered
+// account with its directory. `current` -- the value already on screen --
+// joins the end flagged when Settings no longer has it: the editor shows the
+// truth instead of rewriting the job, as it does for a switched-off model.
+export const ACCOUNT_GONE_SUFFIX = " (not in Settings)";
+export function accountOptions(platform, platforms, current){
+  const list = accountsOf(platform, platforms);
+  const opts = [{v: "default", label: "Default"}]
+    .concat(list.map(a => ({v: a.id, label: a.name + " — " + a.dir})));
+  if(current && current !== "default" && !list.some(a => a.id === current)){
+    opts.push({v: current, label: current + ACCOUNT_GONE_SUFFIX, flagged: true});
+  }
+  return opts;
+}
+
 // How many models the catalog carries that Settings keeps off the list.
 export function hiddenModelCount(platform, platforms){
   const key = platformKey(platform);

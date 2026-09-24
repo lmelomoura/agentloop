@@ -912,6 +912,22 @@ document.documentElement.dataset.theme =
     <input type="hidden" id="ed-platform">
   </div>
   <p class="fieldhelp" id="ed-platform-note">Which CLI runs this job. Only platforms enabled in Settings › Platforms are offered; changing it resets the model, effort and permission mode to that platform's defaults. Moving the job to a project on the other platform keeps this choice and sets it on the job. A job being created takes its project's.</p>
+  <div id="ed-account-row" hidden>
+  <label>Account — which of the platform's sign-ins this job runs under</label>
+  <div class="combo" id="ed-account-combo">
+    <button type="button" class="combo-trigger" id="ed-account-trigger" aria-haspopup="listbox" aria-expanded="false">
+      <span class="combo-val" id="ed-account-val">— Default —</span>
+      <span class="combo-caret"></span>
+    </button>
+    <div class="combo-pop" id="ed-account-pop" hidden>
+      <input type="text" class="combo-search" id="ed-account-search" placeholder="Search accounts…" autocomplete="off">
+      <ul class="combo-list" id="ed-account-opts" role="listbox"></ul>
+    </div>
+    <input type="hidden" id="ed-account">
+  </div>
+  <p class="fieldhelp">Registered in Settings › Platforms. Empty follows the project's account when the job runs on the
+    project's platform, and the Default otherwise; a resume always signs in where its session was created.</p>
+  </div>
   <div class="row2">
     <div><label>Model</label>
       <div class="combo" id="ed-model-combo">
@@ -1051,6 +1067,21 @@ document.documentElement.dataset.theme =
     it; one that inherits this runs on it from its next start — and, while it still names a model the
     new platform does not know, fails there (towards OpenAI, refused in <code>tick.log</code> before a
     slot is taken).</p>
+  <div id="pj-account-row" hidden>
+  <label>Account — which sign-in this project's runs use on its platform</label>
+  <div class="combo" id="pj-account-combo">
+    <button type="button" class="combo-trigger" id="pj-account-trigger" aria-haspopup="listbox" aria-expanded="false">
+      <span class="combo-val" id="pj-account-val">— Default —</span>
+      <span class="combo-caret"></span>
+    </button>
+    <div class="combo-pop" id="pj-account-pop" hidden>
+      <input type="text" class="combo-search" id="pj-account-search" placeholder="Search accounts…" autocomplete="off">
+      <ul class="combo-list" id="pj-account-opts" role="listbox"></ul>
+    </div>
+    <input type="hidden" id="pj-account">
+  </div>
+  <p class="fieldhelp">Registered in Settings › Platforms. The project's jobs on this platform inherit it unless they pick their own; the Security tab can pick another for the analysis.</p>
+  </div>
   <label>Working directory (cwd) — jobs in this project inherit it unless they set their own</label>
   <div class="cwdrow">
     <input id="pj-cwd" type="text" placeholder="click Browse to choose a folder" readonly data-cwd-target="pj-cwd" class="cwd-ro">
@@ -1143,6 +1174,21 @@ document.documentElement.dataset.theme =
     nothing can close the agent's subagents by flag, so the prompt forbids them; the run is priced
     from tokens like any Codex run. On OpenCode the derived job closes the <code>task</code> tool by
     rule, so there are no subagents, and the cost is what the CLI reports from its catalog.</p>
+  <div id="sec-account-row" hidden>
+  <label>Account</label>
+  <div class="combo" id="sec-account-combo">
+    <button type="button" class="combo-trigger" id="sec-account-trigger" aria-haspopup="listbox" aria-expanded="false">
+      <span class="combo-val" id="sec-account-val">— Default —</span>
+      <span class="combo-caret"></span>
+    </button>
+    <div class="combo-pop" id="sec-account-pop" hidden>
+      <input type="text" class="combo-search" id="sec-account-search" placeholder="Search accounts…" autocomplete="off">
+      <ul class="combo-list" id="sec-account-opts" role="listbox"></ul>
+    </div>
+    <input type="hidden" id="sec-account">
+  </div>
+  <p class="fieldhelp">Which sign-in runs the analysis — the project's account when the analysis runs on the project's platform, unless set here.</p>
+  </div>
   <div class="row2">
     <div><label>Model</label>
       <div class="combo" id="sec-model-combo">
@@ -2561,10 +2607,14 @@ function openProjectEditor(name){
   // below is read against the platform that results.
   const pjp=ALApp.platformKey(p&&p.platform);
   pjPlatformCombo.set(pjp, ALApp.platformOptions(PLATFORMS, pjp));
+  $("pj-account").value=(p&&p.account)||"";
+  paintProjectAccount(true);
   const sp=ALApp.KNOWN_PLATFORMS.includes(sec.platform)?sec.platform:"";
   secPlatformCombo.set(sp, ALApp.platformOptions(PLATFORMS, sp));
   const splat=secEffectivePlatform();
   applyPlatformToSecurity(splat, false);
+  $("sec-account").value=sec.account||"";
+  paintSecurityAccount(true);
   // Same reason as fill()'s modelCombo.set just above: the option list, so a
   // switched-off model shows flagged the moment the project opens.
   secModelCombo.set(sec.model||"", modelOptions(splat, sec.model||""));
@@ -2631,6 +2681,8 @@ async function saveProject(){
     // Always sent: project-set merges, and a project going back to Anthropic
     // has to be able to say so.
     proj.platform=$("pj-platform").value||"anthropic";
+    // Always sent, like the platform: empty is how a project goes back to the Default.
+    proj.account=$("pj-account").value||"";
     // Send only .worktree.enabled: project-set merges (jq `. * $p`), so any
     // venv/env the project declares alongside it survives the save.
     const wv=$("pj-wt").value;
@@ -2660,6 +2712,7 @@ async function saveProject(){
       enabled: $("sec-enabled").checked,
       // "" = inherit the project's; the engine's security_derived_jobs reads it that way
       platform: $("sec-platform").value,
+      account: $("sec-account").value||"",
       model: $("sec-model").value.trim(),
       // Read against the Security pane's own ladder (secEfforts, rebuilt by
       // applyPlatformToSecurity from editor-domain.js's effortsFor) -- the
@@ -3530,6 +3583,7 @@ function refillPlatformBound(){
   if(secPlatformCombo) secPlatformCombo.set(sp, ALApp.platformOptions(PLATFORMS, sp));
   if(platformCombo) applyPlatformToJobEditor(edp, true);
   if(secPlatformCombo) applyPlatformToSecurity(secEffectivePlatform(), true);
+  paintProjectAccount(true);
 }
 /* Which of the two Settings tabs is showing. Two gestures select one -- the
    strip, and the sidebar photo taking a shortcut to Profile -- so both come
@@ -3635,6 +3689,7 @@ function applyPlatformToJobEditor(p, keep){
   $("ed-model-help").textContent="The model the agent uses to execute this job — one of the models switched on in Settings."
     +(hid ? " "+hid+" more in the catalog "+(hid===1?"is":"are")+" switched off there." : "")
     +(waits.length ? " "+waits.join(". ")+"." : "");
+  paintJobAccount(keep);
   edPlatApplied=p;
 }
 // On OpenAI the effort ladder is the MODEL's; a new model means a new ladder.
@@ -3657,6 +3712,31 @@ function paintLimitsNote(p, model){
     ? " No price for "+model+" — dollar caps will not see this job's spend, and a max_budget_usd is not applied."
     : " No price configured for "+model+" — dollar caps will not see this job's spend.";
   n.textContent=t; n.hidden=false;
+}
+// One editor's Account combo, rebuilt for platform `p`: hidden while the
+// platform has nothing to pick besides the Default, the empty row saying
+// what it resolves to, and the value kept only while it is still one of p's
+// (`keep`) -- or flagged when Settings dropped it (accountOptions).
+function paintAccountCombo(prefix, combo, cfg, p, keep, inheritName){
+  if(!combo) return;
+  $(prefix+"-account-row").hidden=!ALApp.accountChoice(p, PLATFORMS);
+  cfg.noneLabel=ALApp.accountNoneLabel(inheritName);
+  const cur=keep ? $(prefix+"-account").value : "";
+  const opts=ALApp.accountOptions(p, PLATFORMS, cur);
+  combo.set(opts.some(o=>o.v===cur) ? cur : "", opts);
+}
+function paintJobAccount(keep){
+  const p=$("ed-platform").value||"anthropic", np=$("ed-project").value.trim();
+  paintAccountCombo("ed", edAccountCombo, edAccountCfg, p, keep,
+    ALApp.inheritedAccountName(p, np?projById(np):null, PLATFORMS));
+}
+function paintProjectAccount(keep){
+  paintAccountCombo("pj", pjAccountCombo, pjAccountCfg, $("pj-platform").value||"anthropic", keep, "");
+}
+function paintSecurityAccount(keep){
+  const sp=secEffectivePlatform();
+  paintAccountCombo("sec", secAccountCombo, secAccountCfg, sp, keep,
+    ALApp.inheritedAccountName(sp, {platform:$("pj-platform").value||"anthropic", account:$("pj-account").value||""}, PLATFORMS));
 }
 // The security block's effective platform: its own, else the project's AS THE
 // EDITOR HAS IT NOW (saved or not), else anthropic -- security_derived_jobs'
@@ -3695,6 +3775,7 @@ function applyPlatformToSecurity(p, keep){
     openai: "full-access is the headless default here: the sandbox modes cannot write the ledger, which lives outside the worktree.",
     opencode: "full-access is the default: the analysis writes the ledger through the CLI and needs bash; there is no sandbox on OpenCode.",
   })[p] || "How the analysis agent may use tools — dontAsk without an allowlist denies everything headless, but the ledger stays protected by the CLI's validating door either way.";
+  paintSecurityAccount(keep);
   secPlatApplied=p;
 }
 // On OpenAI the ladder is the model's: a new model, a new ladder.
@@ -3740,6 +3821,15 @@ const edModelCfg={id:"ed-model", allowNone:false, def:"opus", onPick:onJobModelP
 // is the authority, and the combo offers exactly that list.
 const secModelCfg={id:"sec-model", allowNone:true, noneLabel:"— Default (opus) —", allowCustom:false,
   onPick:(v)=>onSecModelPicked(v)};
+// The three Account combos, configured by name so the paint functions below
+// can relabel the empty row with what it resolves to -- createCombo keeps
+// cfg by reference and reads noneLabel in set(). The project's own pick
+// changes what the Security pane's empty row resolves to.
+const edAccountCfg={id:"ed-account", allowNone:true, noneLabel:"— Default —", allowCustom:false};
+const pjAccountCfg={id:"pj-account", allowNone:true, noneLabel:"— Default —", allowCustom:false,
+  onPick:()=>paintSecurityAccount(true)};
+const secAccountCfg={id:"sec-account", allowNone:true, noneLabel:"— Default —", allowCustom:false};
+let edAccountCombo=null, pjAccountCombo=null, secAccountCombo=null;
 let pjPlatformCombo=null;
 let edEfforts=ALApp.FALLBACK_EFFORTS.slice(), secEfforts=ALApp.FALLBACK_EFFORTS.slice();
 // The platform each pane was last built for (applyPlatformToJobEditor /
@@ -3758,17 +3848,22 @@ let projectCombo=null, modelCombo=null, permCombo=null, wtCombo=null, platformCo
 function titleOpt(v){ return {v, label: v.charAt(0).toUpperCase()+v.slice(1)}; }
 function initCombos(){
   projectCombo=createCombo({id:"ed-project", allowNone:true, noneLabel:"— None —", withIcon:true,
-    onPick:(v)=>syncCwdField(v)});
+    onPick:(v)=>{ syncCwdField(v); paintJobAccount(true); }});
   platformCombo=createCombo({id:"ed-platform", allowNone:false, def:"anthropic",
     onPick:(v)=>{ if(v!==edPlatApplied) applyPlatformToJobEditor(v,false); }});
   platformCombo.set("anthropic", ALApp.platformOptions(PLATFORMS, "anthropic"));
   modelCombo=createCombo(edModelCfg);
   modelCombo.set("opus", modelOptions("anthropic"));
+  edAccountCombo=createCombo(edAccountCfg);
+  pjAccountCombo=createCombo(pjAccountCfg);
+  secAccountCombo=createCombo(secAccountCfg);
   // The two security-side combos apply only when the EFFECTIVE platform moved:
   // the project's own pick reaches the pane only while the block inherits, and
   // neither pick is a change when it names what the pane already shows.
   pjPlatformCombo=createCombo({id:"pj-platform", allowNone:false, def:"anthropic",
-    onPick:()=>{ if(!$("sec-platform").value && secEffectivePlatform()!==secPlatApplied) applyPlatformToSecurity(secEffectivePlatform(), false); }});
+    onPick:()=>{ paintProjectAccount(false);
+                 if(!$("sec-platform").value && secEffectivePlatform()!==secPlatApplied) applyPlatformToSecurity(secEffectivePlatform(), false);
+                 else paintSecurityAccount(true); }});
   pjPlatformCombo.set("anthropic", ALApp.platformOptions(PLATFORMS, "anthropic"));
   secPlatformCombo=createCombo({id:"sec-platform", allowNone:true, noneLabel:"— Inherit the project's —",
     onPick:()=>{ if(secEffectivePlatform()!==secPlatApplied) applyPlatformToSecurity(secEffectivePlatform(), false); }});
@@ -3847,6 +3942,10 @@ function fill(j){
   const plat=ALApp.platformOf(j, j.project?projById(j.project):null);
   platformCombo.set(plat, ALApp.platformOptions(PLATFORMS, plat));
   applyPlatformToJobEditor(plat, false);
+  // The job's own account, drawn against the platform just applied: an
+  // account Settings no longer has shows flagged, never rewritten.
+  $("ed-account").value=j.account||"";
+  paintJobAccount(true);
   // The full option list, not just a bare id -- opening a job must show a
   // switched-off model flagged right away, not only after the next
   // /api/models re-apply (applyPlatformToJobEditor's own `keep` path, below).
@@ -4013,6 +4112,7 @@ async function saveEditor(){
         ...(f.maxPar!=null?{max_parallel:f.maxPar}:{}),
         permission_mode:$("ed-perm").value};
       if(f.effort) job.effort=f.effort;
+      if($("ed-account").value) job.account=$("ed-account").value;
       if(f.interactive) job.interactive=true;
       if(f.timeoutSecs!=null) job.timeout_seconds=f.timeoutSecs;
       if(f.stallSecs!=null) job.stall_timeout_seconds=f.stallSecs;
@@ -4053,6 +4153,9 @@ async function saveEditor(){
     const nextPlat=ALApp.platformOf(j, np?projById(np):null);
     const platSent=(f.platform!==curPlat || f.platform!==nextPlat);
     if(platSent){ if(!await api("set_field",{id,field:"platform",value:f.platform})) return; }
+    // The account after the platform -- a platform change clears one the new
+    // platform does not have -- and re-sent with it, like the model below.
+    if(!await setF("account",$("ed-account").value,j.account||"",platSent)) return;
     const prompt=$("ed-prompt").value.trim();
     if(prompt && prompt!==(j.prompt||"")){ if(!await api("set_prompt",{id,prompt})) return; }
     const pc=$("ed-precheck").value;
@@ -4176,7 +4279,23 @@ function modelCell(rec, live){
    the same thing on the run's own platform (see `cmd_resume`). */
 function reopenCommand(rec, a){
   const sid=(a&&a.session)||rec.session||"";
-  return (({openai: "codex exec resume ", opencode: "opencode run --dir <run dir> -s "})[(rec&&rec.platform)] || "claude --resume ") + sid;
+  // The account travels in the environment, not the argv: without it the CLI
+  // looks for the session in its own default directory, where it is not.
+  const dir=(rec&&rec.account_dir)||"";
+  const q=/^[A-Za-z0-9_.\/~@+-]+$/.test(dir) ? dir : "'"+dir.replace(/'/g,"'\\''")+"'";
+  const env=dir ? ((rec.platform==="openai" ? "CODEX_HOME=" : "CLAUDE_CONFIG_DIR=")+q+" ") : "";
+  return env+((({openai: "codex exec resume ", opencode: "opencode run --dir <run dir> -s "})[(rec&&rec.platform)] || "claude --resume ") + sid);
+}
+
+/* Which account the run signed in as -- a row only when it is not simply the
+   Default on the CLI's own directory, which every run of a single-account
+   install without a pin is. */
+function accountCell(rec){
+  const id=rec.account||"", dir=rec.account_dir||"";
+  if((!id || id==="default") && !dir) return "";
+  const name=ALApp.accountName(rec.platform, id||"default", PLATFORMS);
+  const gone=!!id && id!=="default" && !ALApp.accountsOf(rec.platform, PLATFORMS).some(a=>a.id===id);
+  return esc(name)+(gone?' <span class="muted">(no longer in Settings)</span>':'')+(dir?' · <code>'+esc(dir)+'</code>':'');
 }
 
 /* How a run ended, in words. Every ending gets the same shape — a short label
@@ -4313,6 +4432,7 @@ function renderLog(d){
     // resolution step rendered for a job that never took one.
     ["Model", modelCell(rec, d.live)],
     ["Platform", esc(ALApp.platformLabel(rec.platform))],
+    ...(accountCell(rec) ? [["Account", accountCell(rec)]] : []),
     ["Tokens", esc(ALApp.tokensText(a.tokens))],
     ["Session", esc(a.session||rec.session||"—")],
     ["Stop reason", stopReasonText(a, rec)],

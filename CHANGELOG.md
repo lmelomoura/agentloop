@@ -65,6 +65,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   account.
   The dashboard's server relays the account actions and carries the account
   on every run — finished, from the journal, and live, from the run's slot.
+  Settings › Platforms lists every account of Anthropic and OpenAI with its
+  session and who runs on it, and adds, edits and removes them; the job,
+  project and Security editors pick Platform → Account → Model, the Account
+  combo showing only where there is a choice; the run dialog names the
+  account, and its reopen line carries the variable.
 
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate
