@@ -2086,7 +2086,8 @@ JSON
   "$JQ" -n '{platforms:{anthropic:{enabled:true,bin:"",models:["opus"]},
                         openai:{enabled:true,bin:"",models:["gpt-a","gpt-b"]},
                         opencode:{enabled:false,bin:"",models:[]}}}' > "$tmp/cfg/config/platforms.json"
-  cfg_al()  { AGENTLOOP_CONFIG="$tmp/cfg/config" AGENTLOOP_DATA="$tmp/cfg/data" AGENTLOOP_CODEX_BIN=/nonexistent "$BIN_DIR/agentloop" "$@"; }
+  cfg_al()  { AGENTLOOP_CONFIG="$tmp/cfg/config" AGENTLOOP_DATA="$tmp/cfg/data" AGENTLOOP_CODEX_BIN=/nonexistent \
+              AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode" "$BIN_DIR/agentloop" "$@"; }
   cfg_job() { "$JQ" -r --arg id "$1" ".jobs[] | select(.id==\$id) | $2" "$tmp/cfg/config/jobs.json"; }
   printf 'gemini' | cfg_al set-field cj platform >/dev/null 2>&1; want "an unknown platform is refused" 1 $?
   out="$(printf 'openai' | cfg_al set-field cj platform 2>&1)"; rc=$?
@@ -2287,7 +2288,8 @@ JSON
   echo "upgrade path — a platforms.json without the opencode key, the file every install has today"
   mkdir -p "$tmp/up/config" "$tmp/up/data"
   printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},"openai":{"enabled":false,"bin":"","models":[]}}}\n' > "$tmp/up/config/platforms.json"
-  up_al() { AGENTLOOP_CONFIG="$tmp/up/config" AGENTLOOP_DATA="$tmp/up/data" AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode" "$BIN_DIR/agentloop" "$@"; }
+  up_al() { AGENTLOOP_CONFIG="$tmp/up/config" AGENTLOOP_DATA="$tmp/up/data" AGENTLOOP_OPENCODE_BIN="$BASE_DIR/test/fake-opencode" \
+            AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" AGENTLOOP_CODEX_BIN="$BASE_DIR/test/fake-codex" "$BIN_DIR/agentloop" "$@"; }
   ( PLATFORMS_FILE="$tmp/up/config/platforms.json"; platforms_valid ); want "the two-key file is still a valid platforms file" 0 $?
   ( PLATFORMS_FILE="$tmp/up/config/platforms.json"; platform_enabled opencode ); want "opencode reads as DISABLED, not as an error and not as enabled by default" 1 $?
   ( PLATFORMS_FILE="$tmp/up/config/platforms.json"; platform_enabled anthropic ); want "and anthropic keeps its state" 0 $?
@@ -6160,7 +6162,7 @@ NASTY
     printf '{"jobs":[]}\n' > "$JOBS_FILE"
     USER_SKILLS="$tmp/inst/fakehome/.claude/skills"
     CODEX_HOME_DIR="$tmp/inst/codexhome"; CODEX_SKILLS="$CODEX_HOME_DIR/skills"
-    CLAUDE_BIN="$tmp/inst/fakebin/claude"; CODEX_BIN="$BASE_DIR/test/fake-codex"
+    CLAUDE_BIN="$tmp/inst/fakebin/claude"; CODEX_BIN="$BASE_DIR/test/fake-codex"; OPENCODE_BIN="$BASE_DIR/test/fake-opencode"
     _upass=0; _ufail=0
     ok()  { _upass=$(( _upass + 1 )); printf '  ok    %s\n' "$1"; }
     bad() { _ufail=$(( _ufail + 1 )); printf '  FAIL  %s\n' "$1"; }

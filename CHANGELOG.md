@@ -148,9 +148,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Against the last release: `AGENTLOOP_LAUNCH_AGENTS_DIR`, the pytest
   fixture that binds the control server for its own tests, and the
   server's own mirror of `installed_config_dir` together keep all three
-  suites — e2e, selftest and pytest — off a real `launchd` plist, and the
-  suites give a fake `claude`, `codex` and `opencode` to any test that
-  does not already name its own stand-in.
+  suites — e2e, selftest and pytest — off a real `launchd` plist. The e2e
+  sandbox and the pytest fixture also give every engine subprocess a fake
+  `claude`, `codex` and `opencode`, once, for the whole suite; the
+  selftest suite has no such single switch, so each block that shells out
+  to the engine or drives `cmd_install`/`status_platforms_block` names its
+  own three stand-ins instead — checked block by block, not assumed.
 
 ### Changed
 
