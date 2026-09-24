@@ -2407,6 +2407,18 @@ JSON
     && ok "a model that makes no tool calls falls back to the first enabled model that does" || bad "Og model $(dplat security-og .model)"
   grep -q "names a model that makes no tool calls ('pdm_ai/vision') -- an analysis needs tools; using pdm_ai/glm-5.3-flash" "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null \
     && ok "and the derivation warning says why" || bad "no tools warning: $(cat "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null | tail -2)"
+  # The fallback used to pipe platform_models_enabled straight into a `while`
+  # whose own stdout fed `head -1`: `head` closes its end after one line, and
+  # if the loop found a SECOND tools-capable model before the shell noticed,
+  # that printf hit a closed pipe and bash logged "write error: Broken pipe"
+  # to stderr -- harmless (the right id still came out; $? was never read)
+  # but noisy, ~24 lines of it in one CI run. Predates #77. Og is the one
+  # fixture project whose model actually reaches this fallback, so a real
+  # stderr capture of the same call the checks above already make is enough.
+  dplat security-og .model >/dev/null 2>"$tmp/dplat/og-stderr.txt"
+  grep -q "Broken pipe" "$tmp/dplat/og-stderr.txt" 2>/dev/null \
+    && bad "the opencode tools fallback still closes its pipe early: $(cat "$tmp/dplat/og-stderr.txt")" \
+    || ok "the opencode tools fallback prints no \"write error: Broken pipe\" while picking a model"
 
   # openai with no catalog resolved yet: platform_default_model answers
   # nothing for it, so the model must come out empty rather than some other
@@ -7861,6 +7873,23 @@ JSON
   # with $TOGGLE_MANY_FILTER, defined once above it as a shared constant) --
   # pull any such constant's own definition into the body under test, or its
   # shape is invisible to the check below.
+  # `cmd_project_set` and `cmd_project_delete` (round 2, #77's account
+  # cleanup) each carry ONE `write_jobs` call that DOES match the `.id ==`
+  # shape: after a project save/delete, it clears a now-invalid `.account`
+  # off every job of that project, its id read straight off $JOBS_FILE
+  # itself (`.jobs[]? | select(.project == $n)`) -- never job_exists/
+  # jobs_json, the only door a derived job's fake existence comes through.
+  # A derived job therefore never lives in $JOBS_FILE at all, so this exact
+  # filter can never reach one. `security_refuse_derived` would be the WRONG
+  # fix here besides: it refuses any "security-" prefix outright, and a REAL
+  # job that predates the prefix's reservation, legitimately sitting in
+  # $JOBS_FILE, must still be cleared too -- and cmd_project_delete's own
+  # pass runs inside a pipeline, where a `die` would not even stop the
+  # write. So the exclusion below is narrow and by TEXT, not by function
+  # name: only this one exact, already-reviewed filter is stripped out of
+  # the two bodies before the shape match runs, so any OTHER by-id write
+  # later added to either command is still caught, exactly like every other
+  # site here.
   local guard_fn guard_body guard_var guard_sites=0 guard_missing=0 guard_bad_names=""
   while IFS= read -r guard_fn; do
     [ "$guard_fn" = "cmd_selftest" ] && continue
@@ -7870,6 +7899,11 @@ JSON
       guard_body="$guard_body
 $(grep "^${guard_var#\$}=" "$BIN_DIR/agentloop")"
     done
+    case "$guard_fn" in
+      cmd_project_set|cmd_project_delete)
+        guard_body="$(printf '%s\n' "$guard_body" \
+          | grep -vF '.jobs = [.jobs[] | if .id == $id then del(.account) else . end]')" ;;
+    esac
     case "$guard_body" in *'.id =='*|*'.id !='*|*'.id |'*) ;; *) continue ;; esac
     guard_sites=$(( guard_sites + 1 ))
     case "$guard_body" in

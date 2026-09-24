@@ -272,6 +272,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The selftest's guard rail recognises a project save's account cleanup,
+  which reads its jobs from jobs.json, as project-scoped.**
+  `cmd_project_set` and `cmd_project_delete`'s own account cleanup (#77)
+  clears a now-invalid `.account` off every job of the project being saved
+  or deleted, its id read straight off `$JOBS_FILE` itself (`.jobs[]? |
+  select(.project == $n)`) — the SAME shape (`write_jobs` selecting `.id
+  ==`) the `cmd_*` guard rail looks for to catch a by-id mutation that
+  forgot to refuse a derived id, so it started finding 10 sites instead of
+  8, two of them "missing" `security_refuse_derived`. Adding that call
+  would have been wrong here: a derived job never lives in `$JOBS_FILE` at
+  all (this cleanup can never reach one), and a real job that predates the
+  `security-` prefix's reservation, legitimately in `$JOBS_FILE`, still has
+  to be cleared — `cmd_project_delete`'s own pass also runs inside a
+  pipeline, where a `die` would not even stop the write. The guard rail now
+  strips this one exact, already-reviewed filter out of those two
+  functions' bodies before the shape match runs, by its own text, not by
+  excluding either function outright — so any OTHER by-id write later
+  added to either command is still caught.
+
 - **A schema bump that only adds journal-sourced columns fills them in
   place, instead of re-indexing every run.** PR #77's `account`/
   `account_dir` columns bumped the index's `SCHEMA_VERSION`, and `ingest()`
