@@ -163,14 +163,14 @@ Em `test/selftest.sh`, imediatamente antes da linha que começa por `  echo "res
 ```bash
   echo "accounts — the sign-ins Settings registers beside each platform's Default"
   local ac="$tmp/ac" _aj
-  mkdir -p "$ac/config" "$ac/data" "$ac/home/.claude" "$ac/home/.claude-a" "$ac/home/.claude-b" "$ac/home/.codex-a" "$ac/codex-home"
+  mkdir -p "$ac/config" "$ac/data" "$ac/fakehome/.claude" "$ac/fakehome/.claude-a" "$ac/fakehome/.claude-b" "$ac/fakehome/.codex-a" "$ac/codex-home"
   printf '{"jobs":[{"id":"ja","project":"P","prompt":"x","model":"claude-opus-5"},{"id":"jo","platform":"openai","model":"gpt-a","prompt":"x"}]}\n' > "$ac/config/jobs.json"
   printf '{"projects":[{"name":"P","cwd":"%s"}]}\n' "$ac" > "$ac/config/projects.json"
   printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},"openai":{"enabled":true,"bin":"","models":["gpt-a"]},"opencode":{"enabled":false,"bin":"","models":[]}}}\n' > "$ac/config/platforms.json"
   # A home of its own: `~` in a directory, the Default's ~/.claude, the plist
   # the pin is read back from and ~/.claude/skills all hang off HOME, and
   # none of them may be the operator's.
-  ac_al() { HOME="$ac/home" AGENTLOOP_CONFIG="$ac/config" AGENTLOOP_DATA="$ac/data" \
+  ac_al() { HOME="$ac/fakehome" AGENTLOOP_CONFIG="$ac/config" AGENTLOOP_DATA="$ac/data" \
             AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" AGENTLOOP_CODEX_BIN="$BASE_DIR/test/fake-codex" \
             AGENTLOOP_CLAUDE_CONFIG_DIR="" CODEX_HOME="$ac/codex-home" AGENTLOOP_OPENCODE_BIN=/nonexistent/opencode \
             "$BIN_DIR/agentloop" "$@"; }
@@ -180,7 +180,7 @@ Em `test/selftest.sh`, imediatamente antes da linha que começa por `  echo "res
     case "$_o" in *"$_w"*) [ "$_r" -ne 0 ] && ok "$_l" || bad "$_l: rc=$_r" ;; *) bad "$_l: $_o" ;; esac
   }
   _aj="$(ac_al platform accounts anthropic 2>/dev/null)"
-  printf '%s' "$_aj" | "$JQ" -e --arg h "$ac/home/.claude" 'length == 1 and .[0].id == "default" and .[0].name == "Default"
+  printf '%s' "$_aj" | "$JQ" -e --arg h "$ac/fakehome/.claude" 'length == 1 and .[0].id == "default" and .[0].name == "Default"
       and .[0].builtin == true and .[0].dir == $h and .[0].account_dir == "" and .[0].check.ready == true
       and .[0].used_by == {jobs: ["ja"], projects: ["P"], security: []}' >/dev/null 2>&1 \
     && ok "platform accounts: the Default alone, on the CLI's own directory, with who runs on it" || bad "accounts before any: $_aj"
@@ -189,23 +189,23 @@ Em `test/selftest.sh`, imediatamente antes da linha que começa por `  echo "res
     && ok "account-add registers it, names its id and whom it is signed in as" || bad "account-add: rc=$rc $out"
   [ "$("$JQ" -c '.platforms.anthropic.accounts' "$ac/config/platforms.json")" = '[{"id":"cliente-a","name":"Cliente A","dir":"~/.claude-a"}]' ] \
     && ok "and the file keeps the directory as it was typed" || bad "file: $(cat "$ac/config/platforms.json")"
-  [ "$(readlink "$ac/home/.claude-a/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
-    && ok "and the skills are linked into that account's own skills directory" || bad "skills in the account: $(ls "$ac/home/.claude-a" 2>&1)"
+  [ "$(readlink "$ac/fakehome/.claude-a/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
+    && ok "and the skills are linked into that account's own skills directory" || bad "skills in the account: $(ls "$ac/fakehome/.claude-a" 2>&1)"
   ac_refused "a name already used is refused, whatever its case" "an account named 'cliente a' already exists on anthropic" account-add anthropic "cliente a" "~/.claude-b"
-  ac_refused "a directory another account has is refused, trailing slash or not" "$ac/home/.claude-a is already the directory of the account 'Cliente A'" account-add anthropic "Other" "$ac/home/.claude-a/"
+  ac_refused "a directory another account has is refused, trailing slash or not" "$ac/fakehome/.claude-a is already the directory of the account 'Cliente A'" account-add anthropic "Other" "$ac/fakehome/.claude-a/"
   ac_refused "a relative directory is refused" "the directory must be absolute or start with ~/ (got 'relative/dir')" account-add anthropic "Rel" "relative/dir"
-  ac_refused "a directory that does not exist says how to create it" "$ac/home/.claude-none does not exist — create it by signing in: CLAUDE_CONFIG_DIR=$ac/home/.claude-none claude auth login" account-add anthropic "None" "~/.claude-none"
-  ac_refused "the Default's own directory is refused" "$ac/home/.claude is the Default account's directory" account-add anthropic "Home" "~/.claude"
+  ac_refused "a directory that does not exist says how to create it" "$ac/fakehome/.claude-none does not exist — create it by signing in: CLAUDE_CONFIG_DIR=$ac/fakehome/.claude-none claude auth login" account-add anthropic "None" "~/.claude-none"
+  ac_refused "the Default's own directory is refused" "$ac/fakehome/.claude is the Default account's directory" account-add anthropic "Home" "~/.claude"
   ac_refused "Default is not a name an account can take" "Default is the install's own account — choose another name" account-add anthropic "default" "~/.claude-b"
   ac_refused "OpenCode has no accounts" "OpenCode has no accounts — its credentials are the providers configured in opencode itself" account-add opencode "X" "~/.claude-b"
   out="$(ac_al platform account-add anthropic "Cliente-A" "~/.claude-b" 2>&1)"
   case "$out" in *"(id cliente-a-2)"*) ok "an id already taken gets a numbered suffix" ;; *) bad "suffix: $out" ;; esac
-  : > "$ac/home/.claude-b/.fake-logged-out"
+  : > "$ac/fakehome/.claude-b/.fake-logged-out"
   _aj="$(ac_al platform check anthropic cliente-a-2 2>/dev/null)"
-  printf '%s' "$_aj" | "$JQ" -e --arg d "$ac/home/.claude-b" '.ready == false and .account_id == "cliente-a-2" and .account_dir == $d
+  printf '%s' "$_aj" | "$JQ" -e --arg d "$ac/fakehome/.claude-b" '.ready == false and .account_id == "cliente-a-2" and .account_dir == $d
       and .reason == ("claude is not signed in in " + $d + " (run: CLAUDE_CONFIG_DIR=" + $d + " claude auth login)")' >/dev/null 2>&1 \
     && ok "platform check <p> <id> checks that account's own directory" || bad "check cliente-a-2: $_aj"
-  printf 'a@example.org' > "$ac/home/.claude-a/.fake-email"
+  printf 'a@example.org' > "$ac/fakehome/.claude-a/.fake-email"
   [ "$(ac_al platform check anthropic cliente-a 2>/dev/null | "$JQ" -r .account)" = "a@example.org · max plan" ] \
     && ok "and says whom that directory is signed in as" || bad "check cliente-a: $(ac_al platform check anthropic cliente-a 2>&1)"
   [ "$(ac_al platform check anthropic nope 2>/dev/null | "$JQ" -r '.ready, .reason' | tr '\n' '|')" = "false|account 'nope' is not an account of anthropic in Settings|" ] \
@@ -226,12 +226,12 @@ Em `test/selftest.sh`, imediatamente antes da linha que começa por `  echo "res
   out="$(ac_al platform account-add openai "Cliente A" "~/.codex-a" 2>&1)"; rc=$?
   [ "$rc" -eq 0 ] && [ "$out" = "account 'Cliente A' added on openai (id cliente-a) — Logged in using ChatGPT" ] \
     && ok "an OpenAI account has its own list: the same name and id are free there" || bad "openai add: rc=$rc $out"
-  : > "$ac/home/.codex-a/.fake-logged-out"
-  [ "$(ac_al platform check openai cliente-a 2>/dev/null | "$JQ" -r .reason)" = "codex is not signed in in $ac/home/.codex-a (run: CODEX_HOME=$ac/home/.codex-a codex login)" ] \
+  : > "$ac/fakehome/.codex-a/.fake-logged-out"
+  [ "$(ac_al platform check openai cliente-a 2>/dev/null | "$JQ" -r .reason)" = "codex is not signed in in $ac/fakehome/.codex-a (run: CODEX_HOME=$ac/fakehome/.codex-a codex login)" ] \
     && ok "and its check runs codex login status in that CODEX_HOME" || bad "openai check: $(ac_al platform check openai cliente-a 2>&1)"
-  [ "$(readlink "$ac/home/.codex-a/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
-    && ok "and the skills are linked into its home too" || bad "codex account skills: $(ls "$ac/home/.codex-a" 2>&1)"
-  ac_refused "a Codex home that does not exist says how to create it" "$ac/home/.codex-none does not exist — create it and sign in: mkdir -p $ac/home/.codex-none && CODEX_HOME=$ac/home/.codex-none codex login" account-add openai "N" "~/.codex-none"
+  [ "$(readlink "$ac/fakehome/.codex-a/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
+    && ok "and the skills are linked into its home too" || bad "codex account skills: $(ls "$ac/fakehome/.codex-a" 2>&1)"
+  ac_refused "a Codex home that does not exist says how to create it" "$ac/fakehome/.codex-none does not exist — create it and sign in: mkdir -p $ac/fakehome/.codex-none && CODEX_HOME=$ac/fakehome/.codex-none codex login" account-add openai "N" "~/.codex-none"
   [ "$( HOME=/Users/me; account_env_value anthropic "/Users/me/.claude/" )" = "" ] \
     && [ "$( HOME=/Users/me; account_env_value anthropic "~/.claude-x///" )" = "/Users/me/.claude-x" ] \
     && [ "$( HOME=/Users/me; account_env_value openai "~/.codex" )" = "" ] \
@@ -810,7 +810,7 @@ Depois, imediatamente antes da linha que começa por `  echo "resolve_pricing_op
 ```bash
   echo "claude_config_dir — install turns what is left of it into accounts"
   local ccd="$tmp/ccd" _mig
-  mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/home/.claude" "$ccd/old-acct"
+  mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/fakehome/.claude" "$ccd/old-acct"
   cat > "$ccd/cfg/projects.json" <<JSON
 {"projects":[{"name":"Old1","cwd":"$ccd","claude_config_dir":"$ccd/old-acct/"},
              {"name":"Old2","cwd":"$ccd","security":{"enabled":false,"claude_config_dir":"$ccd/old-acct"}},
@@ -821,7 +821,7 @@ JSON
   printf '{"jobs":[]}\n' > "$ccd/cfg/jobs.json"
   printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},"openai":{"enabled":true,"bin":"","models":["gpt-a"]}}}\n' > "$ccd/cfg/platforms.json"
   ccd_env() {
-    HOME="$ccd/home"; PLIST_PATH=/nonexistent; AGENTLOOP_CLAUDE_CONFIG_DIR=""
+    HOME="$ccd/fakehome"; PLIST_PATH=/nonexistent; AGENTLOOP_CLAUDE_CONFIG_DIR=""
     CONFIG_DIR="$ccd/cfg"; PROJECTS_FILE="$ccd/cfg/projects.json"; JOBS_FILE="$ccd/cfg/jobs.json"
     PLATFORMS_FILE="$ccd/cfg/platforms.json"; DATA_DIR="$ccd/data"
   }
@@ -3048,17 +3048,24 @@ Esperado: tudo verde. O último bloco verifica o CHANGELOG, os home dirs em fich
 Nunca na instalação viva. Numa pasta de rascunho `$A` (no scratchpad, fora de qualquer repositório git):
 
 ```bash
-mkdir -p "$A/config" "$A/data" "$A/empty-claude" "$A/empty-codex" "$A/work"
+mkdir -p "$A/config" "$A/data" "$A/empty-claude" "$A/empty-codex" "$A/work" "$A/scratch-claude"
 cp config/pricing.example.json "$A/config/pricing.json"
 printf '{"projects":[{"name":"acc","cwd":"%s","worktree":{"enabled":false}}]}\n' "$A/work" > "$A/config/projects.json"
-printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-haiku-4-5-20251001"]},"openai":{"enabled":true,"bin":"","models":["gpt-5.6-luna"]},"opencode":{"enabled":false,"bin":"","models":[]}}}\n' > "$A/config/platforms.json"
+printf '{"jobs":[]}\n' > "$A/config/jobs.json"
+printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-haiku-4-5-20251001"],"accounts":[{"id":"home","name":"Home","dir":"~/.claude"}]},"openai":{"enabled":true,"bin":"","models":["gpt-5.6-luna"],"accounts":[{"id":"home","name":"Home","dir":"~/.codex"}]},"opencode":{"enabled":false,"bin":"","models":[]}}}\n' > "$A/config/platforms.json"
 export AGENTLOOP_CONFIG="$A/config" AGENTLOOP_DATA="$A/data"
 export AGENTLOOP_CLAUDE_CONFIG_DIR="$A/empty-claude"    # the Default: a directory with no session
 export CODEX_HOME="$A/empty-codex"                      # the Codex Default: a home with no session
 PATH="$WT/bin:$PATH"
 agentloop resolve-models openai
-agentloop platform account-add anthropic "Home" "~/.claude"
-agentloop platform account-add openai "Home" "~/.codex"
+```
+
+A conta `Home` entra escrita directamente no `platforms.json` de rascunho, nunca por `account-add`: esse comando liga as skills da árvore em execução a `<dir>/skills`, e feito a partir de um worktree isso reapontaria os links da instalação viva em `~/.claude/skills` e `~/.codex/skills` para um worktree que é apagado depois do merge. Os verbos em si exercitam-se à parte, sobre um directório de rascunho:
+
+```bash
+agentloop platform account-add anthropic "Scratch" "$A/scratch-claude"
+agentloop platform account-edit anthropic scratch "Scratch" "$A/scratch-claude"
+agentloop platform account-remove anthropic scratch
 agentloop platform accounts anthropic | jq -c '.[] | {id, dir, ready: .check.ready}'
 agentloop platform accounts openai | jq -c '.[] | {id, dir, ready: .check.ready}'
 ```
@@ -3068,7 +3075,7 @@ Esperado: a Default das duas plataformas `ready:false` (pastas vazias), a conta 
 Criar dois jobs baratos (`printf '{"id":"acc-c","project":"acc","account":"home","model":"claude-haiku-4-5-20251001","prompt":"Reply with the single word OK, then end your run as the contract says.","enabled":false}' | agentloop create` e o equivalente `acc-o` com `"platform":"openai","model":"gpt-5.6-luna","permission_mode":"read-only"`), mais um `acc-d` na Default Claude, e correr `agentloop run acc-d`, `agentloop run acc-c`, `agentloop run acc-o`. Esperado:
 
 - `acc-d` recusado no `tick.log` com `claude is not signed in in $A/empty-claude (run: CLAUDE_CONFIG_DIR=$A/empty-claude claude auth login)`;
-- `acc-c` `success`, com o registo a dizer `"account":"home","account_dir":""` (correu com a variável por definir, o único caminho para a sessão real do `~/.claude`);
+- `acc-c` no estado que a resposta do agente ao contrato render — uma resposta NOTHING TO DO dá `warning`, que nada diz sobre contas; o que prova a conta é o registo a dizer `"account":"home","account_dir":""` e a ausência de qualquer recusa (correu com a variável por definir, o único caminho para a sessão real do `~/.claude`);
 - `acc-o` `success`, `model_id` lido do rollout em `~/.codex/sessions` e `data/rate-limits.json` com o bloco `openai` (a chave do `~/.codex`) e sem `openai@$A/empty-codex`.
 
 Depois, servidor de rascunho numa porta que não a 8787 (`AGENTLOOP_PORT=8798 python3 "$WT/bin/agentloop-server"` em segundo plano) e, no browser integrado, confirmar: o bloco Accounts nos cartões Anthropic e OpenAI (Default *Not signed in* com o comando, Home *Signed in as …*); o combo Account nos três editores, depois de Platform e antes de Model; e, no detalhe dos runs `acc-c` e `acc-o`, a linha Account e o comando de reabrir. No fim: matar o servidor pelo PID, `unset` das variáveis, e apagar `$A`.

@@ -1017,14 +1017,14 @@ JSON
 
   echo "accounts — the sign-ins Settings registers beside each platform's Default"
   local ac="$tmp/ac" _aj
-  mkdir -p "$ac/config" "$ac/data" "$ac/home/.claude" "$ac/home/.claude-a" "$ac/home/.claude-b" "$ac/home/.claude-c" "$ac/home/.claude-file" "$ac/home/.codex-a" "$ac/codex-home"
+  mkdir -p "$ac/config" "$ac/data" "$ac/fakehome/.claude" "$ac/fakehome/.claude-a" "$ac/fakehome/.claude-b" "$ac/fakehome/.claude-c" "$ac/fakehome/.claude-file" "$ac/fakehome/.codex-a" "$ac/codex-home"
   printf '{"jobs":[{"id":"ja","project":"P","prompt":"x","model":"claude-opus-5"},{"id":"jo","platform":"openai","model":"gpt-a","prompt":"x"}]}\n' > "$ac/config/jobs.json"
   printf '{"projects":[{"name":"P","cwd":"%s"}]}\n' "$ac" > "$ac/config/projects.json"
   printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},"openai":{"enabled":true,"bin":"","models":["gpt-a"]},"opencode":{"enabled":false,"bin":"","models":[]}}}\n' > "$ac/config/platforms.json"
   # A home of its own: `~` in a directory, the Default's ~/.claude, the plist
   # the pin is read back from and ~/.claude/skills all hang off HOME, and
   # none of them may be the operator's.
-  ac_al() { HOME="$ac/home" AGENTLOOP_CONFIG="$ac/config" AGENTLOOP_DATA="$ac/data" \
+  ac_al() { HOME="$ac/fakehome" AGENTLOOP_CONFIG="$ac/config" AGENTLOOP_DATA="$ac/data" \
             AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" AGENTLOOP_CODEX_BIN="$BASE_DIR/test/fake-codex" \
             AGENTLOOP_CLAUDE_CONFIG_DIR="" CODEX_HOME="$ac/codex-home" AGENTLOOP_OPENCODE_BIN=/nonexistent/opencode \
             "$BIN_DIR/agentloop" "$@"; }
@@ -1034,7 +1034,7 @@ JSON
     case "$_o" in *"$_w"*) [ "$_r" -ne 0 ] && ok "$_l" || bad "$_l: rc=$_r" ;; *) bad "$_l: $_o" ;; esac
   }
   _aj="$(ac_al platform accounts anthropic 2>/dev/null)"
-  printf '%s' "$_aj" | "$JQ" -e --arg h "$ac/home/.claude" 'length == 1 and .[0].id == "default" and .[0].name == "Default"
+  printf '%s' "$_aj" | "$JQ" -e --arg h "$ac/fakehome/.claude" 'length == 1 and .[0].id == "default" and .[0].name == "Default"
       and .[0].builtin == true and .[0].dir == $h and .[0].account_dir == "" and .[0].check.ready == true
       and .[0].used_by == {jobs: ["ja"], projects: ["P"], security: []}' >/dev/null 2>&1 \
     && ok "platform accounts: the Default alone, on the CLI's own directory, with who runs on it" || bad "accounts before any: $_aj"
@@ -1043,12 +1043,12 @@ JSON
     && ok "account-add registers it, names its id and whom it is signed in as" || bad "account-add: rc=$rc $out"
   [ "$("$JQ" -c '.platforms.anthropic.accounts' "$ac/config/platforms.json")" = '[{"id":"client-a","name":"Client A","dir":"~/.claude-a"}]' ] \
     && ok "and the file keeps the directory as it was typed" || bad "file: $(cat "$ac/config/platforms.json")"
-  [ "$(readlink "$ac/home/.claude-a/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
-    && ok "and the skills are linked into that account's own skills directory" || bad "skills in the account: $(ls "$ac/home/.claude-a" 2>&1)"
-  : > "$ac/home/.claude-file/skills"
+  [ "$(readlink "$ac/fakehome/.claude-a/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
+    && ok "and the skills are linked into that account's own skills directory" || bad "skills in the account: $(ls "$ac/fakehome/.claude-a" 2>&1)"
+  : > "$ac/fakehome/.claude-file/skills"
   out="$(ac_al platform account-add anthropic "Filed" "~/.claude-file" 2>&1)"; rc=$?
   case "$out" in
-    "account 'Filed' added on anthropic (id filed) — signed in as fake@example.org · max plan; "*" skill(s) could not be linked into $ac/home/.claude-file/skills (agentloop skills install)")
+    "account 'Filed' added on anthropic (id filed) — signed in as fake@example.org · max plan; "*" skill(s) could not be linked into $ac/fakehome/.claude-file/skills (agentloop skills install)")
       [ "$rc" -eq 0 ] && ok "and says when an account's own skills could not be linked (its skills path is a plain file)" || bad "rc=$rc $out" ;;
     *) bad "skills suffix missing: rc=$rc $out" ;;
   esac
@@ -1056,26 +1056,26 @@ JSON
   ac_refused "an account needs a name" "an account needs a name" account-add anthropic "" "~/.claude-a"
   ac_refused "an account needs a directory" "an account needs a directory" account-add anthropic "NeedsDir" ""
   ac_refused "a name already used is refused, whatever its case" "an account named 'client a' already exists on anthropic" account-add anthropic "client a" "~/.claude-b"
-  ac_refused "a directory another account has is refused, trailing slash or not" "$ac/home/.claude-a is already the directory of the account 'Client A'" account-add anthropic "Other" "$ac/home/.claude-a/"
+  ac_refused "a directory another account has is refused, trailing slash or not" "$ac/fakehome/.claude-a is already the directory of the account 'Client A'" account-add anthropic "Other" "$ac/fakehome/.claude-a/"
   ac_refused "a relative directory is refused" "the directory must be absolute or start with ~/ (got 'relative/dir')" account-add anthropic "Rel" "relative/dir"
-  ac_refused "a directory that does not exist says how to create it" "$ac/home/.claude-none does not exist — create it by signing in: CLAUDE_CONFIG_DIR=$ac/home/.claude-none claude auth login" account-add anthropic "None" "~/.claude-none"
-  ac_refused "the Default's own directory is refused" "$ac/home/.claude is the Default account's directory" account-add anthropic "Home" "~/.claude"
+  ac_refused "a directory that does not exist says how to create it" "$ac/fakehome/.claude-none does not exist — create it by signing in: CLAUDE_CONFIG_DIR=$ac/fakehome/.claude-none claude auth login" account-add anthropic "None" "~/.claude-none"
+  ac_refused "the Default's own directory is refused" "$ac/fakehome/.claude is the Default account's directory" account-add anthropic "Home" "~/.claude"
   ac_refused "Default is not a name an account can take" "Default is the install's own account — choose another name" account-add anthropic "default" "~/.claude-b"
   ac_refused "OpenCode has no accounts" "OpenCode has no accounts — its credentials are the providers configured in opencode itself" account-add opencode "X" "~/.claude-b"
   out="$(ac_al platform account-add anthropic "Client-A" "~/.claude-b" 2>&1)"
   case "$out" in *"(id client-a-2)"*) ok "an id already taken gets a numbered suffix" ;; *) bad "suffix: $out" ;; esac
-  : > "$ac/home/.claude-b/.fake-logged-out"
+  : > "$ac/fakehome/.claude-b/.fake-logged-out"
   _aj="$(ac_al platform check anthropic client-a-2 2>/dev/null)"
-  printf '%s' "$_aj" | "$JQ" -e --arg d "$ac/home/.claude-b" '.ready == false and .account_id == "client-a-2" and .account_dir == $d
+  printf '%s' "$_aj" | "$JQ" -e --arg d "$ac/fakehome/.claude-b" '.ready == false and .account_id == "client-a-2" and .account_dir == $d
       and .reason == ("claude is not signed in in " + $d + " (run: CLAUDE_CONFIG_DIR=" + $d + " claude auth login)")' >/dev/null 2>&1 \
     && ok "platform check <p> <id> checks that account's own directory" || bad "check client-a-2: $_aj"
   _aj="$(ac_al platform accounts anthropic 2>/dev/null)"
-  printf '%s' "$_aj" | "$JQ" -e --arg d "$ac/home/.claude-b" \
+  printf '%s' "$_aj" | "$JQ" -e --arg d "$ac/fakehome/.claude-b" \
       '(.[] | select(.id == "client-a-2")) as $e
        | $e.dir == "~/.claude-b" and $e.account_dir == $d and $e.builtin == false and $e.check.ready == false
        and $e.used_by == {jobs:[], projects:[], security:[]}' >/dev/null 2>&1 \
     && ok "platform accounts: a registered, logged-out account shows its typed dir, its exported dir, and that nobody uses it" || bad "accounts client-a-2: $_aj"
-  printf 'a@example.org' > "$ac/home/.claude-a/.fake-email"
+  printf 'a@example.org' > "$ac/fakehome/.claude-a/.fake-email"
   [ "$(ac_al platform check anthropic client-a 2>/dev/null | "$JQ" -r .account)" = "a@example.org · max plan" ] \
     && ok "and says whom that directory is signed in as" || bad "check client-a: $(ac_al platform check anthropic client-a 2>&1)"
   [ "$(ac_al platform check anthropic nope 2>/dev/null | "$JQ" -r '.ready, .account_dir, .reason' | tr '\n' '|')" = "false||account 'nope' is not an account of anthropic in Settings|" ] \
@@ -1086,8 +1086,8 @@ JSON
     && ok "account-edit renames it and keeps its id" || bad "edit: rc=$rc $out"
   out="$(ac_al platform account-edit anthropic client-a "Client Alpha" "~/.claude-c" 2>&1)"; rc=$?
   [ "$rc" -eq 0 ] && [ "$out" = "account 'Client Alpha' saved on anthropic — signed in as fake@example.org · max plan" ] \
-    && [ "$(readlink "$ac/home/.claude-c/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
-    && ok "account-edit moving an account to a new, existing directory relinks the skills there too" || bad "edit relink: rc=$rc $out $(ls "$ac/home/.claude-c" 2>&1)"
+    && [ "$(readlink "$ac/fakehome/.claude-c/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
+    && ok "account-edit moving an account to a new, existing directory relinks the skills there too" || bad "edit relink: rc=$rc $out $(ls "$ac/fakehome/.claude-c" 2>&1)"
   ac_refused "the Default is not edited here" "the Default account is the install's own — it is not edited here" account-edit anthropic default "X" "~/.claude-b"
   ac_refused "an unknown id is not edited" "no account 'nope' on anthropic" account-edit anthropic nope "X" "~/.claude-b"
   "$JQ" '.jobs[0].account = "client-a"' "$ac/config/jobs.json" > "$ac/jobs.next" && mv "$ac/jobs.next" "$ac/config/jobs.json"
@@ -1105,24 +1105,24 @@ JSON
   out="$(ac_al platform account-add openai "Client A" "~/.codex-a" 2>&1)"; rc=$?
   [ "$rc" -eq 0 ] && [ "$out" = "account 'Client A' added on openai (id client-a) — Logged in using ChatGPT" ] \
     && ok "an OpenAI account has its own list: the same name and id are free there" || bad "openai add: rc=$rc $out"
-  : > "$ac/home/.codex-a/.fake-logged-out"
-  [ "$(ac_al platform check openai client-a 2>/dev/null | "$JQ" -r .reason)" = "codex is not signed in in $ac/home/.codex-a (run: CODEX_HOME=$ac/home/.codex-a codex login)" ] \
+  : > "$ac/fakehome/.codex-a/.fake-logged-out"
+  [ "$(ac_al platform check openai client-a 2>/dev/null | "$JQ" -r .reason)" = "codex is not signed in in $ac/fakehome/.codex-a (run: CODEX_HOME=$ac/fakehome/.codex-a codex login)" ] \
     && ok "and its check runs codex login status in that CODEX_HOME" || bad "openai check: $(ac_al platform check openai client-a 2>&1)"
-  [ "$(readlink "$ac/home/.codex-a/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
-    && ok "and the skills are linked into its home too" || bad "codex account skills: $(ls "$ac/home/.codex-a" 2>&1)"
-  ac_refused "a Codex home that does not exist says how to create it" "$ac/home/.codex-none does not exist — create it and sign in: mkdir -p $ac/home/.codex-none && CODEX_HOME=$ac/home/.codex-none codex login" account-add openai "N" "~/.codex-none"
+  [ "$(readlink "$ac/fakehome/.codex-a/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
+    && ok "and the skills are linked into its home too" || bad "codex account skills: $(ls "$ac/fakehome/.codex-a" 2>&1)"
+  ac_refused "a Codex home that does not exist says how to create it" "$ac/fakehome/.codex-none does not exist — create it and sign in: mkdir -p $ac/fakehome/.codex-none && CODEX_HOME=$ac/fakehome/.codex-none codex login" account-add openai "N" "~/.codex-none"
   # A pin that normalizes to the CLI's own directory must still leave the
   # variable UNSET (account_env_value), not set it to that same path: the
   # fake only honours the marker when CLAUDE_CONFIG_DIR is actually set, so
   # ready here proves it was left unset.
-  : > "$ac/home/.claude/.fake-logged-out"
-  out="$(HOME="$ac/home" AGENTLOOP_CONFIG="$ac/config" AGENTLOOP_DATA="$ac/data" \
+  : > "$ac/fakehome/.claude/.fake-logged-out"
+  out="$(HOME="$ac/fakehome" AGENTLOOP_CONFIG="$ac/config" AGENTLOOP_DATA="$ac/data" \
          AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" AGENTLOOP_CODEX_BIN="$BASE_DIR/test/fake-codex" \
-         AGENTLOOP_CLAUDE_CONFIG_DIR="$ac/home/.claude/" CODEX_HOME="$ac/codex-home" AGENTLOOP_OPENCODE_BIN=/nonexistent/opencode \
+         AGENTLOOP_CLAUDE_CONFIG_DIR="$ac/fakehome/.claude/" CODEX_HOME="$ac/codex-home" AGENTLOOP_OPENCODE_BIN=/nonexistent/opencode \
          "$BIN_DIR/agentloop" platform check anthropic 2>/dev/null)"
   [ "$(printf '%s' "$out" | "$JQ" -r .ready)" = "true" ] && [ "$(printf '%s' "$out" | "$JQ" -r .account_dir)" = "" ] \
     && ok "a pin that normalizes to the CLI's own directory still runs with CLAUDE_CONFIG_DIR unset, and exports nothing" || bad "pin equals default: $out"
-  rm -f "$ac/home/.claude/.fake-logged-out"
+  rm -f "$ac/fakehome/.claude/.fake-logged-out"
   [ "$( HOME=/Users/me; account_env_value anthropic "/Users/me/.claude/" )" = "" ] \
     && [ "$( HOME=/Users/me; account_env_value anthropic "~/.claude-x///" )" = "/Users/me/.claude-x" ] \
     && [ "$( HOME=/Users/me; account_env_value openai "~/.codex" )" = "" ] \
@@ -1139,7 +1139,7 @@ JSON
 
   echo "claude_config_dir — install turns what is left of it into accounts"
   local ccd="$tmp/ccd" _mig
-  mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/home/.claude" "$ccd/home/old-elsewhere" "$ccd/old-acct" "$ccd/orphan-p" "$ccd/orphan-s" "$ccd/old-acct2" "$ccd/old-acct3"
+  mkdir -p "$ccd/cfg" "$ccd/data" "$ccd/fakehome/.claude" "$ccd/fakehome/old-elsewhere" "$ccd/old-acct" "$ccd/orphan-p" "$ccd/orphan-s" "$ccd/old-acct2" "$ccd/old-acct3"
   cat > "$ccd/cfg/projects.json" <<JSON
 {"projects":[{"name":"Old1","cwd":"$ccd","claude_config_dir":"$ccd/old-acct/"},
              {"name":"Old2","cwd":"$ccd","security":{"enabled":false,"claude_config_dir":"$ccd/old-acct"}},
@@ -1153,7 +1153,7 @@ JSON
   printf '{"jobs":[]}\n' > "$ccd/cfg/jobs.json"
   printf '{"platforms":{"anthropic":{"enabled":true,"bin":"","models":["claude-opus-5"]},"openai":{"enabled":true,"bin":"","models":["gpt-a"]}}}\n' > "$ccd/cfg/platforms.json"
   ccd_env() {
-    HOME="$ccd/home"; PLIST_PATH=/nonexistent; AGENTLOOP_CLAUDE_CONFIG_DIR=""
+    HOME="$ccd/fakehome"; PLIST_PATH=/nonexistent; AGENTLOOP_CLAUDE_CONFIG_DIR=""
     CONFIG_DIR="$ccd/cfg"; PROJECTS_FILE="$ccd/cfg/projects.json"; JOBS_FILE="$ccd/cfg/jobs.json"
     PLATFORMS_FILE="$ccd/cfg/platforms.json"; DATA_DIR="$ccd/data"
   }
@@ -1165,7 +1165,7 @@ JSON
     || bad "migrated: $("$JQ" -c '.projects' "$ccd/cfg/projects.json")"
   case "$_mig" in *"claude_config_dir on Old4 (project) left in place — that level runs on openai"*) ok "a level that does not run on Anthropic keeps the field, and says why" ;; *) bad "Old4: $_mig" ;; esac
   case "$_mig" in *"claude_config_dir on Old5 (project) left in place — $ccd/missing does not exist"*) ok "and so does a directory that is gone" ;; *) bad "Old5: $_mig" ;; esac
-  case "$_mig" in *"registered the Claude account 'old-elsewhere' ($ccd/home/old-elsewhere) from projects.json"*) ok "a directory written with ~ is registered too, named after it" ;; *) bad "Old6: $_mig" ;; esac
+  case "$_mig" in *"registered the Claude account 'old-elsewhere' ($ccd/fakehome/old-elsewhere) from projects.json"*) ok "a directory written with ~ is registered too, named after it" ;; *) bad "Old6: $_mig" ;; esac
   [ "$("$JQ" -r '.platforms.anthropic.accounts[] | select(.name=="old-elsewhere") | .dir' "$ccd/cfg/platforms.json")" = "~/old-elsewhere" ] \
     && ok "and the stored directory is what projects.json had (~ kept, not expanded; account_add trims the trailing slash)" \
     || bad "old-elsewhere dir: $("$JQ" -c '.platforms.anthropic.accounts' "$ccd/cfg/platforms.json")"

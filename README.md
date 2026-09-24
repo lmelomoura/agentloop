@@ -1222,45 +1222,73 @@ fixing one field never means walking the other two.
 back to and why that is usually not what you want. Add `repos` only when one
 ticket really does touch several repositories.
 
-### Which Claude account a run signs in as
+### Accounts — which sign-in a run uses
 
-Claude Code keeps credentials, settings, plugins, MCP servers and past sessions
-**per config directory** — one signed-in account each. If you keep two accounts
-on the same Mac (a company one and a personal one, say), the directory is the
-only thing that chooses between them:
+Claude Code keeps credentials, settings, plugins, MCP servers, skills and past
+sessions **per config directory** — one signed-in account each — and the Codex
+CLI does the same per `CODEX_HOME`. If you keep several accounts on one Mac
+(a client's and your own, say), the directory is what chooses between them:
 
 ```bash
-CLAUDE_CONFIG_DIR=~/.claude-work     claude    # work account
-CLAUDE_CONFIG_DIR=~/.claude-personal claude    # personal account
+CLAUDE_CONFIG_DIR=~/.claude-client-a claude auth login
+CODEX_HOME=~/.codex-client-a codex login          # mkdir -p ~/.codex-client-a first
 ```
 
-Shell aliases for that never reach agentloop: `launchd` inherits nothing from
-your shell, so by default every run signs in as the CLI's own `~/.claude`. The
-account is the install's — one pin, set at install time, for every run and every
-model probe:
+Sign in without a trailing slash: Claude Code names the Keychain entry that
+holds the session after the exact directory string it was given.
+
+**Every platform has a Default** — the install's own: the pin below, or the
+CLI's own `~/.claude`; the engine's `CODEX_HOME`, or `~/.codex`. **Settings ›
+Platforms › Accounts** registers the others, one row per directory, each with
+the session it holds (*Signed in as …*, or the login to run) and who runs on
+it; the same from the terminal:
+
+```bash
+agentloop platform accounts anthropic                                   # every account, with its session
+agentloop platform account-add anthropic "Client A" ~/.claude-client-a  # register one
+agentloop platform check anthropic client-a                             # its session, live
+agentloop platform account-edit anthropic client-a "Client A" ~/.claude-a
+agentloop platform account-remove anthropic client-a                    # refused while anything uses it
+```
+
+**Who runs where.** The job editor, the project editor and the Security tab
+pick **Platform → Account → Model** (the Account list appears once a platform
+has an account besides the Default). A job runs on its own account; without
+one, on its project's when the job runs on the project's platform; else on
+the Default. A security analysis follows the same rule against its block. A
+**resume** always signs in where its session was created — the journal
+records the account and the directory of every run — whatever the job says
+today.
+
+**What follows the account.** The agent and its precheck run with the
+account's variable (an account on the CLI's own directory runs with the
+variable *unset*: set, even to `~/.claude`, Claude Code looks for another
+Keychain entry); a run whose account is gone, whose directory is gone, or
+which has no session is refused in `tick.log` before a slot is taken; the
+Codex rollout is read from the run's own `CODEX_HOME`; the usage-window gate
+is the account's own (`data/rate-limits.json` keys every account directory as
+`<platform>@<dir>`), and the statusline feeds the account its session runs as
+— wire it in each account's own `settings.json`; the agentloop skills are
+linked into every account directory. The model probes and the catalog
+refreshes run on the Default. OpenCode has no accounts: its credentials are
+the providers configured in opencode itself.
+
+**The pin.** `launchd` inherits nothing from your shell, so the Default's
+Claude account is set at install time:
 
 ```bash
 AGENTLOOP_CLAUDE_CONFIG_DIR=~/.claude-work bash install.sh
 ```
 
-The value is written into both `launchd` plists — under `AGENTLOOP_CLAUDE_CONFIG_DIR`,
-the name the engine reads, and under `CLAUDE_CONFIG_DIR` beside it for everything
-else those agents start — so it survives logout and reboot; re-running the
-installer without the variable keeps whatever is already pinned. There is no
-account per project: a `claude_config_dir` still sitting in `config/projects.json`
-is ignored, `agentloop status` and `install` say so, and the next save of that
-project drops it. **Settings › Platforms** shows whom the pin is signed in as —
-the Anthropic card's Session line is `claude auth status` run in that directory,
-and a directory with no session says so with the `claude auth login` to run —
-and `agentloop status` prints the same account, with the directory in brackets.
+The value is written into both `launchd` plists — under
+`AGENTLOOP_CLAUDE_CONFIG_DIR`, the name the engine reads, and under
+`CLAUDE_CONFIG_DIR` beside it — and re-running the installer without the
+variable keeps it. A run you type yourself (`agentloop run <id>`) reads only
+the explicit variable, never the `CLAUDE_CONFIG_DIR` your shell exports.
 
-The pin reaches everything `launchd` starts: the tick, and therefore every
-scheduled run, a **Run now** from the dashboard, and the model probes. A run you
-type yourself (`agentloop run <id>`) does **not** pick it up — the engine reads
-only the explicit variable, and never the `CLAUDE_CONFIG_DIR` your shell happens
-to export, so a run typed inside a Claude Code session cannot silently bill that
-session's account. Put the variable in front of the command when you want the
-pinned account by hand: `AGENTLOOP_CLAUDE_CONFIG_DIR=~/.claude-work agentloop run <id>`.
+**From before accounts.** `agentloop install` turns a `claude_config_dir`
+still in `config/projects.json` into an account and sets it on the level that
+carried it; `status` names any it could not convert.
 
 ---
 
@@ -1754,7 +1782,7 @@ falls back, with a warning, the way a model switched off in Settings does.
 [Settings](#settings), and a model switched off there falls back to the same
 one, with a warning; `effort` left empty leaves the decision to the CLI, as in
 a job. The analysis signs in as the platform's account — the install's pin, see
-[Which Claude account a run signs in as](#which-claude-account-a-run-signs-in-as);
+[Accounts — which sign-in a run uses](#accounts--which-sign-in-a-run-uses);
 there is no account of its own to set here.
 
 **Some noise is filtered before you configure anything.** A `fixtures`,
