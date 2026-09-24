@@ -25,6 +25,8 @@ close names. A stop is not the unit's failure: its continuation keeps the
 same attempt.
 """
 
+import sqlite3
+
 from . import diff, evidence, ledger, queries, slices
 
 TRIAGE_BATCH = 25
@@ -288,3 +290,123 @@ def label(conn, unit) -> str:
     place = next((n for n, u in enumerate(firsts, 1) if u["id"] == root["id"]), 0)
     text = f"{unit['kind']} {place}/{len(firsts)}"
     return text if unit["attempt"] == 1 else f"{text} · attempt {unit['attempt']}"
+
+
+def _lineages(all_units):
+    """(root, last attempt) for every lineage, in the order of the roots --
+    how a unit that was continued is counted: by where its lineage ended."""
+    children = {}
+    for u in all_units:
+        if u["parent"]:
+            children.setdefault(u["parent"], []).append(u)
+    out = []
+    for root in (u for u in all_units if not u["parent"]):
+        last = root
+        while children.get(last["id"]):
+            last = max(children[last["id"]], key=lambda c: c["seq"])
+        out.append((root, last))
+    return out
+
+
+def owed(conn, analysis_id, all_units=None, inventory=None) -> list:
+    """The deep scope's lines no read unit proved it read, as
+    [{"path", "first", "last"}] in inventory order: every range of the
+    inventory minus the union of the `covered` spans the read units of this
+    analysis recorded (`_judge_read`), WHATEVER THEIR STATE.
+
+    FROM THE INVENTORY, NOT FROM THE UNITS. Counting what each lineage's last
+    attempt still carried left out everything no unit carries -- a slice a
+    plan cut short never got -- and everything a unit gave up on without
+    naming it: a crash, a subagent, three runs the engine could not finish
+    all settle with no `missing`, and each read "in full". A unit that
+    covered nothing proved nothing. THE ONE COMPUTATION OF THE DEBT: `summary`
+    reads it for the page, and the close (`gaps`, security/units.py) for the
+    report."""
+    if inventory is None:
+        inventory = ledger.inventory_of(conn, analysis_id)
+    if not inventory:
+        return []
+    if all_units is None:
+        all_units = ledger.units_of(conn, analysis_id)
+    covered = {}
+    for u in all_units:
+        spans = u["evidence"].get("covered") if u["kind"] == "read" else None
+        if not isinstance(spans, dict):
+            continue
+        for path, pairs in spans.items():
+            for pair in pairs if isinstance(pairs, list) else []:
+                try:
+                    covered.setdefault(path, []).append((int(pair[0]), int(pair[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue    # a cell nobody could have written: it proves nothing
+    merged = {path: _merge_spans(spans) for path, spans in covered.items()}
+    out = []
+    for f in inventory.get("files") or []:
+        for rng in f.get("ranges") or []:
+            first, last = int(rng[0]), int(rng[1])
+            cursor = first
+            for a, b in merged.get(f["path"], []):
+                if b < cursor or a > last:
+                    continue
+                if a > cursor:
+                    out.append({"path": f["path"], "first": cursor, "last": a - 1})
+                cursor = max(cursor, b + 1)
+                if cursor > last:
+                    break
+            if cursor <= last:
+                out.append({"path": f["path"], "first": cursor, "last": last})
+    return out
+
+
+def summary(conn, analysis_id):
+    """What the page shows while an analysis runs and after it: per kind, how
+    many lineages are done, running, waiting or given up (each judged by its
+    LAST attempt); in a deep analysis, how much of the inventory has been
+    read (`owed`); and what the units cost. None on a ledger that predates the
+    unit table -- the read-only paths never migrate."""
+    try:
+        all_units = ledger.units_of(conn, analysis_id)
+    except sqlite3.OperationalError:
+        return None
+    lineages = _lineages(all_units)
+    kinds = {}
+    for kind in ledger.UNIT_KINDS:
+        lasts = [last for root, last in lineages if root["kind"] == kind]
+        if not lasts:
+            continue
+        counts = {"total": len(lasts), "done": 0, "running": 0, "pending": 0, "failed": 0}
+        for last in lasts:
+            state = last["state"]
+            counts[state if state in ("done", "running", "failed") else "pending"] += 1
+        kinds[kind] = counts
+    deep = None
+    inventory = ledger.inventory_of(conn, analysis_id)
+    if inventory:
+        left = owed(conn, analysis_id, all_units, inventory)
+        paths_left = {s["path"] for s in left}
+        lines = int((inventory.get("totals") or {}).get("lines", 0))
+        files = inventory.get("files") or []
+        deep = {"files": len(files),
+                "files_read": sum(1 for f in files if f["path"] not in paths_left),
+                "lines": lines,
+                "lines_read": lines - sum(s["last"] - s["first"] + 1 for s in left)}
+    return {"kinds": kinds, "deep": deep, "units": len(all_units),
+            "spend_usd": round(sum(u["spend_usd"] for u in all_units), 4)}
+
+
+def close(conn, unit, *, stream="", root="", status="error", reason="", spend_usd=0.0) -> dict:
+    """Judge one run of `unit` by what it left -- its stream, what `security
+    read` served it, the ledger -- and conclude it. {"state", "continuation"}.
+
+    THE ONE CLOSE OF A UNIT. The engine's `unit-close` (a run that ended) and
+    the orchestrator (a run that died without closing, security/orchestrator.py)
+    both come here, so a unit is judged the same way whichever of them saw its
+    run end. A unit already settled is left exactly as it is: the orchestrator
+    closes a unit whose run died before its own close could."""
+    if unit["state"] not in ("pending", "running"):
+        return {"state": unit["state"], "continuation": None}
+    session = evidence.read_session(stream or None, root or ".")
+    session = evidence.with_served(session, ledger.unit_reads(conn, unit["id"]))
+    done, remaining, ev, note = judge(conn, unit, session, status, reason)
+    return conclude(conn, unit, done=done, evidence=ev, note=note, spend_usd=spend_usd,
+                    remaining=remaining, stopped=status == "stopped")

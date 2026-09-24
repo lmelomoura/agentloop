@@ -20,6 +20,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The security CLI runs units.** `prepare` lists a deep analysis's scope,
+  and — with `--plan`, which only the engine's orchestrator passes — writes
+  the plan, all of it or none: a plan that fails exits non-zero with the
+  reason and writes no unit, instead of reporting success over half a plan.
+  `unit-prompt` prints a unit's minted prompt — a triage row with every
+  location it has, a read unit's files with what is already recorded or
+  decided in them — `unit-close` judges a unit's run from its stream and
+  the ledger and plans what it left undone, `units` prints the progress (per
+  kind, and how much of a deep scope has been read, counted against the
+  inventory itself), and `read` serves a file to a unit in numbered chunks
+  of 200 lines or 8 KB, recording each chunk as proof of reading — the only
+  proof there is on Codex. A line wider than one whole chunk is shown but
+  never recorded: `read` never records more than the chunk it actually
+  showed.
+
 - **Each unit of an analysis is given one job, and told how it is checked.**
   The CLI mints the prompt of every unit from the ledger: a triage unit's
   rows with every location each one has (a re-report replaces the stored

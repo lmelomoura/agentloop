@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, ledger, osv, prompts, queries, report, secrets, taxonomy, verdict  # noqa: E402
+from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, inventory, ledger, osv, prompts, queries, report, secrets, taxonomy, units, verdict  # noqa: E402
 
 REQUIRED_FINDING_KEYS = ("fingerprint", "category", "rule", "severity", "title")
 
@@ -1240,6 +1240,29 @@ def _scan_iac(root, offline: bool, ignore_paths=()):
     return findings, notes, PRODUCER_TRIVY_IAC, coverage.RAN
 
 
+def _slice_guides(root, ignore, components):
+    """The hunting guides each read unit's files call for: this analysis's own
+    signals (security/guides.py) narrowed to the slice's paths --
+    ATTACK-CLASSES and the two best-matched domain guides. The inventory
+    signal is left out on purpose: it fires on nearly every project and would
+    hand SUPPLY-CHAIN to every slice. Advice never fails the plan: on any
+    error -- reading the signals, or choosing for one slice -- the units get
+    ATTACK-CLASSES alone, and only a real planning failure fails `prepare`."""
+    try:
+        sig = guides.signals(root, ignore, components)
+    except Exception:  # noqa: BLE001 -- advice must not fail the phase
+        return None
+
+    def pick(ranges):
+        paths = sorted({r["path"] for r in ranges})
+        try:
+            return guides.select({"deps": sig["deps"], "paths": paths, "inventory": False},
+                                 "standard")[:3]
+        except Exception:  # noqa: BLE001 -- advice must not fail the plan
+            return [guides.ALWAYS]
+    return pick
+
+
 def cmd_prepare(args):
     """The deterministic phases, run inside the worktree by the agent's first
     command. Seconds, and no tokens."""
@@ -1448,10 +1471,28 @@ def cmd_prepare(args):
     # itself goes onto the analysis row (`ledger.set_guides`) below and out
     # on stdout, where the skill tells the agent to read it.
     recommended, guides_note = guides.recommend(root, ignore, components, row["profile"])
+    # THE SCOPE ROW'S SENTENCES STAND TOGETHER AT THE HEAD OF THE PARAGRAPH.
+    # `notes` already opens with the switch and noise-filter sentences (the
+    # two inserts above), and the scope row's note is those plus the two
+    # below, joined: appended after the secret phase's notes instead, the row
+    # stopped being one contiguous run of the paragraph -- the invariant
+    # test_every_phases_prose_is_a_substring_of_the_paragraph pins, and
+    # test_the_deep_scope_sentence_keeps_the_scope_row_a_substring_of_the_paragraph
+    # (test_cli_units.py) pins for the deep case. So each goes in right after
+    # the scope sentences already there, in the order the row carries them.
     if guides_note:
-        notes.append(guides_note)
+        notes.insert(len(scope_notes), guides_note)
         scope_notes.append(guides_note)
         print(f"prepare: {guides_note}", file=sys.stderr)
+    # THE DEEP SCOPE, listed before any unit reads a line of it -- see
+    # security/inventory.py. Filed under `scope` like the guides: it is what
+    # this analysis was set up to read.
+    deep_inventory = None
+    if row["profile"] == "deep":
+        deep_inventory = inventory.build(root, ignore)
+        inventory_note = inventory.summary(deep_inventory)
+        notes.insert(len(scope_notes), inventory_note)
+        scope_notes.append(inventory_note)
 
     findings += _produced_by(dep_findings, dep_producer, produced)
 
@@ -1614,9 +1655,34 @@ def cmd_prepare(args):
     # marked prepared with an empty `produced` would report its whole
     # deterministic baseline `pending` for ever.
     ledger.set_guides(conn, aid, recommended=recommended)
+    if deep_inventory is not None:
+        ledger.set_inventory(conn, aid, deep_inventory)
     ledger.mark_prepared(conn, aid, produced)
+    # THE PLAN -- only for an analysis the engine runs as a pipeline: the one
+    # its orchestrator prepares, which passes --plan. A hand run, the
+    # selftest's fixtures and every test that prepares an analysis to exercise
+    # something else plan nothing, as before the pipeline, so none of them can
+    # meet a planning failure it was not written about.
+    #
+    # After `prepared`: the checklist the triage units are drawn from
+    # classifies what the last analysis left by what THIS one ran, and until
+    # `mark_prepared` it cannot know. ALL OR NOTHING (ledger.add_units), and a
+    # plan that fails fails LOUDLY -- non-zero, the reason on stderr, no JSON
+    # on stdout. It used to be swallowed and printed as success with no units
+    # (and a kill mid-plan left half a plan `plan` then refused to complete):
+    # the analysis closed `done` with slices nobody read. The phases' results
+    # stay, because they are this analysis's and running them again would pay
+    # for them twice; the orchestrator closes the analysis `capped`, naming
+    # the failure (security/orchestrator.py).
+    planned = []
+    if args.plan:
+        try:
+            planned = units.plan(conn, aid, slice_guides=_slice_guides(root, ignore, components))
+        except Exception as exc:  # noqa: BLE001 -- reported below, never swallowed
+            sys.exit(f"prepare: the units could not be planned ({type(exc).__name__}: {exc}). "
+                     "No unit was written; the deterministic phase's results are kept.")
     print(json.dumps({"coverage_note": note, "findings": len(findings),
-                      "guides": {"recommended": recommended}}))
+                      "guides": {"recommended": recommended}, "units": len(planned)}))
 
 
 def cmd_findings(args):
@@ -1702,6 +1768,223 @@ def cmd_report_verdict(args):
     if not ledger.record_verdict(conn, args.analysis, args.fingerprint, value, reason):
         sys.exit(f"report-verdict: {args.fingerprint[:12]}… could not be written. "
                  "Nothing was recorded")
+
+
+# ---- the pipeline's units (security/units.py) -------------------------------
+
+def _session_unit() -> int:
+    """This session's unit id, or 0 outside one (a hand run, a test)."""
+    value = _agent_env("SECURITY_UNIT_ID")
+    return int(value) if value.isdigit() else 0
+
+
+READ_LINES = 200
+READ_BYTES = 8000
+
+
+def _unit_of(conn, analysis_id, unit_id):
+    unit = ledger.get_unit(conn, unit_id)
+    if unit is None or unit["analysis_id"] != analysis_id:
+        sys.exit(f"unit {unit_id} is not a unit of analysis {analysis_id}")
+    return unit
+
+
+def _finding_row(f, kind=None):
+    """One ledger row as a unit's prompt shows it: its first location on its
+    own line, and EVERY location beside it. A re-report REPLACES the stored
+    list (ledger.record_finding), so a triage unit shown one location of
+    five, and told to re-report the row as shown, would narrow it to one."""
+    places = [{"file": o.get("file", ""), "line": o.get("line", 0)}
+              for o in f.get("occurrences") or []]
+    first = places[0] if places else {}
+    row = {"fingerprint": f["fingerprint"], "category": f.get("category", ""),
+           "rule": f.get("rule", ""), "severity": f.get("severity", ""),
+           "state": f.get("state", ""), "title": f.get("title", ""),
+           "file": first.get("file", ""), "line": first.get("line", 0),
+           "producer": f.get("producer", ""), "occurrences": places}
+    if kind:
+        row["kind"] = kind
+    return row
+
+
+def cmd_unit_prompt(args):
+    """The prompt of one unit, minted from the ledger -- the text the engine
+    launches the unit's session with (bin/agentloop, run_job). Read-only, so
+    it is not in AGENT_FORBIDDEN: the engine calls it inside the run's own
+    environment."""
+    conn = _conn(args)
+    row = _analysis(conn, args.analysis)
+    unit = _unit_of(conn, args.analysis, args.unit)
+    _a, findings = queries.checklist(conn, args.analysis)
+    by_fp = {f["fingerprint"]: f for f in findings}
+    kind = unit["kind"]
+    if kind == "triage":
+        context = {"rows": [_finding_row(by_fp[i["fingerprint"]], i["kind"])
+                            for i in unit["payload"].get("items", []) if i["fingerprint"] in by_fp]}
+    elif kind == "hunt":
+        context = {"guides": ledger.guides_of(row).get("recommended") or [guides.ALWAYS]}
+    elif kind == "read":
+        ranges = unit["payload"].get("ranges", [])
+        paths = {r["path"] for r in ranges}
+
+        def in_ranges(f):
+            return any(o.get("file") in paths for o in f.get("occurrences") or [])
+        # WHAT IS ALREADY RECORDED IN THESE FILES: every open row, AND every
+        # row the operator decided on this branch. The checklist lists those
+        # with the decision's state, which is not open, and `decided_sast`
+        # leaves out whatever the checklist lists -- so a decided row filtered
+        # out here reached the unit from nowhere, and was minted again under a
+        # second identity no decision matches.
+        known = [_finding_row(f) for f in findings if in_ranges(f)
+                 and (queries.is_open(f.get("state", ""))
+                      or f.get("state") in ledger.DECISION_STATES)]
+        # A `decided_sast` entry carries neither a category (every one is a
+        # sast finding) nor a state (the decision's is inside `decision`), and
+        # the prompt's line shows both.
+        decided = [_finding_row(dict(e, category="sast", state=e["decision"]["state"]))
+                   for e in queries.decided_sast(conn, args.analysis, listed=findings)
+                   if in_ranges(e)]
+        context = {"ranges": ranges, "guides": unit["payload"].get("guides") or [guides.ALWAYS],
+                   "known": known, "decided": decided}
+    else:
+        finding = by_fp.get(unit["payload"].get("fingerprint", ""))
+        if finding is None:
+            sys.exit(f"unit-prompt: unit {args.unit}'s finding is not in analysis {args.analysis}")
+        context = {"finding": finding}
+    analysis = {k: row[k] for k in ("id", "project", "repo", "branch", "commit_sha", "profile")}
+    print(prompts.unit_prompt(analysis, units.label(conn, unit), args.platform, kind, context))
+
+
+def cmd_unit_close(args):
+    """Judge one run of a unit by what it left -- its stream, what `read`
+    served it, the ledger -- and plan what it left undone (units.close). The
+    ENGINE's verb: run_job calls it when a unit's run ends, with the agent
+    flag removed, so it is in AGENT_FORBIDDEN (a session does not grade
+    itself). Closing a unit that is already settled is a no-op: the
+    orchestrator judges a unit whose run died before this close could run,
+    through the same function, and whichever comes second finds it settled."""
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    unit = _unit_of(conn, args.analysis, args.unit)
+    print(json.dumps(units.close(conn, unit, stream=args.stream, root=args.root,
+                                 status=args.status, reason=args.reason,
+                                 spend_usd=_spend(args.spend))))
+
+
+def cmd_report_gone(args):
+    """A carried `sast` finding the session's triage unit read and found gone,
+    SAID, with the reason -- the one way such a finding leaves the report
+    without a silence the unit's proof could not tell from a skipped row."""
+    uid = _session_unit()
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError as exc:
+        sys.exit(f"report-gone: stdin is not valid JSON: {exc}")
+    reason = (payload.get("reason") or "").strip() if isinstance(payload, dict) else ""
+    if not reason:
+        sys.exit("report-gone: a reason is required -- what you read that shows it is gone. Nothing was recorded")
+    _refuse_if_secret("report-gone: reason", reason)
+    conn = _conn(args)
+    _running(conn, args.analysis)
+    unit = ledger.get_unit(conn, uid) if uid else None
+    carried = [] if unit is None else [i for i in unit["payload"].get("items", [])
+                                       if i.get("kind") == "carried" and i.get("category") == "sast"]
+    if (unit is None or unit["kind"] != "triage" or unit["analysis_id"] != args.analysis
+            or unit["state"] != "running"
+            or args.fingerprint not in {i["fingerprint"] for i in carried}):
+        sys.exit(f"report-gone: {args.fingerprint[:12]}… is not a carried sast finding of this "
+                 "session's triage unit. Nothing was recorded")
+    ledger.record_gone(conn, uid, args.fingerprint, reason)
+
+
+def cmd_units(args):
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    if args.label is not None:
+        print(units.label(conn, _unit_of(conn, args.analysis, args.label)))
+        return
+    print(json.dumps(units.summary(conn, args.analysis), indent=2))
+
+
+def cmd_read(args):
+    """A chunk of a file, numbered, for a unit that must PROVE it read it --
+    the only proof on the Codex CLI, whose shell reads the stream cannot carry
+    (security/evidence.py). Records the chunk only after printing it: the
+    record says what was put in front of the session, never what it asked
+    for. Served to a unit of a running analysis only, and only inside the
+    unit's own run.
+
+    THE BUDGET COUNTS WHAT IS ACTUALLY PRINTED, byte for byte -- each line's
+    "N\\t" prefix included, encoded as UTF-8 -- never the bare text alone. On
+    the Codex CLI this verb's ledger record IS the proof of reading, because
+    that CLI shows the model at most ~10 KiB / 256 lines of a command's
+    output and cuts the middle of anything longer: a chunk sized off the text
+    alone can run past what the model actually saw -- two-byte characters
+    double the true cost of every line, and two hundred line-number prefixes
+    add on the order of 1.4 KB by themselves -- and the ledger would then
+    record lines nobody read.
+    """
+    aid, uid = _agent_env("SECURITY_ANALYSIS_ID"), _agent_env("SECURITY_UNIT_ID")
+    if not (aid.isdigit() and uid.isdigit()):
+        sys.exit("read: serves only a unit of an analysis -- AL_SECURITY_ANALYSIS_ID and "
+                 "AL_SECURITY_UNIT_ID are not set in this session")
+    conn = _conn(args)
+    _running(conn, int(aid))
+    _unit_of(conn, int(aid), int(uid))
+    root = os.path.realpath(_agent_env("RUN_CWD") or os.getcwd())
+    full = os.path.realpath(args.path if os.path.isabs(args.path) else os.path.join(root, args.path))
+    if full != root and not full.startswith(root + os.sep):
+        sys.exit(f"read: {args.path} is outside this run's checkout ({root})")
+    rel = os.path.relpath(full, root).replace(os.sep, "/")
+    try:
+        data = Path(full).read_bytes()
+    except OSError as exc:
+        sys.exit(f"read: cannot read {rel}: {exc.strerror or exc}")
+    lines = data.decode("utf-8", errors="replace").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    total, first = len(lines), max(1, args.start)
+    if first > total:
+        print(f"== {rel} has {total} line{'s' if total != 1 else ''}; nothing at line {first} ==")
+        return
+    # Each line's cost is the UTF-8 bytes of what is actually PRINTED for it
+    # -- "N\tTEXT" -- plus one for its newline, never `len(text)` alone: see
+    # the docstring. `out` empty is what tells apart a line too wide for a
+    # whole chunk on its own from one that merely does not fit beside lines
+    # already collected: the first never breaks the loop before it is judged
+    # (so it always gets a verdict below), the second always does.
+    out, size, last = [], 0, first - 1
+    oversized = None
+    for number in range(first, total + 1):
+        piece = f"{number}\t{lines[number - 1]}"
+        cost = len(piece.encode("utf-8")) + 1
+        if out and (len(out) >= READ_LINES or size + cost > READ_BYTES):
+            break
+        if not out and cost > READ_BYTES:
+            # A single line wider than the whole budget -- only possible
+            # under `!defaults`, since the default inventory already leaves
+            # out any file with a line over 5,000 bytes (security/inventory.py
+            # `generated`). Shown so a reader is not left guessing what is
+            # there, but never recorded: this chunk cannot show it whole, and
+            # what a model on the Codex CLI saw of it is exactly as
+            # incomplete -- there is nothing here that proves it was read.
+            oversized, last = piece, number
+            break
+        out.append(piece)
+        size += cost
+        last = number
+    print(f"== {rel} lines {first}-{last} of {total} ==")
+    if oversized is not None:
+        print(oversized)
+        print(f"-- line {last} is {len(oversized.encode('utf-8'))} bytes, wider than one chunk "
+              f"({READ_BYTES} bytes) can show -- it cannot be proven read here")
+    else:
+        print("\n".join(out))
+    print(f"-- next: agentloop security read --path {rel} --from {last + 1}" if last < total
+          else "-- end of file")
+    sys.stdout.flush()
+    if out:
+        ledger.record_unit_read(conn, int(uid), rel, first, last)
 
 
 def cmd_fingerprint(args):
@@ -3654,6 +3937,9 @@ def main(argv=None):
     pr.add_argument("--root", required=True)
     pr.add_argument("--ignore", default="")
     pr.add_argument("--offline", action="store_true")
+    # The orchestrator's prepare only (security/orchestrator.py): write the
+    # analysis's plan. Without it `prepare` plans nothing -- see cmd_prepare.
+    pr.add_argument("--plan", action="store_true")
 
     fi = sub.add_parser("findings", parents=[dbflag]); fi.set_defaults(fn=cmd_findings)
     fi.add_argument("--analysis", type=int, required=True)
@@ -3690,6 +3976,35 @@ def main(argv=None):
     rv = sub.add_parser("report-verdict", parents=[dbflag]); rv.set_defaults(fn=cmd_report_verdict)
     rv.add_argument("--analysis", type=int, required=True)
     rv.add_argument("--fingerprint", required=True)
+
+    # The pipeline's units. `unit-prompt`, `units` and `read` are reads (and
+    # `read` exists for the agent), so they stay reachable under the agent
+    # flag; `unit-close` is the engine's and joins AGENT_FORBIDDEN (Task 8).
+    up = sub.add_parser("unit-prompt", parents=[dbflag]); up.set_defaults(fn=cmd_unit_prompt)
+    up.add_argument("--analysis", type=int, required=True)
+    up.add_argument("--unit", type=int, required=True)
+    up.add_argument("--platform", default="anthropic", choices=("anthropic", "openai", "opencode"))
+
+    uc = sub.add_parser("unit-close", parents=[dbflag]); uc.set_defaults(fn=cmd_unit_close)
+    uc.add_argument("--analysis", type=int, required=True)
+    uc.add_argument("--unit", type=int, required=True)
+    uc.add_argument("--stream", default="")
+    uc.add_argument("--root", default="")
+    uc.add_argument("--status", default="error")
+    uc.add_argument("--reason", default="")
+    uc.add_argument("--spend", default="0")
+
+    us = sub.add_parser("units", parents=[dbflag]); us.set_defaults(fn=cmd_units)
+    us.add_argument("--analysis", type=int, required=True)
+    us.add_argument("--label", type=int, default=None)
+
+    rg = sub.add_parser("report-gone", parents=[dbflag]); rg.set_defaults(fn=cmd_report_gone)
+    rg.add_argument("--analysis", type=int, required=True)
+    rg.add_argument("--fingerprint", required=True)
+
+    rd = sub.add_parser("read", parents=[dbflag]); rd.set_defaults(fn=cmd_read)
+    rd.add_argument("--path", required=True)
+    rd.add_argument("--from", type=int, default=1, dest="start")
 
     fn = sub.add_parser("finish", parents=[dbflag]); fn.set_defaults(fn=cmd_finish)
     fn.add_argument("--analysis", type=int, required=True)

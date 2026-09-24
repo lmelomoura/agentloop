@@ -291,3 +291,58 @@ def test_the_label_names_the_kind_its_place_and_the_attempt(conn):
     cont = ledger.add_unit(conn, aid, "read", {"ranges": []}, attempt=2, parent=first)
     assert units.label(conn, ledger.get_unit(conn, first)) == "read 1/2"
     assert units.label(conn, ledger.get_unit(conn, cont)) == "read 1/2 · attempt 2"
+
+
+def test_the_summary_counts_lineages_by_their_last_attempt_and_the_lines_still_owed(conn):
+    aid = _analysis(conn)
+    ledger.set_inventory(conn, aid, {"files": [_file("a.py", (1, 10, 100)), _file("b.py", (1, 5, 50))],
+                                     "excluded": {}, "git": True,
+                                     "totals": {"files": 2, "lines": 15, "bytes": 150}})
+    first = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 1, "last": 10, "bytes": 100}]})
+    other = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "b.py", "first": 1, "last": 5, "bytes": 50}]})
+    ledger.settle_unit(conn, first, "incomplete", 1.0, {"covered": {"a.py": [[1, 5]]}})
+    ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 6, "last": 10, "bytes": 0}]},
+                    attempt=2, parent=first)
+    ledger.settle_unit(conn, other, "done", 0.5, {"covered": {"b.py": [[1, 5]]}})
+    s = units.summary(conn, aid)
+    assert s["kinds"]["read"] == {"total": 2, "done": 1, "running": 0, "pending": 1, "failed": 0}
+    assert s["deep"] == {"files": 2, "files_read": 1, "lines": 15, "lines_read": 10}
+    assert (s["spend_usd"], s["units"]) == (1.5, 3)
+
+
+def test_owed_is_the_inventory_minus_every_span_a_read_unit_proved(conn):
+    """FROM THE INVENTORY, NOT FROM THE UNITS: a file no unit carries is owed
+    whole, a unit that gave up without saying what it missed owes its whole
+    slice, and what a unit covered counts whatever state it ended in."""
+    aid = _analysis(conn)
+    ledger.set_inventory(conn, aid, {
+        "files": [_file("a.py", (1, 20, 200)), _file("b.py", (1, 5, 50)), _file("c.py", (1, 3, 30)),
+                  _file("d.py", (1, 4, 40))],
+        "excluded": {}, "git": True, "totals": {"files": 4, "lines": 32, "bytes": 320}})
+    first = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 1, "last": 20, "bytes": 200}]})
+    ledger.settle_unit(conn, first, "incomplete", 0, {"covered": {"a.py": [[1, 10]]}})
+    cont = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 11, "last": 20, "bytes": 0}]},
+                           attempt=2, parent=first)
+    ledger.settle_unit(conn, cont, "failed", 0, {"covered": {"a.py": [[11, 14]]}})
+    other = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "b.py", "first": 1, "last": 5, "bytes": 50}]})
+    ledger.settle_unit(conn, other, "done", 0, {"covered": {"b.py": [[1, 5]]}})
+    silent = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "d.py", "first": 1, "last": 4, "bytes": 40}]})
+    ledger.settle_unit(conn, silent, "failed", 0, {})        # a crash, a subagent, a strike-out
+    # c.py is in no unit at all: a plan an older engine cut short, a unit lost
+    assert units.owed(conn, aid) == [{"path": "a.py", "first": 15, "last": 20},
+                                     {"path": "c.py", "first": 1, "last": 3},
+                                     {"path": "d.py", "first": 1, "last": 4}]
+    assert units.owed(conn, _analysis(conn)) == [], "no inventory, no debt"
+
+
+def test_close_judges_a_run_and_settles_its_unit_once(conn):
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 1, "last": 3, "bytes": 9}]})
+    ledger.start_unit(conn, uid)
+    ledger.record_unit_read(conn, uid, "a.py", 1, 3)       # what `security read` served it
+    out = units.close(conn, ledger.get_unit(conn, uid), status="success", spend_usd=0.5)
+    assert out == {"state": "done", "continuation": None}
+    assert ledger.get_unit(conn, uid)["evidence"]["covered"] == {"a.py": [[1, 3]]}
+    again = units.close(conn, ledger.get_unit(conn, uid), status="error", spend_usd=9)
+    assert again == {"state": "done", "continuation": None}
+    assert ledger.get_unit(conn, uid)["spend_usd"] == 0.5, "a settled unit is never closed twice"
