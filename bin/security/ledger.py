@@ -184,10 +184,64 @@ CREATE TABLE IF NOT EXISTS history_sweep (
   scanner TEXT NOT NULL, sha TEXT NOT NULL,
   findings TEXT NOT NULL DEFAULT '[]', at INTEGER NOT NULL,
   PRIMARY KEY (project, repo, branch, scanner));
+
+-- THE WORK UNITS OF AN ANALYSIS (security/units.py). A NEW table, so IF NOT
+-- EXISTS is enough -- the precedent `history_sweep` set above. One row per
+-- session the engine runs for an analysis: `kind` is triage | hunt | read |
+-- verify, `payload` the JSON its prompt is minted from (rows, line ranges, a
+-- fingerprint), `evidence` the JSON `unit-close` wrote from the unit's own
+-- stream and from the ledger. A unit that left work undone is never
+-- rewritten: its continuation is a NEW row whose `parent` names it and whose
+-- `attempt` is one higher, so the trail of what each session did survives
+-- every retry.
+CREATE TABLE IF NOT EXISTS unit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  analysis_id INTEGER NOT NULL REFERENCES analysis(id),
+  seq INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  attempt INTEGER NOT NULL DEFAULT 1, parent INTEGER REFERENCES unit(id),
+  run_key TEXT NOT NULL DEFAULT '',
+  started INTEGER, ended INTEGER,
+  spend_usd REAL NOT NULL DEFAULT 0,
+  evidence TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+  UNIQUE(analysis_id, seq));
+CREATE INDEX IF NOT EXISTS unit_by_analysis ON unit(analysis_id, state);
+
+-- WHAT `security read` SERVED TO A UNIT, one row per chunk. The proof of
+-- reading on a platform whose stream cannot carry it (Codex: every read is
+-- a shell command whose output the stream caps at 8 KB, and sometimes
+-- loses) -- and accepted on every platform beside the native Read tool.
+-- Written by the CLI only after the lines were printed, never by the agent.
+CREATE TABLE IF NOT EXISTS unit_read (
+  unit_id INTEGER NOT NULL REFERENCES unit(id),
+  path TEXT NOT NULL, first INTEGER NOT NULL, last INTEGER NOT NULL,
+  at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS unit_read_by_unit ON unit_read(unit_id);
+
+-- A CARRIED `sast` FINDING A TRIAGE UNIT READ AND FOUND GONE. Silence used
+-- to be how such a finding became `fixed`, and silence cannot tell "read it,
+-- it is gone" from "never opened it": the triage unit's proof needs the
+-- first to be SAID. Written by `report-gone` only, with the reason.
+CREATE TABLE IF NOT EXISTS unit_gone (
+  unit_id INTEGER NOT NULL REFERENCES unit(id),
+  fingerprint TEXT NOT NULL, reason TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS unit_gone_by_unit ON unit_gone(unit_id);
 """
 
 DECISION_STATES = ("accepted", "false_positive")
 ANALYSIS_END_STATES = ("done", "failed", "capped")
+
+UNIT_KINDS = ("triage", "hunt", "read", "verify")
+UNIT_STATES = ("pending", "running", "done", "incomplete", "failed")
+UNIT_SETTLED = ("done", "incomplete", "failed")
+# NOT AN END STATE, and deliberately not in ANALYSIS_END_STATES: `finish`
+# never writes it. An analysis the operator stopped, or whose orchestrator
+# died, keeps its finished units and waits to be resumed; only
+# `interrupt_analysis` puts it here and `resume_analysis` takes it back.
+# Every baseline and posture query already reads `state IN ('done','capped')`,
+# so an interrupted analysis is nobody's baseline without a line changing
+# there.
+INTERRUPTED = "interrupted"
 
 # A closed set. A typo must fail loudly rather than file an event that no
 # filter will ever match and no screen will ever show.
@@ -224,6 +278,14 @@ _ANALYSIS_COLUMNS = (
     # "read": [...]}`, see `set_guides`/`guides_of`. '' for every analysis
     # from before the column; nothing derives a state from it.
     ("guides", "TEXT NOT NULL DEFAULT ''"),
+    # The deep scope (security/inventory.py): every file a line-by-line read
+    # has to cover, and every file left out with the rule that left it out.
+    # '' on every analysis before the column and on every non-deep one.
+    ("inventory", "TEXT NOT NULL DEFAULT ''"),
+    # How many times the tick resumed this analysis after its orchestrator
+    # died, never an operator's Resume: the automatic ones are capped, so a
+    # machine that keeps crashing stops spending.
+    ("resumes", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -267,6 +329,11 @@ _FINDING_COLUMNS = (
     # so that the day a second origin appears is not the day somebody
     # discovers the column was missing.
     ("verified_by", "TEXT NOT NULL DEFAULT ''"),
+    # The unit whose session wrote this row -- stamped by the door from the
+    # run's own AL_SECURITY_UNIT_ID, never read from a payload, on the rule
+    # `producer` follows. 0 for a scanner's row and for every row written
+    # before the pipeline existed.
+    ("unit", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -668,25 +735,27 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
             conn.execute(
                 "UPDATE finding SET category=?, rule=?, severity=?, title=?,"
                 " rationale=?, remediation=?, partial_note=?, cwe=?, owasp=?,"
-                " candidate=?, triaged=MAX(triaged, ?)"
+                " candidate=?, triaged=MAX(triaged, ?),"
+                " unit=CASE WHEN ? > 0 THEN ? ELSE unit END"
                 " WHERE id=?",
                 (finding["category"], finding["rule"], finding["severity"], finding["title"],
                  finding.get("rationale", ""), finding.get("remediation", ""),
                  finding.get("partial_note", ""), finding.get("cwe", ""),
-                 finding.get("owasp", ""), finding.get("candidate", ""), triaged, fid))
+                 finding.get("owasp", ""), finding.get("candidate", ""), triaged,
+                 int(finding.get("unit") or 0), int(finding.get("unit") or 0), fid))
             conn.execute("DELETE FROM occurrence WHERE finding_id=?", (fid,))
         else:
             cur = conn.execute(
                 "INSERT INTO finding (analysis_id, fingerprint, category, rule, severity,"
                 " title, rationale, remediation, partial_note, cwe, owasp, producer,"
-                " scope, candidate)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " scope, candidate, unit)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (analysis_id, finding["fingerprint"], finding["category"], finding["rule"],
                  finding["severity"], finding["title"], finding.get("rationale", ""),
                  finding.get("remediation", ""), finding.get("partial_note", ""),
                  finding.get("cwe", ""), finding.get("owasp", ""),
                  finding.get("producer", ""), finding.get("scope", ""),
-                 finding.get("candidate", "")))
+                 finding.get("candidate", ""), int(finding.get("unit") or 0)))
             fid = cur.lastrowid
         # An occurrence that names no file is not stored, whoever wrote it.
         # The door refuses such an object outright (`names_a_file` on every
@@ -1183,3 +1252,158 @@ def delete_filter(conn, project, name) -> bool:
         cur = conn.execute("DELETE FROM saved_filter WHERE project=? AND name=?",
                            (project, name))
     return cur.rowcount > 0
+
+
+# ---- the pipeline's units (security/units.py decides; this only stores) ----
+
+def _unit_row(row) -> dict:
+    """A unit as every reader wants it: `payload` and `evidence` decoded to
+    dicts. A cell that does not decode reads as `{}` -- never a traceback
+    in the middle of an orchestration."""
+    d = dict(row)
+    for key in ("payload", "evidence"):
+        try:
+            value = json.loads(d.get(key) or "{}")
+        except (ValueError, TypeError):
+            value = {}
+        d[key] = value if isinstance(value, dict) else {}
+    return d
+
+
+def add_unit(conn, analysis_id, kind, payload, attempt=1, parent=None) -> int:
+    """A new `pending` unit, numbered after the analysis's last one.
+
+    BEGIN IMMEDIATE, not the implicit deferred transaction: the orchestrator
+    adds units while the closes of units running in parallel add their
+    continuations, and two writers that both read MAX(seq) before either
+    inserts would collide on UNIQUE(analysis_id, seq)."""
+    if kind not in UNIT_KINDS:
+        raise ValueError(f"bad unit kind: {kind}")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM unit WHERE analysis_id=?",
+                           (analysis_id,)).fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO unit (analysis_id, seq, kind, payload, attempt, parent)"
+            " VALUES (?,?,?,?,?,?)",
+            (analysis_id, seq, kind, json.dumps(payload, sort_keys=True), attempt, parent))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return cur.lastrowid
+
+
+def get_unit(conn, unit_id):
+    row = conn.execute("SELECT * FROM unit WHERE id=?", (unit_id,)).fetchone()
+    return _unit_row(row) if row else None
+
+
+def units_of(conn, analysis_id) -> list:
+    return [_unit_row(r) for r in conn.execute(
+        "SELECT * FROM unit WHERE analysis_id=? ORDER BY seq", (analysis_id,))]
+
+
+def start_unit(conn, unit_id, run_key="") -> bool:
+    """pending -> running. False when somebody else already started it: the
+    WHERE is the lock, so two launches of one unit cannot both proceed."""
+    with conn:
+        cur = conn.execute(
+            "UPDATE unit SET state='running', run_key=?, started=?, ended=NULL"
+            " WHERE id=? AND state='pending'", (run_key, int(time.time()), unit_id))
+    return cur.rowcount > 0
+
+
+def settle_unit(conn, unit_id, state, spend_usd=0.0, evidence=None, note="") -> bool:
+    """pending/running -> done | incomplete | failed, once. The spend is ADDED:
+    a unit reset after a stop and run again paid for both runs."""
+    if state not in UNIT_SETTLED:
+        raise ValueError(f"bad unit state: {state}")
+    with conn:
+        cur = conn.execute(
+            "UPDATE unit SET state=?, ended=?, spend_usd=spend_usd+?, evidence=?, note=?"
+            " WHERE id=? AND state IN ('pending','running')",
+            (state, int(time.time()), float(spend_usd or 0),
+             json.dumps(evidence or {}, sort_keys=True), note or "", unit_id))
+    return cur.rowcount > 0
+
+
+def reset_unit(conn, unit_id, spend_usd=0.0) -> bool:
+    """running -> pending in the SAME attempt: the run behind it ended with
+    no verdict of its own to judge (the operator stopped the analysis, the
+    orchestrator died), which is not the unit's failure."""
+    with conn:
+        cur = conn.execute(
+            "UPDATE unit SET state='pending', run_key='', spend_usd=spend_usd+?"
+            " WHERE id=? AND state='running'", (float(spend_usd or 0), unit_id))
+    return cur.rowcount > 0
+
+
+def interrupt_analysis(conn, analysis_id) -> bool:
+    with conn:
+        cur = conn.execute("UPDATE analysis SET state=? WHERE id=? AND state='running'",
+                           (INTERRUPTED, analysis_id))
+    return cur.rowcount > 0
+
+
+def resume_analysis(conn, analysis_id, automatic=False) -> bool:
+    with conn:
+        cur = conn.execute(
+            "UPDATE analysis SET state='running', resumes=resumes+? WHERE id=? AND state=?",
+            (1 if automatic else 0, analysis_id, INTERRUPTED))
+    return cur.rowcount > 0
+
+
+def close_interrupted(conn, analysis_id, note) -> bool:
+    """interrupted -> failed: superseded by a newer analysis of the same scope,
+    or out of automatic resumes. The units it finished stay in the ledger."""
+    with conn:
+        cur = conn.execute(
+            "UPDATE analysis SET state='failed', ended=?,"
+            " coverage_note=TRIM(coverage_note || ' ' || ?) WHERE id=? AND state=?",
+            (int(time.time()), note, analysis_id, INTERRUPTED))
+    return cur.rowcount > 0
+
+
+def set_inventory(conn, analysis_id, inventory) -> None:
+    with conn:
+        conn.execute("UPDATE analysis SET inventory=? WHERE id=?",
+                     (json.dumps(inventory, sort_keys=True, separators=(",", ":")), analysis_id))
+
+
+def inventory_of(row) -> dict:
+    """The stored deep inventory, or {} -- for a row before the column, a row
+    with none, and a cell that does not decode. Never raises, on the rule
+    `guides_of` follows: the read-only paths never migrate."""
+    try:
+        raw = row["inventory"]
+    except (KeyError, IndexError, TypeError):
+        return {}
+    try:
+        doc = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def record_unit_read(conn, unit_id, path, first, last) -> None:
+    with conn:
+        conn.execute("INSERT INTO unit_read (unit_id, path, first, last, at) VALUES (?,?,?,?,?)",
+                     (unit_id, path, int(first), int(last), int(time.time())))
+
+
+def unit_reads(conn, unit_id) -> list:
+    return [(r["path"], r["first"], r["last"]) for r in conn.execute(
+        "SELECT path, first, last FROM unit_read WHERE unit_id=? ORDER BY rowid", (unit_id,))]
+
+
+def record_gone(conn, unit_id, fingerprint, reason) -> None:
+    with conn:
+        conn.execute("INSERT INTO unit_gone (unit_id, fingerprint, reason, at) VALUES (?,?,?,?)",
+                     (unit_id, fingerprint, reason, int(time.time())))
+
+
+def gone_in(conn, analysis_id) -> set:
+    return {r[0] for r in conn.execute(
+        "SELECT g.fingerprint FROM unit_gone g JOIN unit u ON u.id = g.unit_id"
+        " WHERE u.analysis_id=?", (analysis_id,))}
