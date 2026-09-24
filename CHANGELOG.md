@@ -272,6 +272,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A command past its deadline reads as 124, never as a traceback.**
+  `run_bounded` (the deadline around `opencode models` and `opencode export`)
+  ends the command's whole process group, and macOS answers `EPERM`, not
+  `ESRCH`, to a `killpg` that reaches a group whose members are all on their
+  way out: the helper only caught the second, so it died with a traceback
+  and rc 1 instead of answering 124. Both mean nothing is left to signal.
 - **The journal lock no longer raises when its holder lets go at the
   instant a waiter looks.** A waiter whose mkdir failed and then found the
   lock already gone had no identity and no owner to judge, and fell into the

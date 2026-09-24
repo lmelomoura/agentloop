@@ -737,6 +737,22 @@ JSON
   run_bounded 1 sh -c 'sleep 601 & sleep 601'; want "a hung process group under a 1 s deadline exits 124" 124 $?
   [ "$(ps -ax -o command= | grep -c '^sleep 601$')" = "0" ] \
     && ok "and no sleep 601 process is left running in its group" || bad "leaked sleep 601 count: $(ps -ax -o command= | grep -c '^sleep 601$')"
+  # macOS answers EPERM, not ESRCH, to a killpg that reaches a group whose
+  # members are all on their way out (seen on the CI runner: a traceback and
+  # rc 1 instead of 124). Forced here through a sitecustomize, so the case
+  # does not depend on catching that instant.
+  mkdir -p "$tmp/rb-eperm"
+  cat > "$tmp/rb-eperm/sitecustomize.py" <<'PY'
+import os, signal
+_real_killpg = os.killpg
+def _killpg(pgid, sig):
+    if sig == signal.SIGKILL:
+        raise PermissionError(1, "Operation not permitted")
+    return _real_killpg(pgid, sig)
+os.killpg = _killpg
+PY
+  PYTHONPATH="$tmp/rb-eperm" run_bounded 1 sh -c 'sleep 602 & sleep 602' 2>/dev/null
+  want "a group that answers EPERM to the final SIGKILL still exits 124" 124 $?
   # A grandchild that IGNORES the TERM while the direct child goes on it
   # used to outlive the deadline: the KILL was only ever sent when the
   # direct child itself sat out the grace. Checked by pid (the grandchild

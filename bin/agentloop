@@ -3665,17 +3665,22 @@ except OSError as e:
 try:
     p.wait(timeout=float(sys.argv[1]))
 except subprocess.TimeoutExpired:
-    os.killpg(p.pid, signal.SIGTERM)
+    # ESRCH: the group is gone. EPERM: what macOS answers for a group whose
+    # members are all on their way out. Nothing left to signal, either way --
+    # the deadline still reads as 124, never as a traceback.
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
     try:
         p.wait(timeout=2)
     except subprocess.TimeoutExpired:
         pass
     # The whole group, unconditionally: the child going on the TERM says
-    # nothing about a grandchild that ignores it. The group is already gone
-    # (ESRCH) when every member left on the TERM.
+    # nothing about a grandchild that ignores it.
     try:
         os.killpg(p.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     sys.exit(124)
 sys.exit(p.returncode)
