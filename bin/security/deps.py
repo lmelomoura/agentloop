@@ -277,6 +277,11 @@ _READERS = {
     "go.sum": _gosum,
 }
 
+# The file names the dependency phase reads, public so the deep scope
+# (security/inventory.py) can leave the same files out: a lockfile's content
+# is that phase's input, and reading it line by line is not a code review.
+LOCKFILE_NAMES = frozenset(_READERS)
+
 
 def inventory(root):
     root = Path(root)

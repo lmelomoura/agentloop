@@ -20,6 +20,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A deep analysis lists its scope before it reads anything.** `prepare`
+  now records every versioned file a line-by-line read has to cover, with
+  its lines and bytes — a file over 300 KB as consecutive line ranges — and
+  counts every file it leaves out under the rule that left it out
+  (ignored, symlink, submodule, dependency tree, lockfile, unreadable,
+  binary, generated, prose), with examples. `deep` promised "all versioned
+  code" in prose only, and the agent that had to keep the promise was the
+  one deciding when it had.
+
 - **The security ledger records an analysis's work units.** A new `unit`
   table holds every session the engine runs for an analysis — its kind
   (triage, hunt, read, verify), what it was given, what it proved, what it
