@@ -28,6 +28,9 @@
 #                      "<key><TAB><value>" line each: PWD, the HEAD commit
 #                      checked out there, and the run's MANIFEST
 #                      ($AL_RUN_MANIFEST, on one line)
+#   FAKE_PID_OUT       a path to record this process's own pid in -- the
+#                      CLI's, which is what a stop and the watchdog have to
+#                      reach (see scenario 53 in e2e.test.sh)
 #   FAKE_CLAUDE_LOGGED_OUT  set to play a CLI with no session: `auth status` exits 1,
 #                      and in the probe world below every model probe gets the
 #                      CLI's not-logged-in answer
@@ -135,6 +138,11 @@ if [ -n "${FAKE_ACCOUNT_OUT:-}" ]; then
   printf '%s\n' "${CLAUDE_CONFIG_DIR:-}" > "$FAKE_ACCOUNT_OUT"
 fi
 
+# The CLI's own pid, from the CLI's side: the engine records the pid it will
+# signal on a stop, and the two are only the same process when the launch
+# hands the CLI that pid instead of forking it under a shell.
+[ -z "${FAKE_PID_OUT:-}" ] || printf '%s\n' "$$" > "$FAKE_PID_OUT"
+
 # Where the engine put the agent, read from the agent's own side: its working
 # directory is the tree `prepare` and every tool call read, and neither the
 # argv nor the account says which tree that is. Written before `prepare` and
@@ -204,8 +212,10 @@ case "$mode" in
     result="I did some work."
     ;;
   hang)
-    sleep 600
-    result="never reached"
+    # `exec`, as `silent` does above: the process the engine signals has to
+    # be the one that ends. A bash waiting on a foreground `sleep` dies of
+    # the TERM and leaves the sleep behind, orphaned, for ten minutes.
+    exec sleep 600
     ;;
   *)
     result="RUN COMPLETE: nothing needed doing."

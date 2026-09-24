@@ -272,6 +272,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A stop now ends the Claude agent, not just the shell that launched it —
+  and so does the watchdog.** The Claude launch lines ran the CLI as the
+  last command of a `( cd …; env claude … ) &` subshell, and bash 3.2 forks
+  that command instead of exec'ing it, so the pid recorded for `agentloop
+  stop` and for the stall and timeout watchdog was the subshell's. The TERM
+  ended the subshell and the agent ran on under init, unseen: measured on a
+  real security analysis stopped 28 seconds in (2026-09-24), the run was
+  journaled `stopped` at $0 and 3 turns and its analysis closed `failed`,
+  while the agent worked on for twelve more minutes — its deterministic
+  phase wrote 91 findings into the closed analysis, nothing it spent was
+  recorded, and the slot it had freed let the next analysis of the same
+  project start beside it. Both Claude launch lines now `exec` the CLI, as
+  the OpenAI and OpenCode line always did, so the pid a stop or the
+  watchdog signals is the agent's own. `test/fake-claude` records its pid
+  (`FAKE_PID_OUT`) and its `hang` mode execs its sleep, so the end-to-end
+  suite checks the process that has to end (scenario 53 for a stop, 41b for
+  the watchdog) and no longer leaves orphans of its own behind.
+
 - **A pin that names the CLI's own `~/.claude` no longer signs the install
   out.** A pin of `$HOME/.claude`, trailing slash or not, was exported as
   written, and Claude Code names the Keychain entry it reads after the

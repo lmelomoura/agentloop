@@ -5656,7 +5656,8 @@ run_launch_and_watch() {
       # day someone hands this one a positional argument the guard is already
       # there. Confirmed harmless on CLI 2.1.258: a `--` with nothing after it
       # parses to no operands at all, and the run starts normally.
-      env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
+      # `exec`: see the branch below.
+      exec env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
         ${toolargs[@]+"${toolargs[@]}"} -- < "$fifo" > "$streamfile" 2> "$logfile.err"
     ) &
   else
@@ -5666,7 +5667,17 @@ run_launch_and_watch() {
       # costs nothing when there is no option to terminate, and it is what
       # keeps the prompt a positional of its own rather than the tail of a
       # variadic option's value list. See the toolargs note above.
-      env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
+      #
+      # `exec`, the way the normalizer branch above already did it: the
+      # subshell BECOMES the CLI, so $! below is the CLI's own pid and the
+      # TERM of a stop or of the watchdog reaches the agent. Without it,
+      # bash 3.2 forks the last command of a subshell instead of exec'ing
+      # it, the TERM ended only the subshell, and the CLI ran on under init
+      # -- measured on a real analysis stopped 28 s in: the run was
+      # journaled `stopped` at $0 while its agent worked on for twelve more
+      # minutes, unaccounted, and the slot it had freed let the next
+      # analysis of the same project start beside it.
+      exec env ${run_env[@]+"${run_env[@]}"} "$cli_bin" $args \
         ${toolargs[@]+"${toolargs[@]}"} -- "$prompt" > "$streamfile" 2> "$logfile.err"
     ) &
   fi
