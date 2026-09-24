@@ -272,6 +272,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A run whose files could not be read is no longer deleted anyway.** Once
+  a run ends, the index reads its files into the run's row and then deletes
+  them. It noticed when one could not be read — a permission, an I/O error —
+  but nothing looked at what it noticed: the files went as soon as anything
+  else of the run had been stored, so a run whose result was read and whose
+  transcript was not lost the transcript for good. Such a run now keeps its
+  files, the reason is logged once, and every later pass over the index
+  reads them again — quietly, and writing nothing until a read works —
+  deleting them only once one does. Passes also run one at a time now. Two
+  at once could take up the same run, one deleting its files while the
+  other was between reading them and writing what it had read, and the
+  other then wrote the emptiness it had found over the row the first one
+  had written; with unread runs read again on every pass, that would have
+  become routine. A pass now takes the index's write lock before it reads
+  anything, so a second one waits, and then finds nothing left to do.
+
+- **A long run keeps the end of its transcript once it is indexed.** The
+  index stored only the first 2 MB of a finished run's stream, and the run's
+  files are deleted as soon as its row is written, so every run longer than
+  that lost the end of its transcript for good: the agent's last decisions,
+  why it stopped, the close. A killed run fared worse — the run dialog
+  rebuilds one from its stream and quotes *the agent's last message before
+  it stopped*, and it quoted one from about two megabytes in. Security
+  analyses pass 2 MB routinely: 11 of the last 12 in one index were stored
+  at ~1.99 MB, every one cut at the head. The live view had the opposite
+  fault — it kept the last 2 MB, so a long run still going lost its first
+  event, and with it the session, model and platform the dialog shows. Both
+  now keep the first and the last megabyte, each cut on a line boundary,
+  with one line between them saying how much is missing, which the Terminal
+  and the Timeline show in its place as *… 1.2 MB of the transcript omitted
+  …*. Both views also stopped listing at their limit (300 turns in the
+  Timeline, 400 messages in the Terminal), which on a busier run hid that
+  same end again; past it they now keep the first and the last half, with a
+  line counting the rest. A stream under 2 MB is stored byte for byte, as
+  before. Nothing is re-indexed: runs already in the index keep what they
+  were stored with, since their files are gone.
+
 - **The Security page no longer freezes an analysis at the agent's own
   close.** An analysis is closed twice — by the agent, then by the engine
   once the agent's process has exited, with the run's real cost, the guides

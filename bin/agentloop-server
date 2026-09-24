@@ -656,7 +656,16 @@ SCHEMA_VERSION = "7"   # account and account_dir columns: the account each run s
 LIGHT_SCHEMA_BUMPS = {
     ("6", "7"): ("account", "account_dir"),
 }
+# The most of a run's stream the index keeps; past it, the first and last
+# halves around one marker line (_fit_stream). How much is kept is not a
+# schema matter: no column changes, and the resync a SCHEMA_VERSION bump sets
+# off could not re-read a single run it cut short -- the prune deletes a
+# run's files as soon as its row holds anything (_finish_prune).
 STREAM_CAP = 2_000_000
+# The marker's subtype, and the room kept inside the cap for its line so a
+# capped stream never exceeds STREAM_CAP: 64 bytes plus the digits of its count.
+STREAM_GAP_SUBTYPE = "stream_truncated"
+STREAM_GAP_ROOM = 128
 
 
 def _log(msg):
@@ -675,6 +684,11 @@ def db_init(conn):
         stderr TEXT, doc TEXT, project TEXT, model TEXT, model_id TEXT,
         note TEXT, resumed_from TEXT, cause TEXT, platform TEXT, cost_basis TEXT,
         tokens TEXT, account TEXT, account_dir TEXT, pruned INTEGER DEFAULT 0)""")
+    # Runs whose files could not all be read into their row, with the journal
+    # record each is read again from: their files are kept until a pass reads
+    # them in full (_finish_prune, _reread_unread). A table of its own rather
+    # than a `runs` column, so it asks nothing of SCHEMA_VERSION.
+    conn.execute("CREATE TABLE IF NOT EXISTS unread_runs (key TEXT PRIMARY KEY, rec TEXT)")
     try:
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS runs_fts USING fts5(key UNINDEXED, content)")
         return True
@@ -727,7 +741,45 @@ def _artifact_paths(rec):
             "prepare": Path(str(logp) + ".prepare")}
 
 
-def _read_artifacts(rec):
+def _fit_stream(data, cap):
+    """A run's stream as the index keeps it: byte for byte while it fits in
+    `cap`; past that, its first half and its last half, each cut on a line
+    boundary, joined by ONE marker line saying how many bytes were left out.
+
+    Both ends, because each holds something nothing else does: the head has
+    the init event (session, model, platform) and the tail is where the run
+    ENDS -- the agent's last decisions, why it stopped, the close. Ingest used
+    to keep the first `cap` bytes, and the prune deletes the files as soon as
+    the row is written, so every run longer than the cap lost its end for
+    good: 11 of the last 12 security analyses in one index were stored at
+    ~1.99 MB, all cut at the head. The live view kept the last `cap`
+    characters instead, which cost a long run still going its init event.
+
+    Never inside a line: every stored line stays a whole JSON event, and a
+    newline is never part of a multi-byte UTF-8 sequence, so both halves
+    decode cleanly. The marker is a stream event like any other (`system`,
+    subtype STREAM_GAP_SUBTYPE), which every reader that skips what it does
+    not know passes over; the two views a person reads show it as a line
+    (_stream_gap). Bytes in, bytes out: the cap is a byte budget, and it can
+    only be kept by cutting before decoding.
+    """
+    if len(data) <= cap:
+        return data
+    half = max(0, (cap - STREAM_GAP_ROOM) // 2)
+    head = data[:half]
+    head = head[:head.rfind(b"\n") + 1]        # no newline in it: no head at all
+    # The tail opens on the first line that STARTS inside its window. Searching
+    # from one byte before the window keeps a first line that starts exactly
+    # on the window's edge, instead of throwing it away for being "cut".
+    nl = data.find(b"\n", len(data) - half - 1)
+    tail = data[nl + 1:] if nl >= 0 else b""
+    marker = json.dumps({"type": "system", "subtype": STREAM_GAP_SUBTYPE,
+                         "omitted_bytes": len(data) - len(head) - len(tail)},
+                        separators=(",", ":"))
+    return head + marker.encode() + b"\n" + tail
+
+
+def _read_artifacts(rec, quiet=False):
     """Read a run's on-disk artifacts. Never raises, and never lies about it.
 
     `art["_read_failed"]` is the load-bearing part: whatever goes wrong here, the
@@ -737,6 +789,9 @@ def _read_artifacts(rec):
     ingestion then stored the emptiness and pruned the originals. A 37-minute,
     $7.27 run was erased that way, and reported success. Read as bytes and decode
     with errors="replace": a mangled character costs a character, not a run.
+    The flag is what _finish_prune keeps a run's files on. `quiet` is for a read
+    of a run already known to fail (_reread_unread): it was reported the first
+    time, and every pass after it would only repeat that.
     """
     art = {"result_json": "", "stream": "", "precheck_txt": "", "stderr": "",
            "_read_failed": False}
@@ -744,19 +799,25 @@ def _read_artifacts(rec):
     if not ap:
         return art
 
-    def slurp(path, cap):
+    def slurp(path, cap, fit=None):
         # Per-file, so one bad artifact cannot take the others down with it.
+        # `fit` picks which `cap` bytes to keep; without one, the first.
         try:
             if not path.exists():
                 return ""
-            return path.read_bytes()[:cap].decode("utf-8", errors="replace")
+            data = path.read_bytes()
+            data = fit(data, cap) if fit else data[:cap]
+            return data.decode("utf-8", errors="replace")
         except Exception as exc:                       # noqa: BLE001 — reported, not swallowed
             art["_read_failed"] = True
-            _log(f"ingest: could not read {path}: {exc!r}")
+            if not quiet:
+                _log(f"ingest: could not read {path}: {exc!r}")
             return ""
 
     art["result_json"] = slurp(ap["json"], 200_000)
-    art["stream"] = slurp(ap["stream"], STREAM_CAP)
+    # Both ends of a long stream, never just its head: the row is all that is
+    # left of it once the prune runs (see _fit_stream).
+    art["stream"] = slurp(ap["stream"], STREAM_CAP, _fit_stream)
     art["precheck_txt"] = slurp(ap["precheck"], 20_000)
     art["stderr"] = slurp(ap["err"], 20_000)
     # The engine-side `security prepare` of an OpenAI analysis writes to its
@@ -795,6 +856,9 @@ def _build_doc(rec, art):
         parts.append(str(data.get("result", "")))
     except Exception:
         pass
+    # A capped stream still opens with the run's own head (_fit_stream), so
+    # this is the start of the run; its end reaches search through the result
+    # above, when the run left one.
     parts.append(art.get("stream", "")[:400_000])
     parts.append(art.get("stderr", ""))
     return "\n".join(p for p in parts if p)
@@ -936,17 +1000,20 @@ def _platform_from_stream(stream, default="anthropic"):
     return default
 
 
-def _upsert(conn, fts, rec, preserve=None):
+def _upsert(conn, fts, rec, preserve=None, art=None, quiet=False):
     """Insert or refresh one journal record. `preserve` carries the existing
     row for already-pruned runs — their files are gone, so their stored
-    content must survive a resync."""
+    content must survive a resync. `art` is a read the caller already made
+    (_reread_unread writes only once one works); `quiet` passes through to
+    _read_artifacts. Returns (key, pruned, read_failed) -- the last is what
+    keeps the run's files on disk (_finish_prune)."""
     key = _rec_key(rec)
     if preserve is not None and preserve["pruned"]:
         art = {"result_json": preserve["result_json"], "stream": preserve["stream"],
                "precheck_txt": preserve["precheck_txt"], "stderr": preserve["stderr"]}
         doc, pruned = preserve["doc"], 1
     else:
-        art = _read_artifacts(rec)
+        art = art if art is not None else _read_artifacts(rec, quiet=quiet)
         doc = _build_doc(rec, art)
         pruned = 0
     conn.execute(
@@ -980,7 +1047,7 @@ def _upsert(conn, fts, rec, preserve=None):
     if fts:
         conn.execute("DELETE FROM runs_fts WHERE key=?", (key,))
         conn.execute("INSERT INTO runs_fts (key, content) VALUES (?,?)", (key, doc))
-    return key, pruned
+    return key, pruned, bool(art.get("_read_failed"))
 
 
 def _finish_prune(conn, pending):
@@ -991,8 +1058,26 @@ def _finish_prune(conn, pending):
     that produced turns and cost but stored no stream did not have nothing to say
     — something went wrong reading it, and the file on disk is the only remaining
     copy.
+
+    So is a run any of whose files could not be read (`read_failed`), however
+    much of the rest was stored. This asked only whether ANYTHING had been, so a
+    run whose result was read and whose transcript was not had its transcript
+    deleted with the rest. Such a run waits in `unread_runs` instead, and every
+    later pass reads it again (_reread_unread) until one can; why its files were
+    kept is logged the first time, not on every pass that finds it still so.
     """
-    for key, rec in pending:
+    for key, rec, read_failed in pending:
+        waiting = conn.execute("SELECT 1 FROM unread_runs WHERE key=?", (key,)).fetchone() is not None
+        if read_failed:
+            if not waiting:
+                _log(f"ingest: keeping artifacts for {key} — some of them could not be read;"
+                     " every later pass reads them again")
+            conn.execute("INSERT OR REPLACE INTO unread_runs (key, rec) VALUES (?, ?)",
+                         (key, json.dumps(rec)))
+            continue
+        if waiting:
+            conn.execute("DELETE FROM unread_runs WHERE key=?", (key,))
+            _log(f"ingest: read the artifacts kept for {key} in full")
         row = conn.execute(
             "SELECT length(coalesce(result_json,'')) + length(coalesce(stream,''))"
             " FROM runs WHERE key=?", (key,)).fetchone()
@@ -1002,6 +1087,35 @@ def _finish_prune(conn, pending):
             continue
         _prune_artifacts(rec)
         conn.execute("UPDATE runs SET pruned=1 WHERE key=?", (key,))
+
+
+def _reread_unread(conn, fts, unread):
+    """Read again the runs an earlier pass could not read in full, `unread`
+    being their {key: journal record as JSON}, and return the ones that now
+    read, in _finish_prune's shape.
+
+    Quietly, and writing nothing until a read works: every pass comes here,
+    one per poll of the page, so a file that stays unreadable must cost a
+    failed open, not a rewrite of its row and search entry. A run no longer
+    waiting to be read -- deleted, renamed, or read in full by a resync since
+    -- leaves: reading its files now would find them gone and write the run
+    back as an empty one."""
+    pending = []
+    for key, rec_json in unread.items():
+        row = conn.execute("SELECT pruned FROM runs WHERE key=?", (key,)).fetchone()
+        try:
+            rec = json.loads(rec_json)
+        except ValueError:
+            rec = None
+        if row is None or row["pruned"] or not isinstance(rec, dict):
+            conn.execute("DELETE FROM unread_runs WHERE key=?", (key,))
+            continue
+        art = _read_artifacts(rec, quiet=True)
+        if art["_read_failed"]:
+            continue
+        k, _, _ = _upsert(conn, fts, rec, art=art)
+        pending.append((k, rec, False))
+    return pending
 
 
 def _backfill_light_bump(conn, fields):
@@ -1039,7 +1153,9 @@ def ingest():
     LIGHT_SCHEMA_BUMPS) triggers a full resync that preserves the stored
     content of already-pruned rows. A schema bump alone, journal otherwise
     unchanged, and listed in LIGHT_SCHEMA_BUMPS backfills in place instead --
-    see _backfill_light_bump and the resync/light_fields split below."""
+    see _backfill_light_bump and the resync/light_fields split below. Every
+    pass also reads again the runs an earlier one could not read in full
+    (_reread_unread), and passes run one at a time (the lock below)."""
     conn = db_conn()
     try:
         # Schema migration: ADDITIVE ONLY — never DROP the runs table. It stores
@@ -1077,6 +1193,17 @@ def ingest():
                     conn.execute("ALTER TABLE runs ADD COLUMN " + name + " " + decl)
             conn.commit()
         fts = db_init(conn)
+        # One pass at a time, and the write lock taken before anything is read.
+        # Passes ran side by side, one per request, and two could take up the
+        # same run: one pruned its files while the other was between reading
+        # them and writing what it read, and the other then stored the
+        # emptiness it had found over the row the first one wrote. A run
+        # waiting in `unread_runs` is read by every pass that finds it there,
+        # so it would meet that race routinely. A second pass now waits here,
+        # and then reads what the first one left.
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        unread = {r["key"]: r["rec"] for r in conn.execute("SELECT key, rec FROM unread_runs")}
         size = RUNS_FILE.stat().st_size if RUNS_FILE.exists() else 0
         offset = int(_meta_get(conn, "offset", "0") or 0)
         sig = _ndjson_sig()
@@ -1122,34 +1249,40 @@ def ingest():
                         continue
                     key = _rec_key(rec)
                     seen.add(key)
-                    k, pruned = _upsert(conn, fts, rec, preserve=existing.get(key))
+                    # A run already waiting to be read again was reported when
+                    # it first failed; this read of it stays as quiet as a retry.
+                    k, pruned, failed = _upsert(conn, fts, rec, preserve=existing.get(key),
+                                                quiet=key in unread)
                     if not pruned:
-                        pending.append((k, rec))
+                        pending.append((k, rec, failed))
             for key in set(existing) - seen:
                 conn.execute("DELETE FROM runs WHERE key=?", (key,))
                 if fts:
                     conn.execute("DELETE FROM runs_fts WHERE key=?", (key,))
             _finish_prune(conn, pending)
             offset = size
-        elif size > offset:
-            with open(RUNS_FILE, "r") as f:
-                f.seek(offset)
-                chunk = f.read()
-            consumed = len(chunk) if chunk.endswith("\n") else chunk.rfind("\n") + 1
-            pending = []
-            for ln in chunk[:consumed].splitlines():
-                ln = ln.strip()
-                if not ln:
-                    continue
-                try:
-                    rec = json.loads(ln)
-                except Exception:
-                    continue
-                k, pruned = _upsert(conn, fts, rec)
-                if not pruned:
-                    pending.append((k, rec))
+        else:
+            # Runs an earlier pass could not read in full, read again. A resync
+            # (above) already reads them, with every run whose files are kept.
+            pending = _reread_unread(conn, fts, unread)
+            if size > offset:
+                with open(RUNS_FILE, "r") as f:
+                    f.seek(offset)
+                    chunk = f.read()
+                consumed = len(chunk) if chunk.endswith("\n") else chunk.rfind("\n") + 1
+                for ln in chunk[:consumed].splitlines():
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        rec = json.loads(ln)
+                    except Exception:
+                        continue
+                    k, pruned, failed = _upsert(conn, fts, rec)
+                    if not pruned:
+                        pending.append((k, rec, failed))
+                offset += consumed
             _finish_prune(conn, pending)
-            offset += consumed
         _meta_set(conn, "offset", offset)
         _meta_set(conn, "sig", sig)
         _meta_set(conn, "schema", SCHEMA_VERSION)
@@ -2351,7 +2484,10 @@ def load_live_detail(jid, start_i):
     stream = ""
     try:
         if sp and sp.resolve().is_relative_to(_logs_root()) and sp.exists():
-            stream = sp.read_text(errors="replace")[-STREAM_CAP:]
+            # The same two ends the index keeps (_fit_stream). The last
+            # STREAM_CAP characters alone lost the init event -- the session,
+            # model and platform read from it below -- of every run past it.
+            stream = _fit_stream(sp.read_bytes(), STREAM_CAP).decode("utf-8", errors="replace")
             logp = logp or str(sp)
     except Exception:  # noqa: BLE001
         stream = ""
@@ -2546,12 +2682,76 @@ def _tool_line(block):
     return {"tool": name, "hint": hint}
 
 
-def parse_turns_text(text):
+def _human_bytes(n):
+    """A byte count for a person, the way the page's fmtBytes writes one:
+    1024-based, one decimal -- "1.2 MB"."""
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _gap_entry(omitted=0, hidden=0, noun=("turn", "turns")):
+    """A view's entry for a place where part of the transcript is not shown:
+    `omitted` bytes a capped stream left out (_fit_stream), `hidden` entries
+    the view had no room for (_keep_both_ends), counted in `noun` (singular,
+    plural). `gap` is what the page reads to draw it as a note rather than a
+    turn -- no T-number, no place in the Timeline's count -- and the line says
+    how much is missing, because a jump nobody mentions reads as a run that
+    skipped its own work."""
+    parts = []
+    if hidden:
+        parts.append(f"{hidden} {noun[0] if hidden == 1 else noun[1]} not shown")
+    if omitted:
+        parts.append(f"{_human_bytes(omitted)} of the transcript omitted")
+    return {"gap": True, "text": "… " + (", and ".join(parts) or "part of the transcript omitted") + " …",
+            "tools": [], "omitted_bytes": omitted, "hidden": hidden}
+
+
+def _stream_gap(ev):
+    """The gap entry for a capped stream's marker (see _fit_stream), or None
+    for any other event. A count that is not a positive int reads as an amount
+    nobody knows -- never as a crash halfway through a transcript."""
+    if not isinstance(ev, dict) or ev.get("type") != "system" \
+            or ev.get("subtype") != STREAM_GAP_SUBTYPE:
+        return None
+    n = ev.get("omitted_bytes")
+    return _gap_entry(omitted=n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else 0)
+
+
+def _keep_both_ends(entries, limit, noun):
+    """At most `limit` of a view's entries (gaps not counted): the first half
+    and the last half, with one gap entry in between counting the rest.
+
+    Both views used to stop at their limit, which on a run with more turns
+    than that dropped its END -- the part _fit_stream exists to keep. A
+    stream gap that falls in the part left out is folded into that one line,
+    so the reader still learns the transcript itself was cut there too."""
+    real = [i for i, e in enumerate(entries) if not e.get("gap")]
+    if len(real) <= limit:
+        return entries
+    keep_head, keep_tail = limit - limit // 2, limit // 2
+    cut_from = real[keep_head - 1] + 1 if keep_head else 0
+    cut_to = real[len(real) - keep_tail] if keep_tail else len(entries)
+    left_out = entries[cut_from:cut_to]
+    gap = _gap_entry(omitted=sum(e.get("omitted_bytes") or 0 for e in left_out if e.get("gap")),
+                     hidden=sum(1 for e in left_out if not e.get("gap")), noun=noun)
+    return entries[:cut_from] + [gap] + entries[cut_to:]
+
+
+def parse_turns_text(text, limit=300):
     """One entry per assistant turn from a stream-json transcript: what the
-    agent said and which tools it called. Empty text → [] (older runs)."""
+    agent said and which tools it called. Empty text → [] (older runs).
+
+    A capped stream's marker becomes a gap entry in its place, and past
+    `limit` turns the first and the last are kept (_keep_both_ends). A turn's
+    `n` counts the turns the stream holds, so it skips the ones a view gap
+    leaves out and cannot know the ones a stream gap took."""
     if not text:
         return []
-    turns = []
+    turns, n = [], 0
     try:
         for ln in text.splitlines():
             ln = ln.strip()
@@ -2560,6 +2760,10 @@ def parse_turns_text(text):
             try:
                 ev = json.loads(ln)
             except Exception:
+                continue
+            gap = _stream_gap(ev)
+            if gap:
+                turns.append(gap)
                 continue
             if ev.get("type") != "assistant":
                 continue
@@ -2576,12 +2780,11 @@ def parse_turns_text(text):
             text = " ".join(texts)
             if len(text) > 300:
                 text = text[:297] + "…"
-            turns.append({"n": len(turns) + 1, "text": text, "tools": tools})
-            if len(turns) >= 300:
-                break
+            n += 1
+            turns.append({"n": n, "text": text, "tools": tools})
     except Exception:
         pass
-    return turns
+    return _keep_both_ends(turns, limit, ("turn", "turns"))
 
 
 def parse_conversation(text, limit=400):
@@ -2590,7 +2793,7 @@ def parse_conversation(text, limit=400):
     `parse_turns_text` deliberately keeps only assistant turns (that is what the
     Timeline shows). The terminal needs both sides — an interactive run echoes
     the human's messages back into the stream (`--replay-user-messages`), so
-    they are here too."""
+    they are here too. Gaps and the limit work as they do there."""
     out = []
     if not text:
         return out
@@ -2601,6 +2804,10 @@ def parse_conversation(text, limit=400):
         try:
             ev = json.loads(ln)
         except Exception:  # noqa: BLE001
+            continue
+        gap = _stream_gap(ev)
+        if gap:
+            out.append(gap)
             continue
         kind = ev.get("type")
         if kind not in ("assistant", "user"):
@@ -2626,9 +2833,7 @@ def parse_conversation(text, limit=400):
             body = body[:1997] + "…"
         out.append({"role": "user" if kind == "user" else "agent",
                     "text": body, "tools": tools})
-        if len(out) >= limit:
-            break
-    return out
+    return _keep_both_ends(out, limit, ("message", "messages"))
 
 
 # The engine's in-request resolve spends this once on `--version` and twice
