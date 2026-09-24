@@ -272,6 +272,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A run whose files could not be read is no longer deleted anyway.** Once
+  a run ends, the index reads its files into the run's row and then deletes
+  them. It noticed when one could not be read — a permission, an I/O error —
+  but nothing looked at what it noticed: the files went as soon as anything
+  else of the run had been stored, so a run whose result was read and whose
+  transcript was not lost the transcript for good. Such a run now keeps its
+  files, the reason is logged once, and every later pass over the index
+  reads them again — quietly, and writing nothing until a read works —
+  deleting them only once one does. Passes also run one at a time now. Two
+  at once could take up the same run, one deleting its files while the
+  other was between reading them and writing what it had read, and the
+  other then wrote the emptiness it had found over the row the first one
+  had written; with unread runs read again on every pass, that would have
+  become routine. A pass now takes the index's write lock before it reads
+  anything, so a second one waits, and then finds nothing left to do.
+
 - **A long run keeps the end of its transcript once it is indexed.** The
   index stored only the first 2 MB of a finished run's stream, and the run's
   files are deleted as soon as its row is written, so every run longer than

@@ -684,6 +684,11 @@ def db_init(conn):
         stderr TEXT, doc TEXT, project TEXT, model TEXT, model_id TEXT,
         note TEXT, resumed_from TEXT, cause TEXT, platform TEXT, cost_basis TEXT,
         tokens TEXT, account TEXT, account_dir TEXT, pruned INTEGER DEFAULT 0)""")
+    # Runs whose files could not all be read into their row, with the journal
+    # record each is read again from: their files are kept until a pass reads
+    # them in full (_finish_prune, _reread_unread). A table of its own rather
+    # than a `runs` column, so it asks nothing of SCHEMA_VERSION.
+    conn.execute("CREATE TABLE IF NOT EXISTS unread_runs (key TEXT PRIMARY KEY, rec TEXT)")
     try:
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS runs_fts USING fts5(key UNINDEXED, content)")
         return True
@@ -774,7 +779,7 @@ def _fit_stream(data, cap):
     return head + marker.encode() + b"\n" + tail
 
 
-def _read_artifacts(rec):
+def _read_artifacts(rec, quiet=False):
     """Read a run's on-disk artifacts. Never raises, and never lies about it.
 
     `art["_read_failed"]` is the load-bearing part: whatever goes wrong here, the
@@ -784,6 +789,9 @@ def _read_artifacts(rec):
     ingestion then stored the emptiness and pruned the originals. A 37-minute,
     $7.27 run was erased that way, and reported success. Read as bytes and decode
     with errors="replace": a mangled character costs a character, not a run.
+    The flag is what _finish_prune keeps a run's files on. `quiet` is for a read
+    of a run already known to fail (_reread_unread): it was reported the first
+    time, and every pass after it would only repeat that.
     """
     art = {"result_json": "", "stream": "", "precheck_txt": "", "stderr": "",
            "_read_failed": False}
@@ -802,7 +810,8 @@ def _read_artifacts(rec):
             return data.decode("utf-8", errors="replace")
         except Exception as exc:                       # noqa: BLE001 — reported, not swallowed
             art["_read_failed"] = True
-            _log(f"ingest: could not read {path}: {exc!r}")
+            if not quiet:
+                _log(f"ingest: could not read {path}: {exc!r}")
             return ""
 
     art["result_json"] = slurp(ap["json"], 200_000)
@@ -991,17 +1000,20 @@ def _platform_from_stream(stream, default="anthropic"):
     return default
 
 
-def _upsert(conn, fts, rec, preserve=None):
+def _upsert(conn, fts, rec, preserve=None, art=None, quiet=False):
     """Insert or refresh one journal record. `preserve` carries the existing
     row for already-pruned runs — their files are gone, so their stored
-    content must survive a resync."""
+    content must survive a resync. `art` is a read the caller already made
+    (_reread_unread writes only once one works); `quiet` passes through to
+    _read_artifacts. Returns (key, pruned, read_failed) -- the last is what
+    keeps the run's files on disk (_finish_prune)."""
     key = _rec_key(rec)
     if preserve is not None and preserve["pruned"]:
         art = {"result_json": preserve["result_json"], "stream": preserve["stream"],
                "precheck_txt": preserve["precheck_txt"], "stderr": preserve["stderr"]}
         doc, pruned = preserve["doc"], 1
     else:
-        art = _read_artifacts(rec)
+        art = art if art is not None else _read_artifacts(rec, quiet=quiet)
         doc = _build_doc(rec, art)
         pruned = 0
     conn.execute(
@@ -1035,7 +1047,7 @@ def _upsert(conn, fts, rec, preserve=None):
     if fts:
         conn.execute("DELETE FROM runs_fts WHERE key=?", (key,))
         conn.execute("INSERT INTO runs_fts (key, content) VALUES (?,?)", (key, doc))
-    return key, pruned
+    return key, pruned, bool(art.get("_read_failed"))
 
 
 def _finish_prune(conn, pending):
@@ -1046,8 +1058,26 @@ def _finish_prune(conn, pending):
     that produced turns and cost but stored no stream did not have nothing to say
     — something went wrong reading it, and the file on disk is the only remaining
     copy.
+
+    So is a run any of whose files could not be read (`read_failed`), however
+    much of the rest was stored. This asked only whether ANYTHING had been, so a
+    run whose result was read and whose transcript was not had its transcript
+    deleted with the rest. Such a run waits in `unread_runs` instead, and every
+    later pass reads it again (_reread_unread) until one can; why its files were
+    kept is logged the first time, not on every pass that finds it still so.
     """
-    for key, rec in pending:
+    for key, rec, read_failed in pending:
+        waiting = conn.execute("SELECT 1 FROM unread_runs WHERE key=?", (key,)).fetchone() is not None
+        if read_failed:
+            if not waiting:
+                _log(f"ingest: keeping artifacts for {key} — some of them could not be read;"
+                     " every later pass reads them again")
+            conn.execute("INSERT OR REPLACE INTO unread_runs (key, rec) VALUES (?, ?)",
+                         (key, json.dumps(rec)))
+            continue
+        if waiting:
+            conn.execute("DELETE FROM unread_runs WHERE key=?", (key,))
+            _log(f"ingest: read the artifacts kept for {key} in full")
         row = conn.execute(
             "SELECT length(coalesce(result_json,'')) + length(coalesce(stream,''))"
             " FROM runs WHERE key=?", (key,)).fetchone()
@@ -1057,6 +1087,35 @@ def _finish_prune(conn, pending):
             continue
         _prune_artifacts(rec)
         conn.execute("UPDATE runs SET pruned=1 WHERE key=?", (key,))
+
+
+def _reread_unread(conn, fts, unread):
+    """Read again the runs an earlier pass could not read in full, `unread`
+    being their {key: journal record as JSON}, and return the ones that now
+    read, in _finish_prune's shape.
+
+    Quietly, and writing nothing until a read works: every pass comes here,
+    one per poll of the page, so a file that stays unreadable must cost a
+    failed open, not a rewrite of its row and search entry. A run no longer
+    waiting to be read -- deleted, renamed, or read in full by a resync since
+    -- leaves: reading its files now would find them gone and write the run
+    back as an empty one."""
+    pending = []
+    for key, rec_json in unread.items():
+        row = conn.execute("SELECT pruned FROM runs WHERE key=?", (key,)).fetchone()
+        try:
+            rec = json.loads(rec_json)
+        except ValueError:
+            rec = None
+        if row is None or row["pruned"] or not isinstance(rec, dict):
+            conn.execute("DELETE FROM unread_runs WHERE key=?", (key,))
+            continue
+        art = _read_artifacts(rec, quiet=True)
+        if art["_read_failed"]:
+            continue
+        k, _, _ = _upsert(conn, fts, rec, art=art)
+        pending.append((k, rec, False))
+    return pending
 
 
 def _backfill_light_bump(conn, fields):
@@ -1094,7 +1153,9 @@ def ingest():
     LIGHT_SCHEMA_BUMPS) triggers a full resync that preserves the stored
     content of already-pruned rows. A schema bump alone, journal otherwise
     unchanged, and listed in LIGHT_SCHEMA_BUMPS backfills in place instead --
-    see _backfill_light_bump and the resync/light_fields split below."""
+    see _backfill_light_bump and the resync/light_fields split below. Every
+    pass also reads again the runs an earlier one could not read in full
+    (_reread_unread), and passes run one at a time (the lock below)."""
     conn = db_conn()
     try:
         # Schema migration: ADDITIVE ONLY — never DROP the runs table. It stores
@@ -1132,6 +1193,17 @@ def ingest():
                     conn.execute("ALTER TABLE runs ADD COLUMN " + name + " " + decl)
             conn.commit()
         fts = db_init(conn)
+        # One pass at a time, and the write lock taken before anything is read.
+        # Passes ran side by side, one per request, and two could take up the
+        # same run: one pruned its files while the other was between reading
+        # them and writing what it read, and the other then stored the
+        # emptiness it had found over the row the first one wrote. A run
+        # waiting in `unread_runs` is read by every pass that finds it there,
+        # so it would meet that race routinely. A second pass now waits here,
+        # and then reads what the first one left.
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        unread = {r["key"]: r["rec"] for r in conn.execute("SELECT key, rec FROM unread_runs")}
         size = RUNS_FILE.stat().st_size if RUNS_FILE.exists() else 0
         offset = int(_meta_get(conn, "offset", "0") or 0)
         sig = _ndjson_sig()
@@ -1177,34 +1249,40 @@ def ingest():
                         continue
                     key = _rec_key(rec)
                     seen.add(key)
-                    k, pruned = _upsert(conn, fts, rec, preserve=existing.get(key))
+                    # A run already waiting to be read again was reported when
+                    # it first failed; this read of it stays as quiet as a retry.
+                    k, pruned, failed = _upsert(conn, fts, rec, preserve=existing.get(key),
+                                                quiet=key in unread)
                     if not pruned:
-                        pending.append((k, rec))
+                        pending.append((k, rec, failed))
             for key in set(existing) - seen:
                 conn.execute("DELETE FROM runs WHERE key=?", (key,))
                 if fts:
                     conn.execute("DELETE FROM runs_fts WHERE key=?", (key,))
             _finish_prune(conn, pending)
             offset = size
-        elif size > offset:
-            with open(RUNS_FILE, "r") as f:
-                f.seek(offset)
-                chunk = f.read()
-            consumed = len(chunk) if chunk.endswith("\n") else chunk.rfind("\n") + 1
-            pending = []
-            for ln in chunk[:consumed].splitlines():
-                ln = ln.strip()
-                if not ln:
-                    continue
-                try:
-                    rec = json.loads(ln)
-                except Exception:
-                    continue
-                k, pruned = _upsert(conn, fts, rec)
-                if not pruned:
-                    pending.append((k, rec))
+        else:
+            # Runs an earlier pass could not read in full, read again. A resync
+            # (above) already reads them, with every run whose files are kept.
+            pending = _reread_unread(conn, fts, unread)
+            if size > offset:
+                with open(RUNS_FILE, "r") as f:
+                    f.seek(offset)
+                    chunk = f.read()
+                consumed = len(chunk) if chunk.endswith("\n") else chunk.rfind("\n") + 1
+                for ln in chunk[:consumed].splitlines():
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        rec = json.loads(ln)
+                    except Exception:
+                        continue
+                    k, pruned, failed = _upsert(conn, fts, rec)
+                    if not pruned:
+                        pending.append((k, rec, failed))
+                offset += consumed
             _finish_prune(conn, pending)
-            offset += consumed
         _meta_set(conn, "offset", offset)
         _meta_set(conn, "sig", sig)
         _meta_set(conn, "schema", SCHEMA_VERSION)

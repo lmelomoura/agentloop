@@ -13,10 +13,16 @@ Both now keep the first half and the last half, each cut on a line boundary,
 joined by one marker line that is itself a stream event. Every reader passes
 over it, and the two views a person reads (Terminal, Timeline) show a line
 saying how much is missing, where it is missing.
+
+The last section is the other way a transcript was lost at the same step: a
+file that could not be read was pruned all the same.
 """
 import json
 import os
 import re
+import threading
+
+import pytest
 
 INIT = {"type": "system", "subtype": "init", "session_id": "sess-long",
         "model": "claude-opus-5", "tools": []}
@@ -315,3 +321,189 @@ def test_a_stream_gap_inside_what_a_view_leaves_out_is_still_named(srv):
             + "".join(_line(_said(f"step {i}")) for i in range(100, 1000)))
     gaps = [t["text"] for t in srv.parse_turns_text(text) if t.get("gap")]
     assert gaps == ["… 2.0 KB of the transcript omitted …", "… 700 turns not shown …"]
+
+
+# ------------------------------------------------------------ a run it could not read
+#
+# Ingest noted when one of a run's files could not be read (`_read_failed`),
+# and nothing looked: the prune only asked whether ANYTHING had been stored,
+# so a run whose result was read and whose transcript was not lost the
+# transcript for good. A file is made unreadable here the way it happens on a
+# real disk -- by its mode -- which root can read through regardless.
+
+needs_modes = pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                                 reason="root reads a file whatever its mode")
+
+
+def _unreadable_run(srv, job="j-unread"):
+    """A journaled run whose result reads and whose stream does not. Returns
+    (log path, stream path, stream text)."""
+    text = _long_stream(turns=3, result_size=100)
+    logp = _artifacts(srv, job, "20260920T000000Z-2", {"result": "done", "session_id": "sess-long"}, text)
+    stream = logp.with_name(logp.stem + ".stream.ndjson")
+    srv.RUNS_FILE.write_text(json.dumps(_record(id=job, log=str(logp))) + "\n")
+    stream.chmod(0)
+    return logp, stream, text
+
+
+def _readable_again(path):
+    # A cleanup, not a check: when the bug is back the prune already took it.
+    if path.exists():
+        path.chmod(0o644)
+
+
+def _row(srv, job):
+    conn = srv.db_conn()
+    try:
+        return conn.execute("SELECT result_json, stream, pruned FROM runs WHERE job=?", (job,)).fetchone()
+    finally:
+        conn.close()
+
+
+@needs_modes
+def test_a_run_whose_transcript_could_not_be_read_keeps_its_files_until_it_can(srv, clean_data, capsys):
+    """Its result was read, its transcript was not (a permission, an I/O
+    error), and the prune deleted both files all the same: the row held the
+    result and no transcript, with nothing on disk to read it from again. The
+    files are kept now, why is logged once, and each later pass reads them
+    again -- pruning them only once the read works."""
+    logp, stream, text = _unreadable_run(srv)
+    try:
+        srv.ingest()
+        assert logp.exists() and stream.exists(), "the only whole copy of the run was deleted"
+        row = _row(srv, "j-unread")
+        assert (row["pruned"], row["stream"]) == (0, "") and "done" in row["result_json"]
+        srv.ingest()                        # the journal has not moved: these two are retries
+        srv.ingest()
+        assert logp.exists() and stream.exists()
+    finally:
+        _readable_again(stream)
+    srv.ingest()
+    row = _row(srv, "j-unread")
+    assert (row["stream"], row["pruned"]) == (text, 1), "read in full on a later pass, then pruned"
+    assert not logp.exists() and not stream.exists()
+    err = capsys.readouterr().err
+    assert err.count("keeping artifacts for") == 1, "why the files were kept is said once, not every pass"
+    assert err.count("could not read") == 1, "a retry that fails again says nothing new"
+
+
+@needs_modes
+def test_a_run_whose_result_could_not_be_read_keeps_its_files_too(srv, clean_data):
+    text = _long_stream(turns=3, result_size=100)
+    logp = _artifacts(srv, "j-noresult", "20260920T000000Z-4", {"result": "done"}, text)
+    srv.RUNS_FILE.write_text(json.dumps(_record(id="j-noresult", log=str(logp))) + "\n")
+    logp.chmod(0)
+    try:
+        srv.ingest()
+        assert logp.exists(), "the run's result was deleted without ever being read"
+        assert _row(srv, "j-noresult")["pruned"] == 0
+    finally:
+        _readable_again(logp)
+    srv.ingest()
+    row = _row(srv, "j-noresult")
+    assert "done" in row["result_json"] and row["pruned"] == 1 and not logp.exists()
+
+
+@needs_modes
+def test_a_run_that_stays_unreadable_is_retried_without_rewriting_its_row(srv, clean_data, monkeypatch):
+    """Every ingest pass retries it -- one per poll of the page -- so a file
+    that stays unreadable must cost a failed open, not a rewrite of the row
+    and its search entry every five seconds."""
+    logp, stream, text = _unreadable_run(srv)
+    try:
+        srv.ingest()
+        calls, real = [], srv._upsert
+        monkeypatch.setattr(srv, "_upsert", lambda *a, **k: calls.append(1) or real(*a, **k))
+        srv.ingest()
+        srv.ingest()
+        assert calls == [], "a retry that failed again rewrote the row"
+        assert stream.exists()
+    finally:
+        _readable_again(stream)
+
+
+@needs_modes
+def test_a_full_resync_keeps_an_unreadable_run_as_well(srv, clean_data, capsys):
+    """A resync (a job renamed, a schema bump) reads again every run whose
+    files are still on disk, and prunes through the same step."""
+    logp, stream, text = _unreadable_run(srv)
+    try:
+        srv.ingest()
+        (srv.DATA_DIR / ".reingest").touch()
+        srv.ingest()
+        assert logp.exists() and stream.exists() and _row(srv, "j-unread")["pruned"] == 0
+    finally:
+        _readable_again(stream)
+    (srv.DATA_DIR / ".reingest").touch()
+    srv.ingest()
+    row = _row(srv, "j-unread")
+    assert (row["stream"], row["pruned"]) == (text, 1) and not stream.exists()
+    err = capsys.readouterr().err
+    assert err.count("keeping artifacts for") == 1 and err.count("could not read") == 1
+
+
+@needs_modes
+def test_a_kept_run_that_is_deleted_is_not_brought_back(srv, clean_data):
+    """A run waiting to be read again can still be deleted from the Runs page.
+    Its retry must not then read the files that are gone as an empty run and
+    write it back into the index."""
+    logp, stream, text = _unreadable_run(srv)
+    try:
+        srv.ingest()
+    finally:
+        _readable_again(stream)
+    assert srv.delete_run("j-unread", 1700000000) is not None
+    srv.ingest()
+    assert _row(srv, "j-unread") is None
+    assert "j-unread" not in [r["id"] for r in srv.load_data()["runs"]]
+
+
+def test_two_passes_at_once_never_store_emptiness_over_a_run(srv, clean_data, monkeypatch):
+    """Ingest passes ran side by side, one per request. One could prune a
+    run's files while another was between reading them and writing what it
+    read, and that one then stored the emptiness it found over the row the
+    first had written -- with no file left to read the run from again. With
+    unread runs retried on every pass that overlap is routine, so a pass now
+    takes the index's write lock before it reads anything: the second one
+    waits, then finds nothing left to do."""
+    text = _long_stream(turns=3, result_size=100)
+    logp = _artifacts(srv, "j-race", "20260920T000000Z-3", {"result": "done"}, text)
+    srv.RUNS_FILE.write_text(json.dumps(_record(id="j-race", log=str(logp))) + "\n")
+    pruned, release, second_read = threading.Event(), threading.Event(), threading.Event()
+    real_prune, real_read = srv._prune_artifacts, srv._read_artifacts
+
+    def prune_then_hold(rec):
+        # The first pass, paused between deleting the files and committing.
+        real_prune(rec)
+        if not pruned.is_set():
+            pruned.set()
+            release.wait(10)
+
+    def read(rec, *a, **k):
+        if threading.current_thread().name == "second":
+            second_read.set()
+        return real_read(rec, *a, **k)
+
+    monkeypatch.setattr(srv, "_prune_artifacts", prune_then_hold)
+    monkeypatch.setattr(srv, "_read_artifacts", read)
+    errors = []
+
+    def ingest():
+        try:
+            srv.ingest()
+        except Exception as exc:  # noqa: BLE001 -- asserted on below
+            errors.append(exc)
+
+    first = threading.Thread(target=ingest, name="first")
+    first.start()
+    assert pruned.wait(10), "the first pass never reached its prune"
+    second = threading.Thread(target=ingest, name="second")
+    second.start()
+    second_read.wait(1.0)       # a pass that does not wait reads at once; one that waits never gets here
+    release.set()
+    first.join(15)
+    second.join(15)
+    assert not errors, errors
+    row = _row(srv, "j-race")
+    assert row["stream"] == text, "the second pass stored the emptiness it read over the run"
+    assert row["pruned"] == 1
