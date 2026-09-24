@@ -11811,6 +11811,54 @@ def test_the_findings_browser_declares_the_verdict_filter(srv, tmp_path):
     assert out["filters"]["verdict"] == []
 
 
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_analysis_card_names_its_confidence_chip(srv, tmp_path):
+    """The analysis card says a finding's severity only in its title ("[medium]
+    ...") and its border colour. The confidence chip beside the state pill used
+    to say nothing but the score, and CSS uppercases it: a medium finding with
+    high confidence read "[medium] ... NEW HIGH CONFIRMED", a second severity
+    contradicting the first, and a low one did the same. The score uses the
+    same three words as a severity, so the card's chip has to name itself. The
+    Findings table keeps the bare score: its Confidence column header names
+    it, and the column is 7% of the table wide."""
+    block = _security_js(srv)
+    consts = "".join(_const(block, n) for n in
+                     ("SEC_STATE_LABEL", "SEC_STATE_HELP", "SEV_ORDER", "SEC_STATES"))
+    arrows = (re.search(r"const secSevKey = .*?;", block).group(0) + "\n"
+              + re.search(r"const secStateKey = .*?;", block).group(0) + "\n")
+    deps = "\n".join(_plainfn(block, n) for n in
+                     ("secEl", "secConfidenceChip", "secVerdictChip", "secFindingRow"))
+    script = tmp_path / "analysis-card-confidence.js"
+    script.write_text(_INDEX_DOM_HARNESS + """
+    // The candidate block and the decision buttons sit under the header this
+    // test reads; stubbed so nothing below it has to be extracted.
+    function secCandidateBlock(_f){ return null; }
+    function secDecisionControls(_f){ return document.createElement("div"); }
+    """ + consts + arrows + deps + """
+    const header = (sev) => secFindingRow({title: "t",
+      severity: sev, state: "new", category: "sast", rule: "r",
+      fingerprint: "a".repeat(64), occurrences: [{file: "a.py", line: 1}],
+      confidence: "high", verdict: "confirmed",
+      candidate: {confidence: {score: "high", reason: "r"}}})
+      .childNodes[0].childNodes.map(c => ({cls: c.className, text: c.textContent}));
+    const f = {confidence: "low", candidate: {confidence: {score: "low", reason: "r"}}};
+    console.log(JSON.stringify({medium: header("medium"), low: header("low"),
+                                cell: secConfidenceChip(f).textContent}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    levels = {"critical", "high", "medium", "low", "info"}
+    for sev in ("medium", "low"):
+        title, *pills = out[sev]
+        assert title["text"].startswith(f"[{sev}] "), out[sev]
+        # every pill beside the title: none of them may read as a severity
+        bare = [p["text"] for p in pills if p["text"].strip().lower() in levels]
+        assert not bare, f"a bare level word beside [{sev}] reads as a second severity: {out[sev]}"
+        chips = [p["text"] for p in pills if p["cls"].split()[0] == "secconf"]
+        assert chips == ["high confidence"], out[sev]
+    assert out["cell"] == "low", "the table's Confidence column already names its chip"
+
+
 # ---- Task 6: Accounts in Settings, and the Account combo in the three editors.
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
