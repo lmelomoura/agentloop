@@ -1082,10 +1082,18 @@ scenario_41b() {
 echo "41b. a run that wrote its first event and then went quiet is still judged by the old rule"
 mkjob j41b
 sed -i '' 's/"max_parallel":1/"max_parallel":1,"stall_timeout_seconds":4/' "$ROOT/config/jobs.json"
-AGENTLOOP_WATCHDOG_POLL=2 FAKE_MODE=hang FAKE_SESSION=sess-quiet "$AL" run j41b >/dev/null 2>&1
+pid41b="$ROOT/pid-41b"; rm -f "$pid41b"
+AGENTLOOP_WATCHDOG_POLL=2 FAKE_MODE=hang FAKE_PID_OUT="$pid41b" FAKE_SESSION=sess-quiet "$AL" run j41b >/dev/null 2>&1
 sleep 1
 lastrun | jq -r .note | grep -q 'no output and no CPU for 4s' && ok "killed by the CPU-and-output rule, not the empty-stream one" || bad "note: $(lastrun | jq -r .note)"
 lastrun | jq -r .note | grep -q 'no output at all' && bad "the empty-stream rule fired on a run that had written" || ok "the empty-stream rule never touches a run that wrote a byte"
+# The watchdog's TERM goes where a stop's does (scenario 53): a hung CLI
+# the kill never reached would sit there, hung, for as long as the machine
+# stays up, while the run it belonged to reads as ended.
+cli41b="$(cat "$pid41b" 2>/dev/null)"
+[ -n "$cli41b" ] && ! kill -0 "$cli41b" 2>/dev/null \
+  && ok "and the hung CLI itself is gone, not just the shell that launched it" \
+  || { bad "the hung CLI (pid ${cli41b:-unrecorded}) outlived the watchdog's kill"; [ -z "$cli41b" ] || kill "$cli41b" 2>/dev/null; }
 
 echo
 }
@@ -1546,6 +1554,70 @@ rm -f "$ROOT/data/rate-limits.json"
 echo
 }
 
+scenario_53() {
+echo "53. a stop ends the Claude CLI itself, not only the shell that launched it"
+# `agentloop stop` TERMs the pid in the slot's `child` file, and on the
+# Claude launch lines that was the pid of the ( cd …; env claude … )
+# subshell: bash 3.2 does not exec the last command of a subshell, so the
+# TERM ended the shell and the CLI ran on under init. Measured on a real
+# analysis (2026-09-24): the run was journaled `stopped` at $0 and its
+# analysis closed `failed` while the agent worked on for twelve more minutes,
+# unaccounted -- its deterministic phase wrote 91 findings into the closed
+# analysis, and the freed slot let the next analysis of the same project
+# start beside it. The OpenAI and OpenCode launch lines always exec'd.
+mkjob j53
+pid53="$ROOT/pid-53"; rm -f "$pid53"
+FAKE_MODE=hang FAKE_PID_OUT="$pid53" FAKE_SESSION=sess-53 "$AL" run j53 >/dev/null 2>&1 &
+# Bounded at 90 s, as scenario 44's waits are: a launch that takes seconds on
+# a laptop took past 20 s on a loaded CI runner.
+w=0
+while [ "$w" -lt 90 ] && ! { ls "$ROOT"/data/locks/j53/*/child >/dev/null 2>&1 && [ -s "$pid53" ]; }; do
+  sleep 1; w=$((w + 1))
+done
+cli53="$(cat "$pid53" 2>/dev/null)"
+child53="$(cat "$ROOT"/data/locks/j53/*/child 2>/dev/null)"
+[ -n "$cli53" ] && [ "$child53" = "$cli53" ] \
+  && ok "the pid a stop signals is the CLI's own (waited ${w}s for the slot)" \
+  || bad "the slot's child is '$child53' and the CLI is '$cli53'"
+"$AL" stop j53 >/dev/null 2>&1
+wait
+[ -n "$cli53" ] && ! kill -0 "$cli53" 2>/dev/null \
+  && ok "and after the stop the CLI is gone, not orphaned" \
+  || { bad "the CLI (pid ${cli53:-unrecorded}) outlived the stop"; [ -z "$cli53" ] || kill "$cli53" 2>/dev/null; }
+[ "$(lastrun | jq -r .status)" = "stopped" ] && ok "and the run is recorded stopped" || bad "status $(lastrun | jq -r .status)"
+# WHERE THE STOP CAME FROM. That same analysis was recorded as "you ended
+# this run from the dashboard" -- every stop was, typed anywhere -- and its
+# operator had not stopped it. This one was typed here, outside the
+# dashboard, and the record and tick.log have to say so, naming the process
+# that ran the command.
+lastrun | jq -r .note | grep -qF 'STOPPED: ended from outside the dashboard (`agentloop stop`, run by ' \
+  && ok "the note says the stop came from outside the dashboard, and what ran it" \
+  || bad "note: $(lastrun | jq -r .note)"
+grep -F 'j53: stop asked for run ' "$ROOT/data/tick.log" | grep -qF 'from outside the dashboard (`agentloop stop`, run by ' \
+  && ok "and tick.log said so the moment the stop was asked" \
+  || bad "tick.log: $(grep -F 'j53:' "$ROOT/data/tick.log" | tail -2)"
+# The control server's own stop sets AL_STOP_SOURCE (bin/agentloop-server
+# stop_run, tests/test_stop_origin.py); the engine's half is here. The first
+# launch's slot has to be gone before the second starts -- scenario 44's
+# lesson: a slot a teardown has not finished removing reads, to a glob, as
+# the new launch's own, and the stop below would be aimed at it.
+w=0; while [ "$w" -lt 90 ] && [ -n "$(ls "$ROOT/data/locks/j53" 2>/dev/null)" ]; do sleep 1; w=$((w + 1)); done
+[ -z "$(ls "$ROOT/data/locks/j53" 2>/dev/null)" ] || bad "the first launch's slot is still there after ${w}s: $(ls "$ROOT/data/locks/j53")"
+pid53b="$ROOT/pid-53b"; rm -f "$pid53b"
+FAKE_MODE=hang FAKE_PID_OUT="$pid53b" FAKE_SESSION=sess-53b "$AL" run j53 >/dev/null 2>&1 &
+w=0
+while [ "$w" -lt 90 ] && ! { ls "$ROOT"/data/locks/j53/*/child >/dev/null 2>&1 && [ -s "$pid53b" ]; }; do
+  sleep 1; w=$((w + 1))
+done
+AL_STOP_SOURCE=dashboard "$AL" stop j53 >/dev/null 2>&1
+wait
+[ "$(lastrun | jq -r .session)" = "sess-53b" ] && lastrun | jq -r .note | grep -qF 'STOPPED: ended from the dashboard. ' \
+  && ok "a stop the dashboard makes is recorded as from the dashboard" \
+  || bad "record: $(lastrun | jq -c '{session,note}')"
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1567,11 +1639,11 @@ echo
 # scenario goes at the END of the file and into the LAST list, or, if it is
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # and the count assertion below fails if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26"
 E2E_LIST_3="27 28 29 30 31 32 33 33b 34 35 35b 36 37"
-E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52"
+E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

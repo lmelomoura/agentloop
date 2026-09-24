@@ -4408,12 +4408,15 @@ const STOP_REASONS={
   tool_use:["Cut off mid tool call","the run ended while a tool call was still open"],
   refusal:["Declined","the model declined to continue"],
   no_result_event:["Killed or crashed","the run ended without reporting a result"],
-  stopped_by_user:["Stopped by you","ended on purpose from the dashboard, not by a failure"],
+  // "Stopped", never "by you": a stop is recorded with where it came from --
+  // the dashboard, or `agentloop stop` from outside it -- and the note beside
+  // this label says which. The old label put every stop down to the reader.
+  stopped_by_user:["Stopped","ended on purpose, not by a failure — the note says where the stop came from"],
 };
 // Our own reasons are already written for a person and carry their headline in a
 // SHOUTED prefix — "STOPPED: ended on purpose…". Same shape, no rewriting: the
 // prefix becomes the label and the rest becomes the sentence.
-const REASON_PREFIX={STOPPED:"Stopped by you", "BUDGET LIMITED":"Budget limited",
+const REASON_PREFIX={STOPPED:"Stopped", "BUDGET LIMITED":"Budget limited",
   "NOTHING TO DO":"Nothing to do", "UNDECLARED ENDING":"Undeclared ending"};
 function reasonParts(s){
   const known=STOP_REASONS[s];

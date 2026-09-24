@@ -547,10 +547,18 @@
       secTimer = null;
     }
   }
+  function secRunStillHeld() {
+    const slots = AL.DATA.active_runs || {};
+    return secState.analyses.some((a) => a.run_id && (slots[a.run_id] || []).length > 0);
+  }
   function secSyncPoll() {
-    const running = AL.currentView === "security" && secState.project && secState.analyses.some((a) => a.state === "running");
-    if (running && !secTimer) secTimer = setInterval(() => secReload(false), SEC_POLL_MS);
-    if (!running) secStopPoll();
+    const here = AL.currentView === "security" && secState.project;
+    const watch = here && (secState.analyses.some((a) => a.state === "running") || secRunStillHeld());
+    if (watch && !secTimer) secTimer = setInterval(() => secReload(false), SEC_POLL_MS);
+    if (!watch && secTimer) {
+      secStopPoll();
+      if (here) secReload(false);
+    }
   }
   function secEnter() {
     if (secState.project) secReload();
@@ -5440,5 +5448,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: d954216d75dee850158dc0b6b80666efc654cfc374d7e6df8992ecf5b13defea */
-/* ui-sources: 9f0d0af7605d7ba3f6b3a63f863ef62df4cce8ca5e1a31de72a498d126f232bf */
+/* ui-bundle: defb9e0bd2d6a4735b906ffe1ee99a4281054fff6b3288e3754318b83d60c409 */
+/* ui-sources: ec73cbc884a738ac02546deabf6242501397380d776bb2f99fe617d4830fca19 */

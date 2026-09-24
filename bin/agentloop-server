@@ -2658,6 +2658,20 @@ def al(args, stdin=None, background=False, env=None):
         return False, str(e)
 
 
+def stop_run(jid, pid=None):
+    """`agentloop stop`, saying that it comes from the dashboard.
+
+    The engine records where a stop came from -- in the run's note, its stop
+    marker and a tick.log line (bin/agentloop `stop_origin`) -- and this is
+    the one caller that can vouch for itself, so it says so in the
+    environment of the one call it makes. Every stop used to be recorded as
+    the operator's from the dashboard, typed in a terminal or not, and on
+    2026-09-24 one the operator had not made was put down to them.
+    """
+    return al(["stop", jid, str(pid)] if pid else ["stop", jid],
+              env={"AL_STOP_SOURCE": "dashboard"})
+
+
 # The permission vocabulary lives in the engine (platform_permissions); this
 # mirrors it with the labels the page shows, and tests/test_platforms_api.py
 # pins the two together. The label says what the mode DOES on that CLI --
@@ -4534,8 +4548,7 @@ class Handler(BaseHTTPRequestHandler):
             ok, out = al(["run", jid], background=True)
         elif op == "stop":
             # With concurrent runs, a stop targets ONE run by its pid; no pid = all.
-            pid = body.get("pid")
-            ok, out = al(["stop", jid, str(pid)] if pid else ["stop", jid])
+            ok, out = stop_run(jid, body.get("pid"))
         elif op == "resume":
             # Resume THE SAME TASK: continue that run's own session
             # (`claude --resume <sid>`), not a fresh run of the job.

@@ -6455,19 +6455,27 @@ PY
   mkdir -p "$sl" "$tmp/stoplogs"
   echo 777 > "$sl/pid"; echo 1700000000 > "$sl/start"
   echo "$tmp/stoplogs/r.json" > "$sl/logfile"
-  : > "$sl/stopped"
+  # The marker as _stop_slot writes it: where the stop came from.
+  printf 'from the dashboard\n' > "$sl/stopped"
   ( CONFIG_DIR="$tmp/cfg"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/stop.ndjson"
     STATE_FILE="$tmp/stopstate.json"; LOG_DIR="$tmp/stoplogs"; TICK_LOG="$tmp/stop.tick"
     run_record_stopped_early j9 "$sl" ) >/dev/null 2>&1
   got="$("$JQ" -r '.status' "$tmp/stop.ndjson" 2>/dev/null | head -1)"
   [ "$got" = "stopped" ] && ok "a stop before the agent starts still journals a run" \
     || bad "journalled status '$got'"
+  # And says where the stop came from, off the marker -- never "by you" for
+  # every stop, which put a stop nobody made in the dashboard down to its
+  # operator (2026-09-24). test/e2e.test.sh scenario 53 drives both origins.
   got="$("$JQ" -r '.note // ""' "$tmp/stop.ndjson" 2>/dev/null | head -1)"
-  case "$got" in STOPPED:*) ok "and the record says why it ended" ;;
+  case "$got" in "STOPPED: ended from the dashboard before its agent started"*)
+                   ok "and the record says why it ended, and where the stop came from" ;;
                  *) bad "note was '$got'" ;; esac
   got="$("$JQ" -r '.subtype // ""' "$tmp/stoplogs/r.json" 2>/dev/null)"
   [ "$got" = "stopped_by_user" ] && ok "and it leaves a log body explaining itself" \
     || bad "log subtype '$got'"
+  got="$("$JQ" -r '.result // ""' "$tmp/stoplogs/r.json" 2>/dev/null)"
+  case "$got" in "**Stopped.**"*) ok "headed Stopped, not Stopped by you" ;;
+                 *) bad "log body began '${got%%$'\n'*}'" ;; esac
   # The record used to carry no model at all, which in the run modal reads as
   # missing data rather than as a run that never got far enough to have one.
   got="$("$JQ" -r '.model // ""' "$tmp/stop.ndjson" 2>/dev/null | head -1)"

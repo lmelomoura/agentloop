@@ -1233,7 +1233,9 @@ def test_an_api_failure_outranks_the_protocol_stop_reason(srv, tmp_path):
     # DID hit a stop sequence, which is the reading this fix could have broken.
     assert "Normal end" in out["turn"]
     assert "Stop sequence" in out["seq"] and "API error" not in out["seq"]
-    assert "Stopped by you" in out["note"]
+    # "Stopped", never "Stopped by you": the note says where a stop came from,
+    # and the old label put every one down to the reader (2026-09-24).
+    assert "Stopped" in out["note"] and "by you" not in out["note"]
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -4780,7 +4782,8 @@ def test_the_analysis_poll_cannot_outlive_the_view(srv, tmp_path):
     analysis. The view belongs in the condition.
     """
     block = _security_js(srv)
-    src = _plainfn(block, "secStopPoll") + "\n" + _plainfn(block, "secSyncPoll")
+    src = "\n".join(_plainfn(block, name)
+                    for name in ("secStopPoll", "secRunStillHeld", "secSyncPoll"))
     script = tmp_path / "poll.js"
     script.write_text("""
     let live = 0;                       // intervals currently armed
@@ -4792,8 +4795,9 @@ def test_the_analysis_poll_cannot_outlive_the_view(srv, tmp_path):
     // The view is the page's and it changes under this area, so the area reads
     // it live off the interface rather than through a copy taken at startup.
     // That is what the stub has to be, or this harness proves nothing about
-    // the code that actually ships.
-    const AL = {currentView: "security"};
+    // the code that actually ships. No run slots here: the one kept watched
+    // after its analysis leaves `running` is the next test's subject.
+    const AL = {currentView: "security", DATA: {}};
     const secState = {project:"web", analyses:[{state:"running"}]};
     """ + src + """
     const out = {};
@@ -4814,6 +4818,58 @@ def test_the_analysis_poll_cannot_outlive_the_view(srv, tmp_path):
     assert out["lateReload"] == 0, "a reload landing after the view was left re-armed the poll"
     assert out["cameBack"] == 1, "coming back to the view did not resume watching"
     assert out["finished"] == 0, "the poll outlived the analysis"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_analysis_poll_waits_for_the_engines_own_close(srv, tmp_path):
+    """An analysis leaves `running` at the AGENT's close; the ENGINE closes it
+    again once the agent's process has exited, with the run's real cost, the
+    guides it read, the subagents it launched and possibly a lower verdict.
+
+    The poll stopped at the first close, so the second was never read: on
+    2026-09-24 analysis 20 showed Cost "—" and the agent's own duration until a
+    reload, 45 s after which the engine had written $19.29 -- and an agent's
+    `done` that the engine lowered to `capped` would have stayed on screen as
+    Done. The run's slot is released only after the engine's close, so the
+    page watches while it is held, and reads once more when it lets go --
+    exactly once, not in a loop.
+    """
+    block = _security_js(srv)
+    src = "\n".join(_plainfn(block, name)
+                    for name in ("secStopPoll", "secRunStillHeld", "secSyncPoll"))
+    script = tmp_path / "poll-close.js"
+    script.write_text("""
+    let live = 0, reloads = 0;
+    const SEC_POLL_MS = 4000;
+    let secTimer = null;
+    globalThis.setInterval = () => { live++; return {}; };
+    globalThis.clearInterval = () => { live--; };
+    const AL = {currentView: "security",
+                DATA: {active_runs: {"security-web": [{pid: 4242, start: 100}]}}};
+    const secState = {project: "web",
+                      analyses: [{id: 20, state: "running", run_id: "security-web"}]};
+    // The real one ends by calling secSyncPoll again (secPaint, then its own
+    // tail): the stub does too, so a last read that re-armed or re-read would
+    // show here.
+    const secReload = () => { reloads++; secSyncPoll(); };
+    """ + src + """
+    const out = {};
+    secSyncPoll();                                        out.running = live;
+    secState.analyses = [{id: 20, state: "capped", run_id: "security-web"}];
+    secSyncPoll();       out.agentClosed = live;          out.readsBefore = reloads;
+    AL.DATA = {active_runs: {}};
+    secSyncPoll();       out.released = live;             out.readsAfter = reloads;
+    secSyncPoll();       out.settled = live;              out.readsSettled = reloads;
+    console.log(JSON.stringify(out));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    assert out["running"] == 1, "an analysis in flight is not being watched"
+    assert out["agentClosed"] == 1, "the poll stopped at the agent's close, before the engine's"
+    assert out["released"] == 0, "the poll outlived the run's slot"
+    assert out["readsAfter"] == out["readsBefore"] + 1, "no last read once the slot let go"
+    assert out["settled"] == 0 and out["readsSettled"] == out["readsAfter"], \
+        "the last read re-armed the poll or read again"
 
 
 def test_an_analysis_is_only_ever_started_through_its_own_op(srv):

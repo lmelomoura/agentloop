@@ -272,6 +272,67 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The Security page no longer freezes an analysis at the agent's own
+  close.** An analysis is closed twice — by the agent, then by the engine
+  once the agent's process has exited, with the run's real cost, the guides
+  it read, the subagents it launched and possibly a lower verdict — and the
+  page polled only while an analysis said `running`, so it stopped at the
+  first close and never read the second. On 2026-09-24 analysis 20 showed
+  Cost *—* and the agent's own duration until a reload, 45 s after which
+  the engine had written $19.29; an agent's `done` that the engine lowered
+  to `capped` would have stayed on screen as *Done*. The page now keeps
+  watching while the project's analysis job still holds its run slot —
+  released only after the engine's close — and reads once more when it
+  lets go.
+
+- **A stopped run says where the stop came from, instead of saying it was
+  you.** Every stop was recorded as *"you ended this run from the
+  dashboard"*, and the dashboard labelled it *Stopped by you* — whether the
+  Stop button was pressed or `agentloop stop` was typed anywhere else, since
+  both reach the same function and nothing told them apart. On 2026-09-24
+  an analysis was stopped 28 seconds in that its operator had not stopped,
+  and the record named them. The control server now tells the engine a stop
+  is its own (`AL_STOP_SOURCE=dashboard`, on the one call it makes), and
+  the engine writes the origin into the run's stop marker, into the run's
+  note — *ended from the dashboard*, or *ended from outside the dashboard
+  (`agentloop stop`, run by zsh under claude)*, naming the two processes
+  above the command — and into a `tick.log` line the moment the stop is
+  asked, so the next unexplained stop has a witness. A marker left by an
+  older engine is recorded as a stop whose origin was not recorded. The
+  label is *Stopped*.
+
+- **`prepare` no longer writes into an analysis that closed while it ran.**
+  It checked that its analysis was open only on the way in, and the
+  deterministic phases are minutes of wall-clock — 679 s on a real one, most
+  of it the history sweep. An analysis closed in between (a stop, the stale
+  sweep, the engine closing a run that died) was written into all the same:
+  on 2026-09-24 a prepare that outlived its run filed 91 findings, its
+  coverage paragraph and `prepared` into an analysis that had closed
+  `failed` eleven minutes earlier. The check is asked again once the phases
+  are done and before the first write, and a closed analysis is refused the
+  way a second `prepare` already was — nothing is written, the history
+  cursor included.
+
+- **A stop now ends the Claude agent, not just the shell that launched it —
+  and so does the watchdog.** The Claude launch lines ran the CLI as the
+  last command of a `( cd …; env claude … ) &` subshell, and bash 3.2 forks
+  that command instead of exec'ing it, so the pid recorded for `agentloop
+  stop` and for the stall and timeout watchdog was the subshell's. The TERM
+  ended the subshell and the agent ran on under init, unseen: measured on a
+  real security analysis stopped 28 seconds in (2026-09-24), the run was
+  journaled `stopped` at $0 and 3 turns and its analysis closed `failed`,
+  while the agent worked on for twelve more minutes — its deterministic
+  phase wrote 91 findings into the closed analysis, nothing it spent was
+  recorded, and the slot it had freed let the next analysis of the same
+  project start beside it. Both Claude launch lines now `exec` the CLI, as
+  the OpenAI and OpenCode line always did, so the pid a stop or the
+  watchdog signals is the agent's own. `test/fake-claude` records its pid
+  (`FAKE_PID_OUT`) and its `hang` mode execs its sleep, so the end-to-end
+  suite checks the process that has to end (scenario 53 for a stop, 41b for
+  the watchdog) and no longer leaves orphans of its own behind. Scenario
+  53's launches wait the way scenario 44's do: bounded at 90 s, and for the
+  previous launch's slot to be gone before the next one starts.
+
 - **The confidence chip on an analysis's finding card says it is
   confidence.** The chip beside the state pill held only the candidate's
   score, which CSS uppercases, and the score uses the same three words as a
