@@ -272,6 +272,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The journal lock no longer raises when its holder lets go at the
+  instant a waiter looks.** A waiter whose mkdir failed and then found the
+  lock already gone had no identity and no owner to judge, and fell into the
+  no-pid grace arithmetic with no start time: a `TypeError` in the request
+  that was waiting (a run delete or rename from the dashboard). A lock that
+  vanished is now simply taken on the next pass, still under the deadline.
 - **The selftest's guard rail recognises a project save's account cleanup,
   which reads its jobs from jobs.json, as project-scoped.**
   `cmd_project_set` and `cmd_project_delete`'s own account cleanup (#77)

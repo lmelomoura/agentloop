@@ -1532,6 +1532,15 @@ class journal_lock:
                 return self
 
             ident = self._identity()          # which lock is judged below, read first
+            if ident is None:
+                # Released by its holder in the instant since the failed mkdir:
+                # there is nothing to judge, and no ownerless start time to
+                # measure a grace from. A free lock -- taken on the next pass,
+                # still under the deadline.
+                ownerless_since = ownerless_ident = None
+                if time.time() > deadline:
+                    raise TimeoutError("the journal lock could not be taken — try again in a moment")
+                continue
             owner = self._owner()
             if owner is not None and not self._alive(owner, self._owner_boot()):
                 # the owner is gone, or from an earlier boot
