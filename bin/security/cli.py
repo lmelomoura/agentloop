@@ -133,7 +133,14 @@ MAX_STDIN_BYTES = 1_000_000
 # if a two-word form of it needs refusing, add that string to this tuple.
 # Nothing else changes -- see `main()`'s dispatch key below.
 AGENT_FORBIDDEN = ("decide", "rename-project", "open-analysis", "event",
-                   "filters save", "filters delete")
+                   "filters save", "filters delete",
+                   # THE ENGINE'S VERBS. A session does not close the analysis
+                   # it is a unit of, grade its own unit, or stop and restart
+                   # the pipeline it runs inside: the engine calls these with
+                   # the agent flag removed (`security_engine_py` in
+                   # bin/agentloop), so refusing them here costs the engine
+                   # nothing and closes the one door a unit could misuse.
+                   "finish", "unit-close", "orchestrate", "interrupt", "resume", "abandon")
 
 
 def _agent_env(name: str) -> str:
@@ -177,9 +184,9 @@ def _refuse_if_agent(cmd):
                       same reason `events` is not: it reads, it writes
                       nothing, and the agent may legitimately want to see it.
 
-    `finish` is deliberately NOT in the list: `security_close_analysis` runs
-    inside run_job, AFTER the agent and still under the same exported flag,
-    and closing the row is the one thing that must always work.
+    `finish` joined the refused verbs with the pipeline: the engine's own
+    closes now run through `security_engine_py`, which removes the flag, so
+    an agent session is the only caller left under it.
 
     A GUARDRAIL, NOT A BOUNDARY. The flag lives in the agent's environment and
     the agent has a shell, so `env -u AL_SECURITY_AGENT ...` is all it takes to
@@ -201,8 +208,9 @@ def _refuse_if_agent(cmd):
             f"security {cmd}: refused inside a security analysis "
             "(AL_SECURITY_AGENT is set) — the agent that reports a finding "
             "does not get to dismiss it, rename the ledger out from under it, "
-            "open analyses of its own, write an event by hand into the one "
-            "record of what actually happened, or save/delete a saved filter "
+            "open analyses of its own, close or grade the analysis the engine "
+            "is running, write an event by hand into the one record of what "
+            "actually happened, or save/delete a saved filter "
             "-- a working set a human curates, not something an analysis "
             "decides; ask a human to run this.")
 
@@ -234,6 +242,10 @@ def _running(conn, analysis_id):
     hand-typed id that lands on the wrong row) must be told, not obeyed.
     """
     row = _analysis(conn, analysis_id)
+    if row["state"] == ledger.INTERRUPTED:
+        sys.exit(f"analysis {analysis_id} is interrupted: nothing is written into it "
+                 "until it is resumed (`agentloop security resume`), and a unit of it "
+                 "that is still running was stopped with it.")
     if row["state"] != "running":
         sys.exit(f"analysis {analysis_id} is closed ({row['state']}): it is the "
                  "baseline the next analysis is compared against, and writing "
@@ -250,10 +262,10 @@ def _refuse_if_secret(field, value):
     stored verbatim, and are quoted back by their own refusals (see
     `cmd_report_finding`). The second door is `finish --note`, which lands in
     `coverage_note`, reaches all four report formats and the analysis page,
-    and is deliberately reachable by the agent (see `_refuse_if_agent`:
-    closing the row is the one thing that must always work) -- it had no gate
-    at all, even though it is the near-identical twin of the `partial_note`
-    already covered. An agent describing what it could not scan is exactly as
+    and is written by the engine's close and by an operator (the agent is
+    refused the verb, see `_refuse_if_agent`) -- it had no gate at all, even
+    though it is the near-identical twin of the `partial_note` already
+    covered. An agent describing what it could not scan is exactly as
     likely to quote the credential it found as one describing what it did.
 
     The deterministic categories cannot leak a secret's value THROUGH THEIR
@@ -330,6 +342,15 @@ def cmd_open_analysis(args):
     conn = _conn(args)
     aid = ledger.start_analysis(conn, args.project, args.repo, args.branch,
                                 args.commit, args.profile, args.run_id)
+    # A NEW ANALYSIS OF THE SAME BRANCH SUPERSEDES AN INTERRUPTED ONE. Resuming
+    # the old one after this would file two readings of one branch out of
+    # order; its finished units stay in the ledger, and its note says why the
+    # rest never ran.
+    for (old,) in conn.execute(
+            "SELECT id FROM analysis WHERE project=? AND repo=? AND branch=? AND state=? AND id<>?",
+            (args.project, args.repo, args.branch, ledger.INTERRUPTED, aid)).fetchall():
+        ledger.close_interrupted(conn, old, f"Superseded by analysis {aid}, opened on the same "
+                                            "branch before this one was resumed.")
     try:
         ledger.record_event(conn, args.project, "analysis_started",
                             f"{args.profile} on {args.branch}", str(aid))
@@ -1742,15 +1763,20 @@ def cmd_verify_prompt(args):
 
 
 def cmd_report_verdict(args):
-    """What a VERIFIER concluded. Called by the subagent itself, not by the
-    hunter that reported the finding -- the write is the evidence that a
-    second agent existed and what it read (see security/prompts.py).
+    """What a VERIFIER concluded. Called by the engine's verify unit for the
+    one finding it was launched for, not by the hunter that reported it --
+    the write is the evidence that a second, independent session read the
+    code and what it found (see security/prompts.py).
 
-    Deliberately NOT in AGENT_FORBIDDEN: a subagent runs under the same
-    `AL_SECURITY_AGENT` the hunter carries, so a refusal there would close the
-    door on the only caller this verb has. What makes it verifiable is not a
-    flag but a count -- `cmd_finish` compares the verdicts recorded here with
-    the `Task` calls the engine counted in the run's stream.
+    Deliberately NOT in AGENT_FORBIDDEN: a verify unit runs under the same
+    `AL_SECURITY_AGENT` every unit of the pipeline carries, so a refusal there
+    would close the door on its only legitimate caller. What confines it to
+    that caller, inside an agent session, is the door below: it checks that
+    the session writing IS the verify unit the engine launched for THIS
+    finding, of THIS analysis, still running -- not a count taken after the
+    fact (`cmd_finish` still compares the verdicts recorded here against the
+    `Task` calls the engine counted in the run's stream, a coarser, close-time
+    check this one does not replace).
     """
     try:
         stdin_text = sys.stdin.read()
@@ -1773,6 +1799,20 @@ def cmd_report_verdict(args):
     _refuse_if_secret("report-verdict: reason", reason)
     conn = _conn(args)
     _running(conn, args.analysis)
+    # WHO MAY WRITE A VERDICT. Inside an agent session, only the verify unit
+    # the engine launched for THIS finding -- the write is the evidence that a
+    # second, independent session read the code, and it is checked here
+    # instead of counted afterwards. Outside any session it is the operator's.
+    by = "operator"
+    if _agent_env("SECURITY_AGENT"):
+        uid = _session_unit()
+        unit = ledger.get_unit(conn, uid) if uid else None
+        if (unit is None or unit["kind"] != "verify" or unit["analysis_id"] != args.analysis
+                or unit["state"] != "running"
+                or unit["payload"].get("fingerprint") != args.fingerprint):
+            sys.exit(f"report-verdict: only the verify unit the engine launched for "
+                     f"{args.fingerprint[:12]}… may record its verdict. Nothing was recorded")
+        by = f"unit:{uid}"
     # The queue is the authority on both questions at once -- is this finding
     # one somebody was asked to verify, and does it still need one. A row that
     # already carries a verdict has left the queue, so a second verdict lands
@@ -1784,7 +1824,7 @@ def cmd_report_verdict(args):
                  "leaves that list the moment it carries a verdict: a verifier does not "
                  "contradict itself, and the first answer is the one that counts. "
                  "Nothing was recorded")
-    if not ledger.record_verdict(conn, args.analysis, args.fingerprint, value, reason):
+    if not ledger.record_verdict(conn, args.analysis, args.fingerprint, value, reason, by=by):
         sys.exit(f"report-verdict: {args.fingerprint[:12]}… could not be written. "
                  "Nothing was recorded")
 
@@ -2145,6 +2185,34 @@ def cmd_read(args):
         ledger.record_unit_read(conn, int(uid), rel, first, last)
 
 
+def _transition(ok, analysis_id, state, why):
+    if not ok:
+        sys.exit(f"analysis {analysis_id} {why}")
+    print(json.dumps({"state": state}))
+
+
+def cmd_interrupt(args):
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    _transition(ledger.interrupt_analysis(conn, args.analysis), args.analysis,
+                ledger.INTERRUPTED, "is not running: only a running analysis is interrupted")
+
+
+def cmd_resume(args):
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    _transition(ledger.resume_analysis(conn, args.analysis, automatic=args.automatic),
+                args.analysis, "running", "is not interrupted: there is nothing to resume")
+
+
+def cmd_abandon(args):
+    _refuse_if_secret("abandon: --note", args.note)
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    _transition(ledger.close_interrupted(conn, args.analysis, args.note), args.analysis,
+                "failed", "is not interrupted: only an interrupted analysis is abandoned")
+
+
 def cmd_fingerprint(args):
     """Print the 64-hex identity of a finding -- computed, never typed.
 
@@ -2487,6 +2555,9 @@ def cmd_report_finding(args):
     # minted -- which is exactly what `diff.AGENT` is proven by: the analysis
     # closing `done`.
     payload["producer"] = diff.AGENT
+    # The unit whose session wrote this row -- from the run's own environment,
+    # never the payload, on the rule `producer` follows.
+    payload["unit"] = _session_unit()
     try:
         ledger.record_finding(conn, args.analysis, payload)
     # OverflowError is here for the same reason ValueError is: it comes out of
@@ -2754,9 +2825,9 @@ def cmd_finish(args):
     # refuses its own four free-text fields: `--note` is written verbatim
     # into `coverage_note`, which reaches all four report formats
     # (`report.py`'s `_coverage`) and the analysis page's own notice, and it
-    # is agent-writable -- `finish` is deliberately NOT in AGENT_FORBIDDEN.
-    # It was the one such channel with no gate on it while its near-twin
-    # `partial_note` had one. See `_refuse_if_secret`.
+    # is free text an operator or the engine types. It was the one such
+    # channel with no gate on it while its near-twin `partial_note` had one.
+    # See `_refuse_if_secret`.
     _refuse_if_secret("finish: --note", args.note)
     conn = _conn(args)
     row = _analysis(conn, args.analysis)
@@ -3391,16 +3462,25 @@ def cmd_migrate_rules(args):
     Pre-flighting those two would mean doing the walk to find out, which is the
     thing that cannot be undone.
 
-    Refused while ANY analysis in the ledger is `running`, for `cmd_decide`'s
-    reason applied to a bigger blast radius. `decide` writes one row keyed to
-    an identity; this REWRITES identities, and mid-analysis that lands under an
-    agent still holding the old ones: findings it already reported get new
-    fingerprints, its re-report of one then misses the `(analysis_id,
-    fingerprint)` upsert key and INSERTs a second row instead, and one hole
-    becomes two contradictory checklist entries -- which is the exact outcome
-    that UNIQUE constraint exists to prevent. Not scoped to a project, unlike
+    Refused while ANY analysis in the ledger is `running` OR `interrupted`, for
+    `cmd_decide`'s reason applied to a bigger blast radius. `decide` writes one
+    row keyed to an identity; this REWRITES identities, and mid-analysis that
+    lands under an agent still holding the old ones: findings it already
+    reported get new fingerprints, its re-report of one then misses the
+    `(analysis_id, fingerprint)` upsert key and INSERTs a second row instead,
+    and one hole becomes two contradictory checklist entries -- which is the
+    exact outcome that UNIQUE constraint exists to prevent. `interrupted` is
+    included for the same reason and a longer fuse: its triage units carry
+    fingerprints of their own in their payloads (security/units.py), minted
+    under the names this verb is about to change, and a rename in the pause
+    orphans them -- a unit resumed afterwards looks for a name the ledger no
+    longer has, and the row it was to carry never reaches it. `_running`'s
+    refusal (`report-finding`, `report-verdict`, ...) does not reach this far
+    because it protects one analysis at a time from a write inside it; this
+    one protects every identity in the ledger from a rewrite under ANY
+    analysis still in flight, paused or not. Not scoped to a project, unlike
     `decide`'s: this verb takes no project and walks every row in the ledger,
-    so any live analysis anywhere is a live analysis this could pull the ground
+    so any live or paused analysis anywhere is one this could pull the ground
     out from under. A `running` row left by a run that died is not a permanent
     lock: the engine's preflight sweep closes those before it opens the next
     analysis of that project (see `cmd_security_analyze` in `bin/agentloop`).
@@ -3422,16 +3502,22 @@ def cmd_migrate_rules(args):
                      + ", ".join(ledger.RENAMEABLE_CATEGORIES)
                      + " (see ledger.rename_rule). Nothing was migrated.")
     conn = _conn(args)
+    # Both `running` and `interrupted` -- see the docstring's paragraph on why
+    # a pause does not lift this refusal: an interrupted analysis's triage
+    # units still carry fingerprints, minted under the names about to change,
+    # in their own payloads.
     live = conn.execute(
-        "SELECT id, project FROM analysis WHERE state='running' "
-        "ORDER BY id ASC LIMIT 1").fetchone()
+        "SELECT id, project, state FROM analysis WHERE state IN ('running', ?) "
+        "ORDER BY id ASC LIMIT 1", (ledger.INTERRUPTED,)).fetchone()
     if live is not None:
         sys.exit(f"migrate-rules: analysis {live['id']} of '{live['project']}' "
-                 "is still running — this rewrites the fingerprints of findings "
-                 "that analysis has already recorded, while the agent is still "
-                 "holding the old ones. Its next re-report of one would miss "
-                 "the upsert key and file a SECOND row for the same hole. Wait "
-                 "for the run to end; nothing was migrated.")
+                 f"is still {live['state']} — this rewrites the fingerprints of "
+                 "findings that analysis has already recorded, while the agent "
+                 "(if running) or one of its resumed units (if interrupted) is "
+                 "still holding the old ones. Its next re-report of one would "
+                 "miss the upsert key and file a SECOND row for the same hole. "
+                 "Wait for the run to end, or resume and finish it; nothing was "
+                 "migrated.")
     applied, total = [], 0
     for category, old, new in renames:
         try:
@@ -4168,6 +4254,18 @@ def main(argv=None):
     rd = sub.add_parser("read", parents=[dbflag]); rd.set_defaults(fn=cmd_read)
     rd.add_argument("--path", required=True)
     rd.add_argument("--from", type=int, default=1, dest="start")
+
+    # The pipeline's lifecycle, the engine's to drive (all three in AGENT_FORBIDDEN).
+    it = sub.add_parser("interrupt", parents=[dbflag]); it.set_defaults(fn=cmd_interrupt)
+    it.add_argument("--analysis", type=int, required=True)
+
+    rs = sub.add_parser("resume", parents=[dbflag]); rs.set_defaults(fn=cmd_resume)
+    rs.add_argument("--analysis", type=int, required=True)
+    rs.add_argument("--automatic", action="store_true")
+
+    ab = sub.add_parser("abandon", parents=[dbflag]); ab.set_defaults(fn=cmd_abandon)
+    ab.add_argument("--analysis", type=int, required=True)
+    ab.add_argument("--note", required=True)
 
     fn = sub.add_parser("finish", parents=[dbflag]); fn.set_defaults(fn=cmd_finish)
     fn.add_argument("--analysis", type=int, required=True)

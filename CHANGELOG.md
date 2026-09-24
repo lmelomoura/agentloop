@@ -20,6 +20,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **An analysis can be interrupted and resumed.** `interrupt`, `resume` and
+  `abandon` move an analysis into and out of the new `interrupted` state;
+  nothing is written into an interrupted analysis, and opening a new
+  analysis of the same branch abandons an interrupted one, saying so in its
+  note.
+
 - **The security CLI runs units.** `prepare` lists a deep analysis's scope,
   and — with `--plan`, which only the engine's orchestrator passes — writes
   the plan, all of it or none: a plan that fails exits non-zero with the
@@ -253,6 +259,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   own three stand-ins instead — checked block by block, not assumed.
 
 ### Changed
+
+- **An agent session can no longer close, grade, interrupt or resume the
+  analysis it works for.** `finish`, `unit-close`, `orchestrate`,
+  `interrupt`, `resume` and `abandon` are refused under the agent flag; the
+  engine makes them with the flag removed. A verdict from an agent session
+  is accepted only from the verify unit the engine launched for that very
+  finding (`verified_by` names the unit), instead of being counted against
+  subagents after the fact; one written outside any session is recorded as
+  the operator's.
+- **The verification queue lists only the analysis's own rows.** A finding
+  the previous analysis recorded, not yet re-checked, used to sit in the
+  queue where no verifier could ever clear it — `record_verdict` writes only
+  this analysis's rows — and lowered `done` to `capped` for a reason nobody
+  could act on. Its re-check is the triage's job.
 
 - **OpenCode's normalised stream keeps the range a read showed.** The
   `metadata.display` line range is copied onto the result in Claude Code's

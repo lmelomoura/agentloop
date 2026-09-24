@@ -1223,9 +1223,12 @@ def test_the_agent_cannot_open_an_analysis_the_engine_will_never_close(tmp_path)
 
 
 def test_the_work_the_agent_is_there_to_do_still_works_under_the_flag(tmp_path):
-    """The flag is on for the WHOLE run, including `security_close_analysis`,
-    which runs inside run_job after the agent. Refusing more than the three
-    named verbs would break the analysis it is supposed to protect."""
+    """The flag is on for the WHOLE of an agent's session: refusing more than
+    the verbs AGENT_FORBIDDEN names would break the analysis it is supposed to
+    protect. `finish` is one of those verbs since the pipeline -- the engine
+    closes the analysis through `security_engine_py`, with the flag removed --
+    so the close below runs without it; the door's refusal of `finish` to an
+    agent has its own test (test_cli_doors.py)."""
     db = tmp_path / "security.db"
     root = tmp_path / "repo"
     root.mkdir()
@@ -1238,7 +1241,7 @@ def test_the_work_the_agent_is_there_to_do_still_works_under_the_flag(tmp_path):
                           "rule": "r", "severity": "high", "title": "t"}))
     run(db, "findings", "--analysis", str(aid), env=AS_AGENT)
     run(db, "checklist", "--analysis", str(aid), env=AS_AGENT)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", env=AS_AGENT)
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
     assert run(db, "list", "--project", "web")[0]["state"] == "done"
 
 
@@ -2756,8 +2759,7 @@ def test_the_agents_own_findings_are_never_counted_as_untriaged(tmp_path):
     # this test is about) but to the verification one. Leaving it unverified
     # would close `capped` for a reason this test does not name.
     run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "c" * 64,
-        stdin=json.dumps({"verdict": "confirmed", "reason": "read app/db.py end to end"}),
-        env=AS_AGENT)
+        stdin=json.dumps({"verdict": "confirmed", "reason": "read app/db.py end to end"}))
 
     run(db, "finish", "--analysis", str(aid), "--state", "done")
     row = run(db, "list", "--project", "web")[0]
@@ -5869,8 +5871,7 @@ def test_finish_refuses_a_note_that_looks_like_a_live_credential(tmp_path):
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path, project="web", repo="web", branch="main")
     out = fails(db, "finish", "--analysis", str(aid), "--state", "done",
-                "--note", "could not scan with AKIAIOSFODNN7EXAMPLE in the env",
-                env=AS_AGENT)
+                "--note", "could not scan with AKIAIOSFODNN7EXAMPLE in the env")
     assert out.returncode != 0, "the note was accepted"
     assert "live credential" in out.stderr, out.stderr
     assert "AKIAIOSFODNN7EXAMPLE" not in out.stderr, \
@@ -5885,7 +5886,7 @@ def test_a_refused_note_leaves_the_analysis_open_rather_than_half_closed(tmp_pat
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path, project="web", repo="web", branch="main")
     fails(db, "finish", "--analysis", str(aid), "--state", "done",
-          "--note", "leaked AKIAIOSFODNN7EXAMPLE", env=AS_AGENT)
+          "--note", "leaked AKIAIOSFODNN7EXAMPLE")
     rows = run(db, "list", "--project", "web")
     assert rows[0]["state"] == "running", rows[0]
     assert "AKIAIOSFODNN7EXAMPLE" not in (rows[0]["coverage_note"] or "")
@@ -6438,7 +6439,7 @@ def test_verify_queue_lists_the_scope_and_report_verdict_writes_it(tmp_path):
                           "reason": "app/db.py:12 is parameterised; the concatenation is in a comment"}))
     row = _finding_row(db, aid)
     assert row["verdict"] == "rejected"
-    assert row["verified_by"] == "subagent"
+    assert row["verified_by"] == "operator"
     assert run(db, "verify-queue", "--analysis", str(aid)) == []
 
 

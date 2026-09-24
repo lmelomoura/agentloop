@@ -7575,6 +7575,20 @@ JSON
     && ok "the security- prefix is refused for a hand-made job" \
     || bad "the security- prefix is refused for a hand-made job"
 
+  # The engine's own security calls run without the agent's flag. `finish`,
+  # `unit-close` and the lifecycle verbs are refused to an agent session,
+  # and the engine makes them from inside the run_job that exported
+  # AL_SECURITY_AGENT for the agent: without the unset every close of every
+  # analysis would be refused, and every analysis would stay `running`.
+  ( AL_SECURITY_AGENT=1; CC_SECURITY_AGENT=1; export AL_SECURITY_AGENT CC_SECURITY_AGENT
+    PYTHON="$tmp/env-python"
+    printf '#!/bin/bash\nprintf "%%s|%%s\\n" "${AL_SECURITY_AGENT:-}" "${CC_SECURITY_AGENT:-}"\n' > "$PYTHON"
+    chmod +x "$PYTHON"
+    [ "$(security_engine_py finish --analysis 1 --state done)" = "|" ] \
+      && [ "$(security_py finish --analysis 1 --state done)" = "1|1" ] ) \
+    && ok "security_engine_py calls the CLI with the agent flag removed, and only that call" \
+    || bad "security_engine_py passed the agent flag through, or security_py lost it"
+
   # security_close_analysis must ignore every job that is not a derived one,
   # or a normal run ending would try to close an analysis that never existed.
   ( DATA_DIR="$tmp/derived/data"; security_close_analysis "real-job" "error" "0" ) \
@@ -8486,8 +8500,10 @@ JSON
 
   echo "the agent cannot vote on its own findings"
   # The marker the run carries (AL_SECURITY_AGENT) reaching the same door the
-  # operator uses. `finish` must stay allowed: security_close_analysis runs
-  # inside run_job, after the agent, under this very variable.
+  # operator uses. `finish` is refused under it like every other engine verb
+  # (Task 8) -- security_close_analysis still closes the row because it calls
+  # through security_engine_py, which strips the flag for that one call, not
+  # because `finish` itself stays open to the agent.
   local secfp="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   local secrc=0
   ( sec_env; AL_SECURITY_AGENT=1 security_py decide --project "Sec App" \
@@ -8510,7 +8526,7 @@ JSON
     security_py list --project "Sec App" \
       | "$JQ" -r --argjson a "$a" '.[] | select(.id==$a) | .state' ) )"
   [ "$secfin" = "done" ] \
-    && ok "while the engine's own close still works under the same flag, which is why finish is not refused" \
+    && ok "the engine's own close still works under the same flag -- security_engine_py strips it" \
     || bad "close under AL_SECURITY_AGENT -> $secfin"
 
   echo "cmd_project_set() — a settings save files settings_changed only when security is on"

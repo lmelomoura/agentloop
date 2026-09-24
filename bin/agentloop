@@ -1006,6 +1006,13 @@ security_db() { # security_db -> the path to this install's ledger
 
 security_py() { "$PYTHON" "$BIN_DIR/security/cli.py" --db "$(security_db)" "$@"; }
 
+# The ENGINE's own security calls: `finish`, `unit-close` and the pipeline's
+# lifecycle verbs are refused to an agent session (AGENT_FORBIDDEN), and the
+# engine makes them from inside the same run_job that exported
+# AL_SECURITY_AGENT for the agent. The subshell drops the flag for this one
+# call and nothing else.
+security_engine_py() { ( unset AL_SECURITY_AGENT CC_SECURITY_AGENT; security_py "$@" ); }
+
 # The canonical checkout of one repo in a project. A project with no `repos`
 # is the single-repo case, where the repo IS the project cwd.
 #
@@ -1092,7 +1099,7 @@ security_run_analysis() { # security_run_analysis <job-id> <analysis-id> <branch
     run_job "$jid" --force || rc=$?
   # `--if-running` makes this a no-op for the ordinary case where the run really
   # happened and has already closed the row with its own verdict.
-  security_py finish --analysis "$aid" --state failed --if-running \
+  security_engine_py finish --analysis "$aid" --state failed --if-running \
     --note "This analysis never ran: the engine did not start the run — see $TICK_LOG." \
     >/dev/null 2>&1 || log_tick "$jid: could not close analysis $aid"
   return "$rc"
@@ -1136,7 +1143,7 @@ cmd_security_analyze() { # [--detach] <project> <repo> <branch> [profile]
     local dead
     while IFS= read -r dead; do
       [ -n "$dead" ] || continue
-      security_py finish --analysis "$dead" --state failed --if-running \
+      security_engine_py finish --analysis "$dead" --state failed --if-running \
         --note "engine: the run behind this analysis is gone" >/dev/null 2>&1 \
         && log_tick "$jid: closed analysis $dead — it said running, and no run of $jid is alive" \
         || log_tick "$jid: could not close stale analysis $dead"
@@ -1354,7 +1361,7 @@ security_close_analysis() { # <job-id> <status> <cost> <wdreason> [stream]
   # engine has nothing to say about subagents", which is a different fact from
   # "none were launched" and `finish` treats it as one.
   local tasks; tasks="$(security_task_count "${5:-}")"
-  security_py finish --analysis "$aid" --state "$state" --spend "${3:-0}" \
+  security_engine_py finish --analysis "$aid" --state "$state" --spend "${3:-0}" \
     --guides-read "$(security_guides_read "${5:-}")" \
     ${tasks:+--tasks-launched "$tasks"} \
     >/dev/null 2>&1 || log_tick "$1: could not close analysis $aid"
