@@ -33,7 +33,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and `platform check <platform> <id>` for that account's own directory.
   Removing an account is refused while jobs.json or projects.json cannot be
   parsed, rather than assuming nobody uses it; an account whose skills
-  could not be linked says so on its own add/edit line. The dashboard's
+  could not be linked says so on its own add/edit line; the login a refusal
+  or a check suggests quotes a directory a shell would split or cut short
+  (`CLAUDE_CONFIG_DIR='/Users/me/My Accounts/.claude' claude auth login`),
+  so it can be pasted as it is. The dashboard's
   server relays the account actions and carries the account on every run —
   finished, from the journal, and live, from the run's slot — the run
   dialog names the account, and its reopen line carries the variable.
@@ -71,10 +74,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   account, and saving a project now runs the same conversion on that
   project's own field — never another project's, and never on a refused
   save — so the field can no longer be lost between updating the code and
-  running install: dropping only what neither can place (a platform that
-  is not Anthropic, or a directory that is gone), and leaving the field
-  alone while `platforms.json` cannot be read, rather than losing the only
-  record of the account.
+  running install: the project keeps the account the conversion gives it,
+  whether it is saved from the dashboard or with `project-set`; a level
+  the save itself puts on an account registers none; what neither can
+  place (a platform that is not Anthropic, or a directory that is gone) is
+  dropped; and the field is left alone while `platforms.json` cannot be
+  read, rather than losing the only record of the account.
 
 - **The dashboard shows the verdict**: a chip beside the confidence one on
   every row and in the drill-down, the verifier's reason inside the candidate
@@ -211,7 +216,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `install` turns it into an account; the warning in `status` and `install`
   now names only what it could not convert, and why.
 
+- **`platform enable` says how to lift its refusal.** A refusal over the
+  session now adds what enable checks — the Default account, the one the
+  model probes (Claude) or the catalog refreshes (Codex) run on, so an
+  account registered in Settings being signed in does not count — and the
+  ways out: sign it in, or, on Claude, pin the install to another account
+  (`AGENTLOOP_CLAUDE_CONFIG_DIR=<its directory> agentloop install`). A
+  refusal over anything else — no binary, a CLI that hung — reads as
+  before.
+
 ### Fixed
+
+- **A pin that names the CLI's own `~/.claude` no longer signs the install
+  out.** A pin of `$HOME/.claude`, trailing slash or not, was exported as
+  written, and Claude Code names the Keychain entry it reads after the
+  directory whenever the variable is set at all (measured, 2.1.280): every
+  run, check, model probe and hook on that install answered *not signed
+  in*. The pin is now exported the way every account directory is — `~`
+  expanded, no trailing slash, and no variable at all when it is the CLI's
+  own `~/.claude` — both into a run and into what the engine starts outside
+  one (the model probes, the `on-run-end` hook); a pin that is not an
+  absolute directory counts as no pin.
+
+- **`agentloop help` prints its own text only.** Its heredoc expands, and
+  three words quoted in backticks ran as commands: `repos` and `sbom`
+  printed *command not found*, and `security` ran the macOS Keychain tool,
+  whose usage landed in the middle of ours. The platform verbs are listed
+  one shape per line, each with the arguments it takes.
 
 - **The Jobs search box no longer fills itself with the operator's name.**
   Since the profile moved from its dialog into Settings › Profile, its three

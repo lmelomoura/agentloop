@@ -781,6 +781,17 @@ JSON
   pc_al_nocodex() { AGENTLOOP_CONFIG="$pc/config" AGENTLOOP_DATA="$pc/data" AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" \
             AGENTLOOP_CODEX_BIN=/nonexistent/codex AGENTLOOP_CLAUDE_CONFIG_DIR="" CODEX_HOME="$pc/codex-home" \
             FAKE_CODEX_MODELS_JSON="$pc/catalog.json" "$BIN_DIR/agentloop" "$@"; }
+  # The help is a heredoc that expands: a backticked word in it ran as a
+  # command -- `security` is the macOS Keychain tool, whose own usage landed
+  # in ours -- and a shell error went to stderr with the text it stood for gone.
+  out="$(pc_al help 2>&1 >/dev/null)"
+  [ -z "$out" ] && ok "agentloop help prints no shell error of its own" || bad "help stderr: $out"
+  out="$(pc_al help 2>/dev/null)"
+  case "$out" in
+    *"agentloop platform check <platform> [id]"*"agentloop platform account-add <platform> <name> <dir>"*"agentloop platform account-edit <platform> <id> <name> <dir>"*"agentloop platform account-remove <platform> <id>"*)
+      ok "and names each platform verb with the arguments it takes" ;;
+    *) bad "help: $out" ;;
+  esac
   pc_al platform check openai | "$JQ" -e '.ready == true' >/dev/null 2>&1; want "platform check prints platform_check's JSON" 0 $?
   pc_al platform check martian >/dev/null 2>&1; want "platform check refuses an unlisted platform" 1 $?
   # the seed happened on that first read: both platforms in use are enabled with their models
@@ -794,11 +805,16 @@ JSON
   [ "$rc" -ne 0 ] && "$JQ" -e '.platforms.openai.enabled == false' "$pc/config/platforms.json" >/dev/null 2>&1 \
     && ok "platform enable refuses while the check fails, and writes nothing" || bad "enable while signed out: rc=$rc $out"
   # pc_al runs the engine with CODEX_HOME pointed at a scratch home: the
-  # Default IS that home, and the sentence names it.
-  case "$out" in *"cannot enable openai: codex is not signed in in $pc/codex-home (run: CODEX_HOME=$pc/codex-home codex login)"*) ok "and says why, naming the home it checked" ;; *) bad "enable refusal: $out" ;; esac
+  # Default IS that home, and the sentence names it -- then says what enable
+  # checks, and how the refusal is lifted.
+  [ "$out" = "cannot enable openai: codex is not signed in in $pc/codex-home (run: CODEX_HOME=$pc/codex-home codex login) — enable checks the Default account, the one the catalog refreshes run on: sign it in" ] \
+    && ok "and says why, naming the home it checked, and how to lift it" || bad "enable refusal: $out"
   pc_al platform enable openai >/dev/null 2>&1; want "platform enable writes once the check passes" 0 $?
   "$JQ" -e '.platforms.openai.enabled == true' "$pc/config/platforms.json" >/dev/null 2>&1 && ok "and the file says so" || bad "enable not written"
-  pc_al platform enable opencode >/dev/null 2>&1; want "platform enable refuses a platform whose binary is missing" 1 $?
+  out="$(pc_al platform enable opencode 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$out" = "cannot enable opencode: opencode not found at /nonexistent/opencode — set the path in Settings (or AGENTLOOP_OPENCODE_BIN); install: brew install opencode (or: npm i -g opencode-ai)" ] \
+    && ok "platform enable refuses a platform whose binary is missing, with that reason alone: no session was ever asked about" \
+    || bad "enable without a binary: rc=$rc $out"
   pc_al platform set-bin openai /nonexistent/codex >/dev/null 2>&1; want "set-bin refuses a path that is not executable" 1 $?
   pc_al platform set-bin openai "$BASE_DIR/test/fake-codex" >/dev/null 2>&1; want "set-bin accepts an executable" 0 $?
   [ "$("$JQ" -r '.platforms.openai.bin' "$pc/config/platforms.json")" = "$BASE_DIR/test/fake-codex" ] && ok "and writes it" || bad "bin not written"
@@ -1111,6 +1127,38 @@ JSON
   [ "$(readlink "$ac/fakehome/.codex-a/skills/security-analysis")" = "$SKILLS_DIR/security-analysis" ] \
     && ok "and the skills are linked into its home too" || bad "codex account skills: $(ls "$ac/fakehome/.codex-a" 2>&1)"
   ac_refused "a Codex home that does not exist says how to create it" "$ac/fakehome/.codex-none does not exist — create it and sign in: mkdir -p $ac/fakehome/.codex-none && CODEX_HOME=$ac/fakehome/.codex-none codex login" account-add openai "N" "~/.codex-none"
+  # A directory a shell would split at a space, or end at a quote, is quoted
+  # in the command a refusal or a check suggests -- only there, and only
+  # then: the plain directories above read exactly as typed. Pasted, the
+  # command has to sign in the very directory the account has.
+  ac_refused "a directory with a space is quoted in the login it suggests, and only there" \
+    "$ac/fakehome/My Claude does not exist — create it by signing in: CLAUDE_CONFIG_DIR='$ac/fakehome/My Claude' claude auth login" account-add anthropic "Spaced" "~/My Claude"
+  ac_refused "and in the Codex one, both times it is named" \
+    "$ac/fakehome/My Codex does not exist — create it and sign in: mkdir -p '$ac/fakehome/My Codex' && CODEX_HOME='$ac/fakehome/My Codex' codex login" account-add openai "SpacedC" "~/My Codex"
+  mkdir -p "$ac/fakehome/Client A's"
+  out="$(ac_al platform account-add anthropic "Quoted" "~/Client A's" 2>&1)"; rc=$?
+  : > "$ac/fakehome/Client A's/.fake-logged-out"
+  _aj="$(ac_al platform check anthropic quoted 2>/dev/null | "$JQ" -r .reason)"
+  [ "$rc" -eq 0 ] && [ "$_aj" = "claude is not signed in in $ac/fakehome/Client A's (run: CLAUDE_CONFIG_DIR='$ac/fakehome/Client A'\''s' claude auth login)" ] \
+    && ok "a registered account's check quotes its directory in the login, a quote inside it included" || bad "quoted check: rc=$rc $out / $_aj"
+  got="$( claude() { printf '%s' "$CLAUDE_CONFIG_DIR"; }; eval "$(printf '%s' "$_aj" | sed -n 's/.*(run: \(.*\))$/\1/p')" )"
+  [ "$got" = "$ac/fakehome/Client A's" ] \
+    && ok "and that login, pasted into a shell, names exactly the account's directory" || bad "pasted login -> '$got'"
+  ac_al platform account-remove anthropic quoted >/dev/null 2>&1
+  # platform enable asks about the Default alone -- the account the model
+  # probes run on -- so its refusal says what it checked and both ways out.
+  out="$(FAKE_CLAUDE_LOGGED_OUT=1 ac_al platform enable anthropic 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$out" = "cannot enable anthropic: claude is not signed in (run: claude auth login) — enable checks the Default account, the one the model probes run on: sign it in, or pin the install to another Claude account (AGENTLOOP_CLAUDE_CONFIG_DIR=<its directory> agentloop install)" ] \
+    && ok "platform enable refuses a Default with no session, and names both ways out: sign it in, or pin the install to another account" \
+    || bad "enable anthropic signed out: rc=$rc $out"
+  mkdir -p "$ac/fakehome/.claude-pin"; : > "$ac/fakehome/.claude-pin/.fake-logged-out"
+  out="$(HOME="$ac/fakehome" AGENTLOOP_CONFIG="$ac/config" AGENTLOOP_DATA="$ac/data" \
+         AGENTLOOP_CLAUDE_BIN="$BASE_DIR/test/fake-claude" AGENTLOOP_CODEX_BIN="$BASE_DIR/test/fake-codex" \
+         AGENTLOOP_CLAUDE_CONFIG_DIR="~/.claude-pin" CODEX_HOME="$ac/codex-home" AGENTLOOP_OPENCODE_BIN=/nonexistent/opencode \
+         "$BIN_DIR/agentloop" platform enable anthropic 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$out" = "cannot enable anthropic: claude is not signed in in $ac/fakehome/.claude-pin (run: CLAUDE_CONFIG_DIR=$ac/fakehome/.claude-pin claude auth login) — enable checks the Default account, the one the model probes run on: sign it in, or pin the install to another Claude account (AGENTLOOP_CLAUDE_CONFIG_DIR=<its directory> agentloop install)" ] \
+    && ok "and on a pinned install the Default it names is the pin" \
+    || bad "enable anthropic, pinned and signed out: rc=$rc $out"
   # A pin that normalizes to the CLI's own directory must still leave the
   # variable UNSET (account_env_value), not set it to that same path: the
   # fake only honours the marker when CLAUDE_CONFIG_DIR is actually set, so
@@ -1212,6 +1260,52 @@ JSON
       = '{"a":"old-acct2","c":false,"d":"x"}' ] \
     && ok "and the project ends with the account, no claude_config_dir, and the rest of the save still applied" \
     || bad "Old8 after project-set: $("$JQ" -c '.projects[] | select(.name=="Old8")' "$ccd/cfg/projects.json")"
+  # The dashboard never sends Old8's shape. saveProject sends EVERY level's
+  # account, "" for a level whose editor showed none -- and that is exactly
+  # the level a leftover claude_config_dir has not been turned into an
+  # account yet. The save's own conversion fills the level first; the ""
+  # merged over it afterwards used to leave the project on the Default, the
+  # new account registered with nothing pointing at it, and the printed "is
+  # now the account" false. Old13 is the other half: a level whose save picks
+  # an account of its own never needed its directory registered at all.
+  mkdir -p "$ccd/old-acct4" "$ccd/old-acct5" "$ccd/old-acct6"
+  "$JQ" --arg c "$ccd" --arg d4 "$ccd/old-acct4" --arg d5 "$ccd/old-acct5" --arg d6 "$ccd/old-acct6" \
+      '.projects += [{"name":"Old11","cwd":$c,"claude_config_dir":$d4},
+                     {"name":"Old12","cwd":$c,"security":{"enabled":false,"claude_config_dir":$d5}},
+                     {"name":"Old13","cwd":$c,"claude_config_dir":$d6}]' \
+      "$ccd/cfg/projects.json" > "$ccd/cfg/projects.json.next" && mv "$ccd/cfg/projects.json.next" "$ccd/cfg/projects.json"
+  ccd_page_save() { # ccd_page_save <project> <account> <security.account> -> the partial saveProject (bin/dashboard.html) sends
+    "$JQ" -nc --arg n "$1" --arg c "$ccd" --arg a "$2" --arg s "$3" '
+      {name:$n, cwd:$c, platform:"anthropic", account:$a, worktree:{enabled:"auto"}, repos:[], base:"",
+       security:{enabled:false, platform:"", account:$s, model:"", effort:"", permission_mode:"bypassPermissions",
+                 default_profile:"standard", max_budget_usd:"", daily_budget_usd:"", min_severity:"low", ignore_paths:""}}'
+  }
+  out="$( ( ccd_env; ccd_page_save Old11 "" "" | cmd_project_set ) 2>&1 )"; rc=$?
+  case "$out" in
+    *"claude_config_dir on Old11 (project) is now the account 'old-acct4'"*)
+      [ "$rc" -eq 0 ] && [ "$("$JQ" -c '.projects[] | select(.name=="Old11") | {a: .account, c: has("claude_config_dir")}' "$ccd/cfg/projects.json")" = '{"a":"old-acct4","c":false}' ] \
+        && ok "a save from the page keeps the account its own conversion gave the project, over the \"\" the page sends for it" \
+        || bad "Old11 after a page save: rc=$rc out=$out now=$("$JQ" -c '.projects[] | select(.name=="Old11")' "$ccd/cfg/projects.json")" ;;
+    *) bad "Old11 page save: rc=$rc $out" ;;
+  esac
+  out="$( ( ccd_env; ccd_page_save Old12 "" "" | cmd_project_set ) 2>&1 )"; rc=$?
+  case "$out" in
+    *"claude_config_dir on Old12 (security) is now the account 'old-acct5'"*)
+      [ "$rc" -eq 0 ] && [ "$("$JQ" -c '.projects[] | select(.name=="Old12") | {a: .account, s: .security.account, c: (.security | has("claude_config_dir")), m: .security.min_severity}' "$ccd/cfg/projects.json")" = '{"a":"","s":"old-acct5","c":false,"m":"low"}' ] \
+        && ok "and so does its security block, over the \"\" sent for security.account -- the rest of the block still saved" \
+        || bad "Old12 after a page save: rc=$rc out=$out now=$("$JQ" -c '.projects[] | select(.name=="Old12")' "$ccd/cfg/projects.json")" ;;
+    *) bad "Old12 page save: rc=$rc $out" ;;
+  esac
+  out="$( ( ccd_env; ccd_page_save Old13 "old-acct" "" | cmd_project_set ) 2>&1 )"; rc=$?
+  case "$out" in
+    *registered*|*"is now the account"*) bad "Old13: a level whose save picks its own account still had its directory registered: $out" ;;
+    *"claude_config_dir on Old13 (project) dropped — it already runs on the account 'old-acct'"*)
+      [ "$rc" -eq 0 ] && [ "$("$JQ" -c '.projects[] | select(.name=="Old13") | {a: .account, c: has("claude_config_dir")}' "$ccd/cfg/projects.json")" = '{"a":"old-acct","c":false}' ] \
+        && [ "$("$JQ" '[.platforms.anthropic.accounts[] | select(.name == "old-acct6")] | length' "$ccd/cfg/platforms.json")" = "0" ] \
+        && ok "a save that picks an account of its own wins, and its leftover directory is dropped, never registered as an orphan" \
+        || bad "Old13 after a page save: rc=$rc out=$out now=$("$JQ" -c '.projects[] | select(.name=="Old13")' "$ccd/cfg/projects.json") accounts=$("$JQ" -c '.platforms.anthropic.accounts' "$ccd/cfg/platforms.json")" ;;
+    *) bad "Old13 page save: rc=$rc $out" ;;
+  esac
 
   # Fix round 3: accounts_migrate_legacy now runs only after every refusal
   # gate has cleared, only for the project actually being saved, and only
@@ -5887,10 +5981,13 @@ NASTY
   # Sourcing it with `--help` runs every top-level assignment and then returns.
   # An empty value and an unset one are the same to `${VAR:-}`, so both can be
   # passed unconditionally — and stay quoted, which a conditional would not.
-  al_account_probe() { # <ambient CLAUDE_CONFIG_DIR> <AGENTLOOP_CLAUDE_CONFIG_DIR>
-    env CLAUDE_CONFIG_DIR="$1" AGENTLOOP_CLAUDE_CONFIG_DIR="$2" \
+  # What is read back is what a CHILD of the engine gets (printenv is one),
+  # not the engine's own shell variable: the model probes and the hooks are
+  # children, and only an exported value reaches them.
+  al_account_probe() { # <ambient CLAUDE_CONFIG_DIR> <AGENTLOOP_CLAUDE_CONFIG_DIR> [HOME]
+    env CLAUDE_CONFIG_DIR="$1" AGENTLOOP_CLAUDE_CONFIG_DIR="$2" HOME="${3:-$HOME}" \
         AGENTLOOP_CONFIG="$tmp/acct/config" AGENTLOOP_DATA="$tmp/acct/data" \
-        bash -c '. "$1" --help >/dev/null 2>&1; printf "%s" "${CLAUDE_CONFIG_DIR-<unset>}"' _ "$SELF"
+        bash -c '. "$1" --help >/dev/null 2>&1; printenv CLAUDE_CONFIG_DIR || printf "<unset>"' _ "$SELF"
   }
   got="$(al_account_probe /tmp/al-someones-session "")"
   [ "$got" = "<unset>" ] \
@@ -5908,6 +6005,32 @@ NASTY
   [ "$got" = "<unset>" ] \
     && ok "no setting anywhere leaves the CLI's own default" \
     || bad "no setting -> '$got'"
+  # The pin reaches a child through account_env_value's rule, the one a run's
+  # own environment follows: exported raw, a pin naming the CLI's own
+  # ~/.claude -- a trailing slash, or the tilde -- made a model probe or a
+  # hook look for another Keychain entry (no session), while check, enable
+  # and every run called the same account signed in.
+  mkdir -p "$tmp/acct/fakehome"
+  got="$(al_account_probe "" "$tmp/acct/fakehome/.claude/" "$tmp/acct/fakehome")"
+  [ "$got" = "<unset>" ] \
+    && ok "a pin naming the CLI's own directory, trailing slash and all, reaches a child as no variable at all" \
+    || bad "pin \$HOME/.claude/ -> a child sees '$got'"
+  got="$(al_account_probe "" "~/.claude" "$tmp/acct/fakehome")"
+  [ "$got" = "<unset>" ] \
+    && ok "and so does the same directory written ~/.claude" \
+    || bad "pin ~/.claude -> a child sees '$got'"
+  got="$(al_account_probe "" "$tmp/acct/fakehome/.claude-x/" "$tmp/acct/fakehome")"
+  [ "$got" = "$tmp/acct/fakehome/.claude-x" ] \
+    && ok "any other pin reaches a child normalized: no trailing slash" \
+    || bad "pin \$HOME/.claude-x/ -> a child sees '$got'"
+  got="$(al_account_probe "" "~/.claude-x" "$tmp/acct/fakehome")"
+  [ "$got" = "$tmp/acct/fakehome/.claude-x" ] \
+    && ok "and with its ~ expanded" \
+    || bad "pin ~/.claude-x -> a child sees '$got'"
+  got="$(al_account_probe "" "relative/pin" "$tmp/acct/fakehome")"
+  [ "$got" = "<unset>" ] \
+    && ok "a pin that is not an absolute directory is no pin, as a run already reads it" \
+    || bad "pin relative/pin -> a child sees '$got'"
 
   # ...and the half nobody tested: does the account the INSTALLER pinned ever
   # reach a scheduled run? launchd hands the tick exactly what the plist's

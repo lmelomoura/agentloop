@@ -95,8 +95,8 @@ legacy_config_dir_warning() { # one line per project or security block still car
 # after the directory -- and sets it on the level that carried it. A level
 # that does not run on Anthropic, or a directory that is gone, keeps the
 # field, said here and warned about by status.
-accounts_migrate_legacy() { # accounts_migrate_legacy [project] -> one line per level converted or left; a project name limits it to that project alone
-  local only="${1:-}"
+accounts_migrate_legacy() { # accounts_migrate_legacy [project [project-account security-account]] -> one line per level converted or left; a project name limits it to that project alone, and the two accounts are what a save of it is about to set on each level ("" for none)
+  local only="${1:-}" set_p="${2:-}" set_s="${3:-}"
   [ -f "$PROJECTS_FILE" ] || return 0
   local rows name level dir plat nd aid nm existing
   rows="$("$JQ" -r --arg only "$only" '.projects[]? | select(type == "object") | .name as $n
@@ -111,8 +111,10 @@ accounts_migrate_legacy() { # accounts_migrate_legacy [project] -> one line per 
     # needed this directory turned into one -- registering it anyway would
     # leave an orphan account nobody points at, and claiming it "is now" that
     # account would be false: the level still runs on the one it already had.
-    if [ "$level" = "project" ]; then existing="$(project_get "$name" '.account' '')"
-    else existing="$(security_get "$name" '.account' '')"
+    # The same for a level the save converting it is about to set: the
+    # account that save sends is the one the level ends on.
+    if [ "$level" = "project" ]; then existing="$set_p"; [ -n "$existing" ] || existing="$(project_get "$name" '.account' '')"
+    else existing="$set_s"; [ -n "$existing" ] || existing="$(security_get "$name" '.account' '')"
     fi
     if [ -n "$existing" ]; then
       if [ "$level" = "project" ]; then
@@ -248,13 +250,13 @@ OPENCODE_DEADLINE="${AGENTLOOP_OPENCODE_DEADLINE:-30}"
 # A non-numeric OPENCODE_DEADLINE, or 0, must fall back to the default instead
 # of reaching python as a bad float() or a deadline that always fires.
 case "$OPENCODE_DEADLINE" in ''|*[!0-9]*|0) OPENCODE_DEADLINE=30 ;; esac
-# Which Claude account every run signs in as. Claude Code keeps credentials,
-# settings, plugins, MCP servers and past sessions per config directory — one
-# signed-in account each — so this variable is the only thing that chooses
-# between two accounts on the same Mac. Set here it is the default for
-# everything, model probes included -- a project or a security block has no
-# pin of its own any more; the Anthropic card in Settings shows whom it is
-# signed in as. Empty leaves the CLI's own default (~/.claude), which is
+# The install's pin: the Claude account the Default runs on. Claude Code
+# keeps credentials, settings, plugins, MCP servers and past sessions per
+# config directory — one signed-in account each — and a run signs in with
+# its OWN account's directory (run_env; the Default's is this pin, else the
+# CLI's own ~/.claude). What this process exports is what everything else it
+# starts inherits: the model probes, which always run on the Default, and the
+# on-run-end hook. Empty leaves the CLI's own default (~/.claude), which is
 # what this tool used before the setting existed.
 #
 # Taken ONLY from the explicit variable — an ambient CLAUDE_CONFIG_DIR is
@@ -265,8 +267,12 @@ case "$OPENCODE_DEADLINE" in ''|*[!0-9]*|0) OPENCODE_DEADLINE=30 ;; esac
 # terminal — different billing, different plugins, different MCP servers — with
 # nothing in the run record saying which. Unsetting instead is the safe answer:
 # it lands on the CLI default, which is where a run with no setting belongs.
-CLAUDE_CONFIG_DIR="${AGENTLOOP_CLAUDE_CONFIG_DIR:-}"
-if [ -n "$CLAUDE_CONFIG_DIR" ]; then export CLAUDE_CONFIG_DIR; else unset CLAUDE_CONFIG_DIR; fi
+#
+# Dropped here, at once. The pin itself is exported just before the dispatch
+# at the end of this file, through account_env_value -- the rule a run's own
+# environment follows, and defined further down: normalized, and no variable
+# at all when it names the CLI's own ~/.claude.
+unset CLAUDE_CONFIG_DIR
 PYTHON="${AGENTLOOP_PYTHON:-$(command -v python3 2>/dev/null || echo /usr/bin/python3)}"
 # /usr/bin/jq is only guaranteed on macOS 15 and later; before that jq comes
 # from Homebrew, at a path that differs between Apple Silicon and Intel. The
@@ -1873,6 +1879,30 @@ account_platform() { case "${1:-}" in anthropic|openai) return 0 ;; *) return 1 
 account_var() { case "${1:-}" in anthropic) printf 'CLAUDE_CONFIG_DIR' ;; openai) printf 'CODEX_HOME' ;; esac; }
 account_cli_default() { case "${1:-}" in anthropic) printf '%s/.claude\n' "$HOME" ;; openai) printf '%s/.codex\n' "$HOME" ;; esac; }
 
+# A directory inside a command the operator is told to run (the login a
+# refusal or a check suggests) has to survive being pasted into a shell. Left
+# bare only when every character is one a shell reads literally -- the set
+# the dashboard's reopen line leaves bare too (reopenCommand) -- so a plain
+# path reads exactly as typed; anything else goes in single quotes, a quote
+# inside written as the usual close-escape-reopen. The set is spelled out
+# rather than written as ranges: a range in a bracket expression follows the
+# locale's collation, and this has to mean ASCII whatever the locale is.
+shell_word() { # shell_word <text> -> the text, quoted for a POSIX shell only when it needs to be
+  local s="${1:-}" sq="'" out="" rest
+  case "$s" in
+    ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./~@+-]*) ;;
+    *) printf '%s' "$s"; return 0 ;;
+  esac
+  rest="$s"
+  while :; do
+    case "$rest" in
+      *"$sq"*) out="$out${rest%%"$sq"*}$sq\\$sq$sq"; rest="${rest#*"$sq"}" ;;
+      *) out="$out$rest"; break ;;
+    esac
+  done
+  printf "'%s'" "$out"
+}
+
 account_trim_dir() { # account_trim_dir <text> -> the text without trailing slashes; a lone "/" is kept as is
   local d="${1:-}"
   while [ "${#d}" -gt 1 ] && [ "${d%/}" != "$d" ]; do d="${d%/}"; done
@@ -1976,10 +2006,12 @@ account_refusal() { # account_refusal <platform> <own-id> <name> <dir> -> one se
     printf "the directory must be absolute or start with ~/ (got '%s')" "$dir"; return 0
   fi
   if [ ! -d "$nd" ]; then
+    # The directory as prose first, then inside the command to paste, where
+    # shell_word quotes it when a shell would otherwise split or end it.
     if [ "$p" = "anthropic" ]; then
-      printf '%s does not exist — create it by signing in: CLAUDE_CONFIG_DIR=%s claude auth login' "$nd" "$nd"
+      printf '%s does not exist — create it by signing in: CLAUDE_CONFIG_DIR=%s claude auth login' "$nd" "$(shell_word "$nd")"
     else
-      printf '%s does not exist — create it and sign in: mkdir -p %s && CODEX_HOME=%s codex login' "$nd" "$nd" "$nd"
+      printf '%s does not exist — create it and sign in: mkdir -p %s && CODEX_HOME=%s codex login' "$nd" "$(shell_word "$nd")" "$(shell_word "$nd")"
     fi
     return 0
   fi
@@ -2164,8 +2196,9 @@ platform_check() { # platform_check <platform> [account-id [account-dir]] -> one
         local out rc
         if [ "$aid" != "default" ] && [ -n "$adir" ] && [ ! -d "$adir" ]; then
           # A registered account whose directory is gone has no session; the
-          # login creates the directory again.
-          reason="claude is not signed in in $adir (run: CLAUDE_CONFIG_DIR=$adir claude auth login)"
+          # login creates the directory again. Every login suggested here
+          # carries the directory through shell_word, so it survives a paste.
+          reason="claude is not signed in in $adir (run: CLAUDE_CONFIG_DIR=$(shell_word "$adir") claude auth login)"
         else
           # The variable exactly as a run gets it: set to the account's own
           # directory, or GONE for the CLI's -- never pointed at ~/.claude,
@@ -2179,7 +2212,7 @@ platform_check() { # platform_check <platform> [account-id [account-dir]] -> one
           else
             case "$out" in
               *loggedIn*)
-                if [ -n "$adir" ]; then reason="claude is not signed in in $adir (run: CLAUDE_CONFIG_DIR=$adir claude auth login)"
+                if [ -n "$adir" ]; then reason="claude is not signed in in $adir (run: CLAUDE_CONFIG_DIR=$(shell_word "$adir") claude auth login)"
                 else reason="claude is not signed in (run: claude auth login)"; fi ;;
               *) # no `auth status` on this CLI (pre-2.1): the binary counts as ready, as it always did
                  ready=true; acct="unknown — claude auth status needs Claude Code 2.1+" ;;
@@ -2190,12 +2223,12 @@ platform_check() { # platform_check <platform> [account-id [account-dir]] -> one
         local line
         if [ "$aid" != "default" ] && [ -n "$adir" ] && [ ! -d "$adir" ]; then
           # The CLI refuses a CODEX_HOME that does not exist (measured, 0.153.4).
-          reason="codex is not signed in in $adir (run: mkdir -p $adir && CODEX_HOME=$adir codex login)"
+          reason="codex is not signed in in $adir (run: mkdir -p $(shell_word "$adir") && CODEX_HOME=$(shell_word "$adir") codex login)"
         elif [ -n "$adir" ] && line="$(CODEX_HOME="$adir" "$bin" login status 2>&1)"; then
           ready=true; acct="$(printf '%s\n' "$line" | head -1)"
         elif [ -z "$adir" ] && line="$(env -u CODEX_HOME "$bin" login status 2>&1)"; then
           ready=true; acct="$(printf '%s\n' "$line" | head -1)"
-        elif [ -n "$adir" ]; then reason="codex is not signed in in $adir (run: CODEX_HOME=$adir codex login)"
+        elif [ -n "$adir" ]; then reason="codex is not signed in in $adir (run: CODEX_HOME=$(shell_word "$adir") codex login)"
         else reason="codex is not signed in (run: codex login)"; fi ;;
       opencode)
         # A CLI of providers, not of one account: ready when it lists a model
@@ -2359,8 +2392,25 @@ cmd_platform() { # agentloop platform <check|enable|disable|set-bin|models|set-m
   case "$verb" in
     check) platform_check "$p" ${3:+"$3"} ;;
     enable)
+      # The Default's session, and only its: the model probes and the catalog
+      # refreshes run on it, so an account registered in Settings being
+      # signed in does not count. A refusal over that session says so, and
+      # how it is lifted -- the Default signed in, or (Claude, the one
+      # platform with a pin) the install pinned to another account. A
+      # refusal over anything else (no binary, a CLI that hung) already
+      # names its own fix, and gets nothing added.
       j="$(platform_check "$p")"
-      [ "$(printf '%s' "$j" | "$JQ" -r .ready)" = "true" ] || die "cannot enable $p: $(printf '%s' "$j" | "$JQ" -r .reason)"
+      if [ "$(printf '%s' "$j" | "$JQ" -r .ready)" != "true" ]; then
+        out="$(printf '%s' "$j" | "$JQ" -r .reason)"
+        case "$out" in
+          *" is not signed in"*)
+            case "$p" in
+              anthropic) out="$out — enable checks the Default account, the one the model probes run on: sign it in, or pin the install to another Claude account (AGENTLOOP_CLAUDE_CONFIG_DIR=<its directory> agentloop install)" ;;
+              openai)    out="$out — enable checks the Default account, the one the catalog refreshes run on: sign it in" ;;
+            esac ;;
+        esac
+        die "cannot enable $p: $out"
+      fi
       write_platforms --arg p "$p" '.platforms[$p] = ((.platforms[$p] // {bin:"", models:[]}) + {enabled:true})'
       echo "$p enabled" ;;
     disable)
@@ -8027,7 +8077,30 @@ cmd_project_set() { # reads a partial project object (JSON) from stdin; merges b
   # and a level the migration would have left in place is exactly what the
   # drop below also leaves alone in that case, so the field survives as the
   # only record of that account until it can be read again.
-  platforms_valid && accounts_migrate_legacy "$name"
+  #
+  # The dashboard's save (saveProject) sends EVERY level's account -- "" for
+  # a level its editor showed none on, which is exactly the level a leftover
+  # directory has not been turned into an account yet. Merged as sent, that
+  # "" landed on the account the conversion had just set: the project back
+  # on the Default, the new account registered with nothing pointing at it,
+  # and "is now the account" printed over it. So a level the conversion
+  # FILLS keeps what it was given, and an empty value sent for that level is
+  # dropped from the save; a value that is not empty is the level's choice
+  # and wins -- and the conversion, told about it, registers nothing for a
+  # level whose save picks an account of its own.
+  if platforms_valid; then
+    local sent_pa sent_sa had_pa had_sa
+    sent_pa="$(echo "$partial" | "$JQ" -r '.account // ""')"
+    sent_sa="$(echo "$partial" | "$JQ" -r '((.security | objects) // {}).account // ""')"
+    had_pa="$(project_get "$name" '.account' '')"; had_sa="$(security_get "$name" '.account' '')"
+    accounts_migrate_legacy "$name" "$sent_pa" "$sent_sa"
+    if [ -z "$had_pa" ] && [ -n "$(project_get "$name" '.account' '')" ]; then
+      partial="$(echo "$partial" | "$JQ" -c 'if (.account // "") == "" then del(.account) else . end')"
+    fi
+    if [ -z "$had_sa" ] && [ -n "$(security_get "$name" '.account' '')" ]; then
+      partial="$(echo "$partial" | "$JQ" -c 'if (.security | type) == "object" and ((.security.account // "") == "") then .security |= del(.account) else . end')"
+    fi
+  fi
   # The account each level signs in as has to be one of that level's own
   # platform -- judged on the project as it will be once this save merges
   # (jq `. * $p`), now that any leftover claude_config_dir above has had its
@@ -8282,7 +8355,7 @@ agentloop — durable local scheduler for headless Claude Code runs
                               SBOM, hygiene and infrastructure-as-code
                               misconfigurations run first at no token cost,
                               then a Claude run does the SAST and the triage.
-                              <repo> names one of the project's `repos`; a
+                              <repo> names one of the project's repos; a
                               project with a single checkout has none, and every
                               analysis of it is filed under the PROJECT's name
                               whatever is typed here, so one project always has
@@ -8291,9 +8364,10 @@ agentloop — durable local scheduler for headless Claude Code runs
                               (what the dashboard's Analyse button uses);
                               without it the command stays until the run ends
   agentloop security render --analysis <n> --format <json|md|html|sbom>
-                              the report for one analysis, or (`sbom`) the
-                              stored SBOM document itself (see `security` with
-                              no arguments for the rest of the vocabulary)
+                              the report for one analysis, or (sbom) the
+                              stored SBOM document itself (see agentloop
+                              security with no arguments for the rest of the
+                              vocabulary)
   agentloop security-branches <project> <repo>
                               list the branches of a project's canonical
                               checkout, local and origin's, for a branch picker
@@ -8306,14 +8380,26 @@ agentloop — durable local scheduler for headless Claude Code runs
                               source (daily on its own)
   agentloop platforms       what each platform offers (permission modes,
                               efforts, defaults) and whether it is ready
-  agentloop platform check|enable|disable|set-bin|models|set-models <platform> [path]
-                            what Settings › Platforms does: probe a CLI, switch a platform on or off,
-                            point at its binary, refresh its catalog, choose its models (JSON list on stdin)
-  agentloop platform accounts|account-add|account-edit|account-remove <platform> [id] [name] [dir]
-                            the sign-ins a platform runs under, beside the install's Default:
-                            list them with their sessions, register one (name, directory), rename
-                            or move one, remove one nothing uses; `platform check <platform> <id>`
-                            checks one account's session
+  agentloop platform check <platform> [id]
+                            what Settings › Platforms does, one verb per control: probe a CLI and
+                            the session of one account (the Default without an id)
+  agentloop platform enable|disable <platform>
+                            switch a platform on or off (enable refuses while that check fails)
+  agentloop platform set-bin <platform> [path]
+                            point at its binary (no path: back to detection)
+  agentloop platform models <platform>
+                            refresh its catalog and list it
+  agentloop platform set-models <platform>
+                            choose its models (a JSON list on stdin)
+  agentloop platform accounts <platform>
+                            every sign-in the platform runs under, the install's Default first,
+                            each with its session and who runs on it (anthropic and openai)
+  agentloop platform account-add <platform> <name> <dir>
+                            register an account: a name, and the config directory it signs in with
+  agentloop platform account-edit <platform> <id> <name> <dir>
+                            rename or move one (its id never changes)
+  agentloop platform account-remove <platform> <id>
+                            remove one nothing runs on
   agentloop tick            internal — what launchd calls every minute
 
 Jobs are defined in $JOBS_FILE
@@ -8350,6 +8436,17 @@ cmd_check() {
     *)     echo "precheck: BROKEN (exit $rc) — the probe could not run, so this job is stuck: it will never find work until this is fixed" ; return 1 ;;
   esac
 }
+
+# The install's pin, exported for what this process starts outside a run's
+# own environment (see the top of this file): by account_env_value, the one
+# rule every account directory is exported by -- ~ expanded, no trailing
+# slash, and the variable left UNSET when the pin is the CLI's own
+# ~/.claude. Exported raw, a pin written ~/.claude, or $HOME/.claude/, sent
+# the model probes and the hooks to another Keychain entry (no session),
+# while check, enable and every run called the same account signed in.
+if [ -n "${AGENTLOOP_CLAUDE_CONFIG_DIR:-}" ]; then
+  account_export anthropic "$(account_env_value anthropic "$AGENTLOOP_CLAUDE_CONFIG_DIR")"
+fi
 
 case "${1:-}" in
   install)   cmd_install ;;
