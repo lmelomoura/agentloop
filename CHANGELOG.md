@@ -272,6 +272,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`prepare` no longer writes into an analysis that closed while it ran.**
+  It checked that its analysis was open only on the way in, and the
+  deterministic phases are minutes of wall-clock — 679 s on a real one, most
+  of it the history sweep. An analysis closed in between (a stop, the stale
+  sweep, the engine closing a run that died) was written into all the same:
+  on 2026-09-24 a prepare that outlived its run filed 91 findings, its
+  coverage paragraph and `prepared` into an analysis that had closed
+  `failed` eleven minutes earlier. The check is asked again once the phases
+  are done and before the first write, and a closed analysis is refused the
+  way a second `prepare` already was — nothing is written, the history
+  cursor included.
+
 - **A stop now ends the Claude agent, not just the shell that launched it —
   and so does the watchdog.** The Claude launch lines ran the CLI as the
   last command of a `( cd …; env claude … ) &` subshell, and bash 3.2 forks

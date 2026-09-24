@@ -1324,6 +1324,43 @@ def test_a_closed_analysis_refuses_a_second_prepare(tmp_path):
     assert run(db, "findings", "--analysis", str(aid)) == []
 
 
+def test_an_analysis_that_closes_while_prepare_runs_is_not_written_into(tmp_path, monkeypatch):
+    """The open check was asked only on the way IN, and the deterministic
+    phases are minutes of wall-clock: 679 s on a real analysis (2026-09-24),
+    most of it the history sweep. The analysis can close in between -- a
+    stop, the stale sweep, the engine closing a run that died -- and there a
+    prepare that outlived its run wrote 91 findings, its coverage and
+    `prepared` into a row that had closed `failed` eleven minutes before.
+    The phases' results are refused the way a second prepare is.
+
+    Closed from inside a phase, through the same `finish` the engine uses,
+    so the close lands while prepare is between its first check and its
+    first write -- the window the real one closed in."""
+    db = tmp_path / "security.db"
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "id_rsa").write_text("-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7Yb3ZpQk9wVt2LmN4RsX8HcJ1FgD6KaE0uWq5TzP3nBvC2rM\n")
+    aid = open_analysis(db)
+    real_scan = security_cli.hygiene.scan
+
+    def the_run_is_closed_meanwhile(*args, **kwargs):
+        run(db, "finish", "--analysis", str(aid), "--state", "failed",
+            "--note", "engine: the run behind this analysis is gone")
+        return real_scan(*args, **kwargs)
+    monkeypatch.setattr(security_cli.hygiene, "scan", the_run_is_closed_meanwhile)
+
+    with pytest.raises(SystemExit) as refused:
+        security_cli.main(["prepare", "--analysis", str(aid), "--root", str(root),
+                           "--offline", "--db", str(db)])
+    assert "closed" in str(refused.value.code)
+    assert run(db, "findings", "--analysis", str(aid)) == []
+    row = run(db, "list", "--project", "web")[0]
+    assert row["state"] == "failed"
+    assert row["prepared"] == 0
+    # Only the close's own sentence: nothing of the phases' paragraph.
+    assert row["coverage_note"] == "engine: the run behind this analysis is gone"
+
+
 # --------------------------------------------------- the baseline's history
 
 def test_a_failed_first_attempt_does_not_make_everything_regressed(tmp_path):

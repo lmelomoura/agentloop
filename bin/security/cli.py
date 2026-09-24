@@ -1385,6 +1385,19 @@ def cmd_prepare(args):
     sast_findings, sast_notes, sast_producer, sast_status = futures["sast-prepass"].result()
     _progress(f"all phases done ({int(time.perf_counter() - started)}s)")
 
+    # ASKED AGAIN, NOW, BEFORE THE FIRST WRITE. `_running` above answered for
+    # the moment this command started, and the phases are minutes of
+    # wall-clock -- 679 s on a real analysis, most of it the history sweep.
+    # The analysis can close in between: a stop, the stale sweep, the engine
+    # closing a run that died. On 2026-09-24 a prepare that outlived its run
+    # (its agent orphaned by a stop that never reached it) wrote 91 findings,
+    # its coverage paragraph and `prepared` into a row that had closed
+    # `failed` eleven minutes earlier -- rewriting what that analysis is
+    # remembered as having found. Refused here the way a second prepare
+    # already is, with nothing written, the history cursor included: the
+    # next analysis re-reads those commits, which is slower and correct.
+    _running(conn, aid)
+
     for scanner, sweep in sweeps.items():
         if sweep.get("reached"):
             ledger.save_history_sweep(conn, project, repo, branch, scanner,
