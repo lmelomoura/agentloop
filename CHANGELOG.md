@@ -272,6 +272,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A schema bump that only adds journal-sourced columns fills them in
+  place, instead of re-indexing every run.** PR #77's `account`/
+  `account_dir` columns bumped the index's `SCHEMA_VERSION`, and `ingest()`
+  read any schema change as a reason to re-upsert every journal record and
+  rebuild the whole FTS table — including the preserved content of every
+  already-pruned run. On the operator's own install (`index.db` 606 MB, 464
+  runs, most pruned) that full resync ran inside the first `/api/data`
+  request: ~7 minutes at 88% CPU, ~1.3 GB written to the WAL, the write lock
+  held throughout. The first request's own client gave up
+  (`ConnectionResetError`); every other request's `ingest()` failed with
+  *database is locked*, so the dashboard drew 0 jobs, 0 projects, launchd
+  off — an install that looked wiped, while the data underneath was intact
+  the whole time. `LIGHT_SCHEMA_BUMPS` now lists which bumps add ONLY
+  columns copied straight off a journal record (`("6","7"):
+  ("account","account_dir")` is the first); when the stored schema and the
+  current one are such a pair, and the journal itself has not changed (not
+  forced, not shrunk, its signature unchanged), `ingest()` backfills those
+  columns in place with one `UPDATE` per record that carries them and
+  continues with its normal incremental tail — no artifact read, no content
+  rewrite, no FTS touch. Any other resync reason, or a bump not on the list,
+  still takes the full resync exactly as before.
+
 - **A pin that names the CLI's own `~/.claude` no longer signs the install
   out.** A pin of `$HOME/.claude`, trailing slash or not, was exported as
   written, and Claude Code names the Keychain entry it reads after the
