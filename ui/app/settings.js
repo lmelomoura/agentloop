@@ -155,8 +155,19 @@ async function loadCatalog(id){
 
 async function loadAccounts(id){
   if(!ACCOUNT_PLATFORMS.includes(id)) return;
+  live.busy[id] = true; paint();
   const j = await post("platform_accounts", {platform: id});
-  if(j && Array.isArray(j.accounts)) live.accounts[id] = j.accounts;
+  if(j && Array.isArray(j.accounts)){
+    live.accounts[id] = j.accounts;
+    // A fresh list that no longer has the account an edit form names (removed
+    // from another tab, or by the CLI) must drop that form -- otherwise "Add
+    // account" stays disabled (an open form already disables it, see
+    // accountsSection) with no Cancel left on screen to close it, since the
+    // row it belonged to is gone too.
+    const f = live.acctForm[id];
+    if(f && f.mode === "edit" && !j.accounts.some(a => a.id === f.id)) delete live.acctForm[id];
+  }
+  live.busy[id] = false;
   paint();
 }
 
@@ -185,14 +196,24 @@ function accountRow(r, a){
   name.appendChild(el("span", null, a.dir + " · " + accountUsersText(a.used_by)));
   const st = accountStatusText(r.id, a.check);
   const sl = el("span", "acct-st" + (st.ok === true ? " ok" : st.ok === false ? " err" : ""));
-  sl.appendChild(icon(st.ok === false ? "xcircle" : "check"));
+  // ok is null until the account has been checked -- neither the green
+  // checkmark nor the red xcircle is true yet, so neither icon should draw.
+  sl.appendChild(icon(st.ok === false ? "xcircle" : st.ok === true ? "check" : "clock"));
   sl.appendChild(document.createTextNode(st.text));
   name.appendChild(sl);
   row.appendChild(name);
   const meta = el("div", "mmeta");
   if(!a.builtin){
-    meta.appendChild(button("Edit", "pencil", () => { live.acctForm[r.id] = {mode: "edit", id: a.id, name: a.name, dir: a.dir}; paint(); }, live.busy[r.id]));
-    meta.appendChild(button("Remove", "trash", () => removeAccount(r.id, a), live.busy[r.id]));
+    // One form at a time per platform: while ANY form is open here (this
+    // account's own edit form is never reached through this branch, but
+    // another account's edit, or the Add row, is), Edit/Remove lock the same
+    // way "Add account" already does -- acctForm's two fields are read back
+    // by a PLATFORM-scoped id (acct-name-<pid>), not an account-scoped one,
+    // so letting a second form open let its stale DOM text land on whichever
+    // account's Edit was clicked last (see accountsSection/paint()).
+    const locked = live.busy[r.id] || !!live.acctForm[r.id];
+    meta.appendChild(button("Edit", "pencil", () => { live.acctForm[r.id] = {mode: "edit", id: a.id, name: a.name, dir: a.dir}; paint(); }, locked));
+    meta.appendChild(button("Remove", "trash", () => removeAccount(r.id, a), locked));
   }
   row.appendChild(meta);
   return row;

@@ -3719,10 +3719,16 @@ function paintLimitsNote(p, model){
 // (`keep`) -- or flagged when Settings dropped it (accountOptions).
 function paintAccountCombo(prefix, combo, cfg, p, keep, inheritName){
   if(!combo) return;
-  $(prefix+"-account-row").hidden=!ALApp.accountChoice(p, PLATFORMS);
   cfg.noneLabel=ALApp.accountNoneLabel(inheritName);
   const cur=keep ? $(prefix+"-account").value : "";
+  // The option list decides the row's visibility, not accountChoice -- that
+  // only counts REGISTERED accounts, so a platform with none of its own but a
+  // STORED value Settings no longer has (a flagged trailing option,
+  // accountOptions' own doing) would hide the row under a value saveProject
+  // always sends: the one field blocking every save, with nothing on screen
+  // to fix it.
   const opts=ALApp.accountOptions(p, PLATFORMS, cur);
+  $(prefix+"-account-row").hidden=opts.length<2;
   combo.set(opts.some(o=>o.v===cur) ? cur : "", opts);
 }
 function paintJobAccount(keep){
@@ -3731,7 +3737,9 @@ function paintJobAccount(keep){
     ALApp.inheritedAccountName(p, np?projById(np):null, PLATFORMS));
 }
 function paintProjectAccount(keep){
-  paintAccountCombo("pj", pjAccountCombo, pjAccountCfg, $("pj-platform").value||"anthropic", keep, "");
+  const p=$("pj-platform").value||"anthropic";
+  paintAccountCombo("pj", pjAccountCombo, pjAccountCfg, p, keep, "");
+  pjPlatApplied=p;
 }
 function paintSecurityAccount(keep){
   const sp=secEffectivePlatform();
@@ -3837,7 +3845,12 @@ let edEfforts=ALApp.FALLBACK_EFFORTS.slice(), secEfforts=ALApp.FALLBACK_EFFORTS.
 // change: the combos' onPick skips the apply, so the model, effort and mode on
 // screen survive a click that chose what was already there. "" until the pane
 // is first built, and reset when an editor opens so a fresh one always applies.
-let edPlatApplied="", secPlatApplied="";
+// pjPlatApplied is the project pane's own, narrower version: it has no big
+// apply to skip, only paintProjectAccount (set on every one of its own
+// calls, including the ones openProjectEditor/refillPlatformBound make
+// directly) -- re-picking what it already names must still KEEP the
+// project's account instead of erasing it.
+let edPlatApplied="", secPlatApplied="", pjPlatApplied="";
 let projectCombo=null, modelCombo=null, permCombo=null, wtCombo=null, platformCombo=null,
     secModelCombo=null, secPermCombo=null, secPlatformCombo=null,
     secProfileCombo=null, secMinSevCombo=null;
@@ -3861,7 +3874,7 @@ function initCombos(){
   // the project's own pick reaches the pane only while the block inherits, and
   // neither pick is a change when it names what the pane already shows.
   pjPlatformCombo=createCombo({id:"pj-platform", allowNone:false, def:"anthropic",
-    onPick:()=>{ paintProjectAccount(false);
+    onPick:(v)=>{ paintProjectAccount(v===pjPlatApplied);
                  if(!$("sec-platform").value && secEffectivePlatform()!==secPlatApplied) applyPlatformToSecurity(secEffectivePlatform(), false);
                  else paintSecurityAccount(true); }});
   pjPlatformCombo.set("anthropic", ALApp.platformOptions(PLATFORMS, "anthropic"));

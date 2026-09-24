@@ -577,6 +577,24 @@ def _const(js, name):
     raise AssertionError(f"unterminated {name}")
 
 
+def _stmt(js, prefix):
+    """The verbatim source of one `TARGET=CALL(...);` statement, paren-matched
+    from the first `(` at-or-after `prefix` through the statement's own
+    closing `;` -- for an inline call (createCombo's own cfg object, onPick
+    closure included) that _const's bracket-only matching cannot reach, and
+    that _fn/_plainfn/_anyfn (which only extract `function` declarations)
+    cannot either."""
+    i = js.index(prefix)
+    j = js.index("(", i)
+    d = 0
+    for k in range(j, len(js)):
+        d += (js[k] == "(") - (js[k] == ")")
+        if d == 0:
+            end = js.index(";", k) + 1
+            return js[i:end]
+    raise AssertionError(f"unterminated statement {prefix}")
+
+
 CWD = "/x/web"
 ROW = {"name": "web", "path": CWD, "base": "develop"}
 
@@ -818,20 +836,29 @@ def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
     let modelOpts = null, permOpts = null;
     const secModelCombo = {set(v, o){ nodes["sec-model"].value = v; if(o) modelOpts = o; }, get: () => nodes["sec-model"].value};
     const secPermCombo = {set(v, o){ nodes["sec-perm"].value = v; if(o) permOpts = o; }, get: () => nodes["sec-perm"].value};
-    // Task 6: applyPlatformToSecurity now also repaints the Account combo --
-    // out of scope for this test (the account behaviour has its own tests),
-    // so it is stubbed rather than pulling in the whole Account combo harness.
-    function paintSecurityAccount(){}
+    // Task 6: applyPlatformToSecurity now also repaints the Account combo.
+    // Running the real paintAccountCombo/paintProjectAccount here (pulling in
+    // a whole second stub DOM, PLATFORMS.accounts and the Account combo
+    // objects) is out of scope for THIS harness, which is about the model/
+    // effort/permission pane -- paintAccountCombo has its own test
+    // (test_paint_account_combo_hides_only_when_there_is_nothing_but_the_default)
+    // and the project pane's own re-pick guard has its own
+    // (test_re_picking_the_project_s_platform_keeps_its_account_a_real_change_clears_it).
+    // So it is stubbed -- but recording the `keep` it was given, so this
+    // harness still proves applyPlatformToSecurity passes ITS OWN keep
+    // through rather than a hardcoded value.
+    let secAccountKeep = "unset";
+    function paintSecurityAccount(keep){ secAccountKeep = keep; }
     """ + deps + """
     applyPlatformToSecurity(secEffectivePlatform(), true);
     const afterKeep = {model: $("sec-model").value, max: $("sec-effort").max, eff: $("sec-effort").value,
       perm: $("sec-perm").value, custom: secModelCfg.allowCustom, none: secModelCfg.noneLabel,
       labels: modelOpts.map(o => o.label), perms: permOpts.map(o => o.v),
-      help: $("sec-model-help").textContent};
+      help: $("sec-model-help").textContent, acctKeep: secAccountKeep};
     applyPlatformToSecurity("anthropic", false);
     const afterReset = {model: $("sec-model").value, max: $("sec-effort").max, eff: $("sec-effort").value,
       perm: $("sec-perm").value, custom: secModelCfg.allowCustom, none: secModelCfg.noneLabel,
-      secPlatApplied};
+      secPlatApplied, acctKeep: secAccountKeep};
     console.log(JSON.stringify({afterKeep, afterReset}));
     """)
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
@@ -842,36 +869,113 @@ def test_the_security_pane_follows_its_effective_platform(srv, tmp_path):
     assert k["custom"] is False and k["none"] == "— Default (gpt-5.6-sol) —"
     assert "GPT-5.5 · no price" in k["labels"] and k["perms"] == ["read-only", "workspace-write", "full-access"]
     assert "falls back to the platform's default" in k["help"]
+    assert k["acctKeep"] is True, "applyPlatformToSecurity's own keep=true must reach paintSecurityAccount"
     r = out["afterReset"]
     # custom is False on BOTH platforms now (Task 9): the list Settings
     # switched on is the authority, so there is no typed-in id on Anthropic
     # either -- the stub above starts it True to prove the apply turns it off.
     assert r == {"model": "", "max": "5", "eff": "0", "perm": "bypassPermissions", "custom": False,
-                 "none": "— Default (opus) —", "secPlatApplied": "anthropic"}, \
-        "the pane records the platform it was built for on its way out"
+                 "none": "— Default (opus) —", "secPlatApplied": "anthropic", "acctKeep": False}, \
+        "the pane records the platform it was built for on its way out, and keep=false reaches the Account combo too"
 
 
 def test_re_picking_the_platform_a_pane_already_shows_changes_nothing(srv):
-    """The three platform combos apply a platform only when the pick MOVES the
-    effective platform: the job editor's against edPlatApplied, the project's
-    and the security block's against secPlatApplied (the project's only while
-    the block inherits). Without a guard, a click that chose what was already
-    there resets the model, effort and mode on screen -- so the three guards
-    are pinned as written, inside initCombos. The project's own pick also
-    always repaints its own Account combo (Task 6): a platform re-pick can
-    leave the effective platform unmoved and still change what the Account
-    combo's empty row resolves to nothing -- but a picked value can go stale,
-    so it is repainted unconditionally, with keep=false."""
+    """The job editor's and the security block's platform combos each guard a
+    big re-apply (model list, effort ladder, modes, help text...) behind
+    edPlatApplied/secPlatApplied: a click that named what was already applied
+    must skip it entirely, or the model/effort/mode the operator chose would
+    reset. Both guards are pinned here as written, inside initCombos --
+    running the real re-apply is its own, separate harness
+    (test_the_security_pane_follows_its_effective_platform)."""
     combos = _plainfn(_js(srv), "initCombos")
     assert 'onPick:(v)=>{ if(v!==edPlatApplied) applyPlatformToJobEditor(v,false); }' in combos, \
         "the job editor's platform combo lost its re-pick guard"
-    assert ('onPick:()=>{ paintProjectAccount(false);\n'
-            '                 if(!$("sec-platform").value && secEffectivePlatform()!==secPlatApplied) applyPlatformToSecurity(secEffectivePlatform(), false);\n'
-            '                 else paintSecurityAccount(true); }') in combos, \
-        "the project's platform combo must reach the Security pane only while the block inherits, and only on a move"
     assert ('onPick:()=>{ if(secEffectivePlatform()!==secPlatApplied) '
             'applyPlatformToSecurity(secEffectivePlatform(), false); }') in combos, \
         "the security block's platform combo lost its re-pick guard"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_re_picking_the_project_s_platform_keeps_its_account_a_real_change_clears_it(srv, tmp_path):
+    """The project's platform combo has no big re-apply to guard -- picking it
+    only ever repaints the project's OWN Account combo (paintProjectAccount),
+    plus the Security pane's when the block inherits -- so unlike the two
+    guards above it used to call paintProjectAccount(false) UNCONDITIONALLY,
+    on every pick, moved or not. A project on Anthropic with an account,
+    re-picking Anthropic (pick() fires onPick even when the value does not
+    change, and open() highlights the current value, so Enter alone did
+    this): pj-account went to "", the Security pane's empty row fell from
+    "Project's account (...)" to "Default", and Save silently sent
+    proj.account="", moving the project -- and every job inheriting from it
+    -- to the Default.
+
+    pjPlatApplied (the platform paintProjectAccount was last painted for,
+    set on every call it makes -- including the direct ones
+    openProjectEditor/refillPlatformBound make on open, with no pick
+    involved) is the fix: paintProjectAccount's OWN keep is conditional on
+    the pick actually moving it.
+
+    This runs the real onPick -- extracted verbatim from initCombos, not
+    retyped -- together with the real paintProjectAccount/paintAccountCombo,
+    over a stub DOM and stub combos: a string pin would have let the old,
+    unconditional call keep reading as intentional (see the docstring this
+    replaced). applyPlatformToSecurity/paintSecurityAccount are stubbed as
+    spies -- out of scope here, proven for real by
+    test_the_security_pane_follows_its_effective_platform -- just enough to
+    see the project's own pick still reaches the Security pane only while it
+    inherits, and only on a move."""
+    js = _js(srv)
+    app = _app_js(srv)
+    deps = (_const(app, "ACCOUNT_GONE_SUFFIX") + _const(app, "KNOWN_PLATFORMS")
+            + "\n".join(_plainfn(app, n) for n in ("platformKey", "accountsOf", "accountChoice", "accountNoneLabel", "accountOptions")))
+    onpick_stmt = _stmt(js, "pjPlatformCombo=createCombo({")
+    script = tmp_path / "pj-platform-repick.js"
+    script.write_text(deps + "\n"
+        + _plainfn(js, "paintAccountCombo") + "\n" + _plainfn(js, "paintProjectAccount") + """
+    function createCombo(cfg){ return {onPick: cfg.onPick}; }   // just enough to catch what initCombos hands it
+    function secEffectivePlatform(){ return $("sec-platform").value || $("pj-platform").value || "anthropic"; }
+    const ALApp = {accountChoice, accountNoneLabel, accountOptions};
+    const PLATFORMS = {anthropic: {accounts: [{id: "a", name: "Client A", dir: "~/.claude-a"}]}, openai: {accounts: []}};
+    const nodes = {};
+    const $ = (id) => nodes[id] || (nodes[id] = {value: "", hidden: false});
+    const pjAccountCombo = {calls: [], set(v, opts){ this.calls.push({v, opts}); }};
+    const pjAccountCfg = {};
+    let secPlatApplied = "", pjPlatApplied = "", secCalls = [];
+    function applyPlatformToSecurity(p, keep){ secCalls.push(["apply", p, keep]); }
+    function paintSecurityAccount(keep){ secCalls.push(["paint", keep]); }
+    let pjPlatformCombo;
+    """ + onpick_stmt + """
+
+    function scenario(pick, applied, secPlat, secApplied){
+      pjPlatApplied = applied; secPlatApplied = secApplied;
+      $("pj-platform").value = pick; $("pj-account").value = "a"; $("sec-platform").value = secPlat;
+      pjAccountCombo.calls = []; secCalls = [];
+      pjPlatformCombo.onPick(pick);
+      return {acct: pjAccountCombo.calls[0], sec: secCalls.slice(), applied: pjPlatApplied};
+    }
+    console.log(JSON.stringify({
+      // A re-pick of the platform already applied, Security inheriting.
+      repick: scenario("anthropic", "anthropic", "", "anthropic"),
+      // A real move, Security inheriting -- it must follow.
+      moved: scenario("openai", "anthropic", "", "anthropic"),
+      // A real move, but the Security block picked its own platform -- it
+      // must NOT follow.
+      ownSecPlatform: scenario("openai", "anthropic", "opencode", "opencode"),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    r = out["repick"]
+    assert r["acct"]["v"] == "a", "a re-pick of the same platform must keep the project's account"
+    assert r["sec"] == [["paint", True]], "unchanged: the Security pane just keeps its label, no re-apply"
+    assert r["applied"] == "anthropic"
+    m = out["moved"]
+    assert m["acct"]["v"] == "", "a real platform change must clear an account the new platform does not have"
+    assert m["sec"] == [["apply", "openai", False]], \
+        "the Security pane still follows an empty (inheriting) Security platform"
+    assert m["applied"] == "openai"
+    o = out["ownSecPlatform"]
+    assert o["acct"]["v"] == "", "still a real platform change: the project's own account is cleared"
+    assert o["sec"] == [["paint", True]], "a Security block with its own platform does not inherit the move"
 
 
 # ---- the job card's kept-session notice, and the guard it must share with
@@ -11536,6 +11640,7 @@ def test_the_run_dialog_names_the_account_and_the_reopen_line_carries_it(srv, tm
       claude: reopenCommand({platform: "anthropic", session: "s1", account_dir: "/Users/me/.claude-a"}, {}),
       codex: reopenCommand({platform: "openai", session: "t1", account_dir: "/Users/me/.codex-a"}, {}),
       spaced: reopenCommand({platform: "anthropic", session: "s1", account_dir: "/Users/me/My Accounts/.claude"}, {}),
+      quoted: reopenCommand({platform: "anthropic", session: "s1", account_dir: "/Users/me/it's here"}, {}),
       none: accountCell({platform: "anthropic"}),
       named: accountCell({platform: "anthropic", account: "a", account_dir: "/Users/me/.claude-a"}),
       gone: accountCell({platform: "anthropic", account: "zz", account_dir: "/Users/me/.claude-z"}),
@@ -11547,6 +11652,8 @@ def test_the_run_dialog_names_the_account_and_the_reopen_line_carries_it(srv, tm
     assert out["claude"] == "CLAUDE_CONFIG_DIR=/Users/me/.claude-a claude --resume s1"
     assert out["codex"] == "CODEX_HOME=/Users/me/.codex-a codex exec resume t1"
     assert out["spaced"] == "CLAUDE_CONFIG_DIR='/Users/me/My Accounts/.claude' claude --resume s1"
+    assert out["quoted"] == "CLAUDE_CONFIG_DIR='/Users/me/it'\\''s here' claude --resume s1", \
+        "a single quote inside the directory must itself be escaped, not just wrapped"
     assert out["none"] == "", "the Default on the CLI's own directory is every single-account run: no row"
     assert "Client A" in out["named"] and "/Users/me/.claude-a" in out["named"]
     assert "zz" in out["gone"] and "no longer in Settings" in out["gone"]
@@ -11586,3 +11693,263 @@ def test_settings_draws_the_accounts_of_the_two_account_platforms(srv):
         "a repaint must read the account form back first: the folder picker sets .value with no event"
     assert "data-cwd-target" in _plainfn(_app_js(srv), "accountForm") or "cwdTarget" in _plainfn(_app_js(srv), "accountForm"), \
         "the directory field reuses the page's folder picker"
+
+
+# ---- Task 6 fix round 1: findings from review.
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_paint_account_combo_hides_only_when_there_is_nothing_but_the_default(srv, tmp_path):
+    """paintAccountCombo used to hide the row off ALApp.accountChoice, which
+    counts REGISTERED accounts only -- so a platform with zero registered
+    accounts but a STORED id Settings no longer has (accountChoice false, but
+    accountOptions still appends it as a flagged trailing option) kept the
+    value and the flagged option yet hid the row that shows them. For a
+    project this blocked every save: saveProject always sends `account`, and
+    the engine refuses an unknown id over a field nobody could see or clear.
+    The fix: build the option list first, and hide the row only when there is
+    nothing in it but the Default (opts.length < 2) -- a flagged current
+    value counts as something to show."""
+    js = _js(srv)
+    app = _app_js(srv)
+    deps = (_const(app, "ACCOUNT_GONE_SUFFIX") + _const(app, "KNOWN_PLATFORMS")
+            + "\n".join(_plainfn(app, n) for n in ("platformKey", "accountsOf", "accountChoice", "accountNoneLabel", "accountOptions")))
+    script = tmp_path / "paint-account-combo.js"
+    script.write_text(deps + "\n" + _plainfn(js, "paintAccountCombo") + """
+    const ALApp = {accountChoice, accountNoneLabel, accountOptions};
+    const PLATFORMS = {anthropic: {accounts: []}};   // zero REGISTERED accounts throughout
+    // paintAccountCombo is defined above, at this top level -- its free
+    // variable `$` has to live here too, not inside run(), or it would
+    // resolve to nothing when paintAccountCombo itself runs.
+    let nodes = {};
+    const $ = (id) => nodes[id];
+    function run(storedValue){
+      nodes = {"x-account-row": {hidden: false}, "x-account": {value: storedValue}};
+      const cfg = {noneLabel: ""};
+      const combo = {calls: [], set(v, opts){ this.calls.push({v, opts}); }};
+      paintAccountCombo("x", combo, cfg, "anthropic", true, "");
+      return {hidden: nodes["x-account-row"].hidden, call: combo.calls[0]};
+    }
+    console.log(JSON.stringify({stale: run("zz"), empty: run("")}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    s = out["stale"]
+    assert s["hidden"] is False, "a flagged current value must still show the row -- saveProject always sends it"
+    assert s["call"] == {"v": "zz", "opts": [{"v": "default", "label": "Default"},
+                                              {"v": "zz", "label": "zz (not in Settings)", "flagged": True}]}
+    e = out["empty"]
+    assert e["hidden"] is True, "zero registered accounts and nothing stored: nothing to pick besides the Default"
+    assert e["call"] == {"v": "", "opts": [{"v": "default", "label": "Default"}]}
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_platform_with_a_form_open_disables_its_other_rows_edit_and_remove(srv, tmp_path):
+    """accountRow's Edit and Remove used to disable only while live.busy --
+    not while ANOTHER form (Add, or Edit of a different account) was already
+    open for the same platform. paint() reads the account form's two fields
+    back by a PLATFORM-scoped id (acct-name-<platform>, acct-dir-<platform> --
+    not one per account), so clicking Edit on account A while a form for B
+    (or a blank Add row) was still showing replaced live.acctForm[platform]
+    with A's own correct {name, dir}, and paint()'s very next read-back loop
+    immediately overwrote them with whatever text was still sitting in the
+    OLD form's DOM inputs, not yet torn down -- saving A under B's typed name
+    and directory. One form at a time per platform closes the hole: while
+    live.acctForm[pid] holds anything, every OTHER row's Edit/Remove must be
+    disabled, the same as "Add account" already is."""
+    app = _app_js(srv)
+    deps = "\n".join(_plainfn(app, n) for n in ("el", "button", "accountStatusText", "accountUsersText", "accountRow"))
+    script = tmp_path / "account-row-lock.js"
+    script.write_text("""
+    class FakeElement {
+      constructor(tag){ this.tagName = tag; this.className = ""; this.childNodes = []; }
+      appendChild(c){ this.childNodes.push(c); return c; }
+      addEventListener(){}   // button() wires a click handler; never fired here
+    }
+    const document = {
+      createElement: (tag) => new FakeElement(tag),
+      createTextNode: (t) => ({textContent: String(t)}),
+    };
+    function icon(_name){ return document.createElement("span"); }
+    """ + deps + """
+    function buttons(row){
+      // accountRow appends `name` then `meta` -- meta (the row's last child)
+      // holds Edit (first) then Remove (second).
+      const meta = row.childNodes[row.childNodes.length - 1];
+      return {edit: meta.childNodes[0], remove: meta.childNodes[1]};
+    }
+    const r = {id: "anthropic"};
+    const a = {id: "a", name: "Client A", dir: "~/.claude-a", used_by: {}};
+
+    let live = {busy: {}, acctForm: {}};
+    const free = buttons(accountRow(r, a));
+
+    live = {busy: {}, acctForm: {anthropic: {mode: "add", name: "", dir: ""}}};
+    const withAdd = buttons(accountRow(r, a));
+
+    live = {busy: {}, acctForm: {anthropic: {mode: "edit", id: "b", name: "Client B", dir: "~/.claude-b"}}};
+    const withOtherEdit = buttons(accountRow(r, a));
+
+    console.log(JSON.stringify({
+      free: {edit: free.edit.disabled, remove: free.remove.disabled},
+      withAdd: {edit: withAdd.edit.disabled, remove: withAdd.remove.disabled},
+      withOtherEdit: {edit: withOtherEdit.edit.disabled, remove: withOtherEdit.remove.disabled},
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["free"] == {"edit": False, "remove": False}, "nothing open on the platform: both stay enabled"
+    assert out["withAdd"] == {"edit": True, "remove": True}, "an open Add form must lock every account's row"
+    assert out["withOtherEdit"] == {"edit": True, "remove": True}, \
+        "editing one account must lock every OTHER row too, not just Add"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_reload_drops_the_edit_form_of_an_account_that_is_gone(srv, tmp_path):
+    """loadAccounts used to overwrite live.accounts and repaint without ever
+    looking at live.acctForm -- so an edit form left open across a reload
+    (platform_check's own re-check on Test, or another tab having removed the
+    account meanwhile) for an account no longer in the fresh list stuck
+    around forever: "Add account" stays disabled (an open form already
+    disables it) with no Cancel anywhere on screen to close it, since the row
+    the form belonged to is gone too."""
+    app = _app_js(srv)
+    deps = _anyfn(app, "loadAccounts")   # async, and _plainfn's `function NAME(` match would drop the keyword
+    script = tmp_path / "load-accounts-drop.js"
+    script.write_text("""
+    const ACCOUNT_PLATFORMS = ["anthropic", "openai"];
+    let live = {accounts: {}, acctForm: {}, busy: {}};
+    function paint(){}
+    let nextAccounts = [];
+    async function post(_op, _extra){ return {ok: true, accounts: nextAccounts}; }
+    """ + deps + """
+    (async () => {
+      const out = {};
+
+      // Editing "b", which the fresh list still has: the form must survive.
+      live.acctForm.anthropic = {mode: "edit", id: "b", name: "Client B", dir: "~/.claude-b"};
+      nextAccounts = [{id: "a", name: "Client A", dir: "~/.claude-a"}, {id: "b", name: "Client B", dir: "~/.claude-b"}];
+      await loadAccounts("anthropic");
+      out.stillThere = !!live.acctForm.anthropic;
+
+      // "b" removed elsewhere: the next reload must drop the stale form.
+      nextAccounts = [{id: "a", name: "Client A", dir: "~/.claude-a"}];
+      await loadAccounts("anthropic");
+      out.dropped = !live.acctForm.anthropic;
+
+      // An "add" form names no account, so it must never be dropped by a
+      // reload just because ITS blank id/name/dir match nothing.
+      live.acctForm.anthropic = {mode: "add", name: "New one", dir: "~/.claude-new"};
+      await loadAccounts("anthropic");
+      out.addKept = !!live.acctForm.anthropic && live.acctForm.anthropic.name === "New one";
+
+      console.log(JSON.stringify(out));
+    })();
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["stillThere"] is True, "the account being edited is still in the fresh list: the form must survive"
+    assert out["dropped"] is True, "the account being edited is gone from the fresh list: the form must be dropped"
+    assert out["addKept"] is True, "an Add form names no account, so a reload must never drop it"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_load_accounts_shows_busy_while_the_call_is_in_flight(srv, tmp_path):
+    """loadAccounts set no loading state of its own, so accountsSection's
+    "Checking the accounts..." branch (gated on live.busy) never actually got
+    to show DURING the accounts fetch: runCheck already resets live.busy back
+    to false before calling loadAccounts (it is the platform_check probe's
+    own flag, cleared when that call lands), and saveAccount/removeAccount's
+    own change() does the same before ITS OWN loadAccounts call -- so the
+    section sat on "The accounts have not been checked yet" for the whole
+    round trip. loadAccounts must raise live.busy itself for the fetch it
+    makes."""
+    app = _app_js(srv)
+    deps = _anyfn(app, "loadAccounts")   # async, and _plainfn's `function NAME(` match would drop the keyword
+    script = tmp_path / "load-accounts-busy.js"
+    script.write_text("""
+    const ACCOUNT_PLATFORMS = ["anthropic", "openai"];
+    let live = {accounts: {}, acctForm: {}, busy: {}};
+    function paint(){}
+    let sawBusyDuringFetch = null;
+    async function post(_op, _extra){ sawBusyDuringFetch = !!live.busy.anthropic; return {ok: true, accounts: []}; }
+    """ + deps + """
+    (async () => {
+      const busyBefore = !!live.busy.anthropic;
+      await loadAccounts("anthropic");
+      console.log(JSON.stringify({busyBefore, sawBusyDuringFetch, busyAfter: !!live.busy.anthropic}));
+    })();
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["busyBefore"] is False
+    assert out["sawBusyDuringFetch"] is True, "live.busy must be set before the accounts fetch, not just around platform_check"
+    assert out["busyAfter"] is False, "and cleared again once the fresh list has landed"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_an_unchecked_account_draws_a_neutral_icon(srv, tmp_path):
+    """accountRow used to pass icon(st.ok===false?"xcircle":"check") -- so an
+    account that has never been checked (accountStatusText's {ok: null})
+    still drew the very same green checkmark as one just proven signed in.
+    I.clock exists in the page's own icon table for exactly this "do not
+    know yet" state. Runs the real accountRow/accountStatusText/button/el
+    rather than reading the source, since icon() resolves any name it is not
+    given straight through to nothing -- a typo here would fail silently,
+    not loudly."""
+    app = _app_js(srv)
+    deps = "\n".join(_plainfn(app, n) for n in ("el", "button", "accountStatusText", "accountUsersText", "accountRow"))
+    script = tmp_path / "account-row-icon.js"
+    script.write_text("""
+    class FakeElement {
+      constructor(tag){ this.tagName = tag; this.className = ""; this.childNodes = []; }
+      appendChild(c){ this.childNodes.push(c); return c; }
+      addEventListener(){}   // button() wires a click handler; never fired here
+    }
+    const document = {
+      createElement: (tag) => new FakeElement(tag),
+      createTextNode: (t) => ({textContent: String(t)}),
+    };
+    const iconNames = [];
+    function icon(name){ iconNames.push(name); return document.createElement("span"); }
+    """ + deps + """
+    const live = {busy: {}, acctForm: {}};
+    const r = {id: "anthropic"};
+    function statusIconOf(check){
+      iconNames.length = 0;
+      accountRow(r, {id: "a", name: "Client A", dir: "~/.claude-a", used_by: {}, check});
+      return iconNames[0];   // the status line's own icon call, before Edit's/Remove's
+    }
+    console.log(JSON.stringify({
+      unchecked: statusIconOf(null),
+      ok: statusIconOf({ready: true, account: "a@example.org"}),
+      err: statusIconOf({ready: false, reason: "not signed in"}),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["unchecked"] == "clock", "not checked yet is neither ok nor an error -- I.clock exists for this"
+    assert out["ok"] == "check"
+    assert out["err"] == "xcircle"
+
+
+def test_reopening_an_editor_redraws_the_stored_account_with_keep(srv):
+    """fill() and openProjectEditor() each draw their Account combo(s) TWICE
+    on open: once through applyPlatformToJobEditor/applyPlatformToSecurity's
+    own keep=false (nothing stored to keep yet), then again with the stored
+    value written onto the hidden input first and keep=true -- the same
+    two-pass shape test_opening_a_job_or_project_shows_a_switched_off_model_flagged
+    already pins for the model combo, and for the same reason: an account
+    Settings no longer has must show flagged, not silently rewritten to the
+    Default, the moment the editor opens -- not only after the next re-apply.
+    A full execution harness for fill()/openProjectEditor() is not cheap --
+    each pulls in a dozen-plus other combos and DOM ids -- so, like that
+    precedent, this pins the two lines and their order rather than running
+    them; Task 7's browser acceptance exercises the real thing end to end."""
+    js = _js(srv)
+    fill = _plainfn(js, "fill")
+    assert '$("ed-account").value=j.account||"";' in fill
+    assert fill.index('$("ed-account").value=j.account||"";') < fill.index("paintJobAccount(true);"), \
+        "the stored account must be written onto the hidden input before the keep=true redraw reads it back"
+
+    ope = _plainfn(js, "openProjectEditor")
+    assert '$("pj-account").value=(p&&p.account)||"";' in ope
+    assert ope.index('$("pj-account").value=(p&&p.account)||"";') < ope.index("paintProjectAccount(true);"), \
+        "same for the project's own account"
+    assert '$("sec-account").value=sec.account||"";' in ope
+    assert ope.index('$("sec-account").value=sec.account||"";') < ope.index('paintSecurityAccount(true);'), \
+        "same for the Security block's account"

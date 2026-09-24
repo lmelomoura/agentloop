@@ -2600,8 +2600,15 @@
   }
   async function loadAccounts(id) {
     if (!ACCOUNT_PLATFORMS.includes(id)) return;
+    live.busy[id] = true;
+    paint();
     const j = await post("platform_accounts", { platform: id });
-    if (j && Array.isArray(j.accounts)) live.accounts[id] = j.accounts;
+    if (j && Array.isArray(j.accounts)) {
+      live.accounts[id] = j.accounts;
+      const f = live.acctForm[id];
+      if (f && f.mode === "edit" && !j.accounts.some((a) => a.id === f.id)) delete live.acctForm[id];
+    }
+    live.busy[id] = false;
     paint();
   }
   function accountStatusText(platform, check) {
@@ -2627,17 +2634,18 @@
     name.appendChild(el("span", null, a.dir + " \xB7 " + accountUsersText(a.used_by)));
     const st = accountStatusText(r.id, a.check);
     const sl = el("span", "acct-st" + (st.ok === true ? " ok" : st.ok === false ? " err" : ""));
-    sl.appendChild(icon(st.ok === false ? "xcircle" : "check"));
+    sl.appendChild(icon(st.ok === false ? "xcircle" : st.ok === true ? "check" : "clock"));
     sl.appendChild(document.createTextNode(st.text));
     name.appendChild(sl);
     row.appendChild(name);
     const meta = el("div", "mmeta");
     if (!a.builtin) {
+      const locked = live.busy[r.id] || !!live.acctForm[r.id];
       meta.appendChild(button("Edit", "pencil", () => {
         live.acctForm[r.id] = { mode: "edit", id: a.id, name: a.name, dir: a.dir };
         paint();
-      }, live.busy[r.id]));
-      meta.appendChild(button("Remove", "trash", () => removeAccount(r.id, a), live.busy[r.id]));
+      }, locked));
+      meta.appendChild(button("Remove", "trash", () => removeAccount(r.id, a), locked));
     }
     row.appendChild(meta);
     return row;
@@ -3251,5 +3259,5 @@
     newerModelNotes
   };
 })();
-/* ui-bundle: 69d3882c6a38f32662f4430bb9a3bb5ea52a64d52db19bae02213320c4800a0f */
-/* ui-sources: 9a730dc81786957889a8207df1d4896875bf6b28961ba1fce362eed65eb4211e */
+/* ui-bundle: fc575a3181da9a36a004f8420388e453f1b1d2970009ee49ec87c5de25ccca5c */
+/* ui-sources: 84ec16060aa1881b3815f3cf78e472cff4c2712760a6e1eed3fffc9011b304ef */
