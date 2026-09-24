@@ -291,6 +291,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   excluding either function outright — so any OTHER by-id write later
   added to either command is still caught.
 
+- **A security analysis on OpenCode no longer prints `write error: Broken
+  pipe` while picking a tools-capable model.** The fallback that skips a
+  model the catalog marks `tools: false` (`security_derived_jobs`) piped a
+  `while` loop's candidates into `head -1`: `head` closed its end the
+  moment it had one line, and a SECOND tools-capable model's `printf`, a
+  beat later, wrote into a reader that was already gone — harmless (the
+  right id still came out) but noisy, ~24 lines of it in one CI run, and
+  predates #77. The loop now reads its candidates from a heredoc instead of
+  a live pipe, and stops with `break` the moment it finds one, so there is
+  never a second write racing an already-closed reader.
+
 - **A schema bump that only adds journal-sourced columns fills them in
   place, instead of re-indexing every run.** PR #77's `account`/
   `account_dir` columns bumped the index's `SCHEMA_VERSION`, and `ingest()`

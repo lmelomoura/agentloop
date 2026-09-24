@@ -535,7 +535,21 @@ security_derived_jobs() {
     # marks `tools: false` cannot do any of that; fall back to the first
     # enabled one, with the warning the other fallbacks give.
     if [ "$splat" = opencode ] && [ -n "$smodel" ] && ! opencode_catalog_tools "$smodel"; then
-      local stools; stools="$(platform_models_enabled opencode | while IFS= read -r mid; do opencode_catalog_tools "$mid" && printf '%s\n' "$mid"; done | head -1)"
+      # A live pipe from this loop into `head -1` used to close as soon as
+      # head had its one line -- and a SECOND tools-capable model's printf
+      # then wrote into a reader that was already gone. Harmless ($stools
+      # still came out right; the exit status was never read) but noisy:
+      # bash logs a write error for that write, ~24 lines of it in one CI
+      # run. Fed from a heredoc instead -- the candidate list is read whole,
+      # up front, never streamed through a live pipe -- and stopped with
+      # `break` the moment a tools-capable model is found, so there is never
+      # a second write racing an already-closed reader.
+      local stools mid; stools=""
+      while IFS= read -r mid; do
+        if opencode_catalog_tools "$mid"; then stools="$mid"; break; fi
+      done <<EOF
+$(platform_models_enabled opencode)
+EOF
       security_warn "security: project '$project' names a model that makes no tool calls ('$smodel') -- an analysis needs tools; using ${stools:-nothing, the analysis will be refused at launch}"
       smodel="$stools"
     fi
