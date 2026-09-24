@@ -20,6 +20,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Each unit of an analysis is given one job, and told how it is checked.**
+  The CLI mints the prompt of every unit from the ledger: a triage unit's
+  rows with every location each one has (a re-report replaces the stored
+  list), a read unit's line ranges with the rows already recorded in those
+  files and the hunting guides its files call for, a hunt unit's profile,
+  a verify unit's finding. Every prompt forbids closing the analysis and
+  names the subagent tool its platform closes, invokes the skill by name on
+  Claude Code and OpenCode (by path on Codex), and says how its work is
+  proven — on Codex, where no shell read can be proven from the stream, a
+  read unit reads through `agentloop security read`.
+
 - **An analysis is planned as units the engine runs and judges.** The plan
   is triage batches of 25 rows (the scanners' findings and the agent
   findings the last analysis left open), one reachability pass, and — in a
