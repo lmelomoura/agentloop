@@ -334,17 +334,22 @@ export function accountNoneLabel(inheritName){
   return inheritName ? "— Project's account (" + inheritName + ") —" : "— Default —";
 }
 
-// The Account combo's options: the Default by name, then every registered
-// account with its directory. `current` -- the value already on screen --
-// joins the end: flagged when accountGone says Settings truly no longer has
-// it (the editor shows the truth instead of rewriting the job, as it does
-// for a switched-off model), or under its own bare id, unflagged, while the
-// page simply does not know yet -- never a false "not in Settings" on a
-// perfectly good account because /api/models has not answered.
+// The Account combo's options: the Default with its directory -- the one
+// /api/models names for the platform (`default_dir`: the install's pin or
+// ~/.claude, CODEX_HOME or ~/.codex), plain "Default" while it names none --
+// then every registered account with its directory. `current` -- the value
+// already on screen -- joins the end: flagged when accountGone says Settings
+// truly no longer has it (the editor shows the truth instead of rewriting
+// the job, as it does for a switched-off model), or under its own bare id,
+// unflagged, while the page simply does not know yet -- never a false "not
+// in Settings" on a perfectly good account because /api/models has not
+// answered.
 export const ACCOUNT_GONE_SUFFIX = " (not in Settings)";
 export function accountOptions(platform, platforms, current){
   const list = accountsOf(platform, platforms);
-  const opts = [{v: "default", label: "Default"}]
+  const p = (platforms || {})[platformKey(platform)];
+  const ddir = (p && typeof p.default_dir === "string") ? p.default_dir : "";
+  const opts = [{v: "default", label: ddir ? "Default — " + ddir : "Default"}]
     .concat(list.map(a => ({v: a.id, label: a.name + " — " + a.dir})));
   if(current && current !== "default" && !list.some(a => a.id === current)){
     opts.push(accountGone(platform, current, platforms)

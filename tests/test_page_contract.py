@@ -11966,6 +11966,78 @@ def test_an_unchecked_account_draws_a_neutral_icon(srv, tmp_path):
     assert out["err"] == "xcircle"
 
 
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_an_account_row_keeps_who_uses_it_off_the_directory_line(srv, tmp_path):
+    """The directory and "used by ..." shared one span, and `.mname span` is
+    nowrap with an ellipsis: a long directory cut off who runs on the
+    account, the one thing Remove is refused over. The directory may still
+    ellipsize; who uses the account is an element of its own, which the
+    stylesheet lets wrap. Runs the real accountRow, and reads the rule off
+    ui/css/pages.css."""
+    app = _app_js(srv)
+    deps = "\n".join(_plainfn(app, n) for n in ("el", "button", "accountStatusText", "accountUsersText", "accountRow"))
+    script = tmp_path / "account-row-users.js"
+    script.write_text("""
+    class FakeElement {
+      constructor(tag){ this.tagName = tag; this.className = ""; this.childNodes = []; }
+      appendChild(c){ this.childNodes.push(c); return c; }
+      addEventListener(){}
+    }
+    const document = {
+      createElement: (tag) => new FakeElement(tag),
+      createTextNode: (t) => ({textContent: String(t)}),
+    };
+    function icon(_name){ return document.createElement("span"); }
+    """ + deps + """
+    const live = {busy: {}, acctForm: {}};
+    const dir = "~/Library/Application Support/Clients/Alpha Corporation/claude-config";
+    const row = accountRow({id: "anthropic"}, {id: "a", name: "Client A", dir,
+                            used_by: {jobs: ["j1", "j2"], projects: ["P"], security: []}, check: null});
+    const name = row.childNodes[0];
+    console.log(JSON.stringify(name.childNodes.map(c => ({tag: c.tagName, cls: c.className, text: c.textContent || ""}))));
+    """)
+    kids = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    by_text = {k["text"]: k for k in kids}
+    long_dir = "~/Library/Application Support/Clients/Alpha Corporation/claude-config"
+    assert long_dir in by_text, f"the directory is a line of its own, and only the directory: {kids}"
+    assert by_text[long_dir]["tag"] == "span"
+    users = by_text.get("used by 2 jobs, 1 project")
+    assert users, f"who uses the account is an element of its own, never glued to the directory: {kids}"
+    assert users["cls"] == "acct-users"
+    css = (REPO / "ui" / "css" / "pages.css").read_text()
+    rule = re.search(r"\.mname \.acct-users\{([^}]*)\}", css)
+    assert rule and "white-space:normal" in rule.group(1), \
+        "`.mname span` ellipsizes; the users line has to be let wrap, or a long list is cut off the same way"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_default_option_names_its_directory_when_the_server_does(srv, tmp_path):
+    """The spec's option is "Default — <dir>", like every registered account's
+    "Name — dir"; /api/models carries the Default's directory per account
+    platform (`default_dir`, ~-relative). Without it -- an older server, or
+    the registry not loaded yet -- the option stays plain "Default"."""
+    js = _app_js(srv)
+    deps = (_const(js, "KNOWN_PLATFORMS") + _const(js, "ACCOUNT_GONE_SUFFIX")
+            + "\n".join(_plainfn(js, n) for n in ("platformKey", "accountsOf", "accountGone", "accountOptions")))
+    script = tmp_path / "default-dir.js"
+    script.write_text(deps + """
+    const P = {anthropic: {default_dir: "~/.claude-work", accounts: [{id: "a", name: "Client A", dir: "~/.claude-a"}]},
+               openai: {default_dir: "", accounts: []}};
+    console.log(JSON.stringify({
+      named: accountOptions("anthropic", P, ""),
+      empty: accountOptions("openai", P, "")[0],
+      absent: accountOptions("anthropic", {anthropic: {accounts: []}}, "")[0],
+      unknown: accountOptions("anthropic", {}, "")[0],
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["named"] == [{"v": "default", "label": "Default — ~/.claude-work"},
+                            {"v": "a", "label": "Client A — ~/.claude-a"}]
+    assert out["empty"] == {"v": "default", "label": "Default"}
+    assert out["absent"] == {"v": "default", "label": "Default"}
+    assert out["unknown"] == {"v": "default", "label": "Default"}
+
+
 def test_reopening_an_editor_redraws_the_stored_account_with_keep(srv):
     """fill() and openProjectEditor() each draw their Account combo(s) TWICE
     on open: once through applyPlatformToJobEditor/applyPlatformToSecurity's

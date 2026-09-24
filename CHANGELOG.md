@@ -24,8 +24,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Claude or Codex account they pick.** A client who signs in to several
   Claude and Codex accounts — one config directory each — registers them in
   Settings › Platforms beside the install's own Default: Settings lists
-  every account of Anthropic and OpenAI with its session and who runs on
-  it, and adds, edits and removes them, one at a time — an account Settings
+  every account of Anthropic and OpenAI with its directory, who runs on it
+  and its session — each on a line of its own, so a long directory never
+  hides who uses the account — and adds, edits and removes them, one at a
+  time — an account Settings
   no longer has stays visible and flagged, never hidden and never flagged
   before Settings has actually answered, rather than disappearing behind a
   save the engine would refuse — the same from the terminal: `agentloop
@@ -42,8 +44,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   dialog names the account, and its reopen line carries the variable.
   A job, a project and a security block pick one (`account`): the job,
   project and Security editors pick Platform → Account → Model, the
-  Account combo showing only where there is a choice, and re-picking a
-  platform already showing leaves its account alone. A job inherits its
+  Account combo showing only where there is a choice and naming the Default
+  with its directory (*Default — ~/.claude*, the pin when there is one,
+  from `default_dir` in `/api/models`), and re-picking a platform already
+  showing leaves its account alone. A job inherits its
   project's when both run on the same platform, an analysis its project's
   on the same terms; `set-field`, `create` and `project-set` refuse an
   account the platform does not have, and a job whose effective platform

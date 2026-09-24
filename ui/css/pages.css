@@ -2349,8 +2349,11 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 .mmeta .jobs{display:inline-flex;align-items:center;font-size:11px;font-weight:600;color:var(--accent);background:var(--accent-soft);border-radius:20px;padding:0 8px;line-height:18px}
 .mempty{padding:16px 20px 18px;border-top:1px solid var(--line2);font-size:12.5px;color:var(--muted)}
 /* Settings › Platforms, Accounts: read like Models -- one row per account;
-   its state is a line of its own under the directory, allowed to wrap (a
-   reason names a directory and a command); the add/edit form is a row too. */
+   under the name, the directory (it may ellipsize, like a model's line),
+   then who runs on the account and its state, each a line of its own that
+   wraps instead (a long directory must never hide who uses the account, and
+   a reason names a directory and a command); the add/edit form is a row too. */
+.mname .acct-users{white-space:normal;overflow:visible}
 .mname .acct-st{display:flex;align-items:center;gap:6px;white-space:normal;margin-top:2px}
 .mname .acct-st .ic{width:13px;height:13px;flex:none}
 .mname .acct-st.ok{color:var(--ok)} .mname .acct-st.err{color:var(--err)}

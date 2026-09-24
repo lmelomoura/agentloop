@@ -10,6 +10,7 @@ is what keeps the two from drifting, the way the backoff curve test does.
 """
 import json
 import os
+import plistlib
 import subprocess
 import time
 from pathlib import Path
@@ -863,3 +864,90 @@ def test_the_server_lets_account_through_set_field():
     src = (REPO / "bin" / "agentloop-server").read_text()
     allow = src[src.index('elif op == "set_field"'):][:900]
     assert '"account"' in allow
+
+
+def _tick_plist(home, env):
+    agents = home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    with open(agents / "com.agentloop.tick.plist", "wb") as f:
+        plistlib.dump({"Label": "com.agentloop.tick", "EnvironmentVariables": env}, f)
+
+
+def _default_dirs(srv):
+    p = srv.list_models()["platforms"]
+    return p["anthropic"].get("default_dir"), p["openai"].get("default_dir"), "default_dir" in p["opencode"]
+
+
+def test_api_models_names_each_account_platform_s_default_directory(srv, tmp_path, monkeypatch):
+    """The editors label the Default "Default — <dir>", and /api/models is
+    all they read. The directory is the engine's account_default_dir: the
+    install's pin -- the variable, else what the tick's plist names -- else
+    ~/.claude; the engine's CODEX_HOME, else ~/.codex. Shown ~-relative under
+    the home, the way a registered account's is typed. OpenCode has none."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _write_platforms(srv, {"anthropic": {"enabled": True, "bin": "", "models": []},
+                           "openai": {"enabled": True, "bin": "", "models": []},
+                           "opencode": {"enabled": False, "bin": "", "models": []}})
+    assert _default_dirs(srv) == ("~/.claude", "~/.codex", False)
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_CONFIG_DIR", "~/.claude-work/")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-x") + "/")
+    assert _default_dirs(srv) == ("~/.claude-work", str(tmp_path / "codex-x"), False)
+    # The variable empty: the pin the last install wrote into the tick's plist.
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_CONFIG_DIR", "")
+    _tick_plist(home, {"AGENTLOOP_CLAUDE_CONFIG_DIR": str(home / ".claude-pinned")})
+    assert _default_dirs(srv)[0] == "~/.claude-pinned"
+    _tick_plist(home, {"CLAUDE_CONFIG_DIR": "/Volumes/Work/.claude-old"})   # an install older than the engine's own key
+    assert _default_dirs(srv)[0] == "/Volumes/Work/.claude-old"
+    monkeypatch.setenv("AGENTLOOP_CLAUDE_CONFIG_DIR", "relative/pin")   # not an absolute directory: no pin
+    assert _default_dirs(srv)[0] == "~/.claude"
+
+
+@pytest.mark.parametrize("pin, plist_env, codex_home", [
+    (None, None, None),
+    ("~/.claude-work/", None, None),
+    ("{home}/.claude", None, "{tmp}/codex-y//"),
+    ("", {"AGENTLOOP_CLAUDE_CONFIG_DIR": "{home}/.claude-pinned/"}, None),
+    ("", {"CLAUDE_CONFIG_DIR": "/Volumes/Work/.claude-old"}, None),
+    ("relative/pin", None, None),
+    ("/", None, None),
+], ids=["nothing", "pin-tilde-slash", "pin-is-cli-default", "plist-own-key", "plist-cli-key", "relative", "root"])
+def test_the_default_directory_is_the_engines_own(srv, tmp_path, monkeypatch, pin, plist_env, codex_home):
+    """Pinned to what `agentloop platform accounts` answers for the Default
+    under the very same environment -- the server mirrors installed_config_dir
+    and account_default_dir, and this is what keeps the two from drifting."""
+    home = tmp_path / "home"
+    home.mkdir()
+    fill = lambda s: s.replace("{home}", str(home)).replace("{tmp}", str(tmp_path))   # noqa: E731
+    env = dict(os.environ, HOME=str(home), AGENTLOOP_CONFIG=str(tmp_path / "config"), AGENTLOOP_DATA=str(tmp_path / "data"),
+               AGENTLOOP_CLAUDE_BIN=str(REPO / "test" / "fake-claude"), AGENTLOOP_CODEX_BIN=str(FAKE_CODEX),
+               AGENTLOOP_OPENCODE_BIN="/nonexistent/opencode")
+    env.pop("AGENTLOOP_CLAUDE_CONFIG_DIR", None)
+    env.pop("CODEX_HOME", None)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("AGENTLOOP_CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    if pin is not None:
+        env["AGENTLOOP_CLAUDE_CONFIG_DIR"] = fill(pin)
+        monkeypatch.setenv("AGENTLOOP_CLAUDE_CONFIG_DIR", fill(pin))
+    if codex_home is not None:
+        env["CODEX_HOME"] = fill(codex_home)
+        monkeypatch.setenv("CODEX_HOME", fill(codex_home))
+    if plist_env is not None:
+        _tick_plist(home, {k: fill(v) for k, v in plist_env.items()})
+    _write_platforms(srv, {"anthropic": {"enabled": True, "bin": "", "models": []},
+                           "openai": {"enabled": True, "bin": "", "models": []}})
+
+    def engine_default(p):
+        out = subprocess.run(["/bin/bash", str(ENGINE), "platform", "accounts", p],
+                             capture_output=True, text=True, env=env, check=True).stdout
+        return json.loads(out)[0]["dir"]
+
+    def expanded(d):
+        return str(home) + d[1:] if d == "~" or d.startswith("~/") else d
+
+    a, o, _ = _default_dirs(srv)
+    assert expanded(a) == engine_default("anthropic")
+    assert expanded(o) == engine_default("openai")

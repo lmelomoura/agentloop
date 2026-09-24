@@ -193,7 +193,11 @@ function accountRow(r, a){
   const row = el("div", "mrow");
   const name = el("div", "mname");
   name.appendChild(el("b", null, a.builtin ? "Default — the install's own" : a.name));
-  name.appendChild(el("span", null, a.dir + " · " + accountUsersText(a.used_by)));
+  // The directory may ellipsize (`.mname span`); who runs on the account is
+  // a line of its own that wraps instead -- the one fact Remove is refused
+  // over, so a long directory must never be able to push it out of sight.
+  name.appendChild(el("span", null, a.dir));
+  name.appendChild(el("span", "acct-users", accountUsersText(a.used_by)));
   const st = accountStatusText(r.id, a.check);
   const sl = el("span", "acct-st" + (st.ok === true ? " ok" : st.ok === false ? " err" : ""));
   // ok is null until the account has been checked -- neither the green

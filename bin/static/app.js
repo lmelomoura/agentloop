@@ -418,7 +418,9 @@
   var ACCOUNT_GONE_SUFFIX = " (not in Settings)";
   function accountOptions(platform, platforms, current) {
     const list = accountsOf(platform, platforms);
-    const opts = [{ v: "default", label: "Default" }].concat(list.map((a) => ({ v: a.id, label: a.name + " \u2014 " + a.dir })));
+    const p = (platforms || {})[platformKey(platform)];
+    const ddir = p && typeof p.default_dir === "string" ? p.default_dir : "";
+    const opts = [{ v: "default", label: ddir ? "Default \u2014 " + ddir : "Default" }].concat(list.map((a) => ({ v: a.id, label: a.name + " \u2014 " + a.dir })));
     if (current && current !== "default" && !list.some((a) => a.id === current)) {
       opts.push(accountGone(platform, current, platforms) ? { v: current, label: current + ACCOUNT_GONE_SUFFIX, flagged: true } : { v: current, label: current });
     }
@@ -2636,7 +2638,8 @@
     const row = el("div", "mrow");
     const name = el("div", "mname");
     name.appendChild(el("b", null, a.builtin ? "Default \u2014 the install's own" : a.name));
-    name.appendChild(el("span", null, a.dir + " \xB7 " + accountUsersText(a.used_by)));
+    name.appendChild(el("span", null, a.dir));
+    name.appendChild(el("span", "acct-users", accountUsersText(a.used_by)));
     const st = accountStatusText(r.id, a.check);
     const sl = el("span", "acct-st" + (st.ok === true ? " ok" : st.ok === false ? " err" : ""));
     sl.appendChild(icon(st.ok === false ? "xcircle" : st.ok === true ? "check" : "clock"));
@@ -3271,5 +3274,5 @@
     newerModelNotes
   };
 })();
-/* ui-bundle: e69e7302b59cd75f3bb9e0c7c206b26879eda95ea440d7ce6b1994632a3a5d3f */
-/* ui-sources: 07de7283ba56edb0ea96d6e98b947251f24ecd224fd4cb0775a5a99485f0263d */
+/* ui-bundle: ae70d7abbcc70ee332cb721bca160073ca2a3f364ab1bcc8a2cacef81673ea91 */
+/* ui-sources: 303ead1be8b8fc9661215e0c8145e093e9cffbff0e6f69b2956ccff86d5cb470 */
