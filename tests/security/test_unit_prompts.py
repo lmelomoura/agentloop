@@ -59,6 +59,7 @@ def test_a_triage_unit_lists_each_row_with_what_it_is():
     assert "[carried] " + "c" * 64 + " · sast/xss · high · src/View.php:12 · by agent" in out
     assert "re-report it under the fingerprint given" in out
     assert "agentloop security report-gone" in out and "no `candidate`" in out
+    assert "a gone claim without that reading is not counted" in out
 
 
 def test_a_scanner_row_whose_severity_changed_shows_the_scanner_s_too():

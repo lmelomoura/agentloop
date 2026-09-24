@@ -59,6 +59,9 @@ def test_the_triage_floor_is_the_close_s_own():
 
 
 def test_a_carried_sast_finding_reported_gone_is_settled_and_a_deterministic_one_is_not(conn):
+    """Fix 3: a `sast` gone claim also needs its file read (here, `a.py`,
+    the occurrence `_agent` records) -- a `dependency` one is never settled
+    by `report-gone` at all, whatever it reads."""
     prev = _analysis(conn, commit="c0")
     _agent(conn, prev, "c" * 64)
     ledger.finish_analysis(conn, prev, "done")
@@ -68,7 +71,8 @@ def test_a_carried_sast_finding_reported_gone_is_settled_and_a_deterministic_one
         {"fingerprint": "d" * 64, "kind": "carried", "category": "dependency"}]})
     ledger.record_gone(conn, uid, "c" * 64, "the handler was deleted")
     ledger.record_gone(conn, uid, "d" * 64, "not how a dependency row is settled")
-    done, remaining, ev, note = units.judge(conn, ledger.get_unit(conn, uid), _session(), "success")
+    done, remaining, ev, note = units.judge(
+        conn, ledger.get_unit(conn, uid), _session({"a.py": [(1, 5)]}), "success")
     assert remaining == {"items": [{"fingerprint": "d" * 64, "kind": "carried", "category": "dependency"}]}
 
 
@@ -516,7 +520,115 @@ def test_a_report_gone_an_attempt_with_a_subagent_made_does_not_count_for_its_co
     second = _fanned_out(conn, first, tmp_path)
     assert units.judge(conn, second, _session(), "success")[:2] == (False, {"items": [item]})
     ledger.record_gone(conn, second["id"], "c" * 64, "the handler was deleted in this commit")
-    assert units.judge(conn, second, _session(), "success")[:2] == (True, None)
+    assert units.judge(conn, second, _session({"a.py": [(1, 5)]}), "success")[:2] == (True, None), \
+        "Fix 3: attempt 2's own claim is credited once attempt 2 also reads the file"
+
+
+def test_a_gone_claim_is_owed_until_its_file_is_read_and_the_note_names_it(conn):
+    """Fix 3. `report-gone` used to be credited on any non-empty reason, so a
+    triage unit could mark a carried vulnerability `fixed` without ever
+    reading the file it was in -- the one non-conservative triage outcome
+    this tool has. Now the claim needs the file too: unread, with no
+    checkout known (`root=""`, the judge's default), it stays owed and the
+    note names the file; read by the session, it settles."""
+    prev = _analysis(conn, commit="c0")
+    _agent(conn, prev, "c" * 64)
+    ledger.finish_analysis(conn, prev, "done")
+    aid = _analysis(conn)
+    item = {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    ledger.record_gone(conn, uid, "c" * 64, "the handler was deleted")
+    unit = ledger.get_unit(conn, uid)
+    done, remaining, ev, note = units.judge(conn, unit, _session(), "success")
+    assert (done, remaining) == (False, {"items": [item]})
+    assert "reported gone without reading a.py" in note
+    done, remaining, ev, note = units.judge(conn, unit, _session({"a.py": [(1, 5)]}), "success")
+    assert (done, remaining) == (True, None)
+
+
+def test_a_gone_claim_is_settled_by_the_file_s_absence_only_when_the_checkout_is_known(conn, tmp_path):
+    """The other half of the rule: a file gone from `root` needs no reading.
+    But `root=""` -- the judge's default, "no checkout known" -- cannot tell
+    absence from anything else, so it never settles a claim on its own: the
+    same empty `tmp_path`, where `a.py` truly does not exist, settles the
+    claim only once it is actually given as `root`."""
+    prev = _analysis(conn, commit="c0")
+    _agent(conn, prev, "c" * 64)
+    ledger.finish_analysis(conn, prev, "done")
+    aid = _analysis(conn)
+    item = {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    ledger.record_gone(conn, uid, "c" * 64, "the handler was deleted")
+    unit = ledger.get_unit(conn, uid)
+    assert units.judge(conn, unit, _session(), "success")[:2] == (False, {"items": [item]}), \
+        "no root given: absence cannot be checked"
+    assert units.judge(conn, unit, _session(), "success", root=str(tmp_path))[:2] == (True, None), \
+        "a.py does not exist in this checkout"
+
+
+def test_a_gone_claim_for_a_finding_in_two_files_is_owed_until_both_are_accounted_for(conn, tmp_path):
+    prev = _analysis(conn, commit="c0")
+    ledger.record_finding(conn, prev, {
+        "fingerprint": "c" * 64, "category": "sast", "rule": "xss", "severity": "medium",
+        "title": "t", "rationale": "the agent read it", "producer": "agent",
+        "occurrences": [{"file": "a.py", "line": 3}, {"file": "b.py", "line": 9}]})
+    ledger.finish_analysis(conn, prev, "done")
+    aid = _analysis(conn)
+    item = {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    ledger.record_gone(conn, uid, "c" * 64, "both handlers were deleted")
+    unit = ledger.get_unit(conn, uid)
+    (tmp_path / "b.py").write_text("x")   # exists: needs its own reading, unlike a.py below
+    done, remaining, ev, note = units.judge(
+        conn, unit, _session({"a.py": [(1, 5)]}), "success", root=str(tmp_path))
+    assert (done, remaining) == (False, {"items": [item]})
+    assert "reported gone without reading b.py" in note
+    done, remaining, ev, note = units.judge(
+        conn, unit, _session({"a.py": [(1, 5)], "b.py": [(1, 1)]}), "success", root=str(tmp_path))
+    assert (done, remaining) == (True, None)
+
+
+def test_a_gone_claim_s_occurrence_outside_the_checkout_is_never_settled_by_absence(conn, tmp_path):
+    """An occurrence's `file` is unvalidated data from a previous analysis --
+    nothing upstream refuses a `..` escape or an absolute path when it is
+    written. Such a path is not "gone from the checkout": were it joined
+    onto `root` raw, a path built to exist nowhere would settle the claim by
+    an absence that never checked this repository at all. `_unread_files`
+    reuses `evidence.relative_path`'s own containment rule instead, so the
+    claim stays owed -- exactly as if `root` were unknown."""
+    prev = _analysis(conn, commit="c0")
+    ledger.record_finding(conn, prev, {
+        "fingerprint": "c" * 64, "category": "sast", "rule": "xss", "severity": "medium",
+        "title": "t", "rationale": "the agent read it", "producer": "agent",
+        "occurrences": [{"file": "../../../../nonexistent-outside-the-checkout-xyz", "line": 1}]})
+    ledger.finish_analysis(conn, prev, "done")
+    aid = _analysis(conn)
+    item = {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    ledger.record_gone(conn, uid, "c" * 64, "the handler was deleted")
+    unit = ledger.get_unit(conn, uid)
+    done, remaining, ev, note = units.judge(conn, unit, _session(), "success", root=str(tmp_path))
+    assert (done, remaining) == (False, {"items": [item]}), \
+        "an escaping path is not 'gone from the checkout' -- it is unaccounted for"
+
+
+def test_a_gone_claim_s_file_served_by_security_read_counts_like_a_stream_read(conn):
+    """`security read`'s own record (`ledger.unit_reads`, joined onto the
+    session by `with_served` before `close` ever judges) is the only proof
+    of reading on a platform whose shell reads cannot be proven from the
+    stream (Codex) -- a gone claim is provable from it exactly as from a
+    Read tool call."""
+    prev = _analysis(conn, commit="c0")
+    _agent(conn, prev, "c" * 64)
+    ledger.finish_analysis(conn, prev, "done")
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [
+        {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}]})
+    ledger.start_unit(conn, uid)
+    ledger.record_gone(conn, uid, "c" * 64, "the handler was deleted")
+    ledger.record_unit_read(conn, uid, "a.py", 1, 3)      # what `security read` served it
+    out = units.close(conn, ledger.get_unit(conn, uid), status="success")
+    assert out == {"state": "done", "continuation": None}
 
 
 @pytest.mark.parametrize("status, reason, done", [

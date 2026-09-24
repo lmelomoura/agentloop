@@ -34,6 +34,7 @@ launching a subagent did -- and counting that last one would close its
 continuation with no work done.
 """
 
+import os
 import sqlite3
 
 from . import diff, evidence, ledger, queries, slices
@@ -41,7 +42,9 @@ from . import diff, evidence, ledger, queries, slices
 TRIAGE_BATCH = 25
 MAX_ATTEMPTS = 3
 # The close's own floor (cli.TRIAGE_BLOCKING, pinned equal by a test): a
-# scanner row below it never blocks `done`, so it never keeps a unit open.
+# scanner row keeps a unit open only while it is at this floor or above, at
+# the severity its scanner filed OR the one it holds now -- below BOTH, it
+# never blocks `done` (`_judge_triage`).
 BLOCKING = ("critical", "high", "medium")
 KIND_RANK = {"triage": 0, "hunt": 1, "read": 2, "verify": 3}
 _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -212,16 +215,63 @@ def _judge_read(unit, session):
     return False, remaining, ev, f"{len(left)} of {len(wanted)} range(s) not read in full."
 
 
-def _judge_triage(conn, unit):
+def _unread_files(occurrences, session, root) -> list:
+    """The files among a `report-gone` claim's OCCURRENCES still unaccounted
+    for, sorted -- what the note names, and what keeps the claim owed while
+    it is non-empty.
+
+    A file leaves this list by a read (`session.reads`, which already
+    carries what `security read` served -- `evidence.with_served`, joined
+    in by `units.close` before the judge ever runs) or by its own absence,
+    proven against `root`, the run's checkout. `root=""` means no checkout
+    is known: absence cannot be told from anything else then, so only a
+    read clears a file.
+
+    CONTAINED THE SAME WAY A READ IS (`evidence.relative_path`). An
+    occurrence's `file` is unvalidated data from a PREVIOUS analysis --
+    nothing upstream refuses an absolute path or a `..` escape when it is
+    written (`ledger.record_finding` checks only that it names A file, never
+    where). Joining it onto `root` raw and asking the filesystem would turn a
+    crafted occurrence into a probe of whatever `os.path.exists` can see
+    outside the checkout -- and, worse, a path built to exist nowhere would
+    settle a `gone` claim by an absence that never checked this repository at
+    all. A file `relative_path` cannot place inside `root` is left
+    unaccounted for instead -- not proven gone, not proven read -- so it
+    stays owed exactly as it would with no checkout known."""
+    files = sorted({o["file"] for o in occurrences if ledger.names_a_file(o)})
+    unread = []
+    for f in files:
+        if f in session.reads:
+            continue                                          # opened by this unit
+        if root:
+            rel = evidence.relative_path(f, root)
+            if rel is not None and not os.path.exists(os.path.join(root, rel)):
+                continue                                      # gone from the checkout, proven
+        unread.append(f)
+    return unread
+
+
+def _judge_triage(conn, unit, session, root):
     """Which of its rows this unit settled, by ITS OWN writes alone.
 
     A scanner row counts once this unit's re-report marked it triaged
     (`finding.unit` names the unit), or when it sits below the floor both at
     the severity its scanner filed and at the one it holds now. A carried
     row counts once this unit re-reported it into this analysis, or -- a
-    `sast` one -- said it is gone (`report-gone`, ledger.gone_by). Either
-    counts when the operator decided it: a human's ruling needs nobody's
-    reading.
+    `sast` one -- said it is gone (`report-gone`, ledger.gone_by) AND PROVED
+    IT: every file the previous analysis recorded an occurrence in for that
+    finding is either read by this unit (`_unread_files`) or gone from
+    `root`. Either counts when the operator decided it: a human's ruling
+    needs nobody's reading.
+
+    A REASON IS WORDS; A READING IS EVIDENCE. `report-gone`'s door already
+    refuses an empty reason, but any non-empty one used to be credited on
+    its own -- so a continuation could close a carried vulnerability
+    `fixed` on a one-word reason with no file ever opened. Of every triage
+    outcome this is the one that is not conservative (a re-report, however
+    wrong, only keeps a finding open one run longer; a wrongly credited
+    `gone` marks a real vulnerability fixed), so it is the one held to a
+    reading rather than to a sentence.
 
     FAIL-CLOSED ON A RACE, KNOWINGLY. Another unit that re-reports one of
     these rows after this one moves `finding.unit` to itself, and this
@@ -233,7 +283,14 @@ def _judge_triage(conn, unit):
     decided = ledger.decisions_for(conn, project)
     gone = ledger.gone_by(conn, uid)
     owed = unit["payload"].get("items") or []
+    # {fingerprint: occurrences}, of the CARRIED rows the checklist compares
+    # this analysis against -- built only once a gone claim actually needs
+    # it, from the same computation `triage_items` plans this unit from (no
+    # raw SQL of its own: `checklist` already carries a carried row's
+    # occurrences, from the previous analysis that recorded them).
+    carried_occurrences = None
     left = []
+    gone_notes = []
     for item in owed:
         fp = item["fingerprint"]
         if fp in decided:
@@ -274,17 +331,30 @@ def _judge_triage(conn, unit):
         elif mine:
             continue
         elif item.get("category") == "sast" and fp in gone:
-            # A carried sast finding this unit read and SAID is gone
-            # (`report-gone`): its absence from this analysis is a reading,
-            # not a silence, and it closes `fixed`.
-            continue
+            # A carried sast finding this unit SAID is gone -- settled only
+            # once it is PROVED, never on the reason alone (see the
+            # docstring). `carried_occurrences` is the previous analysis's
+            # own record of where the finding was; a fingerprint absent from
+            # it (a hand-built item in a test, never a planned one) has no
+            # file to prove, so it settles like any other empty debt.
+            if carried_occurrences is None:
+                _an, findings = queries.checklist(conn, aid)
+                carried_occurrences = {f["fingerprint"]: f.get("occurrences") or []
+                                       for f in findings if f.get("analysis_id") != aid}
+            unread = _unread_files(carried_occurrences.get(fp) or [], session, root)
+            if not unread:
+                continue
+            gone_notes.append(f"reported gone without reading {', '.join(unread)}")
         # The continuation's item carries the severity on: its floor is
         # judged by the scanner's, however the row has been rewritten since.
         left.append({k: item[k] for k in ("fingerprint", "kind", "category", "severity") if k in item})
     ev = {"items": len(owed), "missing": [i["fingerprint"] for i in left]}
     if not left:
         return True, None, ev, f"Triaged: {len(owed)} row(s)."
-    return False, {"items": left}, ev, f"{len(left)} of {len(owed)} row(s) not triaged by this unit."
+    note = f"{len(left)} of {len(owed)} row(s) not triaged by this unit."
+    if gone_notes:
+        note += " " + " ".join(gone_notes)
+    return False, {"items": left}, ev, note
 
 
 def _judge_verify(conn, unit):
@@ -314,10 +384,13 @@ def _judge_hunt(status, reason):
         f"The run ended {status}{': ' + reason if reason else ''}.")
 
 
-def judge(conn, unit, session, status, reason=""):
+def judge(conn, unit, session, status, reason="", root=""):
     """(done, remaining, evidence, note) for one run of `unit`. `remaining`
     is the payload of the continuation -- only what is still owed -- or None
-    for "all of it again".
+    for "all of it again". `root`, the run's checkout, is read only by a
+    triage unit's gone claims (`_judge_triage`, `_unread_files`); the
+    default -- no checkout known -- lets such a claim be settled by a
+    reading alone, never by a file's absence.
 
     A SESSION THAT LAUNCHED A SUBAGENT FAILS ITS ATTEMPT, WHATEVER ITS KIND.
     The engine distributes the work; a triage, a hunt or a verdict a
@@ -337,7 +410,7 @@ def judge(conn, unit, session, status, reason=""):
     if unit["kind"] == "read":
         done, remaining, ev, note = _judge_read(unit, session)
     elif unit["kind"] == "triage":
-        done, remaining, ev, note = _judge_triage(conn, unit)
+        done, remaining, ev, note = _judge_triage(conn, unit, session, root)
     elif unit["kind"] == "verify":
         done, remaining, ev, note = _judge_verify(conn, unit)
     else:
@@ -533,7 +606,11 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     # guards the case anyway, for whatever calls `reset_unit` outside that
     # rule -- a test, a future caller -- rather than leaning on the rule alone.
     session = evidence.with_served(session, ledger.unit_reads(conn, unit["id"], since=unit["started"]))
-    done, remaining, ev, note = judge(conn, unit, session, status, reason)
+    # `root` is passed on for a triage unit's gone claims (_judge_triage,
+    # _unread_files): what proves a claimed-gone file's ABSENCE. What proves
+    # a READ of it is already on `session` above, whichever kind of unit
+    # this is.
+    done, remaining, ev, note = judge(conn, unit, session, status, reason, root=root)
     clear = None
     if session.tasks and unit["kind"] == "verify":
         # A VERDICT NOBODY CAN PROVE THIS UNIT REASONED MUST NOT STAND. The

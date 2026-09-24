@@ -216,8 +216,9 @@ def _triage(context):
         "  still there -> re-report it under the fingerprint given, with the full",
         "  `candidate`; genuinely gone -> say so, with the reason, through",
         "  `agentloop security report-gone --analysis <id> --fingerprint <fp>`",
-        "  (stdin: {\"reason\": \"...\"}). Silence proves nothing and keeps this",
-        "  unit open.",
+        "  (stdin: {\"reason\": \"...\"}). Read every file the row is in first, or confirm",
+        "  it no longer exists: a gone claim without that reading is not counted,",
+        "  whatever the reason says. Silence proves nothing and keeps this unit open.",
         "",
         "ROWS",
     ]

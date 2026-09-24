@@ -71,9 +71,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   only with what carries its own id — the rows it re-reported, what it said
   is gone, the verdict it wrote — so nothing a disqualified attempt wrote
   closes the attempt after it, and a disqualified verification's verdict is
-  cleared at its close. A unit is settled and its continuation planned in
-  one transaction, two callers can never both write a plan, and a deep
-  analysis is never planned without its inventory.
+  cleared at its close. A carried finding said to be gone settles only once
+  every file it was found in has been read by the unit or is gone from the
+  checkout — a reason alone used to be enough, and a vulnerability could be
+  marked fixed without anyone opening its file. A unit is settled and its
+  continuation planned in one transaction, two callers can never both write
+  a plan, and a deep analysis is never planned without its inventory.
 
 - **What a unit read is proven from its own stream.** A read counts only
   the lines its result carried — Claude Code's `tool_use_result` range, or
