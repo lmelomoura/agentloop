@@ -378,6 +378,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **CI answers in about five minutes instead of fifteen to twenty-two, with
+  every test still run exactly once.** The three jobs took 16, 14 and 22
+  minutes on GitHub's three-core macOS runner. Now: the pytest suites run one
+  worker per core (`pytest-xdist`, pinned); the end-to-end suite runs as two
+  jobs of its own (`E2E_LISTS="1 2"` / `"3 4"`) while the selftest job skips
+  it (`AGENTLOOP_SELFTEST_E2E=separate`, honoured on GitHub Actions only —
+  anywhere else it fails the selftest, so it cannot become a local opt-out);
+  and the e2e's four worker lists are rebalanced — "new scenarios go into the
+  last list" had made list 4 take 297 s against 109 / 85 / 70 s, so four
+  workers waited on it; they are 109 / 155 / 145 / 152 s now, and the whole
+  e2e went from ~300 s to ~160 s locally. Measured locally (10 cores, idle):
+  security engines-off 518 s → 50 s, engines-on 782 s → 90 s (178 s at three
+  workers, a runner's count), server suite 35 s → 10 s. `prepare` stopped
+  paying for what it does not use: it probed the version of all four engines
+  on every run, switched off or not — semgrep's `--version` alone is a python
+  start-up — and now probes only the engines `engine_path` reaches, and not
+  semgrep under `--offline`, which skips the SAST pre-pass anyway (an
+  engines-off `prepare` 0.8 s → 0.09 s, engines-on 1.7 s → 0.8 s). Two
+  tests reported their dozens of setup findings in-process instead of one
+  python start-up each (26 s → 1 s apiece). Two tests that failed under load
+  were fixed: the phases-at-once timing had counted those four probes, and
+  the budget-caps test patched `time.sleep` for every module, so a
+  `subprocess` wait on a loaded machine ended its pass after one launch. Two
+  assertions left stale by the empty-files count (`files_empty`) were
+  updated; they had kept the security suite red on `main`.
 - **The security-analysis skill is written for a unit, not for a whole
   analysis.** It opens with the rules every unit follows — what qualifies
   as a finding, the reporting door, the closed rule vocabulary, never a

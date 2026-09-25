@@ -61,6 +61,12 @@ env:
 
   PYTHON_VERSION: "3.13"
 
+  # The pytest suites run one worker per core (`-n auto`). Pinned like the
+  # engines, and for a smaller version of the same reason: a new release that
+  # changed how tests are distributed or reported would change what a green
+  # run means (the skip guard below reads `-rs` lines) without a commit here.
+  PYTEST_XDIST_VERSION: "3.8.0"
+
   # Fixed here rather than left to Trivy's per-platform default
   # (~/Library/Caches/trivy on macOS), so the cache step below and the engine
   # both name one path.
@@ -70,7 +76,16 @@ jobs:
 
   # ---------------------------------------------------------------- fast gate
   #
-  # Seconds, and it fails first when something obvious is wrong.
+  # The selftest without its end-to-end suite (that is the `e2e` job below),
+  # then the server suite. About five minutes.
+  #
+  # THE JOBS ARE SPLIT FOR WALL-CLOCK, NOT FOR TIDINESS. This used to be one
+  # job of ~16 minutes on GitHub's three-core macOS runner (measured
+  # 2026-09-25: selftest 15m13s, of which the e2e 10m12s, then the server
+  # suite 54s), next to two security jobs of ~14 and ~21 minutes. Every test
+  # still runs exactly once; five jobs of about five minutes answer sooner
+  # than three of fifteen to twenty. Five is also the free plan's macOS
+  # concurrency, so a sixth job would queue rather than help.
   checks:
     name: selftest and server suite
     # macOS, AND THAT IS NOT A PREFERENCE. `cmd_selftest` (test/selftest.sh,
@@ -96,7 +111,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - run: python -m pip install --disable-pip-version-check --quiet pytest
+      - run: python -m pip install --disable-pip-version-check --quiet pytest "pytest-xdist==${PYTEST_XDIST_VERSION}"
 
       - name: the tools the shell suite shells out to
         run: |
@@ -127,6 +142,10 @@ jobs:
           printf '  ok    seeded config/jobs.json from the example\n'
 
       - name: agentloop selftest
+        # `separate` hands the end-to-end suite to the `e2e` job below; the
+        # selftest honours it on GitHub Actions only, and prints that it did.
+        env:
+          AGENTLOOP_SELFTEST_E2E: separate
         run: bin/agentloop selftest
 
       - name: the server suite
@@ -134,8 +153,50 @@ jobs:
         # `security` job below, run twice, and running it a third time to no
         # extra purpose is what "economical" rules out. This is the rest of
         # `pytest tests/` — the journal, the API and the dashboard page
-        # contract, which shells out to `node`. About 16 seconds.
-        run: python -m pytest tests/ -q --ignore=tests/security
+        # contract, which shells out to `node`. One worker per core: each test
+        # gets its own tmp tree and its own server module (conftest.py's
+        # session fixture is per worker).
+        run: python -m pytest tests/ -q --ignore=tests/security -n auto --dist loadgroup
+
+  # ------------------------------------------------------ the end-to-end suite
+  #
+  # test/e2e.test.sh, which the selftest runs inside itself everywhere except
+  # here. Its four worker lists each run in a sandbox of their own
+  # (test/sandbox-<n>), so two jobs of two lists are the same scenarios in the
+  # same sandboxes as one job of four -- on two runners instead of four
+  # workers crowding one three-core machine, where the four took ten minutes.
+  # BOTH HALVES ARE SPELLED OUT, and between them they name all four lists:
+  # a list missing from this matrix is a quarter of the suite nobody runs.
+  e2e:
+    name: end-to-end suite (lists ${{ matrix.lists }})
+    runs-on: macos-latest   # BSD date, as the selftest job above
+    strategy:
+      fail-fast: false
+      matrix:
+        lists: ["1 2", "3 4"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: the tools the shell suite shells out to
+        run: |
+          rc=0
+          for tool in git jq node shasum; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              printf '  ok    %s\n' "$tool"
+            else
+              printf '  FAIL  %s is not on PATH\n' "$tool"; rc=1
+            fi
+          done
+          exit $rc
+
+      - name: test/e2e.test.sh
+        env:
+          E2E_LISTS: ${{ matrix.lists }}
+        run: bash test/e2e.test.sh
 
   # ----------------------------------------------------- the two configurations
   #
@@ -196,7 +257,7 @@ jobs:
           python -m pip install --disable-pip-version-check --quiet \
             "semgrep==${SEMGREP_VERSION}"
 
-      - run: python -m pip install --disable-pip-version-check --quiet pytest
+      - run: python -m pip install --disable-pip-version-check --quiet pytest "pytest-xdist==${PYTEST_XDIST_VERSION}"
 
       - name: the four engines answer, at the versions this suite was measured against
         run: |
@@ -273,7 +334,13 @@ jobs:
           # while collecting, and this step reads that exit code directly
           # (which the in-suite version could not, having only a child's
           # stdout to parse).
-          python -m pytest tests/security/ -q -rs $deselect 2>&1 | tee result.txt
+          # `-n auto`: one worker per core. Every test works in its own
+          # tmp_path, and the ones that swap an engine's binary or the switch
+          # do it with monkeypatch inside their own worker process. Workers'
+          # trivy processes do read the one vulnerability database at once;
+          # measured green, both configurations, repeatedly at 3 and 10
+          # workers before this was turned on (2026-09-25).
+          python -m pytest tests/security/ -q -rs -n auto --dist loadgroup $deselect 2>&1 | tee result.txt
 
       - name: nothing was skipped for want of an engine
         run: |

@@ -1439,8 +1439,16 @@ def cmd_prepare(args):
     # still fails the whole prepare, after the others have been waited for,
     # so no scanner is left running under a dead parent.
     # The engines' versions, probed once and first, on a machine nothing
-    # else of this phase has loaded yet: see `engines.warm_versions`.
-    engines.warm_versions()
+    # else of this phase has loaded yet: see `engines.warm_versions`. Only
+    # the engines this run can reach: a switched-off engine's version is
+    # never read (every `version_of` caller sits behind `engine_path`), and
+    # probing it anyway launched all four binaries -- semgrep's `--version`
+    # is a whole python start-up -- on every prepare of an engines-off run.
+    # Semgrep is the SAST pre-pass alone, which `--offline` skips outright
+    # (`_scan_sast`), so an offline prepare does not ask it either.
+    engines.warm_versions(tuple(
+        n for n in engines.PURGE
+        if adapters.engine_path(n) and not (args.offline and n == "semgrep")))
     started = time.perf_counter()
     def _progress(text):
         print(f"prepare: {text}", file=sys.stderr, flush=True)

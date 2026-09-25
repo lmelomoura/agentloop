@@ -43,13 +43,17 @@ def _open(db, project, branch, commit, aid_profile="quick", repo=None):
 
 
 def _finding(db, aid, fingerprint, severity="high", title="a finding",
-             rule="sql-injection", category="sast", path="app/x.py", line=1):
+             rule="sql-injection", category="sast", path="app/x.py", line=1,
+             run=None):
     payload = {"fingerprint": fingerprint, "category": category, "rule": rule,
                "severity": severity, "title": title,
                "rationale": "because", "remediation": "fix it",
                "occurrences": [{"file": path, "line": line}]}
     if category == "sast":
         payload["candidate"] = SAST_CANDIDATE
+    if run is not None:
+        run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
+        return
     out = subprocess.run([sys.executable, str(CLI), "report-finding", "--analysis",
                           str(aid), "--db", str(db)],
                          input=json.dumps(payload), capture_output=True,
@@ -110,7 +114,7 @@ def test_the_json_is_the_same_document_parsed(tmp_path):
     assert doc["branches"][0]["open"][0]["fingerprint"] == "a" * 64
 
 
-def test_it_reaches_past_the_first_page(tmp_path):
+def test_it_reaches_past_the_first_page(tmp_path, cli_inproc):
     # finding_rows caps a page at MAX_PER_PAGE; a document that stops there
     # would be silently short, which is the one failure an agent cannot see.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "bin"))
@@ -119,8 +123,11 @@ def test_it_reaches_past_the_first_page(tmp_path):
     db = tmp_path / "l.db"
     aid = _prepared(db, tmp_path, "web", "main", "abc0000000000000")
     n = MAX_PER_PAGE + 7
+    # The findings are scaffolding, reported in-process (conftest's
+    # `cli_inproc`): a python start-up each was most of this test's time.
+    # The verb under test, export-findings, still runs as a subprocess.
     for i in range(n):
-        _finding(db, aid, f"{i:064x}", title=f"finding {i}")
+        _finding(db, aid, f"{i:064x}", title=f"finding {i}", run=cli_inproc)
     _close(db, aid)
     doc = json.loads(_run(db, "export-findings", "--project", "web",
                           "--format", "json").stdout)

@@ -6461,6 +6461,43 @@ def test_the_phases_run_at_once_and_the_progress_says_so(tmp_path, monkeypatch, 
         "scope", "secrets", "hygiene", "dependencies", "sbom", "iac", "sast-prepass"]
 
 
+def test_prepare_probes_the_version_of_only_the_engines_it_can_reach(tmp_path, monkeypatch):
+    """`warm_versions` used to probe all four binaries whatever the switch
+    said, so every prepare of an engines-off run launched gitleaks, trivy,
+    syft and semgrep (`--version` is a whole python start-up there) for a
+    version nothing would read: every `version_of` caller sits behind
+    `engine_path`. It probes exactly what `engine_path` reaches now."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    db = tmp_path / "security.db"
+    probed = []
+    monkeypatch.setattr(security_cli.engines, "version_of",
+                        lambda name: probed.append(name) or None)
+    for name in ("_scan_secrets", "_scan_dependencies", "_scan_iac", "_scan_sbom", "_scan_sast"):
+        monkeypatch.setattr(security_cli, name, lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("stop after the probes")))
+
+    def prepare(aid, *offline):
+        with pytest.raises(RuntimeError, match="stop after the probes"):
+            security_cli.main(["prepare", "--analysis", str(aid), "--root", str(root),
+                               *offline, "--db", str(db)])
+
+    monkeypatch.setattr(security_cli.adapters, "engine_path", lambda name: None)
+    prepare(open_analysis(db), "--offline")
+    prepare(open_analysis(db, commit="a2", run_id="r1b"))
+    assert probed == [], "an engines-off prepare launched a version probe"
+
+    monkeypatch.setattr(security_cli.adapters, "engine_path",
+                        lambda name: f"/usr/bin/{name}" if name in ("trivy", "semgrep") else None)
+    prepare(open_analysis(db, commit="b", run_id="r2"))
+    assert sorted(probed) == ["semgrep", "trivy"]
+    # Offline, the SAST pre-pass -- semgrep's only phase -- does not run, so
+    # its version is not asked for either.
+    probed.clear()
+    prepare(open_analysis(db, commit="c", run_id="r3"), "--offline")
+    assert probed == ["trivy"]
+
+
 # ------------------------------------------------ the hunting guides
 
 def test_prepare_recommends_guides_by_the_profile_and_checklist_prints_them(tmp_path):

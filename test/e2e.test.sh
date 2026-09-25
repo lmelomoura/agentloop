@@ -1760,24 +1760,33 @@ echo
 # resumes 14's and reads 12's `mi`, 31 resumes 30's), and a contiguous range
 # preserves every such order without anyone having to find the rest. They
 # were balanced on measured durations (2026-09-13: 312 s in all, the two
-# security analyses 37 s each, most others 4-5 s): 79 / 82 / 72 / 78 s. A new
+# security analyses 37 s each, most others 4-5 s): 79 / 82 / 72 / 78 s.
+# REBALANCED 2026-09-25, because "a new scenario goes into the last list" had
+# made the last list the suite: 38-56 measured 297 s against 109 / 85 / 70 s
+# for the other three, so four workers took as long as that one list. The
+# pipeline scenarios (42, 46, 50: 30-38 s each) and the rest since 47 are
+# heavy. Re-measured per scenario (561 s in all), the ranges are now 109 /
+# 155 / 145 / 152 s. (A list starting at 24 was tried and failed: 24 leans on
+# state that 20-23 leave in the sandbox, so 20 stays a list's first.) A new
 # scenario goes at the END of the file and into the LAST list, or, if it is
 # heavy, wherever it keeps the lists within a few seconds of each other --
-# and the count assertion below fails if it is forgotten from every list.
+# re-measure when the last list grows -- and the count assertion below fails
+# if it is forgotten from every list.
 E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
-E2E_LIST_2="20 21 22 23 24 25 26"
-E2E_LIST_3="27 28 29 30 31 32 33 33b 34 35 35b 36 37"
-E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56"
+E2E_LIST_2="20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37"
+E2E_LIST_3="38 39 40 41 41b 41c 42 43 44 45 46"
+E2E_LIST_4="47 48 49 50 51 52 53 54 55 56"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to
 # be done in passing by scenario 12 (openai) and scenario 28 (opencode), and
 # every later scenario leaned on that without saying so -- which held only
 # while all of them ran in one sandbox in file order, and broke the moment a
-# worker started at 20 or 38. Done here, per sandbox, and still done again by
-# 12 and 28 where they always were: both are idempotent, and 28 in
-# particular deletes and reseeds platforms.json around its own resolve.
+# worker started at 20 or 38 (or 47, since 2026-09-25). Done here, per
+# sandbox, and still done again by 12 and 28 where they always were: both are
+# idempotent, and 28 in particular deletes and reseeds platforms.json around
+# its own resolve.
 e2e_catalogs() {
   cp "$REPO/config/pricing.example.json" "$ROOT/config/pricing.json"
   "$AL" resolve-models openai >/dev/null 2>&1
@@ -1805,13 +1814,34 @@ if [ "$_listed" != "$_all" ]; then
   exit 2
 fi
 
+# E2E_LISTS names which of the four lists this invocation runs, side by side
+# as always -- default all four. It exists for CI, which runs the suite as two
+# jobs ("1 2" and "3 4") on two machines instead of four workers on one
+# three-core runner, where they took ten minutes. Each list already runs in a
+# sandbox of its own, so a subset is exactly the same scenarios in the same
+# sandboxes; what CI must guarantee is that its jobs name all four between
+# them, and ci.yml spells them out. Only in the four-worker mode: the
+# one-sandbox mode is the file order, and a subset of it is not.
+E2E_LISTS="${E2E_LISTS:-1 2 3 4}"
+_seen=""
+for _w in $E2E_LISTS; do
+  case "$_w" in 1|2|3|4) ;; *) echo "E2E_LISTS names lists 1-4 (got '$_w')" >&2; exit 2 ;; esac
+  case " $_seen " in *" $_w "*) echo "E2E_LISTS names list $_w twice" >&2; exit 2 ;; esac
+  _seen="$_seen $_w"
+done
+if [ -z "$_seen" ]; then echo "E2E_LISTS names no list" >&2; exit 2; fi
+if [ "$E2E_WORKERS" = 1 ] && [ "$E2E_LISTS" != "1 2 3 4" ]; then
+  echo "E2E_LISTS applies to E2E_WORKERS=4 only: E2E_WORKERS=1 is the whole file order" >&2
+  exit 2
+fi
+
 if [ "$E2E_WORKERS" = 1 ]; then
   trap 'rm -rf "$E2E/sandbox"' EXIT
   e2e_run_list "$E2E/sandbox" $E2E_ALL
 else
   trap 'rm -rf "$E2E"/sandbox-[1-4] "$E2E"/e2e-out-[1-4] "$E2E"/e2e-rc-[1-4]' EXIT
   _pids=""
-  for _w in 1 2 3 4; do
+  for _w in $E2E_LISTS; do
     eval "_list=\$E2E_LIST_$_w"
     # a subshell: pass/fail are its own and come back through a file, because
     # a child cannot hand a variable to its parent
@@ -1821,7 +1851,7 @@ else
   done
   for _p in $_pids; do wait "$_p"; done
   pass=0; fail=0
-  for _w in 1 2 3 4; do
+  for _w in $E2E_LISTS; do
     cat "$E2E/e2e-out-$_w"
     read -r _p _f < "$E2E/e2e-rc-$_w"
     pass=$((pass + _p)); fail=$((fail + _f))
