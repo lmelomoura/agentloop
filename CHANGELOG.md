@@ -539,6 +539,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The e2e check that a stopped analysis leaves nothing behind waits as long
+  as the engine promises.** Scenario 56 gave the stopped analysis's lock 60 s
+  to clear; a GitHub runner took longer to wind the unit down (its close and
+  its worktree removal), and the check failed while the engine was within the
+  300 s it grants its units (`STOP_GRACE_SECONDS`). The check now uses that
+  bound and still exits as soon as the lock is gone.
 - **The security-close selftest block hands its fixture a stream, like every
   real close does.** `security_close_analysis`'s two real call sites in
   `bin/agentloop` (a run's own end, and a run stopped before its agent
