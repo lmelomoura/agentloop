@@ -614,6 +614,23 @@ EOF
     # run_job). This sentence is what jobs_json needs a prompt for, and it says
     # so to anyone who opens the job.
     prompt="This job runs only as a unit of a security analysis: each unit's prompt is minted by \`agentloop security unit-prompt\`."
+    # security_parallel's own validation, inlined rather than called: every
+    # $( ) forks a subshell, and SECURITY_WARNINGS is a bash LOCAL that
+    # dynamic scoping only reaches from the same process -- a security_warn
+    # raised inside a command substitution updates the subshell's own copy
+    # and is gone the moment it exits, never reaching this function's
+    # SECURITY_WARNINGS and never flushed to derivation-warnings.txt. Calling
+    # `security_parallel "$project"` for `--arg par` below did exactly that.
+    local par
+    par="$(security_get "$project" '.parallel' '')"
+    case "$par" in
+      ''|null) par=3 ;;
+      *[!0-9]*) security_warn "security: project '$project' has a non-numeric parallel ('$par') -- running 3 units at a time"
+                par=3 ;;
+      *) par=$(( 10#$par ))
+         [ "$par" -lt 1 ] && par=1
+         [ "$par" -gt 8 ] && par=8 ;;
+    esac
     # Build the element FIRST and only then commit to it. The separator used to
     # be printed before this jq ran, so anything that made jq exit without
     # stdout -- a `tonumber` on a budget the user typed as "abc" was enough --
@@ -632,7 +649,7 @@ EOF
       --arg perm "$perm" \
       --arg account "$sacct" \
       --arg notools "$(security_disallowed_tools "$splat")" \
-      --arg par "$(security_parallel "$project")" \
+      --arg par "$par" \
       '{id:$id, project:$project, prompt:$prompt, model:$model, platform:$platform,
         account:$account,
         description:"Security analysis (derived from the project, not a job you created).",
@@ -1112,7 +1129,13 @@ security_resume_orphans() {
     jid="$(basename "$(dirname "$d")")"
     [ "$(slots_active "$jid")" -eq 0 ] || continue
     aid="$(cat "$d/analysis" 2>/dev/null)"
-    rm -rf "$d"
+    # lock_break, not a bare rm -rf: the judgement above (dead by slot_alive
+    # or older than the grace) and the removal are two separate moments, and
+    # a manual `agentloop security analyze`/`resume` can win a fresh mkdir on
+    # this exact path in between -- the same check-then-act race lock_take
+    # closes elsewhere (line 1458). lock_break only removes the directory
+    # while it still names the owner just judged gone.
+    lock_break "$d" "$(lock_id "$d")" "$pid"
     case "$aid" in ''|*[!0-9]*) continue ;; esac
     row="$(security_engine_py analysis --id "$aid" 2>/dev/null)"
     state="$(printf '%s' "$row" | "$JQ" -r '.state // empty' 2>/dev/null)"
@@ -1127,7 +1150,7 @@ security_resume_orphans() {
     security_engine_py resume --analysis "$aid" --automatic >/dev/null 2>&1 || continue
     security_launch_detached "$jid" "$aid" "$(printf '%s' "$row" | "$JQ" -r '.branch')" \
       "$(printf '%s' "$row" | "$JQ" -r '.repo')"
-    log_tick "$jid: analysis $aid resumed automatically ($((resumes + 1))/$SECURITY_MAX_AUTO_RESUMES) — its orchestrator had died"
+    log_tick "$jid: analysis $aid resumed automatically ($(( $(num "$resumes" 0) + 1 ))/$SECURITY_MAX_AUTO_RESUMES) — its orchestrator had died"
   done
 }
 
@@ -1303,12 +1326,18 @@ cmd_security_resume() { # cmd_security_resume <project> <analysis-id>
 # The ids come from the run's own environment and nowhere else: the request
 # file is rewritten by the NEXT `security analyze` of the project, and a close
 # that read it would land on another analysis's unit.
-security_close_analysis() { # <job-id> <status> <cost> <wdreason> [stream]
+security_close_analysis() { # <job-id> <status> <cost> <wdreason> [stream] [root]
   case "$1" in "$SECURITY_JOB_PREFIX"*) ;; *) return 0 ;; esac
   local aid="${AL_SECURITY_ANALYSIS_ID:-}" uid="${AL_SECURITY_UNIT_ID:-}"
   [ -n "$aid" ] && [ -n "$uid" ] || return 0
+  # $6 wins over the dynamically-scoped `run_cwd`: this is called from
+  # run_job's own body (where run_cwd is a live local, and no $6 is given),
+  # but also from run_record_stopped_early, reached through the EXIT trap
+  # after run_job's frame -- and its locals -- may already be gone, where
+  # run_cwd would silently read empty. A caller outside run_job passes its
+  # own root explicitly instead of hoping dynamic scope still reaches it.
   security_engine_py unit-close --analysis "$aid" --unit "$uid" \
-    --stream "${5:-}" --root "${run_cwd:-}" --status "$2" --reason "${4:-}" \
+    --stream "${5:-}" --root "${6:-${run_cwd:-}}" --status "$2" --reason "${4:-}" \
     --spend "${3:-0}" >/dev/null 2>&1 \
     || log_tick "$1: could not close unit $uid of analysis $aid"
 }
@@ -4061,6 +4090,18 @@ run_record_stopped_early() { # <id> <slot-dir>
     mkdir -p "$LOG_DIR/$id" 2>/dev/null || true
     logf="$LOG_DIR/$id/$(date -u -r "$start" +%Y%m%dT%H%M%SZ 2>/dev/null || date -u +%Y%m%dT%H%M%SZ)-$(basename "$slot").json"
   fi
+  # The unit's stream and worktree, evidence already paid for when the agent
+  # ran ($slot/child), not derived fresh: run_job names the stream next to
+  # $slot/logfile's own path (same $stamp, ".stream.ndjson" for ".json"), and
+  # $slot/worktree already holds the run's root. Closing the unit with
+  # neither (as this used to) throws that evidence away even when it is
+  # sitting on disk -- the same stream and root a run that reached its own
+  # classifier would have handed the close.
+  local stream=""
+  if [ -f "$slot/child" ]; then
+    local cand="${logf%.json}.stream.ndjson"
+    [ -f "$cand" ] && stream="$cand"
+  fi
   "$JQ" -nc --arg r "$note" --arg sid "$sid" '{is_error:false, subtype:"stopped_by_user", num_turns:0,
     session_id:$sid, stop_reason:"stopped_by_user",
     result:("**Stopped.**\n\n"+$r)}' > "$logf" 2>/dev/null || logf=""
@@ -4075,7 +4116,7 @@ run_record_stopped_early() { # <id> <slot-dir>
   # The run's verdict is `stopped`, which the unit's close continues at the
   # same attempt (nothing else; a job that is not derived returns at once),
   # the same close the classifier gives a run stopped after its agent ran.
-  security_close_analysis "$id" stopped 0 "$note"
+  security_close_analysis "$id" stopped 0 "$note" "$stream" "$wt"
   if [ -f "$slot/child" ]; then
     log_tick "$id: stopped by the user after its agent had already run"
   else
@@ -5272,13 +5313,23 @@ cmd_stop() { # <id> [run-pid] — stop ONE run (by its run-pid) or, with no pid,
   # frees. The orchestrator stops its units itself (it calls back here with
   # AL_SECURITY_ORCHESTRATOR set) and leaves the analysis `interrupted`.
   case "$id" in "$SECURITY_JOB_PREFIX"*)
-    if [ -z "${AL_SECURITY_ORCHESTRATOR:-}" ] && lock_active "$id/.analysis"; then
+    if [ -z "${AL_SECURITY_ORCHESTRATOR:-}" ] && security_analysis_live "$id"; then
       local opid; opid="$(cat "$LOCK_DIR/$id/.analysis/pid" 2>/dev/null)"
       case "$opid" in
         ''|0|*[!0-9]*) ;;
         *) log_tick "$id: stop asked for its analysis $(stop_origin)"
            kill -TERM "$opid" 2>/dev/null \
              && echo "stopping the analysis of $id (orchestrator pid $opid)"
+           # Also reach the job's own slots, not just the orchestrator: a unit
+           # the orchestrator launched moments ago can already hold a slot
+           # (it takes one before its agent starts, bin/agentloop ~6235)
+           # while the orchestrator is still inside its own STOP_GRACE_SECONDS
+           # wait. Left alone, that unit would run to the end unseen. Stopping
+           # it here is harmless even when it is not there yet or already
+           # gone (_stop_slot's own checks cover both), and a `stopped` unit
+           # simply continues -- the orchestrator judges it -- at the same
+           # attempt.
+           for d in "$LOCK_DIR/$id"/*/; do [ -d "$d" ] || continue; _stop_slot "$id" "$d"; done
            return 0 ;;
       esac
     fi ;;

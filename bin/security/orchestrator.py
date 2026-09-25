@@ -70,7 +70,10 @@ LAUNCH_STRIKES = 3
 # orchestrator leaves it `running`: the close then names it "never finished",
 # and a resume judges it again. Never reset instead (see the docstring).
 JUDGE_TRIES = 5
-STOP_GRACE_SECONDS = 300
+# Overridable only for a test that needs the wait itself to be short -- the
+# production default is the number an operator actually needs a unit's agent
+# to notice a TERM and close cleanly, never something a test should wait out.
+STOP_GRACE_SECONDS = int(os.environ.get("AL_SECURITY_STOP_GRACE_SECONDS") or 300)
 # Spends are sums of floats: ten units of 0.10 add up to 0.9999999999999999.
 _CENT_EPSILON = 1e-9
 CLI = Path(__file__).resolve().parent / "cli.py"
@@ -541,15 +544,23 @@ class Orchestrator:
     def _interrupt(self) -> int:
         self._set_phase("stopping")
         self.log("stopping its units")
-        if self.children or self.adopted:
+        deadline = time.time() + STOP_GRACE_SECONDS
+        # Re-issue the stop on every poll, not once: a unit launched just
+        # before this loop started can still be between claiming its slot
+        # and spawning its agent (bin/agentloop's run_job, ~6235) when the
+        # first `stop` runs, so that first call never reaches it -- the slot
+        # it takes appears only afterwards. A second `stop` during THIS wait
+        # does reach it (cmd_stop now stops the job's slots too), so keep
+        # asking until nothing is left alive or the grace runs out.
+        while (self.children or self.adopted) and time.time() < deadline:
             try:
                 subprocess.run([self.engine, "stop", self.job], capture_output=True, timeout=120,
                                env={**self.env, "AL_SECURITY_ORCHESTRATOR": "1"})
             except (OSError, subprocess.SubprocessError) as exc:
                 self.log(f"could not ask the engine to stop the units: {exc}")
-        deadline = time.time() + STOP_GRACE_SECONDS
-        while (self.children or self.adopted) and time.time() < deadline:
             self._reap()
+            if not (self.children or self.adopted):
+                break
             time.sleep(min(self.poll, 1.0))
         # Past the grace, a unit whose run is STILL ALIVE stays `running`: its
         # own close settles it whenever it ends, and a resume adopts it. One

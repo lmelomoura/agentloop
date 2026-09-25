@@ -1080,6 +1080,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the trigger when there is more room there) and closes on any scroll or
   resize, the way a native select does.
 
+- **A stop now reaches a unit that was still claiming its slot, and keeps
+  the evidence a stopped unit already paid for.** The orchestrator asked the
+  engine to stop an analysis's units once, then just waited out the grace: a
+  unit that took its slot a moment later ran its agent to the end unseen. It
+  now re-asks on every poll of that wait, and the engine's own `stop`, once
+  it has signalled the orchestrator, also reaches the job's slots directly.
+  A unit the operator stopped after its agent had already run used to close
+  with no stream and no root — proof already sitting on disk, thrown away —
+  and now closes with both, off the same breadcrumbs a normal close reads.
+  A Stop landing in the instant between an analysis lock's `mkdir` and its
+  pid being written used to read as "no runs in progress"; it now uses the
+  same liveness the rest of the engine gives that window. And a project
+  whose `security.parallel` was not a number logged the fallback warning
+  into a subshell that then discarded it, so `derivation-warnings.txt` never
+  said why the analysis ran at the default parallelism instead of the value
+  configured. `security_resume_orphans` also no longer removes a dead
+  orchestrator's lock with a plain `rm -rf`: a manual `agentloop security
+  analyze` or `resume` re-acquiring that exact path in between could have its
+  fresh lock deleted from under it; the removal now goes through the same
+  judged-then-close the engine already uses for this race elsewhere.
+
 ### Added
 
 - **A model the API keeps for a newer Claude Code is named, with the command

@@ -358,6 +358,31 @@ def test_a_stop_judges_what_a_run_that_died_without_its_close_had_read(world, mo
     assert _row(world)["state"] == "done", _row(world)["coverage_note"]
 
 
+def test_a_stop_reaches_a_unit_that_was_still_starting(world, monkeypatch):
+    """The engine's `stop` only reaches slots that exist AT THE MOMENT it runs
+    (bin/agentloop's cmd_stop / _stop_slot): a unit still claiming its slot
+    when the first `stop` fires takes it only afterwards, launches its agent,
+    and would otherwise run to the end unseen. `late-stop` stands in for that
+    unit -- it needs a SECOND `stop` call to end -- so this proves the
+    orchestrator's interrupt loop keeps re-issuing `stop` on every poll,
+    not just once, until nothing is left alive (or the grace runs out)."""
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "late-stop")
+    monkeypatch.setenv("AL_SECURITY_STOP_GRACE_SECONDS", "20")
+    proc = _spawn(world)
+    deadline = time.time() + 60
+    while time.time() < deadline and not any(u["state"] == "running" for u in _units(world)):
+        time.sleep(0.1)
+    proc.send_signal(signal.SIGTERM)
+    try:
+        assert proc.wait(timeout=15) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    assert _row(world)["state"] == "interrupted"
+    assert not any(u["state"] == "running" for u in _units(world))
+
+
 def test_the_close_never_settles_an_analysis_interrupted_under_it(world):
     """A stop, or the next Analyse's sweep, can interrupt the analysis while
     this loop is ending: the close is `--if-running`, so the row stays

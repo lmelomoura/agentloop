@@ -711,13 +711,19 @@ def test_a_hunt_is_done_when_its_run_worked(conn, status, reason, done):
     assert units.judge(conn, ledger.get_unit(conn, uid), _session(), status, reason)[0] is done
 
 
-def test_every_mark_that_truncates_a_hunt_is_one_the_engine_s_close_reads():
-    """`_TRUNCATED` mirrors how `security_close_analysis` (bin/agentloop)
-    reads a `warning`: a mark renamed there and not here would judge a
-    truncated hunt done, so the suite reads the engine's own case pattern."""
+def test_every_mark_that_truncates_a_hunt_is_one_the_engine_writes_into_its_reason():
+    """`_TRUNCATED` mirrors the `wdreason` strings `run_classify` (bin/agentloop)
+    writes when a run ended without finishing -- BUDGET LIMITED, UNDECLARED
+    ENDING -- and `wt_undelivered_work`'s UNDELIVERED. That reason is what
+    `unit-close --reason` passes on, unread by the engine itself since Task
+    11 removed its own case pattern over it: `judge` (bin/security/units.py,
+    `_judge_hunt`) is the only reader left, matching `mark in reason`. A mark
+    renamed on the engine's side and not here -- or vice versa -- would let a
+    truncated hunt's warning read as a pass, so the suite pins each mark to
+    the exact prefix the engine writes."""
     engine = ENGINE.read_text()
     for mark in units._TRUNCATED:
-        assert f'*"{mark}"*' in engine, f"{mark!r} is not a truncation mark of the engine's close"
+        assert f"{mark}: " in engine, f"{mark!r} is not a reason prefix the engine writes"
 
 
 def test_conclude_settles_done_and_plans_nothing(conn):

@@ -2330,7 +2330,8 @@ JSON
  {"name":"Oc","cwd":"/tmp/oc","security":{"enabled":true,"platform":"martian"}},
  {"name":"Oe","cwd":"/tmp/oe","security":{"enabled":true,"model":"claude-sonnet-5"}},
  {"name":"Of","cwd":"/tmp/of","security":{"enabled":true,"platform":"opencode","model":"pdm_ai/glm-5.3-flash","effort":"high"}},
- {"name":"Og","cwd":"/tmp/og","security":{"enabled":true,"platform":"opencode","model":"pdm_ai/vision"}}]}
+ {"name":"Og","cwd":"/tmp/og","security":{"enabled":true,"platform":"opencode","model":"pdm_ai/vision"}},
+ {"name":"Oh","cwd":"/tmp/oh","security":{"enabled":true,"parallel":"abc"}}]}
 JSON
   printf '{"jobs":[]}\n' > "$tmp/dplat/jobs.json"
   # pdm_ai/vision has to be ENABLED too, not just a valid catalog id: Og's
@@ -2380,6 +2381,19 @@ JSON
   grep -q "Broken pipe" "$tmp/dplat/og-stderr.txt" 2>/dev/null \
     && bad "the opencode tools fallback still closes its pipe early: $(cat "$tmp/dplat/og-stderr.txt")" \
     || ok "the opencode tools fallback prints no \"write error: Broken pipe\" while picking a model"
+
+  # A non-numeric security.parallel: max_parallel still clamps to 3, and the
+  # warning has to reach derivation-warnings.txt even though security_parallel
+  # (which raises it) is only ever read through a `--arg par "$( )"` inside
+  # jobs_json's own jq call -- a command substitution forks a subshell, and a
+  # security_warn raised inside one updates that subshell's own copy of
+  # SECURITY_WARNINGS, lost the moment it exits, never reaching this
+  # derivation's collection or the file it flushes to.
+  [ "$(dplat security-oh .max_parallel)" = "3" ] \
+    && ok "a non-numeric security.parallel still clamps to 3" || bad "Oh max_parallel: $(dplat security-oh .max_parallel)"
+  grep -q "has a non-numeric parallel ('abc') -- running 3 units at a time" "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null \
+    && ok "and the warning reaches derivation-warnings.txt, not just the subshell that raised it" \
+    || bad "no parallel warning for Oh: $(cat "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null)"
 
   # openai with no catalog resolved yet: platform_default_model answers
   # nothing for it, so the model must come out empty rather than some other
