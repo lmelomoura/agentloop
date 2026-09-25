@@ -9036,6 +9036,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and produced a textbook-clean record while doing it. A clean exit must now be
   claimed (`RUN COMPLETE:` / `NOTHING TO DO:` / `BLOCKED:`); an undeclared ending
   is a warning naming what to check.
+- **A running security unit showed no label on the Runs page.** A finished run's
+  "triage 2/5" comes from ingestion reading the precheck header; a live slot
+  carries the same label (`active_runs_for` already reads it), but the Runs
+  table's live rows are built by a separate function that dropped it on the
+  floor, so the row stayed blank for the whole time an operator most wants to
+  know which unit is running. `liveRuns()` now carries the slot's label
+  through, rendered the same text-only way a finished row's is.
 
 ## [0.1.0] — 2026-07-26
 

@@ -3171,7 +3171,12 @@ function liveRuns(){
                 duration:started?Math.max(0,now-started):0,
                 platform:ALApp.platformOf(j, j.project?projById(j.project):null),
                 model:j.model||"", model_id:"",
-                cost:null, session:s.session||"", project:j.project||"", live:true, pid:s.pid});
+                cost:null, session:s.session||"", project:j.project||"", live:true, pid:s.pid,
+                // Same field a finished row gets from ingestion (_unit_label,
+                // read off the precheck header) -- the slot already carries it
+                // (active_runs_for), so a running security unit's row can show
+                // "triage 2/5" too instead of going blank until it finishes.
+                label:s.label||""});
     }
   }
   return out.sort((a,b)=>b.start-a.start);
