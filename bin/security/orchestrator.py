@@ -114,9 +114,6 @@ _SESSION_VARS = ("AL_SECURITY_AGENT", "CC_SECURITY_AGENT",
                  "AL_SECURITY_UNIT_BUDGET")
 PREPARE_FAILED_NOTE = ("The deterministic phase did not complete -- a phase, or the planning "
                        "of the units, failed (see tick.log) -- so no unit ran.")
-NO_STREAM_NOTE = ("The run ended without its close and left no stream -- the only proof of "
-                  "what a session did, and of whether it launched a subagent -- so nothing "
-                  "it did counts.")
 STRUCK_OUT_NOTE = ("The engine could not run this unit: {n} runs ended without a close "
                    "(see tick.log).")
 STRUCK_OUT_OUTAGE_NOTE = ("The engine could not run this unit: {n} runs in a row were cut short "
@@ -786,20 +783,18 @@ class Orchestrator:
         started an agent, and see the module docstring for why that unit
         must not run again under the same id.
 
-        WITH ITS STREAM, through the one close (units.close), under
-        `stopped`. WITHOUT ONE, as a disqualified attempt: the stream is the
-        only proof of what the session did and of whether it launched a
-        subagent (a close without it would see none and credit whatever the
-        ledger holds), so nothing counts, and a verify unit's own verdict is
-        cleared in the settle's transaction (units.conclude) -- the whole
-        unit runs again at the same attempt."""
+        THROUGH THE ONE CLOSE (units.close), under `stopped`, with the stream
+        it left if one is found. Without one, that close judges it as a
+        disqualified attempt -- the stream is the only proof of what the
+        session did and of whether it launched a subagent, so nothing counts
+        and a verify unit's own verdict is cleared in the settle's
+        transaction -- and, being `stopped`, the whole unit runs again at the
+        same attempt. The rule lives in the close, not here, so the engine's
+        `unit-close` handed an empty stream is held to it too."""
         try:
-            stream = self._stream_of(unit, pid)
-            if stream:
-                out = units.close(self.conn, unit, stream=stream, root=_stream_root(stream),
-                                  status="stopped")
-            else:
-                out = self._disqualify(unit)
+            stream = self._stream_of(unit, pid) or ""
+            out = units.close(self.conn, unit, stream=stream,
+                              root=_stream_root(stream) if stream else "", status="stopped")
         except Exception as exc:  # noqa: BLE001 -- a unit must never stay `running` for ever
             tries = self.unjudged.get(unit["id"], [pid, 0])[1] + 1
             if tries >= JUDGE_TRIES:
@@ -813,19 +808,6 @@ class Orchestrator:
             return None
         self.unjudged.pop(unit["id"], None)
         return out
-
-    def _disqualify(self, unit):
-        unit = ledger.get_unit(self.conn, unit["id"])
-        if unit["state"] not in ("pending", "running"):
-            return {"state": unit["state"], "continuation": None}
-        ev = {"stream": "none", "guides": []}
-        if unit["kind"] == "read":
-            ev.update({"ranges": len(unit["payload"].get("ranges") or []), "covered": {}})
-        clear = None
-        if unit["kind"] == "verify":
-            clear = (unit["analysis_id"], unit["payload"].get("fingerprint", ""), f"unit:{unit['id']}")
-        return units.conclude(self.conn, unit, done=False, evidence=ev, note=NO_STREAM_NOTE,
-                              spend_usd=0.0, stopped=True, clear_verdict=clear)
 
     def _interrupt(self, note="") -> int:
         """Stop the units' runs and leave the analysis `interrupted` -- with

@@ -114,7 +114,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `unit-prompt` prints a unit's minted prompt — a triage row with every
   location it has, a read unit's files with what is already recorded or
   decided in them — `unit-close` judges a unit's run from its stream and
-  the ledger and plans what it left undone, `report-gone` lets a triage
+  the ledger and plans what it left undone (a run whose stream is missing,
+  empty or unreadable is credited with nothing it wrote or read, and a
+  verify unit's own verdict is cleared: the stream is the only proof of
+  whether its session launched a subagent), `report-gone` lets a triage
   unit say a carried finding is gone, with the reason, `units` prints the
   progress (per kind, and how much of a deep scope has been read, counted
   against the inventory itself), and `read` serves a file to a unit in

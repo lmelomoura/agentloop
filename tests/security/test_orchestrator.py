@@ -186,6 +186,20 @@ def test_a_verify_unit_whose_run_died_with_no_stream_keeps_no_verdict(world, mon
     assert _row(world)["state"] == "capped"
 
 
+def test_a_run_that_closes_with_no_stream_is_credited_with_nothing(world, monkeypatch):
+    """The rule is the close's, not only this loop's: a hunt run whose own
+    `unit-close` hands no stream is not `done` on its word, and after three
+    attempts that proved nothing the lineage is given up by name."""
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "no-stream-close")
+    assert _orchestrator(world).run() == 0
+    hunts = [u for u in _units(world) if u["kind"] == "hunt"]
+    assert [u["attempt"] for u in hunts] == [1, 2, 3]
+    assert all(u["evidence"].get("stream") == "none" for u in hunts)
+    assert hunts[-1]["state"] == "failed"
+    row = _row(world)
+    assert row["state"] == "capped" and "left no stream" in row["coverage_note"]
+
+
 def test_a_close_that_raises_is_retried_and_the_unit_is_never_reset(world, monkeypatch, tmp_path):
     """A unit whose run started an agent is never sent back to `pending` under
     the same id: an orphan agent's reads would be credited to the relaunch.

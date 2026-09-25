@@ -141,6 +141,27 @@ def parse(lines, root) -> Session:
     return Session(reads={p: merge_spans(s) for p, s in reads.items()}, tasks=tasks, guides=guides)
 
 
+def stream_proves(stream_path) -> bool:
+    """Whether `stream_path` is a stream at all: a file that opens and holds
+    at least one JSON event. A missing path, an unreadable file and an empty
+    one all answer False -- and a run judged without a stream cannot be
+    judged (security/units.py `close`): the stream is the only proof of what
+    its session did, and of whether it launched a subagent."""
+    if not stream_path:
+        return False
+    try:
+        with open(stream_path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    if isinstance(json.loads(line), dict):
+                        return True
+                except (ValueError, TypeError):
+                    continue
+    except OSError:
+        return False
+    return False
+
+
 def read_session(stream_path, root) -> Session:
     if not stream_path:
         return EMPTY

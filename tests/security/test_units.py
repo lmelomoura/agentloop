@@ -14,6 +14,14 @@ LAUNCH = next(line for line in (Path(__file__).parent / "fixtures" / "streams" /
               .read_text().splitlines() if '"name":"Agent"' in line)
 
 
+def _quiet(tmp_path):
+    """A stream that proves a session ran and launched nothing: its init
+    event alone. A close judges nothing without a stream (units.close)."""
+    stream = tmp_path / "quiet.stream.ndjson"
+    stream.write_text('{"type":"system","subtype":"init","cwd":"/Users/me/run"}\n')
+    return str(stream)
+
+
 @pytest.fixture
 def conn(tmp_path):
     c = ledger.connect(tmp_path / "security.db")
@@ -460,7 +468,8 @@ def test_a_scanner_row_another_unit_folded_into_is_owed_only_at_the_floor_or_abo
     ledger.start_unit(conn, read["id"])
     _agent(conn, aid, "a" * 64, "high", unit=triage["id"], rationale="the triage unit read it")
     _agent(conn, aid, "b" * 64, folded, unit=read["id"], rationale="the read unit folded its finding here")
-    out = units.close(conn, ledger.get_unit(conn, triage["id"]), root=str(tmp_path), status="success")
+    out = units.close(conn, ledger.get_unit(conn, triage["id"]), stream=_quiet(tmp_path),
+                      root=str(tmp_path), status="success")
     if not owed:
         assert out == {"state": "done", "continuation": None}
         return
@@ -677,7 +686,7 @@ def test_a_gone_claim_s_read_check_normalises_an_absolute_occurrence_path(conn, 
         "an absolute occurrence path inside root, once read, must count as read"
 
 
-def test_a_gone_claim_s_file_served_by_security_read_counts_like_a_stream_read(conn):
+def test_a_gone_claim_s_file_served_by_security_read_counts_like_a_stream_read(conn, tmp_path):
     """`security read`'s own record (`ledger.unit_reads`, joined onto the
     session by `with_served` before `close` ever judges) is the only proof
     of reading on a platform whose shell reads cannot be proven from the
@@ -692,7 +701,7 @@ def test_a_gone_claim_s_file_served_by_security_read_counts_like_a_stream_read(c
     ledger.start_unit(conn, uid)
     ledger.record_gone(conn, uid, "c" * 64, "the handler was deleted")
     ledger.record_unit_read(conn, uid, "a.py", 1, 3)      # what `security read` served it
-    out = units.close(conn, ledger.get_unit(conn, uid), status="success")
+    out = units.close(conn, ledger.get_unit(conn, uid), stream=_quiet(tmp_path), status="success")
     assert out == {"state": "done", "continuation": None}
 
 
@@ -868,7 +877,7 @@ def test_unit_reads_since_keeps_only_rows_recorded_at_or_after_it(conn):
     assert ledger.unit_reads(conn, uid, since=150) == [("a.py", 4, 9)]
 
 
-def test_close_counts_only_reads_recorded_since_this_run_started(conn):
+def test_close_counts_only_reads_recorded_since_this_run_started(conn, tmp_path):
     """Minor 1. `reset_unit` sends a unit whose run died back to `pending`
     without clearing its id or its `started` -- so a chunk `security read`
     recorded for that dead run is still on `unit_read` under the same unit
@@ -883,7 +892,7 @@ def test_close_counts_only_reads_recorded_since_this_run_started(conn):
     conn.execute("INSERT INTO unit_read (unit_id, path, first, last, at) VALUES (?,?,?,?,?)",
                  (uid, "a.py", 4, 9, 250))                  # what THIS run actually served
     conn.commit()
-    out = units.close(conn, ledger.get_unit(conn, uid), status="success")
+    out = units.close(conn, ledger.get_unit(conn, uid), stream=_quiet(tmp_path), status="success")
     assert out["state"] == "incomplete", "lines 1-3 are still owed, not credited to this run"
     assert ledger.get_unit(conn, uid)["evidence"]["covered"] == {"a.py": [[4, 9]]}, \
         "lines 1-3 were served to the run that died, not to this one"
@@ -891,12 +900,13 @@ def test_close_counts_only_reads_recorded_since_this_run_started(conn):
     assert cont["payload"]["ranges"] == [{"path": "a.py", "first": 1, "last": 3, "bytes": 0}]
 
 
-def test_close_judges_a_run_and_settles_its_unit_once(conn):
+def test_close_judges_a_run_and_settles_its_unit_once(conn, tmp_path):
     aid = _analysis(conn)
     uid = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 1, "last": 3, "bytes": 9}]})
     ledger.start_unit(conn, uid)
     ledger.record_unit_read(conn, uid, "a.py", 1, 3)       # what `security read` served it
-    out = units.close(conn, ledger.get_unit(conn, uid), status="success", spend_usd=0.5)
+    out = units.close(conn, ledger.get_unit(conn, uid), stream=_quiet(tmp_path), status="success",
+                      spend_usd=0.5)
     assert out == {"state": "done", "continuation": None}
     assert ledger.get_unit(conn, uid)["evidence"]["covered"] == {"a.py": [[1, 3]]}
     again = units.close(conn, ledger.get_unit(conn, uid), status="error", spend_usd=9)
@@ -930,8 +940,8 @@ def test_two_closes_of_one_verify_unit_interleaved_never_leave_it_done_without_i
         tmp_path, monkeypatch, lands):
     """M1. The close of a session that launched a subagent clears the
     verdict its unit wrote -- and it used to clear it on its own, before the
-    settle. A second close of the same unit with no stream (which sees no
-    subagent) settled it `done` on that verdict in between, and the first
+    settle. A second close of the same unit whose stream shows no subagent
+    (a copy that lost the launch) settled it `done` on that verdict in between, and the first
     then took the verdict away: a `done` verify unit with no verdict. The
     clear now lands inside the settle's transaction, and only if the settle
     takes effect: the first close finds the unit settled and touches
@@ -949,13 +959,16 @@ def test_two_closes_of_one_verify_unit_interleaved_never_leave_it_done_without_i
     theirs = []
 
     def the_other_close_lands():
-        theirs.append(units.close(other, ledger.get_unit(other, uid), root=str(tmp_path), status="success"))
+        # A stream that shows no subagent -- a close that sees none.
+        theirs.append(units.close(other, ledger.get_unit(other, uid), stream=_quiet(tmp_path),
+                                  root=str(tmp_path), status="success"))
 
     if lands == "before this close judges":
-        real_read = evidence.read_session
+        real_read, started = evidence.read_session, []
 
         def read_session(path, root):
-            if not theirs and path:
+            if not started and path:
+                started.append(True)                # the other close reads a stream too
                 the_other_close_lands()
             return real_read(path, root)
         monkeypatch.setattr(evidence, "read_session", read_session)
@@ -972,7 +985,7 @@ def test_two_closes_of_one_verify_unit_interleaved_never_leave_it_done_without_i
     try:
         ours = units.close(mine, ledger.get_unit(mine, uid), stream=str(stream), root=str(tmp_path),
                            status="success")
-        assert theirs == [{"state": "done", "continuation": None}], "the close with no stream saw no subagent"
+        assert theirs == [{"state": "done", "continuation": None}], "the close whose stream shows no subagent"
         assert ours == {"state": "done", "continuation": None}, "and this one found the unit settled"
         assert _verdict(mine, "a" * 64) == ("rejected", f"unit:{uid}"), \
             "a verify unit settled `done` keeps the verdict it was credited with"

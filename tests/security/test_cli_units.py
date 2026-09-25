@@ -1036,9 +1036,58 @@ def test_what_security_read_served_counts_at_the_close(tmp_path):
     _start(db, read["id"])
     subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--db", str(db)],
                    capture_output=True, text=True, env=_reader_env(aid, read["id"], root), check=True)
+    # The stream a Codex run leaves: normalised, with no read the stream
+    # itself can prove -- `security read`'s record is the proof.
+    quiet = tmp_path / "codex.stream.ndjson"
+    quiet.write_text(json.dumps({"type": "system", "subtype": "init", "cwd": str(root)}) + "\n")
     out = run(db, "unit-close", "--analysis", str(aid), "--unit", str(read["id"]), "--root", str(root),
-              "--status", "success")
+              "--stream", str(quiet), "--status", "success")
     assert out["state"] == "done"
+
+
+@pytest.mark.parametrize("stream", ["none", "missing", "empty", "not json"])
+def test_a_close_with_no_stream_credits_nothing_a_unit_wrote(tmp_path, stream):
+    """The stream is the only proof of whether the session launched a
+    subagent. `unit-close` handed an empty, missing or unreadable one used to
+    judge with `tasks = 0` and credit every write stamped with the unit --
+    a subagent's included. Now nothing counts: the rows it re-reported are
+    owed again, and what `read` served it is not covered."""
+    db = tmp_path / "security.db"
+    aid, root, _ = _deep(db, tmp_path, {"src/a.py": "a\nb\n"})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--db", str(db)],
+                   capture_output=True, text=True, env=_reader_env(aid, read["id"], root), check=True)
+    path = tmp_path / "stream.ndjson"
+    if stream == "empty":
+        path.write_text("")
+    elif stream == "not json":
+        path.write_text("the CLI crashed before its first event\n")
+    args = [] if stream == "none" else ["--stream", str(path)]
+    out = run(db, "unit-close", "--analysis", str(aid), "--unit", str(read["id"]), "--root", str(root),
+              "--status", "success", *args)
+    assert out["state"] == "incomplete"
+    unit = next(u for u in _units(db, aid) if u["id"] == read["id"])
+    assert unit["evidence"]["stream"] == "none" and unit["evidence"]["covered"] == {}
+    assert "left no stream" in unit["note"]
+    cont = next(u for u in _units(db, aid) if u["id"] == out["continuation"])
+    assert cont["attempt"] == 2, "a close that says success, with nothing to show for it, spends the attempt"
+
+
+def test_a_verify_close_with_no_stream_clears_the_unit_s_own_verdict(tmp_path):
+    db = tmp_path / "security.db"
+    aid = open_analysis(db, profile="quick", commit="c1")
+    conn = ledger.connect(db)
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
+        "fingerprint": "e" * 64, "category": "hygiene", "rule": "r", "severity": "high", "title": "t",
+        "rationale": "seen", "occurrences": [{"file": "a.py", "line": 1}]}))
+    uid = ledger.add_unit(conn, aid, "verify", {"fingerprint": "e" * 64})
+    ledger.start_unit(conn, uid)
+    ledger.record_verdict(conn, aid, "e" * 64, "confirmed", "read a.py:1", by=f"unit:{uid}")
+    out = run(db, "unit-close", "--analysis", str(aid), "--unit", str(uid), "--status", "success")
+    assert out["state"] == "incomplete"
+    row = conn.execute("SELECT verdict, verified_by FROM finding WHERE fingerprint=?", ("e" * 64,)).fetchone()
+    assert (row["verdict"], row["verified_by"]) == ("", "")
 
 
 def test_report_gone_is_accepted_only_for_a_carried_sast_row_of_the_session_s_triage_unit(tmp_path):

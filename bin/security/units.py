@@ -54,6 +54,8 @@ _TRUNCATED = ("BUDGET LIMITED", "UNDECLARED ENDING", "UNDELIVERED")
 # The classifier's causes for a run the PROVIDER ended (run_classify in
 # bin/agentloop): not the unit's failure, so its close keeps the attempt.
 OUTAGE_CAUSES = ("rate_limited", "api_error")
+NO_STREAM_NOTE = ("The run left no stream -- the only proof of what a session did, and of "
+                  "whether it launched a subagent -- so nothing it did counts.")
 
 
 def triage_items(conn, analysis_id) -> list:
@@ -741,6 +743,30 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     unit = ledger.get_unit(conn, unit["id"])
     if unit["state"] not in ("pending", "running"):
         return {"state": unit["state"], "continuation": None}
+    outage = cause in OUTAGE_CAUSES
+    if not evidence.stream_proves(stream):
+        # NO STREAM, NOTHING COUNTS -- whoever closes: the engine's
+        # `unit-close` handed an empty or unreadable one, or the orchestrator
+        # found none for a run that died. The stream is the only thing that
+        # shows whether the session launched a subagent; judged without it,
+        # `session.tasks` reads 0 and every write stamped with this unit --
+        # a subagent's included -- would be credited. So the attempt is a
+        # disqualified one: no write it made counts, a read unit covers
+        # nothing, and a verify unit's own verdict goes with it, cleared in
+        # the settle's transaction. The attempt follows the status as any
+        # close's does (a stop or an outage keeps it), which bounds a run
+        # that keeps losing its stream by MAX_ATTEMPTS.
+        ev = {"stream": "none", "guides": []}
+        if unit["kind"] == "read":
+            ev.update({"ranges": len(unit["payload"].get("ranges") or []), "covered": {}})
+        if outage:
+            ev["cause"] = cause
+        clear = None
+        if unit["kind"] == "verify":
+            clear = (unit["analysis_id"], unit["payload"].get("fingerprint", ""), f"unit:{unit['id']}")
+        return conclude(conn, unit, done=False, evidence=ev, note=NO_STREAM_NOTE,
+                        spend_usd=spend_usd, stopped=status == "stopped" or outage,
+                        clear_verdict=clear)
     session = evidence.read_session(stream or None, root or ".")
     # ONLY THIS RUN'S OWN READS (minor 1). A unit `reset_unit` sends back to
     # `pending` after its run died keeps its id and its `started`, so a
@@ -791,7 +817,6 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
         # without the stream cannot see the subagent at all -- the limit
         # every close has on a run whose stream is lost.)
         clear = (unit["analysis_id"], unit["payload"].get("fingerprint", ""), f"unit:{unit['id']}")
-    outage = cause in OUTAGE_CAUSES
     if outage:
         ev["cause"] = cause
     return conclude(conn, unit, done=done, evidence=ev, note=note, spend_usd=spend_usd,
