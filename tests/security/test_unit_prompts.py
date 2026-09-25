@@ -62,6 +62,30 @@ def test_a_triage_unit_lists_each_row_with_what_it_is():
     assert "a gone claim without that reading is not counted" in out
 
 
+def test_a_triage_unit_is_told_how_a_gone_claim_s_reading_is_proven_per_platform():
+    """The read unit's `_unread_files`/`_judge_triage` (bin/security/units.py)
+    credit only a proven read -- the Read tool's own result, or `agentloop
+    security read` -- never a shell read, whatever platform ran it. The
+    triage prompt's report-gone sentence used to leave this unsaid, so a
+    `cat`/`sed`/`grep` read looked like proof and the claim was refused."""
+    claude = _p("triage", {"rows": [ROW]})
+    assert "your Read tool" in claude
+    assert "agentloop security read --path=<path> --from <line>" in claude
+    assert "`cat`, `sed`, `grep` or other shell read proves nothing" in claude
+    assert "will not be counted" in claude
+
+    opencode = _p("triage", {"rows": [ROW]}, platform="opencode")
+    assert "your Read tool" in opencode
+    assert "agentloop security read --path=<path> --from <line>" in opencode
+    assert "`cat`, `sed`, `grep` or other shell read proves nothing" in opencode
+
+    codex = _p("triage", {"rows": [ROW]}, platform="openai")
+    assert "only with `agentloop security read --path=<path> --from <line>`" in codex
+    assert "your Read tool" not in codex
+    assert "`cat`, `sed`, `grep` or other shell read proves nothing" in codex
+    assert "will not be counted" in codex
+
+
 def test_a_scanner_row_whose_severity_changed_shows_the_scanner_s_too():
     """The judge owes a scanner row at medium or above at the severity its
     scanner filed OR at the one it holds now (security/units.py). A row
