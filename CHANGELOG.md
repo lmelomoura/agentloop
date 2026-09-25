@@ -300,6 +300,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A security analysis runs as a pipeline of units, on every platform.**
+  `security analyze` now starts an orchestrator that holds the analysis lock,
+  prepares the analysis once and runs each unit as an ordinary run of the
+  derived job — at the analysis's own commit, never the branch tip, so a
+  long analysis reads one tree — up to `security.parallel` at a time (3 by
+  default). Each unit gets a prompt minted from the ledger and its share of
+  the budget — the derived job's own `max_budget_usd`, with the
+  derivation's fallback for a value that is not a number — and its run's
+  close judges the unit. A unit is launched without its platform's subagent
+  tool; the prepare the agent used to run as its first command is the
+  engine's, in a checkout of its own outside the run worktrees. Stopping any
+  run of an analysis stops the whole analysis and leaves it `interrupted`;
+  `agentloop security resume <project> <analysis>` continues it without
+  repeating a finished unit. A row found `running` with nothing behind it
+  is interrupted rather than failed, and the orchestrator's own close never
+  settles an analysis interrupted under it. Before this, one agent decided
+  when an analysis of a large repository had done enough, and it always
+  decided early.
+
 - **An agent session can no longer close, grade, interrupt or resume the
   analysis it works for.** `finish`, `unit-close`, `orchestrate`,
   `interrupt`, `resume` and `abandon` are refused under the agent flag; the

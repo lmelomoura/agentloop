@@ -3049,9 +3049,9 @@ def cmd_finish(args):
     #   V > N        verdicts with no subagent behind them: the hunter wrote
     #                them itself.
     #
-    # N is only known to the ENGINE's close (`--tasks-launched`, from
-    # `security_task_count` over the stream); the agent's own close omits the
-    # flag and the two comparisons are simply not made.
+    # N is only known from `--tasks-launched`, which the single-session close
+    # counted off the stream; without it (every close since the pipeline) the
+    # two comparisons are simply not made.
     # `verify_note` is the ROW's prose; `verify_gap` is the part of it that is
     # a GAP and therefore belongs in the paragraph too. The summary sentences
     # -- nothing was waiting, N verified -- describe what happened rather than
@@ -4400,9 +4400,10 @@ def main(argv=None):
     # The ENGINE's close of a pipeline analysis (security/orchestrator.py):
     # the spend is the units' sum, and every gap the units leave lowers `done`.
     fn.add_argument("--from-units", action="store_true", dest="from_units")
-    # How many subagents the run launched, from `security_task_count` over the
-    # stream. The ENGINE's close only: the agent does not know its own stream,
-    # omits the flag, and the two count comparisons are then not made.
+    # How many subagents the run launched. The single-session close counted
+    # them off the stream; since the pipeline no engine caller passes it (a
+    # unit that launches one is judged a failed attempt, security/units.py),
+    # and without it the two count comparisons are not made.
     fn.add_argument("--tasks-launched", type=int, default=None, dest="tasks_launched")
 
     ck = sub.add_parser("checklist", parents=[dbflag]); ck.set_defaults(fn=cmd_checklist)

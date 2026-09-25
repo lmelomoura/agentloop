@@ -358,6 +358,16 @@ def test_a_stop_judges_what_a_run_that_died_without_its_close_had_read(world, mo
     assert _row(world)["state"] == "done", _row(world)["coverage_note"]
 
 
+def test_the_close_never_settles_an_analysis_interrupted_under_it(world):
+    """A stop, or the next Analyse's sweep, can interrupt the analysis while
+    this loop is ending: the close is `--if-running`, so the row stays
+    `interrupted` for a resume and is never closed from half its units."""
+    conn = ledger.connect(world["db"])
+    assert ledger.interrupt_analysis(conn, world["aid"])
+    _orchestrator(world)._finish("")
+    assert _row(world)["state"] == "interrupted"
+
+
 def test_the_orchestrator_writes_its_phase_into_its_own_lock(world, tmp_path, monkeypatch):
     """Between two units no slot is alive; the phase in the lock is what the
     page reads to know the analysis is still in hand (Task 13)."""

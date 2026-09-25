@@ -76,8 +76,9 @@ _CENT_EPSILON = 1e-9
 CLI = Path(__file__).resolve().parent / "cli.py"
 # The engine exports these into a unit's run; the orchestrator must never pass
 # them on -- its own CLI calls are the engine's, not an agent's.
-_SESSION_VARS = ("AL_SECURITY_AGENT", "CC_SECURITY_AGENT", "AL_SECURITY_UNIT_ID",
-                 "CC_SECURITY_UNIT_ID", "AL_SECURITY_UNIT_BUDGET")
+_SESSION_VARS = ("AL_SECURITY_AGENT", "CC_SECURITY_AGENT",
+                 "AL_SECURITY_UNIT_ID", "CC_SECURITY_UNIT_ID",
+                 "AL_SECURITY_UNIT_BUDGET")
 PREPARE_FAILED_NOTE = ("The deterministic phase did not complete -- a phase, or the planning "
                        "of the units, failed (see tick.log) -- so no unit ran.")
 NO_STREAM_NOTE = ("The run ended without its close and left no stream -- the only proof of "
@@ -564,8 +565,14 @@ class Orchestrator:
         return 0
 
     def _finish(self, note, state="done"):
+        """The close, from the units' proof -- and ONLY of a row still
+        `running` (`--if-running`): a stop, or the next Analyse's sweep, may
+        have interrupted the analysis while this loop was ending, and an
+        interrupted analysis is the resume's to continue, never this close's
+        to settle."""
         self._set_phase("finishing")
-        args = ["finish", "--analysis", str(self.aid), "--state", state, "--from-units"]
+        args = ["finish", "--analysis", str(self.aid), "--state", state, "--from-units",
+                "--if-running"]
         if note:
             args += ["--note", note]
         out = self._cli(*args)

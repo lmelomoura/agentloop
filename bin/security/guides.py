@@ -13,8 +13,8 @@ many.
 DETERMINISTIC AND RECORDED. The agent could pick its own guides after a
 look at the tree; then the cost per run would be the model's mood and nothing
 would say what it read. Here the list is data, it is stored on the analysis
-(`ledger.set_guides`) and the close records what was actually opened off the
-run's stream (see `security_guides_read` in bin/agentloop).
+(`ledger.set_guides`) and each unit's proof records what its run actually
+opened off the run's stream (`evidence["guides"]`, security/evidence.py).
 
 NEVER A FAILURE OF `prepare`. Guides are advice. `recommend` catches
 everything, answers ATTACK-CLASSES alone plus a note the coverage paragraph

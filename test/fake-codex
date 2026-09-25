@@ -12,8 +12,11 @@
 #   FAKE_PROMPT_OUT        record the last argument (the prompt) WHOLE -- FAKE_ARGV_OUT keeps first lines only
 #   FAKE_ACCOUNT_OUT       record the CODEX_HOME this launch runs with (empty line when unset)
 #   FAKE_SKIP_PREPARE      set to skip `security prepare` inside a security run -- see the hook below:
-#                          on openai the ENGINE runs prepare before it launches the CLI, so the hook
-#                          only fires for a launch that carries no AL_PLATFORM=openai marker
+#                          the ENGINE's orchestrator runs prepare before any unit, so the hook only
+#                          fires for a hand launch that carries no AL_PLATFORM=openai marker
+#   AL_SECURITY_UNIT_ID    set by the engine on a unit of a security analysis: the stand-in plays it
+#                          (test/fake-unit.sh) -- a read unit reads through `agentloop security read`,
+#                          the only proof of reading on this platform
 #   FAKE_CODEX_LOGGED_OUT  set to make `login status` exit 1
 #   $CODEX_HOME/.fake-logged-out  that one home has no session (an account signed out)
 #   FAKE_USED_5H/7D        the used_percent the rollout reports (default 5.0 / 2.0)
@@ -35,11 +38,13 @@ case "${1:-}" in
   *)         echo "fake-codex: unexpected invocation: $*" >&2; exit 2 ;;
 esac
 
+# Written whole and then moved into place, as test/fake-claude does: the
+# units of one analysis launch side by side.
 if [ -n "${FAKE_ARGV_OUT:-}" ]; then
   { printf 'ARGC\t%s\n' "$#"
     n=0
     for a in "$@"; do n=$((n + 1)); printf '%s\t%s\n' "$n" "${a%%$'\n'*}"; done
-  } > "$FAKE_ARGV_OUT"
+  } > "$FAKE_ARGV_OUT.$$" && mv -f "$FAKE_ARGV_OUT.$$" "$FAKE_ARGV_OUT"
 fi
 # The account this launch signs in as travels in the environment, where the
 # argv cannot show it: CODEX_HOME, or an empty line when it has none.
@@ -48,7 +53,7 @@ if [ -n "${FAKE_ACCOUNT_OUT:-}" ]; then
 fi
 if [ -n "${FAKE_PROMPT_OUT:-}" ]; then
   last=""; for a in "$@"; do last="$a"; done
-  printf '%s' "$last" > "$FAKE_PROMPT_OUT"
+  printf '%s' "$last" > "$FAKE_PROMPT_OUT.$$" && mv -f "$FAKE_PROMPT_OUT.$$" "$FAKE_PROMPT_OUT"
 fi
 
 tid="${FAKE_SESSION:-01a0fake-0000-7000-8000-000000000001}"
@@ -72,6 +77,15 @@ if [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ] && [ -z "${FAKE_SKIP_PREPARE:-}" ] \
   "$HERE/../bin/agentloop" security prepare \
     --analysis "$AL_SECURITY_ANALYSIS_ID" --root "$PWD" --offline >/dev/null 2>&1 || true
 fi
+# A UNIT OF A SECURITY ANALYSIS (security/orchestrator.py): the prompt is the
+# last argument. Codex has no read tool, so a read unit reads the way its
+# prompt tells it to -- `agentloop security read`, chunk by chunk -- and the
+# ledger's record of what was served is the proof (security/evidence.py).
+. "$HERE/fake-unit.sh"
+last=""; for a in "$@"; do last="$a"; done
+fake_unit_init "$last"
+[ "$FAKE_UNIT_KIND" != read ] || fake_unit_serve_reads
+fake_unit_act
 # The one line the real CLI prints on every run, whatever happens.
 echo "Reading additional input from stdin..." >&2
 
