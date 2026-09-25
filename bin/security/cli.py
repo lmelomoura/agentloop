@@ -2530,6 +2530,19 @@ def cmd_report_finding(args):
                  "reader of the report opens; an object with no `file` is not "
                  "one, and a row carrying only such objects has no location "
                  "at all")
+    # A SAST FINDING NEEDS AT LEAST ONE LOCATION. `all(...)` above is
+    # vacuously true of an EMPTY `occurrences` list, so it alone let a `sast`
+    # row through with NO location whatsoever -- and a later triage unit's
+    # `report-gone` on that same fingerprint would then have nothing to
+    # prove a reading of, settling a `gone` claim on nothing at all
+    # (units._unread_files / _judge_triage's own fix). A weakness in code
+    # with no file and no line is one nobody has read; refused here, at the
+    # door, rather than let it become an unprovable row later.
+    if payload["category"] == "sast" and not occurrences:
+        sys.exit("report-finding: a sast finding needs at least one occurrence "
+                 "naming a file. A weakness with no location can be neither "
+                 "fixed nor verified, by this analysis or the next one's "
+                 "report-gone")
     conn = _conn(args)
     _running(conn, args.analysis)
     refusal = _decided_identity_refusal(conn, args.analysis, payload)

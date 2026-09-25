@@ -713,6 +713,22 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
     # more than twice in a real analysis and a later write that happens not to
     # qualify must not erase the reading that already happened.
     with conn:
+        # A SAST FINDING NEEDS AT LEAST ONE LOCATION -- the ledger's own copy
+        # of this lock, on the same rule as the one just below for an
+        # occurrence with no `file` ("this is the ledger's own copy of that
+        # lock, for the one route the door does not reach"). `cmd_
+        # report_finding` refuses a `sast` payload with no occurrence naming
+        # a file, but a scanner producer or a test can still call this
+        # function directly; a `sast` row with no location can be neither
+        # fixed nor verified by any later analysis (units._unread_files, on
+        # a `report-gone` with nothing to check, fails closed rather than
+        # settling one), so it is refused here too, before either branch
+        # below writes anything.
+        if finding["category"] == "sast" and not _locates(finding):
+            raise ValueError(
+                "a sast finding needs at least one occurrence naming a file. "
+                "A weakness with no location can be neither fixed nor "
+                "verified. Nothing was recorded.")
         existing = conn.execute(
             "SELECT id, producer, rationale, triaged, unit FROM finding"
             " WHERE analysis_id=? AND fingerprint=?",

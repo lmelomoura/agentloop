@@ -1045,7 +1045,8 @@ def test_severity_totals_windows_by_when_the_analysis_itself_ran(conn):
     aid_old = ledger.start_analysis(conn, "web", "web", "develop", "s2", "quick", "r")
     ledger.record_finding(conn, aid_old, {
         "fingerprint": "b" * 64, "category": "sast", "rule": "sql-injection",
-        "severity": "high", "title": "t", "occurrences": []})
+        "severity": "high", "title": "t",
+        "occurrences": [{"file": "app/db.py", "line": 1}]})
     ledger.mark_prepared(conn, aid_old)
     ledger.finish_analysis(conn, aid_old, "done")
     sixty_days_ago = int(time.time()) - 60 * 86400

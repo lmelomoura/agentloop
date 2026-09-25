@@ -237,14 +237,35 @@ def _unread_files(occurrences, session, root) -> list:
     settle a `gone` claim by an absence that never checked this repository at
     all. A file `relative_path` cannot place inside `root` is left
     unaccounted for instead -- not proven gone, not proven read -- so it
-    stays owed exactly as it would with no checkout known."""
+    stays owed exactly as it would with no checkout known.
+
+    A FINDING WITH NO STORED OCCURRENCE IS NOT THIS FUNCTION'S TO SETTLE.
+    Called with `occurrences == []` (or none of them naming a file), this
+    returns `[]` -- vacuously, the same empty list a finding whose every
+    file WAS read or IS gone would also produce -- which would let a
+    carried row with no recorded location settle a `gone` claim on nothing
+    at all. `_judge_triage` checks for that case ITSELF, before ever
+    calling this function, and never credits it: nothing to check is not a
+    passed check, the same fail-closed rule this function applies to a race
+    between two units (see its own docstring) -- absence of evidence is not
+    evidence of absence."""
     files = sorted({o["file"] for o in occurrences if ledger.names_a_file(o)})
     unread = []
     for f in files:
-        if f in session.reads:
+        # THE SAME PATH RULE AS THE ABSENCE CHECK BELOW (minor). `session.
+        # reads`'s keys are already canonical -- relative to `root`, the
+        # same normal form `evidence.relative_path` produces (see
+        # `security read`, which is what actually populates them). A stored
+        # occurrence's own `file`, in contrast, is unvalidated data from a
+        # PREVIOUS analysis (see this function's own docstring) and may be
+        # absolute -- an absolute occurrence path INSIDE `root` that this
+        # unit did read must still count as read, so the lookup key is
+        # normalised the same way the absence check just below already
+        # normalises it, when `root` is known.
+        rel = evidence.relative_path(f, root) if root else None
+        if (rel if rel is not None else f) in session.reads:
             continue                                          # opened by this unit
         if root:
-            rel = evidence.relative_path(f, root)
             if rel is not None and not os.path.exists(os.path.join(root, rel)):
                 continue                                      # gone from the checkout, proven
         unread.append(f)
@@ -334,17 +355,30 @@ def _judge_triage(conn, unit, session, root):
             # A carried sast finding this unit SAID is gone -- settled only
             # once it is PROVED, never on the reason alone (see the
             # docstring). `carried_occurrences` is the previous analysis's
-            # own record of where the finding was; a fingerprint absent from
-            # it (a hand-built item in a test, never a planned one) has no
-            # file to prove, so it settles like any other empty debt.
+            # own record of where the finding was.
             if carried_occurrences is None:
                 _an, findings = queries.checklist(conn, aid)
                 carried_occurrences = {f["fingerprint"]: f.get("occurrences") or []
                                        for f in findings if f.get("analysis_id") != aid}
-            unread = _unread_files(carried_occurrences.get(fp) or [], session, root)
-            if not unread:
-                continue
-            gone_notes.append(f"reported gone without reading {', '.join(unread)}")
+            occurrences = carried_occurrences.get(fp) or []
+            if not any(ledger.names_a_file(o) for o in occurrences):
+                # A fingerprint absent from `carried_occurrences` (a
+                # hand-built item in a test, never a planned one) or one
+                # whose finding stores no occurrence naming a file has
+                # NOTHING for `_unread_files` to check -- and nothing to
+                # check is not a passed check (see `_unread_files`'s own
+                # docstring). Both `report-finding` and
+                # `ledger.record_finding` now refuse to write a `sast`
+                # finding with no such occurrence in the first place, so
+                # this is reachable only for a row that predates that door,
+                # or one built directly for a test -- either way, it stays
+                # owed rather than settling on nothing.
+                gone_notes.append(f"reported gone, but the finding has no recorded location to verify ({fp})")
+            else:
+                unread = _unread_files(occurrences, session, root)
+                if not unread:
+                    continue
+                gone_notes.append(f"reported gone without reading {', '.join(unread)}")
         # The continuation's item carries the severity on: its floor is
         # judged by the scanner's, however the row has been rewritten since.
         left.append({k: item[k] for k in ("fingerprint", "kind", "category", "severity") if k in item})

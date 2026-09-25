@@ -84,7 +84,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cleared at its close. A carried finding said to be gone settles only once
   every file it was found in has been read by the unit or is gone from the
   checkout — a reason alone used to be enough, and a vulnerability could be
-  marked fixed without anyone opening its file. A unit is settled and its
+  marked fixed without anyone opening its file — and a finding with no
+  recorded location at all is refused at the door and never taken as gone:
+  nothing to check is not a passed check. A unit is settled and its
   continuation planned in one transaction, two callers can never both write
   a plan, and a deep analysis is never planned without its inventory.
 

@@ -219,7 +219,8 @@ def test_report_finding_accepts_other_as_the_escape_hatch(tmp_path):
         "fingerprint": "4" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "other",
         "severity": "high", "title": "t",
         "rationale": "Nothing in the vocabulary fits: it is a logic flaw in "
-                     "the refund path."}))
+                     "the refund path.",
+        "occurrences": [{"file": "app/refund.py", "line": 10}]}))
     row = _finding_row(db, aid)
     assert row["rule"] == "other"
     assert row["cwe"] == ""
@@ -242,6 +243,33 @@ def test_report_finding_refuses_a_category_outside_the_closed_set(tmp_path):
         assert "sast" in out.stderr and "hygiene" in out.stderr
     # Nothing reached the ledger under any of the four spellings.
     assert _finding_row(db, aid) is None
+
+
+def test_report_finding_refuses_a_sast_finding_with_no_occurrence(tmp_path):
+    """Round 4 of Task 5's own fix. `all(...)` on an EMPTY `occurrences` list
+    is vacuously true, so the existing "every occurrence must name a file"
+    check alone let `[]` straight through -- and a carried `sast` row with
+    no stored location later settled a `gone` claim on nothing at all
+    (units._unread_files / _judge_triage). A weakness with no location can
+    be neither fixed nor verified, by this analysis or the next one's
+    `report-gone`, so it is refused here, at the door, before the ledger
+    ever sees it. `occurrences` omitted entirely and `occurrences: []` are
+    the same refusal; a non-`sast` category is unaffected."""
+    db = tmp_path / "security.db"
+    aid = open_analysis(db)
+    for payload in ({"fingerprint": "9" * 64, "category": "sast", "candidate": SAST_CANDIDATE,
+                     "rule": "sql-injection", "severity": "high", "title": "t"},
+                    {"fingerprint": "9" * 64, "category": "sast", "candidate": SAST_CANDIDATE,
+                     "rule": "sql-injection", "severity": "high", "title": "t", "occurrences": []}):
+        out = fails(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
+        assert out.returncode != 0
+        assert "at least one occurrence" in out.stderr
+    assert _finding_row(db, aid) is None
+    # The control: a dependency finding needs no location at all.
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
+        "fingerprint": "a" * 64, "category": "dependency", "rule": "CVE-1",
+        "severity": "high", "title": "t"}))
+    assert _finding_row(db, aid) is not None
 
 
 def test_report_finding_does_not_echo_an_unscanned_rule_that_looks_like_a_key(tmp_path):
@@ -298,7 +326,8 @@ def test_report_finding_derives_the_classification_from_the_rule(tmp_path):
     aid = open_analysis(db)
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
         "fingerprint": "e" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "sql-injection",
-        "severity": "high", "title": "t"}))
+        "severity": "high", "title": "t",
+        "occurrences": [{"file": "app/db.py", "line": 12}]}))
     row = _finding_row(db, aid)
     assert row["cwe"] == "CWE-89"
     assert row["owasp"] == "A03:2021"
@@ -313,7 +342,8 @@ def test_report_finding_ignores_a_classification_sent_by_the_agent(tmp_path):
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
         "fingerprint": "f" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "sql-injection",
         "severity": "high", "title": "t",
-        "cwe": "CWE-79", "owasp": "A01:2021"}))
+        "cwe": "CWE-79", "owasp": "A01:2021",
+        "occurrences": [{"file": "app/db.py", "line": 12}]}))
     row = _finding_row(db, aid)
     assert row["cwe"] == "CWE-89"
     assert row["owasp"] == "A03:2021"
@@ -415,7 +445,8 @@ def test_a_finding_that_describes_a_credential_instead_of_quoting_it_is_accepted
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
         "fingerprint": "2" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "hardcoded-credentials",
         "severity": "high", "title": "Hardcoded AWS key",
-        "rationale": "An AWS access key is hardcoded in config/prod.env at line 12."}))
+        "rationale": "An AWS access key is hardcoded in config/prod.env at line 12.",
+        "occurrences": [{"file": "config/prod.env", "line": 12}]}))
 
 
 def test_a_finding_whose_rationale_names_an_obvious_placeholder_is_accepted(tmp_path):
@@ -425,7 +456,8 @@ def test_a_finding_whose_rationale_names_an_obvious_placeholder_is_accepted(tmp_
         "fingerprint": "3" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "hardcoded-credentials",
         "severity": "high", "title": "t",
         "rationale": 'Default credential left in place: '
-                     'password = "changeme12345678901234"'}))
+                     'password = "changeme12345678901234"',
+        "occurrences": [{"file": "config/prod.env", "line": 3}]}))
 
 
 def test_the_agent_cannot_send_something_that_is_not_json(tmp_path):
@@ -4892,9 +4924,13 @@ def finished_analysis(db, tmp_path, project, branch, severity="high", rule="r",
     payload = {"fingerprint": fingerprint_for(project, branch, rule), "category": category,
                "rule": rule, "severity": severity, "title": "t", "rationale": "r"}
     # A `sast` finding at medium or above has to carry its candidate through
-    # the door (block 4.1); a deterministic placeholder does not.
+    # the door (block 4.1); a deterministic placeholder does not. A `sast`
+    # finding also needs at least one occurrence naming a file (round 4 of
+    # Task 5's own fix): a weakness with no location can be neither fixed
+    # nor verified.
     if category == "sast":
         payload["candidate"] = SAST_CANDIDATE
+        payload["occurrences"] = [{"file": "app/a.py", "line": 1}]
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
     # A `sast` finding at medium or above owes a verdict since block 4.2, and
     # a close that leaves the queue unworked is lowered to `capped` -- which
@@ -4922,6 +4958,7 @@ def capped_analysis(db, tmp_path, project, branch, severity="high", rule="r",
                "rule": rule, "severity": severity, "title": "t", "rationale": "r"}
     if category == "sast":
         payload["candidate"] = SAST_CANDIDATE
+        payload["occurrences"] = [{"file": "app/a.py", "line": 1}]
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
     run(db, "finish", "--analysis", str(aid), "--state", "capped", "--spend", "0.3")
     return aid

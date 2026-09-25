@@ -1250,13 +1250,23 @@ def test_the_same_half_payloads_onto_an_unread_scanner_row_stay_refused(conn, ha
 def test_the_same_half_payloads_onto_the_agents_own_row_are_refused_too(conn, half, names):
     """No mark at stake, same `elif`, same erasure: the agent's own row
     carries a sentence and a location, and a payload missing either would
-    take it. Refused on the same terms as on a marked scanner row."""
+    take it. Refused on the same terms as on a marked scanner row.
+
+    `category="dependency"` here (not this file's default `_finding`
+    category, `sast`): a `sast` payload with an empty `occurrences` is now
+    refused before this test's OWN `elif` ever runs, by the newer, sast-only
+    "needs at least one occurrence" rule -- a different refusal, for a
+    different reason, than the erasure this test exists to pin. Dependency
+    findings carry no such requirement, so the rationale-only half still
+    reaches the erasure check this test is actually about."""
     aid = ledger.start_analysis(conn, "web", "web", "main", "abc", "standard", "r")
-    ledger.record_finding(conn, aid, _finding(producer=ledger.AGENT))
+    ledger.record_finding(conn, aid, _finding(
+        producer=ledger.AGENT, category="dependency", rule="CVE-1",
+        occurrences=[{"file": "app/db.py", "line": 12, "snippet_hash": "h1"}]))
 
     with pytest.raises(ValueError) as exc:
         ledger.record_finding(conn, aid, {
-            "fingerprint": "a" * 64, "category": "sast", "rule": "sql-injection",
+            "fingerprint": "a" * 64, "category": "dependency", "rule": "CVE-1",
             "severity": "high", "title": "String-built SQL",
             "producer": ledger.AGENT, **half})
     assert names in str(exc.value)
@@ -1292,12 +1302,21 @@ def test_a_row_that_never_carried_a_location_can_be_rewritten_without_one(conn):
     have. `[]` on a NEW agent finding is accepted at the door, so an agent's
     own row can hold a sentence and no location; a correction of that
     sentence omits nothing the row had, and refusing it would punish the
-    one write that cannot erase anything."""
+    one write that cannot erase anything.
+
+    `category="dependency"`, not this file's default `_finding` category
+    (`sast`): a `sast` finding can no longer be recorded with an empty
+    `occurrences` at all (round 4's own fix -- a `sast` weakness with no
+    location can be neither fixed nor verified), so the row this test needs
+    -- one that never carried a location in the first place -- is only
+    reachable for a category the new rule does not apply to."""
     aid = ledger.start_analysis(conn, "web", "web", "main", "abc", "standard", "r")
-    ledger.record_finding(conn, aid, _finding(producer=ledger.AGENT, occurrences=[]))
+    ledger.record_finding(conn, aid, _finding(
+        producer=ledger.AGENT, category="dependency", rule="CVE-1", occurrences=[]))
 
     ledger.record_finding(conn, aid, _finding(
-        producer=ledger.AGENT, occurrences=[], rationale="why, reworded"))
+        producer=ledger.AGENT, category="dependency", rule="CVE-1",
+        occurrences=[], rationale="why, reworded"))
 
     got = ledger.findings_of(conn, aid)
     assert got[0]["rationale"] == "why, reworded"
@@ -1316,12 +1335,21 @@ def test_an_occurrence_naming_no_file_is_never_stored_even_where_nothing_refuses
     the phantom location the report renders as nothing and the gate's note
     prints as "(no file recorded)", the exact row the door refuses. Same
     predicate, asked here of every occurrence about to be INSERTED, so a
-    stored occurrence names a file whoever wrote it."""
+    stored occurrence names a file whoever wrote it.
+
+    `category="dependency"`, not this file's default `_finding` category
+    (`sast`): the baseline row here never carries a location, and a `sast`
+    finding can no longer be recorded that way at all (round 4's own fix,
+    unrelated to what THIS test is about) -- a category without that
+    requirement is what lets the phantom-occurrence coverage below still
+    run."""
     aid = ledger.start_analysis(conn, "web", "web", "main", "abc", "standard", "r")
-    ledger.record_finding(conn, aid, _finding(producer=ledger.AGENT, occurrences=[]))
+    ledger.record_finding(conn, aid, _finding(
+        producer=ledger.AGENT, category="dependency", rule="CVE-1", occurrences=[]))
 
     ledger.record_finding(conn, aid, _finding(
-        producer=ledger.AGENT, occurrences=phantom, rationale="why, reworded"))
+        producer=ledger.AGENT, category="dependency", rule="CVE-1",
+        occurrences=phantom, rationale="why, reworded"))
 
     got = ledger.findings_of(conn, aid)
     assert got[0]["rationale"] == "why, reworded"

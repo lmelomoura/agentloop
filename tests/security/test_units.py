@@ -612,6 +612,71 @@ def test_a_gone_claim_s_occurrence_outside_the_checkout_is_never_settled_by_abse
         "an escaping path is not 'gone from the checkout' -- it is unaccounted for"
 
 
+def test_a_gone_claim_on_a_finding_with_no_stored_occurrence_stays_owed(conn):
+    """Fix 4. Nothing to check is not a passed check -- the same fail-closed
+    rule `_unread_files` already applies to a race between two units (see
+    its own docstring). A carried `sast` row with ZERO stored occurrences
+    (planted here by raw SQL: `ledger.record_finding` itself now refuses to
+    write one, round 4's other half of this fix -- so the only way such a
+    row still exists is a row written before that door existed) settled a
+    `gone` claim VACUOUSLY before this fix: `_unread_files([], ...)` returns
+    `[]`, indistinguishable from a finding whose every file WAS read or IS
+    gone. Now it stays owed, with a note that says there was nothing to
+    verify -- absence of evidence is not evidence of absence."""
+    prev = _analysis(conn, commit="c0")
+    with conn:
+        conn.execute(
+            "INSERT INTO finding (analysis_id, fingerprint, category, rule, severity, title,"
+            " rationale, producer) VALUES (?,?,?,?,?,?,?,?)",
+            (prev, "c" * 64, "sast", "xss", "medium", "t", "the agent read it", "agent"))
+    ledger.finish_analysis(conn, prev, "done")
+    assert ledger.findings_of(conn, prev)[0]["occurrences"] == [], \
+        "the planted row really has no stored occurrence"
+    aid = _analysis(conn)
+    item = {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    ledger.record_gone(conn, uid, "c" * 64, "vacuous reason, nothing to read")
+    unit = ledger.get_unit(conn, uid)
+    # No session read could ever settle this claim -- there is no file to
+    # read in the first place -- so even a session that "read everything"
+    # must leave it owed.
+    done, remaining, ev, note = units.judge(
+        conn, unit, _session({"a.py": [(1, 999)], "b.py": [(1, 999)]}), "success")
+    assert (done, remaining) == (False, {"items": [item]})
+    assert "no recorded location to verify" in note
+
+
+def test_a_gone_claim_s_read_check_normalises_an_absolute_occurrence_path(conn, tmp_path):
+    """Minor 3. `session.reads`'s keys are canonical -- relative to `root`,
+    the same normal form `evidence.relative_path` produces (see `security
+    read`, which is what populates them). A stored occurrence's own `file`
+    is unvalidated data from a PREVIOUS analysis and may be absolute; an
+    absolute occurrence path INSIDE `root` that THIS unit actually did read
+    must still count as read, not stay owed because the raw string never
+    matched the canonical key."""
+    prev = _analysis(conn, commit="c0")
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n")
+    ledger.record_finding(conn, prev, {
+        "fingerprint": "c" * 64, "category": "sast", "rule": "xss", "severity": "medium",
+        "title": "t", "rationale": "the agent read it", "producer": "agent",
+        "occurrences": [{"file": str(root / "a.py"), "line": 3}]})
+    ledger.finish_analysis(conn, prev, "done")
+    aid = _analysis(conn)
+    item = {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    ledger.record_gone(conn, uid, "c" * 64, "the handler was deleted")
+    unit = ledger.get_unit(conn, uid)
+    # `session.reads` carries the CANONICAL key ("a.py"), the way `security
+    # read` records it -- never the absolute path the stored occurrence
+    # happens to carry.
+    done, remaining, ev, note = units.judge(
+        conn, unit, _session({"a.py": [(1, 5)]}), "success", root=str(root))
+    assert (done, remaining) == (True, None), \
+        "an absolute occurrence path inside root, once read, must count as read"
+
+
 def test_a_gone_claim_s_file_served_by_security_read_counts_like_a_stream_read(conn):
     """`security read`'s own record (`ledger.unit_reads`, joined onto the
     session by `with_served` before `close` ever judges) is the only proof
