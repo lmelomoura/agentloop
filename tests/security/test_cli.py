@@ -6463,39 +6463,18 @@ def _sast_note(db, aid):
     return next(p["note"] for p in phases if p["name"] == "sast"), analysis
 
 
-@pytest.mark.parametrize("flag, sentence, read", [
-    ("AI-AND-LLM,ATTACK-CLASSES",
-     "Guides read: ATTACK-CLASSES, AI-AND-LLM. Recommended but not read: CLIENT-SIDE.",
-     ["ATTACK-CLASSES", "AI-AND-LLM"]),
-    ("", "Guides read: none of the 3 recommended.", []),
-    ("unknown", "Guides read: unknown (run stream unavailable).", None),
-])
-def test_the_engines_close_records_what_was_read_off_the_stream(tmp_path, flag, sentence, read):
+def test_the_agents_own_close_writes_no_guides_sentence(tmp_path):
+    """`--guides-read` was the single-session close's own flag, retired with
+    the pipeline (Task 11): `guides_note` is now written only off the units'
+    account (`--from-units`), never by the agent's own close."""
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path)
     conn = security_ledger.connect(db)
     security_ledger.set_guides(conn, aid, recommended=["ATTACK-CLASSES", "AI-AND-LLM", "CLIENT-SIDE"])
     conn.close()
     run(db, "finish", "--analysis", str(aid), "--state", "done")
-    note, analysis = _sast_note(db, aid)
+    note, _analysis = _sast_note(db, aid)
     assert "Guides read" not in note, "the agent's own close knows nothing about the stream"
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--guides-read", flag)
-    note, analysis = _sast_note(db, aid)
-    assert sentence in note
-    assert sentence in analysis["coverage_note"]
-    assert analysis["guides"].get("read") == read
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--guides-read", flag)
-    assert _sast_note(db, aid)[1]["coverage_note"].count("Guides read") == 1
-
-
-def test_guides_read_that_were_never_recommended_are_still_listed(tmp_path):
-    db = tmp_path / "security.db"
-    aid = prepared_analysis(db, tmp_path)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--guides-read",
-        "WEB-PROTOCOL-AND-AUTH,bogus")
-    note, analysis = _sast_note(db, aid)
-    assert "Guides read: WEB-PROTOCOL-AND-AUTH. Recommended but not read: ATTACK-CLASSES." in note
-    assert "bogus" not in note
 
 
 # ------------------------------------------------ the verifier's door
@@ -6598,41 +6577,19 @@ def _verdict(db, aid, fp, value="confirmed", reason="read it end to end"):
 
 
 def test_a_queue_nobody_worked_lowers_done_to_capped(tmp_path):
-    """The guard the N=V count cannot see: an agent that ignores the phase
-    launches no subagents and writes no verdicts, so the two numbers agree at
-    zero. What does not agree is the queue."""
+    """An agent that ignores the verification phase launches no subagents and
+    writes no verdicts. The queue is what catches that the work never
+    happened."""
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path)
     _agent_sast(db, aid, "b" * 64)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
     row, analysis = _verification_note(db, aid)
     assert run(db, "list", "--project", "web")[0]["state"] == "capped"
     assert "1 finding left unverified" in row["note"]
     assert "sql-injection" in row["note"]
     assert row["note"] in analysis["coverage_note"]
     assert row["status"] == "warning"
-
-
-def test_subagents_that_produced_no_verdict_lower_done_to_capped(tmp_path):
-    db = tmp_path / "security.db"
-    aid = prepared_analysis(db, tmp_path)
-    _agent_sast(db, aid, "b" * 64)
-    _verdict(db, aid, "b" * 64)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "5")
-    row, _ = _verification_note(db, aid)
-    assert run(db, "list", "--project", "web")[0]["state"] == "capped"
-    assert "5 subagents were launched and 1 verdict recorded" in row["note"]
-
-
-def test_verdicts_without_subagents_lower_done_to_capped(tmp_path):
-    db = tmp_path / "security.db"
-    aid = prepared_analysis(db, tmp_path)
-    _agent_sast(db, aid, "b" * 64)
-    _verdict(db, aid, "b" * 64)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
-    row, _ = _verification_note(db, aid)
-    assert run(db, "list", "--project", "web")[0]["state"] == "capped"
-    assert "1 verdict recorded and no subagent was launched" in row["note"]
 
 
 def test_a_worked_queue_closes_done_and_counts_the_verdicts(tmp_path):
@@ -6642,7 +6599,7 @@ def test_a_worked_queue_closes_done_and_counts_the_verdicts(tmp_path):
     _agent_sast(db, aid, "c" * 64)
     _verdict(db, aid, "b" * 64, "confirmed")
     _verdict(db, aid, "c" * 64, "rejected", "the escaping helper at app/db.py:12")
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "2")
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
     row, _ = _verification_note(db, aid)
     assert run(db, "list", "--project", "web")[0]["state"] == "done"
     assert row["status"] == "ran"
@@ -6652,21 +6609,8 @@ def test_a_worked_queue_closes_done_and_counts_the_verdicts(tmp_path):
 def test_an_analysis_with_nothing_to_verify_closes_done(tmp_path):
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
     row, _ = _verification_note(db, aid)
     assert run(db, "list", "--project", "web")[0]["state"] == "done"
     assert row["status"] == "ran"
     assert "No finding was waiting" in row["note"]
-
-
-def test_without_the_flag_the_counts_are_not_compared(tmp_path):
-    """The agent's own close does not know its stream. Only the engine's
-    close passes --tasks-launched, so only it can compare."""
-    db = tmp_path / "security.db"
-    aid = prepared_analysis(db, tmp_path)
-    _agent_sast(db, aid, "b" * 64)
-    _verdict(db, aid, "b" * 64)
-    run(db, "finish", "--analysis", str(aid), "--state", "done")
-    assert run(db, "list", "--project", "web")[0]["state"] == "done"
-    row, _ = _verification_note(db, aid)
-    assert "subagent" not in row["note"]

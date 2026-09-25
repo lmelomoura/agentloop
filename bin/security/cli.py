@@ -2823,13 +2823,6 @@ VERIFY_DONE_NOTE = ("{n} verified: {confirmed} confirmed, {rejected} rejected, "
 VERIFY_UNVERIFIED_NOTE = ("{n} finding{s} left unverified: nobody tried to "
                           "disprove {them}, so this analysis says nothing about "
                           "whether {they} real. {lead}: {named}.")
-VERIFY_TASKS_WITHOUT_VERDICTS_NOTE = (
-    "{tasks} subagents were launched and {v} verdict{s} recorded: the rest "
-    "produced nothing, which is budget spent on parallelism rather than on "
-    "reading. Subagents in this run are for verification.")
-VERIFY_VERDICTS_WITHOUT_TASKS_NOTE = (
-    "{v} verdict{s} recorded and no subagent was launched: a verdict is a "
-    "second agent's reading, and nothing in this run's stream shows one ran.")
 VERIFY_UNVERIFIED_UNREACHED = ("This analysis did not close `done`, so nothing "
                                "checked whether the findings were verified.")
 
@@ -2843,9 +2836,6 @@ def _verdict_counts(conn, analysis_id) -> dict:
         if row["verdict"] in out:
             out[row["verdict"]] = row["n"]
     return out
-
-
-GUIDES_UNKNOWN = "unknown"
 
 
 def _guides_sentence(recommended, read) -> str:
@@ -2905,24 +2895,14 @@ def cmd_finish(args):
     if args.if_running and row["state"] != "running":
         return
     state = args.state
-    # WHAT THE AGENT READ, from the ENGINE's close only -- the flag is absent
-    # on the agent's own close, which knows nothing about its stream, so no
-    # sentence is written then; the engine's close writes the one true
-    # sentence and `guides.read`. `unknown` is a value, not an absence: the
-    # stream could not be read, and the report says so rather than "none".
-    # Names outside the vendored set are dropped, never echoed: a name is
-    # matched off the stream by a regex, and this is the one place that knows
-    # the closed set.
+    # WHAT THE AGENT READ. The single-session close that used to pass
+    # `--guides-read` off its own stream is gone with the pipeline (Task 11):
+    # `guides_note` is now written only by the units' account below
+    # (`--from-units`), off `units.guides_read`. Names outside the vendored
+    # set are dropped, never echoed: a name is matched off the stream by a
+    # regex, and `units.guides_read` is the one place that knows the closed
+    # set.
     guides_note = ""
-    if args.guides_read is not None:
-        recommended = ledger.guides_of(row).get("recommended", [])
-        if args.guides_read.strip() == GUIDES_UNKNOWN:
-            read = None
-        else:
-            given = set(args.guides_read.split(","))
-            read = [g for g in guides.NAMES if g in given]
-            ledger.set_guides(conn, args.analysis, read=read)
-        guides_note = _guides_sentence(recommended, read)
     if state == "done" and row["state"] in ("capped", "failed"):
         print(f"finish: analysis {args.analysis} is already {row['state']} — a "
               "close never upgrades a truncated or failed analysis to done",
@@ -3036,22 +3016,15 @@ def cmd_finish(args):
         # one close.
         triage_phase = _triage_phase(conn, args.analysis, skipped,
                                      untriaged_note, decided_note)
-    # THE VERIFICATION, checked the way the triage is: three facts the ledger
-    # and the run's stream hold between them, and a `done` that survives all
-    # three or is lowered with the reason in writing.
+    # THE VERIFICATION, checked the way the triage is: what the ledger holds
+    # against what the phase should have covered, and a `done` that survives
+    # it or is lowered with the reason in writing.
     #
-    #   the queue    findings in scope that nobody verified. This is the guard
-    #                the two counts below CANNOT see: an agent that ignores
-    #                the phase launches nothing and records nothing, so N and
-    #                V agree at zero while the work never happened.
-    #   N > V        subagents that produced no verdict -- the $51.44 failure,
-    #                budget spent on parallelism.
-    #   V > N        verdicts with no subagent behind them: the hunter wrote
-    #                them itself.
+    #   the queue    findings in scope that nobody verified. An agent that
+    #                ignores the phase launches nothing and records nothing,
+    #                and the queue is what catches that the work never
+    #                happened.
     #
-    # N is only known from `--tasks-launched`, which the single-session close
-    # counted off the stream; without it (every close since the pipeline) the
-    # two comparisons are simply not made.
     # `verify_note` is the ROW's prose; `verify_gap` is the part of it that is
     # a GAP and therefore belongs in the paragraph too. The summary sentences
     # -- nothing was waiting, N verified -- describe what happened rather than
@@ -3064,7 +3037,6 @@ def cmd_finish(args):
         unverified = queries.verify_queue(conn, args.analysis)
         counts = _verdict_counts(conn, args.analysis)
         recorded = sum(counts.values())
-        tasks = args.tasks_launched
         if unverified:
             n = len(unverified)
             named = "; ".join(
@@ -3081,17 +3053,7 @@ def cmd_finish(args):
                 rejected=counts["rejected"], needs=counts["needs_validation"])
         else:
             verify_note = VERIFY_NOTHING_NOTE
-        mismatch = ""
-        if tasks is not None and tasks > recorded:
-            mismatch = VERIFY_TASKS_WITHOUT_VERDICTS_NOTE.format(
-                tasks=tasks, v=recorded, s="s" if recorded != 1 else "")
-        elif tasks is not None and recorded > tasks:
-            mismatch = VERIFY_VERDICTS_WITHOUT_TASKS_NOTE.format(
-                v=recorded, s="s" if recorded != 1 else "")
-        if mismatch:
-            verify_note = f"{verify_note} {mismatch}".strip()
-            verify_gap = f"{verify_gap} {mismatch}".strip()
-        bad = bool(unverified) or (tasks is not None and tasks != recorded)
+        bad = bool(unverified)
         if state == "done" and bad:
             state = "capped"
             print(f"finish: analysis {args.analysis} — {verify_note}", file=sys.stderr)
@@ -3281,6 +3243,9 @@ def cmd_checklist(args):
     # shell tool that truncates a long output keeps its head, and the short
     # list the skill's fold rule depends on must not be the part that is cut.
     print(json.dumps({"analysis": analysis,
+                      # The pipeline's progress, for the page's Pipeline block:
+                      # small, and read while the analysis runs.
+                      "units": units.summary(conn, args.analysis),
                       "decided_sast": queries.decided_sast(conn, args.analysis, listed=findings),
                       "findings": findings},
                      indent=2))
@@ -4394,17 +4359,9 @@ def main(argv=None):
     fn.add_argument("--spend", default="0")
     fn.add_argument("--note", default="")
     fn.add_argument("--if-running", action="store_true", dest="if_running")
-    # The ENGINE's close only: a comma list of guide names, '' for none, or
-    # `unknown` when the run's stream could not be read. See `cmd_finish`.
-    fn.add_argument("--guides-read", default=None, dest="guides_read")
     # The ENGINE's close of a pipeline analysis (security/orchestrator.py):
     # the spend is the units' sum, and every gap the units leave lowers `done`.
     fn.add_argument("--from-units", action="store_true", dest="from_units")
-    # How many subagents the run launched. The single-session close counted
-    # them off the stream; since the pipeline no engine caller passes it (a
-    # unit that launches one is judged a failed attempt, security/units.py),
-    # and without it the two count comparisons are not made.
-    fn.add_argument("--tasks-launched", type=int, default=None, dest="tasks_launched")
 
     ck = sub.add_parser("checklist", parents=[dbflag]); ck.set_defaults(fn=cmd_checklist)
     ck.add_argument("--analysis", type=int, required=True)

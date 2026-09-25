@@ -1734,6 +1734,18 @@ def active_runs_for(jid):
             except OSError:
                 started = 0
         logf = _read("logfile")
+        # The unit label, read off the SAME precheck sidecar the finished row
+        # gets it from once ingested — only the first 400 bytes, which is
+        # where the header (`_UNIT_HEADER`) lives.
+        label = ""
+        if logf:
+            try:
+                precheck_path = Path(logf[:-5] + ".precheck.txt" if logf.endswith(".json")
+                                     else logf + ".precheck.txt")
+                with open(precheck_path, "rb") as fh:
+                    label = _unit_label(jid, fh.read(400).decode("utf-8", "replace"))
+            except OSError:
+                label = ""
         out.append({"pid": pid, "child": _read("child"), "log": logf,
                     # when THIS run began: the shared state holds one value per
                     # job, so concurrent runs are told apart by their slots
@@ -1748,7 +1760,8 @@ def active_runs_for(jid):
                     # "false", or "" for a slot from before the breadcrumb
                     "forced": _read("forced"),
                     # the account the run signs in as, and the directory its variable carries
-                    "account": _read("account"), "account_dir": _read("account_dir")})
+                    "account": _read("account"), "account_dir": _read("account_dir"),
+                    "label": label})
     return out
 
 
@@ -2221,6 +2234,19 @@ def load_config():
 _LAST_RUNS = []
 
 
+_UNIT_HEADER = re.compile(r"^SECURITY ANALYSIS (\d+) · unit (.+?) — ")
+
+
+def _unit_label(job, precheck_text):
+    """"analysis 22 · read 7/25 · attempt 2" for a run of a security unit, read
+    off the header its precheck file starts with (bin/agentloop, run_job); ""
+    for every other run. The table shows it as text, never as markup."""
+    if not str(job or "").startswith("security-"):
+        return ""
+    match = _UNIT_HEADER.match(precheck_text or "")
+    return f"analysis {match.group(1)} · {match.group(2)}" if match else ""
+
+
 def _list_runs():
     """The runs the page lists, newest first. Raises whatever the index raises."""
     runs = []
@@ -2228,7 +2254,10 @@ def _list_runs():
     conn = db_conn()
     db_init(conn)
     for row in conn.execute(
-            "SELECT job, start, status, duration, cost, session, log, forced, precheck_note, project, note, resumed_from, cause, platform, cost_basis, model, model_id"
+            "SELECT job, start, status, duration, cost, session, log, forced, precheck_note, project, note, resumed_from, cause, platform, cost_basis, model, model_id,"
+            # The head of the precheck text, for the unit label: the header is
+            # its first line, and the whole text is up to 20 KB a row.
+            " substr(precheck_txt, 1, 400) AS precheck_head"
             " FROM runs ORDER BY start DESC, rowid DESC LIMIT 1000"):
         runs.append({"id": row["job"], "start": row["start"], "status": row["status"],
                      "duration": row["duration"], "cost": row["cost"],
@@ -2245,7 +2274,8 @@ def _list_runs():
                      "cost_basis": row["cost_basis"] or "reported",
                      # the model asked for and the one that ran, so a row
                      # can name what ran without opening the run
-                     "model": row["model"] or "", "model_id": row["model_id"] or ""})
+                     "model": row["model"] or "", "model_id": row["model_id"] or "",
+                     "label": _unit_label(row["job"], row["precheck_head"])})
     conn.close()
     return runs
 
@@ -2380,28 +2410,6 @@ def load_live_detail(jid, start_i):
     if not job and jid.startswith("security-"):
         job = _derived_security_job(jid, projects)
     job_platform = _job_platform(job, projects) if job else "anthropic"
-    # The deterministic phase (`prepare`) runs engine-side before the agent on
-    # the platforms without prepare_inline: the engine opens `<log>.prepare`
-    # as it starts that phase and the stream file only at the launch, so
-    # the sidecar with no stream yet names the phase the run is in.
-    phase = ""
-    phase_detail = ""
-    try:
-        if not stream and logp and sp is not None and not sp.exists() \
-                and Path(logp + ".prepare").exists():
-            phase = "prepare"
-            # The engine keeps prepare's stderr as that file, and prepare
-            # writes one flushed line per phase event ("prepare: sast-prepass
-            # done (412s)", "prepare: history 4000/21607 commits"): the last
-            # one is where the deterministic phase is right now.
-            with open(logp + ".prepare", "rb") as fh:
-                fh.seek(0, os.SEEK_END)
-                fh.seek(max(0, fh.tell() - 4096))
-                lines = [l.strip() for l in fh.read().decode("utf-8", "replace").splitlines() if l.strip()]
-            phase_detail = (lines[-1] if lines else "")[:200]
-    except Exception:  # noqa: BLE001
-        phase = phase or ""
-        phase_detail = ""
     # What launched the run, from the slot's own breadcrumb -- three answers,
     # not two: true, false, and None for a slot that has no breadcrumb (a run
     # in flight from an engine older than it), which the page shows as a
@@ -2421,8 +2429,7 @@ def load_live_detail(jid, start_i):
            "account": (slot or {}).get("account") or "", "account_dir": (slot or {}).get("account_dir") or "",
            "cost_basis": "", "live": True}
     interactive = bool(job.get("interactive"))
-    return {"record": rec, "live": True, "interactive": interactive, "phase": phase,
-            "phase_detail": phase_detail,
+    return {"record": rec, "live": True, "interactive": interactive,
             "api_retries": _api_retries(stream),
             "agent": {"result": last_text, "num_turns": turns, "session": sess,
                       "stop_reason": "still running"},
@@ -3504,12 +3511,50 @@ def security_list(project):
     return _json_or_500(ok, out, "security list")
 
 
+# A derived security job's id, and nothing else: the one shape a run id may
+# have before it becomes a path under DATA_DIR/locks.
+_SECURITY_JOB = re.compile(r"security-[a-z0-9][a-z0-9-]*")
+
+
+def _orchestrator_status(job, analysis_id):
+    """{"alive", "phase"} of an analysis's orchestrator, off its lock
+    (DATA_DIR/locks/<job>/.analysis, taken by bin/agentloop's
+    security_orchestrate). Alive by the rule every slot is judged by
+    (slot_alive: the pid, on this boot), and only while the lock names THIS
+    analysis (its `analysis` file) -- the lock is per job, and the next
+    analysis of the job takes it. `phase` is what the orchestrator wrote there
+    (security/orchestrator.py, _set_phase), "" while it has written none.
+    Between two units no slot is alive; this is what tells an analysis in hand
+    from one that died."""
+    if not _SECURITY_JOB.fullmatch(str(job or "")):
+        return {"alive": False, "phase": ""}
+    lock = DATA_DIR / "locks" / str(job) / ".analysis"
+    try:
+        owner = (lock / "analysis").read_text().strip()
+    except OSError:
+        owner = ""
+    if owner != str(analysis_id) or not slot_alive(lock):
+        return {"alive": False, "phase": ""}
+    try:
+        phase = (lock / "phase").read_text().strip()
+    except OSError:
+        phase = ""
+    return {"alive": True, "phase": phase}
+
+
 def security_checklist(analysis_raw):
     aid = _analysis_id(analysis_raw)
     if aid is None:
         return 400, {"error": "analysis must be an integer"}
     ok, out = al(["security", "checklist", "--analysis", str(aid)])
-    return _json_or_500(ok, out, "security checklist")
+    code, body = _json_or_500(ok, out, "security checklist")
+    # THE ORCHESTRATOR'S LIFE, for the page's run notice: a `running` analysis
+    # with no live slot is either between two units or dead, and only its
+    # orchestrator's lock tells the two apart -- a thing the CLI, which never
+    # reads the lock directory, cannot answer.
+    if code == 200 and isinstance(body, dict) and isinstance(body.get("analysis"), dict):
+        body["orchestrator"] = _orchestrator_status(body["analysis"].get("run_id"), aid)
+    return code, body
 
 
 def security_branches(project, repo):
@@ -3668,6 +3713,18 @@ def security_analyze(body):
     # detaches only the run, so `output` carries the id of a row that really
     # exists.
     ok, out = al(["security", "analyze", "--detach", project, repo, branch, profile])
+    return (200, {"ok": True, "output": out}) if ok else (500, {"error": out})
+
+
+def security_resume(body):
+    """Resume an interrupted analysis: the engine checks the rest (that it is
+    this project's, that it is interrupted, that nothing of it still runs) and
+    says why in its own sentence when it refuses."""
+    project = str(body.get("project", "")).strip()
+    analysis = str(body.get("analysis", "")).strip()
+    if not project or not analysis.isdigit():
+        return 400, {"error": "project and a numeric analysis id are required"}
+    ok, out = al(["security", "resume", project, analysis])
     return (200, {"ok": True, "output": out}) if ok else (500, {"error": out})
 
 
@@ -4453,6 +4510,8 @@ class Handler(BaseHTTPRequestHandler):
         # check below would otherwise refuse them for having no "id".
         if op == "security_analyze":
             return self._send(*security_analyze(body))
+        if op == "security_resume":
+            return self._send(*security_resume(body))
         if op == "security_decide":
             return self._send(*security_decide(body))
         if op == "security_filter_save":

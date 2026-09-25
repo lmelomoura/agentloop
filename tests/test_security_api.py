@@ -24,6 +24,7 @@ to get wrong.
 import json
 import os
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 
@@ -417,6 +418,43 @@ def test_analyze_reports_a_cli_failure_as_500(srv, monkeypatch):
                         (False, "an analysis of 'web' is already running"))
     code, payload = srv.security_analyze({"project": "web", "repo": "web", "branch": "main"})
     assert code == 500
+
+
+def test_resume_asks_the_engine_to_resume_that_analysis_of_that_project(srv, monkeypatch):
+    calls = []
+    monkeypatch.setattr(srv, "al", lambda args, **kw: (calls.append(args) or (True, '{"analysis_id":7,"resumed":true}')))
+    code, body = srv.security_resume({"project": "web", "analysis": 7})
+    assert (code, calls) == (200, [["security", "resume", "web", "7"]])
+    assert srv.security_resume({"project": "web", "analysis": "7; rm -rf /"})[0] == 400
+    assert srv.security_resume({"project": "", "analysis": 7})[0] == 400
+
+
+def test_the_checklist_says_whether_the_orchestrator_is_alive_and_in_which_phase(clean_data, monkeypatch):
+    """Between two units of an analysis no slot is alive, and the page used to
+    call that a dead analysis. The orchestrator's lock is the fact: alive by
+    the rule every slot is judged by, and only when it names THIS analysis."""
+    srv = clean_data
+    checklist = {"analysis": {"id": 7, "run_id": "security-web", "state": "running"}, "findings": []}
+    monkeypatch.setattr(srv, "al", lambda args, stdin=None: (True, json.dumps(checklist)))
+    code, body = srv.security_checklist("7")
+    assert (code, body["orchestrator"]) == (200, {"alive": False, "phase": ""})
+    lock = srv.DATA_DIR / "locks" / "security-web" / ".analysis"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(str(os.getpid()))
+    (lock / "boot").write_text(srv.boot_id())
+    (lock / "analysis").write_text("7\n")
+    (lock / "phase").write_text("preparing\n")
+    assert srv.security_checklist("7")[1]["orchestrator"] == {"alive": True, "phase": "preparing"}
+    (lock / "analysis").write_text("8\n")
+    assert srv.security_checklist("7")[1]["orchestrator"]["alive"] is False, "the lock is another analysis's"
+    (lock / "analysis").write_text("7\n")
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    (lock / "pid").write_text(str(gone.pid))
+    assert srv.security_checklist("7")[1]["orchestrator"]["alive"] is False, "its pid is gone"
+    checklist["analysis"]["run_id"] = "../../etc"
+    assert srv.security_checklist("7")[1]["orchestrator"] == {"alive": False, "phase": ""}, \
+        "a run id that is not a derived job's never becomes a path"
 
 
 # ----------------------------------------------------------------- branches

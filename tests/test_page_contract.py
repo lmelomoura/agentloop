@@ -1286,19 +1286,6 @@ def test_the_server_hands_the_page_what_the_api_did(srv):
     assert '"api_error_status": data.get("api_error_status")' in server_src
 
 
-def test_the_terminal_names_the_deterministic_phase_while_it_runs(srv):
-    """On OpenAI and OpenCode the engine runs `prepare` before the agent, and a
-    long git history keeps it busy for minutes; the Terminal said "Waiting for
-    the first turn" the whole time, which reads as a run that never started.
-    The server names the phase (`phase: "prepare"`, from the .prepare sidecar
-    with no stream yet) and the page says so."""
-    page = (REPO / "bin" / "dashboard.html").read_text()
-    assert 'd.phase === "prepare"' in page
-    assert "Running the deterministic phase before the agent" in page
-    server_src = (REPO / "bin" / "agentloop-server").read_text()
-    assert '"phase": phase' in server_src
-
-
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_a_resume_is_not_its_own_continuation(srv, tmp_path):
     """A resumed run carries the session it continued in BOTH `resumed_from` and

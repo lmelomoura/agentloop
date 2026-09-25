@@ -1181,3 +1181,11 @@ def test_units_prints_the_progress_and_a_unit_s_label(tmp_path):
     assert summary["deep"] == {"files": 2, "files_read": 0, "lines": 2, "lines_read": 0}
     hunt = _unit(db, aid, "hunt")
     assert raw(db, "units", "--analysis", str(aid), "--label", str(hunt["id"])).strip() == "hunt 1/1"
+
+
+def test_the_checklist_carries_the_units_progress(tmp_path):
+    db = tmp_path / "security.db"
+    aid, _root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
+    checklist = run(db, "checklist", "--analysis", str(aid))
+    assert checklist["units"]["kinds"]["read"]["total"] == 1
+    assert checklist["units"]["deep"] == {"files": 1, "files_read": 0, "lines": 1, "lines_read": 0}

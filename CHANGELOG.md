@@ -20,6 +20,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The analysis page can follow and resume a pipeline analysis.** The
+  checklist carries the units' progress, and whether the analysis's
+  orchestrator is alive and in which phase — between two units no run is
+  alive, and that is not an analysis that died; the report and the screen
+  say an interrupted analysis stopped short and that Resume continues it;
+  the dashboard can resume an analysis (`security_resume`); and each run of
+  a security unit on the Runs page is labelled with its analysis and its
+  unit ("analysis 22 · read 7/25 · attempt 2"), read off the head of its
+  precheck text.
 - **An analysis whose orchestrator died is resumed by the tick.** A reboot or
   a crash left the analysis `running` behind a dead lock, with its finished
   units paid for and the rest never started. The tick now marks it
