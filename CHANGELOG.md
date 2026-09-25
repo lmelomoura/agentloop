@@ -20,6 +20,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The run index keeps transcripts for 30 days, and every run's summary
+  forever.** A finished run's stream, result, precheck output and stderr
+  used to stay in `index.db` for as long as the index existed — 751 MB on
+  the operator's own install, unbounded on every install. Past a
+  configurable window (Settings › Data, `index_retention_days`, default 30
+  days, 0 keeps everything) the index clears an already-pruned run's large
+  text columns and marks the row trimmed; the row itself — job, start,
+  status, cost, duration, session, model, note, cause and the rest — is
+  never touched, and no row is ever deleted. The trim runs inside the
+  existing index pass, under the same write lock, at most once a day and in
+  bounded batches, and hands the freed space back with `VACUUM` the same way
+  a run delete already does. A trimmed run's Terminal and Timeline say the
+  transcript was removed after N days instead of rendering as if it never
+  had one.
 - **End-to-end scenarios for the pipeline.** A deep analysis of the sandbox
   runs every unit and closes `done` with every line read; a read unit that
   leaves a range unread is continued and the analysis still closes `done`;

@@ -721,6 +721,7 @@ document.documentElement.dataset.theme =
   <nav class="viewtabs" id="st-tabs">
     <button class="viewtab active" data-sttab="platforms" id="sttab-platforms"></button>
     <button class="viewtab" data-sttab="profile" id="sttab-profile"></button>
+    <button class="viewtab" data-sttab="data" id="sttab-data"></button>
   </nav>
   <div class="pane" id="st-platforms"></div>
   <!-- The one account, edited here. It lived in a dialog behind the sidebar
@@ -769,6 +770,32 @@ document.documentElement.dataset.theme =
       <div class="pf-f">
         <div class="dlg-err" id="pf-err" hidden></div>
         <button type="submit" class="btn primary" id="pf-save">Save profile</button>
+      </div>
+      </form>
+    </section>
+  </div>
+  <!-- The run index's own retention: how long a finished run keeps its full
+       transcript before the server clears it down to a summary (agentloop-
+       server's _trim_old_runs). One field, so it wears the Platforms tab's
+       card the same way Profile does. -->
+  <div class="pane" id="st-data" hidden>
+    <section class="platcard">
+      <div class="platcard-h">
+        <div class="platcard-ic" id="sd-halo"></div>
+        <div class="platcard-t"><b>Run index retention</b><span>How long a finished run keeps its transcript</span></div>
+      </div>
+      <form id="sd-form" novalidate>
+      <div class="pf-b">
+        <label for="sd-days">Keep transcripts for (days)</label>
+        <input id="sd-days" type="number" min="0" max="3650" step="1" inputmode="numeric">
+        <p class="fieldhelp">A run's summary — status, cost, duration, session, model — is kept forever.
+          Its transcript, precheck output and stderr are cleared once this many days have passed since it
+          ran. 0 keeps every transcript forever. The change applies to future index passes, not retroactively
+          in one sweep — the server catches up over the following days.</p>
+      </div>
+      <div class="pf-f">
+        <div class="dlg-err" id="sd-err" hidden></div>
+        <button type="submit" class="btn primary" id="sd-save">Save</button>
       </div>
       </form>
     </section>
@@ -3684,9 +3711,38 @@ function selectSettingsTab(name){
     b.classList.toggle("active", b.dataset.sttab===name));
   $("st-platforms").hidden=(name!=="platforms");
   $("st-profile").hidden=(name!=="profile");
+  $("st-data").hidden=(name!=="data");
   // Filled on the way in, so the fields say what the server says however you
   // arrived -- Platforms rebuilds itself from PLATFORMS the same way.
   if(name==="profile") fillProfile();
+  if(name==="data") fillDataSettings();
+}
+// Retention days, read back from CFG.settings (arrives on /api/config, same
+// as prefs above) whenever the tab is entered -- so a value changed from
+// another tab, or by the server's own default, is what the field shows.
+function fillDataSettings(){
+  const s=(CFG.settings)||{index_retention_days:30};
+  $("sd-days").value=s.index_retention_days;
+  $("sd-err").hidden=true;
+}
+async function saveDataSettings(){
+  const raw=$("sd-days").value;
+  const n=Number(raw);
+  if(raw==="" || !Number.isInteger(n) || n<0 || n>3650){
+    $("sd-err").textContent="Enter a whole number of days, 0 to 3650 (0 keeps every transcript forever).";
+    $("sd-err").hidden=false;
+    return;
+  }
+  $("sd-err").hidden=true;
+  const btn=$("sd-save"); btn.disabled=true;
+  try{
+    const ok=await api("setting_set", {key:"index_retention_days", value:n});
+    if(ok){
+      if(!CFG.settings) CFG.settings={};
+      CFG.settings.index_retention_days=n;
+      toast("Retention saved");
+    }
+  } finally { btn.disabled=false; }
 }
 // The Settings page repaints only on entering the view and when /api/models
 // answers -- never on the five-second poll, which would reset what the
@@ -4581,10 +4637,22 @@ function renderLog(d){
     : "";
   const meta='<dl class="kv loginfo">'+rows.map(x=>'<dt>'+x[0]+'</dt><dd>'+x[1]+'</dd>').join("")+'</dl>';
 
+  // A run whose large text columns the index retention trim already
+  // cleared (see agentloop-server's _trim_old_runs) says so, plainly,
+  // rather than the Terminal/Timeline reading like a run that never had a
+  // transcript at all. Retention keeps the row's summary fields forever;
+  // only the transcript itself is gone.
+  const retentionLine = d.trimmed
+    ? 'The transcript was removed after ' + (d.retention_days || 30)
+      + ' day' + (d.retention_days === 1 ? '' : 's')
+      + ' — its summary (status, cost, duration) is kept.'
+    : '';
+
   const turns=d.turns||[];
   const timelinePane = turns.length
     ? '<ol class="timeline">'+turns.map(timelineRow).join("")+'</ol>'
-    : '<div class="muted">No per-turn trace for this run (it pre-dates stream capture).</div>';
+    : '<div class="muted">'+esc(d.trimmed ? retentionLine
+        : 'No per-turn trace for this run (it pre-dates stream capture).')+'</div>';
 
   const answerPane = a.result ? '<div class="md">'+mdToHtml(a.result)+'</div>'
                               : '<div class="muted">No agent output recorded.</div>';
@@ -4608,6 +4676,7 @@ function renderLog(d){
           // reads as "still going" and hides a real failure: the transcript was
           // lost, not delayed.
           + (retryLine ? esc(retryLine)
+             : d.trimmed ? esc(retentionLine)
              : d.live ? 'Waiting for the first turn…'
                     : 'No transcript was captured for this run. It finished, and its cost '
                       + 'and turn count were recorded, but the log could not be read back — '
@@ -5998,10 +6067,12 @@ $("pj-cancel").addEventListener("click", ()=>pjWiz.close());
    block is not a <button> — it holds one (sign out) — so the listener sits on
    the block and the inner button stops its own click from reaching it. */
 $("pf-halo").innerHTML=I.user;
+$("sd-halo").innerHTML=I.clock;
 $("side-user").addEventListener("click", openProfile);
 // Save is the profile form's submit button, so Enter in a field saves too --
 // and the submit never navigates: saveProfile posts it.
 $("pf-form").addEventListener("submit",(e)=>{ e.preventDefault(); saveProfile(); });
+$("sd-form").addEventListener("submit",(e)=>{ e.preventDefault(); saveDataSettings(); });
 $("pf-pick").addEventListener("click", ()=>$("pf-file").click());
 $("pf-drop").addEventListener("click", ()=>{ pfAvatar=""; $("pf-file").value=""; pfFace(); });
 $("st-profile").addEventListener("input", ()=>{ pfError(""); pfFace(); });
@@ -6177,6 +6248,7 @@ paintUser();
 // settings.js) on entering the view; only the two tabs are labelled here.
 $("sttab-platforms").innerHTML=I.layers+"Platforms";
 $("sttab-profile").innerHTML=I.user+"Profile";
+$("sttab-data").innerHTML=I.clock+"Data";
 $("st-tabs").addEventListener("click",(e)=>{
   const b=e.target.closest(".viewtab"); if(!b) return;
   selectSettingsTab(b.dataset.sttab);
