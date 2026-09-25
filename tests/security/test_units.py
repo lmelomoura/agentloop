@@ -595,6 +595,27 @@ def test_a_gone_claim_is_settled_by_the_file_s_absence_only_when_the_checkout_is
         "a.py does not exist in this checkout"
 
 
+def test_a_close_against_a_checkout_that_is_gone_proves_no_absence(conn, tmp_path):
+    """A unit's checkout is torn down when its run ends (run_cleanup, the
+    orchestrator's sweep). A close handed a root that is no longer on disk
+    -- the orchestrator judging a dead run by its stream's `cwd` -- must not
+    read every claimed-gone file as absent from it: the claim stays owed, as
+    with no checkout known, and a read still settles it."""
+    prev = _analysis(conn, commit="c0")
+    _agent(conn, prev, "c" * 64)
+    ledger.finish_analysis(conn, prev, "done")
+    aid = _analysis(conn)
+    item = {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [item]})
+    ledger.start_unit(conn, uid)
+    ledger.record_gone(conn, uid, "c" * 64, "the handler was deleted")
+    gone = tmp_path / "torn-down-checkout"
+    out = units.close(conn, ledger.get_unit(conn, uid), stream=_quiet(tmp_path), root=str(gone),
+                      status="success")
+    assert out["state"] != "done", "a checkout that is gone proved a.py absent"
+    assert "reported gone without reading a.py" in ledger.get_unit(conn, uid)["note"]
+
+
 def test_a_gone_claim_for_a_finding_in_two_files_is_owed_until_both_are_accounted_for(conn, tmp_path):
     prev = _analysis(conn, commit="c0")
     ledger.record_finding(conn, prev, {

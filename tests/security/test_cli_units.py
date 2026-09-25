@@ -1237,7 +1237,7 @@ def test_units_prints_the_progress_and_a_unit_s_label(tmp_path):
     aid, _root, _ = _deep(db, tmp_path, {"src/a.py": "a\n", "src/b.py": "b\n"})
     summary = run(db, "units", "--analysis", str(aid))
     assert summary["kinds"]["read"] == {"total": 1, "done": 0, "running": 0, "pending": 1, "failed": 0}
-    assert summary["deep"] == {"files": 2, "files_read": 0, "lines": 2, "lines_read": 0}
+    assert summary["deep"] == {"files": 2, "files_read": 0, "files_empty": 0, "lines": 2, "lines_read": 0}
     hunt = _unit(db, aid, "hunt")
     assert raw(db, "units", "--analysis", str(aid), "--label", str(hunt["id"])).strip() == "hunt 1/1"
 
@@ -1247,4 +1247,4 @@ def test_the_checklist_carries_the_units_progress(tmp_path):
     aid, _root, _ = _deep(db, tmp_path, {"src/a.py": "a\n"})
     checklist = run(db, "checklist", "--analysis", str(aid))
     assert checklist["units"]["kinds"]["read"]["total"] == 1
-    assert checklist["units"]["deep"] == {"files": 1, "files_read": 0, "lines": 1, "lines_read": 0}
+    assert checklist["units"]["deep"] == {"files": 1, "files_read": 0, "files_empty": 0, "lines": 1, "lines_read": 0}

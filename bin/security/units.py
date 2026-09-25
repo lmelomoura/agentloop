@@ -828,7 +828,16 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     # _unread_files): what proves a claimed-gone file's ABSENCE. What proves
     # a READ of it is already on `session` above, whichever kind of unit
     # this is.
-    done, remaining, ev, note = judge(conn, unit, session, status, reason, root=root)
+    #
+    # A ROOT THAT IS NOT ON DISK PROVES NO ABSENCE. The checkout a run worked
+    # in is torn down when the run ends (run_cleanup, and the orchestrator's
+    # sweep); judged against a root that is gone, every claimed-gone file
+    # would read as absent and settle its claim on nothing. So the absence
+    # check is given no root then -- "no checkout known", where only a read
+    # clears a file. The reads above are relativised by the path alone and
+    # need no directory.
+    judge_root = root if root and os.path.isdir(root) else ""
+    done, remaining, ev, note = judge(conn, unit, session, status, reason, root=judge_root)
     clear = None
     if session.tasks and unit["kind"] == "verify":
         # A VERDICT NOBODY CAN PROVE THIS UNIT REASONED MUST NOT STAND. The
