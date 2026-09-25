@@ -243,9 +243,14 @@ def _running(conn, analysis_id):
     """
     row = _analysis(conn, analysis_id)
     if row["state"] == ledger.INTERRUPTED:
+        # `ledger.interrupt_analysis` only ever moves the ROW to `interrupted`
+        # (a single UPDATE, no unit touched) -- it is the ORCHESTRATOR, not
+        # this state, that actually stops a unit still running when it
+        # interrupts the analysis around it, and the two happen together in
+        # practice, but only the first is a fact this message can vouch for.
         sys.exit(f"analysis {analysis_id} is interrupted: nothing is written into it "
-                 "until it is resumed (`agentloop security resume`), and a unit of it "
-                 "that is still running was stopped with it.")
+                 "until it is resumed (`agentloop security resume`); the orchestrator "
+                 "stops any unit of it still running when it interrupts an analysis.")
     if row["state"] != "running":
         sys.exit(f"analysis {analysis_id} is closed ({row['state']}): it is the "
                  "baseline the next analysis is compared against, and writing "
@@ -346,11 +351,27 @@ def cmd_open_analysis(args):
     # the old one after this would file two readings of one branch out of
     # order; its finished units stay in the ledger, and its note says why the
     # rest never ran.
-    for (old,) in conn.execute(
-            "SELECT id FROM analysis WHERE project=? AND repo=? AND branch=? AND state=? AND id<>?",
-            (args.project, args.repo, args.branch, ledger.INTERRUPTED, aid)).fetchall():
-        ledger.close_interrupted(conn, old, f"Superseded by analysis {aid}, opened on the same "
-                                            "branch before this one was resumed.")
+    #
+    # BEST-EFFORT, LIKE `record_event` BELOW -- AND FOR THE SAME REASON.
+    # `aid` is already committed by `start_analysis` above; a `sqlite3.Error`
+    # here (a busy `security.db`, shared across every project) must not turn
+    # this call into the same "orphaned `running` row, `could not open an
+    # analysis`" failure `record_event`'s own comment describes -- this
+    # write is strictly less important than that one, an audit event, since
+    # its ONLY effect is tidying up a row this new analysis has already
+    # superseded in substance. Left `interrupted` instead of `failed`, the
+    # old row is merely resumable a while longer (until the next open, or
+    # its own automatic-resume budget runs out) -- a far smaller harm than
+    # losing this call's own `analysis_id` to a write that was never the
+    # point of it.
+    try:
+        for (old,) in conn.execute(
+                "SELECT id FROM analysis WHERE project=? AND repo=? AND branch=? AND state=? AND id<>?",
+                (args.project, args.repo, args.branch, ledger.INTERRUPTED, aid)).fetchall():
+            ledger.close_interrupted(conn, old, f"Superseded by analysis {aid}, opened on the same "
+                                                "branch before this one was resumed.")
+    except sqlite3.Error:
+        pass
     try:
         ledger.record_event(conn, args.project, "analysis_started",
                             f"{args.profile} on {args.branch}", str(aid))

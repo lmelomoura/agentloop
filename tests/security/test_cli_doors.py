@@ -54,6 +54,37 @@ def test_a_finding_carries_the_unit_of_the_session_that_wrote_it(tmp_path):
     assert conn.execute("SELECT unit FROM finding WHERE fingerprint=?", ("b" * 64,)).fetchone()[0] == uid
 
 
+def test_a_finding_ignores_a_unit_the_payload_itself_tries_to_set(tmp_path):
+    """`unit` is stamped from the RUN's own environment (`_session_unit()`),
+    never read from the payload -- the same rule `producer` follows, and
+    for the same reason: a session able to claim another unit's id in its
+    own payload could hand a disqualified attempt's rows to whichever unit
+    it liked, or credit a unit that never wrote anything at all. The
+    payload's own `unit` key, whatever it names, must be silently
+    overwritten, not merely ignored as an extra key that happens not to
+    reach the column."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    conn = _conn(db)
+    real = ledger.add_unit(conn, aid, "hunt", {})
+    claimed = ledger.add_unit(conn, aid, "hunt", {})
+    run(db, "report-finding", "--analysis", str(aid), env=_agent_in_unit(aid, real), stdin=json.dumps({
+        "fingerprint": "b" * 64, "category": "sast", "rule": "sql-injection", "severity": "high",
+        "title": "t", "rationale": "the query is concatenated",
+        "occurrences": [{"file": "app/db.py", "line": 12}], "unit": claimed,
+        "candidate": {"trace": [{"kind": "entrypoint", "file": "app/api.py", "line": 4, "scope": "s",
+                                 "description": "input"},
+                                {"kind": "sink", "file": "app/db.py", "line": 12, "scope": "f",
+                                 "description": "execute"}],
+                      "intended_control": "parameterised queries",
+                      "confidence": {"score": "high", "reason": "r"},
+                      "likelihood": {"score": "high", "reason": "r"},
+                      "impact": {"score": "high", "reason": "r"}}}))
+    stored = conn.execute("SELECT unit FROM finding WHERE fingerprint=?", ("b" * 64,)).fetchone()[0]
+    assert stored == real, "the session's own unit, never the one the payload asked for"
+    assert stored != claimed
+
+
 def test_a_verdict_from_an_agent_session_must_come_from_that_finding_s_verify_unit(tmp_path):
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path)
@@ -72,6 +103,56 @@ def test_a_verdict_from_an_agent_session_must_come_from_that_finding_s_verify_un
         env=_agent_in_unit(aid, right))
     row = conn.execute("SELECT verdict, verified_by FROM finding WHERE fingerprint=?", ("b" * 64,)).fetchone()
     assert (row["verdict"], row["verified_by"]) == ("confirmed", f"unit:{right}")
+
+
+def test_a_verdict_is_refused_for_the_right_unit_while_it_is_still_pending(tmp_path):
+    """The door's combined `if` names five ways a session is not this
+    finding's verifier -- no unit, the wrong kind, the wrong analysis, the
+    wrong fingerprint, and `unit["state"] != "running"` -- and the sibling
+    test above exercises the first two of the five (`None`, a `hunt` unit)
+    plus the fingerprint mismatch (`wrong`), but never sends the RIGHT
+    unit, for the RIGHT finding, before the engine has started it: a plan
+    leaves every unit `pending`, and `report-verdict` must refuse a session
+    that has not actually been launched for it yet, the same as a wrong
+    unit entirely."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _sast(db, aid, "b" * 64)
+    conn = _conn(db)
+    right = ledger.add_unit(conn, aid, "verify", {"fingerprint": "b" * 64})   # never started: still pending
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+               stdin=json.dumps({"verdict": "confirmed", "reason": "read app/db.py:12"}),
+               env=_agent_in_unit(aid, right))
+    assert out.returncode != 0 and "verify unit" in out.stderr
+    assert conn.execute("SELECT verdict FROM finding WHERE fingerprint=?", ("b" * 64,)).fetchone()[0] == ""
+
+
+def test_a_verdict_is_refused_for_a_verify_unit_of_another_analysis_with_the_same_fingerprint(tmp_path):
+    """`unit["analysis_id"] != args.analysis` is its own condition in the
+    door's combined `if`, untested on its own: a verify unit that IS
+    running, and IS a `verify` unit, and DOES carry the right fingerprint
+    -- but was launched for a DIFFERENT analysis that happens to carry a
+    finding under the same fingerprint text -- must not be able to write a
+    verdict onto the analysis named by `--analysis` either. Two analyses of
+    the same fingerprint is ordinary: a carried finding keeps its
+    fingerprint across analyses, and two independently reported findings
+    can collide on one by chance."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    _sast(db, aid, "b" * 64)
+    other_aid = prepared_analysis(db, tmp_path)
+    _sast(db, other_aid, "b" * 64)
+    conn = _conn(db)
+    other_unit = ledger.add_unit(conn, other_aid, "verify", {"fingerprint": "b" * 64})
+    ledger.start_unit(conn, other_unit)
+    # The session env names THIS analysis (`aid`) as the one it is writing
+    # into, but the unit id is the OTHER analysis's own verify unit.
+    env = {**AS_AGENT, "AL_SECURITY_ANALYSIS_ID": str(aid), "AL_SECURITY_UNIT_ID": str(other_unit)}
+    out = fails(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "b" * 64,
+               stdin=json.dumps({"verdict": "confirmed", "reason": "read app/db.py:12"}), env=env)
+    assert out.returncode != 0 and "verify unit" in out.stderr
+    assert conn.execute("SELECT verdict FROM finding WHERE analysis_id=? AND fingerprint=?",
+                        (aid, "b" * 64)).fetchone()[0] == ""
 
 
 def test_a_verdict_written_outside_any_agent_session_is_the_operator_s(tmp_path):
@@ -133,16 +214,25 @@ def test_nothing_is_written_into_an_interrupted_analysis(tmp_path):
 
 
 def test_a_new_analysis_supersedes_an_interrupted_one_on_the_same_branch(tmp_path):
+    """Scoped by `project`, `branch` AND `repo` alike -- the supersede
+    query's own `WHERE` names all three -- so an interrupted analysis of a
+    different branch OR a different repo of the same project/branch stays
+    interrupted; only the exact same (project, repo, branch) is superseded.
+    `list` is scoped by `--project` alone, so `other_repo`'s row -- a
+    different repo of the SAME project -- still shows up in it."""
     db = tmp_path / "security.db"
     old = open_analysis(db)
     other_branch = open_analysis(db, branch="develop")
+    other_repo = open_analysis(db, repo="web-other")
     run(db, "interrupt", "--analysis", str(old))
     run(db, "interrupt", "--analysis", str(other_branch))
+    run(db, "interrupt", "--analysis", str(other_repo))
     new = open_analysis(db)
     rows = {r["id"]: r for r in run(db, "list", "--project", "web")}
     assert rows[old]["state"] == "failed"
     assert f"Superseded by analysis {new}" in rows[old]["coverage_note"]
     assert rows[other_branch]["state"] == "interrupted"
+    assert rows[other_repo]["state"] == "interrupted"
 
 
 # ---- controller decision: `migrate-rules` refuses while an analysis is

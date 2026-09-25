@@ -1071,10 +1071,14 @@ cmd_security_branches() { # cmd_security_branches <project> <repo> -> every
 # from its own tool shell inside the worktree: without a marker, `security
 # decide --state false_positive` permanently suppresses a finding the agent
 # itself just reported, and `security rename-project` moves the ledger out from
-# under the project. bin/security/cli.py refuses those three verbs when it sees
-# this. It is deliberately NOT limited to the agent's own process:
-# security_close_analysis runs inside run_job, still under this assignment, and
-# `finish` stays allowed precisely so that close keeps working.
+# under the project. bin/security/cli.py refuses those and every other engine
+# verb (AGENT_FORBIDDEN in bin/security/cli.py -- `finish`, `unit-close`,
+# `orchestrate`, `interrupt`, `resume`, `abandon` among them) when it sees this
+# flag set. security_close_analysis calls `finish` through security_engine_py
+# instead (bin/agentloop's own wrapper that UNSETS this assignment before it
+# runs), the same way every other engine-only write does -- not because
+# `finish` is exempt from the refusal, but because the call that closes the
+# analysis is never made under the agent's own flag in the first place.
 #
 # AL_SECURITY_ANALYSIS_ID is what the close-out reads the row id from. The
 # request file is shared and mutable -- the next analysis of this project
@@ -1260,14 +1264,14 @@ EOF
 # closing an analysis must be a no-op for any job that isn't derived, or a
 # normal run ending would try to close an analysis that never existed.
 #
-# The agent that finished cleanly has already called `security finish`; this
-# closes the row again with the RUN's verdict and the run's real cost.
-# Deliberate: the agent's own word is the one thing here that is not
-# verifiable, and a report that claims to be complete after the process that
-# produced it fell over is the failure this whole feature exists to avoid. The
-# close can only ever LOWER the verdict -- `finish` refuses to turn a stored
-# `capped` or `failed` back into `done` -- so an agent that honestly said it
-# ran out of room keeps saying so.
+# `finish` is one of the engine's own verbs now (AGENT_FORBIDDEN in
+# bin/security/cli.py) -- an agent session can no longer call it at all, so
+# this call is THE close for any analysis this hook runs after, not a second
+# one over an agent's own: the RUN's own verdict and the run's real cost,
+# read from the classifier and the stream, never from anything the agent
+# claimed. `finish` still refuses to turn a stored `capped` or `failed` back
+# into `done` (cmd_finish, bin/security/cli.py) -- a general property of the
+# verb, not specific to a caller this hook no longer shares it with.
 # The hunting guides a run actually opened, read off the run's own stream --
 # never off the agent's word. Every platform's stream is normalised to Claude's
 # shape (bin/platforms/*_stream.py), so a `Read` on Claude Code, a `read` on
@@ -8677,20 +8681,24 @@ case "${1:-}" in
                analyze) shift; [ $# -ge 3 ] || die "usage: agentloop security analyze [--detach] <project> <repo> <branch> [profile]"
                         cmd_security_analyze "$@" ;;
                # Everything else is the ledger's own vocabulary: prepare,
-               # findings, fingerprint, report-finding, finish, checklist,
-               # render, list, analysis, events are what the agent types
-               # verbatim from its prompt; decide, rename-project,
-               # open-analysis, event and `filters save`/`filters delete` are
-               # the operator's (AGENT_FORBIDDEN refuses all of those to the
-               # agent); migrate-rules is the operator's too, though NOT
-               # refused the agent -- it takes no arguments and can only
-               # apply the rename map this repository declares; and
+               # findings, fingerprint, report-finding, report-verdict,
+               # checklist, render, list, analysis, events are what the agent
+               # types verbatim from its prompt; decide, rename-project,
+               # open-analysis, event, `filters save`/`filters delete`, and
+               # the engine's own verbs -- finish, unit-close, orchestrate,
+               # interrupt, resume, abandon -- are the operator's or the
+               # engine's alone (AGENT_FORBIDDEN in bin/security/cli.py
+               # refuses every one of those to an agent session; the engine
+               # reaches `finish` itself through security_engine_py, which
+               # unsets the flag first); migrate-rules is the operator's too,
+               # though NOT refused the agent -- it takes no arguments and
+               # can only apply the rename map this repository declares; and
                # index-data, project-data, findings-page, activity-data and
                # `filters list` are the dashboard's own screens fetching
                # through this same door, never typed by a human at all --
                # listed here anyway so this message names every verb the door
                # actually accepts, not just the subset any one caller uses.
-               "")      die "usage: agentloop security <analyze|prepare|findings|fingerprint|report-finding|finish|checklist|render|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
+               "")      die "usage: agentloop security <analyze|prepare|findings|fingerprint|report-finding|report-verdict|finish|checklist|render|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
                *)       security_py "$@" ;;
              esac ;;
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"

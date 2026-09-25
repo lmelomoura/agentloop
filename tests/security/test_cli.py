@@ -4658,6 +4658,45 @@ def test_open_analysis_survives_a_ledger_write_failure(tmp_path, monkeypatch, ca
     assert row["state"] == "running"
 
 
+def test_open_analysis_survives_a_failure_superseding_an_interrupted_one(tmp_path, monkeypatch, capsys):
+    """The other write `cmd_open_analysis` makes after `start_analysis`
+    commits: superseding an INTERRUPTED analysis of the same branch. Before
+    this fix it ran unguarded too, between the new row's commit and the
+    `record_event` call the test above already covers -- a `sqlite3.Error`
+    here (the same busy `security.db` `record_event`'s own guard exists
+    for) would have raised past `main()`'s own top-level guard, with the
+    new `running` row already committed but never printed: the exact
+    orphan-row failure the sibling test's docstring describes, at a second
+    call site. Left `interrupted` rather than `failed`, the old row is
+    merely resumable a while longer -- the far smaller harm the new guard's
+    own comment names.
+
+    Driven in-process for the same reason as the sibling test: the point is
+    to monkeypatch `ledger.close_interrupted` mid-call."""
+    db = tmp_path / "security.db"
+    old_aid = open_analysis(db, project="web", repo="web", branch="main", run_id="r0")
+    conn = security_ledger.connect(db)
+    assert security_ledger.interrupt_analysis(conn, old_aid)
+    conn.close()
+
+    def boom(*_a, **_kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(security_ledger, "close_interrupted", boom)
+    security_cli.main([
+        "open-analysis", "--project", "web", "--repo", "web", "--branch", "main",
+        "--commit", "a", "--profile", "quick", "--run-id", "r1", "--db", str(db)])
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["analysis_id"] == old_aid + 1
+    # A fresh subprocess, so the still-broken monkeypatch above cannot mask
+    # a failure: the new row is real and running, and the old one -- left
+    # untouched by the failed supersede -- is still `interrupted`, not
+    # silently lost either.
+    rows = {r["id"]: r["state"] for r in run(db, "list", "--project", "web")}
+    assert rows[old_aid + 1] == "running"
+    assert rows[old_aid] == "interrupted"
+
+
 def test_finish_survives_a_ledger_write_failure(tmp_path, monkeypatch):
     """Same failure, second call site: `finish_analysis` above already closed
     the row with its real verdict and spend when `record_event` raises, and
@@ -5899,10 +5938,13 @@ def test_decide_still_accepts_a_real_fingerprint(tmp_path):
 
 
 # ---- final whole-branch review, IMPORTANT 1: `finish --note` was the one
-# agent-writable free-text channel with no `looks_like_a_secret` guard on it,
-# even though the near-identically-named `partial_note` is covered and
-# `finish` is deliberately allowed to the agent. A credential written there
-# reaches all four report formats and the page.
+# writable free-text channel with no `looks_like_a_secret` guard on it, even
+# though the near-identically-named `partial_note` is covered. `finish` is
+# one of the engine's own verbs now (AGENT_FORBIDDEN in bin/security/cli.py
+# -- an agent session cannot call it at all); the tests below call it the
+# way its one remaining caller does, with no agent flag set. `--note` is
+# still free text a caller types, and a credential written there reaches
+# all four report formats and the page.
 
 def test_finish_refuses_a_note_that_looks_like_a_live_credential(tmp_path):
     db = tmp_path / "security.db"
@@ -5918,7 +5960,7 @@ def test_finish_refuses_a_note_that_looks_like_a_live_credential(tmp_path):
 
 def test_a_refused_note_leaves_the_analysis_open_rather_than_half_closed(tmp_path):
     """The refusal happens BEFORE `finish_analysis`, so nothing is written --
-    the agent can close again with a note that says the same thing without
+    the caller can close again with a note that says the same thing without
     quoting the credential."""
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path, project="web", repo="web", branch="main")
