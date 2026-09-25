@@ -4518,6 +4518,35 @@ function triggerText(rec){
   return "—";
 }
 
+/* One Timeline row, and one Terminal row. Either list can hold a GAP: where
+   the server says part of the transcript is not here -- the middle of a long
+   stream the index did not keep, or turns a view had no room for -- with
+   the line to say so (bin/agentloop-server, _gap_entry). A gap is not a
+   turn: drawn as one it would read as something the agent said and take a
+   T-number, so it is a note instead, in the Terminal's own system voice. */
+function timelineRow(t){
+  if(t.gap) return '<li class="muted">'+esc(t.text)+'</li>';
+  let line='<li><span class="tn">T'+t.n+'</span>';
+  (t.tools||[]).forEach(x=>{ line+='<span class="tool">'+esc(x.tool)+'</span>';
+    if(x.hint) line+='<span class="thint">'+esc(x.hint)+'</span> '; });
+  if(t.text) line+='<span class="ttext">'+esc(t.text)+'</span>';
+  return line+'</li>';
+}
+function termRow(t){
+  if(t.gap) return '<div class="row"><span class="t-sys">'+esc(t.text)+'</span></div>';
+  const you = t.role==="user";
+  let line = "";
+  // _tool_line yields {tool, hint} — stringifying it printed "[object Object]"
+  (t.tools||[]).forEach(x=>{
+    const nm = (x && x.tool) ? x.tool : String(x||"tool");
+    const hint = (x && x.hint) ? x.hint : "";
+    line += '<span class="t-tool">⏺ <b>'+esc(nm)+'</b>'+(hint?' '+esc(hint):'')+'</span>\n';
+  });
+  if(t.text) line += '<span class="t-'+(you?"you":"agent")+'">'
+    + (you ? "&gt; " : "") + esc(t.text) + '</span>';
+  return line ? '<div class="row">'+line+'</div>' : "";
+}
+
 function renderLog(d){
   const rec=d.record||{}, a=d.agent||{};
   const rows=[
@@ -4549,12 +4578,7 @@ function renderLog(d){
 
   const turns=d.turns||[];
   const timelinePane = turns.length
-    ? '<ol class="timeline">'+turns.map(t=>{
-        let line='<li><span class="tn">T'+t.n+'</span>';
-        (t.tools||[]).forEach(x=>{ line+='<span class="tool">'+esc(x.tool)+'</span>';
-          if(x.hint) line+='<span class="thint">'+esc(x.hint)+'</span> '; });
-        if(t.text) line+='<span class="ttext">'+esc(t.text)+'</span>';
-        return line+'</li>'; }).join("")+'</ol>'
+    ? '<ol class="timeline">'+turns.map(timelineRow).join("")+'</ol>'
     : '<div class="muted">No per-turn trace for this run (it pre-dates stream capture).</div>';
 
   const answerPane = a.result ? '<div class="md">'+mdToHtml(a.result)+'</div>'
@@ -4566,19 +4590,7 @@ function renderLog(d){
   // Terminal: the run as a conversation, and — while it is live and the job is
   // interactive — a prompt box that delivers what you type into that same run.
   const convo = d.conversation||[];
-  const termRows = convo.map(t=>{
-    const you = t.role==="user";
-    let line = "";
-    // _tool_line yields {tool, hint} — stringifying it printed "[object Object]"
-    (t.tools||[]).forEach(x=>{
-      const nm = (x && x.tool) ? x.tool : String(x||"tool");
-      const hint = (x && x.hint) ? x.hint : "";
-      line += '<span class="t-tool">⏺ <b>'+esc(nm)+'</b>'+(hint?' '+esc(hint):'')+'</span>\n';
-    });
-    if(t.text) line += '<span class="t-'+(you?"you":"agent")+'">'
-      + (you ? "&gt; " : "") + esc(t.text) + '</span>';
-    return line ? '<div class="row">'+line+'</div>' : "";
-  }).join("");
+  const termRows = convo.map(termRow).join("");
   // The API bouncing every turn looks EXACTLY like a slow start: no rows, under
   // the word "live". The stream says which it is — the panel is already tailing
   // the file that holds the answer — so say it rather than leaving the operator
@@ -4615,7 +4627,7 @@ function renderLog(d){
   const tabs=[
     {id:"terminal", icon:I.terminal, label:"Terminal",            pane:termPane},
     {id:"answer",   icon:I.file,     label:"Answer",             pane:answerPane},
-    {id:"timeline", icon:I.terminal, label:"Timeline ("+turns.length+")", pane:timelinePane},
+    {id:"timeline", icon:I.terminal, label:"Timeline ("+turns.filter(t=>!t.gap).length+")", pane:timelinePane},
     {id:"precheck", icon:I.radar,    label:"Precheck",           pane:precheckPane},
   ];
   const den=a.permission_denials;

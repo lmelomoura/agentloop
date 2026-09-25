@@ -1287,6 +1287,50 @@ def test_the_server_hands_the_page_what_the_api_did(srv):
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_log_says_where_part_of_a_transcript_is_missing(srv, tmp_path):
+    """A long run's stored stream keeps its two ends with a marker between
+    them, and a view over its limit keeps its own two ends the same way; the
+    server hands both to the page as `gap` entries (bin/agentloop-server,
+    _gap_entry). Drawn as a turn, a gap reads as something the agent said,
+    and takes a T-number and a place in the Timeline tab's count. It is a
+    note about the transcript: no number, no count, in the Terminal's muted
+    system voice (tests/test_stored_stream.py covers the server side)."""
+    js = _js(srv)
+    render = _plainfn(js, "renderLog")
+    assert "turns.map(timelineRow)" in render, "the Timeline does not draw its rows through timelineRow"
+    assert "convo.map(termRow)" in render, "the Terminal does not draw its rows through termRow"
+    assert 'label:"Timeline ("+turns.filter(t=>!t.gap).length+")"' in render, \
+        "the Timeline tab counts a gap as a turn"
+    script = tmp_path / "gap.js"
+    script.write_text("""
+    const esc = (s) => String(s ?? "").replace(/[&<>"]/g,
+      c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+    """ + _plainfn(js, "timelineRow") + "\n" + _plainfn(js, "termRow") + """
+    const gap = {gap: true, text: "… 1.2 MB of the transcript omitted …", tools: []};
+    console.log(JSON.stringify({
+      tlGap: timelineRow(gap), termGap: termRow(gap),
+      turn:  timelineRow({n: 7, text: "done <now>", tools: [{tool: "Read", hint: "/a"}]}),
+      agent: termRow({role: "agent", text: "done", tools: []}),
+      tool:  termRow({role: "agent", text: "", tools: [{tool: "Bash", hint: "ls"}]}),
+      you:   termRow({role: "user", text: "go on", tools: []}),
+      empty: termRow({role: "agent", text: "", tools: []}),
+    }));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert out["tlGap"] == '<li class="muted">… 1.2 MB of the transcript omitted …</li>'
+    assert out["termGap"] == ('<div class="row"><span class="t-sys">'
+                              '… 1.2 MB of the transcript omitted …</span></div>')
+    # Turns and messages come out exactly as renderLog drew them inline.
+    assert out["turn"] == ('<li><span class="tn">T7</span><span class="tool">Read</span>'
+                           '<span class="thint">/a</span> <span class="ttext">done &lt;now&gt;</span></li>')
+    assert out["agent"] == '<div class="row"><span class="t-agent">done</span></div>'
+    assert out["tool"] == '<div class="row"><span class="t-tool">⏺ <b>Bash</b> ls</span>\n</div>'
+    assert out["you"] == '<div class="row"><span class="t-you">&gt; go on</span></div>'
+    assert out["empty"] == ""
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_a_resume_is_not_its_own_continuation(srv, tmp_path):
     """A resumed run carries the session it continued in BOTH `resumed_from` and
     `session` -- it is the same conversation. continuationsOf matched on
