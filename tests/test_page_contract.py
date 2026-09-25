@@ -3112,6 +3112,41 @@ def test_a_run_still_going_already_knows_which_cli_is_spending(srv, tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_running_security_unit_already_shows_its_label(srv, tmp_path):
+    """A finished run's label comes from ingestion, which reads the precheck
+    header once the run ends. `active_runs_for` (bin/agentloop-server) reads the
+    SAME header off the live slot's precheck sidecar and hands the label over
+    on every poll -- liveRuns() must carry it through, or a unit still running
+    shows no "triage 2/5" until it is already done, the one time an operator
+    most wants to know which unit is running."""
+    page = _js(srv)
+    app = _app_js(srv)
+    deps = (_plainfn(page, "liveRuns") + "\n" + _const(app, "KNOWN_PLATFORMS")
+            + _plainfn(app, "platformKey") + _plainfn(app, "platformOf")
+            + _plainfn(app, "securitySlug") + _plainfn(app, "derivedSecurityJob"))
+    script = tmp_path / "live-label.js"
+    script.write_text("""
+    const ALApp = {platformOf, derivedSecurityJob};
+    const DATA = {
+      active_runs: {"security-atd-core": [{start: 80, pid: 9, label: "triage 2/5"}],
+                    an: [{start: 90, pid: 8}]},
+      jobs: [{id: "an", model: "opus"}],
+      projects: [{name: "ATD Core", platform: "anthropic",
+                  security: {enabled: true, platform: "opencode", model: "m"}}],
+    };
+    const projById = (n) => DATA.projects.find(p => p.name === n) || null;
+    const forgetDeadStops = () => {};
+    """ + deps + """
+    const by = {}; liveRuns().forEach(r => { by[r.id] = r; });
+    console.log(JSON.stringify({sec: by["security-atd-core"].label, an: by.an.label}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert out["sec"] == "triage 2/5", "a running unit's label reaches the live row, not only the finished one"
+    assert out["an"] == "", "a slot with no label (a non-security run) stays blank, not undefined"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_the_reopen_line_names_the_cli_the_run_actually_ran_on(srv, tmp_path):
     """`claude --resume <id>` on a Codex thread sends the operator to a CLI that
     has never heard of that session. Each platform resumes with its own verb."""
