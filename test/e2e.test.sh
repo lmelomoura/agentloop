@@ -1721,9 +1721,13 @@ w=0; while [ "$w" -lt 90 ] && [ "$(secstate sandbox "$aid56")" = "running" ]; do
 # when the unit claimed a worktree, wt_down_all's `git worktree remove`
 # ahead of release_slot. Both are real work, not a leak: on a loaded box (a
 # CI runner shared with other jobs measured this over 30s while never
-# leaving the lock behind for good) 30s cut it too close. 60s, still bounded.
+# leaving the lock behind for good) 30s cut it too close, and a GitHub runner
+# went past 60s too. The bound is now the engine's own promise -- the
+# orchestrator waits STOP_GRACE_SECONDS (300) for its units to wind down --
+# so the test fails only when the engine breaks that promise. The loop exits
+# as soon as the lock is gone, so a healthy run pays nothing for it.
 w=0
-while [ "$w" -lt 60 ] && [ -n "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ]; do
+while [ "$w" -lt 300 ] && [ -n "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ]; do
   sleep 1; w=$((w + 1))
 done
 [ -z "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ] \
