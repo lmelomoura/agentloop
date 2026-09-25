@@ -1711,8 +1711,19 @@ w=0; while [ "$w" -lt 90 ] && [ "$(secstate sandbox "$aid56")" = "running" ]; do
 # after (a resume racing it must see "still winding down", never a live-looking
 # running analysis), so the lock can outlive the state change by a moment:
 # waited for, bounded, rather than read once.
+#
+# THE UNIT'S OWN SLOT IS A SEPARATE ACTOR'S, AND A SLOWER ONE. The
+# orchestrator's reap only watches the unit's AGENT pid (fake-claude here,
+# TERM'd directly by _stop_slot): it flips the row to `interrupted` the
+# moment that pid is gone, not once the unit's own `run_job` wrapper has
+# finished -- and that wrapper still has run_record_stopped_early's
+# security_close_analysis (a `unit-close` subprocess, a ledger write) and,
+# when the unit claimed a worktree, wt_down_all's `git worktree remove`
+# ahead of release_slot. Both are real work, not a leak: on a loaded box (a
+# CI runner shared with other jobs measured this over 30s while never
+# leaving the lock behind for good) 30s cut it too close. 60s, still bounded.
 w=0
-while [ "$w" -lt 30 ] && [ -n "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ]; do
+while [ "$w" -lt 60 ] && [ -n "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ]; do
   sleep 1; w=$((w + 1))
 done
 [ -z "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ] \
