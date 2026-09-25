@@ -507,13 +507,20 @@ def label(conn, unit) -> str:
     return text if unit["attempt"] == 1 else f"{text} · attempt {unit['attempt']}"
 
 
-def _lineages(all_units):
-    """(root, last attempt) for every lineage, in the order of the roots --
-    how a unit that was continued is counted: by where its lineage ended."""
+def _children_of(all_units):
+    """parent id -> its continuations -- the map `_lineages` and the runs
+    count in `gaps` both walk the same way."""
     children = {}
     for u in all_units:
         if u["parent"]:
             children.setdefault(u["parent"], []).append(u)
+    return children
+
+
+def _lineages(all_units):
+    """(root, last attempt) for every lineage, in the order of the roots --
+    how a unit that was continued is counted: by where its lineage ended."""
+    children = _children_of(all_units)
     out = []
     for root in (u for u in all_units if not u["parent"]):
         last = root
@@ -521,6 +528,21 @@ def _lineages(all_units):
             last = max(children[last["id"]], key=lambda c: c["seq"])
         out.append((root, last))
     return out
+
+
+def _lineage_runs(children, root):
+    """How many unit rows carried `root`'s lineage to its end -- root plus
+    every continuation, INCLUDING one settled at the same attempt after a run
+    that died without closing (orchestrator._judge_orphan, units.conclude
+    under `stopped`): each such row is one more run the ledger held, whether
+    or not the attempt advanced. This is what `gaps` reports as "runs",
+    never `MAX_ATTEMPTS` -- a lineage struck out by the orchestrator failed
+    at whatever attempt it was on, after as many runs as it took."""
+    node, runs = root, 1
+    while children.get(node["id"]):
+        node = max(children[node["id"]], key=lambda c: c["seq"])
+        runs += 1
+    return runs
 
 
 def owed(conn, analysis_id, all_units=None, inventory=None) -> list:
@@ -612,6 +634,7 @@ def gaps(conn, analysis_id) -> list:
     `owed` the page's Pipeline block counts, from the inventory, so a slice no
     unit ever carried and a unit that gave up saying nothing are both named."""
     all_units = ledger.units_of(conn, analysis_id)
+    children = _children_of(all_units)
     lineages = _lineages(all_units)
     out = []
     open_ = [last for _r, last in lineages if last["state"] in ("pending", "running")]
@@ -619,21 +642,46 @@ def gaps(conn, analysis_id) -> list:
         names = "; ".join(label(conn, u) for u in open_[:3])
         out.append(f"{len(open_)} unit{'s' if len(open_) != 1 else ''} never finished: {names}"
                    f"{' and others' if len(open_) > 3 else ''}.")
-    failed = [last for _r, last in lineages if last["state"] == "failed"]
-    if failed:
+    # RUNS AND ATTEMPTS, EACH COUNTED FROM THE LEDGER -- never `MAX_ATTEMPTS`,
+    # which a lineage struck out by the orchestrator (three runs that died
+    # without closing) never reaches: it can fail at attempt 1, after as many
+    # rows as the engine put in its lineage. Lineages are grouped by their
+    # (runs, attempt) pair so the sentence never claims a count no two of
+    # them share.
+    groups, order = {}, []
+    for root, last in lineages:
+        if last["state"] != "failed":
+            continue
+        key = (_lineage_runs(children, root), last["attempt"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(last)
+    for runs, attempt in order:
+        failed = groups[(runs, attempt)]
         names = "; ".join(f"{label(conn, u)} ({u['note']})" for u in failed[:3])
+        run_word = f"{runs} run{'s' if runs != 1 else ''}"
+        attempt_word = f"{attempt} attempt{'s' if attempt != 1 else ''}"
         out.append(f"{len(failed)} unit{'s' if len(failed) != 1 else ''} gave up after "
-                   f"{MAX_ATTEMPTS} attempts: {names}.")
+                   f"{run_word} ({attempt_word}): {names}"
+                   f"{' and others' if len(failed) > 3 else ''}.")
     inventory = ledger.inventory_of(conn, analysis_id)
-    left = owed(conn, analysis_id, all_units, inventory)
-    if inventory and left:
-        lines = int((inventory.get("totals") or {}).get("lines", 0))
-        files = len(inventory.get("files") or [])
-        missing_lines = sum(s["last"] - s["first"] + 1 for s in left)
-        missing_files = len({s["path"] for s in left})
-        first_ten = ", ".join(f"{s['path']}:{s['first']}-{s['last']}" for s in left[:10])
-        out.append(f"{missing_lines:,} of {lines:,} lines in the deep scope ({missing_files:,} of "
-                   f"{files:,} files) were never read in full. The first ten: {first_ten}.")
+    profile_row = conn.execute("SELECT profile FROM analysis WHERE id=?",
+                               (analysis_id,)).fetchone()
+    profile = profile_row["profile"] if profile_row else None
+    if profile == "deep" and not inventory:
+        out.append("The deep scope was never listed or cannot be read: no inventory is "
+                   "recorded for this analysis, so none of it can be proven read.")
+    else:
+        left = owed(conn, analysis_id, all_units, inventory)
+        if inventory and left:
+            lines = int((inventory.get("totals") or {}).get("lines", 0))
+            files = len(inventory.get("files") or [])
+            missing_lines = sum(s["last"] - s["first"] + 1 for s in left)
+            missing_files = len({s["path"] for s in left})
+            first_ten = ", ".join(f"{s['path']}:{s['first']}-{s['last']}" for s in left[:10])
+            out.append(f"{missing_lines:,} of {lines:,} lines in the deep scope ({missing_files:,} of "
+                       f"{files:,} files) were never read in full. The first ten: {first_ten}.")
     return out
 
 

@@ -43,12 +43,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **The engine closes a pipeline analysis from what its units proved.**
   `finish --from-units` records the units' summed cost and lowers `done` to
   `capped` for each gap the units leave — a unit that never finished, a
-  lineage that gave up after three attempts, the lines of the deep scope no
-  unit proved it read, counted against the inventory itself, so a slice no
-  unit carried or a unit that gave up without saying what it missed is
-  named too — naming the first of each in the report. The `sast` coverage
-  row, and the paragraph beside it, say how much of the deep scope was read
-  in full, and the guides read are the union of what every unit opened.
+  lineage that gave up (named by the runs and the attempts the ledger
+  actually holds, never a fixed count, so a struck-out run at attempt one
+  is never read as three attempts), a deep scope never listed or that could
+  not be read, the lines of the deep scope no unit proved it read, counted
+  against the inventory itself, so a slice no unit carried or a unit that
+  gave up without saying what it missed is named too — naming the first of
+  each in the report, and keeping a passed `--spend` when the ledger
+  predates the unit table. The `sast` coverage row, and the paragraph
+  beside it, say how much of the deep scope was read in full, and the
+  guides read are the union of what every unit opened.
 
 - **An analysis can be interrupted and resumed.** `interrupt`, `resume` and
   `abandon` move an analysis into and out of the new `interrupted` state;

@@ -3114,7 +3114,7 @@ def cmd_finish(args):
             print(f"finish: analysis {args.analysis} — {' '.join(found)}", file=sys.stderr)
         units_gap = " ".join(found)
         units_sentence = units.coverage_sentence(conn, args.analysis)
-        args.spend = (units.summary(conn, args.analysis) or {}).get("spend_usd", 0)
+        args.spend = (units.summary(conn, args.analysis) or {}).get("spend_usd", args.spend)
         read = units.guides_read(conn, args.analysis)
         ledger.set_guides(conn, args.analysis, read=read)
         guides_note = _guides_sentence(ledger.guides_of(row).get("recommended", []), read)
