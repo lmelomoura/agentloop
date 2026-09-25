@@ -539,6 +539,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The security-close selftest block hands its fixture a stream, like every
+  real close does.** `security_close_analysis`'s two real call sites in
+  `bin/agentloop` (a run's own end, and a run stopped before its agent
+  finished) always pass the run's stream file, but the selftest block for
+  `security_close_analysis()` closed its units with none. A prior fix moved
+  the "no stream, nothing counts" rule into `units.close`, so the block's
+  `success` and `warning` cases started reading `incomplete` instead of
+  `done` — the fixture was stale, not the engine. It now hands the close an
+  init-only stream, the same first line a real run writes, and keeps a
+  dedicated case for a close with a genuinely missing stream.
+- **An e2e scenario's "nothing left behind" bound was tighter than the
+  teardown it waits on.** Scenario 56 waited 30 s for a stopped security
+  analysis's lock directory to empty, but the orchestrator's own reap only
+  watches the unit's agent pid — it marks the analysis `interrupted` the
+  moment that pid is gone, before the unit's `run_job` wrapper has
+  necessarily finished its own teardown (a `unit-close` subprocess, then,
+  when the unit claimed a worktree, `git worktree remove`) and released its
+  slot. Reproduced clean and solo: the lock always cleared, well inside the
+  300 s `STOP_GRACE_SECONDS` the engine actually promises, just occasionally
+  past the test's 30 s watch. Widened to 60 s, still a bounded wait.
+
 - **The Security page no longer freezes an analysis at the agent's own
   close.** An analysis is closed twice — by the agent, then by the engine
   once the agent's process has exited, with the run's real cost, the guides
