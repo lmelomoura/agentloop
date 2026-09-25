@@ -5177,9 +5177,45 @@ def test_the_pipeline_block_says_how_far_each_kind_of_unit_got(srv, tmp_path):
     assert "Reachability" in texts and "1 of 1 done" in texts
     assert "Deep read" in texts and "3 of 6 done · 2 running · 1 waiting" in texts
     assert "Verification" in texts and "1 gave up" in texts
-    assert "Deep scope read in full: 612 of 980 files with content, 201,442 of 294,495 lines." in texts
+    assert ("Deep scope read in full: 612 of 980 files with content, 201,442 of 294,495 "
+            "lines in scope after the exclusion rules.") in texts
     assert "$12.50" in texts
     assert out["buttons"] == ["Stop analysis"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_pipeline_block_names_the_trees_own_total_beside_the_scoped_one(srv, tmp_path):
+    """The Pipeline block's own `lines` (bin/security/units.py summary) is
+    THIS analysis's inventory, IN SCOPE after the exclusion rules drop
+    generated/prose files -- a different, smaller number from the header's
+    own "Lines of code" (every text line of the tree, prose and generated
+    included). `a.lines_of_code`, this analysis's own count in that wider
+    sense (recorded at `prepare`), rides beside the scoped one so the two
+    can be read together instead of silently disagreeing across the page."""
+    script = tmp_path / "pipeline_tree.js"
+    script.write_text(_pipeline_script(
+        _security_js(srv),
+        {"id": 22, "state": "running", "run_id": "security-web", "lines_of_code": 974200},
+        SUMMARY))
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    texts = " | ".join(n["text"] for n in out["nodes"])
+    assert ("Deep scope read in full: 612 of 980 files with content, 201,442 of 294,495 "
+            "lines in scope after the exclusion rules. The tree has 974,200 text lines."
+           ) in texts
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_pipeline_block_says_nothing_about_the_tree_when_no_count_is_recorded(srv, tmp_path):
+    """An analysis that has not reached `prepare` yet (or predates the
+    column) has no `lines_of_code` of its own -- the sentence must not claim
+    a tree total it does not have, rather than printing a bare 0 or "of
+    undefined"."""
+    script = tmp_path / "pipeline_no_tree.js"
+    script.write_text(_pipeline_script(
+        _security_js(srv), {"id": 22, "state": "running", "run_id": "security-web"}, SUMMARY))
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    texts = " | ".join(n["text"] for n in out["nodes"])
+    assert "The tree has" not in texts, texts
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -5195,7 +5231,7 @@ def test_the_pipeline_block_names_empty_files_left_out_of_the_deep_count(srv, tm
     out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
     texts = " | ".join(n["text"] for n in out["nodes"])
     assert ("Deep scope read in full: 0 of 1,323 files with content (8 empty), "
-            "0 of 260,999 lines.") in texts
+            "0 of 260,999 lines in scope after the exclusion rules.") in texts
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -5717,7 +5753,7 @@ def test_the_project_header_renders_a_dash_not_zero_for_lines_of_code(srv, tmp_p
     would read as an empty repository instead."""
     block = _security_js(srv)
     deps = (_const(block, "SEC_NEVER") + "\n".join(_plainfn(block, n) for n in
-            ("secEl", "secIcon", "secHeaderBit", "secRenderProjectHeader")))
+            ("secEl", "secIcon", "secHeaderBit", "secLinesOfCodeTitle", "secRenderProjectHeader")))
     script = tmp_path / "pj-loc.js"
     script.write_text(_PROJECT_DOM_HARNESS + deps + """
     secRenderProjectHeader({header: {profile: "standard", branch: "main",
@@ -6062,8 +6098,8 @@ def test_the_two_scope_captions_name_the_branch_and_the_branch_count(srv, tmp_pa
     counting rules) must never be confused in silence."""
     block = _security_js(srv)
     deps = "\n".join(_plainfn(block, n) for n in
-                     ("secEl", "secIcon", "secHeaderBit", "secRenderProjectHeader",
-                      "secSidebarScopeNote"))
+                     ("secEl", "secIcon", "secHeaderBit", "secLinesOfCodeTitle",
+                      "secRenderProjectHeader", "secSidebarScopeNote"))
     deps = _const(block, "SEC_NEVER") + _const(block, "SEC_FLOOR_SCOPE_NOTE") + deps
     script = tmp_path / "pj-captions.js"
     script.write_text(_PROJECT_DOM_HARNESS + deps + """
@@ -8607,7 +8643,7 @@ def test_the_project_header_says_a_dash_means_not_counted(srv, tmp_path):
     screen claiming the repository is empty."""
     block = _security_js(srv)
     deps = (_const(block, "SEC_NEVER") + "\n".join(_plainfn(block, n) for n in
-            ("secEl", "secIcon", "secHeaderBit", "secRenderProjectHeader")))
+            ("secEl", "secIcon", "secHeaderBit", "secLinesOfCodeTitle", "secRenderProjectHeader")))
     script = tmp_path / "pj-loc-title.js"
     script.write_text(_PROJECT_DOM_HARNESS + deps + """
     secRenderProjectHeader({header: {profile: "standard", branch: "main",
@@ -8634,6 +8670,44 @@ def test_the_project_header_says_a_dash_means_not_counted(srv, tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_project_header_names_the_analysis_its_line_count_came_from(srv, tmp_path):
+    """The header's "Lines of code" used to disagree in public with the
+    Pipeline block's own "Deep scope" numbers -- a finished analysis days
+    (or commits) old beside a running one's fresher inventory -- with
+    nothing on screen saying why. `lines_of_code_sources`
+    (bin/security/queries.py) is the CLI's own answer to "which analysis";
+    this is the page saying so, naming the analysis id and commit, and
+    preferring a RUNNING analysis's own count (`running: true`) over a
+    stale finished one for the same repository."""
+    block = _security_js(srv)
+    deps = (_const(block, "SEC_NEVER") + "\n".join(_plainfn(block, n) for n in
+            ("secEl", "secIcon", "secHeaderBit", "secLinesOfCodeTitle", "secRenderProjectHeader")))
+    script = tmp_path / "pj-loc-source.js"
+    script.write_text(_PROJECT_DOM_HARNESS + deps + """
+    secRenderProjectHeader({header: {profile: "standard", branch: "main",
+      lines_of_code: 974200, last_analysis: 5, lines_of_code_sources: [
+        {analysis_id: 41, repo: "web", commit_sha: "abc123def456789",
+         lines_of_code: 974200, running: true}]}});
+    const running = collectAll(_els["sec-pj-head"], []);
+    _els["sec-pj-head"] = new FakeElement("div");
+    secRenderProjectHeader({header: {profile: "standard", branch: "main",
+      lines_of_code: 318477, last_analysis: 5, lines_of_code_sources: [
+        {analysis_id: 30, repo: "web", commit_sha: "9998887776665",
+         lines_of_code: 318477, running: false}]}});
+    const finished = collectAll(_els["sec-pj-head"], []);
+    console.log(JSON.stringify({running, finished}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)],
+                                    capture_output=True, text=True, check=True).stdout)
+    running_titles = " ".join(r["title"] for r in out["running"] if r["title"])
+    assert "#41" in running_titles and "abc123def456" in running_titles, running_titles
+    assert "running" in running_titles.lower(), running_titles
+    finished_titles = " ".join(r["title"] for r in out["finished"] if r["title"])
+    assert "#30" in finished_titles and "9998887776" in finished_titles, finished_titles
+    assert "running" not in finished_titles.lower(), finished_titles
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_the_project_header_says_the_branch_spans_its_repositories(srv, tmp_path):
     """The Overview reads the declared branch in every repository the project
     has analysed on it (queries.default_branch_posture). With more than one,
@@ -8641,7 +8715,7 @@ def test_the_project_header_says_the_branch_spans_its_repositories(srv, tmp_path
     always did."""
     block = _security_js(srv)
     deps = (_const(block, "SEC_NEVER") + "\n".join(_plainfn(block, n) for n in
-            ("secEl", "secIcon", "secHeaderBit", "secRenderProjectHeader")))
+            ("secEl", "secIcon", "secHeaderBit", "secLinesOfCodeTitle", "secRenderProjectHeader")))
     script = tmp_path / "pj-head-repos.js"
     script.write_text(_PROJECT_DOM_HARNESS + deps + """
     secRenderProjectHeader({header: {profile: "standard", branch: "main",

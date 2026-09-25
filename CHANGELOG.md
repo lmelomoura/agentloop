@@ -553,6 +553,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The Security project page's two "lines" numbers now say what each one
+  counts, and where it comes from.** The header's "Lines of code"
+  (`cmd_project_data`, `bin/security/cli.py`) counts every text line of the
+  tree — prose and generated files included — as a by-product of the
+  secret sweep at `prepare` (`ledger.set_lines_of_code`), and read off the
+  latest COMPLETED analysis; the Pipeline block's "Deep scope" numbers come
+  from the RUNNING analysis's own inventory (`bin/security/inventory.py`)
+  at its own commit, after the exclusion rules drop generated/prose files.
+  The two disagreed in public with nothing on screen saying why — one real
+  project showed header 318,477 against deep scope 260,999 (1,421
+  generated and 48 prose files excluded) for the exact same run. The header
+  now names the analysis (`#N`) and short commit its own count came from in
+  its tooltip (`lines_of_code_sources`, `queries.py`), and prefers a
+  RUNNING analysis of the header's branch over a stale finished one the
+  moment that running analysis has recorded its own count. The Pipeline
+  block's own sentence now says its "lines" total is in scope AFTER the
+  exclusion rules, and adds the running analysis's own tree total beside
+  it when one has been recorded, so the two sentences can be read
+  together instead of as a silent contradiction.
+
 - **A triage unit is now told how its "gone" reading is proven, per
   platform.** Its report-gone rule said to read the file first but never
   said what counts as reading it; a session on the Codex CLI reported a

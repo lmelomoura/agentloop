@@ -301,6 +301,49 @@ function secRenderProjectTitle(){
     " project. A quick summary of the latest analysis and key metrics."));
 }
 
+// The header's "Lines of code" counts EVERY text line of the tree, prose
+// and generated files included (bin/security/cli.py cmd_prepare, a
+// by-product of the secret sweep) -- a different, larger scope from the
+// Pipeline block's own "Deep scope" numbers, which are the RUNNING
+// analysis's own inventory (bin/security/inventory.py) at ITS commit, after
+// the exclusion rules drop generated/prose files. The two used to disagree
+// in public with no explanation on screen (a header from a finished
+// analysis days -- or commits -- old, beside a Pipeline block for the
+// analysis actually running): this tooltip is where the header says WHICH
+// analysis, and commit, its own number came from, so a reader can tell "a
+// different, larger count" from "the page is wrong". `h.lines_of_code_sources`
+// (bin/security/queries.py `lines_of_code_sources`) is one entry per
+// repository the total was summed over -- a running analysis of this
+// branch that has already recorded its own count wins there over a stale
+// finished one, and `running: true` says so.
+function secLinesOfCodeTitle(h){
+  if(!h.lines_of_code){
+    return "Not counted — this analysis predates the line count, or "
+      + "nothing has been analysed yet. It is not a claim that the "
+      + "repository is empty.";
+  }
+  const sources = h.lines_of_code_sources || [];
+  if(!sources.length){
+    // Back-compat shape (or a caller that never sent the field): still say
+    // what the number IS, even without naming the analysis it came from.
+    return "Counts every text line of the tree, at the commit of the "
+      + "analysis it was read from.";
+  }
+  const name = (s) => "#" + s.analysis_id + " at "
+    + String(s.commit_sha || "").slice(0, 12)
+    + (s.running ? " (running)" : "");
+  if(sources.length === 1){
+    const s = sources[0];
+    return "Counts every text line of the tree at the commit of analysis "
+      + name(s) + (s.running
+        ? " -- the analysis currently running, read fresh at its own commit."
+        : ".");
+  }
+  return "Counts every text line of the tree, across " + sources.length
+    + " repositories, each at its own latest reading: "
+    + sources.map(name).join(", ") + ".";
+}
+
 function secRenderProjectHeader(payload){
   const host = $("sec-pj-head");
   if(!host) return;
@@ -348,9 +391,7 @@ function secRenderProjectHeader(payload){
   // compact-density device the "Never analysed" cell beside it uses.
   meta.appendChild(secHeaderBit("code", "Lines of code",
     h.lines_of_code ? h.lines_of_code.toLocaleString() : "—",
-    h.lines_of_code ? "" : "Not counted — this analysis predates the line "
-      + "count, or nothing has been analysed yet. It is not a claim that the "
-      + "repository is empty."));
+    secLinesOfCodeTitle(h)));
   meta.appendChild(secHeaderBit("clock", "Last analysis",
     h.last_analysis ? fmtAgo(h.last_analysis) : SEC_NEVER.short,
     h.last_analysis ? "" : SEC_NEVER.next));

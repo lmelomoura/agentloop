@@ -554,6 +554,62 @@ def _readings_of(conn, project, branch):
         " ORDER BY id DESC", (project, branch))]
 
 
+def _running_readings(conn, project, branch):
+    """`_readings_of`'s own companion for the analyses still IN FLIGHT: every
+    repository's newest RUNNING analysis of `branch`, one row per repository,
+    newest first.
+
+    `cmd_prepare` records `lines_of_code` (`ledger.set_lines_of_code`) as a
+    by-product of the secret sweep, before any unit has read a byte -- so a
+    running analysis's own count is never older than the commit it is
+    reading, while the newest FINISHED reading (`_readings_of`) can be
+    however many days, or commits, stale. `lines_of_code_sources` below is
+    what picks between the two per repository."""
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM analysis WHERE id IN ("
+        "SELECT MAX(id) FROM analysis WHERE project=? AND branch=?"
+        " AND state='running' GROUP BY repo)"
+        " ORDER BY id DESC", (project, branch))]
+
+
+def lines_of_code_sources(readings, running):
+    """Which analysis the header's `lines_of_code` count for each repository
+    should come from, and why -- one entry per repository that has either a
+    finished reading (`readings`, `_readings_of`) or a running one
+    (`running`, `_running_readings`).
+
+    A RUNNING analysis wins over the newest FINISHED one for its own
+    repository the moment it has recorded its own `lines_of_code` (set at
+    `prepare`, see `_running_readings`'s docstring) -- that count was taken
+    at the commit this project detail screen is showing readings FOR, while
+    the finished one it would otherwise show can be a stale, unrelated
+    commit read days ago. A running analysis that has not reached `prepare`
+    yet (no count recorded) changes nothing: the finished reading still
+    stands, rather than the repository silently dropping out of the total.
+
+    No pure function here has ever needed a connection -- both lists are
+    already fetched rows -- so this takes them directly rather than a
+    project/branch pair, the same shape `branch_findings` takes `readings`
+    in."""
+    finished_by_repo = {r["repo"]: r for r in readings}
+    running_by_repo = {r["repo"]: r for r in running}
+    sources = []
+    for repo in sorted(set(finished_by_repo) | set(running_by_repo)):
+        run = running_by_repo.get(repo)
+        fin = finished_by_repo.get(repo)
+        use_running = bool(run and run.get("lines_of_code"))
+        chosen = run if use_running else fin
+        if chosen is None:
+            continue
+        sources.append({
+            "analysis_id": chosen["id"], "repo": repo,
+            "commit_sha": chosen.get("commit_sha", ""),
+            "lines_of_code": chosen.get("lines_of_code") or 0,
+            "running": use_running,
+        })
+    return sources
+
+
 def branch_findings(conn, readings):
     """One row per fingerprint across `readings` -- the findings browser's
     own grouping (`_group_by_fingerprint`) over those analyses' checklists:

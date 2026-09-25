@@ -5197,7 +5197,7 @@ def test_project_data_survives_a_ledger_that_does_not_exist_yet(tmp_path):
     assert out["project"] == "web"
     assert out["header"] == {"profile": "deep", "branch": "main", "repos": [],
                              "branch_fell_back": False, "lines_of_code": 0,
-                             "last_analysis": 0}
+                             "lines_of_code_sources": [], "last_analysis": 0}
     assert out["tabs"]["overview"]["posture"] == {
         "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0, "total": 0}
     assert out["tabs"]["overview"]["state"] == ""
@@ -5252,6 +5252,75 @@ def test_project_data_lines_of_code_is_a_property_of_the_latest_analysis(tmp_pat
     finished_analysis(db, tmp_path, "web", "main")
     out = run(db, "project-data", "--project", "web", "--base", "main", "--default-profile", "")
     assert out["header"]["lines_of_code"] == 0
+
+
+def test_project_data_names_the_analysis_its_lines_of_code_count_came_from(tmp_path):
+    """`header.lines_of_code_sources` is one entry per repository the total
+    was summed over -- naming the analysis and commit it actually came from,
+    so the page's tooltip can say so (queries.lines_of_code_sources)."""
+    db = tmp_path / "security.db"
+    aid = finished_analysis(db, tmp_path, "web", "main")
+    conn = security_ledger.connect(db)
+    security_ledger.set_lines_of_code(conn, aid, 318477)
+    conn.commit()
+    conn.close()
+    out = run(db, "project-data", "--project", "web", "--base", "main", "--default-profile", "")
+    assert out["header"]["lines_of_code"] == 318477
+    assert out["header"]["lines_of_code_sources"] == [
+        {"analysis_id": aid, "repo": "web", "commit_sha": "abc",
+         "lines_of_code": 318477, "running": False}]
+
+
+def test_project_data_prefers_a_running_analysis_own_lines_of_code(tmp_path):
+    """The header used to disagree in public with the Pipeline block: a
+    finished analysis's `lines_of_code`, however many days or commits old,
+    over the RUNNING analysis's own, fresher count for the exact commit that
+    analysis (and its Pipeline block) is reading. The moment a running
+    analysis of this same branch has recorded its own count (at `prepare`,
+    see `ledger.set_lines_of_code`), the header switches to THAT one for its
+    repository -- and says so via `lines_of_code_sources`'s own `running`
+    flag -- rather than keep showing the older, finished reading."""
+    db = tmp_path / "security.db"
+    old_aid = finished_analysis(db, tmp_path, "web", "main")
+    conn = security_ledger.connect(db)
+    security_ledger.set_lines_of_code(conn, old_aid, 318477)
+    conn.commit()
+    conn.close()
+
+    running_aid = open_analysis(db, project="web", repo="web", branch="main",
+                                commit="def456", run_id="r2")
+    conn = security_ledger.connect(db)
+    security_ledger.set_lines_of_code(conn, running_aid, 974200)
+    conn.commit()
+    conn.close()
+
+    out = run(db, "project-data", "--project", "web", "--base", "main", "--default-profile", "")
+    assert out["header"]["lines_of_code"] == 974200
+    assert out["header"]["lines_of_code_sources"] == [
+        {"analysis_id": running_aid, "repo": "web", "commit_sha": "def456",
+         "lines_of_code": 974200, "running": True}]
+
+
+def test_project_data_keeps_the_finished_reading_while_the_running_one_has_no_count_yet(tmp_path):
+    """A running analysis that has not reached `prepare` yet carries
+    `lines_of_code: 0` -- the same default every never-prepared row has, not
+    a claim that the tree is empty -- so it must not knock the still-good
+    finished reading out of the total."""
+    db = tmp_path / "security.db"
+    old_aid = finished_analysis(db, tmp_path, "web", "main")
+    conn = security_ledger.connect(db)
+    security_ledger.set_lines_of_code(conn, old_aid, 318477)
+    conn.commit()
+    conn.close()
+
+    open_analysis(db, project="web", repo="web", branch="main",
+                  commit="def456", run_id="r2")
+
+    out = run(db, "project-data", "--project", "web", "--base", "main", "--default-profile", "")
+    assert out["header"]["lines_of_code"] == 318477
+    assert out["header"]["lines_of_code_sources"] == [
+        {"analysis_id": old_aid, "repo": "web", "commit_sha": "abc",
+         "lines_of_code": 318477, "running": False}]
 
 
 def test_project_data_shows_the_branch_it_fell_back_to(tmp_path):
