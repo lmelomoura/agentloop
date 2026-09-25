@@ -3842,7 +3842,7 @@ def cmd_project_data(args):
             "project": args.project,
             "header": {"profile": default_profile, "branch": args.base or "",
                        "repos": [], "branch_fell_back": False, "lines_of_code": 0,
-                       "last_analysis": 0},
+                       "lines_of_code_sources": [], "last_analysis": 0},
             "tabs": {"overview": {"posture": queries._empty_posture(),
                                   "checklist": _empty_checklist_counts(),
                                   "state": "", "attempted": False,
@@ -3859,6 +3859,18 @@ def cmd_project_data(args):
     # The newest of the readings -- one per repository -- is what "last
     # analysis" and the run a lone finding points at mean here.
     latest = readings[0] if readings else None
+
+    # `header.lines_of_code` -- WHICH analysis it comes from, per repository:
+    # a running analysis of this same branch that has already recorded its
+    # own count (at `prepare`) wins over the newest FINISHED reading, which
+    # can be a stale, unrelated commit read days ago (see
+    # `queries.lines_of_code_sources`'s own docstring -- this was the header
+    # disagreeing in public with the Pipeline block's own, fresher numbers
+    # for the analysis actually on screen). `sources` is handed to the page
+    # too, so its tooltip can name the analysis (and commit) each repository's
+    # count actually came from, rather than the number floating unexplained.
+    running_readings = queries._running_readings(conn, args.project, branch) if branch else []
+    lines_of_code_sources = queries.lines_of_code_sources(readings, running_readings)
 
     # The Overview tab's own cards beyond the posture row (ProjectOverview.png):
     # `categories` and `top_findings` are projections of the SAME grouped rows
@@ -3963,8 +3975,20 @@ def cmd_project_data(args):
                    "repos": sorted(r["repo"] for r in readings),
                    "branch_fell_back": fell_back,
                    # Every repository's count, added: 0 in one of them is
-                   # "not counted" there, never a claim that it is empty.
-                   "lines_of_code": sum(r.get("lines_of_code") or 0 for r in readings),
+                   # "not counted" there, never a claim that it is empty. Per
+                   # repository this is `lines_of_code_sources`'s own choice
+                   # (a running analysis's fresher count over a stale
+                   # finished one) -- summed the same way the old, readings-
+                   # only total was, so a project with no running analysis
+                   # of this branch reads exactly as before.
+                   "lines_of_code": sum(s["lines_of_code"] for s in lines_of_code_sources),
+                   # WHICH analysis (and commit) each repository's count in
+                   # the line above actually came from -- the header's own
+                   # tooltip names it (see `ui/security/project-screen.js`,
+                   # `secLinesOfCodeTitle`) so the number is never left to
+                   # float unexplained beside the Pipeline block's own,
+                   # differently-scoped one for the analysis on screen.
+                   "lines_of_code_sources": lines_of_code_sources,
                    "last_analysis": (latest or {}).get("started", 0)
                                     or (runs[0]["started"] if runs else 0)},
         "tabs": {"overview": {"posture": posture, "checklist": checklist_counts,

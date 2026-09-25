@@ -591,9 +591,23 @@ export function secRenderPipeline(a, summary){
     // otherwise count as "read" before any unit ran. Say so when it matters,
     // rather than silently shrinking the denominator.
     const emptyNote = d.files_empty ? " (" + n(d.files_empty) + " empty)" : "";
-    host.appendChild(secEl("div", "secpipe-deep", "Deep scope read in full: "
+    // `d.lines` is THIS analysis's own inventory total (bin/security/
+    // inventory.py) -- in scope AFTER the exclusion rules drop generated
+    // and prose files, said explicitly rather than left to read as "the
+    // whole tree" beside the header's own "Lines of code", which counts
+    // every text line, prose and generated included, and can come from a
+    // different, older analysis entirely (see project-screen.js's own
+    // secLinesOfCodeTitle). `a.lines_of_code` is THIS analysis's own count
+    // in that wider sense, recorded at `prepare` -- present the moment the
+    // header can prefer it too, so the two sentences can be read side by
+    // side without the reader having to already know why they differ.
+    let deepText = "Deep scope read in full: "
       + n(d.files_read) + " of " + n(d.files) + " files with content" + emptyNote + ", "
-      + n(d.lines_read) + " of " + n(d.lines) + " lines."));
+      + n(d.lines_read) + " of " + n(d.lines) + " lines in scope after the exclusion rules.";
+    if(a.lines_of_code){
+      deepText += " The tree has " + n(a.lines_of_code) + " text lines.";
+    }
+    host.appendChild(secEl("div", "secpipe-deep", deepText));
   }
   host.appendChild(secEl("div", "secpipe-spend", "Spent by the units: " + money(summary.spend_usd || 0)));
   if(a.state === "running" || a.state === "interrupted"){
