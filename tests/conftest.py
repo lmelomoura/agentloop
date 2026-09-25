@@ -71,4 +71,18 @@ def clean_data(srv):
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
+    # index_retention_days defaults to 30 and lives in app.db, which (unlike
+    # everything above) this fixture does not otherwise touch -- it is
+    # durable settings, not disposable index state. Left at the default it
+    # would silently trim any fixture here whose `start` is a fixed old
+    # timestamp (plenty are, for readability) the moment it is more than 30
+    # real wall-clock days in the past, which has nothing to do with what
+    # such a test is checking. Off by default; tests/test_index_retention.py
+    # turns it back on deliberately, per test, the same way this fixture
+    # itself is opted into.
+    conn = srv.app_conn()
+    conn.execute("INSERT OR REPLACE INTO prefs (key, value, updated) VALUES (?,?,?)",
+                 ("index_retention_days", "0", 0))
+    conn.commit()
+    conn.close()
     return srv
