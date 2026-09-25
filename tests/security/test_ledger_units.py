@@ -210,6 +210,32 @@ def _finding(fp, **extra):
             "occurrences": [{"file": "a.py", "line": 1}], **extra}
 
 
+@pytest.mark.parametrize("occurrences", [[], [{"line": 3}], [{"file": "", "line": 3}]])
+def test_the_ledger_refuses_a_sast_finding_with_no_location_on_its_own(conn, occurrences):
+    """The ledger's own copy of the door's lock (report-finding refuses the
+    same payload with its own message): a scanner producer or a test calls
+    record_finding directly, and a `sast` row with no location can be
+    neither fixed nor verified -- nothing is written."""
+    aid = _analysis(conn)
+    with pytest.raises(ValueError, match="a sast finding needs at least one occurrence naming a file"):
+        ledger.record_finding(conn, aid, _finding("a" * 64, occurrences=occurrences))
+    assert conn.execute("SELECT COUNT(*) FROM finding").fetchone()[0] == 0
+
+
+def test_the_door_refuses_a_sast_finding_with_no_location_in_its_own_words(tmp_path):
+    import json
+    from test_cli import fails, open_analysis
+    db = tmp_path / "security.db"
+    aid = open_analysis(db, profile="quick", commit="c1")
+    out = fails(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(
+        {"fingerprint": "a" * 64, "category": "sast", "rule": "xss", "severity": "low",
+         "title": "t", "rationale": "r", "occurrences": []}))
+    assert out.returncode != 0
+    assert ("report-finding: a sast finding needs at least one occurrence naming a file. A "
+            "weakness with no location can be neither fixed nor verified, by this analysis or "
+            "the next one's report-gone") in out.stderr
+
+
 def test_a_finding_remembers_the_unit_that_wrote_it(conn):
     aid = _analysis(conn)
     ledger.record_finding(conn, aid, _finding("a" * 64, unit=7))

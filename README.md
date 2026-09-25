@@ -1503,10 +1503,25 @@ session of the derived job with a prompt minted from the ledger, at the
 analysis's own commit, up to `security.parallel` at a time (1–8, 3 by
 default), each with its share of the analysis's `max_budget_usd`. Each run's
 close judges its unit from the run's own tool calls and the ledger, never its
-word, and continues what it left undone; the analysis closes from what the
-units proved. **Stop** on any run of an analysis stops the whole analysis and
-leaves it `interrupted`; `agentloop security resume <project> <analysis>`
-continues it without repeating a finished unit.
+word, and continues what it left undone — a new unit carrying only what is
+missing, one attempt up, **at most 3 attempts per unit's lineage**; what the
+third still leaves is named in the report and the analysis closes `capped`. A
+run that was stopped, died, or was cut short by the provider (a rate limit,
+an API error) keeps its attempt, and three of those in a row give the unit up
+as one the engine could not run. The analysis closes from what the units
+proved. Every launch first asks the engine for the gates a unit's run would
+otherwise skip — the usage window, the job's `daily_budget_usd`, the global
+daily cap — and a closed one leaves the analysis `interrupted` with the gate
+named, to be resumed once it reopens; each unit's budget share is reserved
+while it runs, so the units together never exceed `max_budget_usd`.
+**Stop** on any run of an analysis stops the whole analysis and leaves it
+`interrupted`; `agentloop security resume <project> <analysis>` continues it
+without repeating a finished unit. **An analysis whose orchestrator died** —
+a reboot, a crash, a `kill -9` — is found by the tick, marked `interrupted`
+and resumed automatically, **at most 3 times per analysis**; after the third
+it is abandoned (`failed`, with a note saying so), its finished units kept,
+so a machine that crashes every time stops spending. Your own Resume is
+never counted against that limit.
 
 Each unit's own contract is versioned rather than typed into a prompt
 (`skills/security-analysis/SKILL.md`), and it is written **per unit role**: a

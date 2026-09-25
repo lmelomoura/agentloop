@@ -356,6 +356,14 @@ def _judge_triage(conn, unit, session, root):
                 continue
         elif mine:
             continue
+        elif item.get("category") == "sast" and fp in gone and row is not None:
+            # SAID GONE, AND RE-REPORTED INTO THIS ANALYSIS BY ANOTHER UNIT
+            # (this unit's own re-report is `mine`, above): the finding is
+            # this analysis's row now, not the carried one the claim was
+            # about, and the two statements contradict each other. Owed --
+            # and named for what happened, not as a row with no location.
+            gone_notes.append(f"reported gone, but another unit re-reported it into this "
+                              f"analysis ({fp})")
         elif item.get("category") == "sast" and fp in gone:
             # A carried sast finding this unit SAID is gone -- settled only
             # once it is PROVED, never on the reason alone (see the

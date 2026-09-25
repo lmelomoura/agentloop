@@ -118,7 +118,12 @@ STRUCK_OUT_NOTE = ("The engine could not run this unit: {n} runs ended without a
                    "(see tick.log).")
 STRUCK_OUT_OUTAGE_NOTE = ("The engine could not run this unit: {n} runs in a row were cut short "
                           "by the provider ({cause}; see tick.log).")
-BUDGET_SPENT_NOTE = "The analysis budget of ${budget:.2f} was spent before every unit ran."
+# The judgement of a dead run that raised: by id, never by label -- the
+# label reads the ledger, which may be the very thing failing.
+JUDGE_RETRY_LOG = "could not judge unit {uid} ({why}) — trying again"
+JUDGE_GAVE_UP_LOG = ("could not judge unit {uid} ({why}) — left running after {tries} tries; "
+                     "a resume judges it again")
+BUDGET_SPENT_NOTE ="The analysis budget of ${budget:.2f} was spent before every unit ran."
 BUDGET_FLOOR_NOTE = ("The analysis budget of ${budget:.2f} had ${left:.2f} left -- less than the "
                      "${floor:.2f} one unit is given -- before every unit ran.")
 GATE_NOTE = ("The engine interrupted this analysis because {gate}; the units it finished are "
@@ -797,14 +802,13 @@ class Orchestrator:
                               root=_stream_root(stream) if stream else "", status="stopped")
         except Exception as exc:  # noqa: BLE001 -- a unit must never stay `running` for ever
             tries = self.unjudged.get(unit["id"], [pid, 0])[1] + 1
+            why = f"{type(exc).__name__}: {exc}"
             if tries >= JUDGE_TRIES:
                 self.unjudged.pop(unit["id"], None)
-                self.log(f"could not judge unit {unit['id']} ({type(exc).__name__}: {exc}) — "
-                         f"left running after {tries} tries; a resume judges it again")
+                self.log(JUDGE_GAVE_UP_LOG.format(uid=unit["id"], why=why, tries=tries))
             else:
                 self.unjudged[unit["id"]] = [pid, tries]
-                self.log(f"could not judge unit {unit['id']} ({type(exc).__name__}: {exc}) — "
-                         "trying again")
+                self.log(JUDGE_RETRY_LOG.format(uid=unit["id"], why=why))
             return None
         self.unjudged.pop(unit["id"], None)
         return out

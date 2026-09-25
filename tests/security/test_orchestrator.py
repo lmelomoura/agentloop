@@ -226,6 +226,36 @@ def test_a_close_that_raises_is_retried_and_the_unit_is_never_reset(world, monke
     assert _row(world)["state"] == "done", _row(world)["coverage_note"]
 
 
+def test_a_judgement_that_keeps_failing_is_given_up_and_the_close_names_the_unit(world, monkeypatch,
+                                                                                  tmp_path):
+    """JUDGE_TRIES judgements of a dead run that all raise: the unit is left
+    `running` -- never reset, never judged on nothing -- verification is not
+    planned over it, and the close names it among the units that never
+    finished, for a resume to judge again."""
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "crash-after-read")
+    real_close = orchestrator.units.close
+    tries = []
+
+    def broken_for_reads(conn, unit, **kw):
+        if unit["kind"] == "read":
+            tries.append(unit["id"])
+            raise RuntimeError("database is locked")
+        return real_close(conn, unit, **kw)
+    monkeypatch.setattr(orchestrator.units, "close", broken_for_reads)
+    log = tmp_path / "tick.log"
+    assert _orchestrator(world, log=str(log)).run() == 0
+    read = next(u for u in _units(world) if u["kind"] == "read")
+    assert len(tries) == orchestrator.JUDGE_TRIES and set(tries) == {read["id"]}
+    assert (read["state"], read["attempt"], read["parent"]) == ("running", 1, None)
+    text = log.read_text()
+    assert text.count("— trying again") == orchestrator.JUDGE_TRIES - 1
+    assert orchestrator.JUDGE_GAVE_UP_LOG.format(
+        uid=read["id"], why="RuntimeError: database is locked", tries=orchestrator.JUDGE_TRIES) in text
+    row = _row(world)
+    assert row["state"] == "capped"
+    assert "1 unit never finished: read 1/1" in row["coverage_note"]
+
+
 def test_a_launch_that_failed_before_any_agent_ran_is_reset_then_struck_out(world):
     """An engine that cannot even be started: no agent ran, so the unit goes
     back to `pending` under the same id (nothing of it can be in the ledger),

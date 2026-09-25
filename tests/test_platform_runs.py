@@ -244,6 +244,30 @@ def test_a_security_unit_run_is_labelled_from_its_precheck_header(srv, clean_dat
     assert runs[0]["label"] == "analysis 22 · read 7/25 · attempt 2"
 
 
+def test_a_live_security_unit_run_is_labelled_from_its_slot_s_precheck_sidecar(srv, clean_data):
+    """A run still going is not in the index yet: its label comes off the
+    precheck sidecar beside the log its slot names (`logfile`), read the
+    same way the finished row's is -- and a job that is not derived, or a
+    slot with no log yet, carries none."""
+    header = ("SECURITY ANALYSIS 31 · unit hunt 1/1 — launched by its orchestrator "
+              "(`agentloop security analyze`), never by a tick\n")
+    for job in ("security-web", "web-dev-agent"):
+        srv.JOBS_FILE.write_text(json.dumps({"jobs": [{"id": job, "project": "P"}]}))
+        logp = srv.DATA_DIR / "logs" / job / "20260925T000000Z-4301.json"
+        logp.parent.mkdir(parents=True, exist_ok=True)
+        logp.with_name(logp.stem + ".precheck.txt").write_text(header + "(no precheck configured)\n")
+        for pid, with_log in ((4301, True), (4302, False)):
+            s = srv.DATA_DIR / "locks" / job / str(pid)
+            s.mkdir(parents=True, exist_ok=True)
+            (s / "pid").write_text(str(os.getpid()))
+            (s / "start").write_text("1700000900")
+            (s / "boot").write_text(srv.boot_id())
+            if with_log:
+                (s / "logfile").write_text(str(logp) + "\n")
+    assert [r["label"] for r in srv.active_runs_for("security-web")] == ["analysis 31 · hunt 1/1", ""]
+    assert [r["label"] for r in srv.active_runs_for("web-dev-agent")] == ["", ""]
+
+
 def test_a_live_run_says_what_launched_it_or_says_nothing(srv, clean_data):
     """The record carries `forced` only once the run has ended, and until then
     this answered `forced: False` for every live run -- and the dialog read

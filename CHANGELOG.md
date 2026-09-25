@@ -370,7 +370,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   secret's value, no subagents — and then one section per unit kind. A
   carried `sast` finding a triage unit finds gone is now said to be gone,
   with the reason (`report-gone`), instead of left out in silence the engine
-  could not tell from a row nobody opened. `low` and `info` rows are
+  could not tell from a row nobody opened; a gone claim on a row another
+  unit re-reported into the analysis stays owed, and the unit's note says
+  exactly that. The README documents the automatic resume after a crash (at
+  most three per analysis, then abandoned with a note) and the cap of three
+  attempts per unit's lineage. `low` and `info` rows are
   optional only when both the scanner's severity and the current one are
   below `medium`: a row shown `low (scanner: high)` is still owed, as the
   engine judges it — the skill used to call every `low` row optional.

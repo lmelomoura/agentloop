@@ -84,6 +84,26 @@ def test_a_carried_sast_finding_reported_gone_is_settled_and_a_deterministic_one
     assert remaining == {"items": [{"fingerprint": "d" * 64, "kind": "carried", "category": "dependency"}]}
 
 
+def test_a_gone_claim_on_a_row_another_unit_re_reported_is_owed_and_named_for_it(conn):
+    """The carried row was re-reported into this analysis by ANOTHER unit
+    while this one said it is gone: owed, and the note says so -- it used to
+    read "has no recorded location to verify", about a row that has one."""
+    prev = _analysis(conn, commit="c0")
+    _agent(conn, prev, "c" * 64)
+    ledger.finish_analysis(conn, prev, "done")
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "triage", {"items": [
+        {"fingerprint": "c" * 64, "kind": "carried", "category": "sast"}]})
+    other = ledger.add_unit(conn, aid, "read", {"ranges": []})
+    ledger.record_gone(conn, uid, "c" * 64, "the handler was deleted")
+    _agent(conn, aid, "c" * 64, unit=other, rationale="the read unit found it still there")
+    done, _remaining, _ev, note = units.judge(
+        conn, ledger.get_unit(conn, uid), _session({"a.py": [(1, 5)]}), "success")
+    assert done is False
+    assert f"reported gone, but another unit re-reported it into this analysis ({'c' * 64})" in note
+    assert "no recorded location" not in note
+
+
 def test_triage_owes_every_open_scanner_row_and_every_agent_finding_left_open(conn):
     prev = _analysis(conn, commit="c0")
     _agent(conn, prev, "c" * 64)
