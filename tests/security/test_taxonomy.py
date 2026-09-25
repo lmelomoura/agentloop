@@ -273,71 +273,57 @@ def test_nowhere_in_the_skill_says_a_row_that_stands_can_be_left_as_it_is():
         "instead")
 
 
-def test_job_2_says_a_finding_that_stands_is_still_re_reported():
-    # The affirmative half, and the one that IS section-scoped: Job 2 is the
-    # procedure for every deterministic row at or above the floor, so the rule
-    # has to be stated where that procedure is, not merely not-contradicted
-    # somewhere else.
-    #
-    # `end_pattern` is Job 3's heading, and pinning Job 2's slice is not all it
-    # does: it also incidentally pins the ORDER of the three jobs. Job 2 moved
-    # after Job 3, or Job 3 renumbered, and this section can no longer be cut
-    # out -- `_skill_section` fails loudly rather than silently widening the
-    # slice to the rest of the file, which would make the assertions below pass
-    # on sentences from a different job.
-    section = _skill_section(r"^\*\*2\. Triage the deterministic findings\.\*\*",
-                             r"^\*\*3\. ")
+def test_the_triage_unit_says_a_finding_that_stands_is_still_re_reported():
+    # The affirmative half, and the one that IS section-scoped: the triage
+    # unit's section is the procedure for every deterministic row at or above
+    # the floor, so the rule has to be stated where that procedure is, not
+    # merely not-contradicted somewhere else. `end_pattern` is the next unit's
+    # heading, so the slice never widens to another unit's sentences.
+    section = _skill_section(r"^## Unit: triage$", r"^## Unit: hunt$")
     lowered = section.lower()
     assert re.search(r"re-report", lowered), \
-        "SKILL.md's Job 2 no longer tells the agent to re-report anything"
+        "SKILL.md's triage unit no longer tells the agent to re-report anything"
     assert _says_a_standing_row_is_re_reported(lowered), (
-        "SKILL.md's Job 2 no longer says -- affirmatively -- that a finding "
+        "SKILL.md's triage unit no longer says -- affirmatively -- that a finding "
         "whose severity you would NOT change is re-reported anyway, which is "
         "the only case the gate in cmd_finish and the old wording disagreed "
         "about. A negated form does not count: it matches the same words and "
         "states the opposite rule")
 
 
-def test_ending_the_run_names_the_gate_that_lowers_done_to_capped():
-    # The agent has to be able to predict the downgrade before it happens, not
+def test_the_triage_unit_names_the_gate_that_lowers_done_to_capped():
+    # The unit has to be able to predict the downgrade before it happens, not
     # discover it in the note afterwards. Three facts, all from `cmd_finish`:
     # the floor is TRIAGE_FLOOR, the verdict becomes `capped`, and the note
     # names the first three by rule and file.
-    section = _skill_section(r"^## Ending the run$")
+    section = _skill_section(r"^## Unit: triage$", r"^## Unit: hunt$")
     for token in ("medium", "capped", "first three"):
         assert token in section.lower(), (
-            f"SKILL.md's 'Ending the run' never says {token!r} -- the agent "
-            "cannot predict a downgrade whose floor, verdict and note this "
-            "section does not describe")
-    # The tokens above are necessary and nowhere near sufficient. `done` and
-    # `capped` both appear in the sentence that says the OPPOSITE of the gate,
-    # so this asks for the direction: a `done` that BECOMES a `capped`, in one
-    # sentence, with no negation inside it.
+            f"SKILL.md's triage unit never says {token!r} -- the agent cannot "
+            "predict a downgrade whose floor, verdict and note this section "
+            "does not describe")
+    # The tokens are necessary and nowhere near sufficient: this asks for the
+    # direction, a `done` that BECOMES a `capped`, in one sentence, with no
+    # negation inside it.
     assert _states_the_downgrade_direction(section), (
-        "SKILL.md's 'Ending the run' names `done` and `capped` but never says "
-        "which way the close moves between them. `cmd_finish` lowers a `done` "
-        "to `capped` over untriaged scanner findings; a section that only "
-        "mentions both words can state the reverse and still pass a token "
-        "check")
+        "SKILL.md's triage unit names `done` and `capped` but never says which "
+        "way the close moves between them. `cmd_finish` lowers a `done` to "
+        "`capped` over untriaged scanner findings; a section that only mentions "
+        "both words can state the reverse and still pass a token check")
 
 
-def test_job_2_says_a_decided_row_is_the_humans_and_the_close_does_not_count_it():
+def test_the_triage_unit_says_a_decided_row_is_the_humans_and_the_close_does_not_count_it():
     # The fourth exclusion in `cli._untriaged` -- a fingerprint the project
     # holds a decision for -- stated where the procedure is, and in its
-    # direction. Section-scoped like the other affirmative pin: the rule has to
-    # be in Job 2, not merely not-contradicted somewhere else.
-    section = _skill_section(r"^\*\*2\. Triage the deterministic findings\.\*\*",
-                             r"^\*\*3\. ")
+    # direction.
+    section = _skill_section(r"^## Unit: triage$", r"^## Unit: hunt$")
     assert _DECIDED_ROW_IS_THE_HUMANS.search(section), (
-        "SKILL.md's Job 2 no longer says, in one sentence, that a row the "
+        "SKILL.md's triage unit no longer says, in one sentence, that a row the "
         "checklist shows `accepted` or `false_positive` is not the agent's to "
         "re-report AND that the close does not count it. `_untriaged` excludes "
-        "decided fingerprints; a Job 2 that says otherwise sends the agent to "
-        "re-report the operator's own signed call, or to close `capped` over a "
-        "debt the gate never counts")
-    # The sentence it replaced, banned across the WHOLE document, for the
-    # reason the comment block above gives: a slice is the wrong scope for
-    # "does this document ANYWHERE say the false thing".
+        "decided fingerprints; a triage unit told otherwise re-reports the "
+        "operator's own signed call, or closes `capped` over a debt the gate "
+        "never counts")
     assert not _FOUR_STATES_ARE_EXACTLY.search(SKILL.read_text()), (
         "SKILL.md says again that the four states are 'exactly' the rows a "
         "producer recorded this analysis. A decided row is producer-recorded "
@@ -345,18 +331,16 @@ def test_job_2_says_a_decided_row_is_the_humans_and_the_close_does_not_count_it(
         "false in that direction")
 
 
-def test_ending_the_run_says_a_decided_row_is_not_counted():
-    # The exemption `_untriaged`'s fourth exclusion grants, stated where the
-    # agent reads what the close will do to it. Job 2 has its pin (above);
-    # this is "Ending the run"'s, and the slice is the point: Job 2's own
-    # sentence, earlier in the file, must not be what satisfies it.
-    section = _skill_section(r"^## Ending the run$")
+def test_the_triage_unit_s_gate_paragraph_says_a_decided_row_is_not_counted():
+    # The exemption `_untriaged`'s fourth exclusion grants, stated in the
+    # paragraph that says what the close will do -- the regex asks for
+    # `counted`, which step 2's own sentence ("does not count it") does not
+    # carry, so it cannot be what satisfies this.
+    section = _skill_section(r"^## Unit: triage$", r"^## Unit: hunt$")
     assert _ENDING_DOES_NOT_COUNT_A_DECIDED_ROW.search(section), (
-        "SKILL.md's 'Ending the run' no longer says that a row the operator "
-        "decided on (`accepted`, `false_positive`) is not counted against the "
-        "agent. `_untriaged` excludes decided fingerprints, and an agent that "
-        "cannot read that here either re-reports the operator's own signed call "
-        "or closes `capped` expecting a debt the gate never counts")
+        "SKILL.md's triage unit no longer says, where it describes the close, "
+        "that a row the operator decided on (`accepted`, `false_positive`) is "
+        "not counted against the agent")
 
 
 def test_the_pins_catch_the_rewrites_that_used_to_slip_past_them():
@@ -402,19 +386,18 @@ def test_the_pins_catch_the_rewrites_that_used_to_slip_past_them():
         "the ban misses 'leave the scanner's row exactly as it is', which is "
         "'leave it alone' spelled differently")
 
-    # 3. The Job 1 half of the same contradiction, which had no pin at all: the
-    # old bullet, and the literal trap sentence, both dropped into Job 1 rather
-    # than Job 2. A section-scoped ban passes on both.
-    job_1 = _skill_section(r"^\*\*1\. Re-verify what was left open\.\*\*",
-                           r"^\*\*2\. ")
+    # 3. The ban is document-wide: the old bullet, and the literal trap
+    # sentence, dropped into a section other than the triage unit's -- where
+    # a section-scoped ban would pass on both.
+    elsewhere = _skill_section(r"^## Unit: hunt$", r"^## Unit: read$")
     for restored in (
             "Re-reporting a row the checklist already shows `open` changes "
             "nothing but its text.",
             "Re-report it with a corrected severity, or leave it alone if it "
             "stands."):
-        assert _forbidden_hits(job_1 + restored), (
-            f"Job 1 can carry {restored!r} and nothing fails -- the ban is "
-            "scoped to Job 2 again")
+        assert _forbidden_hits(elsewhere + restored), (
+            f"the hunt unit can carry {restored!r} and nothing fails -- the ban "
+            "is scoped to one section again")
 
     # 4. Job 2's decided-row clause with its second half flipped, and the false
     # sentence it replaced restored beside it. A reviewer applied both to the
@@ -453,33 +436,23 @@ def test_the_pins_catch_the_rewrites_that_used_to_slip_past_them():
     assert _DECIDED_ROW_IS_THE_HUMANS.search(text)
     assert _FOUR_STATES_ARE_EXACTLY.search(text) is None
     assert _ENDING_DOES_NOT_COUNT_A_DECIDED_ROW.search(
-        _skill_section(r"^## Ending the run$"))
+        _skill_section(r"^## Unit: triage$", r"^## Unit: hunt$"))
 
 
-def test_the_skill_scopes_subagents_to_verification_and_says_why():
-    """Since block 4.2 the tool is OPEN -- verification is subagents -- so the
-    rule is no longer "you have none" but "you have them for one job". Both
-    spellings still have to be named: the CLI's roster calls the tool `Task`,
-    and an agent told only about `Agent` does not connect the two."""
-    text = SKILL.read_text()
-    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    naming = [s for s in sentences if "`Agent`" in s and "`Task`" in s]
-    assert naming, (
-        "no sentence in SKILL.md names both `Agent` and `Task` -- the agent is "
-        "told to launch subagents and the roster calls them by the other name")
-    assert any(re.search(r"verification|for one job|nothing else", s, re.I)
-               for s in naming), (
-        "SKILL.md names `Agent`/`Task` but never says what they are for: "
-        f"{naming!r}")
-    # What keeps the tool from being used for anything else is the COUNT at the
-    # close, and the skill has to say so -- an instruction with no consequence
-    # is exactly what failed before.
-    assert re.search(r"close counts", text, re.I), \
-        "SKILL.md opens subagents without saying that the close counts them"
-    # The reason travels with the rule, or the next reader deletes the rule as
-    # unexplained. $51.44 on six subagents that triaged nothing is the reason.
-    assert "51.44" in text, \
-        "SKILL.md scopes subagents without the cost that made it a rule"
+def test_the_skill_forbids_subagents_on_every_platform_and_says_why():
+    """Since the pipeline the engine distributes the work, and every unit is
+    launched without its platform's subagent tool (bin/agentloop,
+    security_disallowed_tools). Both Claude Code spellings still have to be
+    named -- the roster calls the tool `Task` -- and so do OpenCode's `task`
+    and Codex's `spawn_agent`, with the cost that made the rule."""
+    section = _skill_section(r"^## Rules for every unit$", r"^## Unit: triage$")
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", section) if s.strip()]
+    assert any("`Agent`" in s and "`Task`" in s for s in sentences), \
+        "no sentence names both `Agent` and `Task` -- the roster calls the closed tool by the other name"
+    assert "`task`" in section and "`spawn_agent`" in section
+    assert re.search(r"does not count", section), \
+        "a unit that launches one does not count, and the rules have to say so"
+    assert "51.44" in section, "the rule without the cost that made it"
 
 
 # ---- RULE_RENAMES: the declared history of every rule name that changed.

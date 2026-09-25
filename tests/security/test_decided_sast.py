@@ -169,11 +169,11 @@ def test_the_skill_tells_the_agent_to_fold_into_a_decided_sast_and_never_to_copy
     told only to use it would re-report every entry as if it were work carried
     over -- so the same paragraph has to say both halves."""
     text = SKILL.read_text()
-    job3 = re.search(r"\*\*3\. The SAST pass\*\*(.*?)## Rules that are not negotiable",
-                     text, re.DOTALL)
-    assert job3, "SKILL.md no longer has a Job 3 section this test can read"
-    blocks = [b for b in job3.group(1).split("\n\n") if "`decided_sast`" in b]
-    assert blocks, "Job 3 never tells the agent about `decided_sast`"
+    rules = re.search(r"^## Rules for every unit$(.*?)^## Unit: triage$", text,
+                      re.DOTALL | re.MULTILINE)
+    assert rules, "SKILL.md no longer has a Rules for every unit section this test can read"
+    blocks = [b for b in rules.group(1).split("\n\n") if "`decided_sast`" in b]
+    assert blocks, "the rules never tell the agent about `decided_sast`"
     assert any("copied exactly" in b and "did not find yourself" in b for b in blocks), \
         "no paragraph both says to reuse the entry's fingerprint and not to copy entries"
 
@@ -181,12 +181,12 @@ def test_the_skill_tells_the_agent_to_fold_into_a_decided_sast_and_never_to_copy
 def test_the_skill_carries_the_rule_across_and_puts_every_fold_in_the_summary():
     """A fold is invisible once it lands -- the finding takes the decision's
     state -- so the skill has to say both what keeps it honest (the entry's
-    rule, which the door checks) and where it is seen (the final summary)."""
+    rule, which the door checks) and where it is seen (the unit's summary)."""
     text = SKILL.read_text()
-    job3 = re.search(r"\*\*3\. The SAST pass\*\*(.*?)## Rules that are not negotiable",
-                     text, re.DOTALL)
-    assert job3, "SKILL.md no longer has a Job 3 section this test can read"
-    blocks = [b for b in job3.group(1).split("\n\n") if "`decided_sast`" in b]
+    rules = re.search(r"^## Rules for every unit$(.*?)^## Unit: triage$", text,
+                      re.DOTALL | re.MULTILINE)
+    assert rules, "SKILL.md no longer has a Rules for every unit section this test can read"
+    blocks = [b for b in rules.group(1).split("\n\n") if "`decided_sast`" in b]
     assert any("`rule`" in b and "refuses" in b for b in blocks), \
         "the fold must carry the entry's rule across, and say the door checks it"
     summary = [p for p in text.split("\n\n") if "one-paragraph summary" in p]
@@ -198,10 +198,10 @@ def test_the_skill_carries_the_rule_across_and_puts_every_fold_in_the_summary():
 
 
 def test_the_skill_states_that_a_decided_finding_keeps_its_category_and_rule():
-    """The rule the door enforces has to be stated where every re-report
-    route reads it -- Job 1's carry-over, Job 2's triage and Job 3's fold
-    alike -- not only implied by what the door refuses."""
+    """The rule the door enforces has to be stated where every re-report route
+    reads it -- a triage unit's carried and scanner rows, a hunt's or a read's
+    fold alike -- not only implied by what the door refuses."""
     text = SKILL.read_text()
-    rules = text.split("## Rules that are not negotiable", 1)
+    rules = text.split("## Rules for every unit", 1)
     assert len(rules) == 2, "SKILL.md no longer has this section this test can read"
     assert "A decided finding keeps its category and rule" in rules[1]

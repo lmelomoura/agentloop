@@ -326,6 +326,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The security-analysis skill is written for a unit, not for a whole
+  analysis.** It opens with the rules every unit follows — what qualifies
+  as a finding, the reporting door, the closed rule vocabulary, never a
+  secret's value, no subagents — and then one section per unit kind. A
+  carried `sast` finding a triage unit finds gone is now said to be gone,
+  with the reason (`report-gone`), instead of left out in silence the engine
+  could not tell from a row nobody opened.
 - **A security analysis runs as a pipeline of units, on every platform.**
   `security analyze` now starts an orchestrator that holds the analysis lock,
   prepares the analysis once and runs each unit as an ordinary run of the

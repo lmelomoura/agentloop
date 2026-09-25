@@ -1508,16 +1508,19 @@ units proved. **Stop** on any run of an analysis stops the whole analysis and
 leaves it `interrupted`; `agentloop security resume <project> <analysis>`
 continues it without repeating a finished unit.
 
-The agent's own contract is versioned rather than typed into a prompt
-(`skills/security-analysis/SKILL.md`) and it does three things in this order:
-re-verify the findings the previous analysis left open — the cheapest of the
-three and the most valuable, so it goes first — triage what the deterministic
-phase found (is that "secret" an example in the documentation? is that CVE on a
-path anything reaches?), then the SAST pass at the profile's depth. It never
-writes to the database: every finding goes through `agentloop security
-report-finding`, which validates before it stores. The agent is
-non-deterministic, and the history that produces the checklist cannot be only as
-trustworthy as the last JSON it happened to type.
+Each unit's own contract is versioned rather than typed into a prompt
+(`skills/security-analysis/SKILL.md`), and it is written **per unit role**: a
+section of rules every unit follows, then one section per kind — `triage`
+(the carried-over findings and the deterministic phase's own — is that
+"secret" an example in the documentation? is that CVE on a path anything
+reaches?), `hunt` (the SAST pass at the profile's depth), `read` (the
+line-by-line pass on `deep`) and `verify` — each named in the unit's own
+prompt (`unit-prompt`) as the one section it has to follow beside the shared
+rules. No unit writes to the database: every finding goes through `agentloop
+security report-finding`, which validates before it stores, and a `read`
+unit's job is proven by what it actually read, never by what it says. A unit
+is non-deterministic, and the history that produces the checklist cannot be
+only as trustworthy as the last JSON one happened to type.
 
 ### What a finding has to carry
 
@@ -1938,7 +1941,9 @@ background, without repeating a finished unit.
 
 The rest of the vocabulary is the ledger's own and belongs to the units and the
 page. A unit's half is `findings`, `fingerprint`, `report-finding`,
-`report-gone`, `report-verdict`, `read`, `checklist` and `render`; the engine's
+`report-gone`, `report-verdict`, `read`, `checklist` and `render`; `units` and
+`unit-prompt` are the orchestrator's own view of the pipeline — every unit of
+an analysis and the prompt minted for one of them; the engine's
 and the operator's are `prepare`, `finish`, `unit-close`, `open-analysis`,
 `decide`, `rename-project`, `migrate-rules`, `list` and `event`. `migrate-rules` is the one that is run after a release
 rather than during an analysis: a rule's name is part of every finding's

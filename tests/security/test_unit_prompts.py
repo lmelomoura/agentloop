@@ -131,3 +131,13 @@ def test_a_verify_unit_is_the_verifier_prompt_under_the_unit_header():
     assert out.startswith("SECURITY ANALYSIS 21 · unit verify 1/1")
     assert prompts.verifier_prompt(21, finding) in out
     assert "PERSUASION" not in out
+
+
+def test_the_skill_has_every_section_a_unit_prompt_names():
+    skill = (prompts.SKILL_DIR / "SKILL.md").read_text()
+    for heading in ("## Rules for every unit", "## Unit: triage", "## Unit: hunt",
+                    "## Unit: read", "## Unit: verify"):
+        assert heading in skill, f"a unit is told to follow {heading!r}, and the skill has no such section"
+    for gone in ("## The four jobs", "## Before anything else", "## Ending the run",
+                 "agentloop security prepare --analysis"):
+        assert gone not in skill, f"{gone!r} describes the single-agent analysis that no longer exists"
