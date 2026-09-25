@@ -539,6 +539,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The Pipeline block no longer claims files were read before any read unit
+  ran.** `units.summary`'s `deep.files_read` counted a file as read once
+  nothing was left owed on it (`owed`, `bin/security/units.py`) — but an
+  empty file (0 lines) is listed with no `ranges` in the inventory
+  (`inventory.py`), so it has nothing to owe and counted as read from the
+  very first render, e.g. "8 of 1,331 files … read in full" on a fresh
+  analysis with 8 empty files and zero units done. `files`/`files_read` now
+  count only files that have lines to prove read; the empty ones are
+  reported apart as `deep.files_empty`, and the Security page's Pipeline
+  sentence says "N files with content (M empty)" when it is non-zero.
 - **The e2e check that a stopped analysis leaves nothing behind waits as long
   as the engine promises.** Scenario 56 gave the stopped analysis's lock 60 s
   to clear; a GitHub runner took longer to wind the unit down (its close and

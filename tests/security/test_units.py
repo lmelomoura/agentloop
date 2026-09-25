@@ -855,8 +855,24 @@ def test_the_summary_counts_lineages_by_their_last_attempt_and_the_lines_still_o
     ledger.settle_unit(conn, other, "done", 0.5, {"covered": {"b.py": [[1, 5]]}})
     s = units.summary(conn, aid)
     assert s["kinds"]["read"] == {"total": 2, "done": 1, "running": 0, "pending": 1, "failed": 0}
-    assert s["deep"] == {"files": 2, "files_read": 1, "lines": 15, "lines_read": 10}
+    assert s["deep"] == {"files": 2, "files_read": 1, "files_empty": 0, "lines": 15, "lines_read": 10}
     assert (s["spend_usd"], s["units"]) == (1.5, 3)
+
+
+def test_the_summary_never_counts_an_empty_file_as_read_before_any_unit_ran(conn):
+    """An empty file is listed with no `ranges` (inventory.py `build`), so
+    `owed` never names it missing anything -- it must not count towards
+    `files`/`files_read` either, or the page would say files were "read in
+    full" before a single read unit ran. It is reported apart, as
+    `files_empty`, so the two totals still add up to the inventory's own
+    file count."""
+    empty = {"path": "empty.py", "lines": 0, "bytes": 0, "ranges": []}
+    ledger.set_inventory(conn, aid := _analysis(conn),
+                         {"files": [_file("a.py", (1, 10, 100)), empty],
+                          "excluded": {}, "git": True,
+                          "totals": {"files": 2, "lines": 10, "bytes": 100}})
+    s = units.summary(conn, aid)
+    assert s["deep"] == {"files": 1, "files_read": 0, "files_empty": 1, "lines": 10, "lines_read": 0}
 
 
 def test_owed_is_the_inventory_minus_every_span_a_read_unit_proved(conn):

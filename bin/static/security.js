@@ -877,7 +877,8 @@
     const d = summary.deep;
     if (d) {
       const n = (v) => Number(v || 0).toLocaleString("en-US");
-      host.appendChild(secEl("div", "secpipe-deep", "Deep scope read in full: " + n(d.files_read) + " of " + n(d.files) + " files, " + n(d.lines_read) + " of " + n(d.lines) + " lines."));
+      const emptyNote = d.files_empty ? " (" + n(d.files_empty) + " empty)" : "";
+      host.appendChild(secEl("div", "secpipe-deep", "Deep scope read in full: " + n(d.files_read) + " of " + n(d.files) + " files with content" + emptyNote + ", " + n(d.lines_read) + " of " + n(d.lines) + " lines."));
     }
     host.appendChild(secEl("div", "secpipe-spend", "Spent by the units: " + money(summary.spend_usd || 0)));
     if (a.state === "running" || a.state === "interrupted") {
@@ -5543,5 +5544,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: eb9a40792c1ec08a4598b8738375227b8495123c49ae56f39419e2d10a2e3885 */
-/* ui-sources: 59b39a2f168d4864427d6f4be9d14553f0f5eadf9bd54f19d99fbc026dd701eb */
+/* ui-bundle: e0e1ddbea38d8a1d88a06af644d23a1df3554a18e95a7c676b41fb4c6169dc1f */
+/* ui-sources: 76d38eae516b9a65d296e3e4a0b470860b13f724013d06ebf4c13e5050b287a6 */

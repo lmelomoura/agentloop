@@ -632,8 +632,17 @@ def summary(conn, analysis_id):
         paths_left = {s["path"] for s in left}
         lines = int((inventory.get("totals") or {}).get("lines", 0))
         files = inventory.get("files") or []
-        deep = {"files": len(files),
-                "files_read": sum(1 for f in files if f["path"] not in paths_left),
+        # An empty file (0 lines) is listed with no `ranges` (inventory.py),
+        # so `owed` never names it as missing anything -- it would count as
+        # "read" before any unit ran. EXCLUDED FROM BOTH NUMBERS: `files` and
+        # `files_read` are counted only over files that HAVE lines to prove
+        # read, and the count skipped is reported apart as `files_empty` so
+        # the page can still say why the two totals don't match the
+        # inventory's own file count.
+        with_content = [f for f in files if f.get("ranges")]
+        deep = {"files": len(with_content),
+                "files_read": sum(1 for f in with_content if f["path"] not in paths_left),
+                "files_empty": len(files) - len(with_content),
                 "lines": lines,
                 "lines_read": lines - sum(s["last"] - s["first"] + 1 for s in left)}
     return {"kinds": kinds, "deep": deep, "units": len(all_units),

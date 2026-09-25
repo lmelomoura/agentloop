@@ -5163,7 +5163,8 @@ SUMMARY = {"units": 9, "spend_usd": 12.5,
            "kinds": {"hunt": {"total": 1, "done": 1, "running": 0, "pending": 0, "failed": 0},
                      "read": {"total": 6, "done": 3, "running": 2, "pending": 1, "failed": 0},
                      "verify": {"total": 2, "done": 1, "running": 0, "pending": 0, "failed": 1}},
-           "deep": {"files": 980, "files_read": 612, "lines": 294495, "lines_read": 201442}}
+           "deep": {"files": 980, "files_read": 612, "files_empty": 0,
+                    "lines": 294495, "lines_read": 201442}}
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -5176,9 +5177,25 @@ def test_the_pipeline_block_says_how_far_each_kind_of_unit_got(srv, tmp_path):
     assert "Reachability" in texts and "1 of 1 done" in texts
     assert "Deep read" in texts and "3 of 6 done · 2 running · 1 waiting" in texts
     assert "Verification" in texts and "1 gave up" in texts
-    assert "Deep scope read in full: 612 of 980 files, 201,442 of 294,495 lines." in texts
+    assert "Deep scope read in full: 612 of 980 files with content, 201,442 of 294,495 lines." in texts
     assert "$12.50" in texts
     assert out["buttons"] == ["Stop analysis"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_pipeline_block_names_empty_files_left_out_of_the_deep_count(srv, tmp_path):
+    """An empty file has no lines to prove read (units.py summary), so it is
+    excluded from both `files` and `files_read` -- the sentence says so
+    instead of silently shrinking the denominator, and before any read unit
+    ran it must NOT claim anything was already read in full."""
+    summary = {**SUMMARY, "deep": {"files": 1323, "files_read": 0, "files_empty": 8,
+                                    "lines": 260999, "lines_read": 0}}
+    script = tmp_path / "pipeline_empty.js"
+    script.write_text(_pipeline_script(_security_js(srv), {"id": 22, "state": "running", "run_id": "security-web"}, summary))
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    texts = " | ".join(n["text"] for n in out["nodes"])
+    assert ("Deep scope read in full: 0 of 1,323 files with content (8 empty), "
+            "0 of 260,999 lines.") in texts
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")

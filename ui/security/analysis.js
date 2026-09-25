@@ -586,8 +586,13 @@ export function secRenderPipeline(a, summary){
     // English, and a bare toLocaleString() prints 201.442 on a machine whose
     // locale says so -- and the test that reads the sentence with it.
     const n = (v) => Number(v || 0).toLocaleString("en-US");
+    // `files`/`files_read` (bin/security/units.py summary) already exclude
+    // empty files -- an empty file has no lines to prove read, so it would
+    // otherwise count as "read" before any unit ran. Say so when it matters,
+    // rather than silently shrinking the denominator.
+    const emptyNote = d.files_empty ? " (" + n(d.files_empty) + " empty)" : "";
     host.appendChild(secEl("div", "secpipe-deep", "Deep scope read in full: "
-      + n(d.files_read) + " of " + n(d.files) + " files, "
+      + n(d.files_read) + " of " + n(d.files) + " files with content" + emptyNote + ", "
       + n(d.lines_read) + " of " + n(d.lines) + " lines."));
   }
   host.appendChild(secEl("div", "secpipe-spend", "Spent by the units: " + money(summary.spend_usd || 0)));
