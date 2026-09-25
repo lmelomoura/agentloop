@@ -23,12 +23,25 @@ __run-unit <job> <analysis> <unit> <commit> <repo>
                           the unit `stopped` -- a stand-in for a unit that was
                           still claiming its slot when the first `stop` ran
                           and only a re-issued one reaches it
+      outage              the FIRST run of every lineage ends `error` with the
+                          classifier's cause `rate_limited` (a stream, no
+                          work); later runs play `complete`
+      always-outage       every run ends `error` / `rate_limited`
+      no-stream-close     a hunt unit closes `success` WITHOUT a stream; the
+                          other kinds play `complete`
+    FAKE_ENGINE_SPEND: what each close records (default 0.1).
+    FAKE_ENGINE_BUDGETS: a file each run appends the AL_SECURITY_UNIT_BUDGET it
+    was handed to, one per line.
     FAKE_ENGINE_FIND=1: the hunt unit reports one sast finding, so a verify
     unit is planned.
 stop <job>
     records one more call in FAKE_ENGINE_STOP (its text content is the count),
     which `slow`/`die-on-stop` wait on for existence and `late-stop` for the
     count to reach 2.
+__unit-gate <job>
+    the engine's gates for a launch: exits 0 (open), or -- with
+    FAKE_ENGINE_GATE set -- prints it and exits 3, as a closed gate does. Each
+    call is counted in FAKE_ENGINE_GATE_CALLS when that names a file.
 """
 import json
 import os
@@ -53,9 +66,13 @@ def cli(*args, env=None, stdin=None):
                           input=stdin, capture_output=True, text=True)
 
 
-def close(aid, uid, status, stream=""):
-    cli("unit-close", "--analysis", aid, "--unit", uid, "--status", status, "--spend", "0.1",
-        "--root", ROOT, *(["--stream", stream] if stream else []))
+SPEND = os.environ.get("FAKE_ENGINE_SPEND", "0.1")
+
+
+def close(aid, uid, status, stream="", cause=""):
+    cli("unit-close", "--analysis", aid, "--unit", uid, "--status", status, "--spend", SPEND,
+        "--root", ROOT, *(["--stream", stream] if stream else []),
+        *(["--cause", cause] if cause else []))
 
 
 def write_stream(job, ranges):
@@ -100,6 +117,13 @@ def wait_for_stop_count(n):
 def run_unit(job, aid, uid):
     conn = ledger.connect(DB)
     unit = ledger.get_unit(conn, int(uid))
+    budgets = os.environ.get("FAKE_ENGINE_BUDGETS")
+    if budgets:
+        with open(budgets, "a", encoding="utf-8") as out:
+            out.write(os.environ.get("AL_SECURITY_UNIT_BUDGET", "") + "\n")
+    if MODE == "always-outage" or (MODE == "outage" and not unit["parent"]):
+        close(aid, uid, "error", write_stream(job, []), cause="rate_limited")
+        return
     if MODE == "crash":
         sys.exit(3)
     if MODE in ("slow", "die-on-stop"):
@@ -157,10 +181,22 @@ def run_unit(job, aid, uid):
             env=agent, stdin=json.dumps({"verdict": "confirmed", "reason": "read src/a.py:1"}))
         if MODE == "verify-dies":
             sys.exit(3)
-    close(aid, uid, "success")
+    if MODE == "no-stream-close" and unit["kind"] == "hunt":
+        close(aid, uid, "success")
+        return
+    # Every run_job leaves a stream: the close judges nothing without one.
+    close(aid, uid, "success", write_stream(job, []))
 
 
 if sys.argv[1] == "__run-unit":
     run_unit(sys.argv[2], sys.argv[3], sys.argv[4])
 elif sys.argv[1] == "stop":
     Path(os.environ["FAKE_ENGINE_STOP"]).write_text(str(stop_count() + 1))
+elif sys.argv[1] == "__unit-gate":
+    calls = os.environ.get("FAKE_ENGINE_GATE_CALLS")
+    if calls:
+        with open(calls, "a", encoding="utf-8") as out:
+            out.write("gate\n")
+    if os.environ.get("FAKE_ENGINE_GATE"):
+        print(os.environ["FAKE_ENGINE_GATE"])
+        sys.exit(3)

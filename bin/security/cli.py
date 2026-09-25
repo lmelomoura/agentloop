@@ -1968,7 +1968,7 @@ def cmd_unit_close(args):
     unit = _unit_of(conn, args.analysis, args.unit)
     print(json.dumps(units.close(conn, unit, stream=args.stream, root=args.root,
                                  status=args.status, reason=args.reason,
-                                 spend_usd=_spend(args.spend))))
+                                 spend_usd=_spend(args.spend), cause=args.cause)))
 
 
 def cmd_report_gone(args):
@@ -4312,6 +4312,11 @@ def main(argv=None):
     uc.add_argument("--status", default="error", choices=("success", "warning", "error", "stopped"))
     uc.add_argument("--reason", default="")
     uc.add_argument("--spend", default="0")
+    # The classifier's cause (RJ_CAUSE): `rate_limited` or `api_error` is the
+    # provider ending the run, never the unit's failure -- units.close keeps
+    # the attempt for them. Free text: an unknown cause is simply not one of
+    # those two.
+    uc.add_argument("--cause", default="")
 
     us = sub.add_parser("units", parents=[dbflag]); us.set_defaults(fn=cmd_units)
     us.add_argument("--analysis", type=int, required=True)

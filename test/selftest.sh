@@ -7550,6 +7550,54 @@ JSON
     && [ "$(wc -l < "$tmp/units/calls" | tr -d ' ')" = 1 ] \
     && ok "a unit's run closes its unit, without the agent flag, and a plain job closes nothing" \
     || bad "security_close_analysis calls: $(cat "$tmp/units/calls" 2>/dev/null)"
+  echo "security_unit_gate() — a unit's forced run still answers to the engine's gates"
+  # The classifier's cause reaches unit-close when there is one: a
+  # rate-limited run is the provider's doing, and the unit keeps its attempt.
+  ( DATA_DIR="$tmp/units/data"; AL_SECURITY_ANALYSIS_ID=7 AL_SECURITY_UNIT_ID=43
+    run_cwd="/Users/me/run"
+    security_py() { printf '%s\n' "$*" >> "$tmp/units/cause-calls"; }
+    security_close_analysis security-x error 0.2 "" "$tmp/units/s.ndjson" "" rate_limited
+    AL_SECURITY_UNIT_ID=44 security_close_analysis security-x error 0.2 "" "$tmp/units/s.ndjson" "" "" )
+  grep -qx -- 'unit-close --analysis 7 --unit 43 --stream '"$tmp"'/units/s.ndjson --root /Users/me/run --status error --reason  --spend 0.2 --cause rate_limited' "$tmp/units/cause-calls" \
+    && grep -qx -- 'unit-close --analysis 7 --unit 44 --stream '"$tmp"'/units/s.ndjson --root /Users/me/run --status error --reason  --spend 0.2' "$tmp/units/cause-calls" \
+    && ok "the run's cause reaches unit-close, and no --cause is passed without one" \
+    || bad "security_close_analysis cause calls: $(cat "$tmp/units/cause-calls" 2>/dev/null)"
+  # daily_gate is run_job's own daily arithmetic, shared with the gate below.
+  ( daily_cap_for() { printf '5\n'; }; spent_today() { printf '5.000000\n'; }; global_daily_cap() { :; }
+    [ "$(daily_gate j)" = "job 5.000000 5" ] ) \
+    && ok "a job at its own daily cap is gated" || bad "daily_gate at the job's cap"
+  ( daily_cap_for() { :; }; global_daily_cap() { printf '10\n'; }; spent_today_all() { printf '3\n'; }
+    ! daily_gate j >/dev/null ) \
+    && ok "under the fleet's cap the daily gate is open" || bad "daily_gate under the global cap"
+  ( daily_cap_for() { printf '50\n'; }; spent_today() { printf '1\n'; }
+    global_daily_cap() { printf '10\n'; }; spent_today_all() { printf '12\n'; }
+    [ "$(daily_gate j)" = "global 12 10" ] ) \
+    && ok "over the fleet's cap the daily gate is closed, whatever the job's own says" \
+    || bad "daily_gate over the global cap"
+  ( resolve() { printf 'anthropic\n'; }; job_account() { printf 'default\n'; }
+    account_env_dir() { :; }; rl_key() { printf 'k\n'; }
+    rl_gate() { return 1; }; daily_gate() { return 1; }
+    out="$(security_unit_gate security-x)"; rc=$?
+    [ "$rc" -eq 0 ] && [ -z "$out" ] ) \
+    && ok "with every gate open a unit may launch" || bad "security_unit_gate with open gates"
+  ( resolve() { printf 'anthropic\n'; }; job_account() { printf 'default\n'; }
+    account_env_dir() { :; }; rl_key() { printf 'k\n'; }
+    rl_gate() { printf 'the five-hour window is at 100%%\n'; return 0; }; daily_gate() { return 1; }
+    out="$(security_unit_gate security-x)"; rc=$?
+    [ "$rc" -eq 3 ] && [ "$out" = "the usage limit was reached (the five-hour window is at 100%)" ] ) \
+    && ok "a usage window at its limit closes the gate, named" || bad "security_unit_gate on the usage window"
+  ( resolve() { printf 'anthropic\n'; }; job_account() { printf 'default\n'; }
+    account_env_dir() { :; }; rl_key() { printf 'k\n'; }
+    rl_gate() { return 1; }; daily_gate() { printf 'job 3.10 3.00\n'; }
+    out="$(security_unit_gate security-x)"; rc=$?
+    [ "$rc" -eq 3 ] && [ "$out" = 'the daily cap of security-x was reached ($3.10 / $3.00)' ] ) \
+    && ok "the job's daily cap closes the gate, named" || bad "security_unit_gate on the daily cap"
+  ( resolve() { printf 'anthropic\n'; }; job_account() { printf 'default\n'; }
+    account_env_dir() { :; }; rl_key() { printf 'k\n'; }
+    rl_gate() { return 1; }; daily_gate() { printf 'global 12 10\n'; }
+    out="$(security_unit_gate security-x)"; rc=$?
+    [ "$rc" -eq 3 ] && [ "$out" = 'the global daily cap was reached ($12 / $10 across all jobs)' ] ) \
+    && ok "the global daily cap closes the gate, named" || bad "security_unit_gate on the global cap"
   # A security run that is not a unit -- no unit id in its environment -- is
   # refused before any slot, worktree or log exists, and closes nothing.
   printf '{"projects":[]}\n' > "$tmp/units/projects.json"

@@ -41,9 +41,39 @@ one that dies before its close is judged as above -- and leaves the analysis
 
 THE BUDGET IS THE ANALYSIS'S. The spend is the units' sum; nothing is
 launched once it reaches `budget`, and each unit is given an even share of
-what remains (never under MIN_UNIT_BUDGET) -- on Claude Code the engine turns
-it into `--max-budget-usd`; elsewhere it is read at the end, which is why
-this loop checks the sum itself before every launch.
+what remains -- on Claude Code the engine turns it into `--max-budget-usd`;
+elsewhere it is read at the end, which is why this loop checks the sum
+itself before every launch. WHAT REMAINS IS NET OF WHAT IS PROMISED: the cap
+handed to every unit still in flight is reserved until that unit settles, so
+the caps in flight plus the spend never add up to more than the budget. The
+spend alone counts only the units that closed, and a pass that launched P
+units off it handed out B, B/2, B/3 ... -- 1.83 times the budget at P=3.
+MIN_UNIT_BUDGET is a floor, never a way over the budget: when what remains
+is below it, nothing is launched, and once nothing is in flight the close
+says why the rest never ran.
+
+THE ENGINE'S OWN GATES STILL HOLD. A unit runs as a forced run of the
+derived job, which skips run_job's usage-window, daily and global-cap gates
+-- so the orchestrator asks the engine for them (`__unit-gate`) before every
+launch, and a closed one stops the launches and leaves the analysis
+`interrupted` with a note naming the gate, to be resumed once it reopens. A
+run the provider cut short (the classifier's `rate_limited` or `api_error`)
+is not the unit's failure either: its close keeps the attempt, and three
+such runs in a row of one lineage give it up as the engine not being able to
+run it, exactly as three runs that died unclosed do.
+
+A PID IS NOT A RUN. After a reboot, or simply later, the kernel hands a
+unit's old pid to some other process, and `kill -0` alone would adopt it and
+wait on it for ever. A run is adopted only while its pid still names the
+process this orchestrator launched: its start time (recorded in the unit's
+`run_key`) and its command line (`__run-unit <job> <analysis> <unit>`).
+
+A FAILURE IS AN INTERRUPTION, NOT A `running` ROW. Anything that raises in
+here, or a close (`finish`) that fails twice, leaves the analysis
+`interrupted` -- resumable, and offered Resume on the page -- and when even
+that cannot be written the lock is kept, so the tick finds its owner dead
+and resumes it. A row left `running` behind a released lock is one nothing
+would ever look at again.
 
 ITS LIFE IS DATA. The phase it is in goes into its lock (`phase`), and the
 page reads it beside the lock's liveness (security_checklist in
@@ -89,6 +119,29 @@ NO_STREAM_NOTE = ("The run ended without its close and left no stream -- the onl
                   "it did counts.")
 STRUCK_OUT_NOTE = ("The engine could not run this unit: {n} runs ended without a close "
                    "(see tick.log).")
+STRUCK_OUT_OUTAGE_NOTE = ("The engine could not run this unit: {n} runs in a row were cut short "
+                          "by the provider ({cause}; see tick.log).")
+BUDGET_SPENT_NOTE = "The analysis budget of ${budget:.2f} was spent before every unit ran."
+BUDGET_FLOOR_NOTE = ("The analysis budget of ${budget:.2f} had ${left:.2f} left -- less than the "
+                     "${floor:.2f} one unit is given -- before every unit ran.")
+GATE_NOTE = ("The engine interrupted this analysis because {gate}; the units it finished are "
+             "kept, and a resume continues it once the gate reopens.")
+FAILED_NOTE = ("The engine interrupted this analysis because its orchestrator failed "
+               "({what}); the units it finished are kept, and a resume continues it.")
+# The classifier's causes (run_classify in bin/agentloop) for a run the
+# PROVIDER ended: the unit's close keeps the attempt for them (units.close),
+# and this loop counts them as runs the engine could not run.
+OUTAGE_CAUSES = units.OUTAGE_CAUSES
+# `__unit-gate`'s answer when one of the engine's gates is closed; the
+# sentence naming it is on its stdout.
+GATE_CLOSED_RC = 3
+# The file beside a prepare's checkout that names the process group running
+# it: `prepare` leads a session of its own, and one whose orchestrator was
+# SIGKILLed keeps running -- the next `_prepare` of the same analysis ends it
+# before cutting the same checkout again. Beside the checkout, not in the
+# analysis lock: the tick breaks a dead orchestrator's lock (lock_break)
+# before it resumes the analysis, and the file would go with it.
+PREPARE_PGID = ".pgid"
 
 
 def _alive(pid) -> bool:
@@ -101,9 +154,67 @@ def _alive(pid) -> bool:
     return True
 
 
+def _ps(pid, field) -> str:
+    """One `ps -o <field>=` of `pid`, or '' when it names no process."""
+    try:
+        out = subprocess.run(["ps", "-o", f"{field}=", "-p", str(int(pid))],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _started_at(pid) -> str:
+    """The process's start time as `ps` prints it (`lstart`): what tells the
+    process a pid named when it was recorded from whatever the kernel has
+    handed that number to since -- a reboot, or a wrap."""
+    return " ".join(_ps(pid, "lstart").split())
+
+
+def _run_key(job, pid, started="", cap=None) -> str:
+    """`<job>/<pid>`, then `;start=<lstart>` and `;cap=<usd>` when known:
+    what a later orchestrator needs to know the run is still the one this
+    one launched (`_is_run`) and how much of the budget it holds."""
+    key = f"{job}/{pid}"
+    if started:
+        key += f";start={started}"
+    if cap is not None:
+        key += f";cap={cap:.2f}"
+    return key
+
+
+def _key_fields(run_key) -> dict:
+    head, *rest = (run_key or "").split(";")
+    fields = dict(part.split("=", 1) for part in rest if "=" in part)
+    tail = head.rsplit("/", 1)[-1]
+    fields["pid"] = int(tail) if tail.isdigit() else None
+    return fields
+
+
 def _pid_of(run_key):
-    tail = (run_key or "").rsplit("/", 1)[-1]
-    return int(tail) if tail.isdigit() else None
+    return _key_fields(run_key)["pid"]
+
+
+def _cap_of(run_key):
+    try:
+        return float(_key_fields(run_key).get("cap", ""))
+    except ValueError:
+        return None
+
+
+def _is_run(pid, job, analysis_id, unit_id, started="") -> bool:
+    """Whether `pid` is STILL the run of this unit: alive, started when the
+    run_key says it was (when it says), and running `__run-unit <job>
+    <analysis> <unit>` -- run_job runs in that very process (security_run_unit
+    in bin/agentloop calls it as a function), so the command line holds for
+    the run's whole life. A pid that fails any of the three is some other
+    process now, and the unit's run is gone."""
+    if not pid or not _alive(pid):
+        return False
+    if started and _started_at(pid) != started:
+        return False
+    args = f" {_ps(pid, 'args')} "
+    return f" __run-unit {job} {analysis_id} {unit_id} " in args
 
 
 def _parse_budget(value):
@@ -162,8 +273,12 @@ class Orchestrator:
         self.adopted = {}         # pid -> unit id: runs a previous orchestrator left alive
         self.unjudged = {}        # unit id -> [pid, tries]: dead runs whose judgement raised
         self.strikes = {}         # lineage root id -> its runs in a row that died unclosed
+        self.reserved = {}        # unit id -> the budget cap its run in flight was handed
         self.stopping = False
         self.budget_spent = False
+        self.budget_left = None   # set when the floor, not the spend, stopped the launches
+        self.gate = ""            # the engine's gate that closed, in the engine's words
+        self.keep_lock = False    # nothing could be written: the tick must find us dead
         self.prepare_proc = None
         self.env = {k: v for k, v in os.environ.items() if k not in _SESSION_VARS}
 
@@ -230,6 +345,11 @@ class Orchestrator:
     def _in_flight(self) -> bool:
         return bool(self.children or self.adopted or self.unjudged)
 
+    def _run_alive(self, unit) -> bool:
+        """Whether `unit`'s run, as its run_key names it, is still that run."""
+        fields = _key_fields(unit["run_key"])
+        return _is_run(fields["pid"], self.job, self.aid, unit["id"], fields.get("start", ""))
+
     # -- the run ---------------------------------------------------------------
     def run(self) -> int:
         previous = {s: signal.signal(s, self._on_signal)
@@ -244,33 +364,72 @@ class Orchestrator:
                 sys.stderr.write(f"orchestrate: {message}\n")
                 self.log(message)
                 return 2
-            row = self._row()
-            if row is None or row["state"] != "running":
-                self.log(f"is {row['state'] if row else 'missing'}; nothing to run")
-                return 0
-            if not row["prepared"] and not self._prepare():
-                if self.stopping:
-                    return self._interrupt()
-                self._finish(PREPARE_FAILED_NOTE, state="capped")
-                return 0
-            if not ledger.units_of(self.conn, self.aid) and not self._plan():
-                return 0
-            self._adopt()
-            self._set_phase("running units")
-            self._loop()
-            if self.stopping:
-                return self._interrupt()
-            # THE BUDGET SENTENCE ONLY WHEN IT IS TRUE: units left unsettled. A
-            # budget the last unit spent to the cent left nothing unrun, and
-            # "spent before every unit ran" would be a false line in the report.
-            left = units.unsettled(ledger.units_of(self.conn, self.aid))
-            self._finish(f"The analysis budget of ${self.budget:.2f} was spent before every unit ran."
-                         if self.budget_spent and left else "")
-            return 0
+            try:
+                return self._run()
+            except Exception as exc:  # noqa: BLE001 -- see "A FAILURE IS AN INTERRUPTION"
+                return self._failed(f"{type(exc).__name__}: {exc}")
         finally:
             for s, handler in previous.items():
                 signal.signal(s, handler)
             self._release()
+
+    def _run(self) -> int:
+        row = self._row()
+        if row is None or row["state"] != "running":
+            self.log(f"is {row['state'] if row else 'missing'}; nothing to run")
+            return 0
+        if not row["prepared"] and not self._prepare():
+            if self.stopping:
+                return self._interrupt()
+            self._finish(PREPARE_FAILED_NOTE, state="capped")
+            return 0
+        if not ledger.units_of(self.conn, self.aid) and not self._plan():
+            return 0
+        self._adopt()
+        self._set_phase("running units")
+        self._loop()
+        if self.stopping:
+            return self._interrupt()
+        if self.gate:
+            return self._interrupt(GATE_NOTE.format(gate=self.gate))
+        # THE BUDGET SENTENCE ONLY WHEN IT IS TRUE: units left unsettled. A
+        # budget the last unit spent to the cent left nothing unrun, and
+        # "spent before every unit ran" would be a false line in the report.
+        left = units.unsettled(ledger.units_of(self.conn, self.aid))
+        note = ""
+        if self.budget_spent and left:
+            note = (BUDGET_FLOOR_NOTE.format(budget=self.budget, left=self.budget_left,
+                                             floor=MIN_UNIT_BUDGET)
+                    if self.budget_left is not None else BUDGET_SPENT_NOTE.format(budget=self.budget))
+        self._finish(note)
+        return 0
+
+    def _failed(self, what) -> int:
+        """Something raised: the analysis is left `interrupted` -- its
+        units' runs stopped and judged as a stop would (`_interrupt`) -- and
+        if even that raises, with the one UPDATE that makes it resumable, on
+        a connection of its own. When nothing can be written at all, the lock
+        is kept: the tick finds its owner dead, interrupts the analysis and
+        resumes it (security_resume_orphans in bin/agentloop)."""
+        self.log(f"failed: {what}")
+        note = FAILED_NOTE.format(what=what.split(":", 1)[0])
+        try:
+            self._interrupt(note)
+            return 1
+        except Exception as exc:  # noqa: BLE001 -- the last resort follows
+            self.log(f"could not stop and interrupt cleanly ({type(exc).__name__}: {exc})")
+        try:
+            conn = ledger.connect(self.db)
+            ledger.interrupt_analysis(conn, self.aid, note)
+            state = conn.execute("SELECT state FROM analysis WHERE id=?", (self.aid,)).fetchone()
+            if state is not None and state["state"] == "running":
+                raise RuntimeError("the analysis is still running")
+            self.log("interrupted — `agentloop security resume` continues it")
+        except Exception as exc:  # noqa: BLE001
+            self.keep_lock = True
+            self.log(f"could not interrupt it either ({type(exc).__name__}: {exc}) — the lock "
+                     "is kept, so the tick resumes it")
+        return 1
 
     def _prepare(self) -> bool:
         """The deterministic phase, once, in a checkout of the analysed commit
@@ -292,6 +451,8 @@ class Orchestrator:
         self._set_phase("preparing")
         tree = self.prepare_root / f"{self.job}-{self.aid}"
         tree.parent.mkdir(parents=True, exist_ok=True)
+        pgid_file = tree.parent / f"{tree.name}{PREPARE_PGID}"
+        self._end_orphan_prepare(pgid_file)
         self._drop_tree(tree)
         made = self._git("worktree", "add", "--detach", str(tree), self.commit)
         if made.returncode != 0:
@@ -309,16 +470,55 @@ class Orchestrator:
                  *(["--offline"] if self.offline else [])],
                 env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                 start_new_session=True)
+            try:
+                pgid_file.write_text(f"{self.prepare_proc.pid}\n"
+                                     f"{_started_at(self.prepare_proc.pid)}\n")
+            except OSError:
+                pass
             _out, err = self.prepare_proc.communicate()
             code = self.prepare_proc.returncode
         finally:
             self.prepare_proc = None
+            pgid_file.unlink(missing_ok=True)
             self._drop_tree(tree)
         if code != 0:
             self.log(f"deterministic phase failed (rc {code}): {(err or '').strip()[-400:]}")
             return False
         self.log("deterministic phase done")
         return True
+
+    def _end_orphan_prepare(self, pgid_file):
+        """A prepare an earlier orchestrator of this analysis started and never
+        saw end -- it was SIGKILLed, and `prepare` leads a session of its own,
+        so it went on running on the very checkout this one is about to cut
+        again, writing into the same analysis. Ended, with its whole group,
+        before anything else -- but ONLY while the recorded pid is still that
+        process: started when the file says it was, and running `prepare
+        --analysis <this analysis>`. A pid the kernel has handed to anything
+        else since is left alone."""
+        try:
+            pid_text, started = (pgid_file.read_text().split("\n") + ["", ""])[:2]
+        except OSError:
+            return
+        pgid_file.unlink(missing_ok=True)
+        if not pid_text.strip().isdigit():
+            return
+        pid = int(pid_text)
+        args = f" {_ps(pid, 'args')} "
+        if (not _alive(pid) or _started_at(pid) != started.strip()
+                or f" prepare --analysis {self.aid} " not in args):
+            return
+        self.log(f"ending the deterministic phase an earlier orchestrator left running (pid {pid})")
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pid, sig)
+            except OSError:
+                return
+            deadline = time.time() + 10
+            while time.time() < deadline and _alive(pid) and not _ps(pid, "stat").startswith("Z"):
+                time.sleep(0.1)
+            if not _alive(pid) or _ps(pid, "stat").startswith("Z"):
+                return
 
     def _drop_tree(self, tree):
         """The prepare checkout gone, and git's record of it with it: `worktree
@@ -355,8 +555,14 @@ class Orchestrator:
             if u["state"] != "running":
                 continue
             pid = _pid_of(u["run_key"])
-            if pid and _alive(pid):
+            if self._run_alive(u):
                 self.adopted[pid] = u["id"]
+                # ITS CAP STAYS RESERVED until it settles. A run_key from
+                # before caps were recorded holds none: the floor is the
+                # least any launched unit was ever handed.
+                if self.budget is not None:
+                    cap = _cap_of(u["run_key"])
+                    self.reserved[u["id"]] = MIN_UNIT_BUDGET if cap is None else cap
             else:
                 self._after(u["id"], pid)
 
@@ -374,25 +580,84 @@ class Orchestrator:
                 if planned:
                     self.log(f"{len(planned)} verify unit(s) planned")
                 continue
-            if not self.budget_spent:
-                room = self.parallel - len(self.children) - len(self.adopted)
-                for unit in units.launchable(self.conn, self.aid, room):
-                    self._launch(unit, spend)
+            if not self.budget_spent and not self.gate:
+                self._launch_pass(spend)
             # NOTHING IN FLIGHT AND NOTHING TO LAUNCH: done. That includes a
             # triage, hunt or read unit left `running` because its judgement
             # kept failing (JUDGE_TRIES) -- verification is never planned over
             # it, and the close names it "never finished".
             if not self._in_flight():
                 waiting = any(u["state"] == "pending" for u in ledger.units_of(self.conn, self.aid))
-                if self.budget_spent or not waiting:
+                if self.budget_spent or self.gate or not waiting:
                     return
             time.sleep(self.poll)
 
-    def _launch(self, unit, spend):
+    def _launch_pass(self, spend):
+        """Launch what the room allows, each unit with its share of what the
+        budget has left NET OF THE CAPS STILL IN FLIGHT (see the module
+        docstring), and each only past the engine's own gates."""
+        room = self.parallel - len(self.children) - len(self.adopted)
+        for n, unit in enumerate(units.launchable(self.conn, self.aid, room)):
+            outages, cause = self._outages_before(unit)
+            if outages >= LAUNCH_STRIKES:
+                # THE PROVIDER CUT SHORT THE LINEAGE'S LAST LAUNCH_STRIKES RUNS
+                # IN A ROW: given up, as three runs that died unclosed are.
+                # Counted off the ledger at the launch, never off this
+                # process's memory: a continuation is pending the moment its
+                # parent's close commits, before this loop has even reaped
+                # that parent's process -- and a resume must count the same.
+                ledger.settle_unit(self.conn, unit["id"], "failed", 0, {},
+                                   STRUCK_OUT_OUTAGE_NOTE.format(n=outages, cause=cause))
+                self.log(f"unit {units.label(self.conn, unit)} failed: the engine could not run it")
+                continue
+            cap = None
+            if self.budget is not None:
+                left = self.budget - spend - sum(self.reserved.values())
+                if left < MIN_UNIT_BUDGET - _CENT_EPSILON:
+                    # BELOW THE FLOOR: nothing more starts now. With runs
+                    # still in flight what they do not spend comes back when
+                    # they settle; with none, the budget is what stopped the
+                    # analysis, and the close says so.
+                    if not self._in_flight():
+                        self.budget_spent = True
+                        self.budget_left = max(0.0, left)
+                    return
+                cap = max(MIN_UNIT_BUDGET, left / (room - n))
+                # In whole cents, rounded DOWN: a cap printed to the cent
+                # must never round the sum of the caps over the budget.
+                cap = math.floor(min(cap, left) * 100 + 1e-6) / 100
+            gate = self._gate()
+            if gate:
+                self.gate = gate
+                self.log(f"stops launching: {gate}")
+                return
+            self._launch(unit, cap)
+
+    def _gate(self) -> str:
+        """The engine's own gates for a launch of the derived job -- the
+        usage window, the job's daily cap, the global daily cap -- asked of
+        the engine itself (`__unit-gate`), never computed a second time here.
+        '' when they are open. An engine that cannot answer is not a closed
+        gate: the launch goes through the same engine, and fails -- and is
+        counted -- there."""
+        try:
+            out = subprocess.run([self.engine, "__unit-gate", self.job], env=self.env,
+                                 capture_output=True, text=True, timeout=120,
+                                 stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.log(f"could not ask the engine for its gates: {exc}")
+            return ""
+        if out.returncode == GATE_CLOSED_RC:
+            return out.stdout.strip() or "one of the engine's spend or usage gates is closed"
+        if out.returncode != 0:
+            self.log(f"could not ask the engine for its gates (rc {out.returncode}): "
+                     f"{out.stderr.strip()[-200:]}")
+        return ""
+
+    def _launch(self, unit, cap=None):
         env = dict(self.env)
-        if self.budget is not None:
-            share = (self.budget - spend) / (len(self.children) + len(self.adopted) + 1)
-            env["AL_SECURITY_UNIT_BUDGET"] = f"{max(MIN_UNIT_BUDGET, share):.2f}"
+        if cap is not None:
+            env["AL_SECURITY_UNIT_BUDGET"] = f"{cap:.2f}"
         # RUNNING BEFORE THE LAUNCH, not after: a verify unit's session writes
         # its verdict through a door that only opens for a running unit, and a
         # fast one would otherwise reach it first.
@@ -412,9 +677,13 @@ class Orchestrator:
             self.log(f"unit {units.label(self.conn, unit)} could not be launched: {exc}")
             self._strike(ledger.get_unit(self.conn, unit["id"]), unit["id"])
             return
-        ledger.set_run_key(self.conn, unit["id"], f"{self.job}/{proc.pid}")
+        if cap is not None:
+            self.reserved[unit["id"]] = cap
         self.children[proc.pid] = (proc, unit["id"])
-        self.log(f"unit {units.label(self.conn, unit)} launched (pid {proc.pid})")
+        ledger.set_run_key(self.conn, unit["id"],
+                           _run_key(self.job, proc.pid, _started_at(proc.pid), cap))
+        self.log(f"unit {units.label(self.conn, unit)} launched (pid {proc.pid}"
+                 f"{f', budget ${cap:.2f}' if cap is not None else ''})")
 
     def _reap(self):
         for pid, (proc, uid) in list(self.children.items()):
@@ -423,7 +692,8 @@ class Orchestrator:
             del self.children[pid]
             self._after(uid, pid)
         for pid, uid in list(self.adopted.items()):
-            if _alive(pid):
+            unit = ledger.get_unit(self.conn, uid)
+            if unit is not None and self._run_alive(unit):
                 continue
             del self.adopted[pid]
             self._after(uid, pid)
@@ -434,13 +704,15 @@ class Orchestrator:
         unit = ledger.get_unit(self.conn, uid)
         if unit is None or unit["state"] == "pending":
             self.unjudged.pop(uid, None)
+            self.reserved.pop(uid, None)
             return
         lineage = units.lineage_root(self.conn, unit)["id"]
         if unit["state"] != "running":
             self.unjudged.pop(uid, None)
-            self.strikes.pop(lineage, None)      # a run closed it: the engine can run it
+            self.reserved.pop(uid, None)
             self.log(f"unit {units.label(self.conn, unit)} {unit['state']} "
                      f"(${unit['spend_usd']:.2f}) — {unit['note']}")
+            self.strikes.pop(lineage, None)      # a run closed it: the engine can run it
             return
         # THE RUN ENDED WITHOUT CLOSING ITS UNIT -- killed, crashed, or
         # orphaned by an orchestrator that died. Judged from what it left, as
@@ -453,11 +725,25 @@ class Orchestrator:
         out = self._judge_orphan(unit, pid)
         if out is None:
             return                               # retried on the next poll (_reap)
+        self.reserved.pop(uid, None)
         if out.get("continuation"):
             self._strike(unit, out["continuation"])
         else:
             self.log(f"unit {units.label(self.conn, unit)} ended without its close — judged "
                      f"{out.get('state')} from what its run left")
+
+    def _outages_before(self, unit):
+        """(n, cause): how many of `unit`'s ancestors IN A ROW, nearest first,
+        closed on a provider outage (their evidence carries the classifier's
+        cause, units.close) -- and the nearest one's cause."""
+        n, cause, node = 0, "", unit
+        while node["parent"]:
+            node = ledger.get_unit(self.conn, node["parent"])
+            if node is None or (node.get("evidence") or {}).get("cause") not in OUTAGE_CAUSES:
+                break
+            cause = cause or node["evidence"]["cause"]
+            n += 1
+        return n, cause
 
     def _strike(self, unit, next_id):
         """One more run of `unit`'s lineage that ended without a close;
@@ -541,7 +827,10 @@ class Orchestrator:
         return units.conclude(self.conn, unit, done=False, evidence=ev, note=NO_STREAM_NOTE,
                               spend_usd=0.0, stopped=True, clear_verdict=clear)
 
-    def _interrupt(self) -> int:
+    def _interrupt(self, note="") -> int:
+        """Stop the units' runs and leave the analysis `interrupted` -- with
+        `note` in its paragraph when something other than a stop is the
+        reason (a gate that closed, a failure)."""
         self._set_phase("stopping")
         self.log("stopping its units")
         deadline = time.time() + STOP_GRACE_SECONDS
@@ -568,10 +857,9 @@ class Orchestrator:
         # never launched, and one whose judgement raised -- is judged from
         # what it left; one that still cannot be is left for the resume.
         for u in ledger.units_of(self.conn, self.aid):
-            pid = _pid_of(u["run_key"])
-            if u["state"] == "running" and not (pid and _alive(pid)):
-                self._judge_orphan(u, pid)
-        ledger.interrupt_analysis(self.conn, self.aid)
+            if u["state"] == "running" and not self._run_alive(u):
+                self._judge_orphan(u, _pid_of(u["run_key"]))
+        ledger.interrupt_analysis(self.conn, self.aid, note)
         self.log("interrupted — `agentloop security resume` continues it")
         return 0
 
@@ -586,12 +874,26 @@ class Orchestrator:
                 "--if-running"]
         if note:
             args += ["--note", note]
-        out = self._cli(*args)
-        if out.returncode != 0:
-            self.log(f"could not close: {out.stderr.strip()[-400:]}")
+        # TWICE, then an interruption: a close that fails -- a busy ledger,
+        # a crash in the CLI -- must never leave the row `running` behind a
+        # lock this process is about to release (see the module docstring).
+        for attempt in (1, 2):
+            out = self._cli(*args)
+            if out.returncode == 0:
+                break
+            self.log(f"could not close (try {attempt}): {out.stderr.strip()[-400:]}")
+            if attempt == 1:
+                time.sleep(min(self.poll, 1.0))
         row = self._row()
+        if row["state"] == "running":
+            ledger.interrupt_analysis(self.conn, self.aid,
+                                      FAILED_NOTE.format(what="its close failed"))
+            self.log("interrupted — the close failed; `agentloop security resume` continues it")
+            return
         self.log(f"closed {row['state']} (${row['spend_usd']:.2f})")
 
     def _release(self):
+        if self.keep_lock:
+            return
         if self._lock_is_mine():
             shutil.rmtree(self.lock_dir, ignore_errors=True)

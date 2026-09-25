@@ -59,17 +59,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   each unit left undone, plans verification once the rest has settled, and
   closes the analysis from what the units proved; a plan that could not be
   written closes it `capped`, never `done`. The analysis budget is enforced
-  across units, and a budget that is not a number is refused with a
-  sentence. A run that dies without closing its unit is judged from the
+  across units: the cap handed to every unit still running is reserved
+  until it settles, so the caps in flight plus the spend never exceed the
+  budget (a pass of three launches used to hand out nearly twice it), and
+  the $0.50 floor per unit never pushes past it — when less than that is
+  left nothing more starts, and the close says so. A budget that is not a
+  number is refused with a sentence. Every launch first asks the engine for
+  the gates a unit's forced run skips — the usage window, the job's daily
+  cap, the global daily cap (`__unit-gate`, run_job's own checks) — and a
+  closed one stops the launches and leaves the analysis `interrupted` with
+  the gate named in its note. A run the provider cut short (`rate_limited`,
+  `api_error`) keeps its unit's attempt, and three in a row give the unit
+  up. A run that dies without closing its unit is judged from the
   stream it left — what it read counts, the rest continues at the same
   attempt; a run that left no stream proved nothing, so nothing it did
   counts and a verify unit's verdict is cleared — and three such deaths in
   a row give the unit up. A unit whose run started an agent is never sent
   back under the same id: a judgement that fails is retried instead. A stop
   leaves the analysis `interrupted` with its finished units kept, a new
-  orchestrator adopts the runs a dead one left behind, and the orchestrator
-  writes its phase into its lock and its log lines in `tick.log`'s own
-  format, where the dashboard reads them.
+  orchestrator adopts the runs a dead one left behind — only while the pid
+  is still that run, by its start time and its `__run-unit` command line,
+  never a process that inherited the number after a reboot — and ends a
+  `prepare` a SIGKILLed predecessor left running before cutting the same
+  checkout again. Anything that fails inside the orchestrator, or a close
+  that fails twice, leaves the analysis `interrupted` (resumable) rather
+  than `running`, and when not even that can be written the lock is kept so
+  the tick resumes it. The orchestrator writes its phase into its lock and
+  its log lines in `tick.log`'s own format, where the dashboard reads them.
 
 - **The engine closes a pipeline analysis from what its units proved.**
   `finish --from-units` records the units' summed cost and lowers `done` to

@@ -458,12 +458,13 @@ security_derived_jobs() {
     budget="$(security_get "$project" '.max_budget_usd' '')"
     daily="$(security_get "$project" '.daily_budget_usd' '')"
     # max_budget_usd cannot just be dropped the way a bad daily_budget_usd can:
-    # the derived job always runs --force, which skips the rate-limit gate,
-    # the daily cap and the global cap below -- max_budget_usd is the ONLY
-    # spend gate left for it, so "declared but unusable" must fail SAFE (the
-    # conservative fallback), not fail OPEN (no cap at all). daily_budget_usd
-    # gates nothing for a forced run either way, so it keeps the old
-    # behaviour: dropped, with a warning, same as if it were never set.
+    # it is the analysis's own ceiling, the one the orchestrator enforces
+    # across every unit, so "declared but unusable" must fail SAFE (the
+    # conservative fallback), not fail OPEN (no cap at all). A unit's run is
+    # forced and skips run_job's daily and usage gates; the orchestrator asks
+    # for them before every launch instead (security_unit_gate), and a
+    # daily_budget_usd it cannot read keeps the old behaviour there: dropped,
+    # with a warning, same as if it were never set.
     security_check_number "$project" max_budget_usd "$budget" "$SECURITY_FALLBACK_BUDGET_USD" \
       || budget="$SECURITY_FALLBACK_BUDGET_USD"
     security_check_number "$project" daily_budget_usd "$daily" || daily=""
@@ -735,11 +736,13 @@ security_job_id() { printf '%s%s' "$SECURITY_JOB_PREFIX" "$(security_slug "$1")"
 
 # What a derived job's max_budget_usd falls back to when a project DECLARES
 # the field but types something jq cannot read as a number (e.g. "5 USD"). It
-# exists because a derived run always carries --force (see run_job), which
-# skips the rate-limit gate, the daily cap and the global cap -- max_budget_usd
-# is the ONLY spend gate left standing for it. Dropping the field on a parse
+# exists because max_budget_usd is the analysis's own ceiling (the
+# orchestrator's, across every unit), and a derived run carries --force (see
+# run_job), which skips the rate-limit gate and the daily caps -- those the
+# orchestrator asks for per launch (security_unit_gate), but they are the
+# day's ceilings, never the analysis's. Dropping the field on a parse
 # failure, as an unset field is dropped, would run the analysis with NO
-# ceiling at all: fail-open on the one gate that actually applies.
+# ceiling of its own at all: fail-open on the one gate made for it.
 SECURITY_FALLBACK_BUDGET_USD=2
 
 # The subagent tool a security unit is launched WITHOUT, per platform. The
@@ -966,6 +969,9 @@ cmd_security_branches() { # cmd_security_branches <project> <repo> -> every
 # branch may move under it, and every unit must read the same tree
 # (wt_base_ref resolves a raw sha under AL_BASE_OVERRIDE). --force because a
 # derived job is disabled: it exists to be run on demand, never on a tick.
+# --force also skips run_job's usage-window and daily-cap gates; the
+# orchestrator asks for those itself before every launch (`__unit-gate`,
+# security_unit_gate), so they still hold for an analysis's units.
 #
 # AL_SECURITY_AGENT marks the whole run as "this is the agent under review".
 # `agentloop security` is one command with one door, and the agent types it
@@ -1326,7 +1332,7 @@ cmd_security_resume() { # cmd_security_resume <project> <analysis-id>
 # The ids come from the run's own environment and nowhere else: the request
 # file is rewritten by the NEXT `security analyze` of the project, and a close
 # that read it would land on another analysis's unit.
-security_close_analysis() { # <job-id> <status> <cost> <wdreason> [stream] [root]
+security_close_analysis() { # <job-id> <status> <cost> <wdreason> [stream] [root] [cause]
   case "$1" in "$SECURITY_JOB_PREFIX"*) ;; *) return 0 ;; esac
   local aid="${AL_SECURITY_ANALYSIS_ID:-}" uid="${AL_SECURITY_UNIT_ID:-}"
   [ -n "$aid" ] && [ -n "$uid" ] || return 0
@@ -1336,9 +1342,12 @@ security_close_analysis() { # <job-id> <status> <cost> <wdreason> [stream] [root
   # after run_job's frame -- and its locals -- may already be gone, where
   # run_cwd would silently read empty. A caller outside run_job passes its
   # own root explicitly instead of hoping dynamic scope still reaches it.
+  # $7, the classifier's cause (RJ_CAUSE), only when there is one: a
+  # `rate_limited` or `api_error` run is the provider's doing, and unit-close
+  # keeps the unit's attempt for it (units.close).
   security_engine_py unit-close --analysis "$aid" --unit "$uid" \
     --stream "${5:-}" --root "${6:-${run_cwd:-}}" --status "$2" --reason "${4:-}" \
-    --spend "${3:-0}" >/dev/null 2>&1 \
+    --spend "${3:-0}" ${7:+--cause "$7"} >/dev/null 2>&1 \
     || log_tick "$1: could not close unit $uid of analysis $aid"
 }
 
@@ -4657,6 +4666,70 @@ global_daily_cap() { # -> dollars, or empty for "no cap"
   printf '%s' "$v"
 }
 
+# THE DAILY CAPS AS ONE QUESTION, for run_job and for the security
+# orchestrator's `__unit-gate` alike, so the two can never disagree on the
+# arithmetic: the job's own cap (daily_cap_for) first, then the fleet's
+# (global_daily_cap). 0 with "<job|global> <spent> <cap>" on stdout when one
+# is reached; 1 when both are open (or unset).
+daily_gate() { # daily_gate <id>
+  local cap spent
+  cap="$(daily_cap_for "$1")"
+  if [ -n "$cap" ]; then
+    spent="$(spent_today "$1")"
+    if awk -v s="$spent" -v c="$cap" 'BEGIN{exit !((s+0)>=(c+0))}'; then
+      printf 'job %s %s\n' "$spent" "$cap"; return 0
+    fi
+  fi
+  # The fleet-wide ceiling. Every job can sit correctly under its own cap and
+  # the day still cost far more than intended — with a job per repo per role,
+  # the sum is the number that actually matters.
+  cap="$(global_daily_cap)"
+  if [ -n "$cap" ]; then
+    spent="$(spent_today_all)"
+    if awk -v s="$spent" -v c="$cap" 'BEGIN{exit !((s+0)>=(c+0))}'; then
+      printf 'global %s %s\n' "$spent" "$cap"; return 0
+    fi
+  fi
+  return 1
+}
+
+# THE GATES A UNIT'S RUN SKIPS, ASKED BY ITS ORCHESTRATOR (`__unit-gate`). A
+# unit runs as a forced run of the derived job (security_run_unit), and a
+# forced run skips run_job's usage-window and daily-cap gates -- right for a
+# person's Run now, wrong for an analysis that launches units for hours: the
+# spec checks `daily_budget_usd` on every launch. So the orchestrator asks
+# here before each one, and these are run_job's own checks -- rl_gate on the
+# job's account, daily_gate -- never a second copy of them. Exit 3 with the
+# gate named in a sentence when one is closed (the orchestrator then stops
+# launching and interrupts the analysis, naming it); 0 when all are open.
+security_unit_gate() { # security_unit_gate <job-id>
+  local id="$1" platform account account_dir name reason dg scope spent cap
+  platform="$(resolve "$id" platform 'anthropic')"
+  case "$platform" in ''|null) platform="anthropic" ;; esac
+  account="$(job_account "$id")"
+  account_dir="$(account_env_dir "$platform" "$account")"
+  name=""
+  if [ "$account" != "default" ]; then
+    name="$(account_field "$platform" "$account" name)"; [ -n "$name" ] || name="$account"
+  fi
+  if reason="$(rl_gate "$(rl_key "$platform" "$account_dir")" "$name")" && [ -n "$reason" ]; then
+    printf 'the usage limit was reached (%s)\n' "$reason"
+    return 3
+  fi
+  if dg="$(daily_gate "$id")"; then
+    read -r scope spent cap <<EOF
+$dg
+EOF
+    if [ "$scope" = "job" ]; then
+      printf 'the daily cap of %s was reached ($%s / $%s)\n' "$id" "$spent" "$cap"
+    else
+      printf 'the global daily cap was reached ($%s / $%s across all jobs)\n' "$spent" "$cap"
+    fi
+    return 3
+  fi
+  return 0
+}
+
 # --- family → newest concrete model id -------------------------------------
 # Picking a family must always mean "the newest one". The CLI alias does NOT do
 # that: it resolves to the newest model the INSTALLED CLI knows, which lags the
@@ -6360,34 +6433,25 @@ $(run_ending_contract)" ;;
     fi
   fi
 
-  # Daily budget gate: a per-job ceiling on today's spend. Empty = no cap.
-  # Scheduled runs only — Run now is a deliberate override, like the precheck.
+  # Daily budget gate: a per-job ceiling on today's spend, then the fleet's
+  # (daily_gate). Empty = no cap. Scheduled runs only — Run now is a
+  # deliberate override, like the precheck.
   if [ "$forced" != "true" ]; then
-    local cap spent gcap gspent
-    cap="$(daily_cap_for "$id")"
-    if [ -n "$cap" ]; then
-      spent="$(spent_today "$id")"
-      if awk -v s="$spent" -v c="$cap" 'BEGIN{exit !((s+0)>=(c+0))}'; then
-        state_set "$id" last_status '"capped"'
-        state_set "$id" last_capped "$("$JQ" -nc --arg s "$spent" --arg c "$cap" '{spent:($s|tonumber),cap:($c|tonumber)}')"
-        log_tick "$id: daily cap reached (\$$spent / \$$cap) — skipping"
-        release_slot "$slot"; trap - EXIT
-        return 0
+    local _dg _dscope _dspent _dcap
+    if _dg="$(daily_gate "$id")"; then
+      read -r _dscope _dspent _dcap <<EOF
+$_dg
+EOF
+      state_set "$id" last_status '"capped"'
+      if [ "$_dscope" = "job" ]; then
+        state_set "$id" last_capped "$("$JQ" -nc --arg s "$_dspent" --arg c "$_dcap" '{spent:($s|tonumber),cap:($c|tonumber)}')"
+        log_tick "$id: daily cap reached (\$$_dspent / \$$_dcap) — skipping"
+      else
+        state_set "$id" last_capped "$("$JQ" -nc --arg s "$_dspent" --arg c "$_dcap" '{spent:($s|tonumber),cap:($c|tonumber),scope:"global"}')"
+        log_tick "$id: GLOBAL daily cap reached (\$$_dspent / \$$_dcap across all jobs) — skipping"
       fi
-    fi
-    # The fleet-wide ceiling. Every job can sit correctly under its own cap and
-    # the day still cost far more than intended — with a job per repo per role,
-    # the sum is the number that actually matters.
-    gcap="$(global_daily_cap)"
-    if [ -n "$gcap" ]; then
-      gspent="$(spent_today_all)"
-      if awk -v s="$gspent" -v c="$gcap" 'BEGIN{exit !((s+0)>=(c+0))}'; then
-        state_set "$id" last_status '"capped"'
-        state_set "$id" last_capped "$("$JQ" -nc --arg s "$gspent" --arg c "$gcap" '{spent:($s|tonumber),cap:($c|tonumber),scope:"global"}')"
-        log_tick "$id: GLOBAL daily cap reached (\$$gspent / \$$gcap across all jobs) — skipping"
-        release_slot "$slot"; trap - EXIT
-        return 0
-      fi
+      release_slot "$slot"; trap - EXIT
+      return 0
     fi
   fi
 
@@ -6975,7 +7039,8 @@ If the work turns out to be already finished, or it can no longer be done at all
   # $wdreason, the same note run_end_hook is about to be handed: it is what
   # separates a `warning` that is stderr noise from one that means the agent
   # stopped mid-analysis (see security_close_analysis).
-  security_close_analysis "$id" "$status" "${cost:-0}" "$wdreason" "$streamfile"
+  # $cause last: an outage (rate_limited, api_error) keeps the unit's attempt.
+  security_close_analysis "$id" "$status" "${cost:-0}" "$wdreason" "$streamfile" "" "$cause"
   # Fired after the record exists, so a hook that opens the dashboard or reads
   # the journal sees this run already in it.
   run_end_hook "$id" "$status" "${cost:-0}" "$wdreason" "$project" "$session" "$logfile" "$start" "$end" "$platform" "$cost_basis" "$tokens_json"
@@ -8650,6 +8715,12 @@ case "${1:-}" in
   __run-unit)
              [ $# -ge 6 ] || die "usage: agentloop __run-unit <job-id> <analysis-id> <unit-id> <commit> <repo>"
              security_run_unit "$2" "$3" "$4" "$5" "$6" ;;
+  # Internal: the gates a unit's forced run skips, asked by the orchestrator
+  # before every launch (security_unit_gate). Exit 3 with the gate named when
+  # one is closed.
+  __unit-gate)
+             [ $# -ge 2 ] || die "usage: agentloop __unit-gate <job-id>"
+             security_unit_gate "$2" ;;
   security)  shift
              case "${1:-}" in
                analyze) shift; [ $# -ge 3 ] || die "usage: agentloop security analyze [--detach] <project> <repo> <branch> [profile]"

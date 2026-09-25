@@ -1543,10 +1543,18 @@ def reset_unit(conn, unit_id, spend_usd=0.0) -> bool:
     return cur.rowcount > 0
 
 
-def interrupt_analysis(conn, analysis_id) -> bool:
+def interrupt_analysis(conn, analysis_id, note="") -> bool:
+    """running -> interrupted. `note`, when given, joins the paragraph (the
+    orchestrator names the gate that closed, or the failure that stopped it)
+    -- once: the same sentence already there is not written twice."""
+    note = (note or "").strip()
     with conn:
-        cur = conn.execute("UPDATE analysis SET state=? WHERE id=? AND state='running'",
-                           (INTERRUPTED, analysis_id))
+        cur = conn.execute(
+            "UPDATE analysis SET state=?, coverage_note=CASE"
+            " WHEN ?='' OR instr(coverage_note, ?)>0 THEN coverage_note"
+            " ELSE TRIM(coverage_note || ' ' || ?) END"
+            " WHERE id=? AND state='running'",
+            (INTERRUPTED, note, note, note, analysis_id))
     return cur.rowcount > 0
 
 

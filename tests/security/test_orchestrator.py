@@ -248,25 +248,92 @@ def test_a_resume_judges_a_unit_whose_run_died_with_the_orchestrator(world):
 
 
 def test_the_budget_stops_the_launches_and_the_close_says_so(world):
-    """0.05: the first unit launched -- whichever kind it is, with or without
-    the sandbox's hygiene row -- spends 0.10, so the rest never start."""
+    """0.05: below the floor one unit is given, so NOTHING starts -- the floor
+    is never a way over the budget -- and the close says why."""
     _orchestrator(world, budget=0.05, parallel=1).run()
     row = _row(world)
     assert row["state"] == "capped"
-    assert "The analysis budget of $0.05 was spent before every unit ran." in row["coverage_note"]
-    assert any(u["state"] == "pending" for u in _units(world))
+    assert ("The analysis budget of $0.05 had $0.05 left -- less than the $0.50 one unit is "
+            "given -- before every unit ran.") in row["coverage_note"]
+    assert all(u["state"] == "pending" for u in _units(world))
 
 
-def test_a_budget_the_last_unit_spends_to_the_cent_is_not_a_gap(world):
+def test_what_a_unit_leaves_under_the_floor_stops_the_next_launch(world, monkeypatch):
+    """$0.60 at one unit at a time: the first is handed all of it and spends
+    $0.30; the $0.30 left is under the floor, so the next never starts."""
+    monkeypatch.setenv("FAKE_ENGINE_SPEND", "0.3")
+    budgets = world["tmp"] / "budgets"
+    monkeypatch.setenv("FAKE_ENGINE_BUDGETS", str(budgets))
+    _orchestrator(world, budget=0.6, parallel=1).run()
+    assert budgets.read_text().split() == ["0.60"]
+    assert "had $0.30 left -- less than the $0.50 one unit is given" in _row(world)["coverage_note"]
+
+
+def test_a_budget_the_last_unit_spends_to_the_cent_is_not_a_gap(world, monkeypatch):
     """The sentence says units were left unrun; with none left it would be a
     false statement in the report."""
+    monkeypatch.setenv("FAKE_ENGINE_SPEND", "0.5")
     run(world["db"], "prepare", "--analysis", str(world["aid"]), "--root", str(world["repo"]),
         "--offline", "--plan")
     planned = len(_units(world))
-    _orchestrator(world, budget=round(0.1 * planned, 2), parallel=1).run()
+    _orchestrator(world, budget=round(0.5 * planned, 2), parallel=1).run()
     row = _row(world)
     assert row["state"] == "done", row["coverage_note"]
     assert "budget" not in row["coverage_note"]
+
+
+class _HeldRun:
+    """A unit's run that never ends while the test looks at the launches."""
+    pids = iter(range(900_001, 999_999))
+
+    def __init__(self, argv, env=None, **_kw):
+        self.argv, self.env, self.pid = argv, env or {}, next(self.pids)
+
+    def poll(self):
+        return None
+
+
+class _OnePass(Exception):
+    pass
+
+
+@pytest.mark.parametrize("parallel, budget", [(3, 3.0), (8, 4.0), (8, 3.0), (3, 1.2)])
+def test_the_caps_in_flight_never_add_up_to_more_than_the_budget(world, monkeypatch, parallel, budget):
+    """ONE PASS with every run still in flight: the caps handed out are
+    reserved, so their sum never exceeds the budget. Off the spend alone
+    (units that closed) a pass handed out B, B/2, B/3 ... -- 1.83 B at P=3,
+    2.72 B at P=8 -- and the floor raised the rest. Here the floor fills what
+    it can and stops: at P=8 and $3 six units get $0.50 and two wait."""
+    run(world["db"], "prepare", "--analysis", str(world["aid"]), "--root", str(world["repo"]),
+        "--offline", "--plan")
+    conn = ledger.connect(world["db"])
+    ledger.add_units(conn, world["aid"], [("hunt", {"profile": "deep"})] * 10)
+    launched = []
+    real_popen = subprocess.Popen
+
+    def held(argv, **kw):
+        if "__run-unit" not in argv:
+            return real_popen(argv, **kw)              # `ps`, and the like
+        proc = _HeldRun(argv, **kw)
+        launched.append(proc)
+        return proc
+
+    def one_pass(_seconds):
+        raise _OnePass()
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", held)
+    monkeypatch.setattr(orchestrator.time, "sleep", one_pass)
+    orch = _orchestrator(world, budget=budget, parallel=parallel)
+    monkeypatch.setattr(orch, "_gate", lambda: "", raising=False)
+    with pytest.raises(_OnePass):
+        orch._loop()
+    caps = [float(p.env["AL_SECURITY_UNIT_BUDGET"]) for p in launched]
+    assert caps and sum(caps) <= budget + 1e-9, caps
+    assert all(c >= orchestrator.MIN_UNIT_BUDGET for c in caps), caps
+    assert len(caps) == min(parallel, int(budget // orchestrator.MIN_UNIT_BUDGET)), caps
+    # Each cap is recorded on its unit, where an orchestrator that adopts the
+    # run after this one died keeps it reserved.
+    keys = [u["run_key"] for u in _units(world) if u["state"] == "running"]
+    assert sorted(orchestrator._cap_of(k) for k in keys) == sorted(caps)
 
 
 def test_a_budget_reached_by_a_float_sum_is_reached(world):
@@ -438,3 +505,218 @@ def test_the_lock_is_released_only_if_it_is_still_the_orchestrator_s(world, tmp_
     # the analysis is closed now, so this run returns at once -- and must leave the lock alone
     _orchestrator(world, lock_dir=str(theirs)).run()
     assert theirs.exists()
+
+
+# -- a failure is an interruption, never a `running` row behind a released lock
+
+def _held_lock(tmp_path):
+    lock = tmp_path / "lock"
+    lock.mkdir()
+    (lock / "pid").write_text(str(os.getpid()))
+    return lock
+
+
+def test_a_raise_in_the_loop_leaves_the_analysis_interrupted(world, monkeypatch, tmp_path):
+    """The ledger raising under the loop (a busy database, a disk error):
+    the analysis is left `interrupted` -- resumable, offered Resume on the
+    page -- never `running` behind a lock the orchestrator then releases."""
+    real = orchestrator.ledger.units_of
+    calls = []
+
+    def flaky(conn, aid):
+        calls.append(aid)
+        if len(calls) == 2:
+            raise RuntimeError("database is locked")
+        return real(conn, aid)
+    monkeypatch.setattr(orchestrator.ledger, "units_of", flaky)
+    lock = _held_lock(tmp_path)
+    assert _orchestrator(world, lock_dir=str(lock)).run() == 1
+    row = _row(world)
+    assert row["state"] == "interrupted"
+    assert "because its orchestrator failed (RuntimeError)" in row["coverage_note"]
+    assert not lock.exists(), "interrupted and resumable: nothing left for the tick to find"
+    monkeypatch.setattr(orchestrator.ledger, "units_of", real)
+    run(world["db"], "resume", "--analysis", str(world["aid"]))
+    assert _orchestrator(world).run() == 0
+    assert _row(world)["state"] == "done", _row(world)["coverage_note"]
+
+
+def test_a_start_unit_that_raises_leaves_the_analysis_interrupted(world, monkeypatch):
+    def broken(*_a, **_k):
+        raise RuntimeError("disk I/O error")
+    monkeypatch.setattr(orchestrator.ledger, "start_unit", broken)
+    assert _orchestrator(world).run() == 1
+    assert _row(world)["state"] == "interrupted"
+
+
+def test_a_close_that_fails_twice_leaves_the_analysis_interrupted(world, monkeypatch, tmp_path):
+    """`finish` exiting non-zero is retried once; still failing, the row is
+    interrupted rather than left `running`."""
+    real = orchestrator.Orchestrator._cli
+    finishes = []
+
+    def failing(self, *args):
+        if args and args[0] == "finish":
+            finishes.append(args)
+            return subprocess.CompletedProcess(args, 1, "", "database is locked")
+        return real(self, *args)
+    monkeypatch.setattr(orchestrator.Orchestrator, "_cli", failing)
+    log = tmp_path / "tick.log"
+    assert _orchestrator(world, log=str(log)).run() == 0
+    assert len(finishes) == 2
+    row = _row(world)
+    assert row["state"] == "interrupted"
+    assert "because its orchestrator failed (its close failed)" in row["coverage_note"]
+    assert "could not close (try 2)" in log.read_text()
+
+
+def test_when_nothing_can_be_written_the_lock_is_kept_for_the_tick(world, monkeypatch, tmp_path):
+    """Not even the interruption can be written: the lock stays, so the tick
+    finds its owner dead and resumes the analysis (security_resume_orphans)."""
+    def broken(*_a, **_k):
+        raise RuntimeError("disk I/O error")
+    monkeypatch.setattr(orchestrator.ledger, "start_unit", broken)
+    monkeypatch.setattr(orchestrator.ledger, "interrupt_analysis", broken)
+    lock = _held_lock(tmp_path)
+    assert _orchestrator(world, lock_dir=str(lock)).run() == 1
+    assert lock.exists()
+    assert _row(world)["state"] == "running"
+
+
+# -- a pid is not a run -----------------------------------------------------------
+
+def test_a_live_unrelated_pid_is_not_adopted(world):
+    """After a reboot the kernel hands a unit's pid to something else. `kill
+    -0` alone adopted it and waited on it for ever; the run is gone, so the
+    unit is judged from the stream its run left, and the analysis closes."""
+    run(world["db"], "prepare", "--analysis", str(world["aid"]), "--root", str(world["repo"]),
+        "--offline", "--plan")
+    conn = ledger.connect(world["db"])
+    read = next(u for u in ledger.units_of(conn, world["aid"]) if u["kind"] == "read")
+    stranger = subprocess.Popen(["sleep", "60"])
+    try:
+        ledger.start_unit(conn, read["id"], f"security-web/{stranger.pid}")
+        logs = world["tmp"] / "logs" / "security-web"
+        logs.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        (logs / f"{stamp}-{stranger.pid}.stream.ndjson").write_text(
+            _read_events(read["payload"]["ranges"]))
+        assert _orchestrator(world).run() == 0
+        assert stranger.poll() is None, "the stranger is left alone"
+        assert (ledger.get_unit(conn, read["id"])["state"], _row(world)["state"]) == ("done", "done")
+    finally:
+        stranger.kill()
+        stranger.wait()
+
+
+def test_a_run_is_its_pid_its_start_and_its_command_line(world):
+    fake = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                             "__run-unit", "security-web", "7", "42", "abc", "web"])
+    try:
+        started = orchestrator._started_at(fake.pid)
+        assert started
+        assert orchestrator._is_run(fake.pid, "security-web", 7, 42, started)
+        assert orchestrator._is_run(fake.pid, "security-web", 7, 42)
+        assert not orchestrator._is_run(fake.pid, "security-web", 7, 4)
+        assert not orchestrator._is_run(fake.pid, "security-web", 8, 42, started)
+        assert not orchestrator._is_run(fake.pid, "security-web", 7, 42, "Thu Jan  1 00:00:00 1970")
+        key = orchestrator._run_key("security-web", fake.pid, started, 0.5)
+        assert orchestrator._pid_of(key) == fake.pid and orchestrator._cap_of(key) == 0.5
+        assert orchestrator._key_fields(key)["start"] == started
+        assert orchestrator._pid_of(f"security-web/{fake.pid}") == fake.pid
+    finally:
+        fake.kill()
+        fake.wait()
+    assert not orchestrator._is_run(fake.pid, "security-web", 7, 42)
+
+
+# -- an orphan prepare --------------------------------------------------------------
+
+def _pgid_file(world):
+    return world["tmp"] / "prepare" / f"security-web-{world['aid']}{orchestrator.PREPARE_PGID}"
+
+
+def test_a_prepare_an_earlier_orchestrator_left_running_is_ended_first(world):
+    """`prepare` leads a session of its own, so after its orchestrator was
+    SIGKILLed it goes on running; the next orchestrator's prepare ends it --
+    group and all -- before cutting the same checkout again."""
+    orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)",
+                               "prepare", "--analysis", str(world["aid"]), "--root", "x"],
+                              start_new_session=True)
+    try:
+        pgid = _pgid_file(world)
+        pgid.parent.mkdir(parents=True, exist_ok=True)
+        pgid.write_text(f"{orphan.pid}\n{orchestrator._started_at(orphan.pid)}\n")
+        assert _orchestrator(world).run() == 0
+        assert orphan.wait(timeout=10) is not None
+        assert not pgid.exists()
+        assert _row(world)["state"] == "done", _row(world)["coverage_note"]
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait()
+
+
+def test_a_recorded_prepare_pid_that_is_something_else_now_is_left_alone(world):
+    stranger = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        pgid = _pgid_file(world)
+        pgid.parent.mkdir(parents=True, exist_ok=True)
+        pgid.write_text(f"{stranger.pid}\n{orchestrator._started_at(stranger.pid)}\n")
+        assert _orchestrator(world).run() == 0
+        assert stranger.poll() is None
+    finally:
+        stranger.kill()
+        stranger.wait()
+
+
+# -- the engine's gates, and the provider's outages -------------------------------------
+
+def test_a_closed_gate_stops_the_launches_and_interrupts_with_its_name(world, monkeypatch):
+    """A unit is a forced run of the derived job, which skips run_job's own
+    gates, so the orchestrator asks the engine for them before each launch:
+    closed, nothing launches, and the analysis is interrupted with the gate
+    named -- resumable once it reopens."""
+    monkeypatch.setenv("FAKE_ENGINE_GATE", "the daily cap of security-web was reached ($3.10 / $3.00)")
+    assert _orchestrator(world).run() == 0
+    row = _row(world)
+    assert row["state"] == "interrupted"
+    assert ("The engine interrupted this analysis because the daily cap of security-web was "
+            "reached ($3.10 / $3.00)") in row["coverage_note"]
+    assert all(u["state"] == "pending" for u in _units(world))
+    monkeypatch.delenv("FAKE_ENGINE_GATE")
+    run(world["db"], "resume", "--analysis", str(world["aid"]))
+    assert _orchestrator(world).run() == 0
+    assert _row(world)["state"] == "done", _row(world)["coverage_note"]
+
+
+def test_the_gate_is_asked_before_every_launch(world, monkeypatch):
+    calls = world["tmp"] / "gate-calls"
+    monkeypatch.setenv("FAKE_ENGINE_GATE_CALLS", str(calls))
+    _orchestrator(world, parallel=1).run()
+    runs = sum(1 for u in _units(world) if u["started"])
+    assert runs and len(calls.read_text().split()) == runs
+
+
+def test_a_run_the_provider_cut_short_keeps_its_attempt(world, monkeypatch):
+    """`rate_limited` is the provider's doing, not the unit's: the close
+    keeps the attempt, and the continuation finishes the unit."""
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "outage")
+    assert _orchestrator(world).run() == 0
+    firsts = [u for u in _units(world) if not u["parent"] and u["kind"] in ("hunt", "read")]
+    assert firsts and all(u["state"] == "incomplete" and u["evidence"].get("cause") == "rate_limited"
+                          for u in firsts)
+    assert all(u["attempt"] == 1 for u in _units(world))
+    assert _row(world)["state"] == "done", _row(world)["coverage_note"]
+
+
+def test_three_outages_in_a_row_give_the_lineage_up(world, monkeypatch):
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "always-outage")
+    assert _orchestrator(world).run() == 0
+    # (a triage unit over the sandbox's rows below the floor is done whatever
+    # its run did: nothing it owes blocks)
+    last = [u for u in _last_attempts(world).values() if u["kind"] in ("hunt", "read")]
+    assert last and all(u["state"] == "failed" and u["attempt"] == 1 for u in last)
+    row = _row(world)
+    assert row["state"] == "capped"
+    assert "3 runs in a row were cut short by the provider (rate_limited" in row["coverage_note"]

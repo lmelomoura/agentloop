@@ -51,6 +51,9 @@ _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 # The classifier notes that make a `warning` a truncated run rather than a
 # noisy one -- the reading `security_close_analysis` applies in the engine.
 _TRUNCATED = ("BUDGET LIMITED", "UNDECLARED ENDING", "UNDELIVERED")
+# The classifier's causes for a run the PROVIDER ended (run_classify in
+# bin/agentloop): not the unit's failure, so its close keeps the attempt.
+OUTAGE_CAUSES = ("rate_limited", "api_error")
 
 
 def triage_items(conn, analysis_id) -> list:
@@ -713,9 +716,19 @@ def guides_read(conn, analysis_id) -> list:
     return [name for name in guide_table.NAMES if name in opened]
 
 
-def close(conn, unit, *, stream="", root="", status="error", reason="", spend_usd=0.0) -> dict:
+def close(conn, unit, *, stream="", root="", status="error", reason="", spend_usd=0.0,
+          cause="") -> dict:
     """Judge one run of `unit` by what it left -- its stream, what `security
     read` served it, the ledger -- and conclude it. {"state", "continuation"}.
+
+    A RUN THE PROVIDER ENDED KEEPS ITS ATTEMPT. `cause` is the classifier's
+    (run_classify in bin/agentloop): `rate_limited` and `api_error`
+    (OUTAGE_CAUSES) are a 429 or an overloaded API, nobody's fault here, and
+    spending one of the lineage's MAX_ATTEMPTS on them would give a unit up
+    for an afternoon's outage. The continuation is planned as a stop's is,
+    and the cause goes into the unit's evidence, where the orchestrator
+    counts such runs toward giving the lineage up (a provider that answers
+    nothing but errors is an engine that cannot run it).
 
     THE ONE CLOSE OF A UNIT. The engine's `unit-close` (a run that ended) and
     the orchestrator (a run that died without closing, security/orchestrator.py)
@@ -778,5 +791,9 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
         # without the stream cannot see the subagent at all -- the limit
         # every close has on a run whose stream is lost.)
         clear = (unit["analysis_id"], unit["payload"].get("fingerprint", ""), f"unit:{unit['id']}")
+    outage = cause in OUTAGE_CAUSES
+    if outage:
+        ev["cause"] = cause
     return conclude(conn, unit, done=done, evidence=ev, note=note, spend_usd=spend_usd,
-                    remaining=remaining, stopped=status == "stopped", clear_verdict=clear)
+                    remaining=remaining, stopped=status == "stopped" or outage,
+                    clear_verdict=clear)
