@@ -84,7 +84,10 @@ fi
 . "$HERE/fake-unit.sh"
 last=""; for a in "$@"; do last="$a"; done
 fake_unit_init "$last"
-[ "$FAKE_UNIT_KIND" != read ] || fake_unit_serve_reads
+case "$FAKE_UNIT_KIND" in
+  read)   fake_unit_serve_reads ;;
+  triage) fake_unit_serve_reads "$(fake_unit_triage_gone_specs)" ;;
+esac
 fake_unit_act
 # The one line the real CLI prints on every run, whatever happens.
 echo "Reading additional input from stdin..." >&2

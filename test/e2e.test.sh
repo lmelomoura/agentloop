@@ -1648,6 +1648,83 @@ wait
 echo
 }
 
+scenario_54() {
+echo "54. a deep analysis runs every unit to the end and closes done, with every line read"
+printf 'a = 1\n' > "$ROOT/work/app/a.py"; printf 'b = 2\n' > "$ROOT/work/app/b.py"
+git -C "$ROOT/work/app" add -A
+git -C "$ROOT/work/app" -c user.email=e2e@local -c user.name=e2e commit -qm more
+git -C "$ROOT/work/app" push -q origin HEAD:refs/heads/main
+out54="$(FAKE_HUNT_FINDING=1 FAKE_MODE=complete FAKE_SESSION=sess-54 \
+  "$AL" security analyze --detach sandbox anything main deep)"
+aid54="$(secid "$out54")"
+w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid54")" = "running" ]; do sleep 1; w=$((w + 1)); done
+[ "$(secstate sandbox "$aid54")" = "done" ] \
+  && ok "the deep analysis closes done (waited ${w}s)" \
+  || bad "left '$(secstate sandbox "$aid54")' after ${w}s -- $(secnote sandbox "$aid54")"
+u54="$("$AL" security units --analysis "$aid54")"
+[ "$(printf '%s' "$u54" | jq -r '.deep.lines_read == .deep.lines and .deep.lines > 0')" = "true" ] \
+  && ok "every line of the deep scope was read in full ($(printf '%s' "$u54" | jq -r '.deep.lines') lines)" \
+  || bad "deep coverage: $(printf '%s' "$u54" | jq -c '.deep')"
+[ "$(printf '%s' "$u54" | jq -r '[.kinds[] | .done == .total] | all')" = "true" ] \
+  && [ "$(printf '%s' "$u54" | jq -r '.kinds.verify.done // 0')" -ge 1 ] \
+  && ok "every unit is done, the hunt's finding verified by its own unit" \
+  || bad "units: $(printf '%s' "$u54" | jq -c '.kinds')"
+sleep 1
+
+echo
+}
+
+scenario_55() {
+echo "55. a read unit that left a range unread is continued, and the analysis still closes done"
+skip55="$ROOT/skip-55"; rm -rf "$skip55"
+out55="$(FAKE_SKIP_READ_ONCE="$skip55" FAKE_MODE=complete FAKE_SESSION=sess-55 \
+  "$AL" security analyze --detach sandbox anything main deep)"
+aid55="$(secid "$out55")"
+w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid55")" = "running" ]; do sleep 1; w=$((w + 1)); done
+[ "$(secstate sandbox "$aid55")" = "done" ] \
+  && ok "closes done after the continuation (waited ${w}s)" \
+  || bad "left '$(secstate sandbox "$aid55")' -- $(secnote sandbox "$aid55")"
+cont55="$(python3 -c 'import sqlite3, sys; c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True); print(c.execute("SELECT COUNT(*) FROM unit WHERE analysis_id=? AND kind=\x27read\x27 AND attempt=2 AND state=\x27done\x27", (int(sys.argv[2]),)).fetchone()[0])' "$ROOT/data/security.db" "$aid55" 2>/dev/null)"
+[ "${cont55:-0}" -ge 1 ] \
+  && ok "the unread range became attempt 2 of its unit, and that attempt read it" \
+  || bad "no done second attempt of a read unit (got '${cont55:-none}')"
+sleep 1
+
+echo
+}
+
+scenario_56() {
+echo "56. a stop interrupts the whole analysis, and resume finishes it without repeating a done unit"
+out56="$(FAKE_MODE=hang FAKE_SESSION=sess-56 "$AL" security analyze --detach sandbox anything main quick)"
+aid56="$(secid "$out56")"
+w=0
+while [ "$w" -lt 90 ] && ! ls "$ROOT"/data/locks/security-sandbox/*/child >/dev/null 2>&1; do sleep 1; w=$((w + 1)); done
+"$AL" stop security-sandbox >/dev/null 2>&1
+w=0; while [ "$w" -lt 90 ] && [ "$(secstate sandbox "$aid56")" = "running" ]; do sleep 1; w=$((w + 1)); done
+[ "$(secstate sandbox "$aid56")" = "interrupted" ] \
+  && ok "stopping the analysis leaves it interrupted (waited ${w}s)" \
+  || bad "left '$(secstate sandbox "$aid56")' after the stop"
+# The orchestrator marks the analysis interrupted FIRST and lets its lock go
+# after (a resume racing it must see "still winding down", never a live-looking
+# running analysis), so the lock can outlive the state change by a moment:
+# waited for, bounded, rather than read once.
+w=0
+while [ "$w" -lt 30 ] && [ -n "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ]; do
+  sleep 1; w=$((w + 1))
+done
+[ -z "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ] \
+  && ok "and nothing of it still runs: no slot, no orchestrator lock (waited ${w}s)" \
+  || bad "left behind after ${w}s: $(ls -A "$ROOT/data/locks/security-sandbox")"
+FAKE_MODE=complete FAKE_SESSION=sess-56b "$AL" security resume sandbox "$aid56" >/dev/null 2>&1
+w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid56")" != "done" ]; do sleep 1; w=$((w + 1)); done
+[ "$(secstate sandbox "$aid56")" = "done" ] \
+  && ok "resume finishes it (waited ${w}s)" \
+  || bad "after resume: '$(secstate sandbox "$aid56")' -- $(secnote sandbox "$aid56")"
+sleep 1
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1669,11 +1746,11 @@ echo
 # scenario goes at the END of the file and into the LAST list, or, if it is
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # and the count assertion below fails if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26"
 E2E_LIST_3="27 28 29 30 31 32 33 33b 34 35 35b 36 37"
-E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53"
+E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

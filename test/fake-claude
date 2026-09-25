@@ -183,7 +183,15 @@ mode="${FAKE_MODE:-complete}"
 . "$(dirname "$0")/fake-unit.sh"
 fake_unit_init "${!#}"
 FAKE_UNIT_EVENTS=""
-if [ "$FAKE_UNIT_KIND" = read ]; then
+# A read unit reads its own RANGES; a triage unit reads only what it needs to
+# prove a [carried] sast row gone (fake_unit_triage_gone_specs) -- both
+# shapes are "path:first-last" per line, and both get the same Read events.
+case "$FAKE_UNIT_KIND" in
+  read)   FAKE_UNIT_SPECS="$(fake_unit_ranges)" ;;
+  triage) FAKE_UNIT_SPECS="$(fake_unit_triage_gone_specs)" ;;
+  *)      FAKE_UNIT_SPECS="" ;;
+esac
+if [ -n "$FAKE_UNIT_SPECS" ]; then
   n=0
   while IFS= read -r spec; do
     [ -n "$spec" ] || continue
@@ -194,7 +202,7 @@ $(jq -nc --arg id "r$n" --arg p "$PWD/$path" --argjson a "$first" --argjson b "$
       '{type:"user",parent_tool_use_id:null,message:{content:[{type:"tool_result",tool_use_id:$id,content:""}]},tool_use_result:{type:"text",file:{filePath:$p,startLine:$a,numLines:($b-$a+1),totalLines:$b}}}')
 "
   done <<EOF
-$(fake_unit_ranges)
+$FAKE_UNIT_SPECS
 EOF
 fi
 fake_unit_act

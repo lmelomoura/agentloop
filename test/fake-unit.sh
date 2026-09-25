@@ -16,6 +16,11 @@
 #   triage  re-reports every [scanner] row and every [carried] non-sast row
 #           exactly as shown (every location; a scanner row with a
 #           confidence), and says a [carried] sast row is gone (`report-gone`)
+#           -- but only after reading every file that row is in (the real
+#           triage prompt requires it, and the judge fails a `gone` claim
+#           closed without it: see fake_unit_triage_gone_specs), through the
+#           same proof the platform uses for a read unit. A file already
+#           gone from the checkout is its own proof and needs no read.
 #   verify  writes a `confirmed` verdict through the door
 #   hunt    FAKE_HUNT_FINDING=1 reports one sast finding (so a verify unit is
 #           planned); otherwise nothing but the run's ending
@@ -49,8 +54,12 @@ fake_unit_ranges() {
 # each range from its first line until the footer says the range is behind
 # it or the file has ended. The ledger's record of what was served is the
 # only proof of reading on that platform (security/evidence.py).
+# fake_unit_serve_reads [specs] -- specs is one "path:first-last" per line,
+# the same shape fake_unit_ranges and fake_unit_triage_gone_specs both
+# produce; omitted defaults to fake_unit_ranges (a read unit's own RANGES).
 fake_unit_serve_reads() {
-  local spec path span from last out next guard
+  local specs spec path span from last out next guard
+  if [ $# -ge 1 ]; then specs="$1"; else specs="$(fake_unit_ranges)"; fi
   while IFS= read -r spec; do
     [ -n "$spec" ] || continue
     path="${spec%:*}"; span="${spec##*:}"; from="${span%-*}"; last="${span#*-}"
@@ -65,7 +74,7 @@ fake_unit_serve_reads() {
       from="$next"
     done
   done <<EOF
-$(fake_unit_ranges)
+$specs
 EOF
 }
 
@@ -89,6 +98,33 @@ _fake_unit_rows() {
     }
     have && !/^     / { emit(); have = 0 }
     END { if (have) emit() }'
+}
+
+# One "path:1-N" per FILE (deduped), among the rows fake_unit_triage is about
+# to mark `gone` (a [carried] sast row): what "Read every file the row is in
+# first" (the real triage prompt's own instruction, prompts.py's _triage)
+# means for the fake. N is the file's own line count, so the read looks like
+# what a session that actually opened the file would leave -- the judge only
+# asks that the file be among a unit's reads at all (units.py
+# _unread_files), not that every line of it was covered, but a whole-file
+# read is the honest stand-in for "read the code". A file already gone from
+# the checkout is skipped: absence is its own proof (report-gone's own door,
+# and the judge, both read a missing file's gone-ness off `root`, never off
+# a session's reads -- see _unread_files' docstring).
+fake_unit_triage_gone_specs() {
+  local kind fp cat rule sev title locs f lines
+  { while IFS="$(printf '\t')" read -r kind fp cat rule sev title locs; do
+      [ "$kind" = carried ] && [ "$cat" = sast ] || continue
+      printf '%s\n' "$locs" | jq -Rr 'split(", ") | .[]' | sed 's/:[0-9]*$//'
+    done <<EOF
+$(_fake_unit_rows)
+EOF
+  } | sort -u | while IFS= read -r f; do
+    [ -n "$f" ] && [ -e "$PWD/$f" ] || continue
+    lines="$(wc -l < "$PWD/$f" 2>/dev/null | tr -d ' ')"
+    case "$lines" in ''|0) lines=1 ;; esac
+    printf '%s:1-%s\n' "$f" "$lines"
+  done
 }
 
 fake_unit_triage() {

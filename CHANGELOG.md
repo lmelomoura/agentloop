@@ -20,6 +20,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **End-to-end scenarios for the pipeline.** A deep analysis of the sandbox
+  runs every unit and closes `done` with every line read; a read unit that
+  leaves a range unread is continued and the analysis still closes `done`;
+  a stop leaves the analysis `interrupted` with nothing running, and
+  `security resume` finishes it.
 - **The analysis page shows the pipeline, and stops or resumes it.** A
   Pipeline block lists each kind of unit — done, running, waiting, gave up
   — how much of a deep scope has been read in full, and what the units have

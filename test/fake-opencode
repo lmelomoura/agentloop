@@ -157,8 +157,15 @@ fi
 step_finish tool-calls 11909 43 0 1792
 # A read unit's reads: one `read` tool event per range, carrying the range the
 # CLI showed in `state.metadata.display` -- where OpenCode reports it, and
-# what the normaliser turns into Claude Code's `tool_use_result.file`.
-if [ "$FAKE_UNIT_KIND" = read ]; then
+# what the normaliser turns into Claude Code's `tool_use_result.file`. A
+# triage unit reads the same way, but only what it needs to prove a
+# [carried] sast row gone (fake_unit_triage_gone_specs).
+case "$FAKE_UNIT_KIND" in
+  read)   FAKE_UNIT_SPECS="$(fake_unit_ranges)" ;;
+  triage) FAKE_UNIT_SPECS="$(fake_unit_triage_gone_specs)" ;;
+  *)      FAKE_UNIT_SPECS="" ;;
+esac
+if [ -n "$FAKE_UNIT_SPECS" ]; then
   rn=0
   step_start
   while IFS= read -r spec; do
@@ -172,7 +179,7 @@ if [ "$FAKE_UNIT_KIND" = read ]; then
                title:$p, time:{start:1789223562190, end:1789223562227}},
         id:("prt_" + $id), sessionID:$sid, messageID:"msg_fake"}')"
   done <<EOF
-$(fake_unit_ranges)
+$FAKE_UNIT_SPECS
 EOF
   step_finish tool-calls 900 20 0 1792
 fi
