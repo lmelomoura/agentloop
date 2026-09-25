@@ -202,6 +202,9 @@ def _coverage(analysis, coverage_note):
                      "covering the whole scope.")
     elif analysis["state"] == "failed":
         parts.append("This analysis is INCOMPLETE: it did not finish.")
+    elif analysis["state"] == "interrupted":
+        parts.append("This analysis is INTERRUPTED: it stopped before covering the "
+                     "whole scope, and Resume continues it where it left off.")
     if coverage_note:
         parts.append(coverage_note)
     return parts

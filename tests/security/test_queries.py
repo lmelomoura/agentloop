@@ -1045,7 +1045,8 @@ def test_severity_totals_windows_by_when_the_analysis_itself_ran(conn):
     aid_old = ledger.start_analysis(conn, "web", "web", "develop", "s2", "quick", "r")
     ledger.record_finding(conn, aid_old, {
         "fingerprint": "b" * 64, "category": "sast", "rule": "sql-injection",
-        "severity": "high", "title": "t", "occurrences": []})
+        "severity": "high", "title": "t",
+        "occurrences": [{"file": "app/db.py", "line": 1}]})
     ledger.mark_prepared(conn, aid_old)
     ledger.finish_analysis(conn, aid_old, "done")
     sixty_days_ago = int(time.time()) - 60 * 86400
@@ -1999,11 +2000,12 @@ def test_the_skill_tells_the_agent_to_re_report_a_pending_row():
     makes the agent produce that behaviour leaves the document.
 
     Shaped rather than a substring match on one sentence, so a rewording does
-    not fail it and a DELETION does: somewhere in Job 1 there must be a block
-    that mentions `pending` and tells the agent to re-report, and that block
-    must name every deterministic category, read off `diff` rather than typed
-    here -- a fifth one added to the code has to be added to the instruction
-    too, or the agent silently drops that category's carried-over rows.
+    not fail it and a DELETION does: somewhere in the triage unit's section
+    there must be a block that mentions `pending` and tells the agent to
+    re-report, and that block must name every deterministic category, read
+    off `diff` rather than typed here -- a fifth one added to the code has to
+    be added to the instruction too, or the agent silently drops that
+    category's carried-over rows.
 
     What it deliberately does NOT catch: a future edit that keeps this block
     and adds a contradicting sentence beside it. A negative match on the
@@ -2011,25 +2013,25 @@ def test_the_skill_tells_the_agent_to_re_report_a_pending_row():
     be one paraphrase away from vacuous, and the two tests above are the real
     guard -- they measure the ledger, not the prose."""
     text = SKILL.read_text()
-    job1 = re.search(r"\*\*1\. Re-verify what was left open\.\*\*(.*?)"
-                     r"\*\*2\. Triage", text, re.DOTALL)
-    assert job1, "SKILL.md no longer has a Job 1 section this test can read"
+    triage = re.search(r"^## Unit: triage$(.*?)^## Unit: hunt$", text, re.DOTALL | re.MULTILINE)
+    assert triage, "SKILL.md no longer has a triage unit section this test can read"
 
-    blocks = [b for b in job1.group(1).split("\n\n") if "`pending`" in b
+    blocks = [b for b in triage.group(1).split("\n\n") if "`pending`" in b
               and "re-report" in b]
     assert blocks, (
-        "SKILL.md's Job 1 never tells the agent to re-report a `pending` row. "
-        "Without that instruction nothing writes the row into this analysis, "
-        "so it drops out of the next baseline and returns as `regressed` -- "
-        "see the two tests above, which measure exactly that.")
+        "SKILL.md's triage unit never tells the agent to re-report a `pending` "
+        "row. Without that instruction nothing writes the row into this "
+        "analysis, so it drops out of the next baseline and returns as "
+        "`regressed` -- see the two tests above, which measure exactly that.")
 
     named = [b for b in blocks
              if all(f"`{c}`" in b for c in diff.DETERMINISTIC_CATEGORIES)]
     assert named, (
-        "no block of Job 1 both instructs the re-report and names every "
-        f"deterministic category {list(diff.DETERMINISTIC_CATEGORIES)} -- a "
-        "category the instruction does not name is one the agent will let "
-        "silently disappear from the report")
+        "no block of the triage unit's section both instructs the re-report "
+        f"and names every deterministic category "
+        f"{list(diff.DETERMINISTIC_CATEGORIES)} -- a category the instruction "
+        "does not name is one the agent will let silently disappear from the "
+        "report")
 
 
 # ------------------------------------------- confidence and the guides

@@ -184,10 +184,78 @@ CREATE TABLE IF NOT EXISTS history_sweep (
   scanner TEXT NOT NULL, sha TEXT NOT NULL,
   findings TEXT NOT NULL DEFAULT '[]', at INTEGER NOT NULL,
   PRIMARY KEY (project, repo, branch, scanner));
+
+-- THE WORK UNITS OF AN ANALYSIS (security/units.py). A NEW table, so IF NOT
+-- EXISTS is enough -- the precedent `history_sweep` set above. One row per
+-- session the engine runs for an analysis: `kind` is triage | hunt | read |
+-- verify, `payload` the JSON its prompt is minted from (rows, line ranges, a
+-- fingerprint), `evidence` the JSON `unit-close` wrote from the unit's own
+-- stream and from the ledger. A unit that left work undone is never
+-- rewritten: its continuation is a NEW row whose `parent` names it and whose
+-- `attempt` is one higher, so the trail of what each session did survives
+-- every retry.
+CREATE TABLE IF NOT EXISTS unit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  analysis_id INTEGER NOT NULL REFERENCES analysis(id),
+  seq INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  attempt INTEGER NOT NULL DEFAULT 1, parent INTEGER REFERENCES unit(id),
+  run_key TEXT NOT NULL DEFAULT '',
+  started INTEGER, ended INTEGER,
+  spend_usd REAL NOT NULL DEFAULT 0,
+  evidence TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+  UNIQUE(analysis_id, seq));
+CREATE INDEX IF NOT EXISTS unit_by_analysis ON unit(analysis_id, state);
+
+-- WHAT `security read` SERVED TO A UNIT, one row per chunk. The proof of
+-- reading on a platform whose stream cannot carry it (Codex: every read is
+-- a shell command whose output the stream caps at 8 KB, and sometimes
+-- loses) -- and accepted on every platform beside the native Read tool.
+-- Written by the CLI only after the lines were printed, never by the agent.
+CREATE TABLE IF NOT EXISTS unit_read (
+  unit_id INTEGER NOT NULL REFERENCES unit(id),
+  path TEXT NOT NULL, first INTEGER NOT NULL, last INTEGER NOT NULL,
+  at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS unit_read_by_unit ON unit_read(unit_id);
+
+-- A CARRIED `sast` FINDING A TRIAGE UNIT READ AND FOUND GONE. Silence used
+-- to be how such a finding became `fixed`, and silence cannot tell "read it,
+-- it is gone" from "never opened it": the triage unit's proof needs the
+-- first to be SAID. Written by `report-gone` only, with the reason.
+CREATE TABLE IF NOT EXISTS unit_gone (
+  unit_id INTEGER NOT NULL REFERENCES unit(id),
+  fingerprint TEXT NOT NULL, reason TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS unit_gone_by_unit ON unit_gone(unit_id);
+
+-- THE DEEP SCOPE OF AN ANALYSIS (security/inventory.py): every file a
+-- line-by-line read has to cover, and every file left out with the rule
+-- that left it out. Kept OUT of `analysis` -- unlike `coverage` or `guides`
+-- above -- because every reader of that table SELECTs * (queries
+-- .recent_analyses, served by the dashboard's index poll; report.as_json;
+-- cmd_analysis, read by the engine) and this document is hundreds of KB of
+-- JSON on a large repository; no reader of `analysis` can carry it by
+-- accident when it is not a column of `analysis` at all. One row per deep
+-- analysis. A NEW table, so IF NOT EXISTS is enough -- the precedent
+-- `history_sweep` and `unit` set above.
+CREATE TABLE IF NOT EXISTS analysis_inventory (
+  analysis_id INTEGER PRIMARY KEY REFERENCES analysis(id),
+  doc TEXT NOT NULL);
 """
 
 DECISION_STATES = ("accepted", "false_positive")
 ANALYSIS_END_STATES = ("done", "failed", "capped")
+
+UNIT_KINDS = ("triage", "hunt", "read", "verify")
+UNIT_STATES = ("pending", "running", "done", "incomplete", "failed")
+UNIT_SETTLED = ("done", "incomplete", "failed")
+# NOT AN END STATE, and deliberately not in ANALYSIS_END_STATES: `finish`
+# never writes it. An analysis the operator stopped, or whose orchestrator
+# died, keeps its finished units and waits to be resumed; only
+# `interrupt_analysis` puts it here and `resume_analysis` takes it back.
+# Every baseline and posture query already reads `state IN ('done','capped')`,
+# so an interrupted analysis is nobody's baseline without a line changing
+# there.
+INTERRUPTED = "interrupted"
 
 # A closed set. A typo must fail loudly rather than file an event that no
 # filter will ever match and no screen will ever show.
@@ -224,6 +292,10 @@ _ANALYSIS_COLUMNS = (
     # "read": [...]}`, see `set_guides`/`guides_of`. '' for every analysis
     # from before the column; nothing derives a state from it.
     ("guides", "TEXT NOT NULL DEFAULT ''"),
+    # How many times the tick resumed this analysis after its orchestrator
+    # died, never an operator's Resume: the automatic ones are capped, so a
+    # machine that keeps crashing stops spending.
+    ("resumes", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -267,6 +339,11 @@ _FINDING_COLUMNS = (
     # so that the day a second origin appears is not the day somebody
     # discovers the column was missing.
     ("verified_by", "TEXT NOT NULL DEFAULT ''"),
+    # The unit whose session wrote this row -- stamped by the door from the
+    # run's own AL_SECURITY_UNIT_ID, never read from a payload, on the rule
+    # `producer` follows. 0 for a scanner's row and for every row written
+    # before the pipeline existed.
+    ("unit", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -363,7 +440,7 @@ def start_analysis(conn, project, repo, branch, commit_sha, profile, run_id) -> 
 
 
 def finish_analysis(conn, analysis_id, state, spend_usd=0.0, coverage_note="",
-                    coverage="") -> None:
+                    coverage="", only_if_running=False) -> bool:
     """Close the row, and write BOTH halves of the coverage together.
 
     `coverage` is the structured twin of `coverage_note` (see
@@ -372,14 +449,22 @@ def finish_analysis(conn, analysis_id, state, spend_usd=0.0, coverage_note="",
     the two can never end up describing different analyses. `cmd_finish` is
     the only caller that has anything to say here, and it merges the stored
     document before passing it back, exactly as it already does for the note.
+
+    `only_if_running` (`finish --if-running`) makes the write itself
+    conditional -- `AND state='running'` -- rather than trusting a read taken
+    before it: a stop or the next Analyse's sweep can interrupt the row
+    between `cmd_finish`'s check and this UPDATE, and an interrupted analysis
+    is the resume's to continue, never this close's to settle. Returns
+    whether the row was written.
     """
     if state not in ANALYSIS_END_STATES:
         raise ValueError(f"bad analysis state: {state}")
-    conn.execute(
+    cur = conn.execute(
         "UPDATE analysis SET ended=?, state=?, spend_usd=?, coverage_note=?,"
-        " coverage=? WHERE id=?",
+        " coverage=? WHERE id=?" + (" AND state='running'" if only_if_running else ""),
         (int(time.time()), state, spend_usd, coverage_note, coverage, analysis_id))
     conn.commit()
+    return cur.rowcount > 0
 
 
 def names_a_file(occurrence: dict) -> bool:
@@ -413,19 +498,26 @@ def _locates(finding: dict) -> bool:
     return any(names_a_file(o) for o in finding.get("occurrences") or ())
 
 
-def _not_a_reading(existing_rationale: str, finding: dict) -> str:
+def _not_a_reading(existing_rationale: str, finding: dict, marked: bool = False) -> str:
     """Why this re-report is a rubber stamp -- '' when it is a real reading.
 
     Three payloads, each one a way of stamping a scanner's finding `triaged`
     without having read it. The sentence returned is quoted straight into the
     refusal, so it says which of the three arrived and what a reading would
-    have carried instead.
+    have carried instead. `marked`: the row already carries a reading (the
+    write is gated because it moves the row to another unit), so the sentence
+    it holds is the session's that wrote it, not the producer's.
     """
     rationale = _rationale_of(finding)
     if not rationale:
         return ("it carries no rationale, and a finding nobody explained is a "
                 "finding nobody read")
     if rationale == (existing_rationale or "").strip():
+        if marked:
+            return ("its rationale is the sentence another session left on this "
+                    "row, handed back byte for byte, which is what a rubber stamp "
+                    "looks like from here -- your own reading, not that "
+                    "session's, is what was missing")
         return ("its rationale is the producer's own sentence handed back "
                 "byte for byte, which is what a rubber stamp looks like from "
                 "here -- your reading, not the scanner's, is what was missing")
@@ -514,6 +606,18 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
     a correction that happens to repeat its own earlier sentence -- is not a
     stamp on unread work, and refusing it would punish the analyses that did
     the job.
+
+    UNLESS THE WRITE MOVES THE ROW TO ANOTHER UNIT: that one is gated like a
+    first. The pipeline credits a triage unit with a row by the unit its
+    re-report carries (`unit`, security/units.py), so the write that moves
+    `unit` is the new unit's own claim to have read the finding -- not a
+    retry of anybody's. Gated at 0 -> 1 alone, the continuation of an
+    attempt disqualified for launching a subagent could hand back the
+    sentence that attempt left -- its subagent's, for all anyone can prove --
+    byte for byte, and be credited with a reading it never did. The same
+    unit writing again, and a write from outside any unit (`unit` 0, which
+    leaves the column as it is), are the retries the paragraph above keeps
+    ungated.
 
     ONE WRITE IS REFUSED WHATEVER THE MARK SAYS, AND WHOEVER MINTED THE ROW: an
     agent payload carrying no rationale and no occurrence naming a file.
@@ -617,18 +721,39 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
     # more than twice in a real analysis and a later write that happens not to
     # qualify must not erase the reading that already happened.
     with conn:
+        # A SAST FINDING NEEDS AT LEAST ONE LOCATION -- the ledger's own copy
+        # of this lock, on the same rule as the one just below for an
+        # occurrence with no `file` ("this is the ledger's own copy of that
+        # lock, for the one route the door does not reach"). `cmd_
+        # report_finding` refuses a `sast` payload with no occurrence naming
+        # a file, but a scanner producer or a test can still call this
+        # function directly; a `sast` row with no location can be neither
+        # fixed nor verified by any later analysis (units._unread_files, on
+        # a `report-gone` with nothing to check, fails closed rather than
+        # settling one), so it is refused here too, before either branch
+        # below writes anything.
+        if finding["category"] == "sast" and not _locates(finding):
+            raise ValueError(
+                "a sast finding needs at least one occurrence naming a file. "
+                "A weakness with no location can be neither fixed nor "
+                "verified. Nothing was recorded.")
         existing = conn.execute(
-            "SELECT id, producer, rationale, triaged FROM finding"
+            "SELECT id, producer, rationale, triaged, unit FROM finding"
             " WHERE analysis_id=? AND fingerprint=?",
             (analysis_id, finding["fingerprint"])).fetchone()
         if existing is not None:
             fid = existing["id"]
             minted_by = (existing["producer"] or "").strip()
             written_by = (finding.get("producer") or "").strip()
+            unit = int(finding.get("unit") or 0)
+            # A new writer's claim to have read the row: see "UNLESS THE
+            # WRITE MOVES THE ROW TO ANOTHER UNIT" in the docstring.
+            moves_unit = unit > 0 and unit != int(existing["unit"] or 0)
             triaged = 0
             if written_by == AGENT:
-                if minted_by not in ("", AGENT) and not existing["triaged"]:
-                    stamp = _not_a_reading(existing["rationale"], finding)
+                if minted_by not in ("", AGENT) and (not existing["triaged"] or moves_unit):
+                    stamp = _not_a_reading(existing["rationale"], finding,
+                                           marked=bool(existing["triaged"]))
                     if stamp:
                         # Inside `with conn:`, so this rolls back: "nothing
                         # was recorded" is a statement about the database,
@@ -643,7 +768,8 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
                     triaged = 1
                 else:
                     # Every other agent write onto an existing row -- one
-                    # already marked, the agent's own, or an unknown minter's.
+                    # already marked (by this same unit, or from outside any
+                    # unit), the agent's own, or an unknown minter's.
                     # The stamp test above is a superset of this on the rows it
                     # gates, so this is the erasure alone, whole or by half:
                     # see the docstring's last two paragraphs. The stored
@@ -668,25 +794,27 @@ def record_finding(conn, analysis_id, finding: dict) -> None:
             conn.execute(
                 "UPDATE finding SET category=?, rule=?, severity=?, title=?,"
                 " rationale=?, remediation=?, partial_note=?, cwe=?, owasp=?,"
-                " candidate=?, triaged=MAX(triaged, ?)"
+                " candidate=?, triaged=MAX(triaged, ?),"
+                " unit=CASE WHEN ? > 0 THEN ? ELSE unit END"
                 " WHERE id=?",
                 (finding["category"], finding["rule"], finding["severity"], finding["title"],
                  finding.get("rationale", ""), finding.get("remediation", ""),
                  finding.get("partial_note", ""), finding.get("cwe", ""),
-                 finding.get("owasp", ""), finding.get("candidate", ""), triaged, fid))
+                 finding.get("owasp", ""), finding.get("candidate", ""), triaged,
+                 unit, unit, fid))
             conn.execute("DELETE FROM occurrence WHERE finding_id=?", (fid,))
         else:
             cur = conn.execute(
                 "INSERT INTO finding (analysis_id, fingerprint, category, rule, severity,"
                 " title, rationale, remediation, partial_note, cwe, owasp, producer,"
-                " scope, candidate)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " scope, candidate, unit)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (analysis_id, finding["fingerprint"], finding["category"], finding["rule"],
                  finding["severity"], finding["title"], finding.get("rationale", ""),
                  finding.get("remediation", ""), finding.get("partial_note", ""),
                  finding.get("cwe", ""), finding.get("owasp", ""),
                  finding.get("producer", ""), finding.get("scope", ""),
-                 finding.get("candidate", "")))
+                 finding.get("candidate", ""), int(finding.get("unit") or 0)))
             fid = cur.lastrowid
         # An occurrence that names no file is not stored, whoever wrote it.
         # The door refuses such an object outright (`names_a_file` on every
@@ -717,7 +845,10 @@ def record_verdict(conn, analysis_id, fingerprint, verdict, reason,
     one row is not a correction, it is either a verifier contradicting itself
     or a hunter overwriting the answer it did not like -- and the caller is
     told (False), rather than the row quietly changing. The same reason
-    `record_finding` refuses a rubber stamp instead of ignoring it.
+    `record_finding` refuses a rubber stamp instead of ignoring it. The one
+    way back is `conclude_unit`'s `clear_verdict`, and only for the writer
+    the row names: the close of a verify unit whose own session
+    disqualified it, in the transaction that settles the unit.
 
     `verified_by` is this function's own record of who arrived, never a field
     a payload can set -- the rule `producer` already follows.
@@ -732,6 +863,20 @@ def record_verdict(conn, analysis_id, fingerprint, verdict, reason,
             "UPDATE finding SET verdict=?, verdict_reason=?, verified_by=?"
             " WHERE analysis_id=? AND fingerprint=? AND verdict=''",
             (verdict, reason, by, analysis_id, fingerprint))
+    return cur.rowcount > 0
+
+
+def _clear_verdict(conn, analysis_id, fingerprint, by) -> bool:
+    """Take the verdict off one finding of one analysis -- only when `by`
+    wrote it -- inside the CALLER's transaction: `conclude_unit` is the one
+    caller, and its docstring says why nothing else may clear a verdict.
+    `verified_by = by` in the WHERE makes it only ever the caller's own:
+    another unit's verdict, the operator's, or a verifier's from before the
+    pipeline is never touched. True when a verdict was cleared."""
+    cur = conn.execute(
+        "UPDATE finding SET verdict='', verdict_reason='', verified_by=''"
+        " WHERE analysis_id=? AND fingerprint=? AND verified_by=? AND verdict<>''",
+        (analysis_id, fingerprint, by))
     return cur.rowcount > 0
 
 
@@ -1183,3 +1328,330 @@ def delete_filter(conn, project, name) -> bool:
         cur = conn.execute("DELETE FROM saved_filter WHERE project=? AND name=?",
                            (project, name))
     return cur.rowcount > 0
+
+
+# ---- the pipeline's units (security/units.py decides; this only stores) ----
+
+def _unit_row(row) -> dict:
+    """A unit as every reader wants it: `payload` and `evidence` decoded to
+    dicts. A cell that does not decode reads as `{}` -- never a traceback
+    in the middle of an orchestration."""
+    d = dict(row)
+    for key in ("payload", "evidence"):
+        try:
+            value = json.loads(d.get(key) or "{}")
+        except (ValueError, TypeError):
+            value = {}
+        d[key] = value if isinstance(value, dict) else {}
+    return d
+
+
+def add_unit(conn, analysis_id, kind, payload, attempt=1, parent=None) -> int:
+    """A new `pending` unit, numbered after the analysis's last one.
+
+    BEGIN IMMEDIATE, not the implicit deferred transaction: the orchestrator
+    adds units while the closes of units running in parallel add their
+    continuations, and two writers that both read MAX(seq) before either
+    inserts would collide on UNIQUE(analysis_id, seq)."""
+    if kind not in UNIT_KINDS:
+        raise ValueError(f"bad unit kind: {kind}")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM unit WHERE analysis_id=?",
+                           (analysis_id,)).fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO unit (analysis_id, seq, kind, payload, attempt, parent)"
+            " VALUES (?,?,?,?,?,?)",
+            (analysis_id, seq, kind, json.dumps(payload, sort_keys=True), attempt, parent))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return cur.lastrowid
+
+
+def _refuse_bad_kinds(specs) -> None:
+    for kind, _payload in specs:
+        if kind not in UNIT_KINDS:
+            raise ValueError(f"bad unit kind: {kind}")
+
+
+def add_units(conn, analysis_id, specs, guard=None) -> list:
+    """Several new `pending` units in ONE transaction, numbered one after the
+    other from the analysis's last `seq` -- all of them, or none.
+
+    WHY ALL OR NONE. `units.plan` refuses to plan an analysis that already has
+    units (a resume, a second prepare must not run the work twice), so a plan
+    written unit by unit and cut off half way -- an exception, a kill -- left
+    the analysis with the first half of its plan and nobody to write the rest:
+    the slices without a unit were never read, and nothing said so. One BEGIN
+    IMMEDIATE for the whole plan makes that state impossible to write. Every
+    kind is checked before the transaction opens, so a bad one writes nothing
+    either.
+
+    `guard(conn, specs) -> specs`, when given, runs INSIDE that transaction,
+    and only what it returns is written -- nothing, and `[]` back, when it
+    returns nothing. It is how a caller checks and writes in ONE step:
+    `units.plan` asks "no units yet?" there and `units.plan_verification`
+    "which of these findings has no verify unit yet?". Asked before the
+    transaction, the answer was stale by the time of the write -- a second
+    caller that planned in between left two plans, every slice read twice;
+    after BEGIN IMMEDIATE no other writer can land between what the guard saw
+    and what is written. What it hands back is checked against the
+    vocabulary like what came in."""
+    specs = list(specs)
+    _refuse_bad_kinds(specs)
+    if not specs:
+        return []
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if guard is not None:
+            specs = list(guard(conn, specs))
+            _refuse_bad_kinds(specs)
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM unit WHERE analysis_id=?",
+                           (analysis_id,)).fetchone()[0]
+        ids = []
+        for kind, payload in specs:
+            seq += 1
+            cur = conn.execute(
+                "INSERT INTO unit (analysis_id, seq, kind, payload) VALUES (?,?,?,?)",
+                (analysis_id, seq, kind, json.dumps(payload, sort_keys=True)))
+            ids.append(cur.lastrowid)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return ids
+
+
+def get_unit(conn, unit_id):
+    row = conn.execute("SELECT * FROM unit WHERE id=?", (unit_id,)).fetchone()
+    return _unit_row(row) if row else None
+
+
+def units_of(conn, analysis_id) -> list:
+    return [_unit_row(r) for r in conn.execute(
+        "SELECT * FROM unit WHERE analysis_id=? ORDER BY seq", (analysis_id,))]
+
+
+def start_unit(conn, unit_id, run_key="") -> bool:
+    """pending -> running. False when somebody else already started it: the
+    WHERE is the lock, so two launches of one unit cannot both proceed."""
+    with conn:
+        cur = conn.execute(
+            "UPDATE unit SET state='running', run_key=?, started=?, ended=NULL"
+            " WHERE id=? AND state='pending'", (run_key, int(time.time()), unit_id))
+    return cur.rowcount > 0
+
+
+def settle_unit(conn, unit_id, state, spend_usd=0.0, evidence=None, note="") -> bool:
+    """pending/running -> done | incomplete | failed, once. The spend is ADDED:
+    a unit reset after a stop and run again paid for both runs."""
+    if state not in UNIT_SETTLED:
+        raise ValueError(f"bad unit state: {state}")
+    with conn:
+        cur = conn.execute(
+            "UPDATE unit SET state=?, ended=?, spend_usd=spend_usd+?, evidence=?, note=?"
+            " WHERE id=? AND state IN ('pending','running')",
+            (state, int(time.time()), float(spend_usd or 0),
+             json.dumps(evidence or {}, sort_keys=True), note or "", unit_id))
+    return cur.rowcount > 0
+
+
+def conclude_unit(conn, unit_id, state, spend_usd=0.0, evidence=None, note="",
+                  continuation=None, clear_verdict=None) -> tuple:
+    """Settle a unit AND plan its continuation, in ONE transaction. `(True,
+    the continuation's id or None)`, or `(False, None)` with nothing written
+    when the unit was no longer `pending` or `running`. `continuation` is
+    `(kind, payload, attempt, parent)`: a new `pending` unit numbered after
+    the analysis's last one, the way `add_unit` numbers it.
+
+    WHY ONE. `units.conclude` used to settle (`settle_unit`) and plan
+    (`add_unit`) in two commits. A kill between them left the unit
+    `incomplete` with no continuation -- nothing relaunched it, and no gap
+    named it. And two closes of one unit -- its run's own, the orchestrator's
+    for a run it saw die -- continued it twice, because the settle's guard
+    refused the second and nobody read its answer. Here that answer decides:
+    a unit already settled changes nothing, gets no continuation, and the
+    caller is told. The spend is ADDED, as `settle_unit` adds it;
+    `settle_unit` stays for the callers with nothing to continue.
+
+    `clear_verdict` -- `(analysis_id, fingerprint, by)` -- takes the verdict
+    `by` wrote off that finding in the same transaction, ONLY once the settle
+    has taken effect. For one case: the close of a verify unit whose session
+    launched a subagent (security/units.py, `close`). The judge disqualifies
+    that attempt, and its verdict must go with it: nobody can prove the unit
+    reasoned it rather than what it fanned out to, and the `verdict=''`
+    guard of `record_verdict` writes a row's verdict ONCE -- left standing,
+    the continuation could never write its own, the lineage could never
+    finish, and a `rejected` would drop the finding from the exposure for
+    good. WHY HERE, AND NOWHERE ELSE: cleared on its own before the settle,
+    as it first was, a second close of the same unit with no stream -- which
+    sees no subagent -- could settle it `done` on that verdict in between,
+    and the clear then left a `done` verify unit with no verdict. Behind the
+    settle's guard, the clear happens only to a unit this call settled, and
+    never apart from its settle: a kill in the middle undoes both, so the
+    unit is never settled with its disqualified verdict still standing. And
+    never with a `done`: that is the very state -- a verify unit done with no
+    verdict -- the clear must not be able to write."""
+    if state not in UNIT_SETTLED:
+        raise ValueError(f"bad unit state: {state}")
+    if clear_verdict is not None and state == "done":
+        raise ValueError("a unit settled done keeps its verdict: clear_verdict is for an attempt "
+                         "that was disqualified")
+    if continuation is not None:
+        _refuse_bad_kinds([continuation[:2]])
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            "UPDATE unit SET state=?, ended=?, spend_usd=spend_usd+?, evidence=?, note=?"
+            " WHERE id=? AND state IN ('pending','running')",
+            (state, int(time.time()), float(spend_usd or 0),
+             json.dumps(evidence or {}, sort_keys=True), note or "", unit_id))
+        if cur.rowcount == 0:
+            conn.rollback()
+            return False, None
+        if clear_verdict is not None:
+            _clear_verdict(conn, *clear_verdict)
+        cid = None
+        if continuation is not None:
+            kind, payload, attempt, parent = continuation
+            aid = conn.execute("SELECT analysis_id FROM unit WHERE id=?", (unit_id,)).fetchone()[0]
+            seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM unit WHERE analysis_id=?",
+                               (aid,)).fetchone()[0]
+            cid = conn.execute(
+                "INSERT INTO unit (analysis_id, seq, kind, payload, attempt, parent)"
+                " VALUES (?,?,?,?,?,?)",
+                (aid, seq, kind, json.dumps(payload, sort_keys=True), attempt, parent)).lastrowid
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return True, cid
+
+
+def set_run_key(conn, unit_id, run_key) -> None:
+    """Which run carries a unit: `<job>/<pid>`, written once the launch has a
+    pid. A resume reads it to adopt a run that is still alive, and to find the
+    stream of one that died (security/orchestrator.py)."""
+    with conn:
+        conn.execute("UPDATE unit SET run_key=? WHERE id=?", (run_key, unit_id))
+
+
+def reset_unit(conn, unit_id, spend_usd=0.0) -> bool:
+    """running -> pending in the SAME attempt, under the SAME id. The
+    orchestrator calls it only for a launch that failed before any agent ran
+    (security/orchestrator.py): a unit whose run started an agent is judged
+    instead, and its judgement retried if it fails -- relaunched under the
+    same id, an orphan of the first run could still be reading under it."""
+    with conn:
+        cur = conn.execute(
+            "UPDATE unit SET state='pending', run_key='', spend_usd=spend_usd+?"
+            " WHERE id=? AND state='running'", (float(spend_usd or 0), unit_id))
+    return cur.rowcount > 0
+
+
+def interrupt_analysis(conn, analysis_id, note="") -> bool:
+    """running -> interrupted. `note`, when given, joins the paragraph (the
+    orchestrator names the gate that closed, or the failure that stopped it)
+    -- once: the same sentence already there is not written twice."""
+    note = (note or "").strip()
+    with conn:
+        cur = conn.execute(
+            "UPDATE analysis SET state=?, coverage_note=CASE"
+            " WHEN ?='' OR instr(coverage_note, ?)>0 THEN coverage_note"
+            " ELSE TRIM(coverage_note || ' ' || ?) END"
+            " WHERE id=? AND state='running'",
+            (INTERRUPTED, note, note, note, analysis_id))
+    return cur.rowcount > 0
+
+
+def resume_analysis(conn, analysis_id, automatic=False) -> bool:
+    with conn:
+        cur = conn.execute(
+            "UPDATE analysis SET state='running', resumes=resumes+? WHERE id=? AND state=?",
+            (1 if automatic else 0, analysis_id, INTERRUPTED))
+    return cur.rowcount > 0
+
+
+def close_interrupted(conn, analysis_id, note) -> bool:
+    """interrupted -> failed: superseded by a newer analysis of the same scope,
+    or out of automatic resumes. The units it finished stay in the ledger."""
+    with conn:
+        cur = conn.execute(
+            "UPDATE analysis SET state='failed', ended=?,"
+            " coverage_note=TRIM(coverage_note || ' ' || ?) WHERE id=? AND state=?",
+            (int(time.time()), note, analysis_id, INTERRUPTED))
+    return cur.rowcount > 0
+
+
+def set_inventory(conn, analysis_id, inventory) -> None:
+    with conn:
+        conn.execute(
+            "INSERT INTO analysis_inventory (analysis_id, doc) VALUES (?, ?)"
+            " ON CONFLICT(analysis_id) DO UPDATE SET doc=excluded.doc",
+            (analysis_id, json.dumps(inventory, sort_keys=True, separators=(",", ":"))))
+
+
+def inventory_of(conn, analysis_id) -> dict:
+    """The stored deep inventory for this analysis. Returns {} for an
+    analysis with no row, a doc that does not decode or is not an object,
+    and a ledger whose `analysis_inventory` table does not exist on THIS
+    connection (a read-only connection opened on a ledger `connect()`
+    never migrated raises `sqlite3.OperationalError: no such table`,
+    caught here and only here). Any other database error -- a lock, a
+    disk I/O failure, ... -- propagates instead of reading as no
+    inventory."""
+    try:
+        row = conn.execute("SELECT doc FROM analysis_inventory WHERE analysis_id=?",
+                            (analysis_id,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        return {}
+    if row is None:
+        return {}
+    try:
+        doc = json.loads(row["doc"]) if row["doc"] else {}
+    except (ValueError, TypeError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def record_unit_read(conn, unit_id, path, first, last) -> None:
+    with conn:
+        conn.execute("INSERT INTO unit_read (unit_id, path, first, last, at) VALUES (?,?,?,?,?)",
+                     (unit_id, path, int(first), int(last), int(time.time())))
+
+
+def unit_reads(conn, unit_id, since=None) -> list:
+    """This unit's own recorded reads (`security read`), oldest first --
+    only those at or after `since` (a unix timestamp) when it is given.
+
+    `reset_unit` sends a unit whose run died back to `pending` WITHOUT
+    clearing `started` or its id, so a row `security read` recorded for
+    that dead run is still here under the same unit id when the unit is
+    relaunched. `units.close` passes `since=unit["started"]` -- set fresh by
+    `start_unit` on every launch, this run's included -- so only what was
+    served since the run now being judged actually began is counted."""
+    if since is None:
+        return [(r["path"], r["first"], r["last"]) for r in conn.execute(
+            "SELECT path, first, last FROM unit_read WHERE unit_id=? ORDER BY rowid", (unit_id,))]
+    return [(r["path"], r["first"], r["last"]) for r in conn.execute(
+        "SELECT path, first, last FROM unit_read WHERE unit_id=? AND at>=? ORDER BY rowid",
+        (unit_id, int(since)))]
+
+
+def record_gone(conn, unit_id, fingerprint, reason) -> None:
+    with conn:
+        conn.execute("INSERT INTO unit_gone (unit_id, fingerprint, reason, at) VALUES (?,?,?,?)",
+                     (unit_id, fingerprint, reason, int(time.time())))
+
+
+def gone_by(conn, unit_id) -> set:
+    """The fingerprints ONE unit reported gone -- what a triage unit is
+    credited with (security/units.py). A `report-gone` another unit made, a
+    disqualified attempt of its own lineage included, is not its reading, so
+    there is deliberately no analysis-wide answer to ask instead."""
+    return {r[0] for r in conn.execute(
+        "SELECT fingerprint FROM unit_gone WHERE unit_id=?", (unit_id,))}

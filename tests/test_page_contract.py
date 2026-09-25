@@ -1286,19 +1286,6 @@ def test_the_server_hands_the_page_what_the_api_did(srv):
     assert '"api_error_status": data.get("api_error_status")' in server_src
 
 
-def test_the_terminal_names_the_deterministic_phase_while_it_runs(srv):
-    """On OpenAI and OpenCode the engine runs `prepare` before the agent, and a
-    long git history keeps it busy for minutes; the Terminal said "Waiting for
-    the first turn" the whole time, which reads as a run that never started.
-    The server names the phase (`phase: "prepare"`, from the .prepare sidecar
-    with no stream yet) and the page says so."""
-    page = (REPO / "bin" / "dashboard.html").read_text()
-    assert 'd.phase === "prepare"' in page
-    assert "Running the deterministic phase before the agent" in page
-    server_src = (REPO / "bin" / "agentloop-server").read_text()
-    assert '"phase": phase' in server_src
-
-
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_the_log_says_where_part_of_a_transcript_is_missing(srv, tmp_path):
     """A long run's stored stream keeps its two ends with a marker between
@@ -5121,6 +5108,116 @@ def test_an_analysis_with_no_structured_coverage_draws_no_phase_summary(
         assert state["text"] == "", out
 
 
+def _pipeline_script(block, analysis, summary):
+    deps = (_const(block, "SEC_UNIT_KIND_LABEL")
+            + _index_screen_deps(block, "secEl", "secRenderPipeline"))
+    return _INDEX_DOM_HARNESS + """
+    const HOSTS = {};
+    function $(id){ if(!HOSTS[id]) HOSTS[id] = document.createElement("div"); return HOSTS[id]; }
+    function money(v){ return "$" + Number(v).toFixed(2); }
+    function secStopAnalysis(){} function secResumeAnalysis(){}
+    """ + deps + f"""
+    secRenderPipeline({json.dumps(analysis)}, {json.dumps(summary)});
+    const host = $("sec-pipeline");
+    console.log(JSON.stringify({{hidden: host.hidden, nodes: collectAll(host, []),
+      buttons: collectAll(host, []).filter(n => n.cls === "btn").map(n => n.text)}}));
+    """
+
+
+SUMMARY = {"units": 9, "spend_usd": 12.5,
+           "kinds": {"hunt": {"total": 1, "done": 1, "running": 0, "pending": 0, "failed": 0},
+                     "read": {"total": 6, "done": 3, "running": 2, "pending": 1, "failed": 0},
+                     "verify": {"total": 2, "done": 1, "running": 0, "pending": 0, "failed": 1}},
+           "deep": {"files": 980, "files_read": 612, "lines": 294495, "lines_read": 201442}}
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_pipeline_block_says_how_far_each_kind_of_unit_got(srv, tmp_path):
+    script = tmp_path / "pipeline.js"
+    script.write_text(_pipeline_script(_security_js(srv), {"id": 22, "state": "running", "run_id": "security-web"}, SUMMARY))
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    texts = " | ".join(n["text"] for n in out["nodes"])
+    assert out["hidden"] is False
+    assert "Reachability" in texts and "1 of 1 done" in texts
+    assert "Deep read" in texts and "3 of 6 done · 2 running · 1 waiting" in texts
+    assert "Verification" in texts and "1 gave up" in texts
+    assert "Deep scope read in full: 612 of 980 files, 201,442 of 294,495 lines." in texts
+    assert "$12.50" in texts
+    assert out["buttons"] == ["Stop analysis"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_an_interrupted_analysis_offers_resume_and_a_closed_one_offers_nothing(srv, tmp_path):
+    for state, want in (("interrupted", ["Resume"]), ("done", []), ("capped", [])):
+        script = tmp_path / f"pipeline-{state}.js"
+        script.write_text(_pipeline_script(_security_js(srv), {"id": 22, "state": state, "run_id": "security-web"}, SUMMARY))
+        out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+        assert out["buttons"] == want, state
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_an_analysis_without_units_has_no_pipeline_block(srv, tmp_path):
+    script = tmp_path / "pipeline-none.js"
+    script.write_text(_pipeline_script(_security_js(srv), {"id": 3, "state": "done"}, None))
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+    assert out["hidden"] is True
+
+
+def _run_notice_script(block, analysis, orchestrator, run=None):
+    deps = (_const(block, "SEC_ORCHESTRATOR_PHASE")
+            + _index_screen_deps(block, "secEl", "secRenderRunNotice"))
+    return _INDEX_DOM_HARNESS + """
+    const HOSTS = {};
+    function $(id){ if(!HOSTS[id]) HOSTS[id] = document.createElement("div"); return HOSTS[id]; }
+    """ + f"""
+    const secState = {{orchestrator: {json.dumps(orchestrator)}}};
+    function secRunFor(_a){{ return {json.dumps(run)}; }}
+    """ + deps + f"""
+    secRenderRunNotice({json.dumps(analysis)});
+    console.log(JSON.stringify({{text: $("sec-run-notice").textContent}}));
+    """
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_live_orchestrator_is_a_live_analysis_and_its_phase_is_said(srv, tmp_path):
+    """The orchestrator's prepare runs for minutes and no unit's run exists
+    between two units: the page used to say "likely died" over a healthy
+    analysis 180 s in. A live orchestrator (Task 13's `orchestrator`) is a
+    live analysis; only with it gone does the dead-run reading hold. And the
+    deterministic phase is no longer the agent's first command."""
+    block = _security_js(srv)
+    long_ago = {"id": 22, "state": "running", "run_id": "security-web", "started": 1}
+    cases = [({"alive": True, "phase": "preparing"}, "deterministic phase", "likely died"),
+             ({"alive": True, "phase": "running units"}, "Running its units", "likely died"),
+             ({"alive": False, "phase": ""}, "likely died", "Running its units")]
+    for n, (orch, says, never) in enumerate(cases):
+        script = tmp_path / f"notice-{n}.js"
+        script.write_text(_run_notice_script(block, long_ago, orch))
+        text = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                         text=True, check=True).stdout)["text"]
+        assert says in text and never not in text, (orch, text)
+        assert "first command" not in text, "the prepare is the orchestrator's, never the agent's first command"
+
+
+def test_stop_stops_the_whole_analysis_and_resume_names_it(srv):
+    block = _security_js(srv)
+    stop = _anyfn(block, "secStopAnalysis")
+    assert 'api("stop", {id: a.run_id})' in stop, "no pid: the engine stops the analysis whole"
+    resume = _anyfn(block, "secResumeAnalysis")
+    assert 'api("security_resume", {project: secState.project, analysis: a.id})' in resume
+
+
+def test_the_interrupted_banner_is_the_report_s_own_sentence(srv):
+    import sys
+    sys.path.insert(0, str(REPO / "bin"))
+    try:
+        from security import report
+    finally:
+        sys.path.pop(0)
+    sentence = report._coverage({"state": "interrupted"}, "")[0]
+    assert sentence in _plainfn(_security_js(srv), "secPaint")
+
+
 # ---- the index screen's own renderer. Everything above this point drives
 # the JSON contract (tests/security/test_cli.py, tests/test_security_api.py)
 # but never the DOM the JSON is painted into -- so a regression in, say, the
@@ -8338,7 +8435,7 @@ def test_the_recent_analyses_findings_cell_shows_three_severity_chips_or_an_hone
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_the_recent_analyses_status_pill_uses_its_own_tone_family(srv, tmp_path):
-    """Phase 4 Task 4. RUN_STATES' own four values (project-screen.js), each
+    """Phase 4 Task 4. RUN_STATES' own five values (project-screen.js), each
     Title-Cased and given a NEW `.pill` modifier -- never `.pill.on`/
     `.pill.off`, which stay reserved for a project's own active/launchd-
     fault reading (see that class's own comment, ui/css/components.css).
@@ -8348,15 +8445,16 @@ def test_the_recent_analyses_status_pill_uses_its_own_tone_family(srv, tmp_path)
     deps = _index_screen_deps(block, "secEl", "secIndexRunStatusPill")
     script = tmp_path / "recent-status-pill.js"
     script.write_text(_INDEX_DOM_HARNESS + consts + deps + """
-    console.log(JSON.stringify(["running", "done", "capped", "failed", "corrupted"]
+    console.log(JSON.stringify(["running", "done", "capped", "interrupted", "failed", "corrupted"]
       .map(s => collectAll(secIndexRunStatusPill(s), [])[0])));
     """)
     out = json.loads(subprocess.run(["node", str(script)],
                                     capture_output=True, text=True, check=True).stdout)
-    by_state = dict(zip(["running", "done", "capped", "failed", "corrupted"], out))
+    by_state = dict(zip(["running", "done", "capped", "interrupted", "failed", "corrupted"], out))
     assert by_state["running"] == {"cls": "pill running", "title": "", "text": "Running"}
     assert by_state["done"] == {"cls": "pill done", "title": "", "text": "Completed"}
     assert by_state["capped"] == {"cls": "pill capped", "title": "", "text": "Capped"}
+    assert by_state["interrupted"] == {"cls": "pill interrupted", "title": "", "text": "Interrupted"}
     assert by_state["failed"] == {"cls": "pill failed", "title": "", "text": "Failed"}
     # Corrupted data (a value RUN_STATES never actually emits) reads as a
     # fault -- the loud branch, not a quiet, misleading "Running".
@@ -11058,6 +11156,11 @@ console.log(JSON.stringify(out));
         "Overview will render no job cards")
     assert got["hiddenAttr"] is False, "a `hidden` popover counts as an open menu"
     assert got["noMenus"] is False, "the guard fires with no menus in the page at all"
+
+
+def test_a_unit_run_shows_its_label_as_text(srv):
+    row = _plainfn(_app_js(srv), "runRow")
+    assert 'if(r.label) tdJob.appendChild(el("div", "runlabel", r.label));' in row
 
 
 def test_the_cause_badge_explains_itself_on_hover(srv, tmp_path):

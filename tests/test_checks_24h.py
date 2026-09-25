@@ -5,6 +5,7 @@ the bucketed series the band at the top of the page draws.
 """
 
 import time
+from pathlib import Path
 
 
 def _stamp(ago_seconds):
@@ -199,3 +200,23 @@ def test_a_failed_probe_is_counted_against_the_job(clean_data):
     ])
     a = _counts(srv)["alpha"]
     assert (a["checks"], a["runs"], a["failed"]) == (2, 0, 1)
+
+
+def test_an_orchestrator_line_is_read_by_the_same_parse_as_every_tick_line(clean_data, tmp_path):
+    """`checks_24h` reads a tick.log line's first 20 characters as an ISO UTC
+    stamp and the job up to the first `: ` -- log_tick's format. The
+    orchestrator writes into the same file, and a line in any other shape is
+    silently skipped. A probe message ending `, skipped` is one the server
+    counts, so the count proves the stamp and the job were both parsed."""
+    import sys
+    bin_dir = str(Path(__file__).resolve().parent.parent / "bin")
+    if bin_dir not in sys.path:
+        sys.path.insert(0, bin_dir)
+    from security import orchestrator
+    srv = clean_data
+    o = orchestrator.Orchestrator(tmp_path / "security.db", 1, engine="/usr/bin/true",
+                                  job="security-web", commit="c", repo="web",
+                                  repo_path=str(tmp_path), prepare_root=str(tmp_path / "prepare"),
+                                  log=str(srv.DATA_DIR / "tick.log"))
+    o.log("a probe of the line format, skipped")
+    assert _counts(srv)["security-web"]["failed"] == 1, (srv.DATA_DIR / "tick.log").read_text()

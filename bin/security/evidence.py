@@ -1,0 +1,285 @@
+# bin/security/evidence.py
+"""What a unit's session proves it read -- off its own stream, never its word.
+
+THE RESULT, NOT THE REQUEST. Measured on 1,620 real Claude Code `Read`
+calls (2026-09-24): a read asked without a limit can come back cut by a
+token cap (lines 1-1096 of 1,724), and a result that is not an error can
+hold nothing ("shorter than the provided offset", "contents are empty").
+Counting what was ASKED would swear to lines nobody saw. What the model
+received is on the result: `tool_use_result.file.{startLine, numLines}` on
+the main agent's `user` event (OpenCode's normaliser now writes the same
+shape from `state.metadata.display`), and failing that the numbered lines
+of the content itself (`N\\t` on Claude Code, `N: ` on OpenCode).
+
+ONLY THE UNIT'S OWN READS. An event with a `parent_tool_use_id` is a
+subagent's: the engine distributes the work, so a subagent's reads prove
+nothing about this unit -- its launch is counted instead (`tasks`), and the
+unit that launched one is judged a failed attempt (security/units.py).
+
+ONLY INSIDE THE RUN. A path is made relative to the run's root after both
+are resolved (a worktree under a symlinked temp dir is the same place);
+anything outside the root is not this analysis's code and counts nothing.
+
+THE CODEX CLI HAS NO READ TOOL, and its shell reads cannot be proven from
+the stream (wrapped in `/bin/zsh -lc`, chained, capped at 8 KB, sometimes
+lost). There the reading goes through `agentloop security read`, whose
+ledger record is the proof; `with_served` joins it to the stream's reads,
+and a unit on any platform may use either.
+"""
+
+import json
+import os
+import re
+import shlex
+import unicodedata
+from dataclasses import dataclass, field
+
+_GUIDE = re.compile(r"security-analysis/references/([A-Z][A-Z-]*)\.md")
+_NUMBERED = re.compile(r"^\s*(\d+)(?:\t|: )", re.MULTILINE)
+
+# ---- what a unit can be shown, and so proven to have read -------------------
+#
+# The budget of one `security read` call (cli.cmd_read), in UTF-8 bytes of
+# everything it prints. Here, not in the CLI, because the inventory asks the
+# same questions of a path before any unit is planned over it (a path no
+# unit can be shown can never be proven read, and is left out by name).
+READ_BYTES = 8000
+READ_LINES = 200
+# Printed as the second line of every ordinary chunk; its bytes are part of
+# the call's overhead (read_overhead).
+RUN_ALONE = ("-- run this command alone: piped into another command, filtered, or chained with "
+             "a second read in the same call, this chunk is still recorded as read in full")
+# The widest line the READ TOOLS show whole: Claude Code's Read and
+# OpenCode's read both cut a line past 2,000 characters, while the result's
+# line count (and each numbered prefix) still counts it -- a numLines that
+# covers a line the model saw only the head of. A line wider than this is
+# proven read only through `security read`, never through a Read result.
+READ_TOOL_LINE_CHARS = 2000
+
+
+def unprintable(rel) -> bool:
+    """Whether `rel` carries a character no line of output can show safely:
+    any Unicode Cc (C0, DEL and the C1 controls, U+0085 NEL among them) or
+    the U+2028/U+2029 separators, which `str.splitlines` breaks on. Printed
+    on a line of its own -- a `security read` header, a unit's prompt -- such
+    a name forges lines in the engine's voice. Written as escapes: an editor
+    strips the invisible literals silently."""
+    return any(unicodedata.category(ch) == "Cc" or ch in "  " for ch in str(rel))
+
+
+def read_overhead(rel, total) -> int:
+    """The bytes of a `security read` call that are not the file's lines:
+    the header, the piping warning and the `-- next:` footer, each sized for
+    the largest it could be for a file of `total` lines (cli.cmd_read)."""
+    quoted = shlex.quote(rel)
+    header = f"== {quoted} lines {total}-{total} of {total} =="
+    footer = f"-- next: agentloop security read --path={quoted} --from {total}"
+    return (len(header.encode("utf-8")) + 1 + len(RUN_ALONE.encode("utf-8")) + 1
+            + len(footer.encode("utf-8")) + 1)
+
+
+def too_long_to_read(rel, total) -> bool:
+    """A path whose own overhead exceeds half the budget: no chunk of it
+    could ever fit beside the header and footer that introduce it."""
+    return read_overhead(rel, total) > READ_BYTES // 2
+
+
+@dataclass(frozen=True)
+class Session:
+    reads: dict = field(default_factory=dict)
+    tasks: int = 0
+    guides: set = field(default_factory=set)
+
+
+EMPTY = Session()
+
+
+def relative_path(path, root):
+    """`path` relative to `root`, both resolved with `os.path.realpath` --
+    THE ONE CONTAINMENT RULE, used by `parse` below (a stream's own reads)
+    and by `cli.cmd_read` (what a unit asked `security read` for): the two
+    must always agree on what counts as inside a run's checkout, because
+    `with_served` joins their two accounts of one run by this exact string.
+    `None` when `path` is not a non-empty string, or resolves outside
+    `root` -- a `..` escape, or an inside symlink whose target is not.
+    `root` ITSELF being a symlink is never the reason: it is resolved first,
+    through the same `os.path.realpath`, so everything else is measured
+    against what it points to, not against its own name."""
+    if not isinstance(path, str) or not path:
+        return None
+    root_real = os.path.realpath(str(root))
+    full = path if os.path.isabs(path) else os.path.join(root_real, path)
+    real = os.path.realpath(full)
+    if real != root_real and not real.startswith(root_real + os.sep):
+        return None
+    return os.path.relpath(real, root_real).replace(os.sep, "/")
+
+
+def _numbered_range(content):
+    if isinstance(content, list):
+        content = "\n".join(b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(content, str):
+        return None
+    numbers = [int(n) for n in _NUMBERED.findall(content)]
+    return (min(numbers), max(numbers)) if numbers else None
+
+
+def _structured_range(event):
+    result = event.get("tool_use_result")
+    file = result.get("file") if isinstance(result, dict) else None
+    if not isinstance(file, dict):
+        return None
+    try:
+        start, count = int(file.get("startLine")), int(file.get("numLines"))
+    except (TypeError, ValueError):
+        return None
+    return (start, start + count - 1) if count > 0 else ()
+
+
+def merge_spans(spans):
+    """[(first, last)] line spans, sorted, with the overlapping and the
+    adjacent joined into one. The package's one merge of spans: the proof of
+    reading here, and what a read unit covered and what the deep scope still
+    owes (security/units.py), all join theirs with it."""
+    out = []
+    for first, last in sorted(spans):
+        if out and first <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], last))
+        else:
+            out.append((first, last))
+    return out
+
+
+def parse(lines, root) -> Session:
+    asked, reads, guides, tasks = {}, {}, set(), 0
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict) or event.get("parent_tool_use_id"):
+            continue
+        message = event.get("message")
+        blocks = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(blocks, list):
+            continue
+        if event.get("type") == "assistant":
+            for block in blocks:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+                guides.update(_GUIDE.findall(json.dumps(inp)))
+                if block.get("name") in ("Task", "Agent"):
+                    tasks += 1
+                elif block.get("name") == "Read":
+                    asked[block.get("id")] = inp.get("file_path") or inp.get("filePath")
+        elif event.get("type") == "user":
+            results = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_result"]
+            for block in results:
+                path = asked.pop(block.get("tool_use_id"), None)
+                if path is None or block.get("is_error"):
+                    continue
+                span = _structured_range(event) if len(results) == 1 else None
+                if span is None:
+                    span = _numbered_range(block.get("content"))
+                rel = relative_path(path, root)
+                if span and rel:
+                    reads.setdefault(rel, []).append(span)
+    return Session(reads={p: merge_spans(s) for p, s in reads.items()}, tasks=tasks, guides=guides)
+
+
+def stream_proves(stream_path) -> bool:
+    """Whether `stream_path` is a stream at all: a file that opens and holds
+    at least one JSON event. A missing path, an unreadable file and an empty
+    one all answer False -- and a run judged without a stream cannot be
+    judged (security/units.py `close`): the stream is the only proof of what
+    its session did, and of whether it launched a subagent."""
+    if not stream_path:
+        return False
+    try:
+        with open(stream_path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    if isinstance(json.loads(line), dict):
+                        return True
+                except (ValueError, TypeError):
+                    continue
+    except OSError:
+        return False
+    return False
+
+
+def read_session(stream_path, root) -> Session:
+    if not stream_path:
+        return EMPTY
+    try:
+        with open(stream_path, encoding="utf-8", errors="replace") as handle:
+            return parse(handle, root)
+    except OSError:
+        return EMPTY
+
+
+def without_lines(session, wide) -> Session:
+    """`session` with the lines `wide` names ({path: [line, ...]}) cut out of
+    every span it proves read. Applied to what the STREAM proves (a Read
+    tool's results), before `with_served` joins what `security read`
+    served: a line wider than READ_TOOL_LINE_CHARS was cut by the tool, and
+    its numbered prefix or its place in `numLines` is not a reading of it.
+    `security read` shows such a line whole (or refuses it), so its record
+    stands."""
+    if not wide:
+        return session
+    reads = {}
+    for path, spans in session.reads.items():
+        cut = sorted({int(n) for n in wide.get(path) or []})
+        if not cut:
+            reads[path] = list(spans)
+            continue
+        kept = []
+        for first, last in spans:
+            cursor = first
+            for n in cut:
+                if n < cursor or n > last:
+                    continue
+                if n > cursor:
+                    kept.append((cursor, n - 1))
+                cursor = n + 1
+            if cursor <= last:
+                kept.append((cursor, last))
+        if kept:
+            reads[path] = merge_spans(kept)
+    return Session(reads=reads, tasks=session.tasks, guides=set(session.guides))
+
+
+def with_served(session, served) -> Session:
+    reads = {p: list(s) for p, s in session.reads.items()}
+    for path, first, last in served:
+        reads.setdefault(path, []).append((int(first), int(last)))
+    return Session(reads={p: merge_spans(s) for p, s in reads.items()},
+                   tasks=session.tasks, guides=set(session.guides))
+
+
+def missing(ranges, reads) -> list:
+    """The part of each wanted range no read covers, as ranges of its own. A
+    range untouched keeps its bytes; a piece of one carries 0 (only its lines
+    are known)."""
+    out = []
+    for wanted in ranges:
+        first, last = int(wanted["first"]), int(wanted["last"])
+        cursor, gaps = first, []
+        for a, b in merge_spans(reads.get(wanted["path"], [])):
+            if b < cursor or a > last:
+                continue
+            if a > cursor:
+                gaps.append((cursor, a - 1))
+            cursor = max(cursor, b + 1)
+            if cursor > last:
+                break
+        if cursor <= last:
+            gaps.append((cursor, last))
+        for a, b in gaps:
+            whole = (a, b) == (first, last)
+            out.append({"path": wanted["path"], "first": a, "last": b,
+                        "bytes": int(wanted.get("bytes", 0)) if whole else 0})
+    return out

@@ -432,6 +432,10 @@ function runRow(r){
 
   const tdJob = el("td");
   tdJob.appendChild(el("code", null, r.id));
+  // A security unit's run says which analysis and which unit it is -- read by
+  // the server off the run's precheck header (_unit_label). Text, never a
+  // tooltip: the page's tooltip bubble renders its content as HTML.
+  if(r.label) tdJob.appendChild(el("div", "runlabel", r.label));
   // EVERY row, both platforms. It was drawn for OpenAI alone at first, on the
   // reasoning that every run used to be an Anthropic one so a badge on all of
   // them said nothing. That stopped being true the moment one job started

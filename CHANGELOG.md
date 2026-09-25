@@ -20,6 +20,213 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **End-to-end scenarios for the pipeline.** A deep analysis of the sandbox
+  runs every unit and closes `done` with every line read; a read unit that
+  leaves a range unread is continued and the analysis still closes `done`;
+  a stop leaves the analysis `interrupted` with nothing running, and
+  `security resume` finishes it.
+- **The analysis page shows the pipeline, and stops or resumes it.** A
+  Pipeline block lists each kind of unit — done, running, waiting, gave up
+  — how much of a deep scope has been read in full, and what the units have
+  cost, with Stop while the analysis runs and Resume once it is
+  interrupted. While the orchestrator is alive the page says what it is
+  doing (preparing, running its units, finishing, stopping) instead of
+  calling the analysis dead in the minutes no unit's run exists.
+  `interrupted` has its own pill, chip and banner, and each run of a unit on
+  the Runs page carries its analysis and unit as a label.
+- **The analysis page can follow and resume a pipeline analysis.** The
+  checklist carries the units' progress, and whether the analysis's
+  orchestrator is alive and in which phase — between two units no run is
+  alive, and that is not an analysis that died; the report and the screen
+  say an interrupted analysis stopped short and that Resume continues it;
+  the dashboard can resume an analysis (`security_resume`); and each run of
+  a security unit on the Runs page is labelled with its analysis and its
+  unit ("analysis 22 · read 7/25 · attempt 2"), read off the head of its
+  precheck text.
+- **An analysis whose orchestrator died is resumed by the tick.** A reboot or
+  a crash left the analysis `running` behind a dead lock, with its finished
+  units paid for and the rest never started. The tick now marks it
+  `interrupted` and starts a new orchestrator, which continues from the
+  ledger — three times at most per analysis, after which it is abandoned
+  with a note, so a machine that keeps crashing stops spending. A lock
+  caught in the instant before its owner writes its pid is an orchestrator
+  being started, and is left alone until it is older than the lock grace.
+  The loser of two near-simultaneous starts no longer leaves its row
+  `running`: closed `failed` with the reason when it was never prepared,
+  left `interrupted` when it already holds units. A ledger that cannot be
+  read when an orchestrator starts is retried and then leaves the analysis
+  `interrupted` — or keeps the lock for the tick — instead of closing it
+  `failed` as if its commit or checkout were gone.
+- **An orchestrator runs an analysis to the end, whatever its size.** It
+  prepares the analysis in a worktree of its own at the analysed commit —
+  outside the run worktrees the tick sweeps, cleared first if a crash left
+  one, and removed when the phase ends — launches every unit as an ordinary
+  run of the derived job, up to the project's parallelism, continues what
+  each unit left undone, plans verification once the rest has settled, and
+  closes the analysis from what the units proved; a plan that could not be
+  written closes it `capped`, never `done`. The analysis budget is enforced
+  across units: the cap handed to every unit still running is reserved
+  until it settles, so the caps in flight plus the spend never exceed the
+  budget (a pass of three launches used to hand out nearly twice it), and
+  the $0.50 floor per unit never pushes past it — when less than that is
+  left nothing more starts, and the close says so. A budget that is not a
+  number is refused with a sentence. Every launch first asks the engine for
+  the gates a unit's forced run skips — the usage window, the job's daily
+  cap, the global daily cap (`__unit-gate`, run_job's own checks) — and a
+  closed one stops the launches and leaves the analysis `interrupted` with
+  the gate named in its note. A run the provider cut short (`rate_limited`,
+  `api_error`) keeps its unit's attempt, and three in a row give the unit
+  up. A run that dies without closing its unit is judged from the
+  stream it left — what it read counts, the rest continues at the same
+  attempt; a run that left no stream proved nothing, so nothing it did
+  counts and a verify unit's verdict is cleared — and three such deaths in
+  a row give the unit up. A unit whose run started an agent is never sent
+  back under the same id: a judgement that fails is retried instead. A stop
+  leaves the analysis `interrupted` with its finished units kept, a new
+  orchestrator adopts the runs a dead one left behind — only while the pid
+  is still that run, by its start time and its `__run-unit` command line,
+  never a process that inherited the number after a reboot — and ends a
+  `prepare` a SIGKILLed predecessor left running before cutting the same
+  checkout again. Anything that fails inside the orchestrator, or a close
+  that fails twice, leaves the analysis `interrupted` (resumable) rather
+  than `running`, and when not even that can be written the lock is kept so
+  the tick resumes it. The orchestrator writes its phase into its lock and
+  its log lines in `tick.log`'s own format, where the dashboard reads them.
+
+- **The engine closes a pipeline analysis from what its units proved.**
+  `finish --from-units` records the units' summed cost and lowers `done` to
+  `capped` for each gap the units leave — a unit that never finished, a
+  lineage that gave up (named by the runs and the attempts the ledger
+  actually holds, never a fixed count, so a struck-out run at attempt one
+  is never read as three attempts), a deep scope never listed or that could
+  not be read, the lines of the deep scope no unit proved it read, counted
+  against the inventory itself, so a slice no unit carried or a unit that
+  gave up without saying what it missed is named too — naming the first of
+  each in the report, and keeping a passed `--spend` when the ledger
+  predates the unit table. The `sast` coverage row, and the paragraph
+  beside it, say how much of the deep scope was read in full, and the
+  guides read are the union of what every unit opened.
+
+- **An analysis can be interrupted and resumed.** `interrupt`, `resume` and
+  `abandon` move an analysis into and out of the new `interrupted` state;
+  nothing is written into an interrupted analysis, and opening a new
+  analysis of the same branch abandons an interrupted one, saying so in its
+  note.
+
+- **The security CLI runs units.** `prepare` lists a deep analysis's scope,
+  and — with `--plan`, which only the engine's orchestrator passes — writes
+  the plan, all of it or none: a plan that fails exits non-zero with the
+  reason and writes no unit, instead of reporting success over half a plan.
+  `unit-prompt` prints a unit's minted prompt — a triage row with every
+  location it has, a read unit's files with what is already recorded or
+  decided in them — `unit-close` judges a unit's run from its stream and
+  the ledger and plans what it left undone (a run whose stream is missing,
+  empty or unreadable is credited with nothing it wrote or read, and a
+  verify unit's own verdict is cleared: the stream is the only proof of
+  whether its session launched a subagent), `report-gone` lets a triage
+  unit say a carried finding is gone, with the reason, `units` prints the
+  progress (per kind, and how much of a deep scope has been read, counted
+  against the inventory itself), and `read` serves a file to a unit in
+  numbered chunks of 200 lines or 8 KB, recording each chunk as proof of
+  reading — the only proof there is on Codex. A line wider than one whole
+  chunk is shown but never recorded: `read` never records more than the
+  chunk it actually showed. The repository being analysed is not trusted
+  input: `read` quotes every path it prints (`--path=<path>`, so a name
+  starting with `-` still parses), its byte budget bounds an ordinary
+  chunk's whole call — the header and the `-- next:` footer included, not
+  only the numbered lines (a line too wide for the budget is still shown,
+  on its own, so a reader is not left guessing what is there, but that
+  notice is never counted as read) — refusing outright a path whose own
+  overhead already exceeds half the budget, since no chunk of it could
+  ever fit alongside the header and footer that would have to introduce
+  it, and refuses a name carrying a control character (any Unicode Cc, or
+  the U+2028/U+2029 line separators) rather than risk it forging a fake
+  line of the verb's own output.
+
+- **Each unit of an analysis is given one job, and told how it is checked.**
+  The CLI mints the prompt of every unit from the ledger: a triage unit's
+  rows with every location each one has (a re-report replaces the stored
+  list), a read unit's line ranges with the rows already recorded in those
+  files and the hunting guides its files call for, a hunt unit's profile,
+  a verify unit's finding. Every prompt forbids closing the analysis and
+  names the subagent tool its platform closes, invokes the skill by name on
+  Claude Code and OpenCode (by path on Codex), and says how its work is
+  proven — on Codex, where no shell read can be proven from the stream, a
+  read unit reads through `agentloop security read`.
+
+- **An analysis is planned as units the engine runs and judges.** The plan
+  is triage batches of 25 rows (the scanners' findings and the findings the
+  last analysis left open), one reachability pass, and — in a deep
+  analysis — one read unit per slice; verification units are planned once
+  the rest has settled, one per finding of the analysis. The plan is
+  written in one transaction, all of it or none, so a plan cut short can
+  never leave slices no unit will read. A unit is judged by what it left:
+  the ranges its own stream proves it read (kept on the unit, whatever its
+  outcome, as the lines it covered), the rows the ledger shows it triaged
+  (a scanner's row below the close's floor needs none — judged at the
+  severity its scanner filed as well as at the one it holds now), the
+  verdict it wrote. What it left undone becomes a new unit carrying
+  only what is missing, up to three attempts; a session that launched a
+  subagent does not count, whatever kind of unit it was. A unit is credited
+  only with what carries its own id — the rows it re-reported, what it said
+  is gone, the verdict it wrote — so nothing a disqualified attempt wrote
+  closes the attempt after it, and a disqualified verification's verdict is
+  cleared at its close. A carried finding said to be gone settles only once
+  every file it was found in has been read by the unit or is gone from the
+  checkout — a reason alone used to be enough, and a vulnerability could be
+  marked fixed without anyone opening its file — and a finding with no
+  recorded location at all is refused at the door and never taken as gone:
+  nothing to check is not a passed check. A unit is settled and its
+  continuation planned in one transaction, two callers can never both write
+  a plan, and a deep analysis is never planned without its inventory.
+
+- **What a unit read is proven from its own stream.** A read counts only
+  the lines its result carried — Claude Code's `tool_use_result` range, or
+  the numbered lines of the content — never what it asked for: a read with
+  no limit can come back cut by a token cap, and one past the end of a file
+  returns nothing without being an error. Errors, reads outside the run's
+  root and a subagent's reads count nothing; a subagent's launch is counted
+  instead. A line that is not an event of the expected shape — invalid
+  JSON, or valid JSON of the wrong shape — is skipped, never taken as proof
+  and never fatal to the rest of the stream.
+
+- **The deep scope is cut into readings a single session can hold.** The
+  inventory is packed, in path order, into slices of at most 300 KB of
+  source (~85k tokens); a range bigger than that is a slice of its own.
+  However large the repository, no session is asked to hold more than one
+  slice — the single agent before this read until its context was full and
+  then stopped.
+
+- **A deep analysis lists its scope before it reads anything.** `prepare`
+  now records every versioned file a line-by-line read has to cover, with
+  its lines and bytes — a file over 300 KB as consecutive line ranges — and
+  counts every file it leaves out under the rule that left it out
+  (ignored, symlink, submodule, dependency tree, lockfile, unreadable,
+  binary, generated, prose, unprintable path), with examples. `deep`
+  promised "all versioned code" in prose only, and the agent that had to
+  keep the promise was the one deciding when it had. A line counts as too
+  long for `generated` past 2,000 characters — where the Read tools of
+  Claude Code and OpenCode cut a line while still counting it as shown —
+  and under `!defaults` such lines stay in scope, named per file, and only
+  `security read` can prove them read, never a Read tool's result. A file
+  whose path no unit could be shown (a control character, a line separator,
+  or a name too long for any `read` chunk) is left out under its own name
+  instead of owed for ever, and every path a unit's prompt prints is quoted,
+  with any character that could break a line escaped.
+
+- **The security ledger records an analysis's work units.** A new `unit`
+  table holds every session the engine runs for an analysis — its kind
+  (triage, hunt, read, verify), what it was given, what it proved, what it
+  cost, and the attempt it was — with a retry recorded as a new row that
+  names its parent, never as an overwrite. The deep scope an analysis has to
+  cover is kept in a table of its own, so no reader of the analysis table
+  ever carries it — a ledger an older version never migrated reads as
+  having no inventory, while any other database error is reported rather
+  than hidden; an analysis gains a count of automatic resumes and a
+  resumable `interrupted` state that no baseline or posture ever reads; a
+  finding records which unit wrote it, and every chunk `security read`
+  serves a unit is kept as proof of what it read.
+
 - **Accounts per platform: a job, a project and an analysis run under the
   Claude or Codex account they pick.** A client who signs in to several
   Claude and Codex accounts — one config directory each — registers them in
@@ -109,9 +316,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   launches nothing and records nothing. A new `verification` row in the
   coverage table says what was verified and what was not.
 
-- **`verify-queue`, `verify-prompt` and `report-verdict`.** The queue is a
-  query, so the agent never derives the scope from prose; the prompt is minted
-  from the ledger, with the job stated as disproving the claim and the
+- **`verify-queue` and `report-verdict`.** The queue is a
+  query, so the agent never derives the scope from prose; the verifier's
+  prompt is minted from the ledger, with the job stated as disproving the claim and the
   hunter's `rationale` deliberately left out — a fresh reader that reads the
   argument stops being fresh; and the verdict is written by the verifier
   itself, refused for a finding outside the queue, refused a second time on
@@ -156,6 +363,66 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   own three stand-ins instead — checked block by block, not assumed.
 
 ### Changed
+
+- **The security-analysis skill is written for a unit, not for a whole
+  analysis.** It opens with the rules every unit follows — what qualifies
+  as a finding, the reporting door, the closed rule vocabulary, never a
+  secret's value, no subagents — and then one section per unit kind. A
+  carried `sast` finding a triage unit finds gone is now said to be gone,
+  with the reason (`report-gone`), instead of left out in silence the engine
+  could not tell from a row nobody opened; a gone claim on a row another
+  unit re-reported into the analysis stays owed, and the unit's note says
+  exactly that. The README documents the automatic resume after a crash (at
+  most three per analysis, then abandoned with a note) and the cap of three
+  attempts per unit's lineage. `low` and `info` rows are
+  optional only when both the scanner's severity and the current one are
+  below `medium`: a row shown `low (scanner: high)` is still owed, as the
+  engine judges it — the skill used to call every `low` row optional.
+- **A security analysis runs as a pipeline of units, on every platform.**
+  `security analyze` now starts an orchestrator that holds the analysis lock,
+  prepares the analysis once and runs each unit as an ordinary run of the
+  derived job — at the analysis's own commit, never the branch tip, so a
+  long analysis reads one tree — up to `security.parallel` at a time (3 by
+  default). Each unit gets a prompt minted from the ledger and its share of
+  the budget — the derived job's own `max_budget_usd`, with the
+  derivation's fallback for a value that is not a number — and its run's
+  close judges the unit. A unit is launched without its platform's subagent
+  tool; the prepare the agent used to run as its first command is the
+  engine's, in a checkout of its own outside the run worktrees. Stopping any
+  run of an analysis stops the whole analysis and leaves it `interrupted`;
+  `agentloop security resume <project> <analysis>` continues it without
+  repeating a finished unit. A row found `running` with nothing behind it
+  is interrupted rather than failed, and the orchestrator's own close never
+  settles an analysis interrupted under it. Before this, one agent decided
+  when an analysis of a large repository had done enough, and it always
+  decided early.
+
+- **An agent session can no longer prepare, close, grade, interrupt or
+  resume the analysis it works for.** `prepare`, `finish`, `unit-close`,
+  `orchestrate`, `interrupt`, `resume` and `abandon` are refused under the
+  agent flag; the engine makes them with the flag removed. A verdict from an
+  agent session is accepted only from the verify unit the engine launched
+  for that very finding (`verified_by` names the unit), instead of being
+  counted against subagents after the fact; one written outside any session
+  is recorded as the operator's. A finding from a session is refused unless
+  its unit is running in that analysis, as a verdict, a `report-gone` and a
+  `read` already were (the `--root` anchor to the run's own worktree stays
+  behind the `prepare` refusal as a defence in depth). `finish --if-running`
+  now decides in the write
+  itself, so a stop that interrupts the analysis while it is being closed is
+  never overwritten. The single-session `verify-prompt` verb is gone: a
+  verify unit's prompt is minted by `unit-prompt`. The engine's `security`
+  usage line names every verb the door accepts.
+- **The verification queue lists only the analysis's own rows.** A finding
+  the previous analysis recorded, not yet re-checked, used to sit in the
+  queue where no verifier could ever clear it — `record_verdict` writes only
+  this analysis's rows — and lowered `done` to `capped` for a reason nobody
+  could act on. Its re-check is the triage's job.
+
+- **OpenCode's normalised stream keeps the range a read showed.** The
+  `metadata.display` line range is copied onto the result in Claude Code's
+  `tool_use_result.file` shape; the output itself is capped at 8 KB, so the
+  numbered lines alone could never prove a long read.
 
 - **The security-analysis skill has a fourth job: verification** — the queue,
   the minted prompt, one subagent per finding, and the fact that the close
@@ -271,6 +538,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Default it already is.
 
 ### Fixed
+
+- **The security-close selftest block hands its fixture a stream, like every
+  real close does.** `security_close_analysis`'s two real call sites in
+  `bin/agentloop` (a run's own end, and a run stopped before its agent
+  finished) always pass the run's stream file, but the selftest block for
+  `security_close_analysis()` closed its units with none. A prior fix moved
+  the "no stream, nothing counts" rule into `units.close`, so the block's
+  `success` and `warning` cases started reading `incomplete` instead of
+  `done` — the fixture was stale, not the engine. It now hands the close an
+  init-only stream, the same first line a real run writes, and keeps a
+  dedicated case for a close with a genuinely missing stream.
+- **An e2e scenario's "nothing left behind" bound was tighter than the
+  teardown it waits on.** Scenario 56 waited 30 s for a stopped security
+  analysis's lock directory to empty, but the orchestrator's own reap only
+  watches the unit's agent pid — it marks the analysis `interrupted` the
+  moment that pid is gone, before the unit's `run_job` wrapper has
+  necessarily finished its own teardown (a `unit-close` subprocess, then,
+  when the unit claimed a worktree, `git worktree remove`) and released its
+  slot. Reproduced clean and solo: the lock always cleared, well inside the
+  300 s `STOP_GRACE_SECONDS` the engine actually promises, just occasionally
+  past the test's 30 s watch. Widened to 60 s, still a bounded wait.
 
 - **A run whose files could not be read is no longer deleted anyway.** Once
   a run ends, the index reads its files into the run's row and then deletes
@@ -918,6 +1206,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   did, plus what none of them did: it clamps to the viewport (flipping above
   the trigger when there is more room there) and closes on any scroll or
   resize, the way a native select does.
+
+- **A stop now reaches a unit that was still claiming its slot, and keeps
+  the evidence a stopped unit already paid for.** The orchestrator asked the
+  engine to stop an analysis's units once, then just waited out the grace: a
+  unit that took its slot a moment later ran its agent to the end unseen. It
+  now re-asks on every poll of that wait, and the engine's own `stop`, once
+  it has signalled the orchestrator, also reaches the job's slots directly.
+  A unit the operator stopped after its agent had already run used to close
+  with no stream and no root — proof already sitting on disk, thrown away —
+  and now closes with both, off the same breadcrumbs a normal close reads.
+  A Stop landing in the instant between an analysis lock's `mkdir` and its
+  pid being written used to read as "no runs in progress"; it now uses the
+  same liveness the rest of the engine gives that window. And a project
+  whose `security.parallel` was not a number logged the fallback warning
+  into a subshell that then discarded it, so `derivation-warnings.txt` never
+  said why the analysis ran at the default parallelism instead of the value
+  configured. `security_resume_orphans` also no longer removes a dead
+  orchestrator's lock with a plain `rm -rf`: a manual `agentloop security
+  analyze` or `resume` re-acquiring that exact path in between could have its
+  fresh lock deleted from under it; the removal now goes through the same
+  judged-then-close the engine already uses for this race elsewhere.
 
 ### Added
 

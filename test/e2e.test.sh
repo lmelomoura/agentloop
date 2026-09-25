@@ -41,6 +41,11 @@ export CODEX_HOME="$ROOT/codex-home"        # the stand-in's rollouts; never ~/.
 export AGENTLOOP_LAUNCH_AGENTS_DIR="$ROOT/LaunchAgents"   # an empty dir: installed_config_dir must never read a developer machine's real pinned install
 export AGENTLOOP_OPENCODE_BIN="$E2E/fake-opencode"
 export AGENTLOOP_PRICING_URL="file://$REPO/test/fixtures/pricing/litellm-sample.json"
+# A security analysis's deterministic phase is the ORCHESTRATOR's, run
+# engine-side without `--offline` (the stand-ins used to run it themselves,
+# offline): with the scanners switched off it stays off the network and takes
+# the same time on every machine, whatever is installed.
+export AL_SECURITY_ENGINES=off
 mkdir -p "$CODEX_HOME"
 git init -q --bare "$ROOT/remote/origin.git"
 git init -q "$ROOT/work/app"
@@ -301,8 +306,11 @@ while [ "$w" -lt 90 ] && [ "$(secstate sandbox "$aid8")" = "running" ]; do sleep
 wlog=0
 while [ "$wlog" -lt 90 ] && [ -z "$(run_of security-sandbox | jq -r '.log // empty')" ]; do sleep 1; wlog=$((wlog + 1)); done
 pc8="$(run_of security-sandbox | jq -r .log)"; pc8="${pc8%.json}.precheck.txt"
-grep -q "^SECURITY ANALYSIS $aid8 — launched by" "$pc8" 2>/dev/null && ! grep -q 'every due tick' "$pc8" 2>/dev/null \
-  && ok "and the run's precheck note names analysis $aid8 and the command that launched it, never a tick" \
+# The sandbox always carries the `missing_gitignore` row (hygiene.py), so a
+# triage unit may run beside the hunt one: run_of reads whichever ended last.
+grep -q "^SECURITY ANALYSIS $aid8 · unit [a-z]* [0-9]*/[0-9]*" "$pc8" 2>/dev/null \
+  && grep -q 'launched by its orchestrator' "$pc8" 2>/dev/null && ! grep -q 'every due tick' "$pc8" 2>/dev/null \
+  && ok "and the run's precheck note names analysis $aid8, the unit it ran and who launched it, never a tick" \
   || bad "note (waited ${wlog}s for the journal record): $(cat "$pc8" 2>/dev/null)"
 sleep 1   # let run_job's own teardown release the derived job's slot before the next scenario
 
@@ -310,7 +318,7 @@ echo
 }
 
 scenario_9() {
-echo "9. an agent that dies on launch still closes its analysis -- failed, not stuck running"
+echo "9. an agent that dies on launch still closes its analysis -- capped, not stuck running"
 cat > "$ROOT/dead-claude" <<'SH'
 #!/usr/bin/env bash
 exit 3
@@ -318,11 +326,18 @@ SH
 chmod +x "$ROOT/dead-claude"
 out9="$(AGENTLOOP_CLAUDE_BIN="$ROOT/dead-claude" "$AL" security analyze --detach sandbox anything main quick)"
 aid9="$(secid "$out9")"
+# Three runs of the hunt unit, each leaving nothing: the unit gives up and
+# the orchestrator closes the analysis from what the units proved -- capped,
+# with the give-up in the note, never a `running` row nobody closes.
 w=0
-while [ "$w" -lt 20 ] && [ "$(secstate sandbox "$aid9")" = "running" ]; do sleep 1; w=$((w + 1)); done
-[ "$(secstate sandbox "$aid9")" = "failed" ] \
-  && ok "a claude that exits without a word still closes the row failed (waited ${w}s)" \
+while [ "$w" -lt 60 ] && [ "$(secstate sandbox "$aid9")" = "running" ]; do sleep 1; w=$((w + 1)); done
+[ "$(secstate sandbox "$aid9")" = "capped" ] \
+  && ok "a claude that exits without a word still gets the row closed capped (waited ${w}s)" \
   || bad "left '$(secstate sandbox "$aid9")' after ${w}s"
+case "$(secnote sandbox "$aid9")" in
+  *"gave up after 3 runs"*) ok "and the note says the unit gave up after three runs" ;;
+  *) bad "no give-up in the coverage note: '$(secnote sandbox "$aid9")'" ;;
+esac
 sleep 1
 
 echo
@@ -337,37 +352,41 @@ stuck_id="$(secid "$stuck_out")"
 [ "$(secstate sandbox "$stuck_id")" = "running" ] \
   && ok "the stuck row starts out running, exactly like a real one" \
   || bad "open-analysis did not open row $stuck_id running"
-# The default grace (120s) would leave a row this young alone -- it may still
-# be on its way to acquire_slot -- so the sweep is forced to fire immediately.
+# The default grace (120s) would leave a row this young alone -- its
+# orchestrator may still be on its way to the lock -- so the sweep is forced
+# to fire immediately. The sweep interrupts it; the analysis opened next on
+# the SAME branch supersedes it (open-analysis), which closes it failed.
 AGENTLOOP_SECURITY_STALE_GRACE=0 FAKE_MODE=complete FAKE_SESSION=sess-sec-fresh \
   "$AL" security analyze sandbox anything main quick >/dev/null 2>&1
 [ "$(secstate sandbox "$stuck_id")" = "failed" ] \
   && ok "the next analyse's own preflight sweeps it before opening a fresh one" \
   || bad "stuck row $stuck_id left '$(secstate sandbox "$stuck_id")'"
+case "$(secnote sandbox "$stuck_id")" in
+  "Superseded by analysis "*) ok "and its note names the analysis that took its place, not a verdict on the code" ;;
+  *) bad "stuck row's note: '$(secnote sandbox "$stuck_id")'" ;;
+esac
 
 echo
 }
 
 scenario_11() {
-echo "11. an agent that never ran the deterministic phases cannot close done"
-# Nothing engine-side runs `prepare` on Claude Code (on Codex the engine does
-# -- scenario 24). An agent that skips its first command
-# exits cleanly, so the engine's own close-out closes the row with `success` --
-# and the result was a `done` analysis with no findings, no coverage note and
-# no banner, which then became the baseline every later analysis is diffed
-# against. The whole path is exercised here, over the real run_job: only the
-# LEDGER can tell the two apart, and only after the run has ended.
-out11="$(FAKE_MODE=complete FAKE_SKIP_PREPARE=1 FAKE_SESSION=sess-sec-noprep \
-  "$AL" security analyze --detach sandbox anything main quick)"
+echo "11. a deep analysis whose read units read nothing closes capped, and names the lines left unread"
+# The deep profile promises every versioned line, and a unit's word is never
+# the proof: its session's own reads are (security/evidence.py). A stand-in
+# that reads nothing clean-exits every run -- and the analysis must still end
+# capped, with the unread lines named, over the real run_job and the real
+# orchestrator.
+out11="$(FAKE_MODE=complete FAKE_READ_NOTHING=1 FAKE_SESSION=sess-sec-noread \
+  "$AL" security analyze --detach sandbox anything main deep)"
 aid11="$(secid "$out11")"
 w=0
-while [ "$w" -lt 20 ] && [ "$(secstate sandbox "$aid11")" = "running" ]; do sleep 1; w=$((w + 1)); done
+while [ "$w" -lt 90 ] && [ "$(secstate sandbox "$aid11")" = "running" ]; do sleep 1; w=$((w + 1)); done
 [ "$(secstate sandbox "$aid11")" = "capped" ] \
-  && ok "a run whose agent skipped prepare closes capped, not done (waited ${w}s)" \
+  && ok "a deep analysis whose reads proved nothing closes capped, not done (waited ${w}s)" \
   || bad "left '$(secstate sandbox "$aid11")' after ${w}s -- expected capped"
 case "$(secnote sandbox "$aid11")" in
-  *"deterministic phases never ran"*) ok "and the report says why, in the coverage note" ;;
-  *) bad "no coverage note explaining the downgrade: '$(secnote sandbox "$aid11")'" ;;
+  *"were never read in full"*) ok "and the report names the lines nobody read, in the coverage note" ;;
+  *) bad "no unread lines in the coverage note: '$(secnote sandbox "$aid11")'" ;;
 esac
 
 echo
@@ -388,16 +407,16 @@ rm -f "$argv"
 FAKE_ARGV_OUT="$argv" FAKE_MODE=complete FAKE_SESSION=sess-sec-argv \
   "$AL" security analyze sandbox anything main quick >/dev/null 2>&1
 argc="$(awk -F'\t' '$1=="ARGC" {print $2; exit}' "$argv" 2>/dev/null)"
-# Since block 4.2 the launch closes NOTHING: the verification phase is
-# subagents, and what keeps them honest is the close counting them against the
-# verdicts in the ledger, not a flag at launch. `--max-budget-usd` is read
-# beside it so an argv that lost every flag fails here rather than passing for
-# the wrong reason.
+# Since the pipeline a unit is launched WITHOUT the Agent tool: the engine
+# distributes the work, and a unit that fans out is what analysis 9 spent
+# $51.44 on (security_disallowed_tools). `--max-budget-usd` is read beside it
+# so an argv that lost every other flag fails here rather than passing for
+# the wrong reason. The argv is the last unit's to start; any unit's holds.
 di="$(idx '--disallowedTools' 2>/dev/null)"
 mb="$(idx '--max-budget-usd' 2>/dev/null)"
-[ -z "${di:-}" ] && [ -n "${mb:-}" ] \
-  && ok "the real analysis launch closes no tool, and still carries its budget cap" \
-  || bad "unexpected --disallowedTools in the launch argv: $(tr '\n' ' ' < "$argv" 2>/dev/null)"
+[ -n "${di:-}" ] && [ "$(at $((di + 1)))" = "Agent" ] && [ -n "${mb:-}" ] \
+  && ok "a unit's launch closes the Agent tool, and still carries its budget cap" \
+  || bad "no --disallowedTools Agent in the launch argv: $(tr '\n' ' ' < "$argv" 2>/dev/null)"
 mi="$(idx '--' 2>/dev/null)"
 [ -n "${mi:-}" ] && [ "$((mi + 1))" = "${argc:-0}" ] \
   && ok "and its prompt is the one argument after --, not swallowed by the variadic flag" \
@@ -670,41 +689,46 @@ echo
 }
 
 scenario_24() {
-echo "24. a security analysis on OpenAI goes through the Codex stand-in, forbids subagents in words, and closes done"
+echo "24. a security analysis on OpenAI goes through the Codex stand-in, reads through security read, and closes done"
 # A second project, on the openai platform, over the same repository. Its
 # derived job takes the block's platform and the platform's security default
 # (full-access: the ledger lives outside the worktree).
 jq --arg cwd "$ROOT/work/app" '.projects += [{"name":"sandbox-oa","cwd":$cwd,"base":"main","worktree":{"enabled":true},
    "security":{"enabled":true,"platform":"openai","model":"gpt-5.6-sol","max_budget_usd":5}}]' \
    "$ROOT/config/projects.json" > "$ROOT/projects.next" && mv "$ROOT/projects.next" "$ROOT/config/projects.json"
-# The stand-in does NOT run prepare here (FAKE_SKIP_PREPARE), so a `done`
-# close can only mean the ENGINE ran the deterministic phase before launching
-# it -- which is what run_job does on openai. AL_SECURITY_ENGINES=off keeps
-# that engine-side prepare off the network, the way `--offline` keeps the
-# stand-ins' own; the fixture has no lockfile, so nothing else reaches for
-# one either.
+# The ORCHESTRATOR runs the deterministic phase, once, before any unit, on
+# every platform: no unit is asked to run it (FAKE_SKIP_PREPARE has no effect
+# on a unit). AL_SECURITY_ENGINES=off keeps that phase off the network. DEEP,
+# so a read unit runs -- and on Codex, which has no read tool, a unit's only
+# proof of reading is what `agentloop security read` served it: the stand-in
+# reads every range through it, and the analysis can close `done` only if the
+# ledger's record of those chunks covers every line of the deep scope.
 argv24="$ROOT/argv-24"; prompt24="$ROOT/prompt-24"; rm -f "$argv24" "$prompt24"
 out24="$(AL_SECURITY_ENGINES=off FAKE_SKIP_PREPARE=1 FAKE_ARGV_OUT="$argv24" FAKE_PROMPT_OUT="$prompt24" \
   FAKE_MODE=complete FAKE_SESSION=thr-sec \
-  "$AL" security analyze sandbox-oa anything main quick 2>&1)"
+  "$AL" security analyze sandbox-oa anything main deep 2>&1)"
 aid24="$(secid "$out24")"
 [ -n "$aid24" ] && ok "the analysis opened: $aid24" || bad "no analysis id in: $out24"
 [ "$(secstate sandbox-oa "$aid24")" = "done" ] \
-  && ok "and closed done: the engine ran security prepare before the agent, and the close found nothing untriaged" \
-  || bad "state '$(secstate sandbox-oa "$aid24")'"
-grep -q 'deterministic phase ran before the agent' "$ROOT/data/tick.log" \
-  && ok "the engine ran prepare before launching codex" || bad "no engine-side prepare line in tick.log"
+  && ok "and closed done: every unit's job was proven, and the close found nothing owed" \
+  || bad "state '$(secstate sandbox-oa "$aid24")' -- $(secnote sandbox-oa "$aid24")"
+units24="$("$AL" security units --analysis "${aid24:-0}" 2>/dev/null)"
+printf '%s' "$units24" | jq -e '(.kinds.read.done // 0) >= 1 and .deep.lines > 0 and .deep.lines_read == .deep.lines' >/dev/null 2>&1 \
+  && ok "a read unit ran, and every line of the deep scope is proven read through security read" \
+  || bad "units: $(printf '%s' "$units24" | jq -c '{kinds, deep}' 2>/dev/null)"
+grep -q "security-sandbox-oa: analysis $aid24 — deterministic phase done" "$ROOT/data/tick.log" \
+  && ok "the orchestrator ran prepare before any unit was launched" || bad "no orchestrator prepare line in tick.log"
 [ "$(at_in "$argv24" 1)" = "exec" ] && ok "it went down the Codex launch line" || bad "argv: $(tr '\n' ' ' < "$argv24" 2>/dev/null)"
 mi="$(idx_in "$argv24" -m)"; [ -n "${mi:-}" ] && [ "$(at_in "$argv24" $((mi + 1)))" = "gpt-5.6-sol" ] \
   && ok "-m carries the block's model" || bad "-m '$(at_in "$argv24" $((${mi:-0} + 1)))'"
 [ -n "$(idx_in "$argv24" --dangerously-bypass-approvals-and-sandbox)" ] \
   && ok "full-access, the security default on openai" || bad "no bypass flag in the launch line"
 [ -z "$(idx_in "$argv24" --disallowedTools)" ] && ok "no --disallowedTools: Codex cannot close a tool by flag" || bad "--disallowedTools was passed to codex"
-grep -q 'Do not spawn subagents' "$prompt24" && ok "the prompt forbids subagents in words" || bad "no subagent ban in the prompt"
+grep -q '^SECURITY ANALYSIS [0-9]* · unit ' "$prompt24" && ok "the prompt is a unit's, minted by the CLI" || bad "not a unit prompt: $(head -1 "$prompt24" 2>/dev/null)"
+grep -q 'Never call `spawn_agent`' "$prompt24" && ok "the prompt forbids subagents in words" || bad "no subagent ban in the prompt"
 grep -q 'security-analysis/SKILL.md' "$prompt24" && ok "and names the skill file by path" || bad "the prompt does not name the skill file"
-grep -q 'Agent. tool' "$prompt24" && bad "the prompt still speaks of the Agent tool" || ok "and never speaks of the Agent tool"
-grep -q 'ALREADY RAN for this analysis' "$prompt24" && ! grep -q 'YOUR FIRST COMMAND' "$prompt24" \
-  && ok "the prompt says the deterministic phase already ran" || bad "the prompt still asks the agent to run prepare, or never says the engine did"
+grep -q '`Agent`' "$prompt24" && bad "the prompt speaks of the Agent tool Codex does not have" || ok "and never speaks of the Agent tool"
+grep -q 'security prepare' "$prompt24" && bad "the prompt still asks the unit to run prepare" || ok "the unit is never asked to run prepare: the orchestrator did"
 E2E_JOB=security-sandbox-oa   # the derived job, which no mkjob made
 [ "$(lastrun | jq -r .id)" = "security-sandbox-oa" ] && [ "$(lastrun | jq -r .platform)" = "openai" ] && [ "$(lastrun | jq -r .cost_basis)" = "estimated" ] \
   && ok "the journal has the derived job's run on openai, priced by estimate" || bad "$(lastrun | jq -c '{id,platform,cost_basis}')"
@@ -1116,33 +1140,39 @@ echo "42. a security analysis on OpenCode goes through the stand-in, closes task
 jq --arg cwd "$ROOT/work/app" '.projects += [{"name":"sandbox-oc","cwd":$cwd,"base":"main","worktree":{"enabled":true},
    "security":{"enabled":true,"platform":"opencode","model":"pdm_ai/glm-5.3-flash","max_budget_usd":5}}]' \
    "$ROOT/config/projects.json" > "$ROOT/projects.next" && mv "$ROOT/projects.next" "$ROOT/config/projects.json"
+# DEEP, so a read unit runs: its reads are the CLI's own `read` tool events,
+# whose range OpenCode reports only in `state.metadata.display` -- the
+# normaliser turns that into Claude Code's shape, and the analysis closes
+# `done` only if those reads cover every line of the deep scope.
 argv42="$ROOT/argv-42"; prompt42="$ROOT/prompt-42"; cfg42="$ROOT/cfg-42"; rm -f "$argv42" "$prompt42" "$cfg42"
 out42="$(AL_SECURITY_ENGINES=off FAKE_SKIP_PREPARE=1 FAKE_ARGV_OUT="$argv42" FAKE_PROMPT_OUT="$prompt42" FAKE_CONFIG_OUT="$cfg42" \
   FAKE_MODE=complete FAKE_SESSION=ses_sec FAKE_COST=0.0002 \
-  "$AL" security analyze sandbox-oc anything main quick 2>&1)"
+  "$AL" security analyze sandbox-oc anything main deep 2>&1)"
 aid42="$(secid "$out42")"
 [ -n "$aid42" ] && ok "the analysis opened: $aid42" || bad "no analysis id in: $out42"
 [ "$(secstate sandbox-oc "$aid42")" = "done" ] \
-  && ok "and closed done: the engine ran security prepare before the agent, and the close found nothing untriaged" \
-  || bad "state '$(secstate sandbox-oc "$aid42")'"
-grep -q 'security-sandbox-oc: deterministic phase ran before the agent (prepare' "$ROOT/data/tick.log" \
-  && ok "the engine ran prepare before launching opencode (prepare_inline is off)" || bad "no engine-side prepare line"
+  && ok "and closed done: every unit's job was proven, and the close found nothing owed" \
+  || bad "state '$(secstate sandbox-oc "$aid42")' -- $(secnote sandbox-oc "$aid42")"
+units42="$("$AL" security units --analysis "${aid42:-0}" 2>/dev/null)"
+printf '%s' "$units42" | jq -e '(.kinds.read.done // 0) >= 1 and .deep.lines > 0 and .deep.lines_read == .deep.lines' >/dev/null 2>&1 \
+  && ok "a read unit ran, and every line of the deep scope is proven read off its read events" \
+  || bad "units: $(printf '%s' "$units42" | jq -c '{kinds, deep}' 2>/dev/null)"
+grep -q "security-sandbox-oc: analysis $aid42 — deterministic phase done" "$ROOT/data/tick.log" \
+  && ok "the orchestrator ran prepare before launching opencode" || bad "no orchestrator prepare line"
 [ "$(at_in "$argv42" 1)" = "run" ] && ok "it went down the OpenCode launch line" || bad "argv: $(tr '\n' ' ' < "$argv42" 2>/dev/null)"
 mi="$(idx_in "$argv42" -m)"; [ -n "${mi:-}" ] && [ "$(at_in "$argv42" $((mi + 1)))" = "pdm_ai/glm-5.3-flash" ] \
   && ok "-m carries the block's model" || bad "-m '$(at_in "$argv42" $((${mi:-0} + 1)))'"
-# No `task: deny` since block 4.2: the derived job closes no tool, so nothing
-# translates into one here. OpenCode still runs no verification (the prompt
-# forbids subagents there and the queue is not served) -- what changed is that
-# the denial is no longer expressed as a permission rule.
-[ "$(jq -r '.permission.task // "unset"' "$cfg42")" = "unset" ] && ok "no task rule: the derived job closes no tool any more" || bad "permission: $(jq -c .permission "$cfg42")"
+# The derived job closes `task` (security_disallowed_tools opencode), and the
+# permission block is where OpenCode takes that rule: a unit that fans out is
+# what analysis 9 spent $51.44 on, and its reads would prove nothing.
+[ "$(jq -r '.permission.task // "unset"' "$cfg42")" = "deny" ] && ok "the task tool is closed by rule" || bad "permission: $(jq -c .permission "$cfg42")"
 [ -n "$(idx_in "$argv42" --auto)" ] && [ "$(jq -r '.permission.bash // "open"' "$cfg42")" != "deny" ] \
   && ok "--auto with bash open: full-access, the security default on opencode" || bad "auto/bash: $(idx_in "$argv42" --auto) / $(jq -c .permission "$cfg42")"
 grep -q 'The `task` tool is closed for this run' "$prompt42" && ok "the prompt says the task tool is closed, by rule" || bad "no task paragraph in the prompt"
 grep -q 'security-analysis/SKILL.md' "$prompt42" && grep -q 'Invoke the `security-analysis` skill' "$prompt42" \
   && ok "and names the skill by name AND by path (the CLI reads ~/.claude/skills: measured)" || bad "the prompt lacks the skill by name or by path"
-grep -q 'ALREADY RAN for this analysis' "$prompt42" && ! grep -q 'YOUR FIRST COMMAND' "$prompt42" \
-  && ok "the prompt says the deterministic phase already ran" || bad "the prompt still asks the agent to run prepare"
-grep -q 'Do not spawn subagents' "$prompt42" && bad "the Codex-only wording leaked into the opencode prompt" || ok "no Codex wording"
+grep -q 'security prepare' "$prompt42" && bad "the prompt still asks the unit to run prepare" || ok "the unit is never asked to run prepare: the orchestrator did"
+grep -q 'spawn_agent' "$prompt42" && bad "the Codex-only wording leaked into the opencode prompt" || ok "no Codex wording"
 E2E_JOB=security-sandbox-oc   # the derived job, which no mkjob made
 [ "$(lastrun | jq -r .id)" = "security-sandbox-oc" ] && [ "$(lastrun | jq -r .platform)" = "opencode" ] && [ "$(lastrun | jq -r .cost_basis)" = "reported" ] \
   && ok "the journal has the derived job's run on opencode, with the CLI's own cost" || bad "$(lastrun | jq -c '{id,platform,cost_basis}')"
@@ -1279,7 +1309,10 @@ grep -q 'j45a: launched detached run' "$ROOT/data/tick.log" && ok "a job with no
 grep -q 'j45b: launched detached run' "$ROOT/data/tick.log" && ok "and so is one with days set and hours blank (the example file's shape)" \
   || bad "no launch line for j45b: $(grep 'j45' "$ROOT/data/tick.log" | tail -2)"
 # The tick detaches both runs; wait for their records rather than for a child.
-w=0; while [ "$w" -lt 20 ] && { [ -z "$(run_of j45a)" ] || [ -z "$(run_of j45b)" ]; }; do sleep 1; w=$((w + 1)); done
+# 60 s, not 20: the loop leaves the moment both records exist, and on a loaded
+# machine (the whole suite, a CI runner) two detached runs once took longer
+# than 20 s to file theirs -- a flake, never a slower success path.
+w=0; while [ "$w" -lt 60 ] &&{ [ -z "$(run_of j45a)" ] || [ -z "$(run_of j45b)" ]; }; do sleep 1; w=$((w + 1)); done
 [ "$(run_of j45a | jq -r .status)" = "success" ] && [ "$(run_of j45a | jq -r .forced)" = "false" ] \
   && ok "j45a ran to a clean success, not forced (waited ${w}s for the records)" || bad "j45a: $(run_of j45a | jq -c '{status,forced}')"
 [ "$(run_of j45b | jq -r .status)" = "success" ] && [ "$(run_of j45b | jq -r .forced)" = "false" ] \
@@ -1618,6 +1651,94 @@ wait
 echo
 }
 
+scenario_54() {
+echo "54. a deep analysis runs every unit to the end and closes done, with every line read"
+printf 'a = 1\n' > "$ROOT/work/app/a.py"; printf 'b = 2\n' > "$ROOT/work/app/b.py"
+git -C "$ROOT/work/app" add -A
+git -C "$ROOT/work/app" -c user.email=e2e@local -c user.name=e2e commit -qm more
+git -C "$ROOT/work/app" push -q origin HEAD:refs/heads/main
+out54="$(FAKE_HUNT_FINDING=1 FAKE_MODE=complete FAKE_SESSION=sess-54 \
+  "$AL" security analyze --detach sandbox anything main deep)"
+aid54="$(secid "$out54")"
+w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid54")" = "running" ]; do sleep 1; w=$((w + 1)); done
+[ "$(secstate sandbox "$aid54")" = "done" ] \
+  && ok "the deep analysis closes done (waited ${w}s)" \
+  || bad "left '$(secstate sandbox "$aid54")' after ${w}s -- $(secnote sandbox "$aid54")"
+u54="$("$AL" security units --analysis "$aid54")"
+[ "$(printf '%s' "$u54" | jq -r '.deep.lines_read == .deep.lines and .deep.lines > 0')" = "true" ] \
+  && ok "every line of the deep scope was read in full ($(printf '%s' "$u54" | jq -r '.deep.lines') lines)" \
+  || bad "deep coverage: $(printf '%s' "$u54" | jq -c '.deep')"
+[ "$(printf '%s' "$u54" | jq -r '[.kinds[] | .done == .total] | all')" = "true" ] \
+  && [ "$(printf '%s' "$u54" | jq -r '.kinds.verify.done // 0')" -ge 1 ] \
+  && ok "every unit is done, the hunt's finding verified by its own unit" \
+  || bad "units: $(printf '%s' "$u54" | jq -c '.kinds')"
+sleep 1
+
+echo
+}
+
+scenario_55() {
+echo "55. a read unit that left a range unread is continued, and the analysis still closes done"
+skip55="$ROOT/skip-55"; rm -rf "$skip55"
+out55="$(FAKE_SKIP_READ_ONCE="$skip55" FAKE_MODE=complete FAKE_SESSION=sess-55 \
+  "$AL" security analyze --detach sandbox anything main deep)"
+aid55="$(secid "$out55")"
+w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid55")" = "running" ]; do sleep 1; w=$((w + 1)); done
+[ "$(secstate sandbox "$aid55")" = "done" ] \
+  && ok "closes done after the continuation (waited ${w}s)" \
+  || bad "left '$(secstate sandbox "$aid55")' -- $(secnote sandbox "$aid55")"
+cont55="$(python3 -c 'import sqlite3, sys; c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True); print(c.execute("SELECT COUNT(*) FROM unit WHERE analysis_id=? AND kind=\x27read\x27 AND attempt=2 AND state=\x27done\x27", (int(sys.argv[2]),)).fetchone()[0])' "$ROOT/data/security.db" "$aid55" 2>/dev/null)"
+[ "${cont55:-0}" -ge 1 ] \
+  && ok "the unread range became attempt 2 of its unit, and that attempt read it" \
+  || bad "no done second attempt of a read unit (got '${cont55:-none}')"
+sleep 1
+
+echo
+}
+
+scenario_56() {
+echo "56. a stop interrupts the whole analysis, and resume finishes it without repeating a done unit"
+out56="$(FAKE_MODE=hang FAKE_SESSION=sess-56 "$AL" security analyze --detach sandbox anything main quick)"
+aid56="$(secid "$out56")"
+w=0
+while [ "$w" -lt 90 ] && ! ls "$ROOT"/data/locks/security-sandbox/*/child >/dev/null 2>&1; do sleep 1; w=$((w + 1)); done
+"$AL" stop security-sandbox >/dev/null 2>&1
+w=0; while [ "$w" -lt 90 ] && [ "$(secstate sandbox "$aid56")" = "running" ]; do sleep 1; w=$((w + 1)); done
+[ "$(secstate sandbox "$aid56")" = "interrupted" ] \
+  && ok "stopping the analysis leaves it interrupted (waited ${w}s)" \
+  || bad "left '$(secstate sandbox "$aid56")' after the stop"
+# The orchestrator marks the analysis interrupted FIRST and lets its lock go
+# after (a resume racing it must see "still winding down", never a live-looking
+# running analysis), so the lock can outlive the state change by a moment:
+# waited for, bounded, rather than read once.
+#
+# THE UNIT'S OWN SLOT IS A SEPARATE ACTOR'S, AND A SLOWER ONE. The
+# orchestrator's reap only watches the unit's AGENT pid (fake-claude here,
+# TERM'd directly by _stop_slot): it flips the row to `interrupted` the
+# moment that pid is gone, not once the unit's own `run_job` wrapper has
+# finished -- and that wrapper still has run_record_stopped_early's
+# security_close_analysis (a `unit-close` subprocess, a ledger write) and,
+# when the unit claimed a worktree, wt_down_all's `git worktree remove`
+# ahead of release_slot. Both are real work, not a leak: on a loaded box (a
+# CI runner shared with other jobs measured this over 30s while never
+# leaving the lock behind for good) 30s cut it too close. 60s, still bounded.
+w=0
+while [ "$w" -lt 60 ] && [ -n "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ]; do
+  sleep 1; w=$((w + 1))
+done
+[ -z "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ] \
+  && ok "and nothing of it still runs: no slot, no orchestrator lock (waited ${w}s)" \
+  || bad "left behind after ${w}s: $(ls -A "$ROOT/data/locks/security-sandbox")"
+FAKE_MODE=complete FAKE_SESSION=sess-56b "$AL" security resume sandbox "$aid56" >/dev/null 2>&1
+w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid56")" != "done" ]; do sleep 1; w=$((w + 1)); done
+[ "$(secstate sandbox "$aid56")" = "done" ] \
+  && ok "resume finishes it (waited ${w}s)" \
+  || bad "after resume: '$(secstate sandbox "$aid56")' -- $(secnote sandbox "$aid56")"
+sleep 1
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1639,11 +1760,11 @@ echo
 # scenario goes at the END of the file and into the LAST list, or, if it is
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # and the count assertion below fails if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26"
 E2E_LIST_3="27 28 29 30 31 32 33 33b 34 35 35b 36 37"
-E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53"
+E2E_LIST_4="38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

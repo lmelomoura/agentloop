@@ -220,7 +220,7 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
     platform_caps opencode "$_cap" && _oc_caps="$_oc_caps $_cap"
   done
   [ "$_oc_caps" = " tool_lists denials cost_reported" ] && ok "opencode has tool_lists, denials and cost_reported, and nothing else" || bad "opencode caps:$_oc_caps"
-  platform_caps anthropic prepare_inline; want "anthropic runs security prepare inside the agent" 0 $?
+  platform_caps anthropic prepare_inline; want "no platform runs security prepare inside the agent: the orchestrator runs it once, on every platform" 1 $?
   platform_caps openai prepare_inline;    want "openai does not (the engine runs it first)"  1 $?
   [ "$(platform_permissions opencode | tr '\n' ' ')" = "full-access read-only " ] && ok "the two opencode modes" || bad "opencode modes: $(platform_permissions opencode | tr '\n' ' ')"
   platform_permission_ok opencode read-only;       want "read-only is an opencode mode"        0 $?
@@ -2321,59 +2321,6 @@ JSON
   printf '["opencode/big-pickle"]' | up_al platform set-models opencode >/dev/null 2>&1; want "set-models writes into the new key" 0 $?
   [ "$("$JQ" -r '.platforms.opencode.models[0]' "$tmp/up/config/platforms.json")" = "opencode/big-pickle" ] && ok "and the model is on the list" || bad "models: $("$JQ" -c .platforms.opencode "$tmp/up/config/platforms.json")"
 
-  echo "security_prompt() — the platform decides how the skill is named and how subagents are forbidden"
-  local _pa _po _pc
-  _pa="$(security_prompt P R B quick 7 'x/**' anthropic)"
-  _po="$(security_prompt P R B quick 7 'x/**' openai)"
-  _pc="$(security_prompt P R B quick 7 'x/**' opencode)"
-  [ "$(security_prompt P R B quick 7 'x/**')" = "$_pa" ] \
-    && ok "security_prompt: no platform argument reads as anthropic" || bad "the six-argument call differs from anthropic"
-  printf '%s\n' "$_pa" | grep -qF 'Invoke the `security-analysis` skill' \
-    && ok "security_prompt anthropic: invokes the skill by name" || bad "anthropic head: $(printf '%s\n' "$_pa" | head -1)"
-  printf '%s\n' "$_pa" | grep -qF 'You HAVE subagents in this run' \
-    && printf '%s\n' "$_pa" | grep -qF 'Use subagents for nothing else' \
-    && ok "security_prompt anthropic: says subagents exist, and for what alone" \
-    || bad "anthropic prompt lacks the verification paragraph"
-  printf '%s\n' "$_po" | grep -qF "Read \`$SKILLS_DIR/security-analysis/SKILL.md\`" \
-    && ok "security_prompt openai: names the skill file by path, not by discovery" || bad "openai head: $(printf '%s\n' "$_po" | head -1)"
-  printf '%s\n' "$_po" | grep -qF 'ALREADY RAN for this analysis' \
-    && ok "security_prompt openai: says the deterministic phase already ran, engine-side" || bad "openai head: $(printf '%s\n' "$_po" | head -1)"
-  printf '%s\n' "$_po" | grep -qF 'YOUR FIRST COMMAND' \
-    && bad "openai prompt still asks the agent to run prepare" || ok "security_prompt openai: never asks the agent to run prepare"
-  printf '%s\n' "$_po" | grep -qF 'Do not spawn subagents' \
-    && ok "security_prompt openai: forbids subagents in words (nothing closes them by flag)" || bad "openai prompt lacks the ban"
-  printf '%s\n' "$_po" | grep -q 'Agent. tool' \
-    && bad "openai prompt still speaks of the Agent tool" || ok "security_prompt openai: never speaks of the Agent tool"
-  printf '%s\n' "$_pa" | grep -qF 'security prepare --analysis 7' && printf '%s\n' "$_pa" | grep -qF 'YOUR FIRST COMMAND' \
-    && ok "security_prompt anthropic: prepare is still the agent's first command, with the analysis id filled in" || bad "the anthropic prompt lost its prepare line"
-  printf '%s\n' "$_pa" | grep -qF 'verify-queue' \
-    && printf '%s\n' "$_pa" | grep -qF 'The close counts' \
-    && ok "security_prompt anthropic: names the verification phase and that it is counted" \
-    || bad "the anthropic prompt does not describe the verification phase"
-  printf '%s\n' "$_po" | grep -qF 'Do not spawn subagents' \
-    && printf '%s\n' "$_pc" | grep -qF 'there are no subagents' \
-    && ok "security_prompt openai/opencode: subagents stay forbidden where verification cannot run" \
-    || bad "a platform without verification lost its ban"
-  printf '%s\n' "$_pa" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
-    && printf '%s\n' "$_po" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
-    && printf '%s\n' "$_pc" | grep -qF "$SKILLS_DIR/security-analysis/references/" \
-    && ok "security_prompt: every platform is told where the hunting guides are" \
-    || bad "security_prompt: a platform's prompt does not name references/"
-  printf '%s\n' "$_pc" | grep -qF 'Invoke the `security-analysis` skill' \
-    && ok "security_prompt opencode: invokes the skill by name" || bad "opencode head: $(printf '%s\n' "$_pc" | head -1)"
-  printf '%s\n' "$_pc" | grep -qF "is \`$SKILLS_DIR/security-analysis/SKILL.md\`" \
-    && ok "security_prompt opencode: and by path too, for a machine where the link is missing" || bad "opencode lacks the skill by path: $(printf '%s\n' "$_pc" | sed -n '5,6p')"
-  printf '%s\n' "$_pc" | grep -qF 'ALREADY RAN for this analysis' \
-    && ok "security_prompt opencode: says the deterministic phase already ran, engine-side" || bad "opencode head: $(printf '%s\n' "$_pc" | head -1)"
-  printf '%s\n' "$_pc" | grep -qF 'YOUR FIRST COMMAND' \
-    && bad "opencode prompt still asks the agent to run prepare" || ok "security_prompt opencode: never asks the agent to run prepare"
-  printf '%s\n' "$_pc" | grep -qF 'The `task` tool is closed for this run' \
-    && ok "security_prompt opencode: the task tool is closed for this run, by rule" || bad "opencode prompt lacks the by-rule paragraph"
-  printf '%s\n' "$_pc" | grep -qF 'Do not spawn subagents' \
-    && bad "the Codex-only wording leaked into the opencode prompt" || ok "security_prompt opencode: never says the Codex-only 'do not spawn subagents'"
-  printf '%s\n' "$_pc" | grep -q 'Agent. tool' \
-    && bad "opencode prompt still speaks of the Agent tool" || ok "security_prompt opencode: never speaks of the Agent tool"
-
   echo "security_derived_jobs() — the block's platform, with the same fallback-and-warn as its permission mode"
   mkdir -p "$tmp/dplat/data"
   cat > "$tmp/dplat/projects.json" <<'JSON'
@@ -2383,7 +2330,8 @@ JSON
  {"name":"Oc","cwd":"/tmp/oc","security":{"enabled":true,"platform":"martian"}},
  {"name":"Oe","cwd":"/tmp/oe","security":{"enabled":true,"model":"claude-sonnet-5"}},
  {"name":"Of","cwd":"/tmp/of","security":{"enabled":true,"platform":"opencode","model":"pdm_ai/glm-5.3-flash","effort":"high"}},
- {"name":"Og","cwd":"/tmp/og","security":{"enabled":true,"platform":"opencode","model":"pdm_ai/vision"}}]}
+ {"name":"Og","cwd":"/tmp/og","security":{"enabled":true,"platform":"opencode","model":"pdm_ai/vision"}},
+ {"name":"Oh","cwd":"/tmp/oh","security":{"enabled":true,"parallel":"abc"}}]}
 JSON
   printf '{"jobs":[]}\n' > "$tmp/dplat/jobs.json"
   # pdm_ai/vision has to be ENABLED too, not just a valid catalog id: Og's
@@ -2405,20 +2353,18 @@ JSON
     && ok "the project's platform is inherited by the block, and valid values are kept" || bad "Ob: $(dplat security-ob '{platform,model,effort,permission_mode}')"
   [ "$(dplat security-oc .platform)" = "anthropic" ] && [ "$(dplat security-oc .model)" = "opus" ] && [ "$(dplat security-oc .permission_mode)" = "bypassPermissions" ] \
     && ok "an unknown platform in the block falls back to anthropic and its defaults" || bad "Oc: $(dplat security-oc '{platform,model,permission_mode}')"
-  dplat security-oa .prompt | grep -qF 'security-analysis/SKILL.md' \
-    && ok "the derived job on openai carries the by-path prompt" || bad "Oa prompt head: $(dplat security-oa .prompt | head -1)"
-  dplat security-ob .prompt | grep -qF 'Do not spawn subagents' \
-    && ok "the derived job on an openai PROJECT carries the subagent ban" || bad "Ob prompt lacks the ban"
-  dplat security-oc .prompt | grep -qF 'Invoke the `security-analysis` skill' \
-    && ok "the derived job that fell back to anthropic carries the by-name prompt" || bad "Oc prompt head: $(dplat security-oc .prompt | head -1)"
+  [ -z "$(dplat security-oa .disallowed_tools)" ] \
+    && ok "the derived job on openai closes no tool by flag: the Codex CLI has none for spawn_agent" \
+    || bad "Oa disallowed_tools: $(dplat security-oa .disallowed_tools)"
+  [ "$(dplat security-oc .disallowed_tools)" = "Agent" ] \
+    && ok "the derived job that fell back to anthropic closes the Agent tool" \
+    || bad "Oc disallowed_tools: $(dplat security-oc .disallowed_tools)"
   [ "$(dplat security-oe .model)" = "opus" ] && ok "a model switched off in Settings falls back to the first one switched on" || bad "Oe model $(dplat security-oe .model)"
   grep -q "not enabled in Settings ('claude-sonnet-5' on anthropic) -- using opus" "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null \
     && ok "and the derivation warning says so" || bad "no warning for Oe: $(cat "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null)"
-  dplat security-of .prompt | grep -qF 'The `task` tool is closed for this run' \
-    && ok "the derived job on opencode carries the by-rule paragraph" || bad "Of prompt lacks the task paragraph"
   [ "$(dplat security-of .platform)" = "opencode" ] && [ "$(dplat security-of .model)" = "pdm_ai/glm-5.3-flash" ] && [ "$(dplat security-of .effort)" = "high" ] \
-    && [ "$(dplat security-of .permission_mode)" = "full-access" ] && [ -z "$(dplat security-of .disallowed_tools)" ] \
-    && ok "an opencode block: platform, model, a variant the model lists, full-access, and no tool closed" || bad "Of: $(dplat security-of '{platform,model,effort,permission_mode,disallowed_tools}')"
+    && [ "$(dplat security-of .permission_mode)" = "full-access" ] && [ "$(dplat security-of .disallowed_tools)" = "task" ] \
+    && ok "an opencode block: platform, model, a variant the model lists, full-access, and the task tool closed" || bad "Of: $(dplat security-of '{platform,model,effort,permission_mode,disallowed_tools}')"
   [ "$(dplat security-og .model)" = "pdm_ai/glm-5.3-flash" ] \
     && ok "a model that makes no tool calls falls back to the first enabled model that does" || bad "Og model $(dplat security-og .model)"
   grep -q "names a model that makes no tool calls ('pdm_ai/vision') -- an analysis needs tools; using pdm_ai/glm-5.3-flash" "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null \
@@ -2435,6 +2381,19 @@ JSON
   grep -q "Broken pipe" "$tmp/dplat/og-stderr.txt" 2>/dev/null \
     && bad "the opencode tools fallback still closes its pipe early: $(cat "$tmp/dplat/og-stderr.txt")" \
     || ok "the opencode tools fallback prints no \"write error: Broken pipe\" while picking a model"
+
+  # A non-numeric security.parallel: max_parallel still clamps to 3, and the
+  # warning has to reach derivation-warnings.txt even though security_parallel
+  # (which raises it) is only ever read through a `--arg par "$( )"` inside
+  # jobs_json's own jq call -- a command substitution forks a subshell, and a
+  # security_warn raised inside one updates that subshell's own copy of
+  # SECURITY_WARNINGS, lost the moment it exits, never reaching this
+  # derivation's collection or the file it flushes to.
+  [ "$(dplat security-oh .max_parallel)" = "3" ] \
+    && ok "a non-numeric security.parallel still clamps to 3" || bad "Oh max_parallel: $(dplat security-oh .max_parallel)"
+  grep -q "has a non-numeric parallel ('abc') -- running 3 units at a time" "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null \
+    && ok "and the warning reaches derivation-warnings.txt, not just the subshell that raised it" \
+    || bad "no parallel warning for Oh: $(cat "$tmp/dplat/data/security/derivation-warnings.txt" 2>/dev/null)"
 
   # openai with no catalog resolved yet: platform_default_model answers
   # nothing for it, so the model must come out empty rather than some other
@@ -3592,17 +3551,17 @@ EOF
   fi
 
   echo "the security-analysis skill ships with the repo, not only in ~/.claude/skills"
-  # security_prompt() makes this skill MANDATORY ("Invoke the
-  # `security-analysis` skill and follow it exactly") -- a prompt that names a
-  # skill the machine does not have is a prompt whose standards silently do
-  # not apply. See the comment above SKILLS_DIR for why the skills this loop
-  # depends on live here rather than only in the unversioned user directory.
+  # Every unit's prompt makes this skill MANDATORY (bin/security/prompts.py,
+  # `_skill_line`) -- a prompt that names a skill the machine does not have is
+  # a prompt whose standards silently do not apply. See the comment above
+  # SKILLS_DIR for why the skills this loop depends on live here rather than
+  # only in the unversioned user directory.
   [ -f "$SKILLS_DIR/security-analysis/SKILL.md" ] \
     && ok "the security-analysis skill ships with the repo" \
     || bad "the security-analysis skill ships with the repo"
-  grep -q 'security-analysis' "$SELF" \
-    && ok "the prompt still names the security-analysis skill" \
-    || bad "the prompt still names the security-analysis skill"
+  grep -q 'security-analysis' "$BIN_DIR/security/prompts.py" \
+    && ok "the unit prompts still name the security-analysis skill" \
+    || bad "the unit prompts still name the security-analysis skill"
 
   echo "a human's board move is an answer, not an anomaly"
   # QG-15: the cap parked the ticket, the human moved it to the ready column, and
@@ -6490,22 +6449,41 @@ PY
   [ -n "$got" ] && [ -f "$got" ] && ok "a stop with no logfile breadcrumb still writes one" \
     || bad "log path '$got'"
   rm -rf "$tmp/locks/j9/778"
-  # A derived security job stopped before its agent started left its analysis
-  # `running` for ever (seen on a real install: the page refused a second
-  # Analyse and the row had to be closed by hand). The record closes the
-  # analysis with the run's own verdict, through the same door the
-  # classifier uses, and a plain job never reaches that door.
+  # A unit of a security analysis stopped before its agent started must not
+  # leave its unit `running` (the analysis row used to stay `running` for
+  # ever the same way, seen on a real install). The record closes the UNIT
+  # with the run's own verdict, `stopped`, through the same door the
+  # classifier's close uses, and a plain job never reaches that door.
   local sl5="$tmp/locks/security-app/779"
   mkdir -p "$sl5"; echo 779 > "$sl5/pid"; echo 1700000000 > "$sl5/start"; : > "$sl5/stopped"
   : > "$tmp/secpy.calls"
   ( CONFIG_DIR="$tmp/cfg"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/stop5.ndjson"
     STATE_FILE="$tmp/stopstate.json"; LOG_DIR="$tmp/stoplogs"; TICK_LOG="$tmp/stop.tick"
-    AL_SECURITY_ANALYSIS_ID=41
+    AL_SECURITY_ANALYSIS_ID=41 AL_SECURITY_UNIT_ID=9
     security_py() { printf '%s\n' "$*" >> "$tmp/secpy.calls"; }
     run_record_stopped_early security-app "$sl5" ) >/dev/null 2>&1
-  grep -q '^finish --analysis 41 --state failed' "$tmp/secpy.calls" \
-    && ok "a derived job stopped before its agent closes its analysis as failed" \
+  grep -q '^unit-close --analysis 41 --unit 9 --stream  --root  --status stopped ' "$tmp/secpy.calls" \
+    && ok "a unit stopped before its agent closes its unit as stopped" \
     || bad "security_py calls: $(cat "$tmp/secpy.calls")"
+  # Stopped AFTER its agent ran ($slot/child): the close gets the stream
+  # run_job wrote beside $slot/logfile and the run's root from
+  # $slot/worktree -- evidence already paid for, which the close judges the
+  # unit by (reads counted, a subagent seen) instead of by nothing.
+  local sl7="$tmp/locks/security-app/783" wt7="$tmp/stopwt7"
+  mkdir -p "$sl7" "$tmp/stoplogs/security-app" "$wt7"
+  echo 783 > "$sl7/pid"; echo 1700000000 > "$sl7/start"; : > "$sl7/stopped"; : > "$sl7/child"
+  echo "$tmp/stoplogs/security-app/20260925T100000Z-783.json" > "$sl7/logfile"
+  echo "$wt7" > "$sl7/worktree"
+  : > "$tmp/stoplogs/security-app/20260925T100000Z-783.stream.ndjson"
+  : > "$tmp/secpy.calls"
+  ( CONFIG_DIR="$tmp/cfg"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/stop7.ndjson"
+    STATE_FILE="$tmp/stopstate.json"; LOG_DIR="$tmp/stoplogs"; TICK_LOG="$tmp/stop.tick"
+    AL_SECURITY_ANALYSIS_ID=41 AL_SECURITY_UNIT_ID=10
+    security_py() { printf '%s\n' "$*" >> "$tmp/secpy.calls"; }
+    run_record_stopped_early security-app "$sl7" ) >/dev/null 2>&1
+  grep -q "^unit-close --analysis 41 --unit 10 --stream $tmp/stoplogs/security-app/20260925T100000Z-783.stream.ndjson --root $wt7 --status stopped " "$tmp/secpy.calls" \
+    && ok "a unit stopped after its agent ran is closed with the stream and the root its run left" \
+    || bad "stopped-early close with evidence: $(cat "$tmp/secpy.calls")"
   : > "$tmp/secpy.calls"
   local sl6="$tmp/locks/j9/781"
   mkdir -p "$sl6"; echo 781 > "$sl6/pid"; echo 1700000000 > "$sl6/start"; : > "$sl6/stopped"
@@ -7331,34 +7309,21 @@ JSON
     && ok "the derived job carries the project's security model" \
     || bad "the derived job carries the project's security model"
 
-  # The `Agent` tool is closed at LAUNCH, not asked for in the prompt -- asking
-  # is what already failed twice ($51.44, six subagents, zero of 40
-  # deterministic findings triaged; see SECURITY_DISALLOWED_TOOLS). That is the
-  # Claude Code half: on Codex nothing closes `spawn_agent` by flag, so there
-  # the prompt is the only door (security_prompt, checked above). Three
-  # separate things have to hold, and each has its own way of silently
-  # regressing: the field on the derived job, the field NOT leaking onto
-  # ordinary jobs, and run_job actually turning the field into a CLI flag.
-  #
-  # The literal "Agent", NOT $SECURITY_DISALLOWED_TOOLS. Comparing the emitted
-  # value against the very constant that produced it asserts nothing: a test
-  # may not take its expected value from the thing it tests.
-  #
-  # SINCE BLOCK 4.2 THE ASSERTION IS THE OTHER WAY UP. The verification phase
-  # IS subagents, so the tool is open and the derived job closes nothing --
-  # and what keeps that honest is not this field but the CLOSE, which counts
-  # the `Task` calls in the run's stream against the verdicts in the ledger
-  # (see security_task_count and `finish --tasks-launched`). An empty field
-  # here would also be what a BROKEN derivation produces, so the job is read
-  # for a field it must carry as well: an empty `disallowed_tools` on a job
-  # that has a prompt is the open tool; an empty one on a job that has
-  # nothing is a derivation that fell over.
+  # The subagent tool is closed at LAUNCH, not asked for in the prompt --
+  # asking is what already failed twice ($51.44, six subagents, zero of 40
+  # deterministic findings triaged). Since the pipeline the ENGINE distributes
+  # an analysis's work into units, so the derived job closes `Agent` again
+  # (security_disallowed_tools; the roster calls it `Task`), and a unit whose
+  # stream shows one is a failed attempt anyway (security/units.py). The
+  # literal "Agent", NOT the function's output: a test may not take its
+  # expected value from the thing it tests. The prompt is read beside it, so
+  # a derivation that fell over -- no field at all -- cannot pass for it.
   ( JOBS_FILE="$tmp/derived/jobs.json"; PROJECTS_FILE="$tmp/derived/projects.json"
     DATA_DIR="$tmp/derived/data"
-    [ -z "$(job_get security-web '.disallowed_tools' '')" ] \
+    [ "$(job_get security-web '.disallowed_tools' '')" = "Agent" ] \
     && [ -n "$(job_get security-web '.prompt' '')" ] ) \
-    && ok "the derived job closes no tool: verification needs subagents, and the close counts them" \
-    || bad "the derived job's disallowed_tools is '$(job_get security-web '.disallowed_tools' '')' with prompt length $(job_get security-web '.prompt' '' | wc -c)"
+    && ok "the derived job closes the Agent tool: the engine distributes the work into units" \
+    || bad "the derived job's disallowed_tools is not Agent"
 
   # A real job of the operator's carries no such field either, and never did:
   # what a user's job may launch is the user's business.
@@ -7490,15 +7455,6 @@ JSON
     && ok "run_job launches config/platforms.json's own bin, the same one platform_ready checked" \
     || bad "the launch never reached the file's bin — no launch argv reached the recorder: $av_filebin"
 
-  # The prompt explains the absence. It does not enforce it (the flag does),
-  # but an agent that finds a tool missing with no reason given wastes turns
-  # rediscovering the wall the first analysis already paid to find.
-  ( JOBS_FILE="$tmp/derived/jobs.json"; PROJECTS_FILE="$tmp/derived/projects.json"
-    DATA_DIR="$tmp/derived/data"
-    job_get security-web '.prompt' '' | grep -q 'You HAVE subagents in this run' ) \
-    && ok "the derived job's prompt says subagents exist and what they are for" \
-    || bad "the prompt no longer explains what subagents are for"
-
   # The mode the analysis runs under. dontAsk looked safer and was the
   # opposite: headless dontAsk denies every tool outside an allowlist a fresh
   # worktree does not have, so the first live analysis could not run one
@@ -7554,13 +7510,6 @@ JSON
     && ok "the derived job is disabled, so a scheduled tick never launches it" \
     || bad "the derived job is disabled, so a scheduled tick never launches it"
 
-  # The prompt has to carry the request, or the agent has no branch to analyse.
-  ( JOBS_FILE="$tmp/derived/jobs.json"; PROJECTS_FILE="$tmp/derived/projects.json"
-    DATA_DIR="$tmp/derived/data"
-    job_get security-web '.prompt' '' | grep -q 'develop' ) \
-    && ok "the derived job's prompt names the requested branch" \
-    || bad "the derived job's prompt names the requested branch"
-
   # write_jobs must not learn about it: config/jobs.json stays the user's.
   ( JOBS_FILE="$tmp/derived/jobs.json"; PROJECTS_FILE="$tmp/derived/projects.json"
     DATA_DIR="$tmp/derived/data"; CONFIG_DIR="$tmp/derived"
@@ -7575,81 +7524,162 @@ JSON
     && ok "the security- prefix is refused for a hand-made job" \
     || bad "the security- prefix is refused for a hand-made job"
 
+  # The engine's own security calls run without the agent's flag. `finish`,
+  # `unit-close` and the lifecycle verbs are refused to an agent session,
+  # and the engine makes them from inside the run_job that exported
+  # AL_SECURITY_AGENT for the agent: without the unset every close of every
+  # analysis would be refused, and every analysis would stay `running`.
+  ( AL_SECURITY_AGENT=1; CC_SECURITY_AGENT=1; export AL_SECURITY_AGENT CC_SECURITY_AGENT
+    PYTHON="$tmp/env-python"
+    printf '#!/bin/bash\nprintf "%%s|%%s\\n" "${AL_SECURITY_AGENT:-}" "${CC_SECURITY_AGENT:-}"\n' > "$PYTHON"
+    chmod +x "$PYTHON"
+    [ "$(security_engine_py finish --analysis 1 --state done)" = "|" ] \
+      && [ "$(security_py finish --analysis 1 --state done)" = "1|1" ] ) \
+    && ok "security_engine_py calls the CLI with the agent flag removed, and only that call" \
+    || bad "security_engine_py passed the agent flag through, or security_py lost it"
+
   # security_close_analysis must ignore every job that is not a derived one,
   # or a normal run ending would try to close an analysis that never existed.
   ( DATA_DIR="$tmp/derived/data"; security_close_analysis "real-job" "error" "0" ) \
     && ok "closing an analysis is a no-op for a job that is not derived" \
     || bad "closing an analysis is a no-op for a job that is not derived"
 
-  # What a run read, off its own stream: `Read` on Claude Code (file_path),
-  # `read` on OpenCode (filePath, already canonicalised to Read by the
-  # normaliser) and a `cat` through Bash on Codex all land in `input`, so the
-  # input is matched as ONE string, with no per-platform key map.
-  mkdir -p "$tmp/guides"
-  cat > "$tmp/guides/stream.ndjson" <<'JSON'
-{"type":"system","subtype":"init"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/Users/me/.claude/skills/security-analysis/references/ATTACK-CLASSES.md"}}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"2","name":"Read","input":{"filePath":"/Users/me/.claude/skills/security-analysis/references/AI-AND-LLM.md"}}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"3","name":"Bash","input":{"command":"cat /Users/me/.claude/skills/security-analysis/references/AI-AND-LLM.md | head"}}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"reading references/CLIENT-SIDE.md is not a tool call"}]}}
-{"type":"result","subtype":"success"}
+  echo "security units — the engine's side of the pipeline"
+  [ "$(security_disallowed_tools anthropic)" = "Agent" ] && [ "$(security_disallowed_tools opencode)" = "task" ] \
+    && [ -z "$(security_disallowed_tools openai)" ] \
+    && ok "a unit is launched without its platform's subagent tool" \
+    || bad "security_disallowed_tools: $(security_disallowed_tools anthropic)/$(security_disallowed_tools opencode)"
+  ( security_get() { printf '%s\n' "$PAR"; }
+    for pair in ":3" "5:5" "0:1" "20:8" "08:8" "abc:3"; do
+      PAR="${pair%%:*}"; want_par="${pair##*:}"
+      [ "$(security_parallel web)" = "$want_par" ] || { echo "parallel '$PAR' gave $(security_parallel web)"; exit 1; }
+    done ) && ok "security.parallel is 1 to 8, 3 when unset or unusable" || bad "security_parallel"
+  ( run_job() { printf '%s|%s|%s|%s|%s\n' "$1" "$AL_BASE_OVERRIDE" "$AL_SECURITY_UNIT_ID" "$AL_SECURITY_ANALYSIS_ID" "$AL_SECURITY_AGENT"; }
+    [ "$(security_run_unit security-x 7 42 abc123 web)" = "security-x|abc123|42|7|1" ] ) \
+    && ok "a unit runs at the analysis's commit, with its own unit id" \
+    || bad "security_run_unit did not export what a unit needs"
+  mkdir -p "$tmp/units"
+  ( DATA_DIR="$tmp/units/data"; mkdir -p "$DATA_DIR"
+    AL_SECURITY_ANALYSIS_ID=7 AL_SECURITY_UNIT_ID=42 AL_SECURITY_AGENT=1; export AL_SECURITY_AGENT
+    run_cwd="/Users/me/run"
+    security_py() { printf '%s|%s\n' "${AL_SECURITY_AGENT:-}" "$*" >> "$tmp/units/calls"; }
+    security_close_analysis security-x stopped 1.5 "STOPPED: ended on purpose" "$tmp/units/s.ndjson"
+    security_close_analysis real-job success 1 "" )
+  grep -qx -- '|unit-close --analysis 7 --unit 42 --stream '"$tmp"'/units/s.ndjson --root /Users/me/run --status stopped --reason STOPPED: ended on purpose --spend 1.5' "$tmp/units/calls" \
+    && [ "$(wc -l < "$tmp/units/calls" | tr -d ' ')" = 1 ] \
+    && ok "a unit's run closes its unit, without the agent flag, and a plain job closes nothing" \
+    || bad "security_close_analysis calls: $(cat "$tmp/units/calls" 2>/dev/null)"
+  echo "security_unit_gate() — a unit's forced run still answers to the engine's gates"
+  # The classifier's cause reaches unit-close when there is one: a
+  # rate-limited run is the provider's doing, and the unit keeps its attempt.
+  ( DATA_DIR="$tmp/units/data"; AL_SECURITY_ANALYSIS_ID=7 AL_SECURITY_UNIT_ID=43
+    run_cwd="/Users/me/run"
+    security_py() { printf '%s\n' "$*" >> "$tmp/units/cause-calls"; }
+    security_close_analysis security-x error 0.2 "" "$tmp/units/s.ndjson" "" rate_limited
+    AL_SECURITY_UNIT_ID=44 security_close_analysis security-x error 0.2 "" "$tmp/units/s.ndjson" "" "" )
+  grep -qx -- 'unit-close --analysis 7 --unit 43 --stream '"$tmp"'/units/s.ndjson --root /Users/me/run --status error --reason  --spend 0.2 --cause rate_limited' "$tmp/units/cause-calls" \
+    && grep -qx -- 'unit-close --analysis 7 --unit 44 --stream '"$tmp"'/units/s.ndjson --root /Users/me/run --status error --reason  --spend 0.2' "$tmp/units/cause-calls" \
+    && ok "the run's cause reaches unit-close, and no --cause is passed without one" \
+    || bad "security_close_analysis cause calls: $(cat "$tmp/units/cause-calls" 2>/dev/null)"
+  # daily_gate is run_job's own daily arithmetic, shared with the gate below.
+  ( daily_cap_for() { printf '5\n'; }; spent_today() { printf '5.000000\n'; }; global_daily_cap() { :; }
+    [ "$(daily_gate j)" = "job 5.000000 5" ] ) \
+    && ok "a job at its own daily cap is gated" || bad "daily_gate at the job's cap"
+  ( daily_cap_for() { :; }; global_daily_cap() { printf '10\n'; }; spent_today_all() { printf '3\n'; }
+    ! daily_gate j >/dev/null ) \
+    && ok "under the fleet's cap the daily gate is open" || bad "daily_gate under the global cap"
+  ( daily_cap_for() { printf '50\n'; }; spent_today() { printf '1\n'; }
+    global_daily_cap() { printf '10\n'; }; spent_today_all() { printf '12\n'; }
+    [ "$(daily_gate j)" = "global 12 10" ] ) \
+    && ok "over the fleet's cap the daily gate is closed, whatever the job's own says" \
+    || bad "daily_gate over the global cap"
+  ( resolve() { printf 'anthropic\n'; }; job_account() { printf 'default\n'; }
+    account_env_dir() { :; }; rl_key() { printf 'k\n'; }
+    rl_gate() { return 1; }; daily_gate() { return 1; }
+    out="$(security_unit_gate security-x)"; rc=$?
+    [ "$rc" -eq 0 ] && [ -z "$out" ] ) \
+    && ok "with every gate open a unit may launch" || bad "security_unit_gate with open gates"
+  ( resolve() { printf 'anthropic\n'; }; job_account() { printf 'default\n'; }
+    account_env_dir() { :; }; rl_key() { printf 'k\n'; }
+    rl_gate() { printf 'the five-hour window is at 100%%\n'; return 0; }; daily_gate() { return 1; }
+    out="$(security_unit_gate security-x)"; rc=$?
+    [ "$rc" -eq 3 ] && [ "$out" = "the usage limit was reached (the five-hour window is at 100%)" ] ) \
+    && ok "a usage window at its limit closes the gate, named" || bad "security_unit_gate on the usage window"
+  ( resolve() { printf 'anthropic\n'; }; job_account() { printf 'default\n'; }
+    account_env_dir() { :; }; rl_key() { printf 'k\n'; }
+    rl_gate() { return 1; }; daily_gate() { printf 'job 3.10 3.00\n'; }
+    out="$(security_unit_gate security-x)"; rc=$?
+    [ "$rc" -eq 3 ] && [ "$out" = 'the daily cap of security-x was reached ($3.10 / $3.00)' ] ) \
+    && ok "the job's daily cap closes the gate, named" || bad "security_unit_gate on the daily cap"
+  ( resolve() { printf 'anthropic\n'; }; job_account() { printf 'default\n'; }
+    account_env_dir() { :; }; rl_key() { printf 'k\n'; }
+    rl_gate() { return 1; }; daily_gate() { printf 'global 12 10\n'; }
+    out="$(security_unit_gate security-x)"; rc=$?
+    [ "$rc" -eq 3 ] && [ "$out" = 'the global daily cap was reached ($12 / $10 across all jobs)' ] ) \
+    && ok "the global daily cap closes the gate, named" || bad "security_unit_gate on the global cap"
+  # A security run that is not a unit -- no unit id in its environment -- is
+  # refused before any slot, worktree or log exists, and closes nothing.
+  printf '{"projects":[]}\n' > "$tmp/units/projects.json"
+  ( DATA_DIR="$tmp/units/data"; TICK_LOG="$tmp/units/tick.log"; PROJECTS_FILE="$tmp/units/projects.json"
+    AL_SECURITY_ANALYSIS_ID=7; unset AL_SECURITY_UNIT_ID
+    jobs_json() { printf '{"jobs":[{"id":"security-x","project":"","prompt":"p"}]}\n'; }
+    acquire_slot() { echo "slot taken" >> "$tmp/units/slot"; return 1; }
+    run_job security-x --force; echo "rc=$?" > "$tmp/units/rj" ) >/dev/null 2>&1
+  [ "$(cat "$tmp/units/rj" 2>/dev/null)" = "rc=1" ] && [ ! -e "$tmp/units/slot" ] \
+    && grep -q 'runs only as a unit of an analysis' "$tmp/units/tick.log" 2>/dev/null \
+    && ok "a security job with no unit id is refused before it takes a slot" \
+    || bad "run_job of a security job without a unit: $(cat "$tmp/units/rj" 2>/dev/null) / $(cat "$tmp/units/tick.log" 2>/dev/null)"
+  ( LOCK_DIR="$tmp/units/locks"; mkdir -p "$LOCK_DIR/security-x/.analysis"
+    sleep 30 & fake=$!
+    printf '%s\n' "$fake" > "$LOCK_DIR/security-x/.analysis/pid"; boot_id > "$LOCK_DIR/security-x/.analysis/boot"
+    AL_SECURITY_ORCHESTRATOR=1 cmd_stop security-x >/dev/null 2>&1
+    kill -0 "$fake" 2>/dev/null || exit 1
+    cmd_stop security-x 12345 >/dev/null 2>&1; sleep 0.3
+    # A killed child this subshell has not reaped yet still answers kill -0:
+    # its state says whether it is gone.
+    case "$(ps -o stat= -p "$fake" 2>/dev/null)" in
+      ''|Z*) exit 0 ;;
+      *) kill "$fake" 2>/dev/null; exit 2 ;;
+    esac ) 2>/dev/null \
+    && ok "stopping any run of an analysis signals its orchestrator, unless the orchestrator is asking" \
+    || bad "cmd_stop and the orchestrator (rc $?)"
+  # The analysis lock's pid-less window: a taker between acquire_lock's mkdir
+  # and its pid write holds the lock (analyze and resume must refuse), until
+  # the lock is older than the grace; a pid that is gone holds nothing.
+  ( LOCK_DIR="$tmp/units/win"; mkdir -p "$LOCK_DIR/security-w/.analysis"
+    security_analysis_live security-w || exit 1
+    touch -t 202001010000 "$LOCK_DIR/security-w/.analysis"
+    security_analysis_live security-w && exit 2
+    sleep 30 & live=$!
+    printf '%s\n' "$live" > "$LOCK_DIR/security-w/.analysis/pid"; boot_id > "$LOCK_DIR/security-w/.analysis/boot"
+    security_analysis_live security-w || { kill "$live"; exit 3; }
+    kill "$live"; wait "$live" 2>/dev/null
+    security_analysis_live security-w && exit 4
+    rm -rf "$LOCK_DIR/security-w/.analysis"
+    security_analysis_live security-w && exit 5
+    exit 0 ) \
+    && ok "an analysis lock with no pid yet holds until the grace, one with a dead pid holds nothing" \
+    || bad "security_analysis_live (rc $?)"
+  # The budget the orchestrator enforces is the derived job's, read -- the
+  # derivation's validation and its fallback, never a second copy of them. A
+  # declared "5 USD" reaches the orchestrator as the conservative fallback,
+  # never as the text a float() dies on (the tick would resume that corpse
+  # three times); an unset budget stays unset.
+  mkdir -p "$tmp/sbud/data"
+  cat > "$tmp/sbud/projects.json" <<'JSON'
+{"projects":[
+ {"name":"Typed","cwd":"/tmp/t","security":{"enabled":true,"max_budget_usd":"5 USD"}},
+ {"name":"Good","cwd":"/tmp/g","security":{"enabled":true,"max_budget_usd":7.5}},
+ {"name":"Open","cwd":"/tmp/o","security":{"enabled":true}}]}
 JSON
-  [ "$(security_guides_read "$tmp/guides/stream.ndjson")" = "AI-AND-LLM,ATTACK-CLASSES" ] \
-    && ok "security_guides_read: the guides a run opened, once each, off Read/read/Bash alike" \
-    || bad "security_guides_read: got '$(security_guides_read "$tmp/guides/stream.ndjson")'"
-  printf '{"type":"result"}\n' > "$tmp/guides/none.ndjson"
-  [ -z "$(security_guides_read "$tmp/guides/none.ndjson")" ] \
-    && ok "security_guides_read: a run that opened no guide answers an empty list, not unknown" \
-    || bad "security_guides_read on a guide-less stream: '$(security_guides_read "$tmp/guides/none.ndjson")'"
-  [ "$(security_guides_read "$tmp/guides/missing.ndjson")" = "unknown" ] \
-    && [ "$(security_guides_read "")" = "unknown" ] \
-    && ok "security_guides_read: a missing or unnamed stream answers unknown, never none" \
-    || bad "security_guides_read on a missing stream: '$(security_guides_read "$tmp/guides/missing.ndjson")'"
-  # The close hands the answer to `finish` as --guides-read, and `unknown`
-  # when it has no stream to read.
-  ( DATA_DIR="$tmp/derived/data"; AL_SECURITY_ANALYSIS_ID=7
-    security_py() { printf '%s\n' "$*" >> "$tmp/guides/calls"; }
-    security_close_analysis "security-x" success 1 "" "$tmp/guides/stream.ndjson"
-    security_close_analysis "security-x" success 1 "" )
-  grep -q -- '--guides-read AI-AND-LLM,ATTACK-CLASSES' "$tmp/guides/calls" \
-    && grep -q -- '--guides-read unknown' "$tmp/guides/calls" \
-    && ok "security_close_analysis passes what was read to finish, and unknown without a stream" \
-    || bad "security_close_analysis calls: $(cat "$tmp/guides/calls")"
-
-  # The subagents a run launched, off its own stream. BOTH NAMES: a `tool_use`
-  # block carries `Agent` on Claude Code (measured on the block 4.2 acceptance
-  # run) while the init roster and OpenCode's normaliser say `Task`. The
-  # fixture below holds one of each, and the count is 2.
-  cat > "$tmp/guides/tasks.ndjson" <<'JSON'
-{"type":"system","subtype":"init"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"1","name":"Task","input":{"description":"verify b1b1","prompt":"You are verifying one security finding"}}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"2","name":"Read","input":{"file_path":"/Users/me/x.py"}}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"3","name":"Agent","input":{"description":"verify c2c2","prompt":"You are verifying one security finding","subagent_type":"general-purpose"}}]}}
-{"type":"result","subtype":"success"}
-JSON
-  [ "$(security_task_count "$tmp/guides/tasks.ndjson")" = "2" ] \
-    && ok "security_task_count: counts the subagents a run launched" \
-    || bad "security_task_count: got '$(security_task_count "$tmp/guides/tasks.ndjson")'"
-  [ "$(security_task_count "$tmp/guides/none.ndjson")" = "0" ] \
-    && ok "security_task_count: a run that launched none answers 0" \
-    || bad "security_task_count on a Task-less stream: '$(security_task_count "$tmp/guides/none.ndjson")'"
-  [ -z "$(security_task_count "$tmp/guides/missing.ndjson")" ] \
-    && [ -z "$(security_task_count "")" ] \
-    && ok "security_task_count: a missing stream answers nothing, never 0 -- the close then makes no comparison" \
-    || bad "security_task_count on a missing stream: '$(security_task_count "$tmp/guides/missing.ndjson")'"
-  ( DATA_DIR="$tmp/derived/data"; AL_SECURITY_ANALYSIS_ID=7
-    security_py() { printf '%s\n' "$*" >> "$tmp/guides/tcalls"; }
-    security_close_analysis "security-x" success 1 "" "$tmp/guides/tasks.ndjson"
-    security_close_analysis "security-x" success 1 "" )
-  grep -q -- '--tasks-launched 2' "$tmp/guides/tcalls" \
-    && [ "$(grep -c -- '--tasks-launched' "$tmp/guides/tcalls")" = "1" ] \
-    && ok "security_close_analysis passes the Task count, and omits the flag without a stream" \
-    || bad "security_close_analysis calls: $(cat "$tmp/guides/tcalls")"
-
-  # The Agent tool is OPEN now, and the prompt says what for.
-  [ -z "$SECURITY_DISALLOWED_TOOLS" ] \
-    && ok "the Agent tool is no longer closed at launch: verification needs subagents" \
-    || bad "SECURITY_DISALLOWED_TOOLS is '$SECURITY_DISALLOWED_TOOLS'"
+  printf '{"jobs":[]}\n' > "$tmp/sbud/jobs.json"
+  ( JOBS_FILE="$tmp/sbud/jobs.json"; PROJECTS_FILE="$tmp/sbud/projects.json"; DATA_DIR="$tmp/sbud/data"
+    TICK_LOG="$tmp/sbud/data/tick.log"
+    [ "$(security_analysis_budget security-typed)" = "$SECURITY_FALLBACK_BUDGET_USD" ] \
+      && [ "$(security_analysis_budget security-good)" = "7.5" ] \
+      && [ -z "$(security_analysis_budget security-open)" ] ) \
+    && ok "the orchestrator's budget is the derived job's: a typo falls back where the derivation falls back, never raw" \
+    || bad "security_analysis_budget does not read the derivation's validated budget"
 
   # A project name that slugs to nothing (e.g. "!!!") would derive the bare
   # prefix -- not a usable id, and not any project's job. It must be skipped,
@@ -8153,89 +8183,169 @@ JSON
     CONFIG_DIR="$sec/cfg"; DATA_DIR="$sec/data"; LOCK_DIR="$sec/data/locks"
     TICK_LOG="$sec/data/tick.log"; RUNS_FILE="$sec/data/runs.ndjson"
     AGENTLOOP_SECURITY_DB="$secdb"
+    # EXPORTED, for every process a block starts. A child `agentloop` -- the
+    # orchestrator's `__run-unit`, a detached `__run-analysis` -- recomputes
+    # its config, data and ledger from these three and nothing else; left
+    # unexported, a process that escaped a stub would read and write the LIVE
+    # installation's config, ledger and tick.log.
+    export AGENTLOOP_CONFIG="$sec/cfg" AGENTLOOP_DATA="$sec/data" AGENTLOOP_SECURITY_DB
   }
-  # An analysis row that is allowed to close `done`. `finish` downgrades a
-  # `done` close to `capped` for a row whose deterministic phases never ran
-  # (bin/security/cli.py, cmd_finish) -- so every fixture below that is about
-  # what a CLOSE does has to prepare its row first, or it silently stops
-  # testing the close and starts testing that guard. The tree is deliberately
+  # An analysis row that is allowed to close `done`, planned. `finish`
+  # downgrades a `done` close to `capped` for a row whose deterministic phases
+  # never ran (bin/security/cli.py, cmd_finish) -- so every fixture below that
+  # is about what a CLOSE does has to prepare its row first, or it silently
+  # stops testing the close and starts testing that guard. `--plan`, so the
+  # analysis has its units (a quick one: its `hunt`). The tree is deliberately
   # empty: what is asserted here is the verdict, not what prepare found.
   mkdir -p "$sec/tree"
-  sec_open() { # sec_open [commit-sha] -> the id of a prepared, running analysis
+  sec_open() { # sec_open [commit-sha] -> the id of a prepared, running analysis, planned
     local a
     a="$(security_py open-analysis --project "Sec App" --repo repo --branch main \
            --commit "${1:-abc}" --profile quick --run-id "$secjid" | "$JQ" -r '.analysis_id')"
-    security_py prepare --analysis "$a" --root "$sec/tree" --offline >/dev/null 2>&1
+    security_py prepare --analysis "$a" --root "$sec/tree" --offline --plan >/dev/null 2>&1
     printf '%s' "$a"
+  }
+  # Read-only readers of the unit table (mode=ro), as e2e scenario 55 reads the
+  # ledger: nothing here writes around the CLI's door.
+  sec_unit() { # sec_unit <analysis-id> <kind> -> the id of its first unit of that kind
+    "$PYTHON" -c 'import sqlite3, sys
+c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+r = c.execute("SELECT id FROM unit WHERE analysis_id=? AND kind=? ORDER BY seq LIMIT 1",
+              (int(sys.argv[2]), sys.argv[3])).fetchone()
+print(r[0] if r else "")' "$secdb" "$1" "$2"
+  }
+  sec_unit_state() { # sec_unit_state <unit-id> -> "<state>,<spend>[,<its continuation's attempt>]"
+    "$PYTHON" -c 'import sqlite3, sys
+c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+u = c.execute("SELECT state, spend_usd FROM unit WHERE id=?", (int(sys.argv[2]),)).fetchone()
+k = c.execute("SELECT attempt FROM unit WHERE parent=?", (int(sys.argv[2]),)).fetchone()
+print(",".join([u[0], repr(u[1])] + ([str(k[0])] if k else [])))' "$secdb" "$1"
   }
   local secreq="$sec/data/security/requests/$secjid.json"
 
-  # run_job is stubbed, so nothing spends a session -- but the stub reads the
-  # ledger from INSIDE the call, which is the only way to prove the row is
-  # open, and open as `running`, at the moment the run starts. That ordering is
-  # the whole point of opening it in cmd_security_analyze rather than in
-  # `prepare`: an agent that dies on launch must still leave an analysis.
+  # security_orchestrate is stubbed, so nothing starts an orchestrator -- and
+  # nothing, therefore, launches a `__run-unit` against this machine. The stub
+  # reads the ledger from INSIDE the call, which is the only way to prove the
+  # row is open, and open as `running`, at the moment the orchestrator would
+  # take over: an orchestrator that dies on launch must still leave an
+  # analysis for the tick to find.
   ( sec_env
-    run_job() {
-      printf '%s\n' "$*" > "$sec/runjob.args"
-      printf '%s|%s\n' "${AL_BASE_OVERRIDE:-}" "${AL_SKIP_PROVISION:-}" > "$sec/runjob.env"
-      printf '%s\n' "${AL_SECURITY_REPO:-}" > "$sec/runjob.repo"
-      # A CHILD PROCESS, not this shell: what matters is that the two markers
-      # are EXPORTED all the way down to the agent's own tool shell, not that
-      # run_job can see them as shell variables.
-      sh -c 'printf "%s|%s\n" "${AL_SECURITY_AGENT:-}" "${AL_SECURITY_ANALYSIS_ID:-}"' \
-        > "$sec/runjob.childenv"
+    security_orchestrate() {
+      printf '%s\n' "$*" > "$sec/orch.args"
+      sh -c 'printf "%s|%s\n" "${AL_SECURITY_AGENT:-unset}" "${AL_SECURITY_UNIT_ID:-unset}"' \
+        > "$sec/orch.childenv"
       security_py list --project "Sec App" | "$JQ" -r '.[0].state' > "$sec/state-during"
       return 0
     }
-    cmd_security_analyze "Sec App" repo main quick
-    printf '%s|%s|%s\n' "${AL_SECURITY_AGENT:-unset}" "${AL_SECURITY_ANALYSIS_ID:-unset}" \
-      "${AL_SECURITY_REPO:-unset}" > "$sec/after-analyze.env" ) > "$sec/analyze.out" 2>&1
+    cmd_security_analyze "Sec App" repo main quick ) > "$sec/analyze.out" 2>&1
   [ "$("$JQ" -r '.analysis_id' "$secreq" 2>/dev/null)" = "1" ] \
-    && ok "the request file carries the analysis id the run has to report against" \
+    && ok "the request file carries the analysis id it was written for" \
     || bad "request file: $(cat "$secreq" 2>/dev/null)"
   # "Sec App", not the "repo" that was typed: the project has no `repos` rows,
   # so the argument names nothing and the analysis is filed under the project's
   # own name -- the same spelling the dashboard uses (secRepos()), so a
   # hand-typed analysis and a page-triggered one land in ONE history.
   [ "$("$JQ" -r '[.branch,.profile,.repo] | join(",")' "$secreq" 2>/dev/null)" = "main,quick,Sec App" ] \
-    && ok "and the branch, profile and repo the derived job's prompt is built from" \
+    && ok "and the branch, profile and repo of the analysis it was written for" \
     || bad "request file: $("$JQ" -r '[.branch,.profile,.repo] | join(",")' "$secreq" 2>/dev/null)"
   [ "$( ( sec_env; security_py list --project "Sec App" | "$JQ" -r '.[0].repo' ) )" = "Sec App" ] \
     && ok "a single-checkout project files the analysis under its own name, whatever repo argument was typed" \
     || bad "the ledger filed it under '$( ( sec_env; security_py list --project "Sec App" | "$JQ" -r '.[0].repo' ) )'"
   [ "$(cat "$sec/state-during" 2>/dev/null)" = "running" ] \
-    && ok "the analysis row is open and running before run_job is called" \
-    || bad "state during the run was '$(cat "$sec/state-during" 2>/dev/null)'"
-  [ "$(cat "$sec/runjob.args" 2>/dev/null)" = "$secjid --force" ] \
-    && ok "the derived job is run forced, never waiting for a tick it can never have" \
-    || bad "run_job got '$(cat "$sec/runjob.args" 2>/dev/null)'"
-  [ "$(cat "$sec/runjob.env" 2>/dev/null)" = "main|1" ] \
-    && ok "with the branch as AL_BASE_OVERRIDE and provisioning skipped" \
-    || bad "run_job saw '$(cat "$sec/runjob.env" 2>/dev/null)'"
-  # The repo travels beside the branch: run_job runs the analysis in the
-  # checkout of the repo it names, which on a multi-repo project is not the
-  # project's cwd. The spelling the ledger files it under, so the two agree.
-  [ "$(cat "$sec/runjob.repo" 2>/dev/null)" = "Sec App" ] \
-    && ok "and the repo it names as AL_SECURITY_REPO, spelt as the ledger files it" \
-    || bad "run_job saw AL_SECURITY_REPO='$(cat "$sec/runjob.repo" 2>/dev/null)'"
-  # The agent reaches `security decide` and `security rename-project` through
-  # the very same command the operator does; the marker is what tells the door
-  # who is knocking, and it is worth nothing unless it reaches the agent's own
-  # process rather than only run_job's shell.
-  [ "$(cat "$sec/runjob.childenv" 2>/dev/null)" = "1|1" ] \
-    && ok "and AL_SECURITY_AGENT=1 plus the analysis id exported into every process the run starts" \
-    || bad "a child of run_job saw '$(cat "$sec/runjob.childenv" 2>/dev/null)'"
-  [ "$(cat "$sec/after-analyze.env" 2>/dev/null)" = "unset|unset|unset" ] \
-    && ok "and gone again the moment run_job returns, so the sweep after it is not marked as the agent" \
-    || bad "the markers outlived the run: '$(cat "$sec/after-analyze.env" 2>/dev/null)'"
-  # The stub never reached security_close_analysis, which is precisely the
-  # shape of every early return in run_job (the slot gate, a missing cwd, an
-  # empty prompt). The sweep at the end of cmd_security_analyze is what keeps
-  # that from leaving a row `running` for ever.
-  [ "$( ( sec_env; security_py list --project "Sec App" | "$JQ" -r '.[0].state' ) )" = "failed" ] \
-    && ok "a run that never started leaves the analysis closed, not running for ever" \
-    || bad "the row was left open after run_job returned without running"
+    && ok "the analysis row is open and running before its orchestrator is started" \
+    || bad "state during the call was '$(cat "$sec/state-during" 2>/dev/null)'"
+  [ "$(cat "$sec/orch.args" 2>/dev/null)" = "$secjid 1 Sec App" ] \
+    && ok "the orchestrator is started for the derived job, the analysis id and the repo the ledger files it under" \
+    || bad "security_orchestrate got '$(cat "$sec/orch.args" 2>/dev/null)'"
+  [ "$(cat "$sec/orch.childenv" 2>/dev/null)" = "unset|unset" ] \
+    && ok "and unmarked: the orchestrator is the engine, never the agent -- each unit's run carries the markers (security_run_unit)" \
+    || bad "the orchestrator was started as '$(cat "$sec/orch.childenv" 2>/dev/null)'"
+  # The one way an analysis can be left `running` with no orchestrator ever
+  # behind it: its commit or its checkout gone by the time the detached half
+  # starts. security_orchestrate closes the row itself -- called for real
+  # here, which is safe only because it refuses before its exec: the checkout
+  # this projects file names does not exist.
+  printf '{"projects":[{"name":"Sec App","cwd":"%s/gone","security":{"enabled":true}}]}\n' "$sec" \
+    > "$sec/cfg/gone-projects.json"
+  local secgone
+  secgone="$( ( sec_env; PROJECTS_FILE="$sec/cfg/gone-projects.json"
+    a="$(security_py open-analysis --project "Sec App" --repo "Sec App" --branch nc \
+           --commit c --profile quick --run-id "$secjid" | "$JQ" -r '.analysis_id')"
+    security_orchestrate "$secjid" "$a" "Sec App" >/dev/null 2>&1
+    [ -d "$LOCK_DIR/$secjid/.analysis" ] && echo "lock-kept"
+    security_py list --project "Sec App" | "$JQ" -r --arg a "$a" \
+      '.[] | select(.id == ($a|tonumber)) | [.state, (.coverage_note | test("could not start this analysis") | tostring)] | join(",")' ) 2>/dev/null )"
+  [ "$secgone" = "failed,true" ] \
+    && ok "an analysis whose checkout is gone is closed failed before any orchestrator runs, and its lock let go" \
+    || bad "security_orchestrate over a missing checkout -> $secgone"
+  # THE LOSER OF TWO NEAR-SIMULTANEOUS STARTS: refused by the analysis lock,
+  # it must not leave its row `running` with nothing behind it. A row never
+  # prepared is closed failed, saying why; one already prepared (a resume
+  # that lost the race) keeps its units and is left interrupted.
+  local secloser
+  secloser="$( ( sec_env
+    acquire_lock() { return 1; }
+    fresh="$(security_py open-analysis --project "Sec App" --repo "Sec App" --branch loser \
+               --commit c --profile quick --run-id "$secjid" | "$JQ" -r '.analysis_id')"
+    paid="$(sec_open)"
+    security_orchestrate "$secjid" "$fresh" "Sec App" >/dev/null 2>&1; r1=$?
+    security_orchestrate "$secjid" "$paid" "Sec App" >/dev/null 2>&1; r2=$?
+    security_py list --project "Sec App" | "$JQ" -r --argjson f "$fresh" --argjson p "$paid" \
+      --arg r "$r1$r2" '[(.[] | select(.id == $f) | .state, (.coverage_note | test("another analysis of the same project") | tostring)),
+         (.[] | select(.id == $p) | .state), $r] | join(",")' ) 2>/dev/null )"
+  [ "$secloser" = "failed,true,interrupted,11" ] \
+    && ok "the loser of two starts leaves no row running: failed when never prepared, interrupted when it holds units" \
+    || bad "the lock's loser -> $secloser (fresh state, note, prepared state, rcs)"
+  # A LEDGER THAT CANNOT BE READ IS NOT A MISSING COMMIT: the read is
+  # retried, and a row it still cannot read is left interrupted -- never
+  # closed failed "commit or checkout could not be found". When even the
+  # interruption cannot be written, the lock stays for the tick.
+  local secread
+  secread="$( ( sec_env
+    a="$(security_py open-analysis --project "Sec App" --repo "Sec App" --branch busy-ledger \
+           --commit c --profile quick --run-id "$secjid" | "$JQ" -r '.analysis_id')"
+    sleep() { :; }
+    # An `if`, not a `case`: bash 3.2 misparses a `case` inside $( ).
+    security_engine_py() {
+      if [ "$1" = "analysis" ]; then printf 'x\n' >> "$sec/ledger.reads"; return 1; fi
+      ( unset AL_SECURITY_AGENT CC_SECURITY_AGENT; security_py "$@" )
+    }
+    security_orchestrate "$secjid" "$a" "Sec App" >/dev/null 2>&1; r=$?
+    lock1="$( [ -d "$LOCK_DIR/$secjid/.analysis" ] && echo kept || echo released )"
+    security_py resume --analysis "$a" >/dev/null 2>&1
+    security_engine_py() { return 1; }
+    security_orchestrate "$secjid" "$a" "Sec App" >/dev/null 2>&1
+    lock2="$( [ -d "$LOCK_DIR/$secjid/.analysis" ] && echo kept || echo released )"
+    rm -rf "$LOCK_DIR/$secjid/.analysis"
+    row="$(security_py list --project "Sec App" | "$JQ" -r --argjson a "$a" \
+             '.[] | select(.id == $a) | [.state, (.coverage_note | test("could not be found") | tostring)] | join(",")')"
+    printf '%s,%s,%s,%s,%s' "$r" "$(wc -l < "$sec/ledger.reads" | tr -d ' ')" "$lock1" "$lock2" "$row" ) 2>/dev/null )"
+  [ "$secread" = "1,3,released,kept,running,false" ] \
+    && ok "a ledger that cannot be read is retried, then left interrupted (or the lock kept for the tick), never closed failed" \
+    || bad "an unreadable ledger at start -> $secread (rc, reads, lock after interrupt, lock when nothing writes, row)"
+  # A live orchestrator between two units holds no slot, and it is still an
+  # analysis in hand: a second analyze is refused with a sentence, and no row
+  # is opened for it. So is one arriving while the lock has no pid yet.
+  local secbusy
+  secbusy="$( ( sec_env
+    mkdir -p "$LOCK_DIR/$secjid/.analysis"
+    sleep 30 & busy=$!
+    printf '%s\n' "$busy" > "$LOCK_DIR/$secjid/.analysis/pid"; boot_id > "$LOCK_DIR/$secjid/.analysis/boot"
+    before="$(security_py list --project "Sec App" | "$JQ" -r 'length')"
+    security_orchestrate() { echo "orchestrated" > "$sec/busy.orch"; return 0; }
+    ( cmd_security_analyze "Sec App" repo main quick ) > "$sec/busy.out" 2>&1; r1=$?
+    rm -f "$LOCK_DIR/$secjid/.analysis/pid" "$LOCK_DIR/$secjid/.analysis/boot"
+    ( cmd_security_analyze "Sec App" repo main quick ) >> "$sec/busy.out" 2>&1; r2=$?
+    kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
+    rm -rf "$LOCK_DIR/$secjid/.analysis"
+    after="$(security_py list --project "Sec App" | "$JQ" -r 'length')"
+    printf '%s,%s,%s' "$r1" "$r2" "$((after - before))" ) 2>/dev/null )"
+  case "$secbusy" in
+    [1-9]*,[1-9]*,0) [ ! -e "$sec/busy.orch" ] && grep -q "already running" "$sec/busy.out" \
+         && ok "a live orchestrator -- or one still taking the lock -- refuses a second analyze, and opens no row" \
+         || bad "busy analyze: $(cat "$sec/busy.out" 2>/dev/null)" ;;
+    *) bad "busy analyze -> $secbusy (rc live, rc pid-less, rows opened): $(cat "$sec/busy.out" 2>/dev/null)" ;;
+  esac
 
   echo "cmd_security_analyze --detach — the caller is not held for the run"
   # THE BUG THIS PINS. The control server gives a CLI call 30 seconds and then
@@ -8289,69 +8399,65 @@ FAKESELF
     *) bad "the detached process got '$(cat "$sec/detached.argv" 2>/dev/null)'" ;;
   esac
 
-  # The other half: what the detached process DOES once it is running. This is
-  # security_run_analysis, called directly -- the same function the new process
-  # re-execs into -- so run_job can be stubbed the way the rest of this suite
-  # stubs it.
-  ( sec_env
-    run_job() { return 0; }   # ends without ever closing the row, like an early return
-    aid="$(security_py open-analysis --project "Sec App" --repo repo --branch nc \
-             --commit c --profile quick --run-id jid | "$JQ" -r '.analysis_id')"
-    security_run_analysis "security-sec-app" "$aid" nc >/dev/null 2>&1
-    security_py list --project "Sec App" | "$JQ" -r --arg a "$aid" \
-      '.[] | select(.id == ($a|tonumber)) | .state' ) > "$sec/nc.state" 2>/dev/null
-  [ "$(cat "$sec/nc.state" 2>/dev/null)" = "failed" ] \
-    && ok "and the close travels with it: a run that ends without closing still closes the row" \
-    || bad "row left '$(cat "$sec/nc.state" 2>/dev/null)' after a run that never closed"
-
-  # A run that DOES close its own row keeps its verdict: the sweep is a no-op.
-  ( sec_env
-    # It prepares before it closes, exactly as a real run does: the agent runs
-    # the deterministic phases first and `finish` refuses `done` without them.
-    run_job() {
-      security_py prepare --analysis "$AL_SECURITY_ANALYSIS_ID" --root "$sec/tree" \
-        --offline >/dev/null 2>&1
-      security_close_analysis "$1" success "1.25" "" >/dev/null 2>&1; return 0; }
-    aid="$(security_py open-analysis --project "Sec App" --repo repo --branch sc \
-             --commit c --profile quick --run-id jid | "$JQ" -r '.analysis_id')"
-    security_run_analysis "security-sec-app" "$aid" sc >/dev/null 2>&1
-    security_py list --project "Sec App" | "$JQ" -r --arg a "$aid" \
-      '.[] | select(.id == ($a|tonumber)) | [.state,(.spend_usd|tostring)] | join(",")' \
-    ) > "$sec/sc.state" 2>/dev/null
-  [ "$(cat "$sec/sc.state" 2>/dev/null)" = "done,1.25" ] \
-    && ok "a run that closes its own row keeps its verdict — the sweep is a no-op over it" \
-    || bad "self-closing run -> $(cat "$sec/sc.state" 2>/dev/null)"
-
   echo "cmd_security_analyze() — a dead row cannot brick the Analyse button"
-  # A row left `running` by a run that is GONE (killed, rebooted, or the 30s
-  # SIGKILL above) disabled Analyse for that project for ever: the page reads
-  # the ledger, and the ledger said an analysis was in flight. With no live slot
-  # on the derived job there is no run behind it, and the preflight says so.
+  # A row left `running` by an analysis that is GONE (killed, rebooted, or the
+  # 30s SIGKILL above) disabled Analyse for that project for ever: the page
+  # reads the ledger, and the ledger said an analysis was in flight. With no
+  # live slot on the derived job and no orchestrator holding its lock there is
+  # nothing behind it, and the preflight says so.
   local secstuck
   secstuck="$( ( sec_env; security_py open-analysis --project "Sec App" --repo "Sec App" \
                    --branch main --commit abc --profile quick --run-id "$secjid" \
                  | "$JQ" -r '.analysis_id' ) )"
-  # The default grace protects a row whose own run has not reached acquire_slot
-  # yet -- which is exactly what this row looks like, being seconds old.
-  ( sec_env; run_job() { return 0; }
+  # The default grace protects a row whose own orchestrator has not reached
+  # the lock yet -- which is exactly what this row looks like, being seconds old.
+  ( sec_env; security_orchestrate() { return 0; }
     cmd_security_analyze "Sec App" repo main quick ) >/dev/null 2>&1
   [ "$( ( sec_env; security_py list --project "Sec App" \
             | "$JQ" -r --argjson s "$secstuck" '.[] | select(.id==$s) | .state' ) )" = "running" ] \
     && ok "a row younger than the grace is left alone — its run may still be starting" \
     || bad "the sweep took a row that was seconds old"
-  ( sec_env; SECURITY_STALE_GRACE=0; run_job() { return 0; }
+  ( sec_env; SECURITY_STALE_GRACE=0; security_orchestrate() { return 0; }
     cmd_security_analyze "Sec App" repo main quick ) > "$sec/stuck.out" 2>&1
   [ "$( ( sec_env; security_py list --project "Sec App" \
             | "$JQ" -r --argjson s "$secstuck" '.[] | select(.id==$s) | .state' ) )" = "failed" ] \
-    && ok "once the grace is up it is closed failed, and the button is usable again" \
+    && ok "once the grace is up it is interrupted, and the analysis opened on its branch supersedes it: failed, and the button is usable again" \
     || bad "stale row left '$( ( sec_env; security_py list --project "Sec App" | "$JQ" -r --argjson s "$secstuck" '.[] | select(.id==$s) | .state' ) )'"
-  [ "$( ( sec_env; security_py list --project "Sec App" \
-            | "$JQ" -r --argjson s "$secstuck" '.[] | select(.id==$s) | .coverage_note' ) )" = "engine: the run behind this analysis is gone" ] \
-    && ok "with a note saying it was the engine's doing, not a verdict on the code" \
-    || bad "coverage note: $( ( sec_env; security_py list --project "Sec App" | "$JQ" -r --argjson s "$secstuck" '.[] | select(.id==$s) | .coverage_note' ) )"
+  case "$( ( sec_env; security_py list --project "Sec App" \
+               | "$JQ" -r --argjson s "$secstuck" '.[] | select(.id==$s) | .coverage_note' ) )" in
+    "Superseded by analysis "*) ok "with a note naming the analysis that took its place, not a verdict on the code" ;;
+    *) bad "coverage note: $( ( sec_env; security_py list --project "Sec App" | "$JQ" -r --argjson s "$secstuck" '.[] | select(.id==$s) | .coverage_note' ) )" ;;
+  esac
   grep -q "^analysis " "$sec/stuck.out" \
     && ok "and the analysis that was asked for is opened rather than refused" \
     || bad "the new analysis did not start: $(cat "$sec/stuck.out" 2>/dev/null)"
+
+  echo "cmd_security_resume() — a resume never revives an analysis a newer one superseded"
+  # An interrupted analysis is the resume's to continue -- until a newer
+  # analysis of the SAME branch is opened, which closes it `failed`
+  # ("Superseded by ..."). From then on the newer one is the branch's
+  # analysis, and resuming the old one would run two histories of one branch
+  # side by side: refused, and nothing is launched.
+  local secsup
+  secsup="$( ( sec_env
+    a="$(security_py open-analysis --project "Sec App" --repo "Sec App" --branch main \
+           --commit abc --profile quick --run-id "$secjid" | "$JQ" -r '.analysis_id')"
+    security_engine_py interrupt --analysis "$a" >/dev/null 2>&1
+    security_launch_detached() { printf '%s\n' "$2" >> "$sec/sup.launched"; }
+    ( cmd_security_resume "Sec App" "$a" ) >/dev/null 2>&1; r1=$?
+    security_engine_py interrupt --analysis "$a" >/dev/null 2>&1
+    security_py open-analysis --project "Sec App" --repo "Sec App" --branch main \
+      --commit def --profile quick --run-id "$secjid" >/dev/null 2>&1
+    ( cmd_security_resume "Sec App" "$a" ) > "$sec/sup.out" 2>&1; r2=$?
+    state="$(security_py list --project "Sec App" | "$JQ" -r --argjson s "$a" '.[] | select(.id==$s) | .state')"
+    printf '%s,%s,%s,%s,%s' "$a" "$r1" "$r2" "$state" "$(wc -l < "$sec/sup.launched" | tr -d ' ')" ) 2>/dev/null )"
+  case "$secsup" in
+    [0-9]*,0,[1-9]*,failed,1)
+      grep -q "is not interrupted" "$sec/sup.out" \
+        && ok "an interrupted analysis resumes, and once a newer one of its branch supersedes it the resume is refused and launches nothing" \
+        || bad "superseded resume said: $(cat "$sec/sup.out" 2>/dev/null)" ;;
+    *) bad "resume vs supersede -> $secsup (id, rc resume, rc after supersede, state, launches): $(cat "$sec/sup.out" 2>/dev/null)" ;;
+  esac
 
   echo "cmd_security_branches() — local and origin branches, HEAD excluded, deduped"
   # A real checkout with an origin, not faked refs: local-only never leaves the
@@ -8395,99 +8501,94 @@ JSON
     && ok "a checkout with no branches yet is rc 0 with empty output, not a pipeline failure" \
     || bad "empty checkout: rc=$secemptyrc out='$secemptyout'"
 
-  echo "security_close_analysis() — the run's own verdict closes the row"
-  sec_close_state() { # sec_close_state <run-status> [wdreason] -> the state it lands on
+  echo "security_close_analysis() — the run's own verdict closes its UNIT"
+  # A run of a derived job is one unit of an analysis, and its close is the
+  # unit's: `unit-close` judges it from the run's status (and its stream and
+  # the ledger), records the run's real cost on the unit, and continues what
+  # it left -- one attempt up, or the SAME attempt after a stop. The analysis
+  # is the orchestrator's to close (finish --from-units). A `hunt` unit,
+  # because a hunt is judged by the run's status alone -- the same table of
+  # verdicts the single-session close applied to the analysis.
+  # A real close is handed the run's own stream -- unit-close's caller
+  # never omits it (both real call sites in bin/agentloop pass $streamfile).
+  # An init-only stream is all a session needs to prove it ran (units.close
+  # / evidence.stream_proves): the same shape the run itself writes as the
+  # very first line, before the model ever calls a tool.
+  sec_stream() { # sec_stream -> the path of a fresh init-only stream file
+    local s="$sec/close.$$.$RANDOM.stream.ndjson"
+    "$JQ" -nc --arg cwd "$sec/tree" '{type:"system",subtype:"init",cwd:$cwd}' > "$s"
+    printf '%s' "$s"
+  }
+  sec_close_state() { # sec_close_state <run-status> [wdreason] -> "<unit state>,<spend>[,<continuation attempt>]"
     ( sec_env
-      local a
+      local a u
       a="$(sec_open)"
-      "$JQ" --argjson a "$a" '.analysis_id = $a' "$secreq" > "$secreq.t" && mv "$secreq.t" "$secreq"
-      security_close_analysis "$secjid" "$1" "1.5" "${2:-}" >/dev/null 2>&1
-      security_py list --project "Sec App" \
-        | "$JQ" -r --argjson a "$a" '.[] | select(.id==$a) | [.state, (.spend_usd|tostring)] | join(",")' )
+      u="$(sec_unit "$a" hunt)"
+      AL_SECURITY_ANALYSIS_ID="$a" AL_SECURITY_UNIT_ID="$u" \
+        security_close_analysis "$secjid" "$1" "1.5" "${2:-}" "$(sec_stream)" >/dev/null 2>&1
+      sec_unit_state "$u" )
   }
   [ "$(sec_close_state success)" = "done,1.5" ] \
-    && ok "success closes it done, carrying the run's real cost" || bad "success -> $(sec_close_state success)"
+    && ok "success settles the unit done, carrying the run's real cost" || bad "success -> $(sec_close_state success)"
   [ "$(sec_close_state warning)" = "done,1.5" ] \
-    && ok "a warning is a run that worked, so the analysis is done too" || bad "warning -> $(sec_close_state warning)"
+    && ok "a warning is a run that worked, so the unit is done too" || bad "warning -> $(sec_close_state warning)"
   [ "$(sec_close_state warning "the agent put 3 lines on stderr")" = "done,1.5" ] \
-    && ok "and a warning about stderr noise is still a finished analysis" \
+    && ok "and a warning about stderr noise is still a finished unit" \
     || bad "warning+stderr -> $(sec_close_state warning "the agent put 3 lines on stderr")"
-  # The half of `warning` that is NOT a finished run. Closing these `done` is
-  # what made a truncated analysis the baseline: the code the agent never
-  # reached read as `fixed` that run and `regressed` the next, with no banner
-  # anywhere saying the report was cut short.
-  [ "$(sec_close_state warning "UNDECLARED ENDING: the agent stopped without saying its run was finished")" = "capped,1.5" ] \
-    && ok "a warning that says the agent stopped mid-task closes it capped, not done" \
+  # The half of `warning` that is NOT a finished run: truncated, and a unit
+  # that did not finish is continued rather than taken for done.
+  [ "$(sec_close_state warning "UNDECLARED ENDING: the agent stopped without saying its run was finished")" = "incomplete,1.5,2" ] \
+    && ok "a warning that says the agent stopped mid-task continues the unit, one attempt up" \
     || bad "warning+UNDECLARED -> $(sec_close_state warning "UNDECLARED ENDING: the agent stopped without saying its run was finished")"
-  [ "$(sec_close_state warning "BUDGET LIMITED: spent \$4.80 of a \$5 cap")" = "capped,1.5" ] \
-    && ok "and so does one that spent its whole budget — the agent wrapped up early" \
+  [ "$(sec_close_state warning "BUDGET LIMITED: spent \$4.80 of a \$5 cap")" = "incomplete,1.5,2" ] \
+    && ok "and so does one that spent its whole budget" \
     || bad "warning+BUDGET -> $(sec_close_state warning "BUDGET LIMITED: spent \$4.80 of a \$5 cap")"
-  [ "$(sec_close_state warning "UNDELIVERED: unpushed commits in repo.")" = "capped,1.5" ] \
+  [ "$(sec_close_state warning "UNDELIVERED: unpushed commits in repo.")" = "incomplete,1.5,2" ] \
     && ok "and one that left work undelivered" \
     || bad "warning+UNDELIVERED -> $(sec_close_state warning "UNDELIVERED: unpushed commits in repo.")"
-  [ "$(sec_close_state error)" = "failed,1.5" ] \
-    && ok "an error closes it failed, so the report says it is incomplete" || bad "error -> $(sec_close_state error)"
-  [ "$(sec_close_state stopped)" = "failed,1.5" ] \
-    && ok "a run the operator stopped leaves an incomplete analysis, not a clean one" \
+  [ "$(sec_close_state error)" = "incomplete,1.5,2" ] \
+    && ok "an error continues the unit one attempt up" || bad "error -> $(sec_close_state error)"
+  [ "$(sec_close_state stopped)" = "incomplete,1.5,1" ] \
+    && ok "a run the operator stopped continues its unit at the SAME attempt: a stop is not the unit's failure" \
     || bad "stopped -> $(sec_close_state stopped)"
-  [ "$(sec_close_state capped)" = "capped,1.5" ] \
-    && ok "and a capped run says it ran out of budget rather than that it broke" \
-    || bad "capped -> $(sec_close_state capped)"
 
-  # The engine's own close is the path an agent that SKIPPED `prepare` comes
-  # home on: it exits cleanly, the classifier says `success`, and the row used
-  # to close `done` with no findings, no coverage note and no banner -- then
-  # became the baseline the next analysis was diffed against. Same close, same
-  # `success`, the one difference being that nothing prepared this row.
-  local secnoprep
-  secnoprep="$( ( sec_env
-    a="$(security_py open-analysis --project "Sec App" --repo repo --branch main \
-           --commit noprep --profile quick --run-id "$secjid" | "$JQ" -r '.analysis_id')"
-    AL_SECURITY_ANALYSIS_ID="$a" security_close_analysis "$secjid" success "0.75" "" \
-      >/dev/null 2>&1
-    security_py list --project "Sec App" | "$JQ" -r --argjson a "$a" \
-      '.[] | select(.id==$a) | [.state, (.coverage_note | test("deterministic phases never ran") | tostring)] | join(",")' ) )"
-  [ "$secnoprep" = "capped,true" ] \
-    && ok "a success-close of an analysis whose deterministic phases never ran lands capped, and says so" \
-    || bad "engine close of an unprepared analysis -> $secnoprep (want capped,true)"
+  # NO STREAM, NOTHING COUNTS (evidence.stream_proves / units.close): a close
+  # that cannot prove its run ever started is disqualified, whatever status
+  # it carries -- success included. The attempt still follows the status, so
+  # a successful run with a missing stream is continued one attempt up, same
+  # as an error.
+  local secnostream
+  secnostream="$( ( sec_env
+    a="$(sec_open)"; u="$(sec_unit "$a" hunt)"
+    AL_SECURITY_ANALYSIS_ID="$a" AL_SECURITY_UNIT_ID="$u" \
+      security_close_analysis "$secjid" success "1.5" "" >/dev/null 2>&1
+    sec_unit_state "$u" ) )"
+  [ "$secnostream" = "incomplete,1.5,2" ] \
+    && ok "a close with no stream credits nothing, even a success -- disqualified, continued one attempt up" \
+    || bad "close with no stream -> $secnostream"
 
-  # The close used to overwrite the row unconditionally, which turned the one
-  # honest thing an agent can say about its own run -- "I ran out of room" --
-  # into `done`, because the PROCESS exited cleanly.
-  local secupg
-  secupg="$( ( sec_env
-    a="$(security_py open-analysis --project "Sec App" --repo repo --branch main \
-           --commit abc --profile quick --run-id "$secjid" | "$JQ" -r '.analysis_id')"
-    security_py finish --analysis "$a" --state capped \
-      --note "I stopped before the SAST phase" >/dev/null 2>&1
-    AL_SECURITY_ANALYSIS_ID="$a" security_close_analysis "$secjid" success "2.5" "" >/dev/null 2>&1
-    security_py list --project "Sec App" \
-      | "$JQ" -r --argjson a "$a" '.[] | select(.id==$a) | [.state, (.spend_usd|tostring)] | join(",")' ) )"
-  [ "$secupg" = "capped,2.5" ] \
-    && ok "an agent's own 'capped' survives a success-close, which still records the run's real cost" \
-    || bad "agent capped then engine success -> $secupg"
-
-  # The id used to travel only through the request file, which the NEXT
-  # analysis of the same project rewrites: the close then landed on that other
-  # analysis's row and left its own running for ever.
+  # The unit id travels in the run's own environment and nowhere else: the
+  # request file is rewritten by the NEXT `security analyze` of the project,
+  # and a close that read it would land on another analysis's unit. Without
+  # AL_SECURITY_UNIT_ID the close does nothing at all, whatever the request
+  # file says.
   local seccross
   seccross="$( ( sec_env
-    mine="$(sec_open abc)"
-    other="$(sec_open def)"
-    # exactly what a second `security analyze` does to the shared file while
-    # the first run is still going
+    mine="$(sec_open abc)"; other="$(sec_open def)"
+    mu="$(sec_unit "$mine" hunt)"; ou="$(sec_unit "$other" hunt)"
     "$JQ" --argjson a "$other" '.analysis_id = $a' "$secreq" > "$secreq.t" && mv "$secreq.t" "$secreq"
-    AL_SECURITY_ANALYSIS_ID="$mine" security_close_analysis "$secjid" success "0.5" "" >/dev/null 2>&1
-    security_py list --project "Sec App" | "$JQ" -r --argjson m "$mine" --argjson o "$other" \
-      '[(.[] | select(.id==$m) | .state), (.[] | select(.id==$o) | .state)] | join(",")' ) )"
-  [ "$seccross" = "done,running" ] \
-    && ok "the close lands on the id its own run was started with, not on whatever rewrote the request file" \
+    AL_SECURITY_ANALYSIS_ID="$mine" AL_SECURITY_UNIT_ID="$mu" \
+      security_close_analysis "$secjid" success "0.5" "" "$(sec_stream)" >/dev/null 2>&1
+    security_close_analysis "$secjid" success "0.5" "" "$(sec_stream)" >/dev/null 2>&1
+    printf '%s,%s' "$(sec_unit_state "$mu" | cut -d, -f1)" "$(sec_unit_state "$ou" | cut -d, -f1)" ) )"
+  [ "$seccross" = "done,pending" ] \
+    && ok "the close lands on the unit its own run was started with, and without one it closes nothing, whatever the request file says" \
     || bad "close with a rewritten request file -> $seccross (mine,other)"
 
   echo "the agent cannot vote on its own findings"
   # The marker the run carries (AL_SECURITY_AGENT) reaching the same door the
-  # operator uses. `finish` must stay allowed: security_close_analysis runs
-  # inside run_job, after the agent, under this very variable.
+  # operator uses. `finish` is refused too, since the pipeline: the engine's
+  # closes run through security_engine_py, which drops the marker.
   local secfp="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   local secrc=0
   ( sec_env; AL_SECURITY_AGENT=1 security_py decide --project "Sec App" \
@@ -8505,13 +8606,13 @@ JSON
   local secfin
   secfin="$( ( sec_env
     a="$(sec_open)"
-    AL_SECURITY_AGENT=1 AL_SECURITY_ANALYSIS_ID="$a" \
-      security_close_analysis "$secjid" success "0.25" "" >/dev/null 2>&1
+    AL_SECURITY_AGENT=1 security_py finish --analysis "$a" --state done >/dev/null 2>&1 && echo "agent-closed"
+    AL_SECURITY_AGENT=1 security_engine_py finish --analysis "$a" --state done >/dev/null 2>&1
     security_py list --project "Sec App" \
       | "$JQ" -r --argjson a "$a" '.[] | select(.id==$a) | .state' ) )"
   [ "$secfin" = "done" ] \
-    && ok "while the engine's own close still works under the same flag, which is why finish is not refused" \
-    || bad "close under AL_SECURITY_AGENT -> $secfin"
+    && ok "an agent session is refused finish, and the engine's own close (security_engine_py) works under the same flag" \
+    || bad "finish under AL_SECURITY_AGENT -> $secfin"
 
   echo "cmd_project_set() — a settings save files settings_changed only when security is on"
   # No test asserted this event's kind or gate anywhere: a wrong kind string
@@ -8567,6 +8668,63 @@ JSON
     && [ "$( ( sec_env; security_py list --project "Sec App Two" | "$JQ" -r 'length' ) )" -ge 1 ] \
     && ok "and every past analysis is carried onto the new name in the ledger" \
     || bad "the security history stayed behind under the old project name"
+
+  echo "security_resume_orphans — an analysis whose orchestrator died is resumed, three times at most"
+  # A reboot or a kill -9 leaves the analysis `running` behind a lock whose pid
+  # is dead. The paid-for units are in the ledger; the tick has to notice, mark
+  # it interrupted, and start a new orchestrator -- and stop doing so after
+  # SECURITY_MAX_AUTO_RESUMES, or a machine that always crashes spends for ever.
+  ( LOCK_DIR="$tmp/orph/locks"; mkdir -p "$LOCK_DIR/security-x/.analysis"
+    printf '999999\n' > "$LOCK_DIR/security-x/.analysis/pid"; boot_id > "$LOCK_DIR/security-x/.analysis/boot"
+    printf '7\n' > "$LOCK_DIR/security-x/.analysis/analysis"
+    RESUMES=1
+    security_engine_py() {
+      case "$1" in
+        analysis) printf '{"id":7,"state":"running","resumes":%s,"branch":"main","repo":"web"}\n' "$RESUMES" ;;
+        *) printf '%s\n' "$*" >> "$tmp/orph/calls" ;;
+      esac; }
+    security_launch_detached() { printf 'launch %s\n' "$*" >> "$tmp/orph/calls"; }
+    security_resume_orphans
+    [ ! -d "$LOCK_DIR/security-x/.analysis" ] || exit 1
+    grep -qx 'interrupt --analysis 7' "$tmp/orph/calls" || exit 2
+    grep -qx 'resume --analysis 7 --automatic' "$tmp/orph/calls" || exit 3
+    grep -qx 'launch security-x 7 main web' "$tmp/orph/calls" || exit 4
+    : > "$tmp/orph/calls"; mkdir -p "$LOCK_DIR/security-x/.analysis"
+    printf '999999\n' > "$LOCK_DIR/security-x/.analysis/pid"; boot_id > "$LOCK_DIR/security-x/.analysis/boot"
+    printf '7\n' > "$LOCK_DIR/security-x/.analysis/analysis"
+    RESUMES=3
+    security_resume_orphans
+    grep -q '^abandon --analysis 7 --note ' "$tmp/orph/calls" || exit 5
+    ! grep -q '^launch' "$tmp/orph/calls" || exit 6
+    exit 0 ) \
+    && ok "a dead orchestrator's analysis is interrupted and resumed, and abandoned after the third resume" \
+    || bad "security_resume_orphans (rc $?): $(cat "$tmp/orph/calls" 2>/dev/null)"
+  ( LOCK_DIR="$tmp/orph2/locks"; mkdir -p "$LOCK_DIR/security-y/.analysis"
+    sleep 30 & live=$!
+    printf '%s\n' "$live" > "$LOCK_DIR/security-y/.analysis/pid"; boot_id > "$LOCK_DIR/security-y/.analysis/boot"
+    security_engine_py() { printf '%s\n' "$*" >> "$tmp/orph2-calls"; }
+    security_resume_orphans
+    kill "$live" 2>/dev/null
+    [ -d "$LOCK_DIR/security-y/.analysis" ] && [ ! -s "$tmp/orph2-calls" ] ) \
+    && ok "a live orchestrator is left alone" \
+    || bad "security_resume_orphans touched a live orchestrator"
+  # THE WINDOW INSIDE acquire_lock: mkdir, then the pid a moment later. A lock
+  # with no pid yet is an orchestrator being started, never a dead one --
+  # slot_alive alone reads it dead, and the tick removed the lock and started
+  # a second orchestrator beside the first. Judged by its age instead
+  # (lock_abandoned), the rule slots_active applies to a slot: left alone
+  # while young, taken once it is older than the grace.
+  ( LOCK_DIR="$tmp/orph3/locks"; mkdir -p "$LOCK_DIR/security-z/.analysis"
+    security_engine_py() { printf '%s\n' "$*" >> "$tmp/orph3-calls"; }
+    security_launch_detached() { printf 'launch %s\n' "$*" >> "$tmp/orph3-calls"; }
+    security_resume_orphans
+    [ -d "$LOCK_DIR/security-z/.analysis" ] && [ ! -s "$tmp/orph3-calls" ] || exit 1
+    touch -t 200001010000 "$LOCK_DIR/security-z/.analysis"
+    security_resume_orphans
+    [ ! -d "$LOCK_DIR/security-z/.analysis" ] || exit 2
+    exit 0 ) \
+    && ok "a lock with no pid yet is an orchestrator being started: left alone until it is older than the grace" \
+    || bad "security_resume_orphans and a lock with no pid (rc $?)"
 
   echo "check_ui_artifacts() — an untracked file in bin/static/ must go red, not pass unnoticed"
   # Reproduces, on a throwaway mirror rather than the real bin/static/, what

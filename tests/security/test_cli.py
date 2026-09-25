@@ -219,7 +219,8 @@ def test_report_finding_accepts_other_as_the_escape_hatch(tmp_path):
         "fingerprint": "4" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "other",
         "severity": "high", "title": "t",
         "rationale": "Nothing in the vocabulary fits: it is a logic flaw in "
-                     "the refund path."}))
+                     "the refund path.",
+        "occurrences": [{"file": "app/refund.py", "line": 10}]}))
     row = _finding_row(db, aid)
     assert row["rule"] == "other"
     assert row["cwe"] == ""
@@ -242,6 +243,33 @@ def test_report_finding_refuses_a_category_outside_the_closed_set(tmp_path):
         assert "sast" in out.stderr and "hygiene" in out.stderr
     # Nothing reached the ledger under any of the four spellings.
     assert _finding_row(db, aid) is None
+
+
+def test_report_finding_refuses_a_sast_finding_with_no_occurrence(tmp_path):
+    """Round 4 of Task 5's own fix. `all(...)` on an EMPTY `occurrences` list
+    is vacuously true, so the existing "every occurrence must name a file"
+    check alone let `[]` straight through -- and a carried `sast` row with
+    no stored location later settled a `gone` claim on nothing at all
+    (units._unread_files / _judge_triage). A weakness with no location can
+    be neither fixed nor verified, by this analysis or the next one's
+    `report-gone`, so it is refused here, at the door, before the ledger
+    ever sees it. `occurrences` omitted entirely and `occurrences: []` are
+    the same refusal; a non-`sast` category is unaffected."""
+    db = tmp_path / "security.db"
+    aid = open_analysis(db)
+    for payload in ({"fingerprint": "9" * 64, "category": "sast", "candidate": SAST_CANDIDATE,
+                     "rule": "sql-injection", "severity": "high", "title": "t"},
+                    {"fingerprint": "9" * 64, "category": "sast", "candidate": SAST_CANDIDATE,
+                     "rule": "sql-injection", "severity": "high", "title": "t", "occurrences": []}):
+        out = fails(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
+        assert out.returncode != 0
+        assert "at least one occurrence" in out.stderr
+    assert _finding_row(db, aid) is None
+    # The control: a dependency finding needs no location at all.
+    run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
+        "fingerprint": "a" * 64, "category": "dependency", "rule": "CVE-1",
+        "severity": "high", "title": "t"}))
+    assert _finding_row(db, aid) is not None
 
 
 def test_report_finding_does_not_echo_an_unscanned_rule_that_looks_like_a_key(tmp_path):
@@ -298,7 +326,8 @@ def test_report_finding_derives_the_classification_from_the_rule(tmp_path):
     aid = open_analysis(db)
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
         "fingerprint": "e" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "sql-injection",
-        "severity": "high", "title": "t"}))
+        "severity": "high", "title": "t",
+        "occurrences": [{"file": "app/db.py", "line": 12}]}))
     row = _finding_row(db, aid)
     assert row["cwe"] == "CWE-89"
     assert row["owasp"] == "A03:2021"
@@ -313,7 +342,8 @@ def test_report_finding_ignores_a_classification_sent_by_the_agent(tmp_path):
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
         "fingerprint": "f" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "sql-injection",
         "severity": "high", "title": "t",
-        "cwe": "CWE-79", "owasp": "A01:2021"}))
+        "cwe": "CWE-79", "owasp": "A01:2021",
+        "occurrences": [{"file": "app/db.py", "line": 12}]}))
     row = _finding_row(db, aid)
     assert row["cwe"] == "CWE-89"
     assert row["owasp"] == "A03:2021"
@@ -415,7 +445,8 @@ def test_a_finding_that_describes_a_credential_instead_of_quoting_it_is_accepted
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps({
         "fingerprint": "2" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "hardcoded-credentials",
         "severity": "high", "title": "Hardcoded AWS key",
-        "rationale": "An AWS access key is hardcoded in config/prod.env at line 12."}))
+        "rationale": "An AWS access key is hardcoded in config/prod.env at line 12.",
+        "occurrences": [{"file": "config/prod.env", "line": 12}]}))
 
 
 def test_a_finding_whose_rationale_names_an_obvious_placeholder_is_accepted(tmp_path):
@@ -425,7 +456,8 @@ def test_a_finding_whose_rationale_names_an_obvious_placeholder_is_accepted(tmp_
         "fingerprint": "3" * 64, "category": "sast", "candidate": SAST_CANDIDATE, "rule": "hardcoded-credentials",
         "severity": "high", "title": "t",
         "rationale": 'Default credential left in place: '
-                     'password = "changeme12345678901234"'}))
+                     'password = "changeme12345678901234"',
+        "occurrences": [{"file": "config/prod.env", "line": 3}]}))
 
 
 def test_the_agent_cannot_send_something_that_is_not_json(tmp_path):
@@ -1223,22 +1255,24 @@ def test_the_agent_cannot_open_an_analysis_the_engine_will_never_close(tmp_path)
 
 
 def test_the_work_the_agent_is_there_to_do_still_works_under_the_flag(tmp_path):
-    """The flag is on for the WHOLE run, including `security_close_analysis`,
-    which runs inside run_job after the agent. Refusing more than the three
-    named verbs would break the analysis it is supposed to protect."""
+    """The flag is on for the WHOLE of an agent's session: refusing more than
+    the verbs AGENT_FORBIDDEN names would break the analysis it is supposed to
+    protect. `finish` and `prepare` are among those verbs since the pipeline
+    -- the engine prepares and closes the analysis with the flag removed --
+    so both run without it below; the door's refusals have their own tests
+    (test_cli_doors.py)."""
     db = tmp_path / "security.db"
     root = tmp_path / "repo"
     root.mkdir()
     (root / "app.py").write_text("print('hi')\n")
     aid = open_analysis(db)
-    run(db, "prepare", "--analysis", str(aid), "--root", str(root), "--offline",
-        env=AS_AGENT)
+    run(db, "prepare", "--analysis", str(aid), "--root", str(root), "--offline")
     run(db, "report-finding", "--analysis", str(aid), env=AS_AGENT,
         stdin=json.dumps({"fingerprint": "b" * 64, "category": "hygiene",
                           "rule": "r", "severity": "high", "title": "t"}))
     run(db, "findings", "--analysis", str(aid), env=AS_AGENT)
     run(db, "checklist", "--analysis", str(aid), env=AS_AGENT)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", env=AS_AGENT)
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
     assert run(db, "list", "--project", "web")[0]["state"] == "done"
 
 
@@ -1553,58 +1587,52 @@ def _isolated_env(manifest_path):
             "AL_RUN_MANIFEST": str(manifest_path)}
 
 
-def test_prepare_root_outside_the_runs_worktree_is_refused_when_isolated(tmp_path):
-    """Reproduced before the guard: an agent pointing `--root` at ANY other
-    valid checkout on the machine got a clean scan of code nobody asked about,
-    `prepare` marked the row `prepared=1`, and the analysis closed `done` with
-    clean findings having never looked at its own scope at all."""
+@pytest.mark.parametrize("where", ["elsewhere", "prefix sibling", "own checkout", "no manifest"])
+def test_prepare_under_the_agent_flag_is_refused_before_its_root_is_even_judged(tmp_path, where):
+    """`prepare` is the engine's since the pipeline (AGENT_FORBIDDEN): the
+    orchestrator runs it with the flag stripped. So a session is refused
+    whatever `--root` it names -- another checkout, a sibling whose name
+    merely starts with the run dir's, the run's own checkout, with or
+    without a run manifest -- and nothing is prepared."""
     db = tmp_path / "security.db"
     aid = open_analysis(db)
     run_dir = tmp_path / "run-dir"
-    run_dir.mkdir()
+    (run_dir / "web").mkdir(parents=True)
     manifest = run_dir / ".run.json"
     manifest.write_text("{}")
-    elsewhere = tmp_path / "some-other-checkout"
-    elsewhere.mkdir()
-    out = fails(db, "prepare", "--analysis", str(aid), "--root", str(elsewhere),
-                "--offline", env=_isolated_env(manifest))
-    assert out.returncode != 0
-    assert "own worktree" in out.stderr
-    assert run(db, "findings", "--analysis", str(aid)) == []
+    root = {"elsewhere": tmp_path / "some-other-checkout", "prefix sibling": tmp_path / "run-dir-evil",
+            "own checkout": run_dir / "web", "no manifest": tmp_path / "any-checkout-at-all"}[where]
+    root.mkdir(exist_ok=True)
+    env = _isolated_env(manifest)
+    if where == "no manifest":
+        env.pop("AL_RUN_MANIFEST")
+    out = fails(db, "prepare", "--analysis", str(aid), "--root", str(root), "--offline", env=env)
+    assert out.returncode != 0 and "refused inside a security analysis" in out.stderr
+    assert not run(db, "analysis", "--id", str(aid))["prepared"]
 
 
-def test_prepare_root_prefix_collision_with_the_run_dir_is_still_refused(tmp_path):
-    """The nearest neighbour to the boundary just closed: a SIBLING directory
-    whose name merely starts with the run dir's own name (`run-dir-evil`
-    starts with `run-dir`). A check written as a string prefix comparison
-    would wrongly accept it; path containment must be exact."""
-    db = tmp_path / "security.db"
-    aid = open_analysis(db)
+@pytest.mark.parametrize("where, refused", [("elsewhere", True), ("prefix sibling", True),
+                                            ("own checkout", False)])
+def test_the_root_anchor_still_holds_as_a_defence_in_depth(tmp_path, monkeypatch, where, refused):
+    """Unreachable from a session now that `prepare` is refused under the
+    flag -- kept, and pinned, for whatever caller one day carries both
+    markers past that door: a root outside the run's own worktree (a
+    sibling sharing its name's prefix included) is refused, the worktree
+    itself is not."""
     run_dir = tmp_path / "run-dir"
-    run_dir.mkdir()
+    (run_dir / "web").mkdir(parents=True)
     manifest = run_dir / ".run.json"
     manifest.write_text("{}")
-    sibling = tmp_path / "run-dir-evil"
-    sibling.mkdir()
-    out = fails(db, "prepare", "--analysis", str(aid), "--root", str(sibling),
-                "--offline", env=_isolated_env(manifest))
-    assert out.returncode != 0
-    assert "own worktree" in out.stderr
-
-
-def test_prepare_root_inside_the_runs_worktree_is_accepted(tmp_path):
-    """The control: the genuine case -- `--root` naming the checkout the
-    engine actually built for this run -- must still work."""
-    db = tmp_path / "security.db"
-    aid = open_analysis(db)
-    run_dir = tmp_path / "run-dir"
-    checkout = run_dir / "web"
-    checkout.mkdir(parents=True)
-    manifest = run_dir / ".run.json"
-    manifest.write_text("{}")
-    out = run(db, "prepare", "--analysis", str(aid), "--root", str(checkout),
-              "--offline", env=_isolated_env(manifest))
-    assert out["findings"] == 0
+    root = {"elsewhere": tmp_path / "some-other-checkout", "prefix sibling": tmp_path / "run-dir-evil",
+            "own checkout": run_dir / "web"}[where]
+    root.mkdir(exist_ok=True)
+    monkeypatch.setenv("AL_SECURITY_AGENT", "1")
+    monkeypatch.setenv("AL_RUN_MANIFEST", str(manifest))
+    if refused:
+        with pytest.raises(SystemExit, match="own worktree"):
+            security_cli._refuse_root_outside_run(root.resolve())
+    else:
+        security_cli._refuse_root_outside_run(root.resolve())
 
 
 def test_prepare_root_check_is_unchanged_without_the_run_manifest(tmp_path):
@@ -1617,23 +1645,6 @@ def test_prepare_root_check_is_unchanged_without_the_run_manifest(tmp_path):
     anywhere.mkdir()
     env = {k: v for k, v in os.environ.items()
            if k not in ("AL_SECURITY_AGENT", "AL_RUN_MANIFEST")}
-    out = run(db, "prepare", "--analysis", str(aid), "--root", str(anywhere),
-              "--offline", env=env)
-    assert out["findings"] == 0
-
-
-def test_prepare_root_check_is_unchanged_when_agent_flag_is_set_without_a_manifest(tmp_path):
-    """AL_SECURITY_AGENT alone (no AL_RUN_MANIFEST) is what
-    `test_the_work_the_agent_is_there_to_do_still_works_under_the_flag`
-    already exercises for a normal analysis; this pins the same for an
-    arbitrary root, so the new guard is provably keyed on BOTH variables, not
-    either one alone."""
-    db = tmp_path / "security.db"
-    aid = open_analysis(db)
-    anywhere = tmp_path / "any-checkout-at-all"
-    anywhere.mkdir()
-    env = {k: v for k, v in os.environ.items() if k != "AL_RUN_MANIFEST"}
-    env["AL_SECURITY_AGENT"] = "1"
     out = run(db, "prepare", "--analysis", str(aid), "--root", str(anywhere),
               "--offline", env=env)
     assert out["findings"] == 0
@@ -2756,8 +2767,7 @@ def test_the_agents_own_findings_are_never_counted_as_untriaged(tmp_path):
     # this test is about) but to the verification one. Leaving it unverified
     # would close `capped` for a reason this test does not name.
     run(db, "report-verdict", "--analysis", str(aid), "--fingerprint", "c" * 64,
-        stdin=json.dumps({"verdict": "confirmed", "reason": "read app/db.py end to end"}),
-        env=AS_AGENT)
+        stdin=json.dumps({"verdict": "confirmed", "reason": "read app/db.py end to end"}))
 
     run(db, "finish", "--analysis", str(aid), "--state", "done")
     row = run(db, "list", "--project", "web")[0]
@@ -4624,6 +4634,45 @@ def test_open_analysis_survives_a_ledger_write_failure(tmp_path, monkeypatch, ca
     assert row["state"] == "running"
 
 
+def test_open_analysis_survives_a_failure_superseding_an_interrupted_one(tmp_path, monkeypatch, capsys):
+    """The other write `cmd_open_analysis` makes after `start_analysis`
+    commits: superseding an INTERRUPTED analysis of the same branch. Before
+    this fix it ran unguarded too, between the new row's commit and the
+    `record_event` call the test above already covers -- a `sqlite3.Error`
+    here (the same busy `security.db` `record_event`'s own guard exists
+    for) would have raised past `main()`'s own top-level guard, with the
+    new `running` row already committed but never printed: the exact
+    orphan-row failure the sibling test's docstring describes, at a second
+    call site. Left `interrupted` rather than `failed`, the old row is
+    merely resumable a while longer -- the far smaller harm the new guard's
+    own comment names.
+
+    Driven in-process for the same reason as the sibling test: the point is
+    to monkeypatch `ledger.close_interrupted` mid-call."""
+    db = tmp_path / "security.db"
+    old_aid = open_analysis(db, project="web", repo="web", branch="main", run_id="r0")
+    conn = security_ledger.connect(db)
+    assert security_ledger.interrupt_analysis(conn, old_aid)
+    conn.close()
+
+    def boom(*_a, **_kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(security_ledger, "close_interrupted", boom)
+    security_cli.main([
+        "open-analysis", "--project", "web", "--repo", "web", "--branch", "main",
+        "--commit", "a", "--profile", "quick", "--run-id", "r1", "--db", str(db)])
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["analysis_id"] == old_aid + 1
+    # A fresh subprocess, so the still-broken monkeypatch above cannot mask
+    # a failure: the new row is real and running, and the old one -- left
+    # untouched by the failed supersede -- is still `interrupted`, not
+    # silently lost either.
+    rows = {r["id"]: r["state"] for r in run(db, "list", "--project", "web")}
+    assert rows[old_aid + 1] == "running"
+    assert rows[old_aid] == "interrupted"
+
+
 def test_finish_survives_a_ledger_write_failure(tmp_path, monkeypatch):
     """Same failure, second call site: `finish_analysis` above already closed
     the row with its real verdict and spend when `record_event` raises, and
@@ -4890,9 +4939,13 @@ def finished_analysis(db, tmp_path, project, branch, severity="high", rule="r",
     payload = {"fingerprint": fingerprint_for(project, branch, rule), "category": category,
                "rule": rule, "severity": severity, "title": "t", "rationale": "r"}
     # A `sast` finding at medium or above has to carry its candidate through
-    # the door (block 4.1); a deterministic placeholder does not.
+    # the door (block 4.1); a deterministic placeholder does not. A `sast`
+    # finding also needs at least one occurrence naming a file (round 4 of
+    # Task 5's own fix): a weakness with no location can be neither fixed
+    # nor verified.
     if category == "sast":
         payload["candidate"] = SAST_CANDIDATE
+        payload["occurrences"] = [{"file": "app/a.py", "line": 1}]
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
     # A `sast` finding at medium or above owes a verdict since block 4.2, and
     # a close that leaves the queue unworked is lowered to `capped` -- which
@@ -4920,6 +4973,7 @@ def capped_analysis(db, tmp_path, project, branch, severity="high", rule="r",
                "rule": rule, "severity": severity, "title": "t", "rationale": "r"}
     if category == "sast":
         payload["candidate"] = SAST_CANDIDATE
+        payload["occurrences"] = [{"file": "app/a.py", "line": 1}]
     run(db, "report-finding", "--analysis", str(aid), stdin=json.dumps(payload))
     run(db, "finish", "--analysis", str(aid), "--state", "capped", "--spend", "0.3")
     return aid
@@ -5860,17 +5914,19 @@ def test_decide_still_accepts_a_real_fingerprint(tmp_path):
 
 
 # ---- final whole-branch review, IMPORTANT 1: `finish --note` was the one
-# agent-writable free-text channel with no `looks_like_a_secret` guard on it,
-# even though the near-identically-named `partial_note` is covered and
-# `finish` is deliberately allowed to the agent. A credential written there
-# reaches all four report formats and the page.
+# writable free-text channel with no `looks_like_a_secret` guard on it, even
+# though the near-identically-named `partial_note` is covered. `finish` is
+# one of the engine's own verbs now (AGENT_FORBIDDEN in bin/security/cli.py
+# -- an agent session cannot call it at all); the tests below call it the
+# way its one remaining caller does, with no agent flag set. `--note` is
+# still free text a caller types, and a credential written there reaches
+# all four report formats and the page.
 
 def test_finish_refuses_a_note_that_looks_like_a_live_credential(tmp_path):
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path, project="web", repo="web", branch="main")
     out = fails(db, "finish", "--analysis", str(aid), "--state", "done",
-                "--note", "could not scan with AKIAIOSFODNN7EXAMPLE in the env",
-                env=AS_AGENT)
+                "--note", "could not scan with AKIAIOSFODNN7EXAMPLE in the env")
     assert out.returncode != 0, "the note was accepted"
     assert "live credential" in out.stderr, out.stderr
     assert "AKIAIOSFODNN7EXAMPLE" not in out.stderr, \
@@ -5880,12 +5936,12 @@ def test_finish_refuses_a_note_that_looks_like_a_live_credential(tmp_path):
 
 def test_a_refused_note_leaves_the_analysis_open_rather_than_half_closed(tmp_path):
     """The refusal happens BEFORE `finish_analysis`, so nothing is written --
-    the agent can close again with a note that says the same thing without
+    the caller can close again with a note that says the same thing without
     quoting the credential."""
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path, project="web", repo="web", branch="main")
     fails(db, "finish", "--analysis", str(aid), "--state", "done",
-          "--note", "leaked AKIAIOSFODNN7EXAMPLE", env=AS_AGENT)
+          "--note", "leaked AKIAIOSFODNN7EXAMPLE")
     rows = run(db, "list", "--project", "web")
     assert rows[0]["state"] == "running", rows[0]
     assert "AKIAIOSFODNN7EXAMPLE" not in (rows[0]["coverage_note"] or "")
@@ -6383,39 +6439,18 @@ def _sast_note(db, aid):
     return next(p["note"] for p in phases if p["name"] == "sast"), analysis
 
 
-@pytest.mark.parametrize("flag, sentence, read", [
-    ("AI-AND-LLM,ATTACK-CLASSES",
-     "Guides read: ATTACK-CLASSES, AI-AND-LLM. Recommended but not read: CLIENT-SIDE.",
-     ["ATTACK-CLASSES", "AI-AND-LLM"]),
-    ("", "Guides read: none of the 3 recommended.", []),
-    ("unknown", "Guides read: unknown (run stream unavailable).", None),
-])
-def test_the_engines_close_records_what_was_read_off_the_stream(tmp_path, flag, sentence, read):
+def test_the_agents_own_close_writes_no_guides_sentence(tmp_path):
+    """`--guides-read` was the single-session close's own flag, retired with
+    the pipeline (Task 11): `guides_note` is now written only off the units'
+    account (`--from-units`), never by the agent's own close."""
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path)
     conn = security_ledger.connect(db)
     security_ledger.set_guides(conn, aid, recommended=["ATTACK-CLASSES", "AI-AND-LLM", "CLIENT-SIDE"])
     conn.close()
     run(db, "finish", "--analysis", str(aid), "--state", "done")
-    note, analysis = _sast_note(db, aid)
+    note, _analysis = _sast_note(db, aid)
     assert "Guides read" not in note, "the agent's own close knows nothing about the stream"
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--guides-read", flag)
-    note, analysis = _sast_note(db, aid)
-    assert sentence in note
-    assert sentence in analysis["coverage_note"]
-    assert analysis["guides"].get("read") == read
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--guides-read", flag)
-    assert _sast_note(db, aid)[1]["coverage_note"].count("Guides read") == 1
-
-
-def test_guides_read_that_were_never_recommended_are_still_listed(tmp_path):
-    db = tmp_path / "security.db"
-    aid = prepared_analysis(db, tmp_path)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--guides-read",
-        "WEB-PROTOCOL-AND-AUTH,bogus")
-    note, analysis = _sast_note(db, aid)
-    assert "Guides read: WEB-PROTOCOL-AND-AUTH. Recommended but not read: ATTACK-CLASSES." in note
-    assert "bogus" not in note
 
 
 # ------------------------------------------------ the verifier's door
@@ -6438,7 +6473,7 @@ def test_verify_queue_lists_the_scope_and_report_verdict_writes_it(tmp_path):
                           "reason": "app/db.py:12 is parameterised; the concatenation is in a comment"}))
     row = _finding_row(db, aid)
     assert row["verdict"] == "rejected"
-    assert row["verified_by"] == "subagent"
+    assert row["verified_by"] == "operator"
     assert run(db, "verify-queue", "--analysis", str(aid)) == []
 
 
@@ -6491,16 +6526,15 @@ def test_a_credential_in_a_verdict_reason_is_refused_and_never_echoed(tmp_path):
     assert AWS not in "".join(str(tuple(r)) for r in conn.execute("SELECT * FROM finding"))
 
 
-def test_verify_prompt_is_minted_for_a_queued_finding_only(tmp_path):
+def test_the_single_session_verify_prompt_verb_is_gone(tmp_path):
+    """`verify-prompt` printed the text a hunter pasted into a `Task`. The
+    verifier is a unit of its own now, whose prompt `unit-prompt` mints, and
+    a verb whose whole purpose was a subagent the engine now refuses is not
+    left lying around to invite one."""
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path)
-    _agent_sast(db, aid, "b" * 64)
-    out = raw(db, "verify-prompt", "--analysis", str(aid), "--fingerprint", "b" * 64)
-    assert "your job is to disprove" in out.lower()
-    assert "report-verdict --analysis" in out
-    assert "my own reading" not in out, "the hunter's rationale must not travel"
     bad = fails(db, "verify-prompt", "--analysis", str(aid), "--fingerprint", "9" * 64)
-    assert bad.returncode != 0 and "not in the verification queue" in bad.stderr
+    assert bad.returncode != 0 and "invalid choice" in bad.stderr
 
 
 # --------------------------------------------- the close counts the phase
@@ -6518,41 +6552,19 @@ def _verdict(db, aid, fp, value="confirmed", reason="read it end to end"):
 
 
 def test_a_queue_nobody_worked_lowers_done_to_capped(tmp_path):
-    """The guard the N=V count cannot see: an agent that ignores the phase
-    launches no subagents and writes no verdicts, so the two numbers agree at
-    zero. What does not agree is the queue."""
+    """An agent that ignores the verification phase launches no subagents and
+    writes no verdicts. The queue is what catches that the work never
+    happened."""
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path)
     _agent_sast(db, aid, "b" * 64)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
     row, analysis = _verification_note(db, aid)
     assert run(db, "list", "--project", "web")[0]["state"] == "capped"
     assert "1 finding left unverified" in row["note"]
     assert "sql-injection" in row["note"]
     assert row["note"] in analysis["coverage_note"]
     assert row["status"] == "warning"
-
-
-def test_subagents_that_produced_no_verdict_lower_done_to_capped(tmp_path):
-    db = tmp_path / "security.db"
-    aid = prepared_analysis(db, tmp_path)
-    _agent_sast(db, aid, "b" * 64)
-    _verdict(db, aid, "b" * 64)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "5")
-    row, _ = _verification_note(db, aid)
-    assert run(db, "list", "--project", "web")[0]["state"] == "capped"
-    assert "5 subagents were launched and 1 verdict recorded" in row["note"]
-
-
-def test_verdicts_without_subagents_lower_done_to_capped(tmp_path):
-    db = tmp_path / "security.db"
-    aid = prepared_analysis(db, tmp_path)
-    _agent_sast(db, aid, "b" * 64)
-    _verdict(db, aid, "b" * 64)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
-    row, _ = _verification_note(db, aid)
-    assert run(db, "list", "--project", "web")[0]["state"] == "capped"
-    assert "1 verdict recorded and no subagent was launched" in row["note"]
 
 
 def test_a_worked_queue_closes_done_and_counts_the_verdicts(tmp_path):
@@ -6562,7 +6574,7 @@ def test_a_worked_queue_closes_done_and_counts_the_verdicts(tmp_path):
     _agent_sast(db, aid, "c" * 64)
     _verdict(db, aid, "b" * 64, "confirmed")
     _verdict(db, aid, "c" * 64, "rejected", "the escaping helper at app/db.py:12")
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "2")
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
     row, _ = _verification_note(db, aid)
     assert run(db, "list", "--project", "web")[0]["state"] == "done"
     assert row["status"] == "ran"
@@ -6572,21 +6584,8 @@ def test_a_worked_queue_closes_done_and_counts_the_verdicts(tmp_path):
 def test_an_analysis_with_nothing_to_verify_closes_done(tmp_path):
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path)
-    run(db, "finish", "--analysis", str(aid), "--state", "done", "--tasks-launched", "0")
+    run(db, "finish", "--analysis", str(aid), "--state", "done")
     row, _ = _verification_note(db, aid)
     assert run(db, "list", "--project", "web")[0]["state"] == "done"
     assert row["status"] == "ran"
     assert "No finding was waiting" in row["note"]
-
-
-def test_without_the_flag_the_counts_are_not_compared(tmp_path):
-    """The agent's own close does not know its stream. Only the engine's
-    close passes --tasks-launched, so only it can compare."""
-    db = tmp_path / "security.db"
-    aid = prepared_analysis(db, tmp_path)
-    _agent_sast(db, aid, "b" * 64)
-    _verdict(db, aid, "b" * 64)
-    run(db, "finish", "--analysis", str(aid), "--state", "done")
-    assert run(db, "list", "--project", "web")[0]["state"] == "done"
-    row, _ = _verification_note(db, aid)
-    assert "subagent" not in row["note"]

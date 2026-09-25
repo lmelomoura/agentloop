@@ -16,8 +16,13 @@
 # Behaviour is steered by env vars the harness sets:
 #   FAKE_SESSION  the session id to report in the init event
 #   FAKE_MODE     complete | undeclared | dirty | hang | silent
-#   FAKE_SKIP_PREPARE  set to skip `security prepare` inside a security run,
-#                      i.e. to play the agent that ignored its first command
+#   FAKE_SKIP_PREPARE  set to skip `security prepare` inside a security run
+#                      that is NOT a unit (a hand launch); a unit never runs
+#                      it -- its orchestrator did, once, engine-side
+#   AL_SECURITY_UNIT_ID  set by the engine on a unit of a security analysis:
+#                      the stand-in then plays that unit (test/fake-unit.sh,
+#                      which also documents FAKE_READ_NOTHING,
+#                      FAKE_SKIP_READ_ONCE and FAKE_HUNT_FINDING)
 #   FAKE_ARGV_OUT      a path to record the launch argv in, one line per
 #                      ARGUMENT, "<n><TAB><that argument's first line>"
 #   FAKE_ACCOUNT_OUT   a path to record the account this launch signs in as
@@ -157,23 +162,56 @@ fi
 # The one place this file reads its own arguments. First line only, because the
 # prompt is a paragraph — but one line here is still exactly one argument there,
 # which is what makes the recording worth reading.
+# Written whole and then moved into place: the units of one analysis launch
+# side by side, and two stand-ins truncating one file at once would leave
+# neither launch line readable. The last to finish is the one recorded.
 if [ -n "${FAKE_ARGV_OUT:-}" ]; then
   { printf 'ARGC\t%s\n' "$#"
     n=0
     for a in "$@"; do n=$((n + 1)); printf '%s\t%s\n' "$n" "${a%%$'\n'*}"; done
-  } > "$FAKE_ARGV_OUT"
+  } > "$FAKE_ARGV_OUT.$$" && mv -f "$FAKE_ARGV_OUT.$$" "$FAKE_ARGV_OUT"
 fi
 
 sid="${FAKE_SESSION:-sess-fake-0001}"
 mode="${FAKE_MODE:-complete}"
 
-# A SECURITY RUN'S FIRST COMMAND. The real agent is told to run this by the
-# analysis prompt and by skills/security-analysis/SKILL.md, and the engine
-# refuses to close an analysis `done` without it -- so a stand-in that never
-# ran it would only ever exercise that refusal, never the happy path.
-# AL_SECURITY_ANALYSIS_ID is exported into the run by cmd_security_analyze and
-# is the one signal here that this is an analysis rather than an ordinary job.
-if [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ] && [ -z "${FAKE_SKIP_PREPARE:-}" ]; then
+# A UNIT OF A SECURITY ANALYSIS (security/orchestrator.py). The prompt is the
+# last argument (after `--`). The ledger side is test/fake-unit.sh's; the
+# reading is this CLI's own: a Read of every range the prompt lists, with the
+# result shape Claude Code writes (`tool_use_result.file`), which is what the
+# proof of reading counts (security/evidence.py).
+. "$(dirname "$0")/fake-unit.sh"
+fake_unit_init "${!#}"
+FAKE_UNIT_EVENTS=""
+# A read unit reads its own RANGES; a triage unit reads only what it needs to
+# prove a [carried] sast row gone (fake_unit_triage_gone_specs) -- both
+# shapes are "path:first-last" per line, and both get the same Read events.
+case "$FAKE_UNIT_KIND" in
+  read)   FAKE_UNIT_SPECS="$(fake_unit_ranges)" ;;
+  triage) FAKE_UNIT_SPECS="$(fake_unit_triage_gone_specs)" ;;
+  *)      FAKE_UNIT_SPECS="" ;;
+esac
+if [ -n "$FAKE_UNIT_SPECS" ]; then
+  n=0
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    n=$((n + 1)); path="${spec%:*}"; span="${spec##*:}"; first="${span%-*}"; last="${span#*-}"
+    FAKE_UNIT_EVENTS="$FAKE_UNIT_EVENTS$(jq -nc --arg id "r$n" --arg p "$PWD/$path" \
+      '{type:"assistant",parent_tool_use_id:null,message:{content:[{type:"tool_use",id:$id,name:"Read",input:{file_path:$p}}]}}')
+$(jq -nc --arg id "r$n" --arg p "$PWD/$path" --argjson a "$first" --argjson b "$last" \
+      '{type:"user",parent_tool_use_id:null,message:{content:[{type:"tool_result",tool_use_id:$id,content:""}]},tool_use_result:{type:"text",file:{filePath:$p,startLine:$a,numLines:($b-$a+1),totalLines:$b}}}')
+"
+  done <<EOF
+$FAKE_UNIT_SPECS
+EOF
+fi
+fake_unit_act
+
+# A SECURITY RUN'S FIRST COMMAND, before the pipeline: a security run that is
+# not a unit (a hand launch of the stand-in) still plays the agent that ran
+# `security prepare` itself. A unit never does -- its orchestrator prepared
+# the analysis once, engine-side, before any unit was launched.
+if [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ] && [ -z "${AL_SECURITY_UNIT_ID:-}" ] && [ -z "${FAKE_SKIP_PREPARE:-}" ]; then
   "$(cd "$(dirname "$0")/../bin" && pwd)/agentloop" security prepare \
     --analysis "$AL_SECURITY_ANALYSIS_ID" --root "$PWD" --offline >/dev/null 2>&1 || true
 fi
@@ -186,7 +224,9 @@ fi
 # The init event, deliberately fat: a real one carries the whole tool roster,
 # which is what used to overflow an 8 KB read on both sides.
 {
-  printf '{"type":"system","subtype":"init","session_id":"%s","tools":[' "$sid"
+  # `cwd`, as the real one carries it: the orchestrator judges a unit whose
+  # run died unclosed from its stream, relative to this root.
+  printf '{"type":"system","subtype":"init","session_id":"%s","cwd":"%s","tools":[' "$sid" "$PWD"
   i=0
   while [ "$i" -lt 400 ]; do
     [ "$i" -gt 0 ] && printf ','
@@ -197,6 +237,7 @@ fi
 }
 
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}\n'
+[ -z "$FAKE_UNIT_EVENTS" ] || printf '%s' "$FAKE_UNIT_EVENTS"
 
 [ -z "${FAKE_RATE_LIMIT_EVENT:-}" ] || printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785427200,"rateLimitType":"seven_day","utilization":0.98,"surpassedThreshold":0.75}}\n'
 

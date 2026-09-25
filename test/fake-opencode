@@ -16,6 +16,9 @@
 #   FAKE_RAN_MODEL          what `export` reports as the model that ran (default opencode/big-pickle-real)
 #   FAKE_OPENCODE_NO_MODELS set to make `models` print nothing: a machine with no usable provider
 #   FAKE_SKIP_PREPARE       set to skip `security prepare` inside a security run (see the hook below)
+#   AL_SECURITY_UNIT_ID     set by the engine on a unit of a security analysis: the stand-in plays it
+#                           (test/fake-unit.sh) -- a read unit's reads are `read` tool events carrying
+#                           `state.metadata.display`, as the real CLI reports them
 #   FAKE_EXPORT_PAD         pad `export`'s document with a filler `messages` array to at least this
 #                           many bytes (measurement 36: a real 35-turn session is 264,607 bytes)
 #   FAKE_MODELS_PAD         append this many synthetic priced models (pad/model-<i>) to `models
@@ -76,17 +79,20 @@ case "${1:-}" in
   *) echo "fake-opencode: unexpected invocation: $*" >&2; exit 2 ;;
 esac
 
+# Written whole and then moved into place, as test/fake-claude does: the
+# units of one analysis launch side by side.
 if [ -n "${FAKE_ARGV_OUT:-}" ]; then
   { printf 'ARGC\t%s\n' "$#"
     n=0
     for a in "$@"; do n=$((n + 1)); printf '%s\t%s\n' "$n" "${a%%$'\n'*}"; done
-  } > "$FAKE_ARGV_OUT"
+  } > "$FAKE_ARGV_OUT.$$" && mv -f "$FAKE_ARGV_OUT.$$" "$FAKE_ARGV_OUT"
 fi
 if [ -n "${FAKE_PROMPT_OUT:-}" ]; then
   last=""; for a in "$@"; do last="$a"; done
-  printf '%s' "$last" > "$FAKE_PROMPT_OUT"
+  printf '%s' "$last" > "$FAKE_PROMPT_OUT.$$" && mv -f "$FAKE_PROMPT_OUT.$$" "$FAKE_PROMPT_OUT"
 fi
-[ -z "${FAKE_CONFIG_OUT:-}" ] || printf '%s\n' "${OPENCODE_CONFIG_CONTENT:-}" > "$FAKE_CONFIG_OUT"
+[ -z "${FAKE_CONFIG_OUT:-}" ] \
+  || { printf '%s\n' "${OPENCODE_CONFIG_CONTENT:-}" > "$FAKE_CONFIG_OUT.$$" && mv -f "$FAKE_CONFIG_OUT.$$" "$FAKE_CONFIG_OUT"; }
 # --dir is the run's cwd (measured 07); the real CLI chdirs there and dies
 # when it does not exist (29). The stand-in does the same, so a dirty run's
 # file lands where the engine will look for it.
@@ -101,15 +107,21 @@ sid="${FAKE_SESSION:-ses_fake000000000000000000000}"
 mode="${FAKE_MODE:-complete}"
 cost="${FAKE_COST:-0}"
 # A SECURITY RUN'S FIRST COMMAND, as test/fake-claude does it -- for a launch
-# WITHOUT the opencode platform marker only. On opencode the engine runs
-# `security prepare` itself before it launches the CLI (prepare_inline is an
-# anthropic-only capability), and every launch it makes carries
-# AL_PLATFORM=opencode, so the hook is skipped there.
+# WITHOUT the opencode platform marker only. The engine's orchestrator runs
+# `security prepare` once, before any unit, and every launch the engine makes
+# carries AL_PLATFORM=opencode, so the hook is skipped there.
 if [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ] && [ -z "${FAKE_SKIP_PREPARE:-}" ] \
    && [ "${AL_PLATFORM:-}" != "opencode" ]; then
   "$HERE/../bin/agentloop" security prepare \
     --analysis "$AL_SECURITY_ANALYSIS_ID" --root "$PWD" --offline >/dev/null 2>&1 || true
 fi
+# A UNIT OF A SECURITY ANALYSIS (security/orchestrator.py): the prompt is the
+# last argument. The ledger side is test/fake-unit.sh's; a read unit's reads
+# are emitted below as the CLI's own `read` tool events.
+. "$HERE/fake-unit.sh"
+last=""; for a in "$@"; do last="$a"; done
+fake_unit_init "$last"
+fake_unit_act
 
 ev() { # ev <type> <part-json> -- one event line, the measured envelope
   printf '{"type":"%s","timestamp":1789223561615,"sessionID":"%s","part":%s}\n' "$1" "$sid" "$2"
@@ -143,6 +155,34 @@ else                          # measured 03: bash ran and answered
   ev tool_use '{"type":"tool","tool":"bash","callID":"call_fake_ls","state":{"status":"completed","input":{"command":"ls"},"output":"README\n","metadata":{"output":"README\n","exit":0,"truncated":false},"title":"ls","time":{"start":1789223562190,"end":1789223562227}},"id":"prt_fake_tool","sessionID":"'"$sid"'","messageID":"msg_fake"}'
 fi
 step_finish tool-calls 11909 43 0 1792
+# A read unit's reads: one `read` tool event per range, carrying the range the
+# CLI showed in `state.metadata.display` -- where OpenCode reports it, and
+# what the normaliser turns into Claude Code's `tool_use_result.file`. A
+# triage unit reads the same way, but only what it needs to prove a
+# [carried] sast row gone (fake_unit_triage_gone_specs).
+case "$FAKE_UNIT_KIND" in
+  read)   FAKE_UNIT_SPECS="$(fake_unit_ranges)" ;;
+  triage) FAKE_UNIT_SPECS="$(fake_unit_triage_gone_specs)" ;;
+  *)      FAKE_UNIT_SPECS="" ;;
+esac
+if [ -n "$FAKE_UNIT_SPECS" ]; then
+  rn=0
+  step_start
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    rn=$((rn + 1)); rpath="$PWD/${spec%:*}"; rspan="${spec##*:}"
+    ev tool_use "$(jq -nc --arg p "$rpath" --arg sid "$sid" --arg id "call_fake_read_$rn" \
+      --argjson a "${rspan%-*}" --argjson b "${rspan#*-}" \
+      '{type:"tool", tool:"read", callID:$id,
+        state:{status:"completed", input:{filePath:$p}, output:"",
+               metadata:{display:{path:$p, lineStart:$a, lineEnd:$b, totalLines:$b}},
+               title:$p, time:{start:1789223562190, end:1789223562227}},
+        id:("prt_" + $id), sessionID:$sid, messageID:"msg_fake"}')"
+  done <<EOF
+$FAKE_UNIT_SPECS
+EOF
+  step_finish tool-calls 900 20 0 1792
+fi
 step_start
 case "$mode" in
   dirty)

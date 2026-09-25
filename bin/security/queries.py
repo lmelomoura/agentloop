@@ -91,7 +91,11 @@ def verify_queue(conn, analysis_id) -> list:
     Nothing here reads inside JSON in SQL.
     """
     _analysis, findings = checklist(conn, analysis_id)
-    rows = [f for f in findings if in_verify_scope(f)]
+    # THIS ANALYSIS'S ROWS ONLY. A carried row -- the previous analysis's,
+    # `pending` until this one re-checks it -- can never take a verdict here
+    # (`record_verdict` writes only rows of this analysis), so listing it kept
+    # a queue no verifier could empty. Its re-check is the triage units' debt.
+    rows = [f for f in findings if f.get("analysis_id") == analysis_id and in_verify_scope(f)]
     rows.sort(key=lambda f: min(_SEV_RANK.get(f["severity"], 9),
                                 _SEV_RANK.get(_impact_of(f), 9)))
     return rows

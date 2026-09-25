@@ -1112,7 +1112,7 @@ const SEC_RECENT_COLS = [
 // It now imports both names from here rather than keeping a second,
 // drifting copy of either the label map or the pill builder.
 export const SEC_RUN_STATUS_LABEL = {running: "Running", done: "Completed",
-                              capped: "Capped", failed: "Failed"};
+                              capped: "Capped", interrupted: "Interrupted", failed: "Failed"};
 
 export function secIndexRunStatusPill(state){
   // An unrecognised state (corrupted data; every value the pipeline can

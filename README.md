@@ -255,7 +255,7 @@ A job is one object in `config/jobs.json`. Fields:
 | `timeout_seconds` | optional absolute time cap (**omit = no limit**) |
 | `permission_mode` | **defaults to `bypassPermissions`** (full autonomy, and the only Anthropic mode that can use a tool headless). `dontAsk` means *allowlisted tools only*, so without an `allowed_tools` list it denies everything and the run says so after spending a session — a job on it is warned about in `tick.log`. On `openai`: `read-only` (no writes, no network), `workspace-write` (writes inside the worktree, network open) or `full-access` (no sandbox). On `opencode`: `full-access` (the default; there is no sandbox) or `read-only` (`edit`, `write`, `bash` and `task` denied by rule) |
 | `allowed_tools` | allowlist passed as `--allowedTools`, whole and as a single argument — so a comma-separated list *and* a specifier containing a space, like `Bash(git *)`, both arrive intact (**omit = every tool**). On `opencode` the same list is translated into the permission block the run launches with — see **Platforms** |
-| `disallowed_tools` | denylist passed as `--disallowedTools`, same handling (**omit = nothing denied**). Set both fields and **deny wins** for any tool named in each — an allowlist can never re-open what the denylist closed. A security analysis is derived with `Agent` here (the CLI's own tool roster calls that tool `Task`; on `opencode` it becomes `task: deny` in the permission block), so it cannot spend its budget on subagents instead of triage |
+| `disallowed_tools` | denylist passed as `--disallowedTools`, same handling (**omit = nothing denied**). Set both fields and **deny wins** for any tool named in each — an allowlist can never re-open what the denylist closed. A security analysis is derived with its platform's subagent tool here — `Agent` on Claude Code (the CLI's own tool roster calls that tool `Task`), `task` on `opencode` (it becomes `task: deny` in the permission block), nothing on Codex, which has no flag for it — so a unit cannot spend its budget on subagents: the engine distributes the work |
 
 Create and edit jobs entirely from the dashboard (**+ New job** / **Edit**),
 including the precheck script, or from the CLI.
@@ -1166,24 +1166,22 @@ itself) and end the run `rate_limited`, outside the failure backoff like the
 other two; with no window to mark, the next run comes at the job's interval.
 
 **Security analyses** run on any of the three platforms. The block's own
-`platform` wins, else the project's. On OpenAI the engine runs the deterministic phase
-(`agentloop security prepare`) itself, in the run's worktree, before
-launching the agent — the Codex shell tool cannot be trusted to wait for it —
-and the prompt says so; the prompt names the skill by file path
+`platform` wins, else the project's. On every platform the deterministic phase
+(`agentloop security prepare`) is the engine's: the analysis's orchestrator
+runs it once, before any unit is launched, and no unit is asked to run it.
+On OpenAI each unit's prompt names the skill by file path
 (`skills/security-analysis/SKILL.md`) rather than relying on discovery, and
 forbids subagents in words — Codex cannot close `spawn_agent` by flag, so the
-sentence is the only door. On Claude Code `prepare` stays the agent's own
-first command and the `Agent` tool is closed at launch, as before. The
-permission default is `full-access`: the sandbox modes
-cannot write the ledger, which lives outside the worktree. `agentloop skills`
-links the skills into `~/.codex/skills` too, when that home exists. On OpenCode
-the engine runs `prepare` itself before the launch, as on OpenAI (the CLI's
-`bash` tool does wait for a command — measured — but its ceiling was not
-measured, and `prepare` can take minutes on a large repository); the prompt
-names the skill by name, since the agent sees `~/.claude/skills`, and by path
-too, for a machine where the link is missing; and the derived job's
-`disallowed_tools: Agent` becomes `task: deny` in the permission block, so
-there are no subagents by rule, not by plea, and the prompt only states it.
+sentence is the only door — and a unit reads code through `agentloop security
+read`, whose record is the only proof of reading on that CLI. On Claude Code
+the `Agent` tool is closed at launch. The permission default is `full-access`:
+the sandbox modes cannot write the ledger, which lives outside the worktree.
+`agentloop skills` links the skills into `~/.codex/skills` too, when that home
+exists. On OpenCode the prompt names the skill by name, since the agent sees
+`~/.claude/skills`, and by path too, for a machine where the link is missing;
+and the derived job's `disallowed_tools: task` becomes `task: deny` in the
+permission block, so there are no subagents by rule, not by plea, and the
+prompt only states it.
 Nothing to link: OpenCode reads `~/.claude/skills`, where `agentloop skills`
 already puts them. The permission default is `full-access` here too. A model
 the catalog marks as making no tool calls cannot run an analysis (it could
@@ -1488,25 +1486,56 @@ module, Kubernetes manifest, Helm chart or CloudFormation template committed
 to the repository. All of it runs by pattern, so it takes seconds and costs
 nothing.
 
-It is written to the ledger **moments after the agent starts** — `prepare` is
-the agent's first command, named in the prompt and in the skill — which is why
-the page fills with secrets and CVEs within seconds of the click while the SAST
-pass is still going. Nothing engine-side runs it, so the engine checks instead
-that it ran: an analysis whose deterministic phases never happened is closed
-**`capped`, never `done`**, with a coverage note saying so. A report with
+It is written to the ledger **before any agent starts** — the analysis's
+orchestrator runs `prepare` once, in a checkout of the analysed commit of its
+own, and plans the units from what it found — which is why the page fills with
+secrets and CVEs within seconds of the click while the SAST pass is still
+going. An analysis whose deterministic phase failed is closed **`capped`,
+never `done`**, with a coverage note saying so, and no unit runs: a report with
 nothing behind it must not become the baseline the next analysis is diffed
 against.
 
-The agent's own contract is versioned rather than typed into a prompt
-(`skills/security-analysis/SKILL.md`) and it does three things in this order:
-re-verify the findings the previous analysis left open — the cheapest of the
-three and the most valuable, so it goes first — triage what the deterministic
-phase found (is that "secret" an example in the documentation? is that CVE on a
-path anything reaches?), then the SAST pass at the profile's depth. It never
-writes to the database: every finding goes through `agentloop security
-report-finding`, which validates before it stores. The agent is
-non-deterministic, and the history that produces the checklist cannot be only as
-trustworthy as the last JSON it happened to type.
+**An analysis is a pipeline of units, and the engine runs it.** Triage of the
+deterministic findings, the SAST pass (`hunt`), and on `deep` the line-by-line
+reading of every versioned file (`read` units, sized from an inventory of the
+scope), then a `verify` unit per finding that needs one: each is a fresh
+session of the derived job with a prompt minted from the ledger, at the
+analysis's own commit, up to `security.parallel` at a time (1–8, 3 by
+default), each with its share of the analysis's `max_budget_usd`. Each run's
+close judges its unit from the run's own tool calls and the ledger, never its
+word, and continues what it left undone — a new unit carrying only what is
+missing, one attempt up, **at most 3 attempts per unit's lineage**; what the
+third still leaves is named in the report and the analysis closes `capped`. A
+run that was stopped, died, or was cut short by the provider (a rate limit,
+an API error) keeps its attempt, and three of those in a row give the unit up
+as one the engine could not run. The analysis closes from what the units
+proved. Every launch first asks the engine for the gates a unit's run would
+otherwise skip — the usage window, the job's `daily_budget_usd`, the global
+daily cap — and a closed one leaves the analysis `interrupted` with the gate
+named, to be resumed once it reopens; each unit's budget share is reserved
+while it runs, so the units together never exceed `max_budget_usd`.
+**Stop** on any run of an analysis stops the whole analysis and leaves it
+`interrupted`; `agentloop security resume <project> <analysis>` continues it
+without repeating a finished unit. **An analysis whose orchestrator died** —
+a reboot, a crash, a `kill -9` — is found by the tick, marked `interrupted`
+and resumed automatically, **at most 3 times per analysis**; after the third
+it is abandoned (`failed`, with a note saying so), its finished units kept,
+so a machine that crashes every time stops spending. Your own Resume is
+never counted against that limit.
+
+Each unit's own contract is versioned rather than typed into a prompt
+(`skills/security-analysis/SKILL.md`), and it is written **per unit role**: a
+section of rules every unit follows, then one section per kind — `triage`
+(the carried-over findings and the deterministic phase's own — is that
+"secret" an example in the documentation? is that CVE on a path anything
+reaches?), `hunt` (the SAST pass at the profile's depth), `read` (the
+line-by-line pass on `deep`) and `verify` — each named in the unit's own
+prompt (`unit-prompt`) as the one section it has to follow beside the shared
+rules. No unit writes to the database: every finding goes through `agentloop
+security report-finding`, which validates before it stores, and a `read`
+unit's job is proven by what it actually read, never by what it says. A unit
+is non-deterministic, and the history that produces the checklist cannot be
+only as trustworthy as the last JSON one happened to type.
 
 ### What a finding has to carry
 
@@ -1538,10 +1567,11 @@ a missing best practice is a hardening note at `info`, not a vulnerability.
 ### And who checks it
 
 A finding the agent minted is a claim until somebody who did not make it has
-tried to disprove it. After the SAST pass, the analysis works a **verification
-queue** — its own `sast` findings at `medium` or above, plus any below that
-claim a `high` impact — and for each one launches a **subagent with a prompt
-the CLI minted from the ledger**, not one the hunter wrote. The subagent reads
+tried to disprove it. Once every other unit has settled, the orchestrator plans
+a **verification queue** — the analysis's own `sast` findings at `medium` or
+above, plus any below that claim a `high` impact — and for each one launches a
+**`verify` unit with a prompt the CLI minted from the ledger**, not one the
+hunter wrote. The verifier reads
 the code, looks for what contradicts the claim, and writes its own verdict:
 `confirmed` (read it, could not disprove it), `rejected` (disproved, and here
 is what disproves it) or `needs_validation` (turns on a fact the code does not
@@ -1555,19 +1585,11 @@ not inherited — the next analysis puts it back in the queue, because a reading
 of one day is not a permanent decision. That is what *Accept risk* and *False
 positive* are for.
 
-**And the close counts it, rather than asking for it.** The engine reads the
-run's stream for the subagents it launched and compares that with the verdicts
-in the ledger: findings left unverified, subagents that produced no verdict,
-and verdicts with no subagent behind them each lower `done` to `capped` with
-the numbers in the report. The first of the three is the one the other two
-cannot see — an agent that ignores the phase launches nothing and records
-nothing, so the two counts agree at zero while the work never happened. It is
-the same shape as the triage guard, for the same reason: asking is what
-failed.
-
-The phase runs on Claude Code only, where a subagent has a shell and can write
-its own verdict; on the Codex CLI and OpenCode the `verification` row of the
-coverage table reads `skipped`.
+**And the close counts it, rather than asking for it.** A verify unit whose
+session wrote no verdict of its own is a unit that did not finish, and runs
+again; one the engine could not finish is a gap the close names, lowering
+`done` to `capped`. It is the same shape as the triage guard, for the same
+reason: asking is what failed.
 
 ### Hunting guides
 
@@ -1778,12 +1800,11 @@ on OpenAI, where the sandbox modes cannot write the ledger, and on OpenCode,
 where it is the only mode with a shell). See [Platforms](#platforms).
 
 On `"platform": "opencode"` the derived job is the same job with the
-platform's vocabulary: its `disallowed_tools: Agent` is translated to `task:
-deny` in the permission block the run launches with, so there are no
+platform's vocabulary: its `disallowed_tools: task` is translated to `task:
+deny` in the permission block each unit launches with, so there are no
 subagents by rule (on Claude Code the tool is closed by flag; on Codex only
-the prompt forbids it); `prepare` runs engine-side, in the worktree, before
-the agent is launched, as on OpenAI; and the prompt names the skill by name
-and by path. Nothing to link: OpenCode reads `~/.claude/skills`. A `model`
+the prompt forbids it); `prepare` is the orchestrator's, as on every
+platform; and the prompt names the skill by name and by path. Nothing to link: OpenCode reads `~/.claude/skills`. A `model`
 that makes no tool calls (the catalog says) is refused for an analysis and
 falls back, with a warning, the way a model switched off in Settings does.
 
@@ -1888,11 +1909,13 @@ on the Security page links straight to its run.
 
 Two consequences worth knowing:
 
-- **One analysis per project at a time.** The derived job carries
-  `max_parallel: 1`, and `security analyze` refuses a second one with a sentence
-  on your terminal rather than a line in the tick log and a silent exit 0.
-  Different projects analyse in parallel, taking engine slots like any other
-  run: an analysis has no priority over the jobs, nor they over it.
+- **One analysis per project at a time.** Its orchestrator holds the analysis
+  lock (`<locks>/security-<project>/.analysis`), and `security analyze` refuses
+  a second one with a sentence on your terminal rather than a line in the tick
+  log. The derived job's `max_parallel` is `security.parallel`: how many of the
+  analysis's units run at once. Different projects analyse in parallel, taking
+  engine slots like any other run: an analysis has no priority over the jobs,
+  nor they over it.
 - **The `security-` prefix is reserved.** `create` and `rename` refuse it, so a
   real job can never collide with a derived one, and every by-id write —
   `delete`, `enable`/`disable`, `toggle-many`, `reorder`, `set-prompt`,
@@ -1914,19 +1937,30 @@ agentloop security analyze [--detach] <project> <repo> <branch> [profile]
 
 `<repo>` is the project's own name when it declares a single checkout — anything
 else is normalised to it — and `[profile]` defaults to `standard`. Without
-`--detach` the analysis runs in the foreground. With it, every refusal (security
-not enabled, no such branch, one already running) still happens synchronously,
-then the run is handed to a background process and the command prints
-`{"analysis_id": n}` and returns. That is the path the dashboard's **Analyse**
-button takes: the control server gives a CLI call thirty seconds before it kills
-it, and an analysis is minutes of work — the button used to spin, report a
-timeout, and leave the row `running` for ever with the agent orphaned behind it.
+`--detach` the analysis runs in the foreground, until its orchestrator has
+closed it. With it, every refusal (security not enabled, no such branch, one
+already running) still happens synchronously, then the orchestrator is handed to
+a background process and the command prints `{"analysis_id": n}` and returns.
+That is the path the dashboard's **Analyse** button takes: the control server
+gives a CLI call thirty seconds before it kills it, and an analysis is minutes of
+work — the button used to spin, report a timeout, and leave the row `running`
+for ever with the agent orphaned behind it.
 
-The rest of the vocabulary is the ledger's own and belongs to the agent and the
-page. The agent's half is `prepare`, `findings`, `fingerprint`,
-`report-finding`, `checklist`, `render` and `finish`; the engine's and the
-operator's are `open-analysis`, `decide`, `rename-project`, `migrate-rules`,
-`list` and `event`. `migrate-rules` is the one that is run after a release
+```bash
+agentloop security resume <project> <analysis-id>
+```
+
+continues an `interrupted` analysis — one that was stopped, or found with no
+orchestrator behind it by the next Analyse of another branch — in the
+background, without repeating a finished unit.
+
+The rest of the vocabulary is the ledger's own and belongs to the units and the
+page. A unit's half is `findings`, `fingerprint`, `report-finding`,
+`report-gone`, `report-verdict`, `read`, `checklist` and `render`; `units` and
+`unit-prompt` are the orchestrator's own view of the pipeline — every unit of
+an analysis and the prompt minted for one of them; the engine's
+and the operator's are `prepare`, `finish`, `unit-close`, `open-analysis`,
+`decide`, `rename-project`, `migrate-rules`, `list` and `event`. `migrate-rules` is the one that is run after a release
 rather than during an analysis: a rule's name is part of every finding's
 fingerprint, so renaming a detector's rule would report each finding under it
 as fixed *and* new in the same report and strand every human decision on an

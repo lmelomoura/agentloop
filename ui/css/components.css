@@ -61,6 +61,7 @@ body{margin:0;background:var(--bg);color:var(--ink);
 .pill.capped{background:var(--warn-soft);color:var(--warn)}
 .pill.failed{background:var(--err-soft);color:var(--err)}
 .pill.running{background:var(--accent-soft);color:var(--accent)}
+.pill.interrupted{background:var(--panel2);color:var(--muted);border:1px dashed var(--line)}
 h3{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
   margin:0;display:flex;align-items:center;gap:7px}
 h3 .ic{width:14px;height:14px}

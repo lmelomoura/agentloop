@@ -65,6 +65,12 @@ def test_a_capped_report_does_not_claim_a_spending_cap_when_it_never_ran():
         assert note in text
 
 
+def test_an_interrupted_analysis_says_so_and_that_resume_continues_it():
+    parts = report._coverage({"state": "interrupted"}, "")
+    assert parts == ["This analysis is INTERRUPTED: it stopped before covering the whole "
+                     "scope, and Resume continues it where it left off."]
+
+
 def test_html_escapes_a_finding_title():
     hostile = [dict(FINDINGS[0], title="<script>alert(1)</script>")]
     html = report.as_html(ANALYSIS, hostile, "")

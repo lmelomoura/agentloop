@@ -34,6 +34,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sqlite3
 import sys
 import time
@@ -42,7 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from security import adapters, candidate, coverage, deps, diff, engines, fingerprint, guides, hygiene, ignores, ledger, osv, prompts, queries, report, secrets, taxonomy, verdict  # noqa: E402
+from security import adapters, candidate, coverage, deps, diff, engines, evidence, fingerprint, guides, hygiene, ignores, inventory, ledger, orchestrator, osv, prompts, queries, report, secrets, taxonomy, units, verdict  # noqa: E402
 
 REQUIRED_FINDING_KEYS = ("fingerprint", "category", "rule", "severity", "title")
 
@@ -131,7 +132,19 @@ MAX_STDIN_BYTES = 1_000_000
 # if a two-word form of it needs refusing, add that string to this tuple.
 # Nothing else changes -- see `main()`'s dispatch key below.
 AGENT_FORBIDDEN = ("decide", "rename-project", "open-analysis", "event",
-                   "filters save", "filters delete")
+                   "filters save", "filters delete",
+                   # THE ENGINE'S VERBS. A session does not close the analysis
+                   # it is a unit of, grade its own unit, or stop and restart
+                   # the pipeline it runs inside: the engine calls these with
+                   # the agent flag removed (`security_engine_py` in
+                   # bin/agentloop), so refusing them here costs the engine
+                   # nothing and closes the one door a unit could misuse.
+                   # `prepare` too: the orchestrator runs it once, before any
+                   # unit, in a checkout of its own (it strips the flag), and
+                   # a second one from a unit's shell would re-run the
+                   # deterministic phases over the analysis mid-pipeline.
+                   "finish", "unit-close", "orchestrate", "interrupt", "resume", "abandon",
+                   "prepare")
 
 
 def _agent_env(name: str) -> str:
@@ -175,9 +188,11 @@ def _refuse_if_agent(cmd):
                       same reason `events` is not: it reads, it writes
                       nothing, and the agent may legitimately want to see it.
 
-    `finish` is deliberately NOT in the list: `security_close_analysis` runs
-    inside run_job, AFTER the agent and still under the same exported flag,
-    and closing the row is the one thing that must always work.
+    `finish` joined the refused verbs with the pipeline: the engine's own
+    closes now run through `security_engine_py`, which removes the flag, so
+    an agent session is the only caller left under it. So did `prepare`:
+    the orchestrator runs the deterministic phase itself, engine-side, with
+    the flag stripped from its environment.
 
     A GUARDRAIL, NOT A BOUNDARY. The flag lives in the agent's environment and
     the agent has a shell, so `env -u AL_SECURITY_AGENT ...` is all it takes to
@@ -199,8 +214,9 @@ def _refuse_if_agent(cmd):
             f"security {cmd}: refused inside a security analysis "
             "(AL_SECURITY_AGENT is set) — the agent that reports a finding "
             "does not get to dismiss it, rename the ledger out from under it, "
-            "open analyses of its own, write an event by hand into the one "
-            "record of what actually happened, or save/delete a saved filter "
+            "open analyses of its own, prepare, close or grade the analysis the "
+            "engine is running, write an event by hand into the one record of what "
+            "actually happened, or save/delete a saved filter "
             "-- a working set a human curates, not something an analysis "
             "decides; ask a human to run this.")
 
@@ -232,6 +248,15 @@ def _running(conn, analysis_id):
     hand-typed id that lands on the wrong row) must be told, not obeyed.
     """
     row = _analysis(conn, analysis_id)
+    if row["state"] == ledger.INTERRUPTED:
+        # `ledger.interrupt_analysis` only ever moves the ROW to `interrupted`
+        # (a single UPDATE, no unit touched) -- it is the ORCHESTRATOR, not
+        # this state, that actually stops a unit still running when it
+        # interrupts the analysis around it, and the two happen together in
+        # practice, but only the first is a fact this message can vouch for.
+        sys.exit(f"analysis {analysis_id} is interrupted: nothing is written into it "
+                 "until it is resumed (`agentloop security resume`); the orchestrator "
+                 "stops any unit of it still running when it interrupts an analysis.")
     if row["state"] != "running":
         sys.exit(f"analysis {analysis_id} is closed ({row['state']}): it is the "
                  "baseline the next analysis is compared against, and writing "
@@ -248,10 +273,10 @@ def _refuse_if_secret(field, value):
     stored verbatim, and are quoted back by their own refusals (see
     `cmd_report_finding`). The second door is `finish --note`, which lands in
     `coverage_note`, reaches all four report formats and the analysis page,
-    and is deliberately reachable by the agent (see `_refuse_if_agent`:
-    closing the row is the one thing that must always work) -- it had no gate
-    at all, even though it is the near-identical twin of the `partial_note`
-    already covered. An agent describing what it could not scan is exactly as
+    and is written by the engine's close and by an operator (the agent is
+    refused the verb, see `_refuse_if_agent`) -- it had no gate at all, even
+    though it is the near-identical twin of the `partial_note` already
+    covered. An agent describing what it could not scan is exactly as
     likely to quote the credential it found as one describing what it did.
 
     The deterministic categories cannot leak a secret's value THROUGH THEIR
@@ -328,6 +353,31 @@ def cmd_open_analysis(args):
     conn = _conn(args)
     aid = ledger.start_analysis(conn, args.project, args.repo, args.branch,
                                 args.commit, args.profile, args.run_id)
+    # A NEW ANALYSIS OF THE SAME BRANCH SUPERSEDES AN INTERRUPTED ONE. Resuming
+    # the old one after this would file two readings of one branch out of
+    # order; its finished units stay in the ledger, and its note says why the
+    # rest never ran.
+    #
+    # BEST-EFFORT, LIKE `record_event` BELOW -- AND FOR THE SAME REASON.
+    # `aid` is already committed by `start_analysis` above; a `sqlite3.Error`
+    # here (a busy `security.db`, shared across every project) must not turn
+    # this call into the same "orphaned `running` row, `could not open an
+    # analysis`" failure `record_event`'s own comment describes -- this
+    # write is strictly less important than that one, an audit event, since
+    # its ONLY effect is tidying up a row this new analysis has already
+    # superseded in substance. Left `interrupted` instead of `failed`, the
+    # old row is merely resumable a while longer (until the next open, or
+    # its own automatic-resume budget runs out) -- a far smaller harm than
+    # losing this call's own `analysis_id` to a write that was never the
+    # point of it.
+    try:
+        for (old,) in conn.execute(
+                "SELECT id FROM analysis WHERE project=? AND repo=? AND branch=? AND state=? AND id<>?",
+                (args.project, args.repo, args.branch, ledger.INTERRUPTED, aid)).fetchall():
+            ledger.close_interrupted(conn, old, f"Superseded by analysis {aid}, opened on the same "
+                                                "branch before this one was resumed.")
+    except sqlite3.Error:
+        pass
     try:
         ledger.record_event(conn, args.project, "analysis_started",
                             f"{args.profile} on {args.branch}", str(aid))
@@ -368,6 +418,11 @@ def _refuse_root_outside_run(root):
     carries neither, and must see the same behaviour as before this guard --
     this is the agent's own run being anchored to the checkout the engine
     built for it, not a new restriction on manual use.
+
+    DEFENCE IN DEPTH SINCE THE PIPELINE: `prepare` is in AGENT_FORBIDDEN,
+    so a session under the flag is refused before this is ever asked. It is
+    kept, and pinned by its own test, for any caller that one day carries
+    both markers past that door.
     """
     manifest = _agent_env("RUN_MANIFEST")
     if not (_agent_env("SECURITY_AGENT") and manifest):
@@ -1240,9 +1295,38 @@ def _scan_iac(root, offline: bool, ignore_paths=()):
     return findings, notes, PRODUCER_TRIVY_IAC, coverage.RAN
 
 
+def _slice_guides(root, ignore, components):
+    """The hunting guides each read unit's files call for: this analysis's own
+    signals (security/guides.py) narrowed to the slice's paths --
+    ATTACK-CLASSES and the two best-matched domain guides. The inventory
+    signal is left out on purpose: it fires on nearly every project and would
+    hand SUPPLY-CHAIN to every slice. Advice never fails the plan: on any
+    error -- reading the signals, or choosing for one slice -- the units get
+    ATTACK-CLASSES alone, and only a real planning failure fails `prepare`."""
+    try:
+        sig = guides.signals(root, ignore, components)
+    except Exception as exc:  # noqa: BLE001 -- advice must not fail the phase
+        print(f"prepare: the read units' guides could not be chosen ({type(exc).__name__}: {exc}); "
+             "every one gets ATTACK-CLASSES alone", file=sys.stderr)
+        return None
+
+    def pick(ranges):
+        paths = sorted({r["path"] for r in ranges})
+        try:
+            return guides.select({"deps": sig["deps"], "paths": paths, "inventory": False},
+                                 "standard")[:3]
+        except Exception as exc:  # noqa: BLE001 -- advice must not fail the plan
+            print(f"prepare: a read unit's guides could not be chosen ({type(exc).__name__}: {exc}); "
+                 "it gets ATTACK-CLASSES alone", file=sys.stderr)
+            return [guides.ALWAYS]
+    return pick
+
+
 def cmd_prepare(args):
-    """The deterministic phases, run inside the worktree by the agent's first
-    command. Seconds, and no tokens."""
+    """The deterministic phases, run once per analysis by its orchestrator
+    (security/orchestrator.py), engine-side, in a checkout of the analysed
+    commit of its own -- never by a unit's session (AGENT_FORBIDDEN).
+    Seconds, and no tokens."""
     # A process group of its own, so a stop can end every scanner this phase
     # spawns (gitleaks, trivy, semgrep, syft, git) with one signal to the
     # group: seen on a real install, a stop during this phase killed the run
@@ -1360,7 +1444,8 @@ def cmd_prepare(args):
     started = time.perf_counter()
     def _progress(text):
         print(f"prepare: {text}", file=sys.stderr, flush=True)
-    _progress("started secrets, hygiene, dependencies, sbom, iac, sast-prepass")
+    _progress("started secrets, hygiene, dependencies, sbom, iac, sast-prepass" +
+             (", deep-inventory" if row["profile"] == "deep" else ""))
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {
             "secrets": pool.submit(_scan_secrets, root, ignore, sweeps),
@@ -1371,6 +1456,17 @@ def cmd_prepare(args):
             "sbom": pool.submit(_scan_sbom, root, components),
             "sast-prepass": pool.submit(_scan_sast, root, args.offline, ignore),
         }
+        if row["profile"] == "deep":
+            # I7. THE DEEP SCOPE'S OWN WALK, folded into the same pool as
+            # every other phase instead of running afterwards on its own.
+            # It reads every file this analysis will ever be asked to read,
+            # which costs real wall-clock on a large repository -- run
+            # after the pool, that cost used to land entirely inside the
+            # window between the re-check below and this function's first
+            # write, stretching exactly the gap that check exists to keep
+            # short. Here its wall-clock overlaps every other phase's
+            # instead of adding to them, same as any other phase.
+            futures["deep-inventory"] = pool.submit(inventory.build, root, ignore)
         for done in as_completed(futures.values()):
             name = next(n for n, f in futures.items() if f is done)
             _progress(f"{name} done ({int(time.perf_counter() - started)}s)"
@@ -1383,6 +1479,7 @@ def cmd_prepare(args):
         (iac_findings, iac_notes, iac_producer, iac_status) = futures["dependencies+iac"].result()
     sbom_document, sbom_notes, sbom_status = futures["sbom"].result()
     sast_findings, sast_notes, sast_producer, sast_status = futures["sast-prepass"].result()
+    deep_inventory = futures["deep-inventory"].result() if "deep-inventory" in futures else None
     _progress(f"all phases done ({int(time.perf_counter() - started)}s)")
 
     # ASKED AGAIN, NOW, BEFORE THE FIRST WRITE. `_running` above answered for
@@ -1448,10 +1545,28 @@ def cmd_prepare(args):
     # itself goes onto the analysis row (`ledger.set_guides`) below and out
     # on stdout, where the skill tells the agent to read it.
     recommended, guides_note = guides.recommend(root, ignore, components, row["profile"])
+    # THE SCOPE ROW'S SENTENCES STAND TOGETHER AT THE HEAD OF THE PARAGRAPH.
+    # `notes` already opens with the switch and noise-filter sentences (the
+    # two inserts above), and the scope row's note is those plus the two
+    # below, joined: appended after the secret phase's notes instead, the row
+    # stopped being one contiguous run of the paragraph -- the invariant
+    # test_every_phases_prose_is_a_substring_of_the_paragraph pins, and
+    # test_the_deep_scope_sentence_keeps_the_scope_row_a_substring_of_the_paragraph
+    # (test_cli_units.py) pins for the deep case. So each goes in right after
+    # the scope sentences already there, in the order the row carries them.
     if guides_note:
-        notes.append(guides_note)
+        notes.insert(len(scope_notes), guides_note)
         scope_notes.append(guides_note)
         print(f"prepare: {guides_note}", file=sys.stderr)
+    # THE DEEP SCOPE, listed before any unit reads a line of it -- see
+    # security/inventory.py. Filed under `scope` like the guides: it is what
+    # this analysis was set up to read. `deep_inventory` itself was already
+    # BUILT inside the phase pool above (I7) -- only the cheap, pure summary
+    # of it happens here, where the rest of the scope note is assembled.
+    if deep_inventory is not None:
+        inventory_note = inventory.summary(deep_inventory)
+        notes.insert(len(scope_notes), inventory_note)
+        scope_notes.append(inventory_note)
 
     findings += _produced_by(dep_findings, dep_producer, produced)
 
@@ -1614,9 +1729,34 @@ def cmd_prepare(args):
     # marked prepared with an empty `produced` would report its whole
     # deterministic baseline `pending` for ever.
     ledger.set_guides(conn, aid, recommended=recommended)
+    if deep_inventory is not None:
+        ledger.set_inventory(conn, aid, deep_inventory)
     ledger.mark_prepared(conn, aid, produced)
+    # THE PLAN -- only for an analysis the engine runs as a pipeline: the one
+    # its orchestrator prepares, which passes --plan. A hand run, the
+    # selftest's fixtures and every test that prepares an analysis to exercise
+    # something else plan nothing, as before the pipeline, so none of them can
+    # meet a planning failure it was not written about.
+    #
+    # After `prepared`: the checklist the triage units are drawn from
+    # classifies what the last analysis left by what THIS one ran, and until
+    # `mark_prepared` it cannot know. ALL OR NOTHING (ledger.add_units), and a
+    # plan that fails fails LOUDLY -- non-zero, the reason on stderr, no JSON
+    # on stdout. It used to be swallowed and printed as success with no units
+    # (and a kill mid-plan left half a plan `plan` then refused to complete):
+    # the analysis closed `done` with slices nobody read. The phases' results
+    # stay, because they are this analysis's and running them again would pay
+    # for them twice; the orchestrator closes the analysis `capped`, naming
+    # the failure (security/orchestrator.py).
+    planned = []
+    if args.plan:
+        try:
+            planned = units.plan(conn, aid, slice_guides=_slice_guides(root, ignore, components))
+        except Exception as exc:  # noqa: BLE001 -- reported below, never swallowed
+            sys.exit(f"prepare: the units could not be planned ({type(exc).__name__}: {exc}). "
+                     "No unit was written; the deterministic phase's results are kept.")
     print(json.dumps({"coverage_note": note, "findings": len(findings),
-                      "guides": {"recommended": recommended}}))
+                      "guides": {"recommended": recommended}, "units": len(planned)}))
 
 
 def cmd_findings(args):
@@ -1639,33 +1779,21 @@ def cmd_verify_queue(args):
     print(json.dumps(queries.verify_queue(conn, args.analysis), indent=2))
 
 
-def cmd_verify_prompt(args):
-    """The text the agent pastes into a `Task` for this finding.
-
-    Refused for a fingerprint outside the queue, on the same rule as
-    `report-verdict`: a prompt for something nobody is verifying is a
-    subagent nobody asked for, and the close counts those.
-    """
-    conn = _conn(args)
-    _analysis(conn, args.analysis)
-    row = next((f for f in queries.verify_queue(conn, args.analysis)
-                if f["fingerprint"] == args.fingerprint), None)
-    if row is None:
-        sys.exit(f"verify-prompt: {args.fingerprint[:12]}… is not in the verification "
-                 "queue of this analysis — `verify-queue` lists what is")
-    print(prompts.verifier_prompt(args.analysis, row))
-
-
 def cmd_report_verdict(args):
-    """What a VERIFIER concluded. Called by the subagent itself, not by the
-    hunter that reported the finding -- the write is the evidence that a
-    second agent existed and what it read (see security/prompts.py).
+    """What a VERIFIER concluded. Called by the engine's verify unit for the
+    one finding it was launched for, not by the hunter that reported it --
+    the write is the evidence that a second, independent session read the
+    code and what it found (see security/prompts.py).
 
-    Deliberately NOT in AGENT_FORBIDDEN: a subagent runs under the same
-    `AL_SECURITY_AGENT` the hunter carries, so a refusal there would close the
-    door on the only caller this verb has. What makes it verifiable is not a
-    flag but a count -- `cmd_finish` compares the verdicts recorded here with
-    the `Task` calls the engine counted in the run's stream.
+    Deliberately NOT in AGENT_FORBIDDEN: a verify unit runs under the same
+    `AL_SECURITY_AGENT` every unit of the pipeline carries, so a refusal there
+    would close the door on its only legitimate caller. What confines it to
+    that caller, inside an agent session, is the door below: it checks that
+    the session writing IS the verify unit the engine launched for THIS
+    finding, of THIS analysis, still running. The unit's close then credits
+    the verdict only to that unit (`verified_by = unit:<id>`), and clears it
+    if the unit's stream shows a subagent -- or shows nothing at all
+    (security/units.py `close`).
     """
     try:
         stdin_text = sys.stdin.read()
@@ -1688,6 +1816,20 @@ def cmd_report_verdict(args):
     _refuse_if_secret("report-verdict: reason", reason)
     conn = _conn(args)
     _running(conn, args.analysis)
+    # WHO MAY WRITE A VERDICT. Inside an agent session, only the verify unit
+    # the engine launched for THIS finding -- the write is the evidence that a
+    # second, independent session read the code, and it is checked here
+    # instead of counted afterwards. Outside any session it is the operator's.
+    by = "operator"
+    if _agent_env("SECURITY_AGENT"):
+        uid = _session_unit()
+        unit = ledger.get_unit(conn, uid) if uid else None
+        if (unit is None or unit["kind"] != "verify" or unit["analysis_id"] != args.analysis
+                or unit["state"] != "running"
+                or unit["payload"].get("fingerprint") != args.fingerprint):
+            sys.exit(f"report-verdict: only the verify unit the engine launched for "
+                     f"{args.fingerprint[:12]}… may record its verdict. Nothing was recorded")
+        by = f"unit:{uid}"
     # The queue is the authority on both questions at once -- is this finding
     # one somebody was asked to verify, and does it still need one. A row that
     # already carries a verdict has left the queue, so a second verdict lands
@@ -1699,9 +1841,427 @@ def cmd_report_verdict(args):
                  "leaves that list the moment it carries a verdict: a verifier does not "
                  "contradict itself, and the first answer is the one that counts. "
                  "Nothing was recorded")
-    if not ledger.record_verdict(conn, args.analysis, args.fingerprint, value, reason):
+    if not ledger.record_verdict(conn, args.analysis, args.fingerprint, value, reason, by=by):
         sys.exit(f"report-verdict: {args.fingerprint[:12]}… could not be written. "
                  "Nothing was recorded")
+
+
+# ---- the pipeline's units (security/units.py) -------------------------------
+
+def _session_unit() -> int:
+    """This session's unit id, or 0 outside one (a hand run, a test)."""
+    value = _agent_env("SECURITY_UNIT_ID")
+    return int(value) if value.isdigit() else 0
+
+
+READ_LINES = evidence.READ_LINES
+READ_BYTES = evidence.READ_BYTES
+
+# Minor 3 (of the first fix; unchanged since): piping a chunk (`| head`),
+# filtering it, or chaining a second read in the same call records a chunk
+# the model never saw whole, and `read` has no way to detect any of that from
+# here. Printed as the second line of every ordinary chunk (never the
+# oversized-single-line one, which explains itself) -- ONE constant, not a
+# literal at each print site, because I1 (below) also has to count its exact
+# bytes into the budget's own overhead, and a second copy is a second copy
+# that can drift from what is actually printed. It lives in evidence.py,
+# beside the overhead rule, because the inventory asks that rule of every
+# path before any unit is planned (`unprintable-path`).
+_RUN_ALONE = evidence.RUN_ALONE
+
+
+def _unit_of(conn, analysis_id, unit_id):
+    unit = ledger.get_unit(conn, unit_id)
+    if unit is None or unit["analysis_id"] != analysis_id:
+        sys.exit(f"unit {unit_id} is not a unit of analysis {analysis_id}")
+    return unit
+
+
+def _finding_row(f, kind=None, scanner_severity=""):
+    """One ledger row as a unit's prompt shows it: its first location on its
+    own line, and EVERY location beside it. A re-report REPLACES the stored
+    list (ledger.record_finding), so a triage unit shown one location of
+    five, and told to re-report the row as shown, would narrow it to one.
+    `scanner_severity` is the one a triage item says its scanner filed: the
+    prompt shows it beside a severity that has changed since."""
+    places = [{"file": o.get("file", ""), "line": o.get("line", 0)}
+              for o in f.get("occurrences") or []]
+    first = places[0] if places else {}
+    row = {"fingerprint": f["fingerprint"], "category": f.get("category", ""),
+           "rule": f.get("rule", ""), "severity": f.get("severity", ""),
+           "state": f.get("state", ""), "title": f.get("title", ""),
+           "file": first.get("file", ""), "line": first.get("line", 0),
+           "producer": f.get("producer", ""), "occurrences": places}
+    if kind:
+        row["kind"] = kind
+    if scanner_severity:
+        row["scanner_severity"] = scanner_severity
+    return row
+
+
+def cmd_unit_prompt(args):
+    """The prompt of one unit, minted from the ledger -- the text the engine
+    launches the unit's session with (bin/agentloop, run_job). Read-only, so
+    it is not in AGENT_FORBIDDEN: the engine calls it inside the run's own
+    environment."""
+    conn = _conn(args)
+    row = _analysis(conn, args.analysis)
+    unit = _unit_of(conn, args.analysis, args.unit)
+    _a, findings = queries.checklist(conn, args.analysis)
+    by_fp = {f["fingerprint"]: f for f in findings}
+    kind = unit["kind"]
+    if kind == "triage":
+        # A scanner item carries the severity its scanner filed (units.plan),
+        # and the unit owes the row at the floor or above at that one as well
+        # as at the row's own now: passed through, so a row another unit
+        # lowered to `low` is shown with the reason it is still owed.
+        context = {"rows": [_finding_row(by_fp[i["fingerprint"]], i["kind"],
+                                         i.get("severity", "") if i["kind"] == "scanner" else "")
+                            for i in unit["payload"].get("items", []) if i["fingerprint"] in by_fp]}
+    elif kind == "hunt":
+        context = {"guides": ledger.guides_of(row).get("recommended") or [guides.ALWAYS]}
+    elif kind == "read":
+        ranges = unit["payload"].get("ranges", [])
+        paths = {r["path"] for r in ranges}
+
+        def in_ranges(f):
+            return any(o.get("file") in paths for o in f.get("occurrences") or [])
+        # WHAT IS ALREADY RECORDED IN THESE FILES: every open row, AND every
+        # row the operator decided on this branch. The checklist lists those
+        # with the decision's state, which is not open, and `decided_sast`
+        # leaves out whatever the checklist lists -- so a decided row filtered
+        # out here reached the unit from nowhere, and was minted again under a
+        # second identity no decision matches.
+        known = [_finding_row(f) for f in findings if in_ranges(f)
+                 and (queries.is_open(f.get("state", ""))
+                      or f.get("state") in ledger.DECISION_STATES)]
+        # A `decided_sast` entry carries neither a category (every one is a
+        # sast finding) nor a state (the decision's is inside `decision`), and
+        # the prompt's line shows both.
+        decided = [_finding_row(dict(e, category="sast", state=e["decision"]["state"]))
+                   for e in queries.decided_sast(conn, args.analysis, listed=findings)
+                   if in_ranges(e)]
+        context = {"ranges": ranges, "guides": unit["payload"].get("guides") or [guides.ALWAYS],
+                   "known": known, "decided": decided}
+    else:
+        finding = by_fp.get(unit["payload"].get("fingerprint", ""))
+        if finding is None:
+            sys.exit(f"unit-prompt: unit {args.unit}'s finding is not in analysis {args.analysis}")
+        context = {"finding": finding}
+    analysis = {k: row[k] for k in ("id", "project", "repo", "branch", "commit_sha", "profile")}
+    print(prompts.unit_prompt(analysis, units.label(conn, unit), args.platform, kind, context))
+
+
+def cmd_unit_close(args):
+    """Judge one run of a unit by what it left -- its stream, what `read`
+    served it, the ledger -- and plan what it left undone (units.close). The
+    ENGINE's verb: run_job calls it when a unit's run ends, with the agent
+    flag removed, so it is in AGENT_FORBIDDEN (a session does not grade
+    itself). Closing a unit that is already settled is a no-op: the
+    orchestrator judges a unit whose run died before this close could run,
+    through the same function, and whichever comes second finds it settled."""
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    unit = _unit_of(conn, args.analysis, args.unit)
+    print(json.dumps(units.close(conn, unit, stream=args.stream, root=args.root,
+                                 status=args.status, reason=args.reason,
+                                 spend_usd=_spend(args.spend), cause=args.cause)))
+
+
+def cmd_report_gone(args):
+    """A carried `sast` finding the session's triage unit read and found gone,
+    SAID, with the reason -- the one way such a finding leaves the report
+    without a silence the unit's proof could not tell from a skipped row."""
+    uid = _session_unit()
+    if not uid:
+        # Minor 8: named on its own, before the generic fingerprint refusal
+        # below -- with no unit id there is no session to check a carried
+        # row against, and saying "the fingerprint is wrong" about a call
+        # that could never have succeeded points at the wrong thing.
+        sys.exit("report-gone: AL_SECURITY_UNIT_ID is not set in this session -- report-gone runs "
+                 "only inside a triage unit's own session. Nothing was recorded")
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError as exc:
+        sys.exit(f"report-gone: stdin is not valid JSON: {exc}")
+    # Minor 8: a `reason` that is JSON but not a STRING (5, ["x"], null, an
+    # object) must be refused with the same "a reason is required" message
+    # as an empty one, never an AttributeError from calling `.strip()` on
+    # whatever it actually was.
+    raw_reason = payload.get("reason") if isinstance(payload, dict) else None
+    reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
+    if not reason:
+        sys.exit("report-gone: a reason is required -- what you read that shows it is gone. Nothing was recorded")
+    _refuse_if_secret("report-gone: reason", reason)
+    conn = _conn(args)
+    _running(conn, args.analysis)
+    unit = ledger.get_unit(conn, uid)
+    carried = [] if unit is None else [i for i in unit["payload"].get("items", [])
+                                       if i.get("kind") == "carried" and i.get("category") == "sast"]
+    if (unit is None or unit["kind"] != "triage" or unit["analysis_id"] != args.analysis
+            or unit["state"] != "running"
+            or args.fingerprint not in {i["fingerprint"] for i in carried}):
+        sys.exit(f"report-gone: {args.fingerprint[:12]}… is not a carried sast finding of this "
+                 "session's triage unit. Nothing was recorded")
+    ledger.record_gone(conn, uid, args.fingerprint, reason)
+
+
+def cmd_units(args):
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    if args.label is not None:
+        print(units.label(conn, _unit_of(conn, args.analysis, args.label)))
+        return
+    print(json.dumps(units.summary(conn, args.analysis), indent=2))
+
+
+# Minor 3: not only the C0 controls and DEL the previous `[\x00-\x1f\x7f]`
+# regex caught, but every Unicode category Cc character -- which also reaches
+# the C1 controls, \x80-\x9f, including U+0085 NEL -- plus U+2028 and U+2029,
+# the line and paragraph separators that are not Cc at all (they are Zl/Zp)
+# but that `str.splitlines` still treats as a line break, the same as `\n`.
+# Any of these, in a path this verb would otherwise print on a line of its
+# own, could forge a second line of its own output. The rule is
+# evidence.unprintable, which the inventory applies to every path too
+# (`unprintable-path`): a file this verb must refuse is never planned.
+def _carries_a_forbidden_char(rel: str) -> bool:
+    return evidence.unprintable(rel)
+
+
+def cmd_read(args):
+    """A chunk of a file, numbered, for a unit that must PROVE it read it --
+    the only proof on the Codex CLI, whose shell reads the stream cannot carry
+    (security/evidence.py). Records the chunk only after printing it: the
+    record says what was put in front of the session, never what it asked
+    for. Served to a `running` unit of a running analysis only, and only
+    inside the unit's own run.
+
+    THE BUDGET COUNTS WHAT IS ACTUALLY PRINTED, byte for byte -- each line's
+    "N\\t" prefix included, encoded as UTF-8 -- never the bare text alone. On
+    the Codex CLI this verb's ledger record IS the proof of reading, because
+    that CLI shows the model at most ~10 KiB / 256 lines of a command's
+    output and cuts the middle of anything longer: a chunk sized off the text
+    alone can run past what the model actually saw -- two-byte characters
+    double the true cost of every line, and two hundred line-number prefixes
+    add on the order of 1.4 KB by themselves -- and the ledger would then
+    record lines nobody read.
+
+    THE REPOSITORY BEING ANALYSED IS NOT TRUSTED INPUT (I1). Git allows a
+    space, `;`, `$( )`, a backtick or a newline in a file name, and the
+    inventory lists whatever the tree holds. Every path this prints -- the
+    header, the "nothing at line N" notice, and the `-- next:` command --
+    goes through `shlex.quote`, so what is shown is exactly what the next
+    command accepts, never a shell fragment a model could copy and have
+    expanded (`--path=<path>`, one token, so a name starting with `-` is
+    never mistaken for another option). A name carrying a control character
+    (any Unicode category Cc, or the U+2028/U+2029 line separators) cannot be
+    shown on a line of its own without risking a forged line of this verb's
+    own output -- a fake `-- next:`, a fake `-- end of file`, a header for a
+    chunk never printed -- so it is refused outright: nothing is printed
+    from the file and nothing is recorded. The close names it owed, the same
+    as any other slice nobody could read.
+
+    THE BUDGET BOUNDS THE WHOLE CALL, NOT ONLY THE NUMBERED LINES (I1, round
+    2). The header, the piping warning above and the `-- next:` footer are
+    not free -- each carries the quoted path -- and sizing the numbered
+    lines off READ_BYTES alone, as this used to, let their combined cost go
+    uncounted: a hostile enough name (hundreds of `'`, each costing several
+    bytes once `shlex.quote` escapes it) could push the WHOLE call's printed
+    output well past what the Codex CLI actually shows the model, while the
+    ledger still recorded the full chunk as read -- the exact failure this
+    budget exists to prevent, since that ledger record is the only proof of
+    reading there is on that platform, and a record may only ever claim what
+    actually fit on the screen. So the header and the footer are built FIRST,
+    at the largest size either could ever be for this file -- substituting
+    the file's own `total` for `last`, since `last` never exceeds it, and the
+    `--from N` footer (the longer of its two forms) is only ever printed when
+    `last < total`, so N = last + 1 is bounded by `total` too -- and only
+    what is left of READ_BYTES after them and the (fixed-length) piping
+    warning is given to the numbered lines. A path whose own overhead already
+    exceeds half of READ_BYTES is refused before anything is printed from it
+    -- the file's bytes are already on disk and get opened regardless, but
+    nothing of them is ever shown or recorded: no chunk of this file could
+    ever fit beside the header and footer that would have to introduce it,
+    so it cannot be proven read through `read` at all, and the close names
+    it owed -- the same debt as a control character or an outside path.
+
+    THIS VERDICT IS A FACT ABOUT THE PATH, NOT ABOUT `--from` (round 3). The
+    header and footer above are sized off `total` alone, never off `first`
+    (`args.start`, chosen by this call's own caller) -- so the same path
+    gets the same verdict whichever chunk of it is asked for. Sizing either
+    one off `first` instead let the very same over-long path be served from
+    line 1 and then refused at the `--from` its own footer had just printed
+    back, and let a caller-supplied `--from` with far more digits than the
+    file has lines inflate the header on its own, refusing a short path
+    that was never actually asked to show anything past its own end.
+    """
+    aid, uid, run_cwd = (_agent_env("SECURITY_ANALYSIS_ID"), _agent_env("SECURITY_UNIT_ID"),
+                         _agent_env("RUN_CWD"))
+    if not (aid.isdigit() and uid.isdigit() and run_cwd):
+        # Minor 2: no silent `os.getcwd()` fallback for a missing AL_RUN_CWD
+        # -- a unit's shell that ran `cd src` first would otherwise serve
+        # `a.py` and record it as `src/a.py`, one directory short of where
+        # it actually is.
+        sys.exit("read: serves only a unit of an analysis -- AL_SECURITY_ANALYSIS_ID, "
+                 "AL_SECURITY_UNIT_ID and AL_RUN_CWD are not set in this session")
+    conn = _conn(args)
+    _running(conn, int(aid))
+    unit = _unit_of(conn, int(aid), int(uid))
+    if unit["state"] != "running":
+        # Minor 1: a unit `reset_unit` sent back to `pending` after its run
+        # died must not go on being served under the same id -- see
+        # `ledger.unit_reads`'s own `since` and `units.close`'s use of it.
+        sys.exit(f"read: unit {uid} is not running in analysis {aid} (state: {unit['state']}) -- "
+                 "a unit reads only during its own run")
+    root = os.path.realpath(run_cwd)
+    # I2: the one containment rule, shared with what a unit's own stream
+    # proves it read (evidence.parse) -- see evidence.relative_path.
+    rel = evidence.relative_path(args.path, root)
+    if rel is None:
+        # Minor 2 (of the second review): decided by `relative_path` alone,
+        # BEFORE the control-character check below ever sees `rel` -- so,
+        # alone among every message here, this one has nothing upstream
+        # filtering what it echoes. `!r` escapes a control character or a
+        # newline (a fake `-- next:` line, forged into `args.path` itself)
+        # instead of ever printing it raw.
+        sys.exit(f"read: {args.path!r} is outside this run's checkout ({root})")
+    if _carries_a_forbidden_char(rel):
+        sys.exit(f"read: {rel!r} carries a character this verb cannot show on a line of its own "
+                 "-- nothing was printed or recorded; the close will name it owed")
+    quoted = shlex.quote(rel)
+    full = os.path.join(root, rel)
+    try:
+        data = Path(full).read_bytes()
+    except OSError as exc:
+        sys.exit(f"read: cannot read {quoted}: {exc.strerror or exc}")
+    # Minor 4: the count below is UTF-8; `print` alone uses whatever
+    # encoding the process's locale gives a non-interactive session (ascii,
+    # under a bare `LC_ALL=C`), and would raise on the very bytes just
+    # counted. Guarded: a stdout that cannot reconfigure (piped through
+    # something that already replaced it) is left as it is.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    lines = data.decode("utf-8", errors="replace").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    total, first = len(lines), max(1, args.start)
+
+    # I1: THE WHOLE CALL, not only the numbered lines below, has to fit
+    # inside READ_BYTES -- see the docstring. Both `first` and `last` max
+    # out at `total` (a chunk that reaches EOF, or one starting at the last
+    # line), in the header as much as in the footer, so substituting `total`
+    # for either one here is a true upper bound on its length, never a
+    # guess: real `first` and `last` only ever have as many digits, or
+    # fewer -- and, unlike `total`, `first` is `args.start`, a value this
+    # call's OWN caller chose, so sizing the header off it would make the
+    # verdict for a given path depend on which `--from` asked for it,
+    # rather than being a fact about the path alone. The same computation the
+    # inventory runs on every path (evidence.read_overhead), so a file this
+    # refuses is left out of the deep scope by name (`unprintable-path`).
+    overhead = evidence.read_overhead(rel, total)
+    if overhead > READ_BYTES // 2:
+        # Refused before the "nothing at line N" branch below too: this is a
+        # judgment about the PATH, not about where `--from` landed in it --
+        # nothing printed from the file, nothing recorded, whichever branch
+        # would otherwise have run.
+        sys.exit(f"read: {quoted} is too long to show with a chunk of this verb's own budget "
+                 f"({READ_BYTES} bytes) -- it cannot be proven read through `read`; the close "
+                 "will name it owed")
+    budget = READ_BYTES - overhead
+
+    if first > total:
+        print(f"== {quoted} has {total} line{'s' if total != 1 else ''}; nothing at line {first} ==")
+        return
+    # Each line's cost is the UTF-8 bytes of what is actually PRINTED for it
+    # -- "N\tTEXT" -- plus one for its newline, never `len(text)` alone: see
+    # the docstring. `out` empty is what tells apart a line too wide for a
+    # whole chunk on its own from one that merely does not fit beside lines
+    # already collected: the first never breaks the loop before it is judged
+    # (so it always gets a verdict below), the second always does. Judged
+    # against `budget` -- READ_BYTES minus the header/warning/footer overhead
+    # above -- never against READ_BYTES itself: that would leave the body
+    # free to spend what the header and the footer already own.
+    out, size, last = [], 0, first - 1
+    oversized, oversized_cost = None, None
+    for number in range(first, total + 1):
+        piece = f"{number}\t{lines[number - 1]}"
+        cost = len(piece.encode("utf-8")) + 1
+        if out and (len(out) >= READ_LINES or size + cost > budget):
+            break
+        if not out and cost > budget:
+            # A single line wider than the whole budget -- only possible
+            # under `!defaults`, since the default inventory already leaves
+            # out any file with a line over 2,000 characters
+            # (security/inventory.py `generated`). Shown so a reader is not left guessing what is
+            # there, but never recorded: this chunk cannot show it whole, and
+            # what a model on the Codex CLI saw of it is exactly as
+            # incomplete -- there is nothing here that proves it was read.
+            oversized, oversized_cost, last = piece, cost, number
+            break
+        out.append(piece)
+        size += cost
+        last = number
+    print(f"== {quoted} lines {first}-{last} of {total} ==")
+    if oversized is not None:
+        print(oversized)
+        # Minor 7: the same measure on both sides -- `oversized_cost` is what
+        # the check above actually compared to `budget` (the line's UTF-8
+        # bytes PLUS its trailing newline, the same "N\tTEXT\n" cost every
+        # other line in this call is charged), not the bare text alone.
+        print(f"-- line {last} is {oversized_cost} bytes, wider than one chunk "
+              f"({budget} bytes) can show -- it cannot be proven read here")
+    else:
+        print(_RUN_ALONE)
+        print("\n".join(out))
+    # Minor 1: `--path=`, not a space -- a name starting with `-` (a root
+    # file `-lead.py`, a top directory `-src/`) is what argparse takes for
+    # another option, not this one's value, under the two-token form.
+    print(f"-- next: agentloop security read --path={quoted} --from {last + 1}" if last < total
+          else "-- end of file")
+    sys.stdout.flush()
+    if out:
+        ledger.record_unit_read(conn, int(uid), rel, first, last)
+
+
+def _transition(ok, analysis_id, state, why):
+    if not ok:
+        sys.exit(f"analysis {analysis_id} {why}")
+    print(json.dumps({"state": state}))
+
+
+def cmd_orchestrate(args):
+    """The engine's long-running half of an analysis (security/orchestrator.py).
+    `__run-analysis` in bin/agentloop takes the analysis lock and execs this,
+    so the lock's pid IS this process: a stop signals it directly. A budget
+    that is not a number exits 2 with a sentence (Orchestrator.run)."""
+    sys.exit(orchestrator.Orchestrator(
+        args.db, args.analysis, engine=args.engine, job=args.job, commit=args.commit,
+        repo=args.repo, repo_path=args.repo_path, prepare_root=args.prepare_root,
+        log_root=args.log_root or None, parallel=args.parallel, budget=args.budget,
+        ignore=args.ignore, log=args.log or None, lock_dir=args.lock_dir or None,
+        offline=args.offline).run())
+
+
+def cmd_interrupt(args):
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    _transition(ledger.interrupt_analysis(conn, args.analysis), args.analysis,
+                ledger.INTERRUPTED, "is not running: only a running analysis is interrupted")
+
+
+def cmd_resume(args):
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    _transition(ledger.resume_analysis(conn, args.analysis, automatic=args.automatic),
+                args.analysis, "running", "is not interrupted: there is nothing to resume")
+
+
+def cmd_abandon(args):
+    _refuse_if_secret("abandon: --note", args.note)
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    _transition(ledger.close_interrupted(conn, args.analysis, args.note), args.analysis,
+                "failed", "is not interrupted: only an interrupted analysis is abandoned")
 
 
 def cmd_fingerprint(args):
@@ -1997,8 +2557,34 @@ def cmd_report_finding(args):
                  "reader of the report opens; an object with no `file` is not "
                  "one, and a row carrying only such objects has no location "
                  "at all")
+    # A SAST FINDING NEEDS AT LEAST ONE LOCATION. `all(...)` above is
+    # vacuously true of an EMPTY `occurrences` list, so it alone let a `sast`
+    # row through with NO location whatsoever -- and a later triage unit's
+    # `report-gone` on that same fingerprint would then have nothing to
+    # prove a reading of, settling a `gone` claim on nothing at all
+    # (units._unread_files / _judge_triage's own fix). A weakness in code
+    # with no file and no line is one nobody has read; refused here, at the
+    # door, rather than let it become an unprovable row later.
+    if payload["category"] == "sast" and not occurrences:
+        sys.exit("report-finding: a sast finding needs at least one occurrence "
+                 "naming a file. A weakness with no location can be neither "
+                 "fixed nor verified, by this analysis or the next one's "
+                 "report-gone")
     conn = _conn(args)
     _running(conn, args.analysis)
+    # THE UNIT THIS ROW WILL BE STAMPED WITH (`finding.unit`, below) must be
+    # a running unit of THIS analysis, as `report-verdict`, `report-gone`
+    # and `read` already require. The judge credits a unit with exactly the
+    # rows stamped with its id; a session whose unit has settled -- an orphan
+    # of a run already judged -- or one naming another analysis's unit would
+    # otherwise write rows credited to a unit that never ran them.
+    uid = _session_unit()
+    if uid:
+        unit = ledger.get_unit(conn, uid)
+        if unit is None or unit["analysis_id"] != args.analysis or unit["state"] != "running":
+            sys.exit(f"report-finding: unit {uid} is not a running unit of analysis "
+                     f"{args.analysis} -- a unit reports only during its own run. "
+                     "Nothing was recorded")
     refusal = _decided_identity_refusal(conn, args.analysis, payload)
     if refusal:
         sys.exit(refusal)
@@ -2046,6 +2632,9 @@ def cmd_report_finding(args):
     # minted -- which is exactly what `diff.AGENT` is proven by: the analysis
     # closing `done`.
     payload["producer"] = diff.AGENT
+    # The unit whose session wrote this row -- from the run's own environment,
+    # never the payload, on the rule `producer` follows.
+    payload["unit"] = _session_unit()
     try:
         ledger.record_finding(conn, args.analysis, payload)
     # OverflowError is here for the same reason ValueError is: it comes out of
@@ -2240,13 +2829,6 @@ VERIFY_DONE_NOTE = ("{n} verified: {confirmed} confirmed, {rejected} rejected, "
 VERIFY_UNVERIFIED_NOTE = ("{n} finding{s} left unverified: nobody tried to "
                           "disprove {them}, so this analysis says nothing about "
                           "whether {they} real. {lead}: {named}.")
-VERIFY_TASKS_WITHOUT_VERDICTS_NOTE = (
-    "{tasks} subagents were launched and {v} verdict{s} recorded: the rest "
-    "produced nothing, which is budget spent on parallelism rather than on "
-    "reading. Subagents in this run are for verification.")
-VERIFY_VERDICTS_WITHOUT_TASKS_NOTE = (
-    "{v} verdict{s} recorded and no subagent was launched: a verdict is a "
-    "second agent's reading, and nothing in this run's stream shows one ran.")
 VERIFY_UNVERIFIED_UNREACHED = ("This analysis did not close `done`, so nothing "
                                "checked whether the findings were verified.")
 
@@ -2260,9 +2842,6 @@ def _verdict_counts(conn, analysis_id) -> dict:
         if row["verdict"] in out:
             out[row["verdict"]] = row["n"]
     return out
-
-
-GUIDES_UNKNOWN = "unknown"
 
 
 def _guides_sentence(recommended, read) -> str:
@@ -2285,26 +2864,26 @@ def _guides_sentence(recommended, read) -> str:
 def cmd_finish(args):
     """Close the analysis. The verdict can be lowered, never raised.
 
-    Two callers, and they disagree on purpose: the AGENT says `--state done`
-    when it believes it finished, and the ENGINE
-    (`security_close_analysis`) closes the same row again with the run's own
-    verdict and real cost. Precedence, in this order:
+    The ENGINE's verb (AGENT_FORBIDDEN): the orchestrator closes a pipeline
+    analysis from what its units proved (`--from-units --if-running`), and
+    the engine's own sweeps close a row nothing will ever run (`--state
+    failed --if-running`). An operator may close one by hand. No unit's
+    session closes the analysis it is part of. Precedence, in this order:
 
-      1. `--if-running` (the engine's sweep for a run that never started) is
-         a no-op on any row that is already closed -- every other run closed
-         its own row with a real verdict, and re-closing it would replace
-         that with a guess.
-      2. A stored `capped` or `failed` is NEVER overwritten with `done`. The
-         agent's own `finish --state capped` is an honest statement that it
-         ran out of room, and the engine's `success` -- which only means the
-         PROCESS exited cleanly -- used to overwrite it: the truncated
-         analysis then became the baseline, and everything the agent had not
+      1. `--if-running` is a no-op on any row that is not `running` -- one
+         already closed with a real verdict, or one interrupted for a resume
+         -- and the write itself is conditional on the row still being
+         `running` (ledger.finish_analysis), so a stop or a sweep that
+         interrupts it between this check and the write still wins.
+      2. A stored `capped` or `failed` is NEVER overwritten with `done`. A
+         close that already said the analysis ran out of room is an honest
+         statement, and a later `done` -- a second close that only knows the
+         process exited cleanly -- used to overwrite it: the truncated
+         analysis then became the baseline, and everything nobody had
          reached read as `fixed` that run and `regressed` the next.
       3. Otherwise the caller's state wins, INCLUDING a downgrade of a stored
-         `done` to `capped`/`failed`. That direction is the whole point of
-         closing twice: the agent's claim that it finished is the one fact
-         here that nothing can verify, and the run it made that claim from
-         may have been cut off mid-sentence.
+         `done` to `capped`/`failed`: a later close knowing of a gap is the
+         one to believe.
 
     Whatever the state ends up being, the SPEND and the note are still
     written: the run's real cost is a fact even when its verdict is refused.
@@ -2313,33 +2892,23 @@ def cmd_finish(args):
     # refuses its own four free-text fields: `--note` is written verbatim
     # into `coverage_note`, which reaches all four report formats
     # (`report.py`'s `_coverage`) and the analysis page's own notice, and it
-    # is agent-writable -- `finish` is deliberately NOT in AGENT_FORBIDDEN.
-    # It was the one such channel with no gate on it while its near-twin
-    # `partial_note` had one. See `_refuse_if_secret`.
+    # is free text an operator or the engine types. It was the one such
+    # channel with no gate on it while its near-twin `partial_note` had one.
+    # See `_refuse_if_secret`.
     _refuse_if_secret("finish: --note", args.note)
     conn = _conn(args)
     row = _analysis(conn, args.analysis)
     if args.if_running and row["state"] != "running":
         return
     state = args.state
-    # WHAT THE AGENT READ, from the ENGINE's close only -- the flag is absent
-    # on the agent's own close, which knows nothing about its stream, so no
-    # sentence is written then; the engine's close writes the one true
-    # sentence and `guides.read`. `unknown` is a value, not an absence: the
-    # stream could not be read, and the report says so rather than "none".
-    # Names outside the vendored set are dropped, never echoed: a name is
-    # matched off the stream by a regex, and this is the one place that knows
-    # the closed set.
+    # WHAT THE AGENT READ. The single-session close that used to pass
+    # `--guides-read` off its own stream is gone with the pipeline (Task 11):
+    # `guides_note` is now written only by the units' account below
+    # (`--from-units`), off `units.guides_read`. Names outside the vendored
+    # set are dropped, never echoed: a name is matched off the stream by a
+    # regex, and `units.guides_read` is the one place that knows the closed
+    # set.
     guides_note = ""
-    if args.guides_read is not None:
-        recommended = ledger.guides_of(row).get("recommended", [])
-        if args.guides_read.strip() == GUIDES_UNKNOWN:
-            read = None
-        else:
-            given = set(args.guides_read.split(","))
-            read = [g for g in guides.NAMES if g in given]
-            ledger.set_guides(conn, args.analysis, read=read)
-        guides_note = _guides_sentence(recommended, read)
     if state == "done" and row["state"] in ("capped", "failed"):
         print(f"finish: analysis {args.analysis} is already {row['state']} — a "
               "close never upgrades a truncated or failed analysis to done",
@@ -2384,12 +2953,14 @@ def cmd_finish(args):
     unprepared_note = ""
     decided_note = ""
     triage_phase = None
-    # `done` REQUIRES that the deterministic phases actually ran. Nothing
-    # engine-side runs `prepare` -- it is the agent's first command, named in
-    # the prompt and in the skill -- so an agent that simply skipped it exited
-    # cleanly, the engine closed the row `done`, and the result was a report
-    # with zero findings, an empty coverage note and no banner anywhere saying
-    # the repository had never been scanned. Worse than useless: that report
+    # `done` REQUIRES that the deterministic phases actually ran. Before the
+    # pipeline nothing engine-side ran `prepare` -- it was the agent's first
+    # command -- so an agent that simply skipped it exited cleanly, the
+    # engine closed the row `done`, and the result was a report with zero
+    # findings, an empty coverage note and no banner anywhere saying the
+    # repository had never been scanned. The orchestrator runs it now, and a
+    # prepare that fails closes the analysis `capped` on its own; this guard
+    # stays as the defence in depth for any close of an unprepared row. Worse than useless: that report
     # becomes the BASELINE the next analysis is diffed against, so everything
     # the next run legitimately finds arrives as `new` and everything a
     # previous run had found reads as `fixed`.
@@ -2453,22 +3024,15 @@ def cmd_finish(args):
         # one close.
         triage_phase = _triage_phase(conn, args.analysis, skipped,
                                      untriaged_note, decided_note)
-    # THE VERIFICATION, checked the way the triage is: three facts the ledger
-    # and the run's stream hold between them, and a `done` that survives all
-    # three or is lowered with the reason in writing.
+    # THE VERIFICATION, checked the way the triage is: what the ledger holds
+    # against what the phase should have covered, and a `done` that survives
+    # it or is lowered with the reason in writing.
     #
-    #   the queue    findings in scope that nobody verified. This is the guard
-    #                the two counts below CANNOT see: an agent that ignores
-    #                the phase launches nothing and records nothing, so N and
-    #                V agree at zero while the work never happened.
-    #   N > V        subagents that produced no verdict -- the $51.44 failure,
-    #                budget spent on parallelism.
-    #   V > N        verdicts with no subagent behind them: the hunter wrote
-    #                them itself.
+    #   the queue    findings in scope that nobody verified. An agent that
+    #                ignores the phase launches nothing and records nothing,
+    #                and the queue is what catches that the work never
+    #                happened.
     #
-    # N is only known to the ENGINE's close (`--tasks-launched`, from
-    # `security_task_count` over the stream); the agent's own close omits the
-    # flag and the two comparisons are simply not made.
     # `verify_note` is the ROW's prose; `verify_gap` is the part of it that is
     # a GAP and therefore belongs in the paragraph too. The summary sentences
     # -- nothing was waiting, N verified -- describe what happened rather than
@@ -2481,7 +3045,6 @@ def cmd_finish(args):
         unverified = queries.verify_queue(conn, args.analysis)
         counts = _verdict_counts(conn, args.analysis)
         recorded = sum(counts.values())
-        tasks = args.tasks_launched
         if unverified:
             n = len(unverified)
             named = "; ".join(
@@ -2498,17 +3061,7 @@ def cmd_finish(args):
                 rejected=counts["rejected"], needs=counts["needs_validation"])
         else:
             verify_note = VERIFY_NOTHING_NOTE
-        mismatch = ""
-        if tasks is not None and tasks > recorded:
-            mismatch = VERIFY_TASKS_WITHOUT_VERDICTS_NOTE.format(
-                tasks=tasks, v=recorded, s="s" if recorded != 1 else "")
-        elif tasks is not None and recorded > tasks:
-            mismatch = VERIFY_VERDICTS_WITHOUT_TASKS_NOTE.format(
-                v=recorded, s="s" if recorded != 1 else "")
-        if mismatch:
-            verify_note = f"{verify_note} {mismatch}".strip()
-            verify_gap = f"{verify_gap} {mismatch}".strip()
-        bad = bool(unverified) or (tasks is not None and tasks != recorded)
+        bad = bool(unverified)
         if state == "done" and bad:
             state = "capped"
             print(f"finish: analysis {args.analysis} — {verify_note}", file=sys.stderr)
@@ -2516,6 +3069,25 @@ def cmd_finish(args):
             coverage.VERIFICATION,
             coverage.WARNING if bad else coverage.RAN,
             diff.AGENT, verify_note)
+    # THE UNITS' ACCOUNT, on the engine's close of a pipeline analysis. Each
+    # gap -- a unit that never finished, a lineage that gave up after
+    # MAX_ATTEMPTS, a line of the deep scope nobody proved they read -- lowers
+    # `done` exactly as the three guards above do, and goes into the paragraph
+    # by name. The spend is the units' own sum: each unit's cost was recorded
+    # by its close, and no caller of `finish` knows the total better.
+    units_gap = ""
+    units_sentence = ""
+    if args.from_units and row["prepared"]:
+        found = units.gaps(conn, args.analysis)
+        if found and state == "done":
+            state = "capped"
+            print(f"finish: analysis {args.analysis} — {' '.join(found)}", file=sys.stderr)
+        units_gap = " ".join(found)
+        units_sentence = units.coverage_sentence(conn, args.analysis)
+        args.spend = (units.summary(conn, args.analysis) or {}).get("spend_usd", args.spend)
+        read = units.guides_read(conn, args.analysis)
+        ledger.set_guides(conn, args.analysis, read=read)
+        guides_note = _guides_sentence(ledger.guides_of(row).get("recommended", []), read)
     # finish_analysis writes coverage_note unconditionally, and neither caller
     # of `finish` carries the note `prepare` printed: the agent never saw it,
     # and the engine's close-out knows only the run's status and cost. An
@@ -2535,8 +3107,21 @@ def cmd_finish(args):
     # has to be in the paragraph for the row to be quoting it.
     stored = row["coverage_note"] or ""
     note = ""
-    for part in (stored, args.note or "", unprepared_note, untriaged_note,
-                 decided_note, guides_note, verify_gap):
+    # THE `sast` ROW'S PROSE STANDS TOGETHER IN THE PARAGRAPH, in the order the
+    # row carries it: the invariant every phase keeps (each row's note is one
+    # contiguous run of the paragraph, test_every_phases_prose_is_a_substring_of_the_paragraph)
+    # and the one test_a_close_from_the_units_keeps_every_row_a_substring_of_the_paragraph
+    # (test_finish_units.py) pins for this close. On the engine's close of a
+    # pipeline analysis the row is the units' sentence, the `--note` and the
+    # guides sentence, so the three go in together, ahead of the gaps; every
+    # other close keeps the order it always had.
+    if args.from_units:
+        parts = (stored, units_sentence, args.note or "", guides_note, units_gap,
+                 unprepared_note, untriaged_note, decided_note, verify_gap)
+    else:
+        parts = (stored, args.note or "", unprepared_note, untriaged_note,
+                 decided_note, guides_note, verify_gap)
+    for part in parts:
         part = part.strip()
         # `not in`, not `!=`: a row is closed twice (the agent, then the
         # engine) and each close re-reads the note it already wrote. Without
@@ -2612,6 +3197,8 @@ def cmd_finish(args):
         sast_note = (args.note or "").strip() or prior_sast
         if guides_note and guides_note not in sast_note:
             sast_note = f"{sast_note} {guides_note}".strip()
+        if units_sentence:
+            sast_note = f"{units_sentence} {sast_note}".strip()
         sast_phase = coverage.phase(
             coverage.SAST_AGENT,
             coverage.RAN if state == "done" else coverage.WARNING,
@@ -2622,8 +3209,9 @@ def cmd_finish(args):
     phases = coverage.merge(
         phases, [sast_phase] + ([triage_phase] if triage_phase else [])
         + ([verify_phase] if verify_phase else []))
-    ledger.finish_analysis(conn, args.analysis, state, _spend(args.spend), note,
-                           coverage.encode(phases))
+    if not ledger.finish_analysis(conn, args.analysis, state, _spend(args.spend), note,
+                                  coverage.encode(phases), only_if_running=args.if_running):
+        return          # interrupted (or closed) between the check above and the write
     # `row`'s own project and branch, never a flag the caller passed: `finish`
     # has two callers and neither one necessarily agrees with the row about
     # what it is closing, so the event has to come from the row itself.
@@ -2664,6 +3252,9 @@ def cmd_checklist(args):
     # shell tool that truncates a long output keeps its head, and the short
     # list the skill's fold rule depends on must not be the part that is cut.
     print(json.dumps({"analysis": analysis,
+                      # The pipeline's progress, for the page's Pipeline block:
+                      # small, and read while the analysis runs.
+                      "units": units.summary(conn, args.analysis),
                       "decided_sast": queries.decided_sast(conn, args.analysis, listed=findings),
                       "findings": findings},
                      indent=2))
@@ -2950,16 +3541,25 @@ def cmd_migrate_rules(args):
     Pre-flighting those two would mean doing the walk to find out, which is the
     thing that cannot be undone.
 
-    Refused while ANY analysis in the ledger is `running`, for `cmd_decide`'s
-    reason applied to a bigger blast radius. `decide` writes one row keyed to
-    an identity; this REWRITES identities, and mid-analysis that lands under an
-    agent still holding the old ones: findings it already reported get new
-    fingerprints, its re-report of one then misses the `(analysis_id,
-    fingerprint)` upsert key and INSERTs a second row instead, and one hole
-    becomes two contradictory checklist entries -- which is the exact outcome
-    that UNIQUE constraint exists to prevent. Not scoped to a project, unlike
+    Refused while ANY analysis in the ledger is `running` OR `interrupted`, for
+    `cmd_decide`'s reason applied to a bigger blast radius. `decide` writes one
+    row keyed to an identity; this REWRITES identities, and mid-analysis that
+    lands under an agent still holding the old ones: findings it already
+    reported get new fingerprints, its re-report of one then misses the
+    `(analysis_id, fingerprint)` upsert key and INSERTs a second row instead,
+    and one hole becomes two contradictory checklist entries -- which is the
+    exact outcome that UNIQUE constraint exists to prevent. `interrupted` is
+    included for the same reason and a longer fuse: its triage units carry
+    fingerprints of their own in their payloads (security/units.py), minted
+    under the names this verb is about to change, and a rename in the pause
+    orphans them -- a unit resumed afterwards looks for a name the ledger no
+    longer has, and the row it was to carry never reaches it. `_running`'s
+    refusal (`report-finding`, `report-verdict`, ...) does not reach this far
+    because it protects one analysis at a time from a write inside it; this
+    one protects every identity in the ledger from a rewrite under ANY
+    analysis still in flight, paused or not. Not scoped to a project, unlike
     `decide`'s: this verb takes no project and walks every row in the ledger,
-    so any live analysis anywhere is a live analysis this could pull the ground
+    so any live or paused analysis anywhere is one this could pull the ground
     out from under. A `running` row left by a run that died is not a permanent
     lock: the engine's preflight sweep closes those before it opens the next
     analysis of that project (see `cmd_security_analyze` in `bin/agentloop`).
@@ -2981,16 +3581,22 @@ def cmd_migrate_rules(args):
                      + ", ".join(ledger.RENAMEABLE_CATEGORIES)
                      + " (see ledger.rename_rule). Nothing was migrated.")
     conn = _conn(args)
+    # Both `running` and `interrupted` -- see the docstring's paragraph on why
+    # a pause does not lift this refusal: an interrupted analysis's triage
+    # units still carry fingerprints, minted under the names about to change,
+    # in their own payloads.
     live = conn.execute(
-        "SELECT id, project FROM analysis WHERE state='running' "
-        "ORDER BY id ASC LIMIT 1").fetchone()
+        "SELECT id, project, state FROM analysis WHERE state IN ('running', ?) "
+        "ORDER BY id ASC LIMIT 1", (ledger.INTERRUPTED,)).fetchone()
     if live is not None:
         sys.exit(f"migrate-rules: analysis {live['id']} of '{live['project']}' "
-                 "is still running — this rewrites the fingerprints of findings "
-                 "that analysis has already recorded, while the agent is still "
-                 "holding the old ones. Its next re-report of one would miss "
-                 "the upsert key and file a SECOND row for the same hole. Wait "
-                 "for the run to end; nothing was migrated.")
+                 f"is still {live['state']} — this rewrites the fingerprints of "
+                 "findings that analysis has already recorded, while the agent "
+                 "(if running) or one of its resumed units (if interrupted) is "
+                 "still holding the old ones. Its next re-report of one would "
+                 "miss the upsert key and file a SECOND row for the same hole. "
+                 "Wait for the run to end, or resume and finish it; nothing was "
+                 "migrated.")
     applied, total = [], 0
     for category, old, new in renames:
         try:
@@ -3654,6 +4260,9 @@ def main(argv=None):
     pr.add_argument("--root", required=True)
     pr.add_argument("--ignore", default="")
     pr.add_argument("--offline", action="store_true")
+    # The orchestrator's prepare only (security/orchestrator.py): write the
+    # analysis's plan. Without it `prepare` plans nothing -- see cmd_prepare.
+    pr.add_argument("--plan", action="store_true")
 
     fi = sub.add_parser("findings", parents=[dbflag]); fi.set_defaults(fn=cmd_findings)
     fi.add_argument("--analysis", type=int, required=True)
@@ -3676,20 +4285,85 @@ def main(argv=None):
     rf = sub.add_parser("report-finding", parents=[dbflag]); rf.set_defaults(fn=cmd_report_finding)
     rf.add_argument("--analysis", type=int, required=True)
 
-    # Deliberately absent from AGENT_FORBIDDEN, all three: the verifier is a
-    # subagent of the analysis and runs under the same flag the hunter does,
+    # Deliberately absent from AGENT_FORBIDDEN, both: a verify unit is a
+    # session of the pipeline and runs under the same flag every unit does,
     # so refusing them there would close the door on their only caller. The
-    # close's count is what makes the phase verifiable -- see `cmd_finish`.
+    # verify unit's prompt is minted by `unit-prompt` (prompts.verifier_prompt);
+    # what keeps a verdict honest is `report-verdict`'s own door and the
+    # unit's close (security/units.py).
     vq = sub.add_parser("verify-queue", parents=[dbflag]); vq.set_defaults(fn=cmd_verify_queue)
     vq.add_argument("--analysis", type=int, required=True)
-
-    vp = sub.add_parser("verify-prompt", parents=[dbflag]); vp.set_defaults(fn=cmd_verify_prompt)
-    vp.add_argument("--analysis", type=int, required=True)
-    vp.add_argument("--fingerprint", required=True)
 
     rv = sub.add_parser("report-verdict", parents=[dbflag]); rv.set_defaults(fn=cmd_report_verdict)
     rv.add_argument("--analysis", type=int, required=True)
     rv.add_argument("--fingerprint", required=True)
+
+    # The pipeline's units. `unit-prompt`, `units` and `read` are reads (and
+    # `read` exists for the agent), so they stay reachable under the agent
+    # flag; `unit-close` is the engine's and joins AGENT_FORBIDDEN (Task 8).
+    up = sub.add_parser("unit-prompt", parents=[dbflag]); up.set_defaults(fn=cmd_unit_prompt)
+    up.add_argument("--analysis", type=int, required=True)
+    up.add_argument("--unit", type=int, required=True)
+    up.add_argument("--platform", default="anthropic", choices=("anthropic", "openai", "opencode"))
+
+    uc = sub.add_parser("unit-close", parents=[dbflag]); uc.set_defaults(fn=cmd_unit_close)
+    uc.add_argument("--analysis", type=int, required=True)
+    uc.add_argument("--unit", type=int, required=True)
+    uc.add_argument("--stream", default="")
+    uc.add_argument("--root", default="")
+    # `run_classify` in bin/agentloop -- the run's own close classifier --
+    # assigns exactly these four strings to RJ_STATUS: success | warning |
+    # error (a non-zero exit, a denied tool, an API error) | stopped (the
+    # operator ended it). Task 8 wires `run_job` to call this verb with
+    # RJ_STATUS unchanged; nothing engine-side calls it with any other value.
+    uc.add_argument("--status", default="error", choices=("success", "warning", "error", "stopped"))
+    uc.add_argument("--reason", default="")
+    uc.add_argument("--spend", default="0")
+    # The classifier's cause (RJ_CAUSE): `rate_limited` or `api_error` is the
+    # provider ending the run, never the unit's failure -- units.close keeps
+    # the attempt for them. Free text: an unknown cause is simply not one of
+    # those two.
+    uc.add_argument("--cause", default="")
+
+    us = sub.add_parser("units", parents=[dbflag]); us.set_defaults(fn=cmd_units)
+    us.add_argument("--analysis", type=int, required=True)
+    us.add_argument("--label", type=int, default=None)
+
+    rg = sub.add_parser("report-gone", parents=[dbflag]); rg.set_defaults(fn=cmd_report_gone)
+    rg.add_argument("--analysis", type=int, required=True)
+    rg.add_argument("--fingerprint", required=True)
+
+    rd = sub.add_parser("read", parents=[dbflag]); rd.set_defaults(fn=cmd_read)
+    rd.add_argument("--path", required=True)
+    rd.add_argument("--from", type=int, default=1, dest="start")
+
+    # The pipeline's lifecycle, the engine's to drive (all three in AGENT_FORBIDDEN).
+    it = sub.add_parser("interrupt", parents=[dbflag]); it.set_defaults(fn=cmd_interrupt)
+    it.add_argument("--analysis", type=int, required=True)
+
+    rs = sub.add_parser("resume", parents=[dbflag]); rs.set_defaults(fn=cmd_resume)
+    rs.add_argument("--analysis", type=int, required=True)
+    rs.add_argument("--automatic", action="store_true")
+
+    ab = sub.add_parser("abandon", parents=[dbflag]); ab.set_defaults(fn=cmd_abandon)
+    ab.add_argument("--analysis", type=int, required=True)
+    ab.add_argument("--note", required=True)
+
+    # The engine's orchestrator of a pipeline analysis (in AGENT_FORBIDDEN).
+    oc = sub.add_parser("orchestrate", parents=[dbflag]); oc.set_defaults(fn=cmd_orchestrate)
+    for flag in ("--engine", "--job", "--commit", "--repo", "--repo-path", "--prepare-root"):
+        oc.add_argument(flag, required=True, dest=flag[2:].replace("-", "_"))
+    oc.add_argument("--analysis", type=int, required=True)
+    # Where run_job writes the units' streams ($LOG_DIR): how a run that died
+    # without its close is found and judged. Empty: such a run left no stream
+    # the orchestrator can find, and is judged as one that proved nothing.
+    oc.add_argument("--log-root", default="", dest="log_root")
+    oc.add_argument("--parallel", type=int, default=3)
+    oc.add_argument("--budget", default="")
+    oc.add_argument("--ignore", default="")
+    oc.add_argument("--log", default="")
+    oc.add_argument("--lock-dir", default="", dest="lock_dir")
+    oc.add_argument("--offline", action="store_true")
 
     fn = sub.add_parser("finish", parents=[dbflag]); fn.set_defaults(fn=cmd_finish)
     fn.add_argument("--analysis", type=int, required=True)
@@ -3697,13 +4371,9 @@ def main(argv=None):
     fn.add_argument("--spend", default="0")
     fn.add_argument("--note", default="")
     fn.add_argument("--if-running", action="store_true", dest="if_running")
-    # The ENGINE's close only: a comma list of guide names, '' for none, or
-    # `unknown` when the run's stream could not be read. See `cmd_finish`.
-    fn.add_argument("--guides-read", default=None, dest="guides_read")
-    # How many subagents the run launched, from `security_task_count` over the
-    # stream. The ENGINE's close only: the agent does not know its own stream,
-    # omits the flag, and the two count comparisons are then not made.
-    fn.add_argument("--tasks-launched", type=int, default=None, dest="tasks_launched")
+    # The ENGINE's close of a pipeline analysis (security/orchestrator.py):
+    # the spend is the units' sum, and every gap the units leave lowers `done`.
+    fn.add_argument("--from-units", action="store_true", dest="from_units")
 
     ck = sub.add_parser("checklist", parents=[dbflag]); ck.set_defaults(fn=cmd_checklist)
     ck.add_argument("--analysis", type=int, required=True)

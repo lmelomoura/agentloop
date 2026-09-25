@@ -284,6 +284,7 @@ export async function secShowAnalysis(id, pinned){
   secState.pinned = !!pinned;
   if(id == null){
     secState.analysis = null; secState.findings = [];
+    secState.units = null; secState.orchestrator = null;
     secPaint();
     return;
   }
@@ -292,9 +293,12 @@ export async function secShowAnalysis(id, pinned){
     if(seq !== secState.seq) return;    // a newer request already answered
     secState.analysis = j.analysis || null;
     secState.findings = j.findings || [];
+    secState.units = j.units || null;
+    secState.orchestrator = j.orchestrator || null;
   }catch(e){
     if(seq !== secState.seq) return;
     secState.analysis = null; secState.findings = [];
+    secState.units = null; secState.orchestrator = null;
     secStatus("Could not read that analysis — " + e.message);
     return;
   }
@@ -420,42 +424,54 @@ function secRenderRunMeta(a){
   host.appendChild(grid);
 }
 
-/* The three transient messages secPaint's old #sec-status line used to
-   append inline, unchanged in wording and in the facts that decide which
-   (if any) shows: the running-analysis reassurance, and the "running in the
-   ledger but no live slot" disagreement's own two readings (dead without a
-   journal past the 180s launch window, or still in the pre-agent worktree-
-   cutting window before that). The "Open the run" button that used to sit
-   beside them is now the Run head's own eye icon (secRenderRunHead,
-   project-screen.js) -- the same secRunFor/openLog call, not a second one. */
+/* What an orchestrator's phase means to a reader. The orchestrator
+   (bin/security/orchestrator.py, _set_phase) writes one of these words into
+   its lock; the server reads it beside the lock's liveness
+   (security_checklist, `orchestrator`). */
+export const SEC_ORCHESTRATOR_PHASE = {
+  "preparing": "Preparing — the deterministic phase (secrets, dependencies, SBOM, hygiene, infrastructure) runs before any unit starts.",
+  "running units": "Running its units — each unit is a run of its own on the Runs page, labelled with this analysis.",
+  "finishing": "Finishing — the engine is closing the analysis from what its units proved.",
+  "stopping": "Stopping — its units are being stopped; the analysis stays interrupted, and Resume continues it.",
+};
+
+/* The transient messages under the Run #N head: what a running analysis
+   already has on screen, and whether anything is still behind it. */
 function secRenderRunNotice(a){
   const host = $("sec-run-notice");
   host.textContent = "";
   const running = a.state === "running";
   if(running){
     host.appendChild(secEl("div", "secrun-notice",
-      "Secrets, dependencies and CVEs are written moments after the agent starts — "
-      + "they are its first command — so what is below is already real while the "
-      + "code review keeps going."));
+      "Secrets, dependencies and CVEs are recorded when the deterministic phase ends, before "
+      + "any unit starts — from then on, what is below is already real while the "
+      + "units keep going."));
   }
+  // `running` in the ledger is a claim, and its orchestrator's lock is the
+  // fact (secState.orchestrator, from the server). Between two units no run
+  // exists at all, and the orchestrator's prepare alone runs for minutes: a
+  // live orchestrator there is an analysis in hand, never one that "likely
+  // died", and what it is doing is said instead.
+  const orch = secState.orchestrator || {};
+  if(running && orch.alive){
+    host.appendChild(secEl("div", "secrun-notice",
+      SEC_ORCHESTRATOR_PHASE[orch.phase] || "The engine is running this analysis."));
+    return;
+  }
+  // With no orchestrator and no run, the old reading holds: a run killed
+  // without a journal (a reboot, a group-kill) leaves exactly this state.
   const run = secRunFor(a);
-  // `running` in the ledger is a claim; a live slot is the fact. When the two
-  // disagree for longer than a launch could take, say so — a run killed
-  // without a journal (a reboot, a group-kill) leaves exactly this state, and
-  // the page used to show "Analysing…" over it indefinitely.
   if(running && !run){
     if((Date.now()/1000 - (a.started||0)) > 180){
       host.appendChild(secEl("div", "secrun-notice warn",
-        "No live run is behind this analysis — it likely died without closing. "
-        + "The next Analyse sweeps it; until then downloads carry what it recorded."));
+        "No orchestrator and no run are behind this analysis — it likely died without closing. "
+        + "The tick resumes it if its orchestrator left a lock, and the next Analyse sweeps it "
+        + "otherwise; until then downloads carry what it recorded."));
     }else{
-      // The pre-agent window: the engine is cutting a worktree from a fresh
-      // fetch of the branch, which on a big repository is most of the wait.
-      // The run trace exists once the agent starts; until then, name the
-      // phase instead of showing a button-less void.
+      // The launch window: `security analyze --detach` has opened the row and
+      // is starting the orchestrator, which takes its lock a moment later.
       host.appendChild(secEl("div", "secrun-notice",
-        "Preparing the run — fetching the branch and cutting a clean worktree. "
-        + "The live trace appears here the moment the agent starts."));
+        "Starting the analysis — its orchestrator takes over in a moment."));
     }
   }
 }
@@ -537,6 +553,80 @@ export function secRenderCoveragePhases(a){
   host.appendChild(list);
 }
 
+// The pipeline an analysis runs as (bin/security/units.py): per kind, how
+// many units are done, running, waiting or gave up; in a deep analysis, how
+// much of the scope has been read in full; what the units have cost. Every
+// string is set as text.
+export const SEC_UNIT_KIND_LABEL = {triage: "Triage", hunt: "Reachability",
+                                    read: "Deep read", verify: "Verification"};
+
+export function secRenderPipeline(a, summary){
+  const host = $("sec-pipeline");
+  host.textContent = "";
+  if(!a || !summary || !summary.units){ host.hidden = true; return; }
+  host.hidden = false;
+  host.appendChild(secEl("div", "secpipe-title", "Pipeline"));
+  const list = secEl("div", "secpipe-kinds");
+  for(const kind of ["triage", "hunt", "read", "verify"]){
+    const k = (summary.kinds || {})[kind];
+    if(!k) continue;
+    const bits = [k.done + " of " + k.total + " done"];
+    if(k.running) bits.push(k.running + " running");
+    if(k.pending) bits.push(k.pending + " waiting");
+    if(k.failed) bits.push(k.failed + " gave up");
+    const row = secEl("div", "secpipe-kind" + (k.failed ? " failed" : k.done === k.total ? " done" : ""));
+    row.appendChild(secEl("span", "secpipe-name", SEC_UNIT_KIND_LABEL[kind] || kind));
+    row.appendChild(secEl("span", "secpipe-count", bits.join(" · ")));
+    list.appendChild(row);
+  }
+  host.appendChild(list);
+  const d = summary.deep;
+  if(d){
+    // "en-US", as editor-domain.js's own counts: the page is written in
+    // English, and a bare toLocaleString() prints 201.442 on a machine whose
+    // locale says so -- and the test that reads the sentence with it.
+    const n = (v) => Number(v || 0).toLocaleString("en-US");
+    host.appendChild(secEl("div", "secpipe-deep", "Deep scope read in full: "
+      + n(d.files_read) + " of " + n(d.files) + " files, "
+      + n(d.lines_read) + " of " + n(d.lines) + " lines."));
+  }
+  host.appendChild(secEl("div", "secpipe-spend", "Spent by the units: " + money(summary.spend_usd || 0)));
+  if(a.state === "running" || a.state === "interrupted"){
+    const running = a.state === "running";
+    const btn = secEl("button", "btn", running ? "Stop analysis" : "Resume");
+    btn.type = "button";
+    btn.onclick = () => running ? secStopAnalysis(a) : secResumeAnalysis(a);
+    host.appendChild(btn);
+  }
+}
+
+async function secStopAnalysis(a){
+  const k = ["security_stop", secState.project, String(a.id)];
+  if(isPending(...k)) return;
+  markPending(...k);
+  try{
+    // No pid: the engine stops the analysis WHOLE -- its orchestrator first,
+    // which stops the units and leaves the analysis interrupted, resumable.
+    if(await api("stop", {id: a.run_id})) toast("Stopping the analysis", false, "power");
+    await secReload(false);
+  } finally { clearPending(...k); }
+}
+
+async function secResumeAnalysis(a){
+  const k = ["security_resume", secState.project, String(a.id)];
+  if(isPending(...k)) return;
+  markPending(...k);
+  try{
+    // The engine refuses with its own sentence (not interrupted, still winding
+    // down), which api() puts on screen.
+    if(await api("security_resume", {project: secState.project, analysis: a.id})){
+      toast("Analysis resumed", false, "shield");
+      await secReload();
+      secSyncPoll();
+    }
+  } finally { clearPending(...k); }
+}
+
 export function secPaint(){
   const a = secState.analysis;
   secPaintRunButton();
@@ -572,6 +662,8 @@ export function secPaint(){
     $("sec-run-meta").textContent = "";
     $("sec-run-notice").textContent = "";
     $("sec-incomplete").hidden = true;
+    $("sec-pipeline").textContent = "";
+    $("sec-pipeline").hidden = true;
     $("sec-phases").textContent = "";
     $("sec-phases").hidden = true;
     $("sec-coverage").hidden = true;
@@ -596,6 +688,7 @@ export function secPaint(){
   inc.textContent = "";
   const incomplete = a.state === "capped" ? "This analysis is INCOMPLETE: it stopped before covering the whole scope."
                    : a.state === "failed" ? "This analysis is INCOMPLETE: it did not finish."
+                   : a.state === "interrupted" ? "This analysis is INTERRUPTED: it stopped before covering the whole scope, and Resume continues it where it left off."
                    : "";
   if(incomplete){
     inc.appendChild(secIcon("alert"));
@@ -603,6 +696,8 @@ export function secPaint(){
       + " What is below is what it had reached, not what is there."));
     inc.hidden = false;
   }else inc.hidden = true;
+
+  secRenderPipeline(a, secState.units);
 
   // ABOVE the paragraph, and the reason is the paragraph. See
   // secRenderCoveragePhases.

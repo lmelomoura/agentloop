@@ -202,9 +202,27 @@ class Normalizer:
         if denial_of(state):
             self.denials.append({"tool_name": name, "tool_use_id": call, "tool_input": inp})
         self.last_rejected = rejection_of(state)   # only an auto-rejected ask can end the turn at EOF
+        result = self._msg("user", [{"type": "tool_result", "tool_use_id": call,
+                                     "content": out, "is_error": is_error}])
+        # THE RANGE A READ SHOWED, in Claude Code's own shape. The proof of
+        # reading (bin/security/evidence.py) counts the lines a read returned,
+        # and OpenCode reports them only in `metadata.display` -- the output
+        # above is capped at OUTPUT_CAP, so its numbered lines alone cannot
+        # prove a long read.
+        display = (state.get("metadata") or {}).get("display") if isinstance(state.get("metadata"), dict) else None
+        if name == "Read" and not is_error and isinstance(display, dict):
+            try:
+                start, end = int(display["lineStart"]), int(display["lineEnd"])
+                total = int(display.get("totalLines", end))
+            except (KeyError, TypeError, ValueError):
+                start = None
+            if start is not None:
+                result["tool_use_result"] = {"type": "text", "file": {
+                    "filePath": display.get("path") or inp.get("filePath", ""),
+                    "startLine": start, "numLines": max(0, end - start + 1),
+                    "totalLines": total}}
         return [self._assistant([{"type": "tool_use", "id": call, "name": name, "input": inp}]),
-                self._msg("user", [{"type": "tool_result", "tool_use_id": call,
-                                    "content": out, "is_error": is_error}])]
+                result]
 
     # -- the final event ---------------------------------------------------
     def _result(self, error=None):

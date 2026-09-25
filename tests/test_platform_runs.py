@@ -226,34 +226,46 @@ def test_a_live_security_analysis_is_described_by_its_projects_security_block(sr
     assert srv._security_slug("ATD Core") == "atd-core" and srv._security_slug("My_App 2") == "my-app-2"
 
 
-def test_a_live_run_says_when_its_deterministic_phase_is_still_running(srv, clean_data):
-    """On a platform whose `prepare` runs engine-side, the seconds (or minutes,
-    on a long git history) before the agent starts showed "Waiting for the
-    first turn" and nothing else. The `.prepare` sidecar exists from the
-    moment the engine starts that phase and the stream file only from the
-    launch, so the two together name the phase."""
-    srv.JOBS_FILE.write_text(json.dumps({"jobs": [{"id": "jprep", "project": "P", "model": "pdm_ai/glm-5.3-flash"}]}))
-    srv.PROJECTS_FILE.write_text(json.dumps({"projects": [{"name": "P", "platform": "opencode"}]}))
-    start = 1700000700
-    logdir = srv.DATA_DIR / "logs" / "jprep"
-    logdir.mkdir(parents=True, exist_ok=True)
-    logp = logdir / "20231114T221820Z-4244.json"
-    (logdir / "20231114T221820Z-4244.json.prepare").write_text(
-        "prepare: started secrets, hygiene\nprepare: hygiene done (2s)\n")
-    slot = srv.DATA_DIR / "locks" / "jprep" / "4244"
-    slot.mkdir(parents=True, exist_ok=True)
-    (slot / "pid").write_text(str(os.getpid()))
-    (slot / "start").write_text(str(start))
-    (slot / "boot").write_text(srv.boot_id())
-    (slot / "logfile").write_text(str(logp))    # the slot's own breadcrumb, the engine's name for it
-    d = srv.load_run_detail("jprep", start)
-    assert d is not None and d["live"] is True
-    assert d["phase"] == "prepare", "the .prepare sidecar with no stream yet is the deterministic phase"
-    assert d["phase_detail"] == "prepare: hygiene done (2s)", "the last progress line is where it is"
-    # The moment the stream exists the phase is over, whatever .prepare says.
-    (logdir / "20231114T221820Z-4244.stream.ndjson").write_text("")
-    d = srv.load_run_detail("jprep", start)
-    assert d["phase"] == "", "a stream file, even empty, means the agent was launched"
+def test_a_security_unit_run_is_labelled_from_its_precheck_header(srv, clean_data):
+    """The label comes from the head of the precheck text the index keeps --
+    a column the list's explicit SELECT used to leave out, so every poll
+    raised on `row["precheck_txt"]` and load_data fell back to the last
+    listing it had."""
+    header = ("SECURITY ANALYSIS 22 · unit read 7/25 · attempt 2 — launched by its orchestrator "
+              "(`agentloop security analyze`), never by a tick\n")
+    assert srv._unit_label("security-web", header) == "analysis 22 · read 7/25 · attempt 2"
+    assert srv._unit_label("web-dev-agent", header) == ""
+    assert srv._unit_label("security-web", "anything else") == ""
+    logp = _artifacts(srv, "security-web", "20260924T000000Z-22",
+                      {"result": "RUN COMPLETE: ok", "total_cost_usd": 0.1})
+    logp.with_name(logp.stem + ".precheck.txt").write_text(header + "(no precheck configured)\n")
+    _write_journal(srv, _record(srv, id="security-web", log=str(logp)))
+    runs = srv.load_data()["runs"]
+    assert runs[0]["label"] == "analysis 22 · read 7/25 · attempt 2"
+
+
+def test_a_live_security_unit_run_is_labelled_from_its_slot_s_precheck_sidecar(srv, clean_data):
+    """A run still going is not in the index yet: its label comes off the
+    precheck sidecar beside the log its slot names (`logfile`), read the
+    same way the finished row's is -- and a job that is not derived, or a
+    slot with no log yet, carries none."""
+    header = ("SECURITY ANALYSIS 31 · unit hunt 1/1 — launched by its orchestrator "
+              "(`agentloop security analyze`), never by a tick\n")
+    for job in ("security-web", "web-dev-agent"):
+        srv.JOBS_FILE.write_text(json.dumps({"jobs": [{"id": job, "project": "P"}]}))
+        logp = srv.DATA_DIR / "logs" / job / "20260925T000000Z-4301.json"
+        logp.parent.mkdir(parents=True, exist_ok=True)
+        logp.with_name(logp.stem + ".precheck.txt").write_text(header + "(no precheck configured)\n")
+        for pid, with_log in ((4301, True), (4302, False)):
+            s = srv.DATA_DIR / "locks" / job / str(pid)
+            s.mkdir(parents=True, exist_ok=True)
+            (s / "pid").write_text(str(os.getpid()))
+            (s / "start").write_text("1700000900")
+            (s / "boot").write_text(srv.boot_id())
+            if with_log:
+                (s / "logfile").write_text(str(logp) + "\n")
+    assert [r["label"] for r in srv.active_runs_for("security-web")] == ["analysis 31 · hunt 1/1", ""]
+    assert [r["label"] for r in srv.active_runs_for("web-dev-agent")] == ["", ""]
 
 
 def test_a_live_run_says_what_launched_it_or_says_nothing(srv, clean_data):
