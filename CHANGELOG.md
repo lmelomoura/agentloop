@@ -20,6 +20,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The engine closes a pipeline analysis from what its units proved.**
+  `finish --from-units` records the units' summed cost and lowers `done` to
+  `capped` for each gap the units leave — a unit that never finished, a
+  lineage that gave up after three attempts, the lines of the deep scope no
+  unit proved it read, counted against the inventory itself, so a slice no
+  unit carried or a unit that gave up without saying what it missed is
+  named too — naming the first of each in the report. The `sast` coverage
+  row, and the paragraph beside it, say how much of the deep scope was read
+  in full, and the guides read are the union of what every unit opened.
+
 - **An analysis can be interrupted and resumed.** `interrupt`, `resume` and
   `abandon` move an analysis into and out of the new `interrupted` state;
   nothing is written into an interrupted analysis, and opening a new

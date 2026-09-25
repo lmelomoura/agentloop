@@ -605,6 +605,66 @@ def summary(conn, analysis_id):
             "spend_usd": round(sum(u["spend_usd"] for u in all_units), 4)}
 
 
+def gaps(conn, analysis_id) -> list:
+    """Each reason this analysis's units do not add up to `done`, as a sentence
+    the report can print: the units that never finished, the lineages that
+    gave up, and the deep scope's lines nobody proved they read -- the same
+    `owed` the page's Pipeline block counts, from the inventory, so a slice no
+    unit ever carried and a unit that gave up saying nothing are both named."""
+    all_units = ledger.units_of(conn, analysis_id)
+    lineages = _lineages(all_units)
+    out = []
+    open_ = [last for _r, last in lineages if last["state"] in ("pending", "running")]
+    if open_:
+        names = "; ".join(label(conn, u) for u in open_[:3])
+        out.append(f"{len(open_)} unit{'s' if len(open_) != 1 else ''} never finished: {names}"
+                   f"{' and others' if len(open_) > 3 else ''}.")
+    failed = [last for _r, last in lineages if last["state"] == "failed"]
+    if failed:
+        names = "; ".join(f"{label(conn, u)} ({u['note']})" for u in failed[:3])
+        out.append(f"{len(failed)} unit{'s' if len(failed) != 1 else ''} gave up after "
+                   f"{MAX_ATTEMPTS} attempts: {names}.")
+    inventory = ledger.inventory_of(conn, analysis_id)
+    left = owed(conn, analysis_id, all_units, inventory)
+    if inventory and left:
+        lines = int((inventory.get("totals") or {}).get("lines", 0))
+        files = len(inventory.get("files") or [])
+        missing_lines = sum(s["last"] - s["first"] + 1 for s in left)
+        missing_files = len({s["path"] for s in left})
+        first_ten = ", ".join(f"{s['path']}:{s['first']}-{s['last']}" for s in left[:10])
+        out.append(f"{missing_lines:,} of {lines:,} lines in the deep scope ({missing_files:,} of "
+                   f"{files:,} files) were never read in full. The first ten: {first_ten}.")
+    return out
+
+
+def coverage_sentence(conn, analysis_id) -> str:
+    """The `sast` coverage row's sentence: how the pass ran, and in a deep
+    analysis how much of the inventory the read units proved they read."""
+    s = summary(conn, analysis_id) or {}
+    kinds = s.get("kinds") or {}
+    parts = []
+    hunt = kinds.get("hunt")
+    if hunt:
+        parts.append(f"Reachability pass: {hunt['done']} of {hunt['total']} unit(s) done.")
+    deep = s.get("deep")
+    read = kinds.get("read")
+    if deep and read:
+        continued = sum(1 for u in ledger.units_of(conn, analysis_id)
+                        if u["kind"] == "read" and u["parent"])
+        parts.append(f"Deep read: {read['total']} read unit(s), {continued} continuation(s); read in "
+                     f"full: {deep['files_read']:,} of {deep['files']:,} files, "
+                     f"{deep['lines_read']:,} of {deep['lines']:,} lines.")
+    return " ".join(parts)
+
+
+def guides_read(conn, analysis_id) -> list:
+    from . import guides as guide_table     # local: guides imports nothing of ours, but keep the graph flat
+    opened = set()
+    for u in ledger.units_of(conn, analysis_id):
+        opened.update(u["evidence"].get("guides") or [])
+    return [name for name in guide_table.NAMES if name in opened]
+
+
 def close(conn, unit, *, stream="", root="", status="error", reason="", spend_usd=0.0) -> dict:
     """Judge one run of `unit` by what it left -- its stream, what `security
     read` served it, the ledger -- and conclude it. {"state", "continuation"}.

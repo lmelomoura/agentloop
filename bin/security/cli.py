@@ -3086,6 +3086,25 @@ def cmd_finish(args):
             coverage.VERIFICATION,
             coverage.WARNING if bad else coverage.RAN,
             diff.AGENT, verify_note)
+    # THE UNITS' ACCOUNT, on the engine's close of a pipeline analysis. Each
+    # gap -- a unit that never finished, a lineage that gave up after
+    # MAX_ATTEMPTS, a line of the deep scope nobody proved they read -- lowers
+    # `done` exactly as the three guards above do, and goes into the paragraph
+    # by name. The spend is the units' own sum: each unit's cost was recorded
+    # by its close, and no caller of `finish` knows the total better.
+    units_gap = ""
+    units_sentence = ""
+    if args.from_units and row["prepared"]:
+        found = units.gaps(conn, args.analysis)
+        if found and state == "done":
+            state = "capped"
+            print(f"finish: analysis {args.analysis} — {' '.join(found)}", file=sys.stderr)
+        units_gap = " ".join(found)
+        units_sentence = units.coverage_sentence(conn, args.analysis)
+        args.spend = (units.summary(conn, args.analysis) or {}).get("spend_usd", 0)
+        read = units.guides_read(conn, args.analysis)
+        ledger.set_guides(conn, args.analysis, read=read)
+        guides_note = _guides_sentence(ledger.guides_of(row).get("recommended", []), read)
     # finish_analysis writes coverage_note unconditionally, and neither caller
     # of `finish` carries the note `prepare` printed: the agent never saw it,
     # and the engine's close-out knows only the run's status and cost. An
@@ -3105,8 +3124,21 @@ def cmd_finish(args):
     # has to be in the paragraph for the row to be quoting it.
     stored = row["coverage_note"] or ""
     note = ""
-    for part in (stored, args.note or "", unprepared_note, untriaged_note,
-                 decided_note, guides_note, verify_gap):
+    # THE `sast` ROW'S PROSE STANDS TOGETHER IN THE PARAGRAPH, in the order the
+    # row carries it: the invariant every phase keeps (each row's note is one
+    # contiguous run of the paragraph, test_every_phases_prose_is_a_substring_of_the_paragraph)
+    # and the one test_a_close_from_the_units_keeps_every_row_a_substring_of_the_paragraph
+    # (test_finish_units.py) pins for this close. On the engine's close of a
+    # pipeline analysis the row is the units' sentence, the `--note` and the
+    # guides sentence, so the three go in together, ahead of the gaps; every
+    # other close keeps the order it always had.
+    if args.from_units:
+        parts = (stored, units_sentence, args.note or "", guides_note, units_gap,
+                 unprepared_note, untriaged_note, decided_note, verify_gap)
+    else:
+        parts = (stored, args.note or "", unprepared_note, untriaged_note,
+                 decided_note, guides_note, verify_gap)
+    for part in parts:
         part = part.strip()
         # `not in`, not `!=`: a row is closed twice (the agent, then the
         # engine) and each close re-reads the note it already wrote. Without
@@ -3182,6 +3214,8 @@ def cmd_finish(args):
         sast_note = (args.note or "").strip() or prior_sast
         if guides_note and guides_note not in sast_note:
             sast_note = f"{sast_note} {guides_note}".strip()
+        if units_sentence:
+            sast_note = f"{units_sentence} {sast_note}".strip()
         sast_phase = coverage.phase(
             coverage.SAST_AGENT,
             coverage.RAN if state == "done" else coverage.WARNING,
@@ -4334,6 +4368,9 @@ def main(argv=None):
     # The ENGINE's close only: a comma list of guide names, '' for none, or
     # `unknown` when the run's stream could not be read. See `cmd_finish`.
     fn.add_argument("--guides-read", default=None, dest="guides_read")
+    # The ENGINE's close of a pipeline analysis (security/orchestrator.py):
+    # the spend is the units' sum, and every gap the units leave lowers `done`.
+    fn.add_argument("--from-units", action="store_true", dest="from_units")
     # How many subagents the run launched, from `security_task_count` over the
     # stream. The ENGINE's close only: the agent does not know its own stream,
     # omits the flag, and the two count comparisons are then not made.
