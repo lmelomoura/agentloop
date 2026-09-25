@@ -20,6 +20,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **An orchestrator runs an analysis to the end, whatever its size.** It
+  prepares the analysis in a worktree of its own at the analysed commit —
+  outside the run worktrees the tick sweeps, cleared first if a crash left
+  one, and removed when the phase ends — launches every unit as an ordinary
+  run of the derived job, up to the project's parallelism, continues what
+  each unit left undone, plans verification once the rest has settled, and
+  closes the analysis from what the units proved; a plan that could not be
+  written closes it `capped`, never `done`. The analysis budget is enforced
+  across units, and a budget that is not a number is refused with a
+  sentence. A run that dies without closing its unit is judged from the
+  stream it left — what it read counts, the rest continues at the same
+  attempt; a run that left no stream proved nothing, so nothing it did
+  counts and a verify unit's verdict is cleared — and three such deaths in
+  a row give the unit up. A unit whose run started an agent is never sent
+  back under the same id: a judgement that fails is retried instead. A stop
+  leaves the analysis `interrupted` with its finished units kept, a new
+  orchestrator adopts the runs a dead one left behind, and the orchestrator
+  writes its phase into its lock and its log lines in `tick.log`'s own
+  format, where the dashboard reads them.
+
 - **The engine closes a pipeline analysis from what its units proved.**
   `finish --from-units` records the units' summed cost and lowers `done` to
   `capped` for each gap the units leave — a unit that never finished, a

@@ -44,7 +44,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from security import adapters, candidate, coverage, deps, diff, engines, evidence, fingerprint, guides, hygiene, ignores, inventory, ledger, osv, prompts, queries, report, secrets, taxonomy, units, verdict  # noqa: E402
+from security import adapters, candidate, coverage, deps, diff, engines, evidence, fingerprint, guides, hygiene, ignores, inventory, ledger, orchestrator, osv, prompts, queries, report, secrets, taxonomy, units, verdict  # noqa: E402
 
 REQUIRED_FINDING_KEYS = ("fingerprint", "category", "rule", "severity", "title")
 
@@ -2236,6 +2236,19 @@ def _transition(ok, analysis_id, state, why):
     print(json.dumps({"state": state}))
 
 
+def cmd_orchestrate(args):
+    """The engine's long-running half of an analysis (security/orchestrator.py).
+    `__run-analysis` in bin/agentloop takes the analysis lock and execs this,
+    so the lock's pid IS this process: a stop signals it directly. A budget
+    that is not a number exits 2 with a sentence (Orchestrator.run)."""
+    sys.exit(orchestrator.Orchestrator(
+        args.db, args.analysis, engine=args.engine, job=args.job, commit=args.commit,
+        repo=args.repo, repo_path=args.repo_path, prepare_root=args.prepare_root,
+        log_root=args.log_root or None, parallel=args.parallel, budget=args.budget,
+        ignore=args.ignore, log=args.log or None, lock_dir=args.lock_dir or None,
+        offline=args.offline).run())
+
+
 def cmd_interrupt(args):
     conn = _conn(args)
     _analysis(conn, args.analysis)
@@ -4358,6 +4371,22 @@ def main(argv=None):
     ab = sub.add_parser("abandon", parents=[dbflag]); ab.set_defaults(fn=cmd_abandon)
     ab.add_argument("--analysis", type=int, required=True)
     ab.add_argument("--note", required=True)
+
+    # The engine's orchestrator of a pipeline analysis (in AGENT_FORBIDDEN).
+    oc = sub.add_parser("orchestrate", parents=[dbflag]); oc.set_defaults(fn=cmd_orchestrate)
+    for flag in ("--engine", "--job", "--commit", "--repo", "--repo-path", "--prepare-root"):
+        oc.add_argument(flag, required=True, dest=flag[2:].replace("-", "_"))
+    oc.add_argument("--analysis", type=int, required=True)
+    # Where run_job writes the units' streams ($LOG_DIR): how a run that died
+    # without its close is found and judged. Empty: such a run left no stream
+    # the orchestrator can find, and is judged as one that proved nothing.
+    oc.add_argument("--log-root", default="", dest="log_root")
+    oc.add_argument("--parallel", type=int, default=3)
+    oc.add_argument("--budget", default="")
+    oc.add_argument("--ignore", default="")
+    oc.add_argument("--log", default="")
+    oc.add_argument("--lock-dir", default="", dest="lock_dir")
+    oc.add_argument("--offline", action="store_true")
 
     fn = sub.add_parser("finish", parents=[dbflag]); fn.set_defaults(fn=cmd_finish)
     fn.add_argument("--analysis", type=int, required=True)

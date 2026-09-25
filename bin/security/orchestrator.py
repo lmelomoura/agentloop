@@ -1,0 +1,579 @@
+# bin/security/orchestrator.py
+"""Runs an analysis's units to the end and closes it: the engine's half of the pipeline.
+
+WHY A PROCESS OF ITS OWN, AND WHY IT IS NOT A MODEL. An analysis used to be
+one agent deciding when it had done enough; on a large repository it always
+decided early. This loop decides instead, from the ledger: it launches every
+unit the plan holds (security/units.py), at most `parallel` at a time, each
+as an ordinary run of the derived job (`__run-unit` in bin/agentloop); it
+lets each run's own close judge the unit and plan what it left undone; it
+launches the continuations; it plans verification once everything else has
+settled; and it closes the analysis from what the units proved (`finish
+--from-units`). Nothing here reads a model's opinion of its own progress.
+
+EVERYTHING IS IN THE LEDGER, so this process can die at any moment and a new
+one picks up where it stopped: a unit whose run is still alive is adopted, a
+unit whose run died without a close is judged from the stream and the ledger
+it left -- exactly as its own close would have judged it (units.close) -- and
+a done unit never runs twice.
+
+A RUN THAT DIED IS NOT THE UNIT'S FAILURE. What it proved counts; what it did
+not becomes a continuation at the SAME attempt. Three runs of one lineage in a
+row that end without a close are the engine saying it cannot run it: the
+lineage is given up with that reason, and the close names it. A run that
+left NO stream proved nothing at all -- the stream is the only thing that
+shows whether the session launched a subagent -- so it is judged as a
+disqualified one: nothing it did counts, and a verify unit's own verdict goes
+with the attempt.
+
+A UNIT WHOSE RUN STARTED AN AGENT IS NEVER SENT BACK UNDER THE SAME ID. If
+its judgement fails, the judgement is retried on a later poll; `reset_unit`
+is kept for a launch that failed before any agent ran. Reset and relaunched,
+the unit would keep its id while an orphan of the first run could still be
+reading under it -- and `unit_reads(since=started)` tells two runs apart only
+a wall-clock second apart.
+
+A STOP IS NOT A FAILURE EITHER. SIGTERM (the engine's `stop`, which signals
+the pid in the analysis lock) stops launching, has the engine stop the units'
+runs -- each closes its unit `stopped`, which continues at the same attempt;
+one that dies before its close is judged as above -- and leaves the analysis
+`interrupted`, to be resumed.
+
+THE BUDGET IS THE ANALYSIS'S. The spend is the units' sum; nothing is
+launched once it reaches `budget`, and each unit is given an even share of
+what remains (never under MIN_UNIT_BUDGET) -- on Claude Code the engine turns
+it into `--max-budget-usd`; elsewhere it is read at the end, which is why
+this loop checks the sum itself before every launch.
+
+ITS LIFE IS DATA. The phase it is in goes into its lock (`phase`), and the
+page reads it beside the lock's liveness (security_checklist in
+bin/agentloop-server): between two units no run is alive, and that is not an
+analysis that died.
+"""
+
+import calendar
+import json
+import math
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from . import ledger, units
+
+MIN_UNIT_BUDGET = 0.50
+LAUNCH_STRIKES = 3
+# How many polls a unit whose judgement raised is retried on before this
+# orchestrator leaves it `running`: the close then names it "never finished",
+# and a resume judges it again. Never reset instead (see the docstring).
+JUDGE_TRIES = 5
+STOP_GRACE_SECONDS = 300
+# Spends are sums of floats: ten units of 0.10 add up to 0.9999999999999999.
+_CENT_EPSILON = 1e-9
+CLI = Path(__file__).resolve().parent / "cli.py"
+# The engine exports these into a unit's run; the orchestrator must never pass
+# them on -- its own CLI calls are the engine's, not an agent's.
+_SESSION_VARS = ("AL_SECURITY_AGENT", "CC_SECURITY_AGENT", "AL_SECURITY_UNIT_ID",
+                 "CC_SECURITY_UNIT_ID", "AL_SECURITY_UNIT_BUDGET")
+PREPARE_FAILED_NOTE = ("The deterministic phase did not complete -- a phase, or the planning "
+                       "of the units, failed (see tick.log) -- so no unit ran.")
+NO_STREAM_NOTE = ("The run ended without its close and left no stream -- the only proof of "
+                  "what a session did, and of whether it launched a subagent -- so nothing "
+                  "it did counts.")
+STRUCK_OUT_NOTE = ("The engine could not run this unit: {n} runs ended without a close "
+                   "(see tick.log).")
+
+
+def _alive(pid) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _pid_of(run_key):
+    tail = (run_key or "").rsplit("/", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def _parse_budget(value):
+    """(budget, refusal). The engine hands the derivation's own value
+    (security_analysis_budget in bin/agentloop: the derived job's
+    max_budget_usd, whose fallback for a declared value that is not a number
+    is SECURITY_FALLBACK_BUDGET_USD), so text float() cannot read is a hand
+    run -- refused with a sentence, never a traceback the tick would take for
+    a crash and resume three times."""
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return None, ""
+    try:
+        budget = float(text)
+    except ValueError:
+        budget = math.nan
+    if not math.isfinite(budget):
+        return None, f"--budget must be a number of US dollars, not {text!r}"
+    return budget, ""
+
+
+def _stream_root(stream):
+    """The run's own root, off its stream's init event (`cwd`, which every
+    platform's normalised stream carries): a dead run's reads are made
+    relative to it, as the engine's close makes them relative to run_job's
+    cwd."""
+    try:
+        with open(stream, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(event, dict) and event.get("type") == "system"
+                        and event.get("subtype") == "init"):
+                    return str(event.get("cwd") or "")
+    except OSError:
+        pass
+    return ""
+
+
+class Orchestrator:
+    def __init__(self, db, analysis_id, *, engine, job, commit, repo, repo_path, prepare_root,
+                 log_root=None, parallel=3, budget=None, ignore="", log=None, lock_dir=None,
+                 poll=2.0, offline=False):
+        self.db, self.aid = str(db), int(analysis_id)
+        self.engine, self.job, self.commit, self.repo = str(engine), job, commit, repo
+        self.repo_path, self.prepare_root = str(repo_path), Path(prepare_root)
+        self.log_root = Path(log_root) if log_root else None
+        self.parallel = max(1, min(8, int(parallel or 3)))
+        self.budget, self.budget_error = _parse_budget(budget)
+        self.ignore, self.log_path, self.lock_dir, self.poll = ignore or "", log, lock_dir, poll
+        self.offline = bool(offline)     # tests: `prepare --offline`, no network
+        self.conn = ledger.connect(self.db)
+        self.children = {}        # pid -> (Popen, unit id)
+        self.adopted = {}         # pid -> unit id: runs a previous orchestrator left alive
+        self.unjudged = {}        # unit id -> [pid, tries]: dead runs whose judgement raised
+        self.strikes = {}         # lineage root id -> its runs in a row that died unclosed
+        self.stopping = False
+        self.budget_spent = False
+        self.prepare_proc = None
+        self.env = {k: v for k, v in os.environ.items() if k not in _SESSION_VARS}
+
+    # -- small helpers -------------------------------------------------------
+    def log(self, message):
+        """One tick.log line in log_tick's own format -- `<ISO UTC> <job>:
+        <message>` (bin/agentloop) -- because the dashboard reads that file
+        by exactly that shape (checks_24h, bin/agentloop-server) and skips a
+        line in any other."""
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        line = f"{stamp} {self.job}: analysis {self.aid} — {message}\n"
+        if self.log_path:
+            try:
+                with open(self.log_path, "a", encoding="utf-8") as out:
+                    out.write(line)
+                return
+            except OSError:
+                pass
+        sys.stderr.write(line)
+
+    def _on_signal(self, _signum, _frame):
+        self.stopping = True
+        proc = self.prepare_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)   # `prepare` leads its own group
+            except OSError:
+                pass
+
+    def _cli(self, *args):
+        return subprocess.run([sys.executable, str(CLI), "--db", self.db, *args],
+                              env=self.env, capture_output=True, text=True)
+
+    def _row(self):
+        return self.conn.execute("SELECT * FROM analysis WHERE id=?", (self.aid,)).fetchone()
+
+    def _git(self, *args):
+        return subprocess.run(["git", "-C", self.repo_path, *args], capture_output=True, text=True)
+
+    def _lock_is_mine(self) -> bool:
+        if not self.lock_dir:
+            return False
+        try:
+            return Path(self.lock_dir, "pid").read_text().strip() == str(os.getpid())
+        except OSError:
+            return False
+
+    def _set_phase(self, phase):
+        """The phase this orchestrator is in -- preparing, running units,
+        finishing, stopping -- written into its lock, where the server reads
+        it beside the lock's liveness for the page (security_checklist):
+        between two units no slot is alive, and the phase is what says the
+        analysis is still in hand. Only into a lock that is still this
+        process's own, and atomically, so a reader never sees half a word."""
+        if not self._lock_is_mine():
+            return
+        tmp = Path(self.lock_dir, ".phase.tmp")
+        try:
+            tmp.write_text(phase + "\n")
+            os.replace(tmp, Path(self.lock_dir, "phase"))
+        except OSError:
+            pass
+
+    def _in_flight(self) -> bool:
+        return bool(self.children or self.adopted or self.unjudged)
+
+    # -- the run ---------------------------------------------------------------
+    def run(self) -> int:
+        previous = {s: signal.signal(s, self._on_signal)
+                    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        try:
+            if self.budget_error:
+                # Before anything else, and inside the `finally` that lets the
+                # lock go: nothing started, so nothing is closed either, and a
+                # lock left behind would have the tick resume a run that can
+                # never start.
+                message = f"{self.budget_error}. Nothing was started."
+                sys.stderr.write(f"orchestrate: {message}\n")
+                self.log(message)
+                return 2
+            row = self._row()
+            if row is None or row["state"] != "running":
+                self.log(f"is {row['state'] if row else 'missing'}; nothing to run")
+                return 0
+            if not row["prepared"] and not self._prepare():
+                if self.stopping:
+                    return self._interrupt()
+                self._finish(PREPARE_FAILED_NOTE, state="capped")
+                return 0
+            if not ledger.units_of(self.conn, self.aid) and not self._plan():
+                return 0
+            self._adopt()
+            self._set_phase("running units")
+            self._loop()
+            if self.stopping:
+                return self._interrupt()
+            # THE BUDGET SENTENCE ONLY WHEN IT IS TRUE: units left unsettled. A
+            # budget the last unit spent to the cent left nothing unrun, and
+            # "spent before every unit ran" would be a false line in the report.
+            left = units.unsettled(ledger.units_of(self.conn, self.aid))
+            self._finish(f"The analysis budget of ${self.budget:.2f} was spent before every unit ran."
+                         if self.budget_spent and left else "")
+            return 0
+        finally:
+            for s, handler in previous.items():
+                signal.signal(s, handler)
+            self._release()
+
+    def _prepare(self) -> bool:
+        """The deterministic phase, once, in a checkout of the analysed commit
+        that is this orchestrator's alone, and with `--plan`: only the
+        orchestrator's prepare writes the plan (security/cli.py, cmd_prepare).
+
+        OUTSIDE THE ENGINE'S WORKTREES FOLDER -- <prepare-root>/<job>-<id>,
+        $DATA_DIR/security/prepare in production. Every directory under
+        $WORKTREES_DIR is a run dir to the engine and the server: the tick's
+        orphan sweep adopts it (writing `.ended` into the very checkout being
+        analysed) and tears it down once its TTL is up, and the dashboard
+        os.walk()s it on every poll. Whatever a prepare that died left at the
+        path is cleared before the checkout is cut, and the checkout -- and
+        git's record of it -- goes when the phase ends, whatever the outcome.
+
+        A failure here is non-zero from `prepare`: a phase that broke, or a
+        plan that could not be written (all or nothing, so there is no half of
+        one). Either way the caller closes the analysis `capped`."""
+        self._set_phase("preparing")
+        tree = self.prepare_root / f"{self.job}-{self.aid}"
+        tree.parent.mkdir(parents=True, exist_ok=True)
+        self._drop_tree(tree)
+        made = self._git("worktree", "add", "--detach", str(tree), self.commit)
+        if made.returncode != 0:
+            self.log(f"could not cut a worktree at {self.commit[:12]} for the deterministic "
+                     f"phase: {made.stderr.strip()}")
+            self._drop_tree(tree)
+            return False
+        try:
+            self.log("deterministic phase started")
+            # A process group of its own, so a stop reaches whatever the
+            # phase launched (the scanners) and not only the CLI.
+            self.prepare_proc = subprocess.Popen(
+                [sys.executable, str(CLI), "--db", self.db, "prepare", "--analysis", str(self.aid),
+                 "--root", str(tree), "--ignore", self.ignore, "--plan",
+                 *(["--offline"] if self.offline else [])],
+                env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                start_new_session=True)
+            _out, err = self.prepare_proc.communicate()
+            code = self.prepare_proc.returncode
+        finally:
+            self.prepare_proc = None
+            self._drop_tree(tree)
+        if code != 0:
+            self.log(f"deterministic phase failed (rc {code}): {(err or '').strip()[-400:]}")
+            return False
+        self.log("deterministic phase done")
+        return True
+
+    def _drop_tree(self, tree):
+        """The prepare checkout gone, and git's record of it with it: `worktree
+        remove --force` for a registered one, rmtree for whatever is left (a
+        directory a crash left behind unregistered), then `worktree prune`, so
+        no registration outlives its directory in the operator's checkout."""
+        if tree.exists():
+            self._git("worktree", "remove", "--force", str(tree))
+            shutil.rmtree(tree, ignore_errors=True)
+        self._git("worktree", "prune")
+
+    def _plan(self) -> bool:
+        """A prepared analysis with no units: prepared before the pipeline, or
+        a resume after a prepare whose plan failed (nothing half-written: the
+        plan is all or nothing). Planned here, without the per-slice guides.
+        A plan that fails closes the analysis `capped` with the reason, never
+        a `done` over units nobody planned."""
+        try:
+            planned = units.plan(self.conn, self.aid)
+        except Exception as exc:  # noqa: BLE001 -- said in tick.log and in the report
+            self.log(f"could not plan its units: {type(exc).__name__}: {exc}")
+            self._finish(f"The engine could not plan this analysis's units "
+                         f"({type(exc).__name__}), so no unit ran.", state="capped")
+            return False
+        self.log(f"{len(planned)} unit(s) planned")
+        return True
+
+    def _adopt(self):
+        """Every unit a previous orchestrator left `running`: a run still alive
+        is adopted and waited for (its own close settles the unit); one that is
+        gone is judged from what it left, as `_after` judges a child of this
+        orchestrator that died unclosed."""
+        for u in ledger.units_of(self.conn, self.aid):
+            if u["state"] != "running":
+                continue
+            pid = _pid_of(u["run_key"])
+            if pid and _alive(pid):
+                self.adopted[pid] = u["id"]
+            else:
+                self._after(u["id"], pid)
+
+    def _loop(self):
+        verify_planned = False
+        while not self.stopping:
+            self._reap()
+            everything = ledger.units_of(self.conn, self.aid)
+            spend = sum(u["spend_usd"] for u in everything)
+            if self.budget is not None and spend >= self.budget - _CENT_EPSILON:
+                self.budget_spent = True
+            if not verify_planned and not units.unsettled(everything, ("triage", "hunt", "read")):
+                planned = units.plan_verification(self.conn, self.aid)
+                verify_planned = True
+                if planned:
+                    self.log(f"{len(planned)} verify unit(s) planned")
+                continue
+            if not self.budget_spent:
+                room = self.parallel - len(self.children) - len(self.adopted)
+                for unit in units.launchable(self.conn, self.aid, room):
+                    self._launch(unit, spend)
+            # NOTHING IN FLIGHT AND NOTHING TO LAUNCH: done. That includes a
+            # triage, hunt or read unit left `running` because its judgement
+            # kept failing (JUDGE_TRIES) -- verification is never planned over
+            # it, and the close names it "never finished".
+            if not self._in_flight():
+                waiting = any(u["state"] == "pending" for u in ledger.units_of(self.conn, self.aid))
+                if self.budget_spent or not waiting:
+                    return
+            time.sleep(self.poll)
+
+    def _launch(self, unit, spend):
+        env = dict(self.env)
+        if self.budget is not None:
+            share = (self.budget - spend) / (len(self.children) + len(self.adopted) + 1)
+            env["AL_SECURITY_UNIT_BUDGET"] = f"{max(MIN_UNIT_BUDGET, share):.2f}"
+        # RUNNING BEFORE THE LAUNCH, not after: a verify unit's session writes
+        # its verdict through a door that only opens for a running unit, and a
+        # fast one would otherwise reach it first.
+        if not ledger.start_unit(self.conn, unit["id"], f"{self.job}/launching"):
+            return
+        try:
+            proc = subprocess.Popen([self.engine, "__run-unit", self.job, str(self.aid),
+                                     str(unit["id"]), self.commit, self.repo],
+                                    env=env, stdin=subprocess.DEVNULL)
+        except OSError as exc:
+            # THE ONE CASE FOR `reset_unit`: nothing was started, so no agent
+            # can have written, read or been served anything under this id.
+            # Back to `pending` in the same attempt -- and a strike, because
+            # an engine that cannot be started is the engine saying it cannot
+            # run the unit.
+            ledger.reset_unit(self.conn, unit["id"])
+            self.log(f"unit {units.label(self.conn, unit)} could not be launched: {exc}")
+            self._strike(ledger.get_unit(self.conn, unit["id"]), unit["id"])
+            return
+        ledger.set_run_key(self.conn, unit["id"], f"{self.job}/{proc.pid}")
+        self.children[proc.pid] = (proc, unit["id"])
+        self.log(f"unit {units.label(self.conn, unit)} launched (pid {proc.pid})")
+
+    def _reap(self):
+        for pid, (proc, uid) in list(self.children.items()):
+            if proc.poll() is None:
+                continue
+            del self.children[pid]
+            self._after(uid, pid)
+        for pid, uid in list(self.adopted.items()):
+            if _alive(pid):
+                continue
+            del self.adopted[pid]
+            self._after(uid, pid)
+        for uid, (pid, _tries) in list(self.unjudged.items()):
+            self._after(uid, pid)
+
+    def _after(self, uid, pid):
+        unit = ledger.get_unit(self.conn, uid)
+        if unit is None or unit["state"] == "pending":
+            self.unjudged.pop(uid, None)
+            return
+        lineage = units.lineage_root(self.conn, unit)["id"]
+        if unit["state"] != "running":
+            self.unjudged.pop(uid, None)
+            self.strikes.pop(lineage, None)      # a run closed it: the engine can run it
+            self.log(f"unit {units.label(self.conn, unit)} {unit['state']} "
+                     f"(${unit['spend_usd']:.2f}) — {unit['note']}")
+            return
+        # THE RUN ENDED WITHOUT CLOSING ITS UNIT -- killed, crashed, or
+        # orphaned by an orchestrator that died. Judged from what it left, as
+        # its own close would have judged it (units.close, under `stopped`):
+        # what it proved counts, and the rest continues at the SAME attempt,
+        # because a run that died is not the unit's failure. Three such
+        # endings in a row of one lineage are the engine saying it cannot run
+        # it: the continuation is given up with that reason, and the close
+        # names it.
+        out = self._judge_orphan(unit, pid)
+        if out is None:
+            return                               # retried on the next poll (_reap)
+        if out.get("continuation"):
+            self._strike(unit, out["continuation"])
+        else:
+            self.log(f"unit {units.label(self.conn, unit)} ended without its close — judged "
+                     f"{out.get('state')} from what its run left")
+
+    def _strike(self, unit, next_id):
+        """One more run of `unit`'s lineage that ended without a close;
+        `next_id` is the unit that would run next -- the continuation, or the
+        unit itself when its launch never started. At LAUNCH_STRIKES it is
+        settled `failed` instead, with the reason the close names."""
+        lineage = units.lineage_root(self.conn, unit)["id"]
+        self.strikes[lineage] = self.strikes.get(lineage, 0) + 1
+        if self.strikes[lineage] >= LAUNCH_STRIKES:
+            ledger.settle_unit(self.conn, next_id, "failed", 0, {},
+                               STRUCK_OUT_NOTE.format(n=LAUNCH_STRIKES))
+            self.log(f"unit {units.label(self.conn, unit)} failed: the engine could not run it")
+        else:
+            self.log(f"unit {units.label(self.conn, unit)} ended without its close — "
+                     "what it left was judged, and the rest runs again at the same attempt")
+
+    def _stream_of(self, unit, pid):
+        """The stream a unit's run left, found by the name run_job gives it:
+        <log-root>/<job>/<UTC stamp>-<pid>.stream.ndjson, <pid> being the
+        process this orchestrator launched (the run's own $$). The newest one
+        stamped no earlier than the unit started -- a pid the kernel reissued
+        names older files too. None without a log root or a file."""
+        if not self.log_root or not pid:
+            return None
+        started = int(unit.get("started") or 0)
+        best = None
+        for path in Path(self.log_root, self.job).glob(f"*-{pid}.stream.ndjson"):
+            try:
+                when = calendar.timegm(time.strptime(path.name.split("-", 1)[0], "%Y%m%dT%H%M%SZ"))
+            except ValueError:
+                continue
+            if when >= started - 5 and (best is None or when > best[0]):
+                best = (when, path)
+        return str(best[1]) if best else None
+
+    def _judge_orphan(self, unit, pid):
+        """{"state", "continuation"} for a unit whose run died unclosed, or
+        None when the judgement raised -- the unit then stays `running` and
+        is judged again on a later poll (JUDGE_TRIES), never reset: its run
+        started an agent, and see the module docstring for why that unit
+        must not run again under the same id.
+
+        WITH ITS STREAM, through the one close (units.close), under
+        `stopped`. WITHOUT ONE, as a disqualified attempt: the stream is the
+        only proof of what the session did and of whether it launched a
+        subagent (a close without it would see none and credit whatever the
+        ledger holds), so nothing counts, and a verify unit's own verdict is
+        cleared in the settle's transaction (units.conclude) -- the whole
+        unit runs again at the same attempt."""
+        try:
+            stream = self._stream_of(unit, pid)
+            if stream:
+                out = units.close(self.conn, unit, stream=stream, root=_stream_root(stream),
+                                  status="stopped")
+            else:
+                out = self._disqualify(unit)
+        except Exception as exc:  # noqa: BLE001 -- a unit must never stay `running` for ever
+            tries = self.unjudged.get(unit["id"], [pid, 0])[1] + 1
+            if tries >= JUDGE_TRIES:
+                self.unjudged.pop(unit["id"], None)
+                self.log(f"could not judge unit {unit['id']} ({type(exc).__name__}: {exc}) — "
+                         f"left running after {tries} tries; a resume judges it again")
+            else:
+                self.unjudged[unit["id"]] = [pid, tries]
+                self.log(f"could not judge unit {unit['id']} ({type(exc).__name__}: {exc}) — "
+                         "trying again")
+            return None
+        self.unjudged.pop(unit["id"], None)
+        return out
+
+    def _disqualify(self, unit):
+        unit = ledger.get_unit(self.conn, unit["id"])
+        if unit["state"] not in ("pending", "running"):
+            return {"state": unit["state"], "continuation": None}
+        ev = {"stream": "none", "guides": []}
+        if unit["kind"] == "read":
+            ev.update({"ranges": len(unit["payload"].get("ranges") or []), "covered": {}})
+        clear = None
+        if unit["kind"] == "verify":
+            clear = (unit["analysis_id"], unit["payload"].get("fingerprint", ""), f"unit:{unit['id']}")
+        return units.conclude(self.conn, unit, done=False, evidence=ev, note=NO_STREAM_NOTE,
+                              spend_usd=0.0, stopped=True, clear_verdict=clear)
+
+    def _interrupt(self) -> int:
+        self._set_phase("stopping")
+        self.log("stopping its units")
+        if self.children or self.adopted:
+            try:
+                subprocess.run([self.engine, "stop", self.job], capture_output=True, timeout=120,
+                               env={**self.env, "AL_SECURITY_ORCHESTRATOR": "1"})
+            except (OSError, subprocess.SubprocessError) as exc:
+                self.log(f"could not ask the engine to stop the units: {exc}")
+        deadline = time.time() + STOP_GRACE_SECONDS
+        while (self.children or self.adopted) and time.time() < deadline:
+            self._reap()
+            time.sleep(min(self.poll, 1.0))
+        # Past the grace, a unit whose run is STILL ALIVE stays `running`: its
+        # own close settles it whenever it ends, and a resume adopts it. One
+        # whose run is gone -- including one a predecessor left and this loop
+        # never launched, and one whose judgement raised -- is judged from
+        # what it left; one that still cannot be is left for the resume.
+        for u in ledger.units_of(self.conn, self.aid):
+            pid = _pid_of(u["run_key"])
+            if u["state"] == "running" and not (pid and _alive(pid)):
+                self._judge_orphan(u, pid)
+        ledger.interrupt_analysis(self.conn, self.aid)
+        self.log("interrupted — `agentloop security resume` continues it")
+        return 0
+
+    def _finish(self, note, state="done"):
+        self._set_phase("finishing")
+        args = ["finish", "--analysis", str(self.aid), "--state", state, "--from-units"]
+        if note:
+            args += ["--note", note]
+        out = self._cli(*args)
+        if out.returncode != 0:
+            self.log(f"could not close: {out.stderr.strip()[-400:]}")
+        row = self._row()
+        self.log(f"closed {row['state']} (${row['spend_usd']:.2f})")
+
+    def _release(self):
+        if self._lock_is_mine():
+            shutil.rmtree(self.lock_dir, ignore_errors=True)

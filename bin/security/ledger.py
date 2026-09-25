@@ -1522,10 +1522,20 @@ def conclude_unit(conn, unit_id, state, spend_usd=0.0, evidence=None, note="",
     return True, cid
 
 
+def set_run_key(conn, unit_id, run_key) -> None:
+    """Which run carries a unit: `<job>/<pid>`, written once the launch has a
+    pid. A resume reads it to adopt a run that is still alive, and to find the
+    stream of one that died (security/orchestrator.py)."""
+    with conn:
+        conn.execute("UPDATE unit SET run_key=? WHERE id=?", (run_key, unit_id))
+
+
 def reset_unit(conn, unit_id, spend_usd=0.0) -> bool:
-    """running -> pending in the SAME attempt: the run behind it ended with
-    no verdict of its own to judge (the operator stopped the analysis, the
-    orchestrator died), which is not the unit's failure."""
+    """running -> pending in the SAME attempt, under the SAME id. The
+    orchestrator calls it only for a launch that failed before any agent ran
+    (security/orchestrator.py): a unit whose run started an agent is judged
+    instead, and its judgement retried if it fails -- relaunched under the
+    same id, an orphan of the first run could still be reading under it."""
     with conn:
         cur = conn.execute(
             "UPDATE unit SET state='pending', run_key='', spend_usd=spend_usd+?"

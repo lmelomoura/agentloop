@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""A stand-in for bin/agentloop in the two verbs the orchestrator uses.
+
+__run-unit <job> <analysis> <unit> <commit> <repo>
+    plays one run of the unit and closes it with `unit-close`, as run_job does.
+    Its stream goes where run_job writes one --
+    <FAKE_ENGINE_LOG_ROOT>/<job>/<UTC stamp>-<pid>.stream.ndjson, <pid> this
+    very process -- because that is where the orchestrator looks for what a
+    run left when it died without its close.
+    FAKE_ENGINE_MODE:
+      complete (default)  every unit does its job and closes
+      skip-first          a read unit's first attempt leaves its last range unread
+      crash               exits without a close and without a stream
+      crash-after-read    a read unit reads every range, then exits WITHOUT a
+                          close; the other kinds play `complete`
+      verify-dies         a verify unit records its verdict, then exits WITHOUT
+                          a close and without a stream; the other kinds play
+                          `complete`
+      slow                waits for the stop marker, then closes the unit `stopped`
+      die-on-stop         a read unit reads its first range; every unit then
+                          waits for the stop marker and exits WITHOUT a close
+    FAKE_ENGINE_FIND=1: the hunt unit reports one sast finding, so a verify
+    unit is planned.
+stop <job>
+    touches FAKE_ENGINE_STOP, which a `slow` or `die-on-stop` unit is waiting for.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parents[3] / "bin"
+sys.path.insert(0, str(BIN))
+from security import ledger  # noqa: E402
+
+CLI = BIN / "security" / "cli.py"
+DB = os.environ["FAKE_ENGINE_DB"]
+ROOT = os.environ.get("FAKE_ENGINE_ROOT", "/Users/me/run")
+MODE = os.environ.get("FAKE_ENGINE_MODE", "complete")
+BASE = {k: v for k, v in os.environ.items() if k not in ("AL_SECURITY_AGENT", "AL_SECURITY_UNIT_ID")}
+
+
+def cli(*args, env=None, stdin=None):
+    return subprocess.run([sys.executable, str(CLI), "--db", DB, *args], env=env or BASE,
+                          input=stdin, capture_output=True, text=True)
+
+
+def close(aid, uid, status, stream=""):
+    cli("unit-close", "--analysis", aid, "--unit", uid, "--status", status, "--spend", "0.1",
+        "--root", ROOT, *(["--stream", stream] if stream else []))
+
+
+def write_stream(job, ranges):
+    """An init event naming the run's root -- the orchestrator relativises a
+    dead run's reads by it -- then a Read of each range, with the result
+    shape Claude Code writes (tool_use_result.file)."""
+    events = [{"type": "system", "subtype": "init", "cwd": ROOT}]
+    for n, r in enumerate(ranges):
+        path = f"{ROOT}/{r['path']}"
+        events.append({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_use", "id": f"t{n}", "name": "Read", "input": {"file_path": path}}]}})
+        events.append({"type": "user", "parent_tool_use_id": None,
+                       "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{n}", "content": ""}]},
+                       "tool_use_result": {"type": "text", "file": {
+                           "filePath": path, "startLine": r["first"],
+                           "numLines": r["last"] - r["first"] + 1, "totalLines": r["last"]}}})
+    folder = Path(os.environ.get("FAKE_ENGINE_LOG_ROOT") or os.environ.get("TMPDIR", "/tmp")) / job
+    folder.mkdir(parents=True, exist_ok=True)
+    stream = folder / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}.stream.ndjson"
+    stream.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return str(stream)
+
+
+def wait_for_stop():
+    marker = Path(os.environ["FAKE_ENGINE_STOP"])
+    while not marker.exists():
+        time.sleep(0.05)
+
+
+def run_unit(job, aid, uid):
+    conn = ledger.connect(DB)
+    unit = ledger.get_unit(conn, int(uid))
+    if MODE == "crash":
+        sys.exit(3)
+    if MODE in ("slow", "die-on-stop"):
+        if MODE == "die-on-stop" and unit["kind"] == "read":
+            write_stream(job, unit["payload"]["ranges"][:1])
+        wait_for_stop()
+        if MODE == "slow":
+            close(aid, uid, "stopped")
+        return
+    agent = {**BASE, "AL_SECURITY_AGENT": "1", "AL_SECURITY_ANALYSIS_ID": aid, "AL_SECURITY_UNIT_ID": uid}
+    if unit["kind"] == "read":
+        ranges = unit["payload"]["ranges"]
+        if MODE == "skip-first" and unit["attempt"] == 1:
+            ranges = ranges[:-1] or []
+        stream = write_stream(job, ranges)
+        if MODE == "crash-after-read":
+            sys.exit(3)
+        close(aid, uid, "success", stream)
+        return
+    if unit["kind"] == "triage":
+        # Re-report every scanner row, as a triage unit must: its own category,
+        # rule, severity and locations, a rationale of its own, a confidence.
+        for item in unit["payload"].get("items", []):
+            row = conn.execute("SELECT * FROM finding WHERE analysis_id=? AND fingerprint=?",
+                               (int(aid), item["fingerprint"])).fetchone()
+            if row is None:
+                continue
+            occ = [{"file": o["file"], "line": o["line"]} for o in conn.execute(
+                "SELECT file, line FROM occurrence WHERE finding_id=?", (row["id"],))]
+            cli("report-finding", "--analysis", aid, env=agent, stdin=json.dumps({
+                "fingerprint": row["fingerprint"], "category": row["category"], "rule": row["rule"],
+                "severity": row["severity"], "title": row["title"],
+                "rationale": "the fake triage read the code around it",
+                "occurrences": occ or [{"file": "src/a.py", "line": 1}],
+                "candidate": {"confidence": {"score": "high", "reason": "fake"}}}))
+    if unit["kind"] == "hunt" and os.environ.get("FAKE_ENGINE_FIND"):
+        cli("report-finding", "--analysis", aid, env=agent, stdin=json.dumps({
+            "fingerprint": "e" * 64, "category": "sast", "rule": "sql-injection", "severity": "high",
+            "title": "t", "rationale": "the query is concatenated",
+            "occurrences": [{"file": "src/a.py", "line": 1}],
+            "candidate": {"trace": [{"kind": "entrypoint", "file": "src/a.py", "line": 1, "scope": "s",
+                                     "description": "input"},
+                                    {"kind": "sink", "file": "src/a.py", "line": 1, "scope": "s",
+                                     "description": "execute"}],
+                          "intended_control": "parameterised queries",
+                          "confidence": {"score": "high", "reason": "r"},
+                          "likelihood": {"score": "high", "reason": "r"},
+                          "impact": {"score": "high", "reason": "r"}}}))
+    if unit["kind"] == "verify":
+        cli("report-verdict", "--analysis", aid, "--fingerprint", unit["payload"]["fingerprint"],
+            env=agent, stdin=json.dumps({"verdict": "confirmed", "reason": "read src/a.py:1"}))
+        if MODE == "verify-dies":
+            sys.exit(3)
+    close(aid, uid, "success")
+
+
+if sys.argv[1] == "__run-unit":
+    run_unit(sys.argv[2], sys.argv[3], sys.argv[4])
+elif sys.argv[1] == "stop":
+    Path(os.environ["FAKE_ENGINE_STOP"]).touch()
