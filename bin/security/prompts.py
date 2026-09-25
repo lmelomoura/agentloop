@@ -217,7 +217,17 @@ def _row(row, with_producer=False):
     return text + (f" · by {row.get('producer') or 'unknown'}" if with_producer else "")
 
 
-def _triage(context):
+def _read_proof_clause(platform) -> str:
+    """The tool that proves a read on this platform, in one clause -- shared
+    by the read unit's own HOW READING IS PROVEN header (`_read`) and by
+    triage's report-gone rule below, so the two never drift into naming
+    different tools for the same fact."""
+    if platform == "openai":
+        return "only with `agentloop security read --path=<path> --from <line>`"
+    return "with your Read tool, or with `agentloop security read --path=<path> --from <line>`"
+
+
+def _triage(context, platform):
     rows = context.get("rows") or []
     lines = [
         f"YOUR JOB: triage these {len(rows)} rows. Read the code at each location first.",
@@ -239,7 +249,9 @@ def _triage(context):
         "  `agentloop security report-gone --analysis <id> --fingerprint <fp>`",
         "  (stdin: {\"reason\": \"...\"}). Read every file the row is in first, or confirm",
         "  it no longer exists: a gone claim without that reading is not counted,",
-        "  whatever the reason says. Silence proves nothing and keeps this unit open.",
+        f"  whatever the reason says. It is proven {_read_proof_clause(platform)};",
+        "  a `cat`, `sed`, `grep` or other shell read proves nothing here, and the",
+        "  claim will not be counted. Silence proves nothing and keeps this unit open.",
         "",
         "ROWS",
     ]
@@ -318,7 +330,7 @@ def unit_prompt(analysis, label, platform, kind, context) -> str:
         raise ValueError(f"no prompt for platform {platform!r}")
     lines = _header(analysis, label, platform, kind)
     if kind == "triage":
-        lines += _triage(context)
+        lines += _triage(context, platform)
     elif kind == "hunt":
         lines += _hunt(analysis, context)
     elif kind == "read":

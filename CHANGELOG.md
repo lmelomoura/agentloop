@@ -539,6 +539,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A triage unit is now told how its "gone" reading is proven, per
+  platform.** Its report-gone rule said to read the file first but never
+  said what counts as reading it; a session on the Codex CLI reported a
+  carried `sast` finding gone after reading it with `sed -n` in a shell
+  call, and the judge (`_unread_files`/`_judge_triage`,
+  `bin/security/units.py`) refused the claim three times in a row because
+  only the Read tool's own result or `agentloop security read` proves a
+  read there — a `cat`/`sed`/`grep` never does, on any platform. The
+  triage prompt (`_triage`, `bin/security/prompts.py`) now names the same
+  rule the read unit's prompt already states, reusing its wording, and
+  `skills/security-analysis/SKILL.md`'s "Unit: triage" section says the
+  same.
+
 - **The Pipeline block no longer claims files were read before any read unit
   ran.** `units.summary`'s `deep.files_read` counted a file as read once
   nothing was left owed on it (`owed`, `bin/security/units.py`) — but an
