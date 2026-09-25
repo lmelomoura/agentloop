@@ -123,6 +123,7 @@ body{margin:0;background:var(--bg);color:var(--ink);
 .pill.capped{background:var(--warn-soft);color:var(--warn)}
 .pill.failed{background:var(--err-soft);color:var(--err)}
 .pill.running{background:var(--accent-soft);color:var(--accent)}
+.pill.interrupted{background:var(--panel2);color:var(--muted);border:1px dashed var(--line)}
 h3{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
   margin:0;display:flex;align-items:center;gap:7px}
 h3 .ic{width:14px;height:14px}
@@ -1949,6 +1950,20 @@ button.secrow:hover{border-color:var(--accent);background:var(--panel2)}
    the map of what looked. `[hidden]` spelled out for the same reason every
    rule above it is -- the author `display` on .secphase-head would otherwise
    outrank the UA sheet. */
+/* The Pipeline block (analysis.js, secRenderPipeline): one line per kind of
+   unit, the deep read's coverage, the units' spend, Stop or Resume. */
+#sec-pipeline[hidden]{display:none}
+#sec-pipeline{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:10px 13px;margin:0 0 12px;display:flex;flex-direction:column;gap:6px}
+.secpipe-title{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.secpipe-kinds{display:flex;flex-direction:column;gap:3px}
+.secpipe-kind{display:flex;gap:10px;font-size:12.5px}
+.secpipe-name{min-width:110px;font-weight:600}
+.secpipe-kind.done .secpipe-count{color:var(--ok)}
+.secpipe-kind.failed .secpipe-count{color:var(--err)}
+.secpipe-deep,.secpipe-spend{font-size:12px;color:var(--muted)}
+#sec-pipeline .btn{align-self:flex-start}
+.runlabel{font-size:11px;color:var(--muted);margin-top:2px}
 #sec-phases[hidden]{display:none}
 .secphases{border:1px solid var(--line);border-radius:10px;overflow:hidden;
   margin:2px 0 8px;background:var(--panel)}
@@ -2955,5 +2970,5 @@ details.secphase > summary.secphase-head::-webkit-details-marker{display:none}
 /* cover, not fill: a photo that is not square is cropped rather than stretched */
 .pf-face img{width:100%;height:100%;object-fit:cover;display:block}
 .pf-photo-a{display:flex;gap:8px;flex-wrap:wrap}
-/* ui-bundle: bcc4e56cfafa095e21e7d5ad11f3cce2a9e70c13bced373d97051fe635d6eb23 */
-/* ui-sources: ec73cbc884a738ac02546deabf6242501397380d776bb2f99fe617d4830fca19 */
+/* ui-bundle: 4d23bd99db015a71721d7e8b91d8ff7b94bdd7113d60b15c8eec88acbc7aa014 */
+/* ui-sources: 59b39a2f168d4864427d6f4be9d14553f0f5eadf9bd54f19d99fbc026dd701eb */

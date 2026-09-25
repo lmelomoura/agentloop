@@ -20,6 +20,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The analysis page shows the pipeline, and stops or resumes it.** A
+  Pipeline block lists each kind of unit — done, running, waiting, gave up
+  — how much of a deep scope has been read in full, and what the units have
+  cost, with Stop while the analysis runs and Resume once it is
+  interrupted. While the orchestrator is alive the page says what it is
+  doing (preparing, running its units, finishing, stopping) instead of
+  calling the analysis dead in the minutes no unit's run exists.
+  `interrupted` has its own pill, chip and banner, and each run of a unit on
+  the Runs page carries its analysis and unit as a label.
 - **The analysis page can follow and resume a pipeline analysis.** The
   checklist carries the units' progress, and whether the analysis's
   orchestrator is alive and in which phase — between two units no run is

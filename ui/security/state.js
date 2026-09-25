@@ -13,4 +13,5 @@
    poll may replace) and its own opener have to agree on -- see
    secShowAnalysis's comment for what it costs to not have it. */
 export const secState = {project:"", repo:"", branch:"", analyses:[], analysis:null,
-                  findings:[], stateFilter:"", seq:0, pinned:false};
+                  findings:[], stateFilter:"", seq:0, pinned:false,
+                  units:null, orchestrator:null};

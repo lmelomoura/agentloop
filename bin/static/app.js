@@ -2267,6 +2267,7 @@
     tr.appendChild(tdWhen);
     const tdJob = el("td");
     tdJob.appendChild(el("code", null, r.id));
+    if (r.label) tdJob.appendChild(el("div", "runlabel", r.label));
     const plat = r.platform || "anthropic";
     const b = el("span", "platbadge plat-" + plat, platformLabel(plat));
     b.title = (r.live ? "Runs on " : "Ran on ") + ({ anthropic: "Claude Code", openai: "the Codex CLI", opencode: "the OpenCode CLI" }[plat] || plat) + (r.model_id ? " \xB7 " + r.model_id : r.model ? " \xB7 " + r.model : "");
@@ -3274,5 +3275,5 @@
     newerModelNotes
   };
 })();
-/* ui-bundle: ae70d7abbcc70ee332cb721bca160073ca2a3f364ab1bcc8a2cacef81673ea91 */
-/* ui-sources: ec73cbc884a738ac02546deabf6242501397380d776bb2f99fe617d4830fca19 */
+/* ui-bundle: 3660842cb4794874812b5e4f42a799e5cdbbe251880be3258c1468a0cea1e9c7 */
+/* ui-sources: 59b39a2f168d4864427d6f4be9d14553f0f5eadf9bd54f19d99fbc026dd701eb */

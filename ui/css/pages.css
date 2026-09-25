@@ -1395,6 +1395,20 @@ button.secrow:hover{border-color:var(--accent);background:var(--panel2)}
    the map of what looked. `[hidden]` spelled out for the same reason every
    rule above it is -- the author `display` on .secphase-head would otherwise
    outrank the UA sheet. */
+/* The Pipeline block (analysis.js, secRenderPipeline): one line per kind of
+   unit, the deep read's coverage, the units' spend, Stop or Resume. */
+#sec-pipeline[hidden]{display:none}
+#sec-pipeline{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:10px 13px;margin:0 0 12px;display:flex;flex-direction:column;gap:6px}
+.secpipe-title{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.secpipe-kinds{display:flex;flex-direction:column;gap:3px}
+.secpipe-kind{display:flex;gap:10px;font-size:12.5px}
+.secpipe-name{min-width:110px;font-weight:600}
+.secpipe-kind.done .secpipe-count{color:var(--ok)}
+.secpipe-kind.failed .secpipe-count{color:var(--err)}
+.secpipe-deep,.secpipe-spend{font-size:12px;color:var(--muted)}
+#sec-pipeline .btn{align-self:flex-start}
+.runlabel{font-size:11px;color:var(--muted);margin-top:2px}
 #sec-phases[hidden]{display:none}
 .secphases{border:1px solid var(--line);border-radius:10px;overflow:hidden;
   margin:2px 0 8px;background:var(--panel)}

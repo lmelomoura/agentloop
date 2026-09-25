@@ -269,7 +269,9 @@
     findings: [],
     stateFilter: "",
     seq: 0,
-    pinned: false
+    pinned: false,
+    units: null,
+    orchestrator: null
   };
 
   // ui/security/dom.js
@@ -672,6 +674,8 @@
     if (id == null) {
       secState.analysis = null;
       secState.findings = [];
+      secState.units = null;
+      secState.orchestrator = null;
       secPaint();
       return;
     }
@@ -680,10 +684,14 @@
       if (seq !== secState.seq) return;
       secState.analysis = j.analysis || null;
       secState.findings = j.findings || [];
+      secState.units = j.units || null;
+      secState.orchestrator = j.orchestrator || null;
     } catch (e) {
       if (seq !== secState.seq) return;
       secState.analysis = null;
       secState.findings = [];
+      secState.units = null;
+      secState.orchestrator = null;
       secStatus("Could not read that analysis \u2014 " + e.message);
       return;
     }
@@ -750,6 +758,12 @@
     grid.appendChild(cell("Runs on", document.createTextNode(secPlatformLabel(plat))));
     host.appendChild(grid);
   }
+  var SEC_ORCHESTRATOR_PHASE = {
+    "preparing": "Preparing \u2014 the deterministic phase (secrets, dependencies, SBOM, hygiene, infrastructure) runs before any unit starts.",
+    "running units": "Running its units \u2014 each unit is a run of its own on the Runs page, labelled with this analysis.",
+    "finishing": "Finishing \u2014 the engine is closing the analysis from what its units proved.",
+    "stopping": "Stopping \u2014 its units are being stopped; the analysis stays interrupted, and Resume continues it."
+  };
   function secRenderRunNotice(a) {
     const host = $("sec-run-notice");
     host.textContent = "";
@@ -758,8 +772,17 @@
       host.appendChild(secEl(
         "div",
         "secrun-notice",
-        "Secrets, dependencies and CVEs are written moments after the agent starts \u2014 they are its first command \u2014 so what is below is already real while the code review keeps going."
+        "Secrets, dependencies and CVEs are recorded when the deterministic phase ends, before any unit starts \u2014 from then on, what is below is already real while the units keep going."
       ));
+    }
+    const orch = secState.orchestrator || {};
+    if (running && orch.alive) {
+      host.appendChild(secEl(
+        "div",
+        "secrun-notice",
+        SEC_ORCHESTRATOR_PHASE[orch.phase] || "The engine is running this analysis."
+      ));
+      return;
     }
     const run = secRunFor(a);
     if (running && !run) {
@@ -767,13 +790,13 @@
         host.appendChild(secEl(
           "div",
           "secrun-notice warn",
-          "No live run is behind this analysis \u2014 it likely died without closing. The next Analyse sweeps it; until then downloads carry what it recorded."
+          "No orchestrator and no run are behind this analysis \u2014 it likely died without closing. The tick resumes it if its orchestrator left a lock, and the next Analyse sweeps it otherwise; until then downloads carry what it recorded."
         ));
       } else {
         host.appendChild(secEl(
           "div",
           "secrun-notice",
-          "Preparing the run \u2014 fetching the branch and cutting a clean worktree. The live trace appears here the moment the agent starts."
+          "Starting the analysis \u2014 its orchestrator takes over in a moment."
         ));
       }
     }
@@ -822,6 +845,74 @@
     }
     host.appendChild(list);
   }
+  var SEC_UNIT_KIND_LABEL = {
+    triage: "Triage",
+    hunt: "Reachability",
+    read: "Deep read",
+    verify: "Verification"
+  };
+  function secRenderPipeline(a, summary) {
+    const host = $("sec-pipeline");
+    host.textContent = "";
+    if (!a || !summary || !summary.units) {
+      host.hidden = true;
+      return;
+    }
+    host.hidden = false;
+    host.appendChild(secEl("div", "secpipe-title", "Pipeline"));
+    const list = secEl("div", "secpipe-kinds");
+    for (const kind of ["triage", "hunt", "read", "verify"]) {
+      const k = (summary.kinds || {})[kind];
+      if (!k) continue;
+      const bits = [k.done + " of " + k.total + " done"];
+      if (k.running) bits.push(k.running + " running");
+      if (k.pending) bits.push(k.pending + " waiting");
+      if (k.failed) bits.push(k.failed + " gave up");
+      const row = secEl("div", "secpipe-kind" + (k.failed ? " failed" : k.done === k.total ? " done" : ""));
+      row.appendChild(secEl("span", "secpipe-name", SEC_UNIT_KIND_LABEL[kind] || kind));
+      row.appendChild(secEl("span", "secpipe-count", bits.join(" \xB7 ")));
+      list.appendChild(row);
+    }
+    host.appendChild(list);
+    const d = summary.deep;
+    if (d) {
+      const n = (v) => Number(v || 0).toLocaleString("en-US");
+      host.appendChild(secEl("div", "secpipe-deep", "Deep scope read in full: " + n(d.files_read) + " of " + n(d.files) + " files, " + n(d.lines_read) + " of " + n(d.lines) + " lines."));
+    }
+    host.appendChild(secEl("div", "secpipe-spend", "Spent by the units: " + money(summary.spend_usd || 0)));
+    if (a.state === "running" || a.state === "interrupted") {
+      const running = a.state === "running";
+      const btn = secEl("button", "btn", running ? "Stop analysis" : "Resume");
+      btn.type = "button";
+      btn.onclick = () => running ? secStopAnalysis(a) : secResumeAnalysis(a);
+      host.appendChild(btn);
+    }
+  }
+  async function secStopAnalysis(a) {
+    const k = ["security_stop", secState.project, String(a.id)];
+    if (isPending(...k)) return;
+    markPending(...k);
+    try {
+      if (await api("stop", { id: a.run_id })) toast("Stopping the analysis", false, "power");
+      await secReload(false);
+    } finally {
+      clearPending(...k);
+    }
+  }
+  async function secResumeAnalysis(a) {
+    const k = ["security_resume", secState.project, String(a.id)];
+    if (isPending(...k)) return;
+    markPending(...k);
+    try {
+      if (await api("security_resume", { project: secState.project, analysis: a.id })) {
+        toast("Analysis resumed", false, "shield");
+        await secReload();
+        secSyncPoll();
+      }
+    } finally {
+      clearPending(...k);
+    }
+  }
   function secPaint() {
     const a = secState.analysis;
     secPaintRunButton();
@@ -840,6 +931,8 @@
       $("sec-run-meta").textContent = "";
       $("sec-run-notice").textContent = "";
       $("sec-incomplete").hidden = true;
+      $("sec-pipeline").textContent = "";
+      $("sec-pipeline").hidden = true;
       $("sec-phases").textContent = "";
       $("sec-phases").hidden = true;
       $("sec-coverage").hidden = true;
@@ -854,12 +947,13 @@
     secRenderRunNotice(a);
     const inc = $("sec-incomplete");
     inc.textContent = "";
-    const incomplete = a.state === "capped" ? "This analysis is INCOMPLETE: it stopped before covering the whole scope." : a.state === "failed" ? "This analysis is INCOMPLETE: it did not finish." : "";
+    const incomplete = a.state === "capped" ? "This analysis is INCOMPLETE: it stopped before covering the whole scope." : a.state === "failed" ? "This analysis is INCOMPLETE: it did not finish." : a.state === "interrupted" ? "This analysis is INTERRUPTED: it stopped before covering the whole scope, and Resume continues it where it left off." : "";
     if (incomplete) {
       inc.appendChild(secIcon("alert"));
       inc.appendChild(secEl("span", "grow", incomplete + " What is below is what it had reached, not what is there."));
       inc.hidden = false;
     } else inc.hidden = true;
+    secRenderPipeline(a, secState.units);
     secRenderCoveragePhases(a);
     const note = $("sec-coverage");
     note.textContent = "";
@@ -3886,7 +3980,7 @@
   }
 
   // ui/security/project-screen.js
-  var RUN_STATES = ["running", "done", "capped", "failed"];
+  var RUN_STATES = ["running", "done", "capped", "interrupted", "failed"];
   var secProjectCache = null;
   var secProjectGen = 0;
   var secProjectTab = "overview";
@@ -5045,6 +5139,7 @@
     running: "Running",
     done: "Completed",
     capped: "Capped",
+    interrupted: "Interrupted",
     failed: "Failed"
   };
   function secIndexRunStatusPill(state) {
@@ -5448,5 +5543,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: defb9e0bd2d6a4735b906ffe1ee99a4281054fff6b3288e3754318b83d60c409 */
-/* ui-sources: ec73cbc884a738ac02546deabf6242501397380d776bb2f99fe617d4830fca19 */
+/* ui-bundle: eb9a40792c1ec08a4598b8738375227b8495123c49ae56f39419e2d10a2e3885 */
+/* ui-sources: 59b39a2f168d4864427d6f4be9d14553f0f5eadf9bd54f19d99fbc026dd701eb */

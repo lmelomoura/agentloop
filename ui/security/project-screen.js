@@ -52,7 +52,7 @@ import { secRenderProjectOverview, secProjectActivity } from "./overview-tab.js"
 // `start_analysis`/`ANALYSIS_END_STATES`) -- the Runs tab's own filter row,
 // a different vocabulary from vocabulary.js's SEC_STATES (that one is a
 // FINDING's state; this one is an ANALYSIS's).
-const RUN_STATES = ["running", "done", "capped", "failed"];
+const RUN_STATES = ["running", "done", "capped", "interrupted", "failed"];
 
 let secProjectCache = null;
 let secProjectGen = 0;
