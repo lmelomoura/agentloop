@@ -51,6 +51,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with a note, so a machine that keeps crashing stops spending. A lock
   caught in the instant before its owner writes its pid is an orchestrator
   being started, and is left alone until it is older than the lock grace.
+  The loser of two near-simultaneous starts no longer leaves its row
+  `running`: closed `failed` with the reason when it was never prepared,
+  left `interrupted` when it already holds units. A ledger that cannot be
+  read when an orchestrator starts is retried and then leaves the analysis
+  `interrupted` — or keeps the lock for the tick — instead of closing it
+  `failed` as if its commit or checkout were gone.
 - **An orchestrator runs an analysis to the end, whatever its size.** It
   prepares the analysis in a worktree of its own at the analysed commit —
   outside the run worktrees the tick sweeps, cleared first if a crash left

@@ -1029,15 +1029,48 @@ security_analysis_live() { # security_analysis_live <job-id> -> 0 while its anal
 # stop signals and what the tick finds dead after a crash. The orchestrator
 # (security/orchestrator.py) removes the lock when it exits.
 security_orchestrate() { # security_orchestrate <job-id> <analysis-id> <repo>
-  local jid="$1" aid="$2" repo="$3" lock row commit project cwd parallel budget ignore
+  local jid="$1" aid="$2" repo="$3" lock row commit project cwd parallel budget ignore rc tries
   mkdir -p "$LOCK_DIR/$jid" 2>/dev/null
   if ! acquire_lock "$jid/.analysis"; then
     log_tick "$jid: analysis $aid not started — another analysis of $jid is being orchestrated"
+    # THE LOSER OF TWO NEAR-SIMULTANEOUS STARTS must not leave its row
+    # `running` with nothing behind it (the Analyse button stays disabled
+    # for as long as one says so). A row never prepared has nothing to keep:
+    # closed `failed`, saying why. One that was (a resume that lost the
+    # race) holds paid-for units: left `interrupted`, for a resume.
+    if [ "$(security_engine_py analysis --id "$aid" 2>/dev/null | "$JQ" -r '.prepared // 0' 2>/dev/null)" = "1" ]; then
+      security_engine_py interrupt --analysis "$aid" >/dev/null 2>&1
+    else
+      security_engine_py finish --analysis "$aid" --state failed --if-running \
+        --note "The engine did not start this analysis: another analysis of the same project was being orchestrated at that moment." \
+        >/dev/null 2>&1
+    fi
     return 1
   fi
   lock="$LOCK_DIR/$jid/.analysis"
   printf '%s\n' "$aid" > "$lock/analysis"
-  row="$(security_engine_py analysis --id "$aid" 2>/dev/null)"
+  # A LEDGER THAT CANNOT BE READ IS NOT A MISSING COMMIT. The read is
+  # retried; one that still fails leaves the analysis `interrupted` -- its
+  # row, its units and its commit may all be fine behind a busy database --
+  # and never closes it `failed` with "its commit or its checkout could not
+  # be found". If even the interruption cannot be written, the lock is
+  # kept: its pid dies with this process, and the tick then finds it and
+  # resumes the analysis (security_resume_orphans).
+  tries=0
+  while :; do
+    row="$(security_engine_py analysis --id "$aid" 2>/dev/null)"; rc=$?
+    [ "$rc" -eq 0 ] && [ -n "$row" ] && break
+    tries=$((tries + 1))
+    [ "$tries" -ge 3 ] && break
+    sleep 2
+  done
+  if [ "$rc" -ne 0 ] || [ -z "$row" ]; then
+    log_tick "$jid: analysis $aid not started — the ledger could not be read (rc $rc); left interrupted for a resume"
+    if security_engine_py interrupt --analysis "$aid" >/dev/null 2>&1; then
+      release_lock "$jid/.analysis"
+    fi
+    return 1
+  fi
   commit="$(printf '%s' "$row" | "$JQ" -r '.commit_sha // empty' 2>/dev/null)"
   project="$(printf '%s' "$row" | "$JQ" -r '.project // empty' 2>/dev/null)"
   cwd=""

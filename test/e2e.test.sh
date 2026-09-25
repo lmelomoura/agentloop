@@ -1309,7 +1309,10 @@ grep -q 'j45a: launched detached run' "$ROOT/data/tick.log" && ok "a job with no
 grep -q 'j45b: launched detached run' "$ROOT/data/tick.log" && ok "and so is one with days set and hours blank (the example file's shape)" \
   || bad "no launch line for j45b: $(grep 'j45' "$ROOT/data/tick.log" | tail -2)"
 # The tick detaches both runs; wait for their records rather than for a child.
-w=0; while [ "$w" -lt 20 ] && { [ -z "$(run_of j45a)" ] || [ -z "$(run_of j45b)" ]; }; do sleep 1; w=$((w + 1)); done
+# 60 s, not 20: the loop leaves the moment both records exist, and on a loaded
+# machine (the whole suite, a CI runner) two detached runs once took longer
+# than 20 s to file theirs -- a flake, never a slower success path.
+w=0; while [ "$w" -lt 60 ] &&{ [ -z "$(run_of j45a)" ] || [ -z "$(run_of j45b)" ]; }; do sleep 1; w=$((w + 1)); done
 [ "$(run_of j45a | jq -r .status)" = "success" ] && [ "$(run_of j45a | jq -r .forced)" = "false" ] \
   && ok "j45a ran to a clean success, not forced (waited ${w}s for the records)" || bad "j45a: $(run_of j45a | jq -c '{status,forced}')"
 [ "$(run_of j45b | jq -r .status)" = "success" ] && [ "$(run_of j45b | jq -r .forced)" = "false" ] \

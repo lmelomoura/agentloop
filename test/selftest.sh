@@ -6465,6 +6465,25 @@ PY
   grep -q '^unit-close --analysis 41 --unit 9 --stream  --root  --status stopped ' "$tmp/secpy.calls" \
     && ok "a unit stopped before its agent closes its unit as stopped" \
     || bad "security_py calls: $(cat "$tmp/secpy.calls")"
+  # Stopped AFTER its agent ran ($slot/child): the close gets the stream
+  # run_job wrote beside $slot/logfile and the run's root from
+  # $slot/worktree -- evidence already paid for, which the close judges the
+  # unit by (reads counted, a subagent seen) instead of by nothing.
+  local sl7="$tmp/locks/security-app/783" wt7="$tmp/stopwt7"
+  mkdir -p "$sl7" "$tmp/stoplogs/security-app" "$wt7"
+  echo 783 > "$sl7/pid"; echo 1700000000 > "$sl7/start"; : > "$sl7/stopped"; : > "$sl7/child"
+  echo "$tmp/stoplogs/security-app/20260925T100000Z-783.json" > "$sl7/logfile"
+  echo "$wt7" > "$sl7/worktree"
+  : > "$tmp/stoplogs/security-app/20260925T100000Z-783.stream.ndjson"
+  : > "$tmp/secpy.calls"
+  ( CONFIG_DIR="$tmp/cfg"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/stop7.ndjson"
+    STATE_FILE="$tmp/stopstate.json"; LOG_DIR="$tmp/stoplogs"; TICK_LOG="$tmp/stop.tick"
+    AL_SECURITY_ANALYSIS_ID=41 AL_SECURITY_UNIT_ID=10
+    security_py() { printf '%s\n' "$*" >> "$tmp/secpy.calls"; }
+    run_record_stopped_early security-app "$sl7" ) >/dev/null 2>&1
+  grep -q "^unit-close --analysis 41 --unit 10 --stream $tmp/stoplogs/security-app/20260925T100000Z-783.stream.ndjson --root $wt7 --status stopped " "$tmp/secpy.calls" \
+    && ok "a unit stopped after its agent ran is closed with the stream and the root its run left" \
+    || bad "stopped-early close with evidence: $(cat "$tmp/secpy.calls")"
   : > "$tmp/secpy.calls"
   local sl6="$tmp/locks/j9/781"
   mkdir -p "$sl6"; echo 781 > "$sl6/pid"; echo 1700000000 > "$sl6/start"; : > "$sl6/stopped"
@@ -8259,6 +8278,51 @@ print(",".join([u[0], repr(u[1])] + ([str(k[0])] if k else [])))' "$secdb" "$1"
   [ "$secgone" = "failed,true" ] \
     && ok "an analysis whose checkout is gone is closed failed before any orchestrator runs, and its lock let go" \
     || bad "security_orchestrate over a missing checkout -> $secgone"
+  # THE LOSER OF TWO NEAR-SIMULTANEOUS STARTS: refused by the analysis lock,
+  # it must not leave its row `running` with nothing behind it. A row never
+  # prepared is closed failed, saying why; one already prepared (a resume
+  # that lost the race) keeps its units and is left interrupted.
+  local secloser
+  secloser="$( ( sec_env
+    acquire_lock() { return 1; }
+    fresh="$(security_py open-analysis --project "Sec App" --repo "Sec App" --branch loser \
+               --commit c --profile quick --run-id "$secjid" | "$JQ" -r '.analysis_id')"
+    paid="$(sec_open)"
+    security_orchestrate "$secjid" "$fresh" "Sec App" >/dev/null 2>&1; r1=$?
+    security_orchestrate "$secjid" "$paid" "Sec App" >/dev/null 2>&1; r2=$?
+    security_py list --project "Sec App" | "$JQ" -r --argjson f "$fresh" --argjson p "$paid" \
+      --arg r "$r1$r2" '[(.[] | select(.id == $f) | .state, (.coverage_note | test("another analysis of the same project") | tostring)),
+         (.[] | select(.id == $p) | .state), $r] | join(",")' ) 2>/dev/null )"
+  [ "$secloser" = "failed,true,interrupted,11" ] \
+    && ok "the loser of two starts leaves no row running: failed when never prepared, interrupted when it holds units" \
+    || bad "the lock's loser -> $secloser (fresh state, note, prepared state, rcs)"
+  # A LEDGER THAT CANNOT BE READ IS NOT A MISSING COMMIT: the read is
+  # retried, and a row it still cannot read is left interrupted -- never
+  # closed failed "commit or checkout could not be found". When even the
+  # interruption cannot be written, the lock stays for the tick.
+  local secread
+  secread="$( ( sec_env
+    a="$(security_py open-analysis --project "Sec App" --repo "Sec App" --branch busy-ledger \
+           --commit c --profile quick --run-id "$secjid" | "$JQ" -r '.analysis_id')"
+    sleep() { :; }
+    # An `if`, not a `case`: bash 3.2 misparses a `case` inside $( ).
+    security_engine_py() {
+      if [ "$1" = "analysis" ]; then printf 'x\n' >> "$sec/ledger.reads"; return 1; fi
+      ( unset AL_SECURITY_AGENT CC_SECURITY_AGENT; security_py "$@" )
+    }
+    security_orchestrate "$secjid" "$a" "Sec App" >/dev/null 2>&1; r=$?
+    lock1="$( [ -d "$LOCK_DIR/$secjid/.analysis" ] && echo kept || echo released )"
+    security_py resume --analysis "$a" >/dev/null 2>&1
+    security_engine_py() { return 1; }
+    security_orchestrate "$secjid" "$a" "Sec App" >/dev/null 2>&1
+    lock2="$( [ -d "$LOCK_DIR/$secjid/.analysis" ] && echo kept || echo released )"
+    rm -rf "$LOCK_DIR/$secjid/.analysis"
+    row="$(security_py list --project "Sec App" | "$JQ" -r --argjson a "$a" \
+             '.[] | select(.id == $a) | [.state, (.coverage_note | test("could not be found") | tostring)] | join(",")')"
+    printf '%s,%s,%s,%s,%s' "$r" "$(wc -l < "$sec/ledger.reads" | tr -d ' ')" "$lock1" "$lock2" "$row" ) 2>/dev/null )"
+  [ "$secread" = "1,3,released,kept,running,false" ] \
+    && ok "a ledger that cannot be read is retried, then left interrupted (or the lock kept for the tick), never closed failed" \
+    || bad "an unreadable ledger at start -> $secread (rc, reads, lock after interrupt, lock when nothing writes, row)"
   # A live orchestrator between two units holds no slot, and it is still an
   # analysis in hand: a second analyze is refused with a sentence, and no row
   # is opened for it. So is one arriving while the lock has no pid yet.
@@ -8367,6 +8431,33 @@ FAKESELF
   grep -q "^analysis " "$sec/stuck.out" \
     && ok "and the analysis that was asked for is opened rather than refused" \
     || bad "the new analysis did not start: $(cat "$sec/stuck.out" 2>/dev/null)"
+
+  echo "cmd_security_resume() — a resume never revives an analysis a newer one superseded"
+  # An interrupted analysis is the resume's to continue -- until a newer
+  # analysis of the SAME branch is opened, which closes it `failed`
+  # ("Superseded by ..."). From then on the newer one is the branch's
+  # analysis, and resuming the old one would run two histories of one branch
+  # side by side: refused, and nothing is launched.
+  local secsup
+  secsup="$( ( sec_env
+    a="$(security_py open-analysis --project "Sec App" --repo "Sec App" --branch main \
+           --commit abc --profile quick --run-id "$secjid" | "$JQ" -r '.analysis_id')"
+    security_engine_py interrupt --analysis "$a" >/dev/null 2>&1
+    security_launch_detached() { printf '%s\n' "$2" >> "$sec/sup.launched"; }
+    ( cmd_security_resume "Sec App" "$a" ) >/dev/null 2>&1; r1=$?
+    security_engine_py interrupt --analysis "$a" >/dev/null 2>&1
+    security_py open-analysis --project "Sec App" --repo "Sec App" --branch main \
+      --commit def --profile quick --run-id "$secjid" >/dev/null 2>&1
+    ( cmd_security_resume "Sec App" "$a" ) > "$sec/sup.out" 2>&1; r2=$?
+    state="$(security_py list --project "Sec App" | "$JQ" -r --argjson s "$a" '.[] | select(.id==$s) | .state')"
+    printf '%s,%s,%s,%s,%s' "$a" "$r1" "$r2" "$state" "$(wc -l < "$sec/sup.launched" | tr -d ' ')" ) 2>/dev/null )"
+  case "$secsup" in
+    [0-9]*,0,[1-9]*,failed,1)
+      grep -q "is not interrupted" "$sec/sup.out" \
+        && ok "an interrupted analysis resumes, and once a newer one of its branch supersedes it the resume is refused and launches nothing" \
+        || bad "superseded resume said: $(cat "$sec/sup.out" 2>/dev/null)" ;;
+    *) bad "resume vs supersede -> $secsup (id, rc resume, rc after supersede, state, launches): $(cat "$sec/sup.out" 2>/dev/null)" ;;
+  esac
 
   echo "cmd_security_branches() — local and origin branches, HEAD excluded, deduped"
   # A real checkout with an origin, not faked refs: local-only never leaves the
