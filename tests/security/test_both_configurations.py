@@ -57,6 +57,7 @@ there, and spawning it from inside the first would be a third execution of a
 ~250s suite. Locally, nothing deselects it.
 """
 
+import importlib.util
 import os
 import re
 import subprocess
@@ -140,9 +141,14 @@ def test_the_security_suite_is_green_with_the_engines_on():
     `AL_SECURITY_ENGINES=on` in its environment, so its own copy of this test
     skips instead of forking a third.
     """
+    # In parallel where pytest-xdist is installed (CI installs it; the suite
+    # does not need it): the child is the whole suite again, and one worker
+    # per core is the difference between minutes and a quarter of them.
+    parallel = (["-n", "auto"] if importlib.util.find_spec("xdist") is not None
+                else [])
     out = subprocess.run(
         [sys.executable, "-m", "pytest", str(SUITE), "-q", "--tb=line", "-rf",
-         "-p", "no:cacheprovider"],
+         "-p", "no:cacheprovider", *parallel],
         cwd=str(REPO), capture_output=True, text=True, check=False,
         env={**os.environ, "AL_SECURITY_ENGINES": "on"})
 
