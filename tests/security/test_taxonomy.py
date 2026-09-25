@@ -687,3 +687,23 @@ def test_the_skills_optional_severities_are_exactly_those_below_the_floor():
     blocking = set(_re.findall(r"`([a-z]+)`", step2.group(1)))
     assert blocking == set(security_cli.TRIAGE_BLOCKING), (blocking, security_cli.TRIAGE_BLOCKING)
     assert not (optional & blocking)
+
+
+def test_the_skill_owes_a_lowered_scanner_row_as_the_judge_does():
+    """The judge (units._judge_triage) keeps a scanner row owed while it is
+    at the floor or above at the scanner's severity OR the current one, and
+    a prompt shows such a row as `low (scanner: high)`. The skill used to say
+    `low` and `info` were optional and "never block", unconditionally -- the
+    one row it most needed to name, it told the unit to skip."""
+    import re as _re
+    text = SKILL.read_text()
+    step5 = _re.search(r"^5\. \*\*.+? are optional\.\*\*(.*)$", text, _re.MULTILINE)
+    assert step5, "SKILL.md's Job 2 has no step 5"
+    rule = step5.group(1)
+    assert "BOTH of its severities" in rule and "`low (scanner: high)`" in rule
+    assert "still owed" in rule
+    assert "`low` and `info` never block." not in text
+    close = next(line for line in text.splitlines()
+                 if line.startswith("**What the close does with a row you skip.**"))
+    assert "below `medium` at both of its severities never blocks" in close
+    assert "`low (scanner: high)` keeps this unit open" in close

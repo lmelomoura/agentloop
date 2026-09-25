@@ -364,7 +364,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   secret's value, no subagents — and then one section per unit kind. A
   carried `sast` finding a triage unit finds gone is now said to be gone,
   with the reason (`report-gone`), instead of left out in silence the engine
-  could not tell from a row nobody opened.
+  could not tell from a row nobody opened. `low` and `info` rows are
+  optional only when both the scanner's severity and the current one are
+  below `medium`: a row shown `low (scanner: high)` is still owed, as the
+  engine judges it — the skill used to call every `low` row optional.
 - **A security analysis runs as a pipeline of units, on every platform.**
   `security analyze` now starts an orchestrator that holds the analysis lock,
   prepares the analysis once and runs each unit as an ordinary run of the
