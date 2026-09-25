@@ -596,15 +596,19 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     # (cli.cmd_read), so nothing new can land between a reset and the next
     # launch either.
     #
-    # A BACKSTOP, NOT THE PRIMARY DEFENCE. The orchestrator's own rule
-    # (Task 10) resets a unit only when its launch failed BEFORE any agent
-    # ran; a unit whose agent ran -- and so could have called `security
-    # read` -- is never reset, its close is retried instead. That rule alone
-    # already makes "a dead run's chunk inherited by its relaunch" and "a
-    # reset and a relaunch inside the same wall-clock second" (`unit_read.at`
-    # has one-second resolution) unreachable in the real pipeline; `since`
-    # guards the case anyway, for whatever calls `reset_unit` outside that
-    # rule -- a test, a future caller -- rather than leaning on the rule alone.
+    # A BACKSTOP, NOT THE PRIMARY DEFENCE -- AND ONLY FOR A LATER SECOND.
+    # `unit_read.at` has one-second resolution, so `since=unit["started"]`
+    # can only tell apart a chunk recorded in a wall-clock second AFTER this
+    # run started from one recorded before it; a reset and its relaunch
+    # inside the SAME second are not something `since` can close on its own.
+    # The orchestrator's own rule (Task 10) is what actually closes that
+    # case: it resets a unit only when its launch failed BEFORE any agent
+    # ran, so a unit whose agent ran -- and so could have called `security
+    # read` -- is never reset (its close is retried instead), and a
+    # same-second reset-then-relaunch never happens in the real pipeline.
+    # `since` guards the later-second case anyway, for whatever calls
+    # `reset_unit` outside that rule -- a test, a future caller -- rather
+    # than leaning on the rule alone.
     session = evidence.with_served(session, ledger.unit_reads(conn, unit["id"], since=unit["started"]))
     # `root` is passed on for a triage unit's gone claims (_judge_triage,
     # _unread_files): what proves a claimed-gone file's ABSENCE. What proves

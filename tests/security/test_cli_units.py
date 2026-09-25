@@ -424,21 +424,25 @@ def test_security_read_stops_at_the_byte_budget(tmp_path):
     # I1: the budget bounds the WHOLE call, not only the numbered lines --
     # the header, the piping warning and the `-- next:` footer all count
     # against it now. "src/wide.py" needs no quoting, but its overhead is
-    # not zero: header_upper = "== src/wide.py lines 1-100 of 100 =="
-    # (37 bytes + 1 for its newline), the piping warning is 130 bytes + 1,
-    # footer_upper = "-- next: agentloop security read --path=src/wide.py"
-    # " --from 100" (53 bytes + 1) -- overhead = 38 + 131 + 54 = 223... the
-    # exact figure (258) is asserted directly below rather than re-derived
-    # by hand here a second time. budget = 8,000 - 258 = 7,742. The body is
+    # not zero: header_upper = "== src/wide.py lines 100-100 of 100 =="
+    # (38 bytes + 1 for its newline -- round 3 sizes BOTH of the header's
+    # own numbers off `total`, not off `first`, so the verdict for this
+    # path never depends on which `--from` asked for it), the piping
+    # warning is 157 bytes + 1, footer_upper = "-- next: agentloop security
+    # read --path=src/wide.py --from 100" (62 bytes + 1) -- overhead =
+    # 39 + 158 + 63 = 260, asserted directly below rather than re-derived
+    # by hand here a second time. budget = 8,000 - 260 = 7,740. The body is
     # counted in what is actually PRINTED, "N\tTEXT", never the 199-byte
     # text alone (see cmd_read's own docstring): lines 1-9 print with a
     # one-digit number, costing len("N\t") + 199 + 1 = 202 bytes; lines 10
     # and up print with two digits, costing 203. 9 * 202 + 29 * 203 =
-    # 1,818 + 5,887 = 7,705 <= 7,742, and adding line 39 (203 more) would
-    # reach 7,908 > 7,742 -- so the chunk stops at line 38.
-    overhead = 258
+    # 1,818 + 5,887 = 7,705 <= 7,740, and adding line 39 (203 more) would
+    # reach 7,908 > 7,740 -- so the chunk stops at line 38, same as before
+    # this round's 2-byte-larger overhead: the margin here was wide enough
+    # that it costs no line.
+    overhead = 260
     assert overhead == (
-        len("== src/wide.py lines 1-100 of 100 ==".encode()) + 1
+        len("== src/wide.py lines 100-100 of 100 ==".encode()) + 1
         + len(security_cli._RUN_ALONE.encode()) + 1
         + len("-- next: agentloop security read --path=src/wide.py --from 100".encode()) + 1)
     assert out.stdout.splitlines()[0] == "== src/wide.py lines 1-38 of 100 =="
@@ -465,15 +469,16 @@ def test_security_read_counts_multi_byte_characters_by_their_utf8_bytes(tmp_path
     lines = out.stdout.splitlines()
     # I1: "src/multibyte.py" needs no quoting either, but the header, the
     # piping warning and the `-- next:` footer still count against the
-    # budget now -- overhead = 268 bytes (asserted below), so
-    # budget = 8,000 - 268 = 7,732. Pinned, not just bounded: 9 lines at
+    # budget now -- overhead = 270 bytes (asserted below -- round 3 sizes
+    # both of the header's own numbers off `total`, not off `first`), so
+    # budget = 8,000 - 270 = 7,730. Pinned, not just bounded: 9 lines at
     # "N\t" + 300 + 1 = 303 bytes each (2,727), then 2-digit lines at 304
     # each: 16 more fit (4,864, total 7,591); the 26th would reach
-    # 7,895 > 7,732. Line 1 is the header, line 2 the piping warning
+    # 7,895 > 7,730. Line 1 is the header, line 2 the piping warning
     # (minor 3), so the body starts at 2.
-    overhead = 268
+    overhead = 270
     assert overhead == (
-        len("== src/multibyte.py lines 1-100 of 100 ==".encode()) + 1
+        len("== src/multibyte.py lines 100-100 of 100 ==".encode()) + 1
         + len(security_cli._RUN_ALONE.encode()) + 1
         + len("-- next: agentloop security read --path=src/multibyte.py --from 100".encode()) + 1)
     assert lines[0] == "== src/multibyte.py lines 1-25 of 100 =="
@@ -518,7 +523,7 @@ def test_security_read_a_quote_heavy_path_still_fits_the_whole_call_in_the_budge
     into extra bytes. Three 100-quote directory segments (each well under
     the filesystem's 255-byte-per-component limit; splitting them keeps the
     STRING `shlex.quote` sees, and so the overhead, identical to one run of
-    300) cost 3,251 bytes of overhead -- well under half of READ_BYTES, so
+    300) cost 3,252 bytes of overhead -- well under half of READ_BYTES, so
     this path is served, not refused, but real headroom all the same: with
     35 lines of 199 "y"s, sizing the body off READ_BYTES alone (the old
     arithmetic) would print 8,802 bytes total, past the budget this verb
@@ -545,12 +550,16 @@ def test_security_read_a_quote_heavy_path_still_fits_the_whole_call_in_the_budge
 def test_security_read_refuses_a_path_whose_own_overhead_exceeds_half_the_budget(tmp_path):
     """I1. Four 100-quote directory segments (again, each under the
     filesystem's own 255-byte-per-component limit -- a single 400-byte
-    component does not even exist, `ENAMETOOLONG`) quote to 2,007 bytes, and
-    just the header and the footer alone (each carrying it once) cost 4,250
-    bytes -- more than half of READ_BYTES (4,000) -- leaving no room a chunk
-    could ever fit in. Refused outright, before anything is read from the
-    file: nothing is printed and nothing is recorded, the same as any other
-    slice this verb cannot prove read."""
+    component does not even exist, `ENAMETOOLONG`) quote to 2,010 bytes, and
+    the header and the footer TEXT alone (each carrying it once, before the
+    piping warning or any of the three newlines) already cost 4,090 bytes --
+    more than half of READ_BYTES (4,000) on their own; the full overhead
+    (asserted indirectly below, via the refusal itself) is 4,250. More than
+    half means no chunk of this path, however it is sliced, could ever be
+    shown beside the header and footer that would have to introduce it.
+    Refused outright, before anything is printed from the file: nothing is
+    shown and nothing is recorded, the same as any other slice this verb
+    cannot prove read."""
     db = tmp_path / "security.db"
     name = "/".join(["'" * 100] * 4) + "/x.py"
     aid, root, _ = _deep(db, tmp_path, {name: "x = 1\n"})
@@ -563,6 +572,190 @@ def test_security_read_refuses_a_path_whose_own_overhead_exceeds_half_the_budget
     assert "too long" in out.stderr and "cannot be proven read" in out.stderr
     conn = ledger.connect(db)
     assert ledger.unit_reads(conn, read["id"]) == [], "nothing is recorded"
+
+
+def test_security_read_the_refusal_verdict_does_not_depend_on_from(tmp_path):
+    """I1, round 3, item 1's own requirement in its most direct, natural-
+    usage form: a path at exactly the refusal boundary (overhead ==
+    READ_BYTES // 2, here 4,000, with a 5-digit total) is served from line
+    1, and is ALSO served when re-read at the exact `--from` its own footer
+    prints back -- the verdict is a fact about the path, not about which
+    chunk of it was asked for. `header_upper` is now sized off `total`
+    alone, the same upper bound the footer already used, never off `first`
+    (`args.start`, chosen by THIS call's own caller).
+
+    This SPECIFIC pair of calls does not itself distinguish the fix from
+    the pre-fix formula (checked by reverting it: both calls still pass) --
+    for any `--from` a real footer ever prints, `first <= total`, so the
+    pre-fix header could only ever be SMALLER than this round's, never
+    larger, and so never more eager to refuse a naturally-chained second
+    call than the first. `test_security_read_pins_the_overhead_arithmetic_
+    at_the_refusal_boundary` below is what actually pins the header against
+    a regression back to `first` (using a construction, closer to the
+    reviewer's own probe, where the pre-fix formula UNDERESTIMATES a path
+    whose true overhead sits just over the boundary). This test is kept
+    anyway as the plain statement of the invariant itself."""
+    db = tmp_path / "security.db"
+    total = 12345
+    # Two 200-`'`-and-173-`'` directory segments (each well under the
+    # filesystem's own 255-byte-per-component limit) -- `shlex.quote`'s own
+    # escaping is what turns 373 raw quote characters into the 1,877 bytes
+    # of overhead this boundary needs, without an unwieldy real path.
+    name = "src/" + "'" * 200 + "/" + "'" * 173 + "/x.py"
+    assert _overhead_model(name, total) == security_cli.READ_BYTES // 2
+    body = "".join("x\n" for _ in range(total))
+    aid, root, _ = _deep(db, tmp_path, {name: body})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", name, "--db", str(db)],
+                         capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert out.returncode == 0, out.stderr
+    assert len(out.stdout.encode("utf-8")) <= security_cli.READ_BYTES
+    footer = next(line for line in out.stdout.splitlines() if line.startswith("-- next:"))
+    words = shlex.split(footer[len("-- next: "):])
+    nxt = subprocess.run([sys.executable, str(CLI), *words[2:], "--db", str(db)],
+                         capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert nxt.returncode == 0, nxt.stderr
+    assert len(nxt.stdout.encode("utf-8")) <= security_cli.READ_BYTES
+
+
+def _overhead_model(rel, total):
+    """An independent model of the overhead `read` reserves for the header,
+    the piping warning and the `-- next:` footer -- written from cmd_read's
+    own docstring, not copied from its arithmetic, and used only to CHOOSE
+    the byte-exact inputs these tests construct; the tests' own assertions
+    below check the CLI's real, observed behaviour (its return code, its
+    stderr, the range it actually recorded), never this model's number
+    directly. Sized by `total` alone -- never `first` -- which is the whole
+    point of this round's fix: the same path must get the same overhead,
+    and so the same verdict, whichever `--from` asks for it."""
+    q = len(shlex.quote(rel).encode("utf-8"))
+    d = len(str(total))
+    header = 3 + q + 7 + d + 1 + d + 4 + d + 3   # "== {q} lines {d}-{d} of {d} =="
+    footer = 40 + q + 8 + d                       # "-- next: ... --path={q} --from {d}"
+    run_alone = len(security_cli._RUN_ALONE.encode("utf-8"))
+    return header + 1 + run_alone + 1 + footer + 1
+
+
+def test_security_read_pins_the_overhead_arithmetic_at_the_refusal_boundary(tmp_path):
+    """I1, round 3. Two named mutations this round's review found undetected
+    survive against the OLD suite: `>` loosened to `>=` at the half-budget
+    check, and the threshold itself moved to an unrelated constant. Both
+    would flip the verdict of a path whose overhead sits EXACTLY at
+    READ_BYTES // 2 (served, since the rule is "more than half", not "half
+    or more") from one that sits one byte-pair above it (refused) -- so
+    this pins both sides of that exact boundary. The overhead here can only
+    ever land on an EVEN number (`_overhead_model`'s only two free
+    variables, the quoted path's byte length and the total's digit count,
+    each enter it multiplied by an even factor), so "half + 1" -- an odd
+    target -- is unreachable; the next value the model can reach above the
+    boundary is two bytes over, not one, and that is what "refused" is
+    pinned against here. A 5-digit total also means a REGRESSION back to
+    sizing the header or the footer off `first` (1 digit, this call's
+    default) rather than `total` would swing this specific overhead by
+    several bytes, not one -- enough to flip the "refused" case below back
+    to wrongly served."""
+    db = tmp_path / "security.db"
+    total = 12345
+    served_name = "src/" + "'" * 200 + "/" + "'" * 173 + "/x.py"
+    refused_name = "src/" + "'" * 200 + "/" + "'" * 173 + "/bx.py"
+    assert _overhead_model(served_name, total) == security_cli.READ_BYTES // 2
+    assert _overhead_model(refused_name, total) == security_cli.READ_BYTES // 2 + 2
+    body = "".join("x\n" for _ in range(total))
+    aid, root, _ = _deep(db, tmp_path, {served_name: body, refused_name: body})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    served = subprocess.run([sys.executable, str(CLI), "read", "--path", served_name, "--db", str(db)],
+                            capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert served.returncode == 0, served.stderr
+    assert len(served.stdout.encode("utf-8")) <= security_cli.READ_BYTES
+    refused = subprocess.run([sys.executable, str(CLI), "read", "--path", refused_name, "--db", str(db)],
+                             capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert refused.returncode != 0
+    assert refused.stdout == ""
+    assert "too long" in refused.stderr
+
+
+def test_security_read_a_huge_from_on_a_short_path_is_a_past_end_notice_not_too_long(tmp_path):
+    """I1, round 3. Before this round, `header_upper` sized its leading
+    number off `args.start` directly -- so a `--from` with thousands of
+    digits, however short the actual path and file, inflated the overhead
+    estimate on its own and refused the path as "too long" before the
+    `first > total` branch below ever got to answer with the harmless
+    "nothing at line N" notice it should have. Fixed the same way: the
+    header no longer reads `first` at all, so a hostile `--from` can no
+    longer move the refusal verdict."""
+    db = tmp_path / "security.db"
+    aid, root, _ = _deep(db, tmp_path, {"src/a.py": "a\nb\n"})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--from", "9" * 3900,
+                          "--db", str(db)], capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert out.returncode == 0, out.stderr
+    assert "; nothing at line " in out.stdout
+    assert "too long" not in out.stderr
+    conn = ledger.connect(db)
+    assert ledger.unit_reads(conn, read["id"]) == []
+
+
+def test_security_read_a_line_that_exactly_fills_the_budget_is_served_to_the_last_byte(tmp_path):
+    """I1, round 3. Pins the newlines that the overhead's own three `+ 1`s
+    charge for -- one after the header, one after the piping warning, one
+    after the footer -- against a mutation that drops any of them: with
+    `--from 98` matching `total`'s own digit count (99), the header and
+    footer this call actually prints are exactly as long as the upper
+    bounds `header_upper`/`footer_upper` reserve for them, so the overhead
+    this call pays is not just a bound but the EXACT cost of this call's
+    whole output. Line 98 is sized to cost exactly the resulting budget:
+    served whole, and the WHOLE call's stdout -- header, warning, line,
+    footer, every one of their newlines -- comes to exactly READ_BYTES, not
+    merely under it."""
+    db = tmp_path / "security.db"
+    total = 99
+    lines = ["w"] * total
+    lines[97] = "y" * 7746   # line 98 (index 97): sized below to cost exactly `budget`
+    # `src/b.py` is a plain, small companion file: the inventory's own
+    # `generated` rule leaves out any file with a line over 5,000 bytes
+    # (security/inventory.py), and `src/a.py` alone would then get no read
+    # unit planned for it at all -- `read` itself never consults the
+    # inventory (see its own docstring), so calling it on `src/a.py`
+    # directly still works once SOME file gives this analysis a read unit.
+    aid, root, _ = _deep(db, tmp_path, {"src/a.py": "".join(ln + "\n" for ln in lines), "src/b.py": "x = 1\n"})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--from", "98", "--db", str(db)],
+                         capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines()[0] == "== src/a.py lines 98-98 of 99 =="
+    assert len(out.stdout.encode("utf-8")) == security_cli.READ_BYTES, \
+        "the whole call's stdout, not merely bounded by READ_BYTES, but exactly it"
+    conn = ledger.connect(db)
+    assert ledger.unit_reads(conn, read["id"]) == [("src/a.py", 98, 98)]
+
+
+def test_security_read_a_line_one_byte_over_the_budget_is_shown_but_never_recorded(tmp_path):
+    """I1, round 3. Pins the oversized-single-line gate against a mutation
+    that judges it against READ_BYTES instead of this call's own (smaller)
+    `budget` -- which would reopen I1 by letting a line that does not
+    actually fit beside the header and footer get recorded as read anyway.
+    Line 1's cost here is `budget + 1`: one byte too many for `not out and
+    cost > budget` to serve normally, but nowhere near READ_BYTES itself,
+    so a mutant comparing against READ_BYTES would wrongly accept and
+    record it."""
+    db = tmp_path / "security.db"
+    # `src/b.py` gives this analysis a read unit at all: the inventory's own
+    # `generated` rule leaves out any file with a line over 5,000 bytes, and
+    # `src/a.py` alone would then plan no read unit to serve it through.
+    aid, root, _ = _deep(db, tmp_path, {"src/a.py": "y" * 7752 + "\n", "src/b.py": "x = 1\n"})
+    read = _unit(db, aid, "read")
+    _start(db, read["id"])
+    out = subprocess.run([sys.executable, str(CLI), "read", "--path", "src/a.py", "--db", str(db)],
+                         capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
+    assert out.returncode == 0, out.stderr
+    assert "1\t" + "y" * 7752 in out.stdout
+    assert "cannot be proven read here" in out.stdout
+    conn = ledger.connect(db)
+    assert ledger.unit_reads(conn, read["id"]) == [], "a line wider than budget is never recorded"
 
 
 def test_security_read_refuses_outside_a_unit_and_outside_the_run(tmp_path):
@@ -746,7 +939,7 @@ def test_security_read_quotes_a_path_with_shell_metacharacters_in_the_next_comma
 # Cc at all: U+2028 (Zl) and U+2029 (Zp), which `str.splitlines` treats as a
 # break the same as `\n`.
 CONTROL_CHARS = {"LF": "\n", "VT": "\x0b", "DEL": "\x7f", "ESC": "\x1b",
-                 "NEL": "\u0085", "LS": " ", "PS": " "}
+                 "NEL": "\u0085", "LS": "\u2028", "PS": "\u2029"}
 
 
 @pytest.mark.parametrize("ch", CONTROL_CHARS.values(), ids=CONTROL_CHARS.keys())

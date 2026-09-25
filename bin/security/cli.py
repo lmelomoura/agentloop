@@ -2005,7 +2005,11 @@ def cmd_units(args):
 # Any of these, in a path this verb would otherwise print on a line of its
 # own, could forge a second line of its own output.
 def _carries_a_forbidden_char(rel: str) -> bool:
-    return any(unicodedata.category(ch) == "Cc" or ch in "  " for ch in rel)
+    # Minor 3 (round 3): written as escapes, never the literal characters --
+    # U+2028 and U+2029 are invisible and editors are prone to stripping
+    # them from a file silently, which would turn this check into a
+    # silent no-op.
+    return any(unicodedata.category(ch) == "Cc" or ch in "\u2028\u2029" for ch in rel)
 
 
 def cmd_read(args):
@@ -2058,10 +2062,22 @@ def cmd_read(args):
     `last < total`, so N = last + 1 is bounded by `total` too -- and only
     what is left of READ_BYTES after them and the (fixed-length) piping
     warning is given to the numbered lines. A path whose own overhead already
-    exceeds half of READ_BYTES is refused before anything is read from the
-    file: nothing this verb could ever show of it would leave room for a
-    chunk, so it cannot be proven read through `read` at all, and the close
-    names it owed -- the same debt as a control character or an outside path.
+    exceeds half of READ_BYTES is refused before anything is printed from it
+    -- the file's bytes are already on disk and get opened regardless, but
+    nothing of them is ever shown or recorded: no chunk of this file could
+    ever fit beside the header and footer that would have to introduce it,
+    so it cannot be proven read through `read` at all, and the close names
+    it owed -- the same debt as a control character or an outside path.
+
+    THIS VERDICT IS A FACT ABOUT THE PATH, NOT ABOUT `--from` (round 3). The
+    header and footer above are sized off `total` alone, never off `first`
+    (`args.start`, chosen by this call's own caller) -- so the same path
+    gets the same verdict whichever chunk of it is asked for. Sizing either
+    one off `first` instead let the very same over-long path be served from
+    line 1 and then refused at the `--from` its own footer had just printed
+    back, and let a caller-supplied `--from` with far more digits than the
+    file has lines inflate the header on its own, refusing a short path
+    that was never actually asked to show anything past its own end.
     """
     aid, uid, run_cwd = (_agent_env("SECURITY_ANALYSIS_ID"), _agent_env("SECURITY_UNIT_ID"),
                          _agent_env("RUN_CWD"))
@@ -2115,12 +2131,16 @@ def cmd_read(args):
     total, first = len(lines), max(1, args.start)
 
     # I1: THE WHOLE CALL, not only the numbered lines below, has to fit
-    # inside READ_BYTES -- see the docstring. `last` maxes out at `total` (a
-    # chunk that reaches EOF), in the header as much as in the footer, so
-    # substituting `total` for it here is a true upper bound on either one's
-    # length, never a guess: real `last` only ever has as many digits, or
-    # fewer.
-    header_upper = f"== {quoted} lines {first}-{total} of {total} =="
+    # inside READ_BYTES -- see the docstring. Both `first` and `last` max
+    # out at `total` (a chunk that reaches EOF, or one starting at the last
+    # line), in the header as much as in the footer, so substituting `total`
+    # for either one here is a true upper bound on its length, never a
+    # guess: real `first` and `last` only ever have as many digits, or
+    # fewer -- and, unlike `total`, `first` is `args.start`, a value this
+    # call's OWN caller chose, so sizing the header off it would make the
+    # verdict for a given path depend on which `--from` asked for it,
+    # rather than being a fact about the path alone.
+    header_upper = f"== {quoted} lines {total}-{total} of {total} =="
     footer_upper = f"-- next: agentloop security read --path={quoted} --from {total}"
     overhead = (len(header_upper.encode("utf-8")) + 1
                + len(_RUN_ALONE.encode("utf-8")) + 1
@@ -2148,7 +2168,7 @@ def cmd_read(args):
     # above -- never against READ_BYTES itself: that would leave the body
     # free to spend what the header and the footer already own.
     out, size, last = [], 0, first - 1
-    oversized = None
+    oversized, oversized_cost = None, None
     for number in range(first, total + 1):
         piece = f"{number}\t{lines[number - 1]}"
         cost = len(piece.encode("utf-8")) + 1
@@ -2162,7 +2182,7 @@ def cmd_read(args):
             # there, but never recorded: this chunk cannot show it whole, and
             # what a model on the Codex CLI saw of it is exactly as
             # incomplete -- there is nothing here that proves it was read.
-            oversized, last = piece, number
+            oversized, oversized_cost, last = piece, cost, number
             break
         out.append(piece)
         size += cost
@@ -2170,7 +2190,11 @@ def cmd_read(args):
     print(f"== {quoted} lines {first}-{last} of {total} ==")
     if oversized is not None:
         print(oversized)
-        print(f"-- line {last} is {len(oversized.encode('utf-8'))} bytes, wider than one chunk "
+        # Minor 7: the same measure on both sides -- `oversized_cost` is what
+        # the check above actually compared to `budget` (the line's UTF-8
+        # bytes PLUS its trailing newline, the same "N\tTEXT\n" cost every
+        # other line in this call is charged), not the bare text alone.
+        print(f"-- line {last} is {oversized_cost} bytes, wider than one chunk "
               f"({budget} bytes) can show -- it cannot be proven read here")
     else:
         print(_RUN_ALONE)

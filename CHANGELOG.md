@@ -42,12 +42,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   chunk is shown but never recorded: `read` never records more than the
   chunk it actually showed. The repository being analysed is not trusted
   input: `read` quotes every path it prints (`--path=<path>`, so a name
-  starting with `-` still parses), its byte budget bounds everything a
-  call prints — the header and the `-- next:` footer included, not only
-  the numbered lines — refusing outright a path whose own overhead would
-  leave no room for a chunk, and refuses a name carrying a control
-  character (any Unicode Cc, or the U+2028/U+2029 line separators) rather
-  than risk it forging a fake line of the verb's own output.
+  starting with `-` still parses), its byte budget bounds an ordinary
+  chunk's whole call — the header and the `-- next:` footer included, not
+  only the numbered lines (a line too wide for the budget is still shown,
+  on its own, so a reader is not left guessing what is there, but that
+  notice is never counted as read) — refusing outright a path whose own
+  overhead already exceeds half the budget, since no chunk of it could
+  ever fit alongside the header and footer that would have to introduce
+  it, and refuses a name carrying a control character (any Unicode Cc, or
+  the U+2028/U+2029 line separators) rather than risk it forging a fake
+  line of the verb's own output.
 
 - **Each unit of an analysis is given one job, and told how it is checked.**
   The CLI mints the prompt of every unit from the ledger: a triage unit's
