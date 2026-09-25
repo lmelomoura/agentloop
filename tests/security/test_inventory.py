@@ -61,6 +61,75 @@ def test_each_rule_leaves_its_file_out_under_its_own_name(tmp_path, rel, data, r
     assert scope["excluded"][reason] == {"count": 1, "examples": [rel]}
 
 
+def test_a_gitlink_is_left_out_as_a_submodule(tmp_path):
+    root = _repo(tmp_path, {"src/keep.py": "k\n"})
+    sha = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True,
+                         text=True, check=True).stdout.strip()
+    subprocess.run(["git", "-C", str(root), "update-index", "--add", "--cacheinfo",
+                    f"160000,{sha},lib/other"], check=True, env=GIT_ENV)
+    scope = inventory.build(root)
+    assert _paths(scope) == ["src/keep.py"]
+    assert scope["excluded"]["submodule"] == {"count": 1, "examples": ["lib/other"]}
+
+
+def test_a_tracked_file_the_checkout_cannot_read_is_left_out_as_unreadable(tmp_path):
+    root = _repo(tmp_path, {"src/locked.py": "x\n", "src/keep.py": "k\n"})
+    locked = root / "src" / "locked.py"
+    locked.chmod(0)
+    try:
+        if os.access(locked, os.R_OK):
+            pytest.skip("this user reads a mode-000 file (root)")
+        scope = inventory.build(root)
+    finally:
+        locked.chmod(0o644)
+    assert _paths(scope) == ["src/keep.py"]
+    assert scope["excluded"]["unreadable"] == {"count": 1, "examples": ["src/locked.py"]}
+
+
+def test_the_long_line_limit_is_the_read_tools_in_characters_not_bytes(tmp_path):
+    """Claude Code's Read and OpenCode's read cut a line past 2,000
+    CHARACTERS and still count it: 2,001 of them make a file `generated`;
+    1,500 two-byte characters (3,000 bytes) do not."""
+    short = "k\n" * 20
+    root = _repo(tmp_path, {"src/wide.js": short + "x" * 2001 + "\n",
+                            "src/accents.py": short + "é" * 1500 + "\n",
+                            "src/edge.py": short + "x" * 2000 + "\n"})
+    scope = inventory.build(root)
+    assert _paths(scope) == ["src/accents.py", "src/edge.py"]
+    assert scope["excluded"]["generated"]["examples"] == ["src/wide.js"]
+    assert all("wide" not in f for f in scope["files"])
+
+
+def test_under_defaults_off_a_wide_line_stays_in_scope_and_is_named(tmp_path):
+    root = _repo(tmp_path, {"src/wide.js": "a\n" + "y" * 2500 + "\nb\n" + "z" * 2001 + "\n"})
+    (wide,) = inventory.build(root, ["!defaults"])["files"]
+    assert (wide["path"], wide["wide"]) == ("src/wide.js", [2, 4])
+
+
+def test_a_path_no_unit_can_be_shown_is_left_out_by_name(tmp_path):
+    """A control character (or U+2028) in a name would forge lines in any
+    prompt or `security read` header it is printed on, and a path whose
+    quoting outgrows half of `read`'s budget can never be shown with a
+    chunk: neither can ever be proven read, so neither is owed for ever --
+    each is left out under `unprintable-path`, its example escaped."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "keep.py").write_text("k\n")
+    (tmp_path / "src" / "a\nb.py").write_text("x\n")
+    (tmp_path / "src" / "c d.py").write_text("x\n")
+    deep = tmp_path / "q"
+    for _ in range(3):
+        deep = deep / ("'" * 200)
+    deep.mkdir(parents=True)
+    (deep / "e.py").write_text("x\n")
+    scope = inventory.build(tmp_path)
+    assert _paths(scope) == ["src/keep.py"]
+    slot = scope["excluded"]["unprintable-path"]
+    assert slot["count"] == 3
+    assert "src/a\\nb.py" in slot["examples"] and "src/c\\u2028d.py" in slot["examples"]
+    assert all("\n" not in e and " " not in e for e in slot["examples"])
+    assert "no unit can be shown" in inventory.summary(scope)
+
+
 def test_ignore_paths_leave_a_file_out_as_ignored(tmp_path):
     root = _repo(tmp_path, {"legacy/old.py": "x\n", "src/keep.py": "k\n"})
     scope = inventory.build(root, ["legacy/**"])

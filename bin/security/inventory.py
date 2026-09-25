@@ -22,14 +22,29 @@ the count into the coverage note:
   lockfile         the dependency phase's own input
   unreadable       tracked, but the checkout cannot read it
   binary           a NUL byte, or not UTF-8
-  generated        *.min.js/.min.mjs/.min.css/.map, a line over 5,000 bytes,
-                   or more than 300 bytes per line on average
+  generated        *.min.js/.min.mjs/.min.css/.map, a line over 2,000
+                   characters, or more than 300 bytes per line on average
   prose            .md, .markdown, .rst, .adoc, .txt
+  unprintable-path a path no unit can be shown: a control character (any
+                   Unicode Cc, C1 and NEL included) or U+2028/U+2029, or so
+                   long that no `security read` chunk fits beside it
 
-`!defaults` (ignores.DEFAULTS_OFF) switches `generated` and `prose` off, on
-top of the noise filter it already switched off. The others always apply: a
-dependency tree is code nobody here wrote, a lockfile has its own phase, and
-a binary has no lines to read.
+THE LONG-LINE LIMIT IS THE READ TOOLS', IN CHARACTERS. Claude Code's Read and
+OpenCode's read both cut a line past 2,000 characters, yet count it in the
+lines they report -- so a file with such a line could be "proven" read by a
+reader that saw only its head. With the default rules that file is
+`generated` and out of scope.
+
+WHY `!defaults` RECORDS THE WIDE LINES INSTEAD. `!defaults`
+(ignores.DEFAULTS_OFF) switches `generated` and `prose` off, on top of the
+noise filter it already switched off, so a file with a line wider than a
+Read tool shows is in scope. Its entry then carries `wide`, the numbers of
+those lines, and the judge never counts a Read result as a reading of them
+(security/units.py `close`): they are proven read only through `security
+read`, which shows a line whole or not at all. The other rules always apply:
+a dependency tree is code nobody here wrote, a lockfile has its own phase, a
+binary has no lines to read, and a path no unit can be shown can never be
+proven read -- left out under its own name rather than owed for ever.
 
 LINES ARE COUNTED THE WAY A READER COUNTS THEM: the number of `\\n`, plus one
 when the last byte is not one. Only `\\n` splits a line -- not `\\r`, form
@@ -41,7 +56,7 @@ tool and `sed -n` both number lines that way, and the proof of reading
 import subprocess
 from pathlib import Path
 
-from . import deps, ignores
+from . import deps, evidence, ignores
 
 # The size of one reading. A file up to this many bytes is one range; a
 # larger one is cut into consecutive line ranges of at most this many bytes,
@@ -58,11 +73,13 @@ LOCKFILES = deps.LOCKFILE_NAMES | frozenset({
     "Cargo.lock", "Pipfile.lock", "packages.lock.json", "mix.lock",
     "pubspec.lock", "gradle.lockfile", "bun.lockb"})
 GENERATED_SUFFIXES = (".min.js", ".min.mjs", ".min.css", ".map")
-LONGEST_LINE = 5_000
+# In CHARACTERS: the widest line the Read tools show whole
+# (evidence.READ_TOOL_LINE_CHARS).
+LONGEST_LINE = evidence.READ_TOOL_LINE_CHARS
 AVERAGE_LINE = 300
 PROSE_SUFFIXES = (".md", ".markdown", ".rst", ".adoc", ".txt")
 REASONS = ("ignored", "symlink", "submodule", "dependency-tree", "lockfile",
-           "unreadable", "binary", "generated", "prose")
+           "unreadable", "binary", "generated", "prose", "unprintable-path")
 EXAMPLES = 3
 
 _LABELS = {
@@ -75,6 +92,7 @@ _LABELS = {
     "binary": "binary or non-UTF-8 files",
     "generated": "generated or minified files",
     "prose": "prose documents",
+    "unprintable-path": "files whose path no unit can be shown (a control character, or too long)",
 }
 _MODE_SYMLINK = "120000"
 _MODE_GITLINK = "160000"
@@ -114,13 +132,19 @@ def line_ranges(data: bytes, budget: int) -> list:
     return ranges
 
 
+def wide_lines(data: bytes) -> list:
+    """The numbers of the lines wider than LONGEST_LINE, in CHARACTERS of
+    the UTF-8 text (a Read tool cuts by characters, not bytes)."""
+    return [n for n, chunk in enumerate(_lines(data), 1)
+            if len(chunk.rstrip(b"\r\n").decode("utf-8", "replace")) > LONGEST_LINE]
+
+
 def _generated(name: str, data: bytes, lines: int) -> bool:
     if name.endswith(GENERATED_SUFFIXES):
         return True
     if not lines:
         return False
-    longest = max(len(chunk.rstrip(b"\r\n")) for chunk in _lines(data))
-    return longest > LONGEST_LINE or len(data) / lines > AVERAGE_LINE
+    return bool(wide_lines(data)) or len(data) / lines > AVERAGE_LINE
 
 
 def _tracked(root: Path):
@@ -185,6 +209,8 @@ def _classify(root: Path, mode: str, rel: str, patterns, defaults: bool):
         return "generated", None
     if defaults and name.lower().endswith(PROSE_SUFFIXES):
         return "prose", None
+    if evidence.unprintable(rel) or evidence.too_long_to_read(rel, count_lines(data)):
+        return "unprintable-path", None
     return None, data
 
 
@@ -208,11 +234,18 @@ def build(root, patterns=()) -> dict:
             slot = excluded[reason]
             slot["count"] += 1
             if len(slot["examples"]) < EXAMPLES:
-                slot["examples"].append(rel)
+                # Escaped for this one reason: the example travels into the
+                # coverage note, which must not print the very characters
+                # that left the file out.
+                slot["examples"].append(ascii(rel)[1:-1] if reason == "unprintable-path" else rel)
             continue
         lines = count_lines(data)
-        files.append({"path": rel, "lines": lines, "bytes": len(data),
-                      "ranges": line_ranges(data, RANGE_BYTES) if lines else []})
+        entry = {"path": rel, "lines": lines, "bytes": len(data),
+                 "ranges": line_ranges(data, RANGE_BYTES) if lines else []}
+        wide = wide_lines(data) if lines else []
+        if wide:
+            entry["wide"] = wide
+        files.append(entry)
     return {"files": files, "excluded": excluded, "git": in_git,
             "totals": {"files": len(files),
                        "lines": sum(f["lines"] for f in files),

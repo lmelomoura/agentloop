@@ -718,6 +718,16 @@ def guides_read(conn, analysis_id) -> list:
     return [name for name in guide_table.NAMES if name in opened]
 
 
+def _wide_lines(conn, analysis_id) -> dict:
+    """{path: [line, ...]}: the lines of the deep scope wider than a Read
+    tool shows whole (security/inventory.py records them as `wide`)."""
+    files = ledger.inventory_of(conn, analysis_id).get("files")
+    if not isinstance(files, list):
+        return {}
+    return {f["path"]: f["wide"] for f in files
+            if isinstance(f, dict) and isinstance(f.get("wide"), list) and f["wide"]}
+
+
 def close(conn, unit, *, stream="", root="", status="error", reason="", spend_usd=0.0,
           cause="") -> dict:
     """Judge one run of `unit` by what it left -- its stream, what `security
@@ -768,6 +778,12 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
                         spend_usd=spend_usd, stopped=status == "stopped" or outage,
                         clear_verdict=clear)
     session = evidence.read_session(stream or None, root or ".")
+    # A LINE THE READ TOOL CUT IS NOT READ BY IT (I5). The inventory records,
+    # per file, the lines wider than a Read tool shows whole (only under
+    # `!defaults`: by default such a file is `generated` and out of scope);
+    # they come out of what the STREAM proves, before `security read`'s own
+    # record -- which shows a line whole or not at all -- is joined in.
+    session = evidence.without_lines(session, _wide_lines(conn, unit["analysis_id"]))
     # ONLY THIS RUN'S OWN READS (minor 1). A unit `reset_unit` sends back to
     # `pending` after its run died keeps its id and its `started`, so a
     # chunk `security read` recorded for that dead run is still on

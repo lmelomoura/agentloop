@@ -1023,3 +1023,54 @@ def test_a_close_cut_short_inside_its_settle_takes_the_clear_back_with_it(conn, 
     cont = ledger.get_unit(conn, out["continuation"])
     assert ledger.record_verdict(conn, aid, "a" * 64, "confirmed", "read it", by=f"unit:{cont['id']}")
     assert units.judge(conn, cont, _session(), "success")[0] is True
+
+
+def _read_tool_stream(tmp_path, path, first, count):
+    """A Read tool result proving lines first..first+count-1 of `path`."""
+    import json
+    events = [{"type": "system", "subtype": "init", "cwd": str(tmp_path)},
+              {"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+                  {"type": "tool_use", "id": "t1", "name": "Read",
+                   "input": {"file_path": str(tmp_path / path)}}]}},
+              {"type": "user", "parent_tool_use_id": None,
+               "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": ""}]},
+               "tool_use_result": {"type": "text", "file": {"filePath": str(tmp_path / path),
+                                                            "startLine": first, "numLines": count,
+                                                            "totalLines": first + count - 1}}}]
+    stream = tmp_path / "read.stream.ndjson"
+    stream.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return str(stream)
+
+
+def test_a_line_the_read_tool_cuts_is_not_proven_read_by_its_result(conn, tmp_path):
+    """I5. A Read result counts a line past 2,000 characters among its
+    `numLines` while showing only its head. Under `!defaults` the inventory
+    names such lines (`wide`), and a Read result never proves them: only
+    `security read`, which shows a line whole or not at all, does."""
+    aid = _analysis(conn)
+    entry = _file("a.py", (1, 3, 5000))
+    entry["wide"] = [2]
+    _inventory(conn, aid, [entry])
+    uid = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 1, "last": 3,
+                                                          "bytes": 5000}]})
+    ledger.start_unit(conn, uid)
+    stream = _read_tool_stream(tmp_path, "a.py", 1, 3)
+    out = units.close(conn, ledger.get_unit(conn, uid), stream=stream, root=str(tmp_path),
+                      status="success")
+    assert out["state"] == "incomplete"
+    assert ledger.get_unit(conn, uid)["evidence"]["covered"] == {"a.py": [[1, 1], [3, 3]]}
+    cont = ledger.get_unit(conn, out["continuation"])
+    assert cont["payload"]["ranges"] == [{"path": "a.py", "first": 2, "last": 2, "bytes": 0}]
+    # The continuation reads the wide line through `security read`: proven.
+    ledger.start_unit(conn, cont["id"])
+    ledger.record_unit_read(conn, cont["id"], "a.py", 2, 2)
+    again = units.close(conn, ledger.get_unit(conn, cont["id"]), stream=stream, root=str(tmp_path),
+                        status="success")
+    assert again == {"state": "done", "continuation": None}
+
+
+def test_without_lines_cuts_named_lines_out_of_every_span():
+    session = evidence.Session(reads={"a.py": [(1, 10)], "b.py": [(1, 2)]})
+    out = evidence.without_lines(session, {"a.py": [1, 5, 10, 99]})
+    assert out.reads == {"a.py": [(2, 4), (6, 9)], "b.py": [(1, 2)]}
+    assert evidence.without_lines(session, {}) is session

@@ -128,13 +128,19 @@ exemplos**. As linhas de um ficheiro são o número de `\n`, mais uma se o
    cobre-os);
 4. binários e texto que não é UTF-8 (um NUL, ou falha a descodificar);
 5. **gerados ou minificados:** nomes `*.min.js`, `*.min.mjs`, `*.min.css`,
-   `*.map`, **ou** uma linha com mais de 5 000 caracteres, **ou** um
-   comprimento médio de linha acima de 300 caracteres;
+   `*.map`, **ou** uma linha com mais de 2 000 caracteres (o limite a partir
+   do qual o Read do Claude Code e o read do OpenCode cortam a linha, embora a
+   contem como lida), **ou** um comprimento médio de linha acima de 300 bytes;
 6. prosa: `.md`, `.markdown`, `.rst`, `.adoc`, `.txt` (excepto ficheiros que o
-   inventário de dependências lê).
+   inventário de dependências lê);
+7. caminhos que nenhuma unidade pode ver (`unprintable-path`): um carácter de
+   controlo (Cc, incluindo C1, ou U+2028/U+2029) ou um caminho tão longo que
+   nenhum bloco do `security read` cabe ao lado dele.
 
 `!defaults` desliga as regras 5 e 6, além do filtro de ruído que já
-desliga. As regras 2, 3 e 4 ficam sempre: uma árvore de dependências é código
+desliga. Nesse caso o inventário grava, por ficheiro, as linhas com mais de
+2 000 caracteres (`wide`), e o juiz nunca aceita um resultado do Read como
+prova de leitura dessas linhas: só o `security read` as prova. As regras 2, 3 e 4 ficam sempre: uma árvore de dependências é código
 que ninguém aqui escreveu, um lockfile já tem a sua fase, e um binário não se
 lê linha a linha. O inventário é gravado em
 `analysis.scope` e resumido na linha `scope` da tabela de cobertura: ficheiros

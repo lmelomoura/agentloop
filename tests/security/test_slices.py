@@ -42,5 +42,18 @@ def test_every_entry_carries_its_bytes_and_no_slice_exceeds_the_budget():
     assert sum(len(s) for s in out) == 10
 
 
+def test_a_slice_reaching_exactly_the_budget_is_full_and_the_next_range_starts_a_new_one():
+    files = [_file("a.py", (1, 5, 60)), _file("b.py", (1, 3, 40)), _file("c.py", (1, 1, 1))]
+    out = slices.pack(files, budget=100)
+    assert _shape(out) == [[("a.py", 1, 5), ("b.py", 1, 3)], [("c.py", 1, 1)]]
+    assert sum(e["bytes"] for e in out[0]) == 100
+
+
+def test_two_small_ranges_of_one_file_share_a_slice():
+    files = [_file("cut.py", (1, 10, 30), (11, 20, 30)), _file("next.py", (1, 2, 50))]
+    assert _shape(slices.pack(files, budget=100)) == [
+        [("cut.py", 1, 10), ("cut.py", 11, 20)], [("next.py", 1, 2)]]
+
+
 def test_the_default_budget_is_one_reading():
     assert slices.SLICE_BYTES == 300_000

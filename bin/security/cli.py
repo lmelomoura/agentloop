@@ -38,7 +38,6 @@ import shlex
 import sqlite3
 import sys
 import time
-import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -1850,19 +1849,20 @@ def _session_unit() -> int:
     return int(value) if value.isdigit() else 0
 
 
-READ_LINES = 200
-READ_BYTES = 8000
+READ_LINES = evidence.READ_LINES
+READ_BYTES = evidence.READ_BYTES
 
 # Minor 3 (of the first fix; unchanged since): piping a chunk (`| head`),
 # filtering it, or chaining a second read in the same call records a chunk
 # the model never saw whole, and `read` has no way to detect any of that from
 # here. Printed as the second line of every ordinary chunk (never the
-# oversized-single-line one, which explains itself) -- a MODULE CONSTANT, not
-# a literal at each print site, because I1 (below) also has to count its
-# exact bytes into the budget's own overhead, and a second copy is a second
-# copy that can drift from what is actually printed.
-_RUN_ALONE = ("-- run this command alone: piped into another command, filtered, or chained with "
-             "a second read in the same call, this chunk is still recorded as read in full")
+# oversized-single-line one, which explains itself) -- ONE constant, not a
+# literal at each print site, because I1 (below) also has to count its exact
+# bytes into the budget's own overhead, and a second copy is a second copy
+# that can drift from what is actually printed. It lives in evidence.py,
+# beside the overhead rule, because the inventory asks that rule of every
+# path before any unit is planned (`unprintable-path`).
+_RUN_ALONE = evidence.RUN_ALONE
 
 
 def _unit_of(conn, analysis_id, unit_id):
@@ -2016,13 +2016,11 @@ def cmd_units(args):
 # the line and paragraph separators that are not Cc at all (they are Zl/Zp)
 # but that `str.splitlines` still treats as a line break, the same as `\n`.
 # Any of these, in a path this verb would otherwise print on a line of its
-# own, could forge a second line of its own output.
+# own, could forge a second line of its own output. The rule is
+# evidence.unprintable, which the inventory applies to every path too
+# (`unprintable-path`): a file this verb must refuse is never planned.
 def _carries_a_forbidden_char(rel: str) -> bool:
-    # Minor 3 (round 3): written as escapes, never the literal characters --
-    # U+2028 and U+2029 are invisible and editors are prone to stripping
-    # them from a file silently, which would turn this check into a
-    # silent no-op.
-    return any(unicodedata.category(ch) == "Cc" or ch in "\u2028\u2029" for ch in rel)
+    return evidence.unprintable(rel)
 
 
 def cmd_read(args):
@@ -2152,12 +2150,10 @@ def cmd_read(args):
     # fewer -- and, unlike `total`, `first` is `args.start`, a value this
     # call's OWN caller chose, so sizing the header off it would make the
     # verdict for a given path depend on which `--from` asked for it,
-    # rather than being a fact about the path alone.
-    header_upper = f"== {quoted} lines {total}-{total} of {total} =="
-    footer_upper = f"-- next: agentloop security read --path={quoted} --from {total}"
-    overhead = (len(header_upper.encode("utf-8")) + 1
-               + len(_RUN_ALONE.encode("utf-8")) + 1
-               + len(footer_upper.encode("utf-8")) + 1)
+    # rather than being a fact about the path alone. The same computation the
+    # inventory runs on every path (evidence.read_overhead), so a file this
+    # refuses is left out of the deep scope by name (`unprintable-path`).
+    overhead = evidence.read_overhead(rel, total)
     if overhead > READ_BYTES // 2:
         # Refused before the "nothing at line N" branch below too: this is a
         # judgment about the PATH, not about where `--from` landed in it --
@@ -2190,8 +2186,8 @@ def cmd_read(args):
         if not out and cost > budget:
             # A single line wider than the whole budget -- only possible
             # under `!defaults`, since the default inventory already leaves
-            # out any file with a line over 5,000 bytes (security/inventory.py
-            # `generated`). Shown so a reader is not left guessing what is
+            # out any file with a line over 2,000 characters
+            # (security/inventory.py `generated`). Shown so a reader is not left guessing what is
             # there, but never recorded: this chunk cannot show it whole, and
             # what a model on the Codex CLI saw of it is exactly as
             # incomplete -- there is nothing here that proves it was read.

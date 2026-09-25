@@ -15,16 +15,36 @@ finding, and a fresh reader that reads it stops being fresh. This is the
 decision that makes the verification independent rather than a second
 opinion, and `tests/security/test_prompts.py` pins it.
 """
+import shlex
 from pathlib import Path
 
+from . import evidence
+
 VERDICT_WORDS = ("confirmed", "needs_validation", "rejected")
+PLATFORMS = ("anthropic", "openai", "opencode")
+
+
+def _shown(path) -> str:
+    """A path as a prompt shows it. THE REPOSITORY IS NOT TRUSTED INPUT: git
+    allows a newline, a space or `$( )` in a file name, and a name printed
+    raw on a prompt line could start a line of its own in the engine's
+    voice. A character no line can carry is escaped (`\\n`, `\\u2028`) --
+    the inventory leaves such a file out of every read unit anyway
+    (`unprintable-path`), so this is only a location recorded elsewhere --
+    and the result is quoted as one shell word (`shlex.quote`) whenever it
+    is not one already, which is exactly the form `security read --path=`
+    takes."""
+    text = str(path or "")
+    if evidence.unprintable(text):
+        text = text.encode("unicode_escape").decode("ascii")
+    return shlex.quote(text)
 
 
 def _chain(candidate) -> list:
     steps = (candidate or {}).get("trace") or []
     if not steps:
         return ["  (no trace was recorded on this finding — read the locations below)"]
-    return [f"  {i + 1}. {s['kind']} · {s['file']}:{s['line']} · {s['scope']}"
+    return [f"  {i + 1}. {s['kind']} · {_shown(s['file'])}:{s['line']} · {s['scope']}"
             f" — {s['description']}" for i, s in enumerate(steps)]
 
 
@@ -39,9 +59,7 @@ def verifier_prompt(analysis_id, finding) -> str:
     """The whole prompt for one finding. `finding` is a row as
     `queries.verify_queue` returns it (candidate decoded, or None)."""
     c = finding.get("candidate") or {}
-    where = ", ".join(
-        f"{o['file']}:{o['line']}" if o.get("line") else o["file"]
-        for o in finding.get("occurrences", [])) or "(no location recorded)"
+    where = ", ".join(_where(o) for o in finding.get("occurrences", [])) or "(no location recorded)"
     conditions = [f"  {x['kind']}: {x['description']}"
                   for x in (c.get("conditions") or [])]
     lines = [
@@ -154,7 +172,9 @@ def _guides_line(names):
 
 
 def _where(row):
-    return f"{row['file']}:{row['line']}" if row.get("line") else (row.get("file") or "(no file)")
+    if not row.get("file"):
+        return "(no file)"
+    return f"{_shown(row.get('file'))}:{row.get('line')}" if row.get("line") else _shown(row.get("file"))
 
 
 def _header(analysis, label, platform, kind):
@@ -270,7 +290,7 @@ def _read(platform, context):
         "analysis's cost.",
         "",
         f"RANGES ({len(ranges)} range{'s' if len(ranges) != 1 else ''}, {total:,} bytes)",
-        *[f"  {r['path']}:{r['first']}-{r['last']}" for r in ranges],
+        *[f"  {_shown(r['path'])}:{r['first']}-{r['last']}" for r in ranges],
     ]
     known = context.get("known") or []
     if known:
@@ -290,7 +310,12 @@ def _read(platform, context):
 
 def unit_prompt(analysis, label, platform, kind, context) -> str:
     """The whole prompt of one unit. The run-ending contract is appended by
-    the engine (`run_ending_contract` in bin/agentloop), as for every run."""
+    the engine (`run_ending_contract` in bin/agentloop), as for every run.
+
+    A platform outside PLATFORMS is refused, never guessed at: the header
+    would name one subagent tool and the reading rule another."""
+    if platform not in PLATFORMS:
+        raise ValueError(f"no prompt for platform {platform!r}")
     lines = _header(analysis, label, platform, kind)
     if kind == "triage":
         lines += _triage(context)

@@ -196,9 +196,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   its lines and bytes — a file over 300 KB as consecutive line ranges — and
   counts every file it leaves out under the rule that left it out
   (ignored, symlink, submodule, dependency tree, lockfile, unreadable,
-  binary, generated, prose), with examples. `deep` promised "all versioned
-  code" in prose only, and the agent that had to keep the promise was the
-  one deciding when it had.
+  binary, generated, prose, unprintable path), with examples. `deep`
+  promised "all versioned code" in prose only, and the agent that had to
+  keep the promise was the one deciding when it had. A line counts as too
+  long for `generated` past 2,000 characters — where the Read tools of
+  Claude Code and OpenCode cut a line while still counting it as shown —
+  and under `!defaults` such lines stay in scope, named per file, and only
+  `security read` can prove them read, never a Read tool's result. A file
+  whose path no unit could be shown (a control character, a line separator,
+  or a name too long for any `read` chunk) is left out under its own name
+  instead of owed for ever, and every path a unit's prompt prints is quoted,
+  with any character that could break a line escaped.
 
 - **The security ledger records an analysis's work units.** A new `unit`
   table holds every session the engine runs for an analysis — its kind

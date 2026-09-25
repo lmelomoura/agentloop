@@ -30,10 +30,58 @@ and a unit on any platform may use either.
 import json
 import os
 import re
+import shlex
+import unicodedata
 from dataclasses import dataclass, field
 
 _GUIDE = re.compile(r"security-analysis/references/([A-Z][A-Z-]*)\.md")
 _NUMBERED = re.compile(r"^\s*(\d+)(?:\t|: )", re.MULTILINE)
+
+# ---- what a unit can be shown, and so proven to have read -------------------
+#
+# The budget of one `security read` call (cli.cmd_read), in UTF-8 bytes of
+# everything it prints. Here, not in the CLI, because the inventory asks the
+# same questions of a path before any unit is planned over it (a path no
+# unit can be shown can never be proven read, and is left out by name).
+READ_BYTES = 8000
+READ_LINES = 200
+# Printed as the second line of every ordinary chunk; its bytes are part of
+# the call's overhead (read_overhead).
+RUN_ALONE = ("-- run this command alone: piped into another command, filtered, or chained with "
+             "a second read in the same call, this chunk is still recorded as read in full")
+# The widest line the READ TOOLS show whole: Claude Code's Read and
+# OpenCode's read both cut a line past 2,000 characters, while the result's
+# line count (and each numbered prefix) still counts it -- a numLines that
+# covers a line the model saw only the head of. A line wider than this is
+# proven read only through `security read`, never through a Read result.
+READ_TOOL_LINE_CHARS = 2000
+
+
+def unprintable(rel) -> bool:
+    """Whether `rel` carries a character no line of output can show safely:
+    any Unicode Cc (C0, DEL and the C1 controls, U+0085 NEL among them) or
+    the U+2028/U+2029 separators, which `str.splitlines` breaks on. Printed
+    on a line of its own -- a `security read` header, a unit's prompt -- such
+    a name forges lines in the engine's voice. Written as escapes: an editor
+    strips the invisible literals silently."""
+    return any(unicodedata.category(ch) == "Cc" or ch in "  " for ch in str(rel))
+
+
+def read_overhead(rel, total) -> int:
+    """The bytes of a `security read` call that are not the file's lines:
+    the header, the piping warning and the `-- next:` footer, each sized for
+    the largest it could be for a file of `total` lines (cli.cmd_read)."""
+    quoted = shlex.quote(rel)
+    header = f"== {quoted} lines {total}-{total} of {total} =="
+    footer = f"-- next: agentloop security read --path={quoted} --from {total}"
+    return (len(header.encode("utf-8")) + 1 + len(RUN_ALONE.encode("utf-8")) + 1
+            + len(footer.encode("utf-8")) + 1)
+
+
+def too_long_to_read(rel, total) -> bool:
+    """A path whose own overhead exceeds half the budget: no chunk of it
+    could ever fit beside the header and footer that introduce it."""
+    return read_overhead(rel, total) > READ_BYTES // 2
 
 
 @dataclass(frozen=True)
@@ -170,6 +218,38 @@ def read_session(stream_path, root) -> Session:
             return parse(handle, root)
     except OSError:
         return EMPTY
+
+
+def without_lines(session, wide) -> Session:
+    """`session` with the lines `wide` names ({path: [line, ...]}) cut out of
+    every span it proves read. Applied to what the STREAM proves (a Read
+    tool's results), before `with_served` joins what `security read`
+    served: a line wider than READ_TOOL_LINE_CHARS was cut by the tool, and
+    its numbered prefix or its place in `numLines` is not a reading of it.
+    `security read` shows such a line whole (or refuses it), so its record
+    stands."""
+    if not wide:
+        return session
+    reads = {}
+    for path, spans in session.reads.items():
+        cut = sorted({int(n) for n in wide.get(path) or []})
+        if not cut:
+            reads[path] = list(spans)
+            continue
+        kept = []
+        for first, last in spans:
+            cursor = first
+            for n in cut:
+                if n < cursor or n > last:
+                    continue
+                if n > cursor:
+                    kept.append((cursor, n - 1))
+                cursor = n + 1
+            if cursor <= last:
+                kept.append((cursor, last))
+        if kept:
+            reads[path] = merge_spans(kept)
+    return Session(reads=reads, tasks=session.tasks, guides=set(session.guides))
 
 
 def with_served(session, served) -> Session:

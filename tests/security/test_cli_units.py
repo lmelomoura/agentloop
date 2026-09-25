@@ -10,7 +10,7 @@ import pytest
 from test_cli import CLI, fails, open_analysis, raw, run  # noqa: F401 -- the suite's own helpers
 
 from security import cli as security_cli
-from security import ledger
+from security import evidence, ledger
 from security import units as security_units
 
 GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
@@ -498,7 +498,7 @@ def test_security_read_counts_multi_byte_characters_by_their_utf8_bytes(tmp_path
 
 def test_security_read_shows_a_line_wider_than_the_budget_but_never_records_it(tmp_path):
     """Only possible under `!defaults` in a real analysis -- the default
-    inventory already leaves out any file with a line over 5,000 bytes
+    inventory already leaves out any file with a line over 2,000 characters
     (security/inventory.py's `generated` rule) -- but `read` itself never
     consults the inventory, so the file need only exist on disk for this."""
     db = tmp_path / "security.db"
@@ -562,7 +562,10 @@ def test_security_read_refuses_a_path_whose_own_overhead_exceeds_half_the_budget
     cannot prove read."""
     db = tmp_path / "security.db"
     name = "/".join(["'" * 100] * 4) + "/x.py"
-    aid, root, _ = _deep(db, tmp_path, {name: "x = 1\n"})
+    # `src/b.py` gives the analysis its read unit: the inventory leaves the
+    # quote-heavy path out itself (`unprintable-path`, the same overhead
+    # rule), and `read` never consults the inventory.
+    aid, root, _ = _deep(db, tmp_path, {name: "x = 1\n", "src/b.py": "x = 1\n"})
     read = _unit(db, aid, "read")
     _start(db, read["id"])
     out = subprocess.run([sys.executable, str(CLI), "read", "--path", name, "--db", str(db)],
@@ -715,7 +718,7 @@ def test_security_read_a_line_that_exactly_fills_the_budget_is_served_to_the_las
     lines = ["w"] * total
     lines[97] = "y" * 7746   # line 98 (index 97): sized below to cost exactly `budget`
     # `src/b.py` is a plain, small companion file: the inventory's own
-    # `generated` rule leaves out any file with a line over 5,000 bytes
+    # `generated` rule leaves out any file with a line over 2,000 characters
     # (security/inventory.py), and `src/a.py` alone would then get no read
     # unit planned for it at all -- `read` itself never consults the
     # inventory (see its own docstring), so calling it on `src/a.py`
@@ -744,7 +747,7 @@ def test_security_read_a_line_one_byte_over_the_budget_is_shown_but_never_record
     record it."""
     db = tmp_path / "security.db"
     # `src/b.py` gives this analysis a read unit at all: the inventory's own
-    # `generated` rule leaves out any file with a line over 5,000 bytes, and
+    # `generated` rule leaves out any file with a line over 2,000 characters, and
     # `src/a.py` alone would then plan no read unit to serve it through.
     aid, root, _ = _deep(db, tmp_path, {"src/a.py": "y" * 7752 + "\n", "src/b.py": "x = 1\n"})
     read = _unit(db, aid, "read")
@@ -753,7 +756,14 @@ def test_security_read_a_line_one_byte_over_the_budget_is_shown_but_never_record
                          capture_output=True, text=True, env=_reader_env(aid, read["id"], root))
     assert out.returncode == 0, out.stderr
     assert "1\t" + "y" * 7752 in out.stdout
-    assert "cannot be proven read here" in out.stdout
+    # The numbers the message prints are the ones the gate compared: the
+    # line's cost (its "N\t" prefix and newline included) and this call's
+    # budget (READ_BYTES less the header, warning and footer it prints).
+    budget = security_cli.READ_BYTES - evidence.read_overhead("src/a.py", 1)
+    cost = len(("1\t" + "y" * 7752).encode("utf-8")) + 1
+    assert cost == budget + 1
+    assert (f"-- line 1 is {cost} bytes, wider than one chunk ({budget} bytes) can show "
+            "-- it cannot be proven read here") in out.stdout
     conn = ledger.connect(db)
     assert ledger.unit_reads(conn, read["id"]) == [], "a line wider than budget is never recorded"
 
