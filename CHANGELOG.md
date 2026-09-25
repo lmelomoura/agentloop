@@ -20,6 +20,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **An analysis whose orchestrator died is resumed by the tick.** A reboot or
+  a crash left the analysis `running` behind a dead lock, with its finished
+  units paid for and the rest never started. The tick now marks it
+  `interrupted` and starts a new orchestrator, which continues from the
+  ledger — three times at most per analysis, after which it is abandoned
+  with a note, so a machine that keeps crashing stops spending. A lock
+  caught in the instant before its owner writes its pid is an orchestrator
+  being started, and is left alone until it is older than the lock grace.
 - **An orchestrator runs an analysis to the end, whatever its size.** It
   prepares the analysis in a worktree of its own at the analysed commit —
   outside the run worktrees the tick sweeps, cleared first if a crash left

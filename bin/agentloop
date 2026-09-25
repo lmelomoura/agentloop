@@ -1082,6 +1082,55 @@ security_launch_detached() { # security_launch_detached <job-id> <analysis-id> <
   set +m
 }
 
+# How many times the tick resumes one analysis after its orchestrator died.
+# The operator's own Resume is never counted: this cap exists so a machine that
+# crashes every time stops spending, not to limit a person.
+SECURITY_MAX_AUTO_RESUMES=3
+
+# THE TICK'S CHECK FOR ORPHANED ANALYSES. An orchestrator that exits removes
+# its lock; one that died (a reboot, a kill -9, a crash) leaves it, with a pid
+# slot_alive calls dead. Its analysis is still `running` in the ledger, with
+# every unit it finished recorded there. Mark it interrupted, then resume it
+# in a detached orchestrator -- or abandon it once it has been resumed
+# SECURITY_MAX_AUTO_RESUMES times. Never blocking: the relaunch is detached,
+# and a job whose units are still winding down is left for the next tick.
+security_resume_orphans() {
+  local d jid aid row state resumes pid
+  for d in "$LOCK_DIR"/"$SECURITY_JOB_PREFIX"*/.analysis; do
+    [ -d "$d" ] || continue
+    # DEAD BY THE RULE slots_active APPLIES TO A SLOT, not by slot_alive
+    # alone: a lock with no pid is acquire_lock between its mkdir and its
+    # echo -- an orchestrator being started -- unless it is older than the
+    # grace (lock_abandoned). slot_alive calls it dead, and removing it here
+    # started a second orchestrator beside the first.
+    pid="$(cat "$d/pid" 2>/dev/null || true)"
+    if [ -n "$pid" ]; then
+      slot_alive "$d" && continue
+    else
+      lock_abandoned "$d" || continue
+    fi
+    jid="$(basename "$(dirname "$d")")"
+    [ "$(slots_active "$jid")" -eq 0 ] || continue
+    aid="$(cat "$d/analysis" 2>/dev/null)"
+    rm -rf "$d"
+    case "$aid" in ''|*[!0-9]*) continue ;; esac
+    row="$(security_engine_py analysis --id "$aid" 2>/dev/null)"
+    state="$(printf '%s' "$row" | "$JQ" -r '.state // empty' 2>/dev/null)"
+    resumes="$(printf '%s' "$row" | "$JQ" -r '.resumes // 0' 2>/dev/null)"
+    [ "$state" = "running" ] || [ "$state" = "interrupted" ] || continue
+    [ "$state" = "interrupted" ] || security_engine_py interrupt --analysis "$aid" >/dev/null 2>&1
+    if [ "$(num "$resumes" 0)" -ge "$SECURITY_MAX_AUTO_RESUMES" ]; then
+      security_engine_py abandon --analysis "$aid" --note "Its orchestrator died again after $SECURITY_MAX_AUTO_RESUMES automatic resumes; the units it finished are kept, the rest never ran." >/dev/null 2>&1
+      log_tick "$jid: analysis $aid abandoned — its orchestrator died after $SECURITY_MAX_AUTO_RESUMES automatic resumes"
+      continue
+    fi
+    security_engine_py resume --analysis "$aid" --automatic >/dev/null 2>&1 || continue
+    security_launch_detached "$jid" "$aid" "$(printf '%s' "$row" | "$JQ" -r '.branch')" \
+      "$(printf '%s' "$row" | "$JQ" -r '.repo')"
+    log_tick "$jid: analysis $aid resumed automatically ($((resumes + 1))/$SECURITY_MAX_AUTO_RESUMES) — its orchestrator had died"
+  done
+}
+
 cmd_security_analyze() { # [--detach] <project> <repo> <branch> [profile]
   # `--detach` opens the analysis and launches its run in the background,
   # printing the id and returning at once. It is what the dashboard's Analyse
@@ -7023,6 +7072,7 @@ cmd_tick() {
   if models_stale && ! lock_active "_models"; then
     models_refresh_launch
   fi
+  security_resume_orphans
   local days hours interval last streak max_par
   # IFS is tick_plan's own separator, never a tab: see the note on TICK_SEP
   # for the job that a folded tab run kept off the schedule.

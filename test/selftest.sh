@@ -8491,6 +8491,63 @@ JSON
     && ok "and every past analysis is carried onto the new name in the ledger" \
     || bad "the security history stayed behind under the old project name"
 
+  echo "security_resume_orphans — an analysis whose orchestrator died is resumed, three times at most"
+  # A reboot or a kill -9 leaves the analysis `running` behind a lock whose pid
+  # is dead. The paid-for units are in the ledger; the tick has to notice, mark
+  # it interrupted, and start a new orchestrator -- and stop doing so after
+  # SECURITY_MAX_AUTO_RESUMES, or a machine that always crashes spends for ever.
+  ( LOCK_DIR="$tmp/orph/locks"; mkdir -p "$LOCK_DIR/security-x/.analysis"
+    printf '999999\n' > "$LOCK_DIR/security-x/.analysis/pid"; boot_id > "$LOCK_DIR/security-x/.analysis/boot"
+    printf '7\n' > "$LOCK_DIR/security-x/.analysis/analysis"
+    RESUMES=1
+    security_engine_py() {
+      case "$1" in
+        analysis) printf '{"id":7,"state":"running","resumes":%s,"branch":"main","repo":"web"}\n' "$RESUMES" ;;
+        *) printf '%s\n' "$*" >> "$tmp/orph/calls" ;;
+      esac; }
+    security_launch_detached() { printf 'launch %s\n' "$*" >> "$tmp/orph/calls"; }
+    security_resume_orphans
+    [ ! -d "$LOCK_DIR/security-x/.analysis" ] || exit 1
+    grep -qx 'interrupt --analysis 7' "$tmp/orph/calls" || exit 2
+    grep -qx 'resume --analysis 7 --automatic' "$tmp/orph/calls" || exit 3
+    grep -qx 'launch security-x 7 main web' "$tmp/orph/calls" || exit 4
+    : > "$tmp/orph/calls"; mkdir -p "$LOCK_DIR/security-x/.analysis"
+    printf '999999\n' > "$LOCK_DIR/security-x/.analysis/pid"; boot_id > "$LOCK_DIR/security-x/.analysis/boot"
+    printf '7\n' > "$LOCK_DIR/security-x/.analysis/analysis"
+    RESUMES=3
+    security_resume_orphans
+    grep -q '^abandon --analysis 7 --note ' "$tmp/orph/calls" || exit 5
+    ! grep -q '^launch' "$tmp/orph/calls" || exit 6
+    exit 0 ) \
+    && ok "a dead orchestrator's analysis is interrupted and resumed, and abandoned after the third resume" \
+    || bad "security_resume_orphans (rc $?): $(cat "$tmp/orph/calls" 2>/dev/null)"
+  ( LOCK_DIR="$tmp/orph2/locks"; mkdir -p "$LOCK_DIR/security-y/.analysis"
+    sleep 30 & live=$!
+    printf '%s\n' "$live" > "$LOCK_DIR/security-y/.analysis/pid"; boot_id > "$LOCK_DIR/security-y/.analysis/boot"
+    security_engine_py() { printf '%s\n' "$*" >> "$tmp/orph2-calls"; }
+    security_resume_orphans
+    kill "$live" 2>/dev/null
+    [ -d "$LOCK_DIR/security-y/.analysis" ] && [ ! -s "$tmp/orph2-calls" ] ) \
+    && ok "a live orchestrator is left alone" \
+    || bad "security_resume_orphans touched a live orchestrator"
+  # THE WINDOW INSIDE acquire_lock: mkdir, then the pid a moment later. A lock
+  # with no pid yet is an orchestrator being started, never a dead one --
+  # slot_alive alone reads it dead, and the tick removed the lock and started
+  # a second orchestrator beside the first. Judged by its age instead
+  # (lock_abandoned), the rule slots_active applies to a slot: left alone
+  # while young, taken once it is older than the grace.
+  ( LOCK_DIR="$tmp/orph3/locks"; mkdir -p "$LOCK_DIR/security-z/.analysis"
+    security_engine_py() { printf '%s\n' "$*" >> "$tmp/orph3-calls"; }
+    security_launch_detached() { printf 'launch %s\n' "$*" >> "$tmp/orph3-calls"; }
+    security_resume_orphans
+    [ -d "$LOCK_DIR/security-z/.analysis" ] && [ ! -s "$tmp/orph3-calls" ] || exit 1
+    touch -t 200001010000 "$LOCK_DIR/security-z/.analysis"
+    security_resume_orphans
+    [ ! -d "$LOCK_DIR/security-z/.analysis" ] || exit 2
+    exit 0 ) \
+    && ok "a lock with no pid yet is an orchestrator being started: left alone until it is older than the grace" \
+    || bad "security_resume_orphans and a lock with no pid (rc $?)"
+
   echo "check_ui_artifacts() — an untracked file in bin/static/ must go red, not pass unnoticed"
   # Reproduces, on a throwaway mirror rather than the real bin/static/, what
   # dropping a fourth built artifact into that directory looks like: a
