@@ -8509,13 +8509,23 @@ JSON
   # is the orchestrator's to close (finish --from-units). A `hunt` unit,
   # because a hunt is judged by the run's status alone -- the same table of
   # verdicts the single-session close applied to the analysis.
+  # A real close is handed the run's own stream -- unit-close's caller
+  # never omits it (both real call sites in bin/agentloop pass $streamfile).
+  # An init-only stream is all a session needs to prove it ran (units.close
+  # / evidence.stream_proves): the same shape the run itself writes as the
+  # very first line, before the model ever calls a tool.
+  sec_stream() { # sec_stream -> the path of a fresh init-only stream file
+    local s="$sec/close.$$.$RANDOM.stream.ndjson"
+    "$JQ" -nc --arg cwd "$sec/tree" '{type:"system",subtype:"init",cwd:$cwd}' > "$s"
+    printf '%s' "$s"
+  }
   sec_close_state() { # sec_close_state <run-status> [wdreason] -> "<unit state>,<spend>[,<continuation attempt>]"
     ( sec_env
       local a u
       a="$(sec_open)"
       u="$(sec_unit "$a" hunt)"
       AL_SECURITY_ANALYSIS_ID="$a" AL_SECURITY_UNIT_ID="$u" \
-        security_close_analysis "$secjid" "$1" "1.5" "${2:-}" >/dev/null 2>&1
+        security_close_analysis "$secjid" "$1" "1.5" "${2:-}" "$(sec_stream)" >/dev/null 2>&1
       sec_unit_state "$u" )
   }
   [ "$(sec_close_state success)" = "done,1.5" ] \
@@ -8542,6 +8552,21 @@ JSON
     && ok "a run the operator stopped continues its unit at the SAME attempt: a stop is not the unit's failure" \
     || bad "stopped -> $(sec_close_state stopped)"
 
+  # NO STREAM, NOTHING COUNTS (evidence.stream_proves / units.close): a close
+  # that cannot prove its run ever started is disqualified, whatever status
+  # it carries -- success included. The attempt still follows the status, so
+  # a successful run with a missing stream is continued one attempt up, same
+  # as an error.
+  local secnostream
+  secnostream="$( ( sec_env
+    a="$(sec_open)"; u="$(sec_unit "$a" hunt)"
+    AL_SECURITY_ANALYSIS_ID="$a" AL_SECURITY_UNIT_ID="$u" \
+      security_close_analysis "$secjid" success "1.5" "" >/dev/null 2>&1
+    sec_unit_state "$u" ) )"
+  [ "$secnostream" = "incomplete,1.5,2" ] \
+    && ok "a close with no stream credits nothing, even a success -- disqualified, continued one attempt up" \
+    || bad "close with no stream -> $secnostream"
+
   # The unit id travels in the run's own environment and nowhere else: the
   # request file is rewritten by the NEXT `security analyze` of the project,
   # and a close that read it would land on another analysis's unit. Without
@@ -8553,8 +8578,8 @@ JSON
     mu="$(sec_unit "$mine" hunt)"; ou="$(sec_unit "$other" hunt)"
     "$JQ" --argjson a "$other" '.analysis_id = $a' "$secreq" > "$secreq.t" && mv "$secreq.t" "$secreq"
     AL_SECURITY_ANALYSIS_ID="$mine" AL_SECURITY_UNIT_ID="$mu" \
-      security_close_analysis "$secjid" success "0.5" "" >/dev/null 2>&1
-    security_close_analysis "$secjid" success "0.5" "" >/dev/null 2>&1
+      security_close_analysis "$secjid" success "0.5" "" "$(sec_stream)" >/dev/null 2>&1
+    security_close_analysis "$secjid" success "0.5" "" "$(sec_stream)" >/dev/null 2>&1
     printf '%s,%s' "$(sec_unit_state "$mu" | cut -d, -f1)" "$(sec_unit_state "$ou" | cut -d, -f1)" ) )"
   [ "$seccross" = "done,pending" ] \
     && ok "the close lands on the unit its own run was started with, and without one it closes nothing, whatever the request file says" \
