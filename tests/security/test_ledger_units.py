@@ -195,14 +195,6 @@ def test_the_reads_served_to_a_unit_are_kept_per_unit(conn):
     assert ledger.unit_reads(conn, u2) == [("src/b.py", 1, 9)]
 
 
-def test_a_carried_finding_reported_gone_is_known_to_its_analysis(conn):
-    aid, other = _analysis(conn), _analysis(conn)
-    uid = ledger.add_unit(conn, aid, "triage", {"items": []})
-    ledger.record_gone(conn, uid, "c" * 64, "the handler was deleted")
-    assert ledger.gone_in(conn, aid) == {"c" * 64}
-    assert ledger.gone_in(conn, other) == set()
-
-
 def test_what_a_unit_reported_gone_is_known_by_that_unit_alone(conn):
     """The judge's question (security/units.py): what did THIS unit say is
     gone -- never what some unit of the analysis said."""

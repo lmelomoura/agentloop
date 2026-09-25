@@ -690,7 +690,7 @@ def is_ancestor(root, sha) -> bool:
 
 # How often the sweep says where it is, in commits. On the repository that
 # motivated the cursor (21,607 commits) that is about ten lines over the whole
-# sweep -- enough to see it move, not enough to fill the run's `.prepare` file.
+# sweep -- enough to see it move, not enough to flood the stderr the orchestrator keeps the tail of.
 PROGRESS_EVERY = 2000
 
 
@@ -773,8 +773,9 @@ def scan_history(root, since_sha, ignore=(), rename=None, budget=None):
     size. Past it the process is killed and the note says where the sweep got
     to, in words that say the next analysis continues from there.
 
-    Progress goes to stderr, every `PROGRESS_EVERY` commits, with `flush` so a
-    reader tailing the run's `.prepare` file sees it move: `prepare` runs
+    Progress goes to stderr, every `PROGRESS_EVERY` commits, with `flush` so
+    whoever reads `prepare`'s stderr as it runs sees it move (a hand run's
+    terminal; the orchestrator keeps its tail for tick.log): `prepare` runs
     unattended for minutes on a large repository, and a line that says
     `2000/21607` is the difference between a sweep and a hang.
 

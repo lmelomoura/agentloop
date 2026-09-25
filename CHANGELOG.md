@@ -302,9 +302,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   launches nothing and records nothing. A new `verification` row in the
   coverage table says what was verified and what was not.
 
-- **`verify-queue`, `verify-prompt` and `report-verdict`.** The queue is a
-  query, so the agent never derives the scope from prose; the prompt is minted
-  from the ledger, with the job stated as disproving the claim and the
+- **`verify-queue` and `report-verdict`.** The queue is a
+  query, so the agent never derives the scope from prose; the verifier's
+  prompt is minted from the ledger, with the job stated as disproving the claim and the
   hunter's `rationale` deliberately left out — a fresh reader that reads the
   argument stops being fresh; and the verdict is written by the verifier
   itself, refused for a finding outside the queue, refused a second time on
@@ -376,14 +376,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   when an analysis of a large repository had done enough, and it always
   decided early.
 
-- **An agent session can no longer close, grade, interrupt or resume the
-  analysis it works for.** `finish`, `unit-close`, `orchestrate`,
-  `interrupt`, `resume` and `abandon` are refused under the agent flag; the
-  engine makes them with the flag removed. A verdict from an agent session
-  is accepted only from the verify unit the engine launched for that very
-  finding (`verified_by` names the unit), instead of being counted against
-  subagents after the fact; one written outside any session is recorded as
-  the operator's.
+- **An agent session can no longer prepare, close, grade, interrupt or
+  resume the analysis it works for.** `prepare`, `finish`, `unit-close`,
+  `orchestrate`, `interrupt`, `resume` and `abandon` are refused under the
+  agent flag; the engine makes them with the flag removed. A verdict from an
+  agent session is accepted only from the verify unit the engine launched
+  for that very finding (`verified_by` names the unit), instead of being
+  counted against subagents after the fact; one written outside any session
+  is recorded as the operator's. A finding from a session is refused unless
+  its unit is running in that analysis, as a verdict, a `report-gone` and a
+  `read` already were. `finish --if-running` now decides in the write
+  itself, so a stop that interrupts the analysis while it is being closed is
+  never overwritten. The single-session `verify-prompt` verb is gone: a
+  verify unit's prompt is minted by `unit-prompt`. The engine's `security`
+  usage line names every verb the door accepts.
 - **The verification queue lists only the analysis's own rows.** A finding
   the previous analysis recorded, not yet re-checked, used to sit in the
   queue where no verifier could ever clear it — `record_verdict` writes only

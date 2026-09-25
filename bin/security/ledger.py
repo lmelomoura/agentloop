@@ -440,7 +440,7 @@ def start_analysis(conn, project, repo, branch, commit_sha, profile, run_id) -> 
 
 
 def finish_analysis(conn, analysis_id, state, spend_usd=0.0, coverage_note="",
-                    coverage="") -> None:
+                    coverage="", only_if_running=False) -> bool:
     """Close the row, and write BOTH halves of the coverage together.
 
     `coverage` is the structured twin of `coverage_note` (see
@@ -449,14 +449,22 @@ def finish_analysis(conn, analysis_id, state, spend_usd=0.0, coverage_note="",
     the two can never end up describing different analyses. `cmd_finish` is
     the only caller that has anything to say here, and it merges the stored
     document before passing it back, exactly as it already does for the note.
+
+    `only_if_running` (`finish --if-running`) makes the write itself
+    conditional -- `AND state='running'` -- rather than trusting a read taken
+    before it: a stop or the next Analyse's sweep can interrupt the row
+    between `cmd_finish`'s check and this UPDATE, and an interrupted analysis
+    is the resume's to continue, never this close's to settle. Returns
+    whether the row was written.
     """
     if state not in ANALYSIS_END_STATES:
         raise ValueError(f"bad analysis state: {state}")
-    conn.execute(
+    cur = conn.execute(
         "UPDATE analysis SET ended=?, state=?, spend_usd=?, coverage_note=?,"
-        " coverage=? WHERE id=?",
+        " coverage=? WHERE id=?" + (" AND state='running'" if only_if_running else ""),
         (int(time.time()), state, spend_usd, coverage_note, coverage, analysis_id))
     conn.commit()
+    return cur.rowcount > 0
 
 
 def names_a_file(occurrence: dict) -> bool:
@@ -1640,16 +1648,10 @@ def record_gone(conn, unit_id, fingerprint, reason) -> None:
                      (unit_id, fingerprint, reason, int(time.time())))
 
 
-def gone_in(conn, analysis_id) -> set:
-    return {r[0] for r in conn.execute(
-        "SELECT g.fingerprint FROM unit_gone g JOIN unit u ON u.id = g.unit_id"
-        " WHERE u.analysis_id=?", (analysis_id,))}
-
-
 def gone_by(conn, unit_id) -> set:
     """The fingerprints ONE unit reported gone -- what a triage unit is
     credited with (security/units.py). A `report-gone` another unit made, a
-    disqualified attempt of its own lineage included, is not its reading;
-    `gone_in` answers for the whole analysis."""
+    disqualified attempt of its own lineage included, is not its reading, so
+    there is deliberately no analysis-wide answer to ask instead."""
     return {r[0] for r in conn.execute(
         "SELECT fingerprint FROM unit_gone WHERE unit_id=?", (unit_id,))}

@@ -1,10 +1,11 @@
 # bin/security/prompts.py
-"""The text a verifier is given, minted from the ledger.
+"""The text every unit of an analysis is given, minted from the ledger.
 
-WHY THE CLI MINTS IT. The verifier is a subagent the hunter launches, and a
-prompt the hunter writes is "confirm what I found". This module is what the
-hunter passes instead: built from the row, with the job stated as DISPROVING
-the claim.
+WHY THE CLI MINTS IT. A unit's prompt is never written by another agent: a
+verifier handed "confirm what I found" by the hunter that found it would be
+a second opinion, not a verification. The engine launches each unit with
+the prompt `unit-prompt` prints from this module -- a verify unit's built
+from the row, with the job stated as DISPROVING the claim.
 
 WHAT IT DELIBERATELY LEAVES OUT: the hunter's `rationale`. Everything a
 verifier can check line by line is in the `candidate` -- the chain with its

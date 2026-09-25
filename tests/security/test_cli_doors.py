@@ -14,9 +14,24 @@ def _conn(db):
     return ledger.connect(db)
 
 
-@pytest.mark.parametrize("verb", ["finish", "unit-close", "orchestrate", "interrupt", "resume", "abandon"])
+@pytest.mark.parametrize("verb", ["finish", "unit-close", "orchestrate", "interrupt", "resume", "abandon",
+                                  "prepare"])
 def test_the_engine_s_verbs_are_refused_to_an_agent_session(verb):
     assert verb in security_cli.AGENT_FORBIDDEN
+
+
+def test_prepare_is_refused_under_the_agent_flag(tmp_path):
+    """The orchestrator runs the deterministic phase once, engine-side, with
+    the flag stripped; a unit's session that ran it again would re-run the
+    scanners over the analysis mid-pipeline."""
+    db = tmp_path / "security.db"
+    aid = open_analysis(db, profile="quick", commit="c1")
+    (tmp_path / "tree").mkdir()
+    out = fails(db, "prepare", "--analysis", str(aid), "--root", str(tmp_path / "tree"), "--offline",
+                env=AS_AGENT)
+    assert out.returncode != 0 and "refused inside a security analysis" in out.stderr
+    row = run(db, "analysis", "--id", str(aid))
+    assert not row["prepared"]
 
 
 def test_finish_is_refused_under_the_agent_flag(tmp_path):
@@ -50,8 +65,37 @@ def test_a_finding_carries_the_unit_of_the_session_that_wrote_it(tmp_path):
     aid = prepared_analysis(db, tmp_path)
     conn = _conn(db)
     uid = ledger.add_unit(conn, aid, "hunt", {})
+    ledger.start_unit(conn, uid)
     _sast(db, aid, "b" * 64, env=_agent_in_unit(aid, uid))
     assert conn.execute("SELECT unit FROM finding WHERE fingerprint=?", ("b" * 64,)).fetchone()[0] == uid
+
+
+@pytest.mark.parametrize("case", ["pending", "settled", "another analysis's", "missing"])
+def test_a_finding_is_refused_for_a_unit_that_is_not_running_in_this_analysis(tmp_path, case):
+    """`finding.unit` is what the judge credits a unit with, so the door
+    asks what `report-verdict`, `report-gone` and `read` ask: a running unit
+    of THIS analysis. An orphan of a run already judged, or a session naming
+    another analysis's unit, writes nothing."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    conn = _conn(db)
+    if case == "another analysis's":
+        other = prepared_analysis(db, tmp_path)
+        uid = ledger.add_unit(conn, other, "hunt", {})
+        ledger.start_unit(conn, uid)
+    elif case == "missing":
+        uid = 999
+    else:
+        uid = ledger.add_unit(conn, aid, "hunt", {})
+        if case == "settled":
+            ledger.start_unit(conn, uid)
+            ledger.settle_unit(conn, uid, "done", 0, {}, "judged")
+    out = fails(db, "report-finding", "--analysis", str(aid), env=_agent_in_unit(aid, uid),
+                stdin=json.dumps({"fingerprint": "b" * 64, "category": "hygiene", "rule": "r",
+                                  "severity": "high", "title": "t", "rationale": "seen",
+                                  "occurrences": [{"file": "a.py", "line": 1}]}))
+    assert out.returncode != 0 and f"unit {uid} is not a running unit of analysis {aid}" in out.stderr
+    assert conn.execute("SELECT COUNT(*) FROM finding WHERE fingerprint=?", ("b" * 64,)).fetchone()[0] == 0
 
 
 def test_a_finding_ignores_a_unit_the_payload_itself_tries_to_set(tmp_path):
@@ -68,6 +112,7 @@ def test_a_finding_ignores_a_unit_the_payload_itself_tries_to_set(tmp_path):
     conn = _conn(db)
     real = ledger.add_unit(conn, aid, "hunt", {})
     claimed = ledger.add_unit(conn, aid, "hunt", {})
+    ledger.start_unit(conn, real)
     run(db, "report-finding", "--analysis", str(aid), env=_agent_in_unit(aid, real), stdin=json.dumps({
         "fingerprint": "b" * 64, "category": "sast", "rule": "sql-injection", "severity": "high",
         "title": "t", "rationale": "the query is concatenated",
@@ -259,3 +304,48 @@ def test_migrate_rules_is_not_refused_once_the_interrupted_analysis_is_abandoned
     run(db, "interrupt", "--analysis", str(aid))
     run(db, "abandon", "--analysis", str(aid), "--note", "giving up on it")
     assert run(db, "migrate-rules") == {"renamed": [], "findings": 0}
+
+
+def test_the_engine_s_usage_line_names_every_verb_the_door_accepts():
+    """bin/agentloop's `security` usage message says it names every verb
+    the door accepts; it had fallen behind the pipeline's (read, units,
+    unit-close, interrupt, export-findings, ...) and kept one that is gone."""
+    import re
+    from pathlib import Path
+    root = Path(security_cli.__file__).resolve().parents[2]
+    usage = re.search(r'die "usage: agentloop security <([^>]+)>',
+                      (root / "bin" / "agentloop").read_text()).group(1).split("|")
+    source = (root / "bin" / "security" / "cli.py").read_text()
+    verbs = set(re.findall(r'\bsub\.add_parser\(\s*"([a-z-]+)"', source))
+    assert "migrate-rules" in verbs and "verify-prompt" not in verbs
+    # `analyze` is the engine's own (cmd_security_analyze), `resume` both.
+    assert set(usage) == verbs | {"analyze"}, (set(usage) ^ (verbs | {"analyze"}))
+
+
+# ---- `finish --if-running` decides in the write, not only in a read before it
+
+def test_a_close_if_running_never_settles_a_row_interrupted_while_it_was_closing(tmp_path, monkeypatch):
+    """The check at the top of `cmd_finish` reads the row; a stop or the
+    next Analyse's sweep can interrupt it before the UPDATE. The write is
+    conditional too, so the interruption stands -- the resume's to continue."""
+    db = tmp_path / "security.db"
+    aid = prepared_analysis(db, tmp_path)
+    real_gaps = security_cli.units.gaps
+
+    def gaps_while_a_stop_lands(conn, analysis_id):
+        ledger.interrupt_analysis(ledger.connect(db), analysis_id)
+        return real_gaps(conn, analysis_id)
+    monkeypatch.setattr(security_cli.units, "gaps", gaps_while_a_stop_lands)
+    security_cli.main(["--db", str(db), "finish", "--analysis", str(aid), "--state", "done",
+                       "--from-units", "--if-running"])
+    row = run(db, "analysis", "--id", str(aid))
+    assert (row["state"], row["ended"]) == ("interrupted", None)
+
+
+def test_finish_analysis_only_if_running_leaves_any_other_row_alone(tmp_path):
+    conn = _conn(tmp_path / "security.db")
+    aid = open_analysis(tmp_path / "security.db", profile="quick", commit="c1")
+    assert ledger.interrupt_analysis(conn, aid)
+    assert ledger.finish_analysis(conn, aid, "done", only_if_running=True) is False
+    assert conn.execute("SELECT state FROM analysis WHERE id=?", (aid,)).fetchone()[0] == "interrupted"
+    assert ledger.finish_analysis(conn, aid, "failed") is True

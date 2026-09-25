@@ -1104,7 +1104,7 @@ def test_report_gone_is_accepted_only_for_a_carried_sast_row_of_the_session_s_tr
                          "--fingerprint", "c" * 64, "--db", str(db)], env=env, capture_output=True,
                         text=True, input=json.dumps({"reason": "the handler was deleted in this commit"}))
     assert ok.returncode == 0, ok.stderr
-    assert ledger.gone_in(conn, aid) == {"c" * 64}
+    assert ledger.gone_by(conn, uid) == {"c" * 64}
     # Minor 4 (test gaps): `returncode != 0` alone is never enough -- a
     # traceback passes it too -- so each case pins its own message.
     for fp, reason, msg in (("d" * 64, "r", "is not a carried sast finding"),

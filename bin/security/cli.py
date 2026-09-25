@@ -140,7 +140,12 @@ AGENT_FORBIDDEN = ("decide", "rename-project", "open-analysis", "event",
                    # the agent flag removed (`security_engine_py` in
                    # bin/agentloop), so refusing them here costs the engine
                    # nothing and closes the one door a unit could misuse.
-                   "finish", "unit-close", "orchestrate", "interrupt", "resume", "abandon")
+                   # `prepare` too: the orchestrator runs it once, before any
+                   # unit, in a checkout of its own (it strips the flag), and
+                   # a second one from a unit's shell would re-run the
+                   # deterministic phases over the analysis mid-pipeline.
+                   "finish", "unit-close", "orchestrate", "interrupt", "resume", "abandon",
+                   "prepare")
 
 
 def _agent_env(name: str) -> str:
@@ -186,7 +191,9 @@ def _refuse_if_agent(cmd):
 
     `finish` joined the refused verbs with the pipeline: the engine's own
     closes now run through `security_engine_py`, which removes the flag, so
-    an agent session is the only caller left under it.
+    an agent session is the only caller left under it. So did `prepare`:
+    the orchestrator runs the deterministic phase itself, engine-side, with
+    the flag stripped from its environment.
 
     A GUARDRAIL, NOT A BOUNDARY. The flag lives in the agent's environment and
     the agent has a shell, so `env -u AL_SECURITY_AGENT ...` is all it takes to
@@ -208,8 +215,8 @@ def _refuse_if_agent(cmd):
             f"security {cmd}: refused inside a security analysis "
             "(AL_SECURITY_AGENT is set) — the agent that reports a finding "
             "does not get to dismiss it, rename the ledger out from under it, "
-            "open analyses of its own, close or grade the analysis the engine "
-            "is running, write an event by hand into the one record of what "
+            "open analyses of its own, prepare, close or grade the analysis the "
+            "engine is running, write an event by hand into the one record of what "
             "actually happened, or save/delete a saved filter "
             "-- a working set a human curates, not something an analysis "
             "decides; ask a human to run this.")
@@ -1312,8 +1319,10 @@ def _slice_guides(root, ignore, components):
 
 
 def cmd_prepare(args):
-    """The deterministic phases, run inside the worktree by the agent's first
-    command. Seconds, and no tokens."""
+    """The deterministic phases, run once per analysis by its orchestrator
+    (security/orchestrator.py), engine-side, in a checkout of the analysed
+    commit of its own -- never by a unit's session (AGENT_FORBIDDEN).
+    Seconds, and no tokens."""
     # A process group of its own, so a stop can end every scanner this phase
     # spawns (gitleaks, trivy, semgrep, syft, git) with one signal to the
     # group: seen on a real install, a stop during this phase killed the run
@@ -1766,23 +1775,6 @@ def cmd_verify_queue(args):
     print(json.dumps(queries.verify_queue(conn, args.analysis), indent=2))
 
 
-def cmd_verify_prompt(args):
-    """The text the agent pastes into a `Task` for this finding.
-
-    Refused for a fingerprint outside the queue, on the same rule as
-    `report-verdict`: a prompt for something nobody is verifying is a
-    subagent nobody asked for, and the close counts those.
-    """
-    conn = _conn(args)
-    _analysis(conn, args.analysis)
-    row = next((f for f in queries.verify_queue(conn, args.analysis)
-                if f["fingerprint"] == args.fingerprint), None)
-    if row is None:
-        sys.exit(f"verify-prompt: {args.fingerprint[:12]}… is not in the verification "
-                 "queue of this analysis — `verify-queue` lists what is")
-    print(prompts.verifier_prompt(args.analysis, row))
-
-
 def cmd_report_verdict(args):
     """What a VERIFIER concluded. Called by the engine's verify unit for the
     one finding it was launched for, not by the hunter that reported it --
@@ -1794,10 +1786,10 @@ def cmd_report_verdict(args):
     would close the door on its only legitimate caller. What confines it to
     that caller, inside an agent session, is the door below: it checks that
     the session writing IS the verify unit the engine launched for THIS
-    finding, of THIS analysis, still running -- not a count taken after the
-    fact (`cmd_finish` still compares the verdicts recorded here against the
-    `Task` calls the engine counted in the run's stream, a coarser, close-time
-    check this one does not replace).
+    finding, of THIS analysis, still running. The unit's close then credits
+    the verdict only to that unit (`verified_by = unit:<id>`), and clears it
+    if the unit's stream shows a subagent -- or shows nothing at all
+    (security/units.py `close`).
     """
     try:
         stdin_text = sys.stdin.read()
@@ -2579,6 +2571,19 @@ def cmd_report_finding(args):
                  "report-gone")
     conn = _conn(args)
     _running(conn, args.analysis)
+    # THE UNIT THIS ROW WILL BE STAMPED WITH (`finding.unit`, below) must be
+    # a running unit of THIS analysis, as `report-verdict`, `report-gone`
+    # and `read` already require. The judge credits a unit with exactly the
+    # rows stamped with its id; a session whose unit has settled -- an orphan
+    # of a run already judged -- or one naming another analysis's unit would
+    # otherwise write rows credited to a unit that never ran them.
+    uid = _session_unit()
+    if uid:
+        unit = ledger.get_unit(conn, uid)
+        if unit is None or unit["analysis_id"] != args.analysis or unit["state"] != "running":
+            sys.exit(f"report-finding: unit {uid} is not a running unit of analysis "
+                     f"{args.analysis} -- a unit reports only during its own run. "
+                     "Nothing was recorded")
     refusal = _decided_identity_refusal(conn, args.analysis, payload)
     if refusal:
         sys.exit(refusal)
@@ -2858,26 +2863,26 @@ def _guides_sentence(recommended, read) -> str:
 def cmd_finish(args):
     """Close the analysis. The verdict can be lowered, never raised.
 
-    Two callers, and they disagree on purpose: the AGENT says `--state done`
-    when it believes it finished, and the ENGINE
-    (`security_close_analysis`) closes the same row again with the run's own
-    verdict and real cost. Precedence, in this order:
+    The ENGINE's verb (AGENT_FORBIDDEN): the orchestrator closes a pipeline
+    analysis from what its units proved (`--from-units --if-running`), and
+    the engine's own sweeps close a row nothing will ever run (`--state
+    failed --if-running`). An operator may close one by hand. No unit's
+    session closes the analysis it is part of. Precedence, in this order:
 
-      1. `--if-running` (the engine's sweep for a run that never started) is
-         a no-op on any row that is already closed -- every other run closed
-         its own row with a real verdict, and re-closing it would replace
-         that with a guess.
-      2. A stored `capped` or `failed` is NEVER overwritten with `done`. The
-         agent's own `finish --state capped` is an honest statement that it
-         ran out of room, and the engine's `success` -- which only means the
-         PROCESS exited cleanly -- used to overwrite it: the truncated
-         analysis then became the baseline, and everything the agent had not
+      1. `--if-running` is a no-op on any row that is not `running` -- one
+         already closed with a real verdict, or one interrupted for a resume
+         -- and the write itself is conditional on the row still being
+         `running` (ledger.finish_analysis), so a stop or a sweep that
+         interrupts it between this check and the write still wins.
+      2. A stored `capped` or `failed` is NEVER overwritten with `done`. A
+         close that already said the analysis ran out of room is an honest
+         statement, and a later `done` -- a second close that only knows the
+         process exited cleanly -- used to overwrite it: the truncated
+         analysis then became the baseline, and everything nobody had
          reached read as `fixed` that run and `regressed` the next.
       3. Otherwise the caller's state wins, INCLUDING a downgrade of a stored
-         `done` to `capped`/`failed`. That direction is the whole point of
-         closing twice: the agent's claim that it finished is the one fact
-         here that nothing can verify, and the run it made that claim from
-         may have been cut off mid-sentence.
+         `done` to `capped`/`failed`: a later close knowing of a gap is the
+         one to believe.
 
     Whatever the state ends up being, the SPEND and the note are still
     written: the run's real cost is a fact even when its verdict is refused.
@@ -2947,12 +2952,14 @@ def cmd_finish(args):
     unprepared_note = ""
     decided_note = ""
     triage_phase = None
-    # `done` REQUIRES that the deterministic phases actually ran. Nothing
-    # engine-side runs `prepare` -- it is the agent's first command, named in
-    # the prompt and in the skill -- so an agent that simply skipped it exited
-    # cleanly, the engine closed the row `done`, and the result was a report
-    # with zero findings, an empty coverage note and no banner anywhere saying
-    # the repository had never been scanned. Worse than useless: that report
+    # `done` REQUIRES that the deterministic phases actually ran. Before the
+    # pipeline nothing engine-side ran `prepare` -- it was the agent's first
+    # command -- so an agent that simply skipped it exited cleanly, the
+    # engine closed the row `done`, and the result was a report with zero
+    # findings, an empty coverage note and no banner anywhere saying the
+    # repository had never been scanned. The orchestrator runs it now, and a
+    # prepare that fails closes the analysis `capped` on its own; this guard
+    # stays as the defence in depth for any close of an unprepared row. Worse than useless: that report
     # becomes the BASELINE the next analysis is diffed against, so everything
     # the next run legitimately finds arrives as `new` and everything a
     # previous run had found reads as `fixed`.
@@ -3201,8 +3208,9 @@ def cmd_finish(args):
     phases = coverage.merge(
         phases, [sast_phase] + ([triage_phase] if triage_phase else [])
         + ([verify_phase] if verify_phase else []))
-    ledger.finish_analysis(conn, args.analysis, state, _spend(args.spend), note,
-                           coverage.encode(phases))
+    if not ledger.finish_analysis(conn, args.analysis, state, _spend(args.spend), note,
+                                  coverage.encode(phases), only_if_running=args.if_running):
+        return          # interrupted (or closed) between the check above and the write
     # `row`'s own project and branch, never a flag the caller passed: `finish`
     # has two callers and neither one necessarily agrees with the row about
     # what it is closing, so the event has to come from the row itself.
@@ -4276,16 +4284,14 @@ def main(argv=None):
     rf = sub.add_parser("report-finding", parents=[dbflag]); rf.set_defaults(fn=cmd_report_finding)
     rf.add_argument("--analysis", type=int, required=True)
 
-    # Deliberately absent from AGENT_FORBIDDEN, all three: the verifier is a
-    # subagent of the analysis and runs under the same flag the hunter does,
+    # Deliberately absent from AGENT_FORBIDDEN, both: a verify unit is a
+    # session of the pipeline and runs under the same flag every unit does,
     # so refusing them there would close the door on their only caller. The
-    # close's count is what makes the phase verifiable -- see `cmd_finish`.
+    # verify unit's prompt is minted by `unit-prompt` (prompts.verifier_prompt);
+    # what keeps a verdict honest is `report-verdict`'s own door and the
+    # unit's close (security/units.py).
     vq = sub.add_parser("verify-queue", parents=[dbflag]); vq.set_defaults(fn=cmd_verify_queue)
     vq.add_argument("--analysis", type=int, required=True)
-
-    vp = sub.add_parser("verify-prompt", parents=[dbflag]); vp.set_defaults(fn=cmd_verify_prompt)
-    vp.add_argument("--analysis", type=int, required=True)
-    vp.add_argument("--fingerprint", required=True)
 
     rv = sub.add_parser("report-verdict", parents=[dbflag]); rv.set_defaults(fn=cmd_report_verdict)
     rv.add_argument("--analysis", type=int, required=True)

@@ -979,8 +979,8 @@ cmd_security_branches() { # cmd_security_branches <project> <repo> -> every
 # decide --state false_positive` permanently suppresses a finding the agent
 # itself just reported, and `security rename-project` moves the ledger out from
 # under the project. bin/security/cli.py refuses those and every other engine
-# verb (AGENT_FORBIDDEN -- `finish`, `unit-close`, `orchestrate`, `interrupt`,
-# `resume`, `abandon` among them) when it sees this flag set. The unit's own
+# verb (AGENT_FORBIDDEN -- `prepare`, `finish`, `unit-close`, `orchestrate`,
+# `interrupt`, `resume`, `abandon` among them) when it sees this flag set. The unit's own
 # close (security_close_analysis) runs inside this same run_job, and reaches
 # `unit-close` through security_engine_py, which unsets the flag for that one
 # call.
@@ -8730,25 +8730,29 @@ case "${1:-}" in
                # transition is the CLI's `resume --analysis`, reached through
                # security_engine_py and never through this dispatch.
                resume)  shift; cmd_security_resume "$@" ;;
-               # Everything else is the ledger's own vocabulary: prepare,
-               # findings, fingerprint, report-finding, report-verdict,
-               # checklist, render, list, analysis, events are what the agent
-               # types verbatim from its prompt; decide, rename-project,
-               # open-analysis, event, `filters save`/`filters delete`, and
-               # the engine's own verbs -- finish, unit-close, orchestrate,
-               # interrupt, resume, abandon -- are the operator's or the
-               # engine's alone (AGENT_FORBIDDEN in bin/security/cli.py
-               # refuses every one of those to an agent session; the engine
-               # reaches `finish` itself through security_engine_py, which
-               # unsets the flag first); migrate-rules is the operator's too,
+               # Everything else is the ledger's own vocabulary. A unit's
+               # session types findings, fingerprint, report-finding,
+               # report-verdict, report-gone, read, verify-queue, checklist,
+               # render, list, analysis and events from its prompt and the
+               # skill; decide, rename-project, open-analysis, event,
+               # `filters save`/`filters delete`, and the engine's own verbs
+               # -- prepare, finish, unit-close, orchestrate, interrupt,
+               # resume, abandon -- are the operator's or the engine's alone
+               # (AGENT_FORBIDDEN in bin/security/cli.py refuses every one of
+               # those to an agent session; the engine reaches them through
+               # security_engine_py, or the orchestrator's own environment,
+               # with the flag unset); unit-prompt and units are the engine's
+               # reads of the pipeline; migrate-rules is the operator's too,
                # though NOT refused the agent -- it takes no arguments and
-               # can only apply the rename map this repository declares; and
-               # index-data, project-data, findings-page, activity-data and
-               # `filters list` are the dashboard's own screens fetching
-               # through this same door, never typed by a human at all --
-               # listed here anyway so this message names every verb the door
-               # actually accepts, not just the subset any one caller uses.
-               "")      die "usage: agentloop security <analyze|resume|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|units|read|verify-queue|verify-prompt|finish|checklist|render|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
+               # can only apply the rename map this repository declares;
+               # export-findings is the operator's export; and index-data,
+               # project-data, findings-page, activity-data and `filters list`
+               # are the dashboard's own screens fetching through this same
+               # door, never typed by a human at all -- listed here anyway so
+               # this message names every verb the door actually accepts, not
+               # just the subset any one caller uses (tests/security/
+               # test_cli_doors.py pins it against the CLI's own parser).
+               "")      die "usage: agentloop security <analyze|resume|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|unit-close|units|read|verify-queue|interrupt|abandon|orchestrate|finish|checklist|render|export-findings|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
                *)       security_py "$@" ;;
              esac ;;
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"

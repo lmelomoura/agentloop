@@ -1257,17 +1257,16 @@ def test_the_agent_cannot_open_an_analysis_the_engine_will_never_close(tmp_path)
 def test_the_work_the_agent_is_there_to_do_still_works_under_the_flag(tmp_path):
     """The flag is on for the WHOLE of an agent's session: refusing more than
     the verbs AGENT_FORBIDDEN names would break the analysis it is supposed to
-    protect. `finish` is one of those verbs since the pipeline -- the engine
-    closes the analysis through `security_engine_py`, with the flag removed --
-    so the close below runs without it; the door's refusal of `finish` to an
-    agent has its own test (test_cli_doors.py)."""
+    protect. `finish` and `prepare` are among those verbs since the pipeline
+    -- the engine prepares and closes the analysis with the flag removed --
+    so both run without it below; the door's refusals have their own tests
+    (test_cli_doors.py)."""
     db = tmp_path / "security.db"
     root = tmp_path / "repo"
     root.mkdir()
     (root / "app.py").write_text("print('hi')\n")
     aid = open_analysis(db)
-    run(db, "prepare", "--analysis", str(aid), "--root", str(root), "--offline",
-        env=AS_AGENT)
+    run(db, "prepare", "--analysis", str(aid), "--root", str(root), "--offline")
     run(db, "report-finding", "--analysis", str(aid), env=AS_AGENT,
         stdin=json.dumps({"fingerprint": "b" * 64, "category": "hygiene",
                           "rule": "r", "severity": "high", "title": "t"}))
@@ -6550,16 +6549,15 @@ def test_a_credential_in_a_verdict_reason_is_refused_and_never_echoed(tmp_path):
     assert AWS not in "".join(str(tuple(r)) for r in conn.execute("SELECT * FROM finding"))
 
 
-def test_verify_prompt_is_minted_for_a_queued_finding_only(tmp_path):
+def test_the_single_session_verify_prompt_verb_is_gone(tmp_path):
+    """`verify-prompt` printed the text a hunter pasted into a `Task`. The
+    verifier is a unit of its own now, whose prompt `unit-prompt` mints, and
+    a verb whose whole purpose was a subagent the engine now refuses is not
+    left lying around to invite one."""
     db = tmp_path / "security.db"
     aid = prepared_analysis(db, tmp_path)
-    _agent_sast(db, aid, "b" * 64)
-    out = raw(db, "verify-prompt", "--analysis", str(aid), "--fingerprint", "b" * 64)
-    assert "your job is to disprove" in out.lower()
-    assert "report-verdict --analysis" in out
-    assert "my own reading" not in out, "the hunter's rationale must not travel"
     bad = fails(db, "verify-prompt", "--analysis", str(aid), "--fingerprint", "9" * 64)
-    assert bad.returncode != 0 and "not in the verification queue" in bad.stderr
+    assert bad.returncode != 0 and "invalid choice" in bad.stderr
 
 
 # --------------------------------------------- the close counts the phase
