@@ -1587,58 +1587,52 @@ def _isolated_env(manifest_path):
             "AL_RUN_MANIFEST": str(manifest_path)}
 
 
-def test_prepare_root_outside_the_runs_worktree_is_refused_when_isolated(tmp_path):
-    """Reproduced before the guard: an agent pointing `--root` at ANY other
-    valid checkout on the machine got a clean scan of code nobody asked about,
-    `prepare` marked the row `prepared=1`, and the analysis closed `done` with
-    clean findings having never looked at its own scope at all."""
+@pytest.mark.parametrize("where", ["elsewhere", "prefix sibling", "own checkout", "no manifest"])
+def test_prepare_under_the_agent_flag_is_refused_before_its_root_is_even_judged(tmp_path, where):
+    """`prepare` is the engine's since the pipeline (AGENT_FORBIDDEN): the
+    orchestrator runs it with the flag stripped. So a session is refused
+    whatever `--root` it names -- another checkout, a sibling whose name
+    merely starts with the run dir's, the run's own checkout, with or
+    without a run manifest -- and nothing is prepared."""
     db = tmp_path / "security.db"
     aid = open_analysis(db)
     run_dir = tmp_path / "run-dir"
-    run_dir.mkdir()
+    (run_dir / "web").mkdir(parents=True)
     manifest = run_dir / ".run.json"
     manifest.write_text("{}")
-    elsewhere = tmp_path / "some-other-checkout"
-    elsewhere.mkdir()
-    out = fails(db, "prepare", "--analysis", str(aid), "--root", str(elsewhere),
-                "--offline", env=_isolated_env(manifest))
-    assert out.returncode != 0
-    assert "own worktree" in out.stderr
-    assert run(db, "findings", "--analysis", str(aid)) == []
+    root = {"elsewhere": tmp_path / "some-other-checkout", "prefix sibling": tmp_path / "run-dir-evil",
+            "own checkout": run_dir / "web", "no manifest": tmp_path / "any-checkout-at-all"}[where]
+    root.mkdir(exist_ok=True)
+    env = _isolated_env(manifest)
+    if where == "no manifest":
+        env.pop("AL_RUN_MANIFEST")
+    out = fails(db, "prepare", "--analysis", str(aid), "--root", str(root), "--offline", env=env)
+    assert out.returncode != 0 and "refused inside a security analysis" in out.stderr
+    assert not run(db, "analysis", "--id", str(aid))["prepared"]
 
 
-def test_prepare_root_prefix_collision_with_the_run_dir_is_still_refused(tmp_path):
-    """The nearest neighbour to the boundary just closed: a SIBLING directory
-    whose name merely starts with the run dir's own name (`run-dir-evil`
-    starts with `run-dir`). A check written as a string prefix comparison
-    would wrongly accept it; path containment must be exact."""
-    db = tmp_path / "security.db"
-    aid = open_analysis(db)
+@pytest.mark.parametrize("where, refused", [("elsewhere", True), ("prefix sibling", True),
+                                            ("own checkout", False)])
+def test_the_root_anchor_still_holds_as_a_defence_in_depth(tmp_path, monkeypatch, where, refused):
+    """Unreachable from a session now that `prepare` is refused under the
+    flag -- kept, and pinned, for whatever caller one day carries both
+    markers past that door: a root outside the run's own worktree (a
+    sibling sharing its name's prefix included) is refused, the worktree
+    itself is not."""
     run_dir = tmp_path / "run-dir"
-    run_dir.mkdir()
+    (run_dir / "web").mkdir(parents=True)
     manifest = run_dir / ".run.json"
     manifest.write_text("{}")
-    sibling = tmp_path / "run-dir-evil"
-    sibling.mkdir()
-    out = fails(db, "prepare", "--analysis", str(aid), "--root", str(sibling),
-                "--offline", env=_isolated_env(manifest))
-    assert out.returncode != 0
-    assert "own worktree" in out.stderr
-
-
-def test_prepare_root_inside_the_runs_worktree_is_accepted(tmp_path):
-    """The control: the genuine case -- `--root` naming the checkout the
-    engine actually built for this run -- must still work."""
-    db = tmp_path / "security.db"
-    aid = open_analysis(db)
-    run_dir = tmp_path / "run-dir"
-    checkout = run_dir / "web"
-    checkout.mkdir(parents=True)
-    manifest = run_dir / ".run.json"
-    manifest.write_text("{}")
-    out = run(db, "prepare", "--analysis", str(aid), "--root", str(checkout),
-              "--offline", env=_isolated_env(manifest))
-    assert out["findings"] == 0
+    root = {"elsewhere": tmp_path / "some-other-checkout", "prefix sibling": tmp_path / "run-dir-evil",
+            "own checkout": run_dir / "web"}[where]
+    root.mkdir(exist_ok=True)
+    monkeypatch.setenv("AL_SECURITY_AGENT", "1")
+    monkeypatch.setenv("AL_RUN_MANIFEST", str(manifest))
+    if refused:
+        with pytest.raises(SystemExit, match="own worktree"):
+            security_cli._refuse_root_outside_run(root.resolve())
+    else:
+        security_cli._refuse_root_outside_run(root.resolve())
 
 
 def test_prepare_root_check_is_unchanged_without_the_run_manifest(tmp_path):
@@ -1651,23 +1645,6 @@ def test_prepare_root_check_is_unchanged_without_the_run_manifest(tmp_path):
     anywhere.mkdir()
     env = {k: v for k, v in os.environ.items()
            if k not in ("AL_SECURITY_AGENT", "AL_RUN_MANIFEST")}
-    out = run(db, "prepare", "--analysis", str(aid), "--root", str(anywhere),
-              "--offline", env=env)
-    assert out["findings"] == 0
-
-
-def test_prepare_root_check_is_unchanged_when_agent_flag_is_set_without_a_manifest(tmp_path):
-    """AL_SECURITY_AGENT alone (no AL_RUN_MANIFEST) is what
-    `test_the_work_the_agent_is_there_to_do_still_works_under_the_flag`
-    already exercises for a normal analysis; this pins the same for an
-    arbitrary root, so the new guard is provably keyed on BOTH variables, not
-    either one alone."""
-    db = tmp_path / "security.db"
-    aid = open_analysis(db)
-    anywhere = tmp_path / "any-checkout-at-all"
-    anywhere.mkdir()
-    env = {k: v for k, v in os.environ.items() if k != "AL_RUN_MANIFEST"}
-    env["AL_SECURITY_AGENT"] = "1"
     out = run(db, "prepare", "--analysis", str(aid), "--root", str(anywhere),
               "--offline", env=env)
     assert out["findings"] == 0

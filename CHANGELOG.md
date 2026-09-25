@@ -406,7 +406,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   counted against subagents after the fact; one written outside any session
   is recorded as the operator's. A finding from a session is refused unless
   its unit is running in that analysis, as a verdict, a `report-gone` and a
-  `read` already were. `finish --if-running` now decides in the write
+  `read` already were (the `--root` anchor to the run's own worktree stays
+  behind the `prepare` refusal as a defence in depth). `finish --if-running`
+  now decides in the write
   itself, so a stop that interrupts the analysis while it is being closed is
   never overwritten. The single-session `verify-prompt` verb is gone: a
   verify unit's prompt is minted by `unit-prompt`. The engine's `security`

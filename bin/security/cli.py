@@ -418,6 +418,11 @@ def _refuse_root_outside_run(root):
     carries neither, and must see the same behaviour as before this guard --
     this is the agent's own run being anchored to the checkout the engine
     built for it, not a new restriction on manual use.
+
+    DEFENCE IN DEPTH SINCE THE PIPELINE: `prepare` is in AGENT_FORBIDDEN,
+    so a session under the flag is refused before this is ever asked. It is
+    kept, and pinned by its own test, for any caller that one day carries
+    both markers past that door.
     """
     manifest = _agent_env("RUN_MANIFEST")
     if not (_agent_env("SECURITY_AGENT") and manifest):
