@@ -8871,6 +8871,46 @@ FAKESELF
     *) bad "resume vs supersede -> $secsup (id, rc resume, rc after supersede, state, launches): $(cat "$sec/sup.out" 2>/dev/null)" ;;
   esac
 
+  echo "cmd_security_retry() — reopen, resume and launch, in that order; nothing launched when the reopen refuses"
+  # The engine's half of a Retry: the ledger decides (security/cli.py reopen,
+  # tested with it); this is the glue, stubbed at its edges.
+  : > "$sec/retry.calls"
+  ( sec_env
+    security_engine_py() {
+      printf '%s\n' "$1" >> "$sec/retry.calls"
+      case "$1" in
+        analysis) printf '{"project":"Sec App","branch":"main","repo":"Sec App"}' ;;
+        reopen)   printf '{"state":"interrupted","units":2}' ;;
+        resume)   printf '{"state":"running"}' ;;
+      esac
+    }
+    security_analysis_live() { return 1; }
+    slots_active() { echo 0; }
+    security_launch_detached() { printf 'launch %s %s %s\n' "$2" "$3" "$4" >> "$sec/retry.calls"; }
+    cmd_security_retry "Sec App" 41 ) > "$sec/retry.out" 2>&1
+  [ "$(tr '\n' ' ' < "$sec/retry.calls")" = "analysis reopen resume launch 41 main Sec App " ] \
+    && ok "it reopens, resumes and launches the analysis on its own branch and repo" \
+    || bad "retry calls: $(tr '\n' ' ' < "$sec/retry.calls")"
+  grep -q '{"analysis_id":41,"retried":2}' "$sec/retry.out" \
+    && ok "and says how many units run again" || bad "retry printed: $(cat "$sec/retry.out")"
+  : > "$sec/retry.calls"
+  ( sec_env
+    security_engine_py() {
+      printf '%s\n' "$1" >> "$sec/retry.calls"
+      case "$1" in
+        analysis) printf '{"project":"Sec App","branch":"main","repo":"Sec App"}' ;;
+        reopen)   echo "analysis 41 is done: only a capped or failed analysis is retried" >&2; return 1 ;;
+      esac
+    }
+    security_analysis_live() { return 1; }
+    slots_active() { echo 0; }
+    security_launch_detached() { printf 'launch\n' >> "$sec/retry.calls"; }
+    cmd_security_retry "Sec App" 41 ) > "$sec/retry.out" 2>&1; rc=$?
+  [ "$rc" -ne 0 ] && grep -q "only a capped or failed analysis is retried" "$sec/retry.out" \
+    && ! grep -q "launch" "$sec/retry.calls" \
+    && ok "a refused reopen stops it, with the ledger's own sentence, and launches nothing" \
+    || bad "refused retry (rc $rc): $(cat "$sec/retry.out"); calls: $(tr '\n' ' ' < "$sec/retry.calls")"
+
   echo "cmd_security_branches() — local and origin branches, HEAD excluded, deduped"
   # A real checkout with an origin, not faked refs: local-only never leaves the
   # repo, shared exists on both sides (the dedup this proves), and origin's

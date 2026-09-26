@@ -1348,6 +1348,34 @@ cmd_security_resume() { # cmd_security_resume <project> <analysis-id>
   printf '{"analysis_id":%s,"resumed":true}\n' "$aid"
 }
 
+# `agentloop security retry <project> <analysis-id>`: a CAPPED or FAILED
+# analysis reopened to run again only the lineages that gave up, on the
+# commit it analysed -- the ledger's `reopen` decides when that is allowed
+# (security/units.py retry_refusal) and says why when it is not -- then
+# continued exactly as a resume continues an interrupted one. Refused, like
+# a resume, while anything of the project's is still alive.
+cmd_security_retry() { # cmd_security_retry <project> <analysis-id>
+  [ $# -ge 2 ] || die "usage: agentloop security retry <project> <analysis-id>"
+  local project="$1" aid="$2" jid row out n
+  security_enabled "$project" || die "security is not enabled for project '$project'"
+  case "$aid" in ''|*[!0-9]*) die "security: '$aid' is not an analysis id" ;; esac
+  jid="$(security_job_id "$project")"
+  row="$(security_engine_py analysis --id "$aid" 2>/dev/null)" || die "no such analysis: $aid"
+  [ "$(printf '%s' "$row" | "$JQ" -r '.project')" = "$project" ] \
+    || die "analysis $aid is not an analysis of '$project'"
+  security_analysis_live "$jid" && die "an analysis of '$project' is already running (job $jid)"
+  [ "$(slots_active "$jid")" -eq 0 ] \
+    || die "units of '$project' are still winding down — try again in a moment"
+  out="$(security_engine_py reopen --analysis "$aid" 2>&1)" || die "$out"
+  n="$(num "$(printf '%s' "$out" | "$JQ" -r '.units // 0' 2>/dev/null)" 0)"
+  security_engine_py resume --analysis "$aid" >/dev/null 2>&1 \
+    || die "analysis $aid was reopened but could not be resumed: run agentloop security resume '$project' $aid"
+  security_launch_detached "$jid" "$aid" "$(printf '%s' "$row" | "$JQ" -r '.branch')" \
+    "$(printf '%s' "$row" | "$JQ" -r '.repo')"
+  log_tick "$jid: retried analysis $aid: $n failed unit(s) run again $(stop_origin)"
+  printf '{"analysis_id":%s,"retried":%s}\n' "$aid" "$n"
+}
+
 # THE CLOSE OF A UNIT'S RUN. Called from run_job at the same point
 # run_end_hook already is, and BEFORE it: the user hook runs detached with a
 # timeout and only exists if they wrote the script. A no-op for every job that
@@ -8894,6 +8922,10 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop security resume <project> <analysis-id>
                               continue an interrupted analysis (stopped, or
                               swept) without repeating a finished unit
+  agentloop security retry <project> <analysis-id>
+                              reopen a capped or failed analysis (the newest
+                              of its branch) and run again only the units
+                              that gave up, on the commit it analysed
   agentloop security render --analysis <n> --format <json|md|html|sbom>
                               the report for one analysis, or (sbom) the
                               stored SBOM document itself (see agentloop
@@ -9050,6 +9082,9 @@ case "${1:-}" in
                # transition is the CLI's `resume --analysis`, reached through
                # security_engine_py and never through this dispatch.
                resume)  shift; cmd_security_resume "$@" ;;
+               # The operator's retry of a capped or failed analysis: the
+               # ledger's `reopen`, then the same launch a resume makes.
+               retry)   shift; cmd_security_retry "$@" ;;
                # Everything else is the ledger's own vocabulary. A unit's
                # session types findings, fingerprint, report-finding,
                # report-verdict, report-gone, read, verify-queue, checklist,
@@ -9072,7 +9107,7 @@ case "${1:-}" in
                # this message names every verb the door actually accepts, not
                # just the subset any one caller uses (tests/security/
                # test_cli_doors.py pins it against the CLI's own parser).
-               "")      die "usage: agentloop security <analyze|resume|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|unit-close|units|read|verify-queue|interrupt|abandon|reopen|orchestrate|finish|checklist|render|export-findings|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
+               "")      die "usage: agentloop security <analyze|resume|retry|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|unit-close|units|read|verify-queue|interrupt|abandon|reopen|orchestrate|finish|checklist|render|export-findings|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
                *)       security_py "$@" ;;
              esac ;;
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"
