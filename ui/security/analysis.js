@@ -666,6 +666,7 @@ async function secRetryAnalysis(a, n){
     title: "Retry the " + units + " that gave up?",
     message: "Runs again the " + units + " that gave up, on commit "
       + String(a.commit_sha || "").slice(0, 7) + ", and any unit that never finished."
+      + " While it runs, the branch shows its previous finished analysis."
       + " Everything already done stays done.",
     confirmLabel: "Retry " + units});
   if(!yes) return;

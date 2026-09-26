@@ -358,6 +358,11 @@ correm durante o ciclo de correcções, e o corpo do PR di-lo.
 
 ## Fica de fora, de propósito
 
+- **O baseline durante um retry.** Enquanto a análise reaberta corre, as 17
+  consultas que lêem `state IN ('done','capped')` vêem a análise anterior do
+  ramo. Os achados da análise reaberta não diminuem durante o retry (só ganham
+  veredictos), por isso ela podia continuar a ser o baseline; mudá-lo é um
+  follow-up próprio. A confirmação e o README dizem-no.
 - **Isolar o estado do OpenCode por análise** (um `XDG_DATA_HOME` do
   agentloop para as runs derivadas). Deixaria de sujar a base do operador (o
   incidente acrescentou-lhe 700 linhas de `project_directory` e 10

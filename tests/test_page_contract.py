@@ -5262,6 +5262,7 @@ def test_retry_says_what_it_will_run_before_it_asks_the_engine(srv):
     assert "showConfirm(" in retry
     assert "on commit" in retry and "stays done" in retry
     assert "never finished" in retry
+    assert "previous finished analysis" in retry
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")

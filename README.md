@@ -1545,13 +1545,15 @@ attempt; three in a row give that unit up, and three in a row across two or
 more units pause the whole analysis: it is left `interrupted`, the note names
 the error, and Resume continues it once the cause is fixed.
 
-**Retry failed units.** A `capped` or `failed` analysis whose units gave up
-is not a dead end. `agentloop security retry <project> <analysis>`, or
-**Retry failed units** on the analysis, reopens it and runs again only those
-units, each with a fresh round of attempts, on the commit it analysed. Every
-unit already done is kept. Only the newest analysis of its branch can be
-retried; its next close describes the final state, and its note says when it
-was retried.
+**Retry failed units.** A `capped` or `failed` analysis whose units gave up is
+not a dead end. `agentloop security retry <project> <analysis>`, or **Retry
+failed units** on the analysis, reopens it and runs again only those units,
+each with a fresh round of attempts, on the commit it analysed. Every unit
+already done is kept. Only the newest analysis of its branch can be retried;
+its next close describes the final state, and its note says when it was
+retried. While it runs the analysis is not finished, so the branch's posture
+and the next analysis's baseline are the previous finished one until it closes
+again.
 
 Each unit's own contract is versioned rather than typed into a prompt
 (`skills/security-analysis/SKILL.md`), and it is written **per unit role**: a
