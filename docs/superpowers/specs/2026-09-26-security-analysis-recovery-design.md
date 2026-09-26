@@ -148,8 +148,11 @@ só a verificação falhou.
 
 ### 1. O sweep nunca cria um caminho
 
-- Em `_wt_prune_one`, a primeira coisa com o `.resume` tomado:
-  `[ -d "$d" ] || return 0`.
+- Em `_wt_prune_one`, com o `.resume` tomado e logo depois do
+  `wt_is_claimed`: `[ -d "$d" ] || return 0`. Depois do dono, nunca antes:
+  o `run_cleanup` remove a árvore e só depois liberta o slot, por isso, sem
+  dono, uma desmontagem que estivesse em curso já acabou e esta resposta é
+  final.
 - Na adopção, `touch -c "$d"`: no `touch` do macOS, `-c` nunca cria o
   ficheiro. As escritas dos marcadores calam o erro de verdade
   (`{ printf …; } 2>/dev/null`): hoje o erro do redireccionamento escapa ao
@@ -192,7 +195,8 @@ com no máximo 300 caracteres. No caso medido:
 
 - `run_classify` passa a devolver `cause=start_failed` com essa razão. O
   `tick.log` mostra
-  `finished status=error cause=start_failed … reason="<razão>"`, e a razão
+  `finished status=error cause=start_failed … — START FAILED: <razão>` (a
+  linha já acaba em `— $wdreason`), e a razão
   vai para a `note` do registo da run e para o diálogo da run no dashboard.
 - A definição só usa o stream, o código de saída e o stderr, por isso vale
   igual para as três plataformas.
@@ -223,11 +227,11 @@ com no máximo 300 caracteres. No caso medido:
 - Com `START_FAIL_BREAKER = 3` seguidas, em pelo menos 2 linhagens
   diferentes, o orquestrador fecha o seu gate com a frase:
   «the agent could not start: 3 units in a row ended before a session
-  opened (<plataforma>: <razão>)».
+  opened (last error: <razão>)». O orquestrador não conhece a plataforma.
 - A partir daí é o caminho dos gates que já existe: não lança mais, espera o
   que está em voo, `_interrupt(GATE_NOTE…)`, e a análise fica
   `interrupted` com a frase na nota. O `tick.log` ganha
-  `<job>: analysis <id> paused: <frase>`.
+  `<job>: analysis <id> — stops launching: <frase>`.
 - Um **Resume** (o botão ou `agentloop security resume`) continua a análise
   com a sequência a zero. Se a causa persistir, o gate volta a fechar ao fim
   de uma vaga, sem custo e sem gastar tentativas. O tick não a retoma
@@ -253,8 +257,10 @@ com no máximo 300 caracteres. No caso medido:
   (uma análise `capped` só pelo orçamento cai aqui);
 - para cada uma dessas folhas, uma unidade nova `pending` (mesmo tipo e
   payload, tentativa 1, `parent` = a folha);
-- o estado passa a `interrupted`, `ended` volta a vazio, e fica uma linha
-  em `event` (tipo `security_analysis_reopened`, com o número de unidades).
+- o estado passa a `interrupted` e `ended` volta a vazio. O registo do
+  reopen é a frase `Retried on <dia>: <n> units that had given up were run
+  again.` na nota e uma linha no `tick.log`; um tipo novo de evento
+  obrigaria a mexer no vocabulário da Activity em quatro sítios.
 
 **O fecho de uma análise retomada descreve o estado final.** As frases das
 lacunas do fecho anterior («231 units gave up…») não podem ficar coladas à
@@ -298,7 +304,8 @@ operador.
 - Uma run sem stream nunca credita nada (sem mudança).
 - Uma unidade `done` nunca volta a correr.
 - Uma análise fechada só muda de estado pelo `reopen`: disparado pelo
-  operador, só na análise mais recente do âmbito, e registado em `event`.
+  operador, só na análise mais recente do âmbito, e registado na nota da
+  análise e no `tick.log`.
 - A retoma automática do tick nunca retoma uma análise que o disjuntor
   pausou.
 
@@ -329,7 +336,8 @@ correm durante o ciclo de correcções, e o corpo do PR di-lo.
 - **`tests/security/test_orchestrator.py`**, com o `fake-engine`:
   - todas as unidades falham ao arrancar: a análise fica `interrupted`
     depois da primeira vaga, a nota tem a razão, nenhuma linhagem desiste, e
-    não se lançam mais runs do que o paralelismo;
+    não se lançam mais do que paralelismo + 2 runs (as vagas das primeiras
+    falhas são reocupadas antes de a terceira chegar);
   - uma unidade falha ao arrancar e as outras correm: o gate não fecha, essa
     linhagem desiste ao fim de 3 com a razão, e a análise fecha `capped` a
     nomeá-la;
