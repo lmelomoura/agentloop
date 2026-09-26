@@ -15,6 +15,8 @@
 #   FAKE_COST               the `cost` of every step_finish (default 0: the Zen free models, measured)
 #   FAKE_RAN_MODEL          what `export` reports as the model that ran (default opencode/big-pickle-real)
 #   FAKE_OPENCODE_NO_MODELS set to make `models` print nothing: a machine with no usable provider
+#   FAKE_OPENCODE_START_FAIL  a `run` fails to start, as measurement 39's does: nothing on stdout,
+#                           "Error: Unexpected error", a blank line and this value on stderr, rc 1
 #   FAKE_SKIP_PREPARE       set to skip `security prepare` inside a security run (see the hook below)
 #   AL_SECURITY_UNIT_ID     set by the engine on a unit of a security analysis: the stand-in plays it
 #                           (test/fake-unit.sh) -- a read unit's reads are `read` tool events carrying
@@ -101,6 +103,14 @@ for a in "$@"; do [ "$prev" = "--dir" ] && dir="$a"; prev="$a"; done
 [ -z "${FAKE_DIR_OUT:-}" ] || printf '%s\n' "$dir" > "$FAKE_DIR_OUT"
 if [ -n "$dir" ]; then
   cd "$dir" 2>/dev/null || { printf '\033[91m\033[1mError: \033[0mFailed to change directory to %s\n' "$dir" >&2; exit 1; }
+fi
+# measurement 39: a project whose sandbox list names a path under a regular
+# file fails EVERY boot before a session exists -- rc 1, nothing on stdout,
+# and the cause on stderr after a coloured "Error: Unexpected error" and a
+# blank line.
+if [ -n "${FAKE_OPENCODE_START_FAIL:-}" ]; then
+  printf '\033[91m\033[1mError: \033[0mUnexpected error\n\n%s\n' "$FAKE_OPENCODE_START_FAIL" >&2
+  exit 1
 fi
 
 sid="${FAKE_SESSION:-ses_fake000000000000000000000}"

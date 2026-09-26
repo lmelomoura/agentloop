@@ -103,3 +103,18 @@ def test_the_undeclared_and_dirty_endings(tmp_path):
     assert und[4]["part"]["text"] == "I did some work."
     run(base, env={"FAKE_MODE": "dirty"}, cwd=tmp_path)
     assert (tmp_path / "agent-left-this.txt").exists()
+
+
+def test_a_start_failure_writes_nothing_and_names_the_cause_on_stderr(tmp_path):
+    """measurement 39: a project whose sandbox list names a path under a
+    regular file fails EVERY boot before a session exists -- rc 1, nothing
+    on stdout, and the cause on stderr after a coloured "Error: Unexpected
+    error" and a blank line."""
+    p = run(["run", "--format", "json", "--dir", str(tmp_path), "--", "do the thing"],
+            env={"FAKE_OPENCODE_START_FAIL": "BadResource: FileSystem.access (/gone/run/repo)"})
+    assert p.returncode == 1
+    assert p.stdout == ""
+    lines = p.stderr.splitlines()
+    assert "Unexpected error" in lines[0]
+    assert lines[1] == ""
+    assert lines[-1] == "BadResource: FileSystem.access (/gone/run/repo)"

@@ -20,6 +20,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A run whose agent never started says so, and says why.** An agent CLI
+  that exits non-zero before its stream holds a single event or a session is
+  bound (OpenCode does exactly that for every boot of a project whose
+  sandbox list names a path under a file, measurement 39) is recorded
+  `error` / `start_failed` instead of `killed`, and its note carries the
+  CLI's own last stderr line. On a real install 693 such runs were filed as
+  kills that never happened, with the cause left unread in each run's
+  stderr. `test/fake-opencode` plays it with `FAKE_OPENCODE_START_FAIL`.
+
 - **The run index keeps transcripts for 30 days, and every run's summary
   forever.** A finished run's stream, result, precheck output and stderr
   used to stay in `index.db` for as long as the index existed — 751 MB on
