@@ -1167,3 +1167,68 @@ def test_the_start_error_is_the_agents_words_without_the_engines_prefix():
     assert units.start_error("BadResource: x") == "BadResource: x"
     assert units.start_error("") == "no reason given"
     assert len(units.start_error("START FAILED: " + "y" * 900)) == 300
+
+
+def _failed_hunt(conn, aid):
+    uid = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    ledger.start_unit(conn, uid)
+    ledger.settle_unit(conn, uid, "failed", 0, {}, "The engine could not run this unit.")
+    return uid
+
+
+def test_a_retry_is_for_the_newest_closed_analysis_of_its_branch_with_a_lineage_that_gave_up(conn):
+    aid = _analysis(conn)
+    uid = _failed_hunt(conn, aid)
+    assert units.retry_refusal(conn, aid) == "is running: only a capped or failed analysis is retried"
+    ledger.finish_analysis(conn, aid, "capped")
+    assert units.retry_refusal(conn, aid) == ""
+    assert units.retryable(conn, aid) == 1
+    assert [u["id"] for u in units.failed_lineages(conn, aid)] == [uid]
+    ledger.start_analysis(conn, "web", "web", "feature", "c2", "deep", "security-web")
+    assert units.retry_refusal(conn, aid) == "", "another branch does not supersede it"
+    newer = _analysis(conn)
+    assert units.retry_refusal(conn, aid) == (f"was superseded by analysis {newer} of the same branch: "
+                                              "run Analyse again instead")
+    assert units.retryable(conn, aid) == 0
+
+
+def test_a_closed_analysis_where_nothing_gave_up_has_nothing_to_retry(conn):
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    ledger.start_unit(conn, uid)
+    ledger.settle_unit(conn, uid, "done", 0, {}, "ok")
+    ledger.finish_analysis(conn, aid, "capped")
+    assert units.retry_refusal(conn, aid) == "has no unit that gave up: there is nothing to retry"
+    assert units.retryable(conn, aid) == 0
+    done = ledger.start_analysis(conn, "web", "web", "other", "c3", "deep", "security-web")
+    _failed_hunt(conn, done)
+    ledger.finish_analysis(conn, done, "done")
+    assert units.retry_refusal(conn, done) == "is done: only a capped or failed analysis is retried"
+
+
+def test_a_lineage_retried_is_judged_by_its_new_last_unit(conn):
+    """The close judges a lineage by its last unit (units._lineages): once a
+    child hangs off the failed leaf, the leaf is history, not a gap."""
+    aid = _analysis(conn)
+    uid = _failed_hunt(conn, aid)
+    ledger.finish_analysis(conn, aid, "capped")
+    assert ledger.reopen_analysis(conn, aid, units.failed_lineages(conn, aid), "n") is True
+    assert units.failed_lineages(conn, aid) == []
+    assert not [g for g in units.gaps(conn, aid) if "gave up" in g]
+    assert ledger.get_unit(conn, uid)["state"] == "failed", "the leaf stays what it was"
+
+
+def test_the_retry_sentence_says_when_and_how_many():
+    assert units.retry_sentence(1, day="2026-09-27") == (
+        "Retried on 2026-09-27: 1 unit that had given up was run again.")
+    assert units.retry_sentence(231, day="2026-09-27") == (
+        "Retried on 2026-09-27: 231 units that had given up were run again.")
+
+
+def test_the_close_part_starts_at_the_units_sentence(conn):
+    aid = _analysis(conn)
+    _failed_hunt(conn, aid)
+    head = "Scope and secrets as prepare wrote them."
+    closed = f"{head} {units.coverage_sentence(conn, aid)} {' '.join(units.gaps(conn, aid))}".strip()
+    assert closed[:units.close_part_start(conn, aid, closed)].strip() == head
+    assert units.close_part_start(conn, aid, head) == len(head), "nothing of a close in it: all kept"

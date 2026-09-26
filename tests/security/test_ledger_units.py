@@ -143,6 +143,27 @@ def test_closing_an_interrupted_analysis_fails_it_with_the_reason(conn):
     assert ledger.close_interrupted(conn, aid, "again") is False
 
 
+def test_reopening_plans_one_child_per_leaf_and_moves_only_a_closed_analysis(conn):
+    aid = _analysis(conn)
+    a = ledger.add_unit(conn, aid, "verify", {"fingerprint": "a" * 64})
+    b = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "x.py", "first": 1, "last": 9}]})
+    for uid in (a, b):
+        ledger.start_unit(conn, uid)
+        ledger.settle_unit(conn, uid, "failed", 0, {}, "gave up")
+    leaves = [ledger.get_unit(conn, a), ledger.get_unit(conn, b)]
+    assert ledger.reopen_analysis(conn, aid, leaves, "n") is False, "a running analysis is not reopened"
+    ledger.finish_analysis(conn, aid, "capped", coverage_note="old")
+    assert ledger.reopen_analysis(conn, aid, leaves, "kept. Retried.") is True
+    row = conn.execute("SELECT state, ended, coverage_note FROM analysis WHERE id=?", (aid,)).fetchone()
+    assert (row["state"], row["ended"], row["coverage_note"]) == (ledger.INTERRUPTED, None, "kept. Retried.")
+    kids = [u for u in ledger.units_of(conn, aid) if u["parent"] in (a, b)]
+    assert [(k["kind"], k["state"], k["attempt"], k["parent"], k["seq"]) for k in kids] == [
+        ("verify", "pending", 1, a, 3), ("read", "pending", 1, b, 4)]
+    assert kids[0]["payload"] == {"fingerprint": "a" * 64}
+    assert ledger.get_unit(conn, a)["state"] == "failed", "the leaf stays what it was"
+    assert ledger.reopen_analysis(conn, aid, leaves, "again") is False, "an interrupted one is not"
+
+
 def test_the_inventory_round_trips_in_its_own_table_and_a_missing_or_broken_one_reads_empty(conn):
     aid = _analysis(conn)
     assert ledger.inventory_of(conn, aid) == {}

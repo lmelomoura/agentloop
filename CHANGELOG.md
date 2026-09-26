@@ -47,6 +47,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   unit that alone cannot start is given up after three tries, with the reason
   named, and the rest of the analysis runs.
 
+- **A capped or failed security analysis can be retried, running only what
+  gave up.**
+
 - **The run index keeps transcripts for 30 days, and every run's summary
   forever.** A finished run's stream, result, precheck output and stderr
   used to stay in `index.db` for as long as the index existed — 751 MB on

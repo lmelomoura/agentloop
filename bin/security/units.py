@@ -36,6 +36,7 @@ continuation with no work done.
 
 import os
 import sqlite3
+import time
 
 from . import diff, evidence, ledger, queries, slices
 
@@ -889,3 +890,70 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     return conclude(conn, unit, done=done, evidence=ev, note=note, spend_usd=spend_usd,
                     remaining=remaining, stopped=status == "stopped" or outage,
                     clear_verdict=clear)
+
+
+# A retry reopens only an analysis that ended; `running` and `interrupted`
+# are the orchestrator's and the resume's, and `done` has nothing to retry.
+REOPENABLE = ("capped", "failed")
+
+
+def failed_lineages(conn, analysis_id) -> list:
+    """The last unit of every lineage that gave up (`failed`), in the order of
+    their roots -- what a retry runs again."""
+    return [last for _root, last in _lineages(ledger.units_of(conn, analysis_id))
+            if last["state"] == "failed"]
+
+
+def retry_refusal(conn, analysis_id) -> str:
+    """Why this analysis cannot be retried, as the words that follow
+    `analysis <id> `; "" when it can. A retry reopens a closed analysis to run
+    again only what gave up, on the commit it analysed. So: only one that
+    ended `capped` or `failed`; only the newest of its scope -- the same
+    (project, repo, branch) with which a new analysis already supersedes an
+    interrupted one (cli.cmd_open_analysis), because retrying an older one
+    would file two readings of one branch out of order; and only one with a
+    lineage that gave up (an analysis capped by its budget alone has none)."""
+    row = conn.execute("SELECT * FROM analysis WHERE id=?", (analysis_id,)).fetchone()
+    if row is None:
+        return "does not exist"
+    if row["state"] not in REOPENABLE:
+        return f"is {row['state']}: only a capped or failed analysis is retried"
+    newer = conn.execute(
+        "SELECT id FROM analysis WHERE project=? AND repo=? AND branch=? AND id>?"
+        " ORDER BY id LIMIT 1",
+        (row["project"], row["repo"], row["branch"], analysis_id)).fetchone()
+    if newer is not None:
+        return (f"was superseded by analysis {newer['id']} of the same branch: "
+                "run Analyse again instead")
+    if not failed_lineages(conn, analysis_id):
+        return "has no unit that gave up: there is nothing to retry"
+    return ""
+
+
+def retryable(conn, analysis_id) -> int:
+    """How many units a retry would run again; 0 when it would be refused. The
+    page shows the Retry button by this number, computed by the very rule the
+    retry applies, so the button and the refusal never disagree."""
+    if retry_refusal(conn, analysis_id):
+        return 0
+    return len(failed_lineages(conn, analysis_id))
+
+
+def close_part_start(conn, analysis_id, note) -> int:
+    """Where the last close from the units began in `note`: `finish
+    --from-units` appends the units' coverage sentence first, then the gaps,
+    after whatever `prepare` stored. The index of the earliest of them;
+    len(note) when none is in it. Computed now from the ledger that close
+    read, which nothing has changed since: every unit of a closed analysis is
+    settled."""
+    marks = [coverage_sentence(conn, analysis_id)] + gaps(conn, analysis_id)
+    found = [note.find(mark) for mark in marks if mark and note.find(mark) >= 0]
+    return min(found) if found else len(note)
+
+
+def retry_sentence(n, day=None) -> str:
+    """What a retry leaves in the analysis's note: when, and how many units."""
+    day = day or time.strftime("%Y-%m-%d", time.gmtime())
+    if n == 1:
+        return f"Retried on {day}: 1 unit that had given up was run again."
+    return f"Retried on {day}: {n} units that had given up were run again."
