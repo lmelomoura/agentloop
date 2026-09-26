@@ -48,6 +48,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   minutes, and the analysis closed `capped` with none of them verified. One
   unit that alone cannot start is given up after three tries, with the reason
   named, and the rest of the analysis runs.
+  A provider that answers every unit with an error (`api_error`: an expired
+  or revoked credential answers them all alike) pauses it the same way; a
+  rate limit (429) does not, being transient.
 
 - **A capped or failed security analysis can be retried, running only what
   gave up.** `security/cli.py reopen` turns the newest analysis of a branch

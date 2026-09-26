@@ -915,7 +915,7 @@ def test_units_that_cannot_start_pause_the_analysis_after_one_wave(world, monkey
     assert ("the agent could not start: 3 units in a row ended before a session opened "
             "(last error: BadResource: FileSystem.access (/gone/repo))") in row["coverage_note"]
     launched = len(runs.read_text().splitlines())
-    assert 3 <= launched <= 3 + orchestrator.START_FAIL_BREAKER - 1, launched
+    assert 3 <= launched <= 3 + orchestrator.BREAKER_RUNS - 1, launched
     assert not [u for u in _units(world) if u["state"] == "failed"], "no lineage given up for the environment"
     assert all(u["attempt"] == 1 for u in _units(world)), "a start failure keeps its attempt"
 
@@ -944,3 +944,16 @@ def test_a_paused_analysis_resumes_once_the_agent_can_start_and_closes_done(worl
     assert ledger.resume_analysis(ledger.connect(world["db"]), world["aid"]) is True
     assert _orchestrator(world).run() == 0
     assert _row(world)["state"] == "done", _row(world)["coverage_note"]
+
+
+def test_a_provider_that_refuses_every_unit_pauses_the_analysis_too(world, monkeypatch):
+    """The morning after analysis 12, the Anthropic token had expired: every
+    run answered 401, which the classifier files as `api_error`. That keeps
+    each unit's attempt, and three in a row gave each lineage up -- the same
+    burn as the start failures, by another cause. The breaker counts it."""
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "always-api-error")
+    assert _orchestrator(world).run() == 0
+    row = _row(world)
+    assert row["state"] == "interrupted", row["coverage_note"]
+    assert "the provider refused 3 units in a row (api_error)" in row["coverage_note"]
+    assert not [u for u in _units(world) if u["state"] == "failed"]

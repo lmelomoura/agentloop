@@ -33,6 +33,9 @@ __run-unit <job> <analysis> <unit> <commit> <repo>
                           classifier's cause `rate_limited` (a stream, no
                           work); later runs play `complete`
       always-outage       every run ends `error` / `rate_limited`
+      always-api-error    every run ends `error` / `api_error` (a stream, no
+                          work): the provider refusing every unit alike, as an
+                          expired OAuth token does
       start-fail          every run ends `error` / `start_failed` with no
                           stream, its reason FAKE_ENGINE_START_ERROR (default
                           a BadResource line, measurement 39)
@@ -163,6 +166,9 @@ def run_unit(job, aid, uid):
         close(aid, uid, "error", cause="start_failed",
               reason="START FAILED: " + os.environ.get(
                   "FAKE_ENGINE_START_ERROR", "BadResource: FileSystem.access (/gone/repo)"))
+        return
+    if MODE == "always-api-error":
+        close(aid, uid, "error", write_stream(job, []), cause="api_error")
         return
     if MODE == "always-outage" or (MODE == "outage" and not unit["parent"]):
         close(aid, uid, "error", write_stream(job, []), cause="rate_limited")

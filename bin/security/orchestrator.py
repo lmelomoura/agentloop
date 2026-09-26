@@ -126,14 +126,21 @@ STRUCK_OUT_OUTAGE_NOTE = ("The engine could not run this unit: {n} runs in a row
                           "by the provider ({cause}; see tick.log).")
 STRUCK_OUT_START_NOTE = ("The engine could not run this unit: its agent could not start {n} "
                          "times in a row ({error}; see tick.log).")
-# THE ANALYSIS-WIDE BREAKER. Start failures in a row, over two lineages or
-# more, are the environment failing every unit alike -- analysis 12 spent
+# THE ANALYSIS-WIDE BREAKER. Runs of BREAKER_CAUSES in a row, over two
+# lineages or more, are the environment failing every unit alike -- analysis 12 spent
 # 693 runs and 42 minutes proving that one lineage at a time. The gate
 # closes, nothing more is launched, and the analysis is left interrupted
-# for a resume once the cause is fixed (see _count_start).
-START_FAIL_BREAKER = 3
+# for a resume once the cause is fixed (see _count_cannot_run).
+BREAKER_RUNS = 3
 START_FAIL_GATE = ("the agent could not start: {n} units in a row ended before a session "
                    "opened (last error: {error})")
+PROVIDER_GATE = "the provider refused {n} units in a row ({cause})"
+# What the breaker counts: an agent that never started, and a provider that
+# answered with an error (an expired or revoked credential answers every
+# unit alike). NOT `rate_limited`: a 429 is transient and has its own pace,
+# and pausing the analysis on every burst would ask for a manual Resume each
+# time. Both still keep the unit's attempt (units.KEPT_ATTEMPT_CAUSES).
+BREAKER_CAUSES = (units.START_FAILED, "api_error")
 # The judgement of a dead run that raised: by id, never by label -- the
 # label reads the ledger, which may be the very thing failing.
 JUDGE_RETRY_LOG = "could not judge unit {uid} ({why}) — trying again"
@@ -304,7 +311,7 @@ class Orchestrator:
         self.budget_spent = False
         self.budget_left = None   # set when the floor, not the spend, stopped the launches
         self.gate = ""            # the engine's gate that closed, in the engine's words
-        self.start_fails = []     # (lineage, error) of the start failures in a row (_count_start)
+        self.cannot_run = []      # (lineage, cause, error) of the breaker's causes in a row
         self.keep_lock = False    # nothing could be written: the tick must find us dead
         self.prepare_proc = None
         self.env = {k: v for k, v in os.environ.items() if k not in _SESSION_VARS}
@@ -775,7 +782,7 @@ class Orchestrator:
             self.log(f"unit {units.label(self.conn, unit)} {unit['state']} "
                      f"(${unit['spend_usd']:.2f}) — {unit['note']}")
             self.strikes.pop(lineage, None)      # a run closed it: the engine can run it
-            self._count_start(unit, lineage)
+            self._count_cannot_run(unit, lineage)
             return
         # THE RUN ENDED WITHOUT CLOSING ITS UNIT -- killed, crashed, or
         # orphaned by an orchestrator that died. Judged from what it left, as
@@ -795,24 +802,30 @@ class Orchestrator:
             self.log(f"unit {units.label(self.conn, unit)} ended without its close — judged "
                      f"{out.get('state')} from what its run left")
 
-    def _count_start(self, unit, lineage):
-        """The analysis-wide breaker. A unit closed on a start failure adds to
-        the run of them; any other close ends it -- an agent started, so the
-        environment works. START_FAIL_BREAKER in a row, over two lineages or
-        more, closes this orchestrator's gate with the agent's last words:
-        _loop stops launching, waits for what is in flight, and run() leaves
-        the analysis interrupted (GATE_NOTE), for a resume once the cause is
-        fixed. The tick never resumes it on its own: no orchestrator died. One
-        lineage alone is that unit's own trouble, given up by _launch_pass."""
+    def _count_cannot_run(self, unit, lineage):
+        """The analysis-wide breaker. A unit closed on one of BREAKER_CAUSES
+        -- an agent that never started, a provider that answered with an
+        error -- adds to the run of them; any other close ends it. BREAKER_RUNS
+        in a row, over two lineages or more, is the environment failing every
+        unit alike (analysis 12 spent 693 runs and 42 minutes proving that one
+        lineage at a time): the gate closes with the last cause's words,
+        _loop stops launching and waits for what is in flight, and run()
+        leaves the analysis interrupted (GATE_NOTE), for a resume once the
+        cause is fixed. The tick never resumes it on its own: no orchestrator
+        died. One lineage alone is that unit's own trouble, given up by
+        _launch_pass."""
         evidence = unit.get("evidence") or {}
-        if evidence.get("cause") != units.START_FAILED:
-            self.start_fails = []
+        cause = evidence.get("cause")
+        if cause not in BREAKER_CAUSES:
+            self.cannot_run = []
             return
-        self.start_fails.append((lineage, evidence.get("error", "")))
-        if (not self.gate and len(self.start_fails) >= START_FAIL_BREAKER
-                and len({lin for lin, _error in self.start_fails}) >= 2):
-            self.gate = START_FAIL_GATE.format(n=len(self.start_fails),
-                                               error=self.start_fails[-1][1])
+        self.cannot_run.append((lineage, cause, evidence.get("error", "")))
+        if (not self.gate and len(self.cannot_run) >= BREAKER_RUNS
+                and len({lin for lin, _cause, _error in self.cannot_run}) >= 2):
+            _lin, cause, error = self.cannot_run[-1]
+            n = len(self.cannot_run)
+            self.gate = (START_FAIL_GATE.format(n=n, error=error) if cause == units.START_FAILED
+                         else PROVIDER_GATE.format(n=n, cause=cause))
             self.log(f"stops launching: {self.gate}")
 
     def _outages_before(self, unit):
