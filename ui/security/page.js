@@ -23,6 +23,7 @@ export let $, TOKEN, api, toast, openLog, projById, sessionLost,
            // SAME state rather than keeping a second one that could disagree
            // about what is already in flight.
            markPending, clearPending, isPending, markIfPending,
+           showConfirm,
            // The chrome bridge (Phase 4 Task 1): pageHeader, kpiCard and
            // tableFooter are ui/app/chrome.js's own builders, read off
            // ALApp -- not imported -- because ui/security/ and ui/app/ are
@@ -121,6 +122,7 @@ export function bindPage(cc) {
   ({ $, TOKEN, api, toast, openLog, projById, sessionLost, unjournaledLive,
      fmtAgo, fmtWhen, fmtDur, money, icon, iconLabel, iconHTML, openProjectEditor,
      markPending, clearPending, isPending, markIfPending,
+     showConfirm,
      pageHeader, kpiCard, tableFooter, makePicker, createCombo, closeMenus,
      pushNav } = cc);
 }

@@ -57,6 +57,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a new one, repeating hours of reading that had already been proved.
   From the terminal: `agentloop security retry <project> <analysis-id>`.
   The dashboard asks for it through a new security_retry operation.
+  On the dashboard, a capped or failed analysis with units that gave up shows
+  **Retry failed units**, which says how many will run and on which commit
+  before it runs them.
 
 - **The run index keeps transcripts for 30 days, and every run's summary
   forever.** A finished run's stream, result, precheck output and stderr
