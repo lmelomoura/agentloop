@@ -51,6 +51,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   A provider that answers every unit with an error (`api_error`: an expired
   or revoked credential answers them all alike) pauses it the same way; a
   rate limit (429) does not, being transient.
+  An analysis whose agent exits before its first event on every unit is
+  therefore left `interrupted`, not `capped`.
 
 - **A capped or failed security analysis can be retried, running only what
   gave up.** `security/cli.py reopen` turns the newest analysis of a branch

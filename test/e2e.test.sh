@@ -318,7 +318,7 @@ echo
 }
 
 scenario_9() {
-echo "9. an agent that dies on launch still closes its analysis -- capped, not stuck running"
+echo "9. an agent that dies on launch pauses its analysis -- interrupted and resumable, never stuck running"
 cat > "$ROOT/dead-claude" <<'SH'
 #!/usr/bin/env bash
 exit 3
@@ -326,17 +326,20 @@ SH
 chmod +x "$ROOT/dead-claude"
 out9="$(AGENTLOOP_CLAUDE_BIN="$ROOT/dead-claude" "$AL" security analyze --detach sandbox anything main quick)"
 aid9="$(secid "$out9")"
-# Three runs of the hunt unit, each leaving nothing: the unit gives up and
-# the orchestrator closes the analysis from what the units proved -- capped,
-# with the give-up in the note, never a `running` row nobody closes.
+# Every unit's agent exits 3 before its first event: start failures, which
+# keep the unit's attempt. Three in a row, over two lineages, close the
+# orchestrator's gate, and the analysis is left interrupted with the cause in
+# its note -- for a Resume once it is fixed, never a `running` row nobody
+# closes, and never every unit given up one by one.
 w=0
 while [ "$w" -lt 60 ] && [ "$(secstate sandbox "$aid9")" = "running" ]; do sleep 1; w=$((w + 1)); done
-[ "$(secstate sandbox "$aid9")" = "capped" ] \
-  && ok "a claude that exits without a word still gets the row closed capped (waited ${w}s)" \
+[ "$(secstate sandbox "$aid9")" = "interrupted" ] \
+  && ok "a claude that exits without a word leaves the row interrupted, not running (waited ${w}s)" \
   || bad "left '$(secstate sandbox "$aid9")' after ${w}s"
 case "$(secnote sandbox "$aid9")" in
-  *"gave up after 3 runs"*) ok "and the note says the unit gave up after three runs" ;;
-  *) bad "no give-up in the coverage note: '$(secnote sandbox "$aid9")'" ;;
+  *"the agent could not start: 3 units in a row"*"the agent exited 3 with nothing on stderr"*)
+    ok "and the note names the pause and the agent's exit" ;;
+  *) bad "no pause in the coverage note: '$(secnote sandbox "$aid9")'" ;;
 esac
 sleep 1
 
