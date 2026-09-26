@@ -22,3 +22,34 @@ if bin_path not in sys.path:
 # is inspected rather than guessed at. The engine path has its own tests in
 # test_adapters.py, which switch it on explicitly.
 os.environ.setdefault("AL_SECURITY_ENGINES", "off")
+
+
+import contextlib
+import io
+
+import pytest
+
+
+@pytest.fixture
+def cli_inproc(monkeypatch):
+    """`bin/security/cli.py` run through its own `main()` in THIS process.
+
+    For SETUP, never for the verb a test is about: the process boundary is
+    the contract test_cli.py drives (an exit code and a line of JSON), and a
+    test asserting on that keeps the subprocess. What this is for is the
+    scaffolding around it -- the dozens of `report-finding` calls a test
+    needs before it can ask its one question. Each of those used to be a
+    python start-up of its own, and two tests spent ~25 s of a run doing
+    nothing else. Same verb, same argument parsing, same ledger writes; only
+    the interpreter is shared. Returns stdout, like the subprocess helpers.
+    """
+    from security import cli
+
+    def run(db, *args, stdin=""):
+        out = io.StringIO()
+        with monkeypatch.context() as m:
+            m.setattr("sys.stdin", io.StringIO(stdin))
+            with contextlib.redirect_stdout(out):
+                cli.main([*args, "--db", str(db)])
+        return out.getvalue()
+    return run

@@ -1378,10 +1378,79 @@ security_close_analysis() { # <job-id> <status> <cost> <wdreason> [stream] [root
   # $7, the classifier's cause (RJ_CAUSE), only when there is one: a
   # `rate_limited` or `api_error` run is the provider's doing, and unit-close
   # keeps the unit's attempt for it (units.close).
-  security_engine_py unit-close --analysis "$aid" --unit "$uid" \
-    --stream "${5:-}" --root "${6:-${run_cwd:-}}" --status "$2" --reason "${4:-}" \
-    --spend "${3:-0}" ${7:+--cause "$7"} >/dev/null 2>&1 \
-    || log_tick "$1: could not close unit $uid of analysis $aid"
+  #
+  # RJ_UNIT_CLOSED says the close LANDED: run_cleanup tears a unit's worktree
+  # down only then. A unit whose close failed is still `running`, and the
+  # orchestrator judges it from its stream against that checkout (a gone
+  # claim is proven by a file's absence there) -- removing it first would
+  # prove every file gone. Such a tree is the orchestrator's sweep to remove
+  # once it has judged (security_unit_sweep).
+  if security_engine_py unit-close --analysis "$aid" --unit "$uid" \
+       --stream "${5:-}" --root "${6:-${run_cwd:-}}" --status "$2" --reason "${4:-}" \
+       --spend "${3:-0}" ${7:+--cause "$7"} >/dev/null 2>&1; then
+    RJ_UNIT_CLOSED=1
+  else
+    log_tick "$1: could not close unit $uid of analysis $aid"
+  fi
+}
+
+# Is this run a unit of a security analysis? The derived job's id AND the
+# unit id in the run's own environment (security_run_unit): a derived job
+# run any other way is not a unit, and keeps the ordinary run's retention.
+security_unit_run() { # security_unit_run <job-id>
+  case "$1" in "$SECURITY_JOB_PREFIX"*) [ -n "${AL_SECURITY_UNIT_ID:-}" ] ;; *) return 1 ;; esac
+}
+
+# THE SWEEP AN ORCHESTRATOR RUNS WHEN IT EXITS (`__unit-sweep`, from
+# security/orchestrator.py): what its units left behind that no live run
+# owns. A unit tears its own worktree down and releases its own slot as its
+# run ends (run_cleanup), but a unit killed outright (SIGKILL, a crash) runs
+# nothing, and one whose close failed keeps its tree for the orchestrator's
+# judgement. By the time the orchestrator exits it has judged every unit
+# whose run is gone, so:
+#   - a slot whose pid is dead (slot_alive), or a pid-less one older than the
+#     grace (lock_abandoned) -- the rules slots_active applies -- is removed;
+#   - a run dir no live slot claims (wt_is_claimed, under $LOCK_DIR/.resume as
+#     wt_prune_orphans takes it) is closed `done` and torn down, which
+#     unregisters its worktrees from the analysed repo (wt_remove_all); a
+#     derived job never runs `down` (wt_down_all).
+# A unit still alive past the stop's grace keeps both: its own close settles
+# it, and its own cleanup removes them. Prints one line naming what went, or
+# nothing. Refuses a job that is not a derived security job: an ordinary
+# job's open sessions are kept for a resume, and this is no place to end one.
+security_unit_sweep() { # security_unit_sweep <job-id>
+  local jid="$1" d pid slots="" trees="" rlock="$LOCK_DIR/.resume"
+  case "$jid" in "$SECURITY_JOB_PREFIX"?*) ;; *) echo "not a security job: $jid" >&2; return 2 ;; esac
+  case "$jid" in */*|*..*) echo "not a security job: $jid" >&2; return 2 ;; esac
+  for d in "$LOCK_DIR/$jid"/*/; do        # the glob skips .analysis and .acq
+    d="${d%/}"
+    [ -d "$d" ] || continue
+    pid="$(cat "$d/pid" 2>/dev/null || true)"
+    if [ -n "$pid" ]; then
+      slot_alive "$d" && continue
+    else
+      lock_abandoned "$d" || continue
+    fi
+    lock_break "$d" "$(lock_id "$d")" "$pid" && slots="$slots ${d##*/}"
+  done
+  if [ -d "$WORKTREES_DIR/$jid" ]; then
+    for d in "$WORKTREES_DIR/$jid"/*; do
+      [ -d "$d" ] || continue              # skips the .<stamp>.tsv scratch files
+      lock_take "$rlock"
+      if ! wt_is_claimed "$jid" "$d"; then
+        printf 'done\n' > "$d/.ended" 2>/dev/null || true
+        wt_teardown "$jid" "" "$d"
+        [ -d "$d" ] || trees="$trees ${d##*/}"
+      fi
+      lock_drop "$rlock"
+    done
+  fi
+  if [ -n "$slots$trees" ]; then
+    printf 'swept %s unit worktree(s)%s and %s stale slot(s)%s\n' \
+      "$(set -- $trees; echo $#)" "${trees:+ (${trees# })}" \
+      "$(set -- $slots; echo $#)" "${slots:+ (${slots# })}"
+  fi
+  return 0
 }
 
 write_projects() { # write_projects <jq-filter> [jq-args...]
@@ -1542,6 +1611,9 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
     fi
     sleep 0.01
   done
+  # Held by THIS shell from here to its lock_drop (lock_drop_held), noted
+  # before the pid is written: from the pid on, the lock reads as alive.
+  AL_LOCKS_HELD="${AL_LOCKS_HELD:-}$d"$'\n'
   echo $$ > "$d/pid" 2>/dev/null || true
   # Written for the same reason a slot writes one: without it, a lock taken
   # before this change (or read by slot_alive's own predate-fallback) reads as
@@ -1550,7 +1622,41 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
   boot_id > "$d/boot" 2>/dev/null || true
   return 0
 }
-lock_drop() { rm -rf "${1:-}"; }   # rm -rf, not rmdir: the dir holds a pid file
+lock_drop() { # rm -rf, not rmdir: the dir holds a pid file
+  local nl=$'\n' held
+  rm -rf "${1:-}"
+  held="$nl${AL_LOCKS_HELD:-}"
+  held="${held/"$nl${1:-}$nl"/$nl}"
+  AL_LOCKS_HELD="${held#$nl}"
+}
+
+# THE LOCKS A SIGNAL LEFT THIS SHELL HOLDING, dropped. A run wrapper's EXIT
+# trap (run_cleanup) writes the state and the journal under the same locks
+# the run itself takes -- and a TERM that ends the wrapper INSIDE one of those
+# writes (a stop re-issued on every poll of the orchestrator's grace reaches
+# a unit's wrapper in its classifier) leaves that lock naming the wrapper's
+# own pid, alive. The cleanup's lock_take then waits on itself for ever, and
+# every other run behind it on that lock: two units of a stopped analysis
+# (CI, 2026-09-26) spun past the whole grace with .state.lock naming one of
+# them, their analysis left `running`, their slots and trees on disk.
+# AL_LOCKS_HELD is this shell's own list (lock_take adds, lock_drop removes;
+# a subshell's changes never reach its parent), so what is left in it when
+# the cleanup starts is exactly a write the signal cut short: gone with it,
+# never finished, and the write itself is atomic (a temp file and an mv).
+# Only while the lock still names this shell -- one taken over since
+# (lock_break) is somebody else's.
+lock_drop_held() { # lock_drop_held <job-id> -- the id names the run in tick.log
+  local rest="${AL_LOCKS_HELD:-}" d
+  while [ -n "$rest" ]; do
+    d="${rest%%$'\n'*}"; rest="${rest#*$'\n'}"
+    [ -n "$d" ] || continue
+    if [ "$(cat "$d/pid" 2>/dev/null || true)" = "$$" ]; then
+      rm -rf "$d"
+      log_tick "$1: dropped ${d#"$LOCK_DIR"/}, the lock a signal left this run holding"
+    fi
+  done
+  AL_LOCKS_HELD=""
+}
 
 # A slot is a LEASE, and a pid alone cannot express one. $LOCK_DIR lives under
 # data/, so every slot survives a reboot — and the kernel reissues pids from 1
@@ -4215,7 +4321,19 @@ run_record_stopped_early() { # <id> <slot-dir>
   # The run's verdict is `stopped`, which the unit's close continues at the
   # same attempt (nothing else; a job that is not derived returns at once),
   # the same close the classifier gives a run stopped after its agent ran.
-  security_close_analysis "$id" stopped 0 "$note" "$stream" "$wt"
+  # The ROOT is the run's primary checkout, the directory the agent ran in and
+  # its reads are relative to -- never the run dir that holds it: a gone
+  # claim is proven by a file's absence under the root, and under the run dir
+  # every repo-relative path is absent. Read off the run's manifest; with no
+  # checkout on disk, empty, and security_close_analysis falls back to the
+  # run's own cwd.
+  local root="" primary=""
+  if [ -n "$wt" ]; then
+    primary="$("$JQ" -r '.primary // ""' "$wt/.run.json" 2>/dev/null)"
+    case "$primary" in null) primary="" ;; esac
+    [ -n "$primary" ] && [ -d "$wt/$primary" ] && root="$wt/$primary"
+  fi
+  security_close_analysis "$id" stopped 0 "$note" "$stream" "$root"
   if [ -f "$slot/child" ]; then
     log_tick "$id: stopped by the user after its agent had already run"
   else
@@ -4226,6 +4344,22 @@ run_record_stopped_early() { # <id> <slot-dir>
 run_cleanup() { # <id> <slot-dir>
   local id="$1" slot="${2:-}" wt project
   [ -n "$slot" ] || return 0
+  # NOTHING INTERRUPTS THE CLEANUP. A stop is re-issued (the orchestrator
+  # asks `stop` on every poll of its grace), and _stop_slot TERMs the run
+  # wrapper itself once its agent is gone -- including a wrapper already in
+  # here, reached from the EXIT trap that the FIRST TERM set off. With TERM at
+  # its default, bash 3.2 dies on the second one mid-trap: the record half
+  # written, the unit's close never landed, the worktree never torn down, and
+  # the slot never released -- a dead slot left on disk, seen on a real install
+  # (analysis 22). A no-op handler, not `trap ''`: an ignored signal is
+  # inherited by every child the cleanup forks (the unit's close, git),
+  # a trapped one is reset to the default in them. Dropped at the end, the
+  # run being over.
+  trap ':' TERM INT HUP
+  # And nothing it needs is still held by the run it cleans up after: a TERM
+  # that ended the run mid-write left that write's lock naming this very
+  # process, and every lock_take below would wait on it for ever.
+  lock_drop_held "$id"
   run_record_stopped_early "$id" "$slot"
   wt="$(cat "$slot/worktree" 2>/dev/null || true)"
   if [ -n "$wt" ]; then
@@ -4257,9 +4391,27 @@ run_cleanup() { # <id> <slot-dir>
         printf 'open\n' > "$wt/.ended" 2>/dev/null || true
       fi
     fi
+    # A UNIT OF A SECURITY ANALYSIS KEEPS NOTHING, however its run ended --
+    # success, error, stopped. Retention exists for a session someone may
+    # resume and for work nobody pushed; a unit has neither. Its checkout is a
+    # detached copy of the analysis commit nobody inspects, its evidence is
+    # its stream (in $LOG_DIR, never in the tree) and a continuation runs in a
+    # fresh tree of its own. The one thing that needs the checkout is the
+    # close, which proves a claimed-gone file's absence there: so `done` once
+    # the unit's close has landed (RJ_UNIT_CLOSED, security_close_analysis --
+    # the classifier's, or run_record_stopped_early's just above). A close
+    # that failed leaves the unit `running` for the orchestrator to judge
+    # against this tree, and its sweep removes the tree afterwards
+    # (security_unit_sweep). Teardown then unregisters every worktree from
+    # the analysed repo (wt_remove_all) and never runs `down` for a derived
+    # job (wt_down_all).
+    if security_unit_run "$id" && [ "${RJ_UNIT_CLOSED:-0}" = "1" ]; then
+      printf 'done\n' > "$wt/.ended" 2>/dev/null || true
+    fi
     wt_teardown "$id" "$project" "$wt"
   fi
   release_slot "$slot"
+  trap - TERM INT HUP
 }
 
 lock_active() { # 0 = a run is currently holding the lock for <id> (single mutex)
@@ -6499,6 +6651,9 @@ $(run_ending_contract)" ;;
     log_tick "$id: already at max_parallel=$max_par run(s), not launching another"
     return 0
   fi
+  # No unit close has landed for THIS run yet (security_close_analysis sets
+  # it; run_cleanup reads it to tear a unit's tree down).
+  RJ_UNIT_CLOSED=0
   trap 'run_cleanup "'"$id"'" "'"$slot"'"' EXIT
 
   local forced="false"
@@ -8838,6 +8993,12 @@ case "${1:-}" in
   __unit-gate)
              [ $# -ge 2 ] || die "usage: agentloop __unit-gate <job-id>"
              security_unit_gate "$2" ;;
+  # Internal: what an analysis's units left that no live run owns -- dead
+  # slots and unclaimed worktrees -- removed by its orchestrator as it exits
+  # (security_unit_sweep). Prints one line naming what went, or nothing.
+  __unit-sweep)
+             [ $# -ge 2 ] || die "usage: agentloop __unit-sweep <job-id>"
+             security_unit_sweep "$2" ;;
   security)  shift
              case "${1:-}" in
                analyze) shift; [ $# -ge 3 ] || die "usage: agentloop security analyze [--detach] <project> <repo> <branch> [profile]"

@@ -44,6 +44,10 @@ stop <job>
     records one more call in FAKE_ENGINE_STOP (its text content is the count),
     which `slow`/`die-on-stop` wait on for existence and `late-stop` for the
     count to reach 2.
+__unit-sweep <job>
+    the sweep an orchestrator runs as it exits: appends <job> to
+    FAKE_ENGINE_SWEEP_CALLS when that names a file, and prints
+    FAKE_ENGINE_SWEEP_SAYS when set (the engine's one line of what went).
 __unit-gate <job>
     the engine's gates for a launch: exits 0 (open), or -- with
     FAKE_ENGINE_GATE set -- prints it and exits 3, as a closed gate does. Each
@@ -223,6 +227,13 @@ if sys.argv[1] == "__run-unit":
     run_unit(sys.argv[2], sys.argv[3], sys.argv[4])
 elif sys.argv[1] == "stop":
     Path(os.environ["FAKE_ENGINE_STOP"]).write_text(str(stop_count() + 1))
+elif sys.argv[1] == "__unit-sweep":
+    calls = os.environ.get("FAKE_ENGINE_SWEEP_CALLS")
+    if calls:
+        with open(calls, "a", encoding="utf-8") as out:
+            out.write(f"{sys.argv[2]}\n")
+    if os.environ.get("FAKE_ENGINE_SWEEP_SAYS"):
+        print(os.environ["FAKE_ENGINE_SWEEP_SAYS"])
 elif sys.argv[1] == "__unit-gate":
     calls = os.environ.get("FAKE_ENGINE_GATE_CALLS")
     if calls:
