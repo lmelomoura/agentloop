@@ -56,6 +56,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   many units ran again. Before, the only way on from a `capped` analysis was
   a new one, repeating hours of reading that had already been proved.
   From the terminal: `agentloop security retry <project> <analysis-id>`.
+  The dashboard asks for it through a new security_retry operation.
 
 - **The run index keeps transcripts for 30 days, and every run's summary
   forever.** A finished run's stream, result, precheck output and stderr

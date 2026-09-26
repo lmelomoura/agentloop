@@ -429,6 +429,18 @@ def test_resume_asks_the_engine_to_resume_that_analysis_of_that_project(srv, mon
     assert srv.security_resume({"project": "", "analysis": 7})[0] == 400
 
 
+def test_retry_asks_the_engine_to_retry_that_analysis_of_that_project(srv, monkeypatch):
+    calls = []
+    monkeypatch.setattr(srv, "al", lambda args, **kw: (calls.append(args) or (True, '{"analysis_id":7,"retried":3}')))
+    code, body = srv.security_retry({"project": "web", "analysis": 7})
+    assert (code, calls) == (200, [["security", "retry", "web", "7"]])
+    assert srv.security_retry({"project": "web", "analysis": "7; rm -rf /"})[0] == 400
+    assert srv.security_retry({"project": "", "analysis": 7})[0] == 400
+    monkeypatch.setattr(srv, "al", lambda args, **kw: (False, "analysis 7 is done: only a capped or failed analysis is retried"))
+    assert srv.security_retry({"project": "web", "analysis": 7}) == (
+        500, {"error": "analysis 7 is done: only a capped or failed analysis is retried"})
+
+
 def test_the_checklist_says_whether_the_orchestrator_is_alive_and_in_which_phase(clean_data, monkeypatch):
     """Between two units of an analysis no slot is alive, and the page used to
     call that a dead analysis. The orchestrator's lock is the fact: alive by
