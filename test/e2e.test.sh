@@ -1733,6 +1733,16 @@ done
 [ -z "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ] \
   && ok "and nothing of it still runs: no slot, no orchestrator lock (waited ${w}s)" \
   || bad "left behind after ${w}s: $(ls -A "$ROOT/data/locks/security-sandbox")"
+# NOR ANY OF ITS CHECKOUTS. A unit's tree is a detached copy of the analysis
+# commit, kept by nobody: a stop used to leave every stopped unit's tree on
+# disk, open for a resume no one can make, and registered in the analysed
+# repo (analysis 22 on a real install, 2026-09-25).
+[ -z "$(dirs security-sandbox)" ] \
+  && ok "and no unit worktree is left on disk" \
+  || bad "unit worktrees left after the stop: $(dirs security-sandbox)"
+git -C "$ROOT/work/app" worktree list --porcelain | grep -qF "/data/worktrees/security-sandbox/" \
+  && bad "the analysed repo still lists a unit worktree: $(git -C "$ROOT/work/app" worktree list)" \
+  || ok "and the analysed repo lists none"
 FAKE_MODE=complete FAKE_SESSION=sess-56b "$AL" security resume sandbox "$aid56" >/dev/null 2>&1
 w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid56")" != "done" ]; do sleep 1; w=$((w + 1)); done
 [ "$(secstate sandbox "$aid56")" = "done" ] \

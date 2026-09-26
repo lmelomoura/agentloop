@@ -373,7 +373,39 @@ class Orchestrator:
         finally:
             for s, handler in previous.items():
                 signal.signal(s, handler)
+            self._sweep()
             self._release()
+
+    def _sweep(self):
+        """What the units left that no live run owns, removed as this
+        orchestrator exits -- done, capped, interrupted or failed -- and
+        while it still holds the analysis lock, so no next analysis is
+        launching units meanwhile. A unit tears its own tree down and
+        releases its own slot when its run ends, but one killed outright runs
+        nothing, and one whose close failed keeps its tree for the judgement
+        this orchestrator has made by now. The engine decides what is dead
+        (`__unit-sweep`: slot_alive, lock_abandoned, wt_is_claimed -- the
+        rules every other walker of the slots applies), never a second copy
+        of them here; then `git worktree prune` in the analysed repo, for a
+        registration whose directory is already gone. One tick.log line
+        when something went. Never raises: a sweep that fails leaves what
+        the tick's own TTL sweep removes later."""
+        try:
+            out = subprocess.run([self.engine, "__unit-sweep", self.job], env=self.env,
+                                 capture_output=True, text=True, timeout=300,
+                                 stdin=subprocess.DEVNULL)
+            said = (out.stdout or "").strip().splitlines()
+            if out.returncode != 0:
+                self.log(f"could not sweep what its units left (rc {out.returncode}): "
+                         f"{(out.stderr or '').strip()[-200:]}")
+            elif said:
+                self.log(said[-1])
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.log(f"could not sweep what its units left: {exc}")
+        try:
+            self._git("worktree", "prune")
+        except OSError:
+            pass
 
     def _run(self) -> int:
         row = self._row()

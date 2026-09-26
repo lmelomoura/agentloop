@@ -578,6 +578,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A security unit leaves no worktree or slot behind, however its run
+  ends.** A Stop of a pipeline analysis left every stopped unit's checkout on
+  disk (~83 MB for three units), still listed by the analysed repo's `git
+  worktree list`, kept `open` for a resume nobody can make — and one unit's
+  slot directory with a dead pid. The slot was a second stop's doing: the
+  orchestrator re-issues `stop` on every poll of its grace, `_stop_slot`
+  TERMs a run's wrapper once its agent is gone, and bash 3.2 died on that
+  second TERM inside the EXIT trap the first one had set off — record half
+  written, the unit's close never landed, the tree never torn down, the slot
+  never released. The run's cleanup now ignores a further TERM, INT or HUP
+  (a no-op handler, so the processes it forks keep the default), and first
+  drops any lock the stop left the run holding: a TERM that ended a wrapper
+  inside its own state or journal write left that lock naming the wrapper's
+  live pid, and the cleanup waited on itself for ever — with every other
+  unit queued behind the same lock, the analysis stayed `running` past the
+  whole grace, both slots and trees on disk (the e2e suite on CI, where a
+  slow runner lets the re-issued stop land mid-write). A unit's
+  tree is torn down as its run ends — success, error or stopped — once its
+  close has landed; a unit whose close failed keeps it for the
+  orchestrator's judgement. The orchestrator, as it exits (done, capped,
+  interrupted or failed), asks the engine to sweep its job
+  (`__unit-sweep`): slots whose pid is dead, pid-less ones past the grace,
+  and unit trees no live run claims go, with one tick.log line naming them,
+  then `git worktree prune` in the analysed repo. A unit stopped after its
+  agent ran is now closed against its primary checkout, not the run dir
+  holding it, and a close whose checkout is no longer on disk proves no
+  file absent — either used to settle a claimed-gone finding on nothing.
+  Ordinary jobs keep their retention unchanged.
+
 - **The Security project page's two "lines" numbers now say what each one
   counts, and where it comes from.** The header's "Lines of code"
   (`cmd_project_data`, `bin/security/cli.py`) counts every text line of the
@@ -600,7 +629,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **A triage unit is now told how its "gone" reading is proven, per
   platform.** Its report-gone rule said to read the file first but never
-  said what counts as reading it; a session on the Codex CLI reported a
+  said what counts as reading it; a session reported a
   carried `sast` finding gone after reading it with `sed -n` in a shell
   call, and the judge (`_unread_files`/`_judge_triage`,
   `bin/security/units.py`) refused the claim three times in a row because

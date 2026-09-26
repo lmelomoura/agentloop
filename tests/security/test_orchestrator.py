@@ -503,6 +503,97 @@ def test_a_stop_reaches_a_unit_that_was_still_starting(world, monkeypatch):
     assert not any(u["state"] == "running" for u in _units(world))
 
 
+def _stale_registration(world, name):
+    """A worktree of the analysed repo whose directory is gone and whose
+    registration is not -- what a unit's tree removed by hand, or by a crash
+    halfway through its teardown, leaves in `git worktree list`."""
+    tree = world["tmp"] / name
+    subprocess.run(["git", "-C", str(world["repo"]), "worktree", "add", "-q", "--detach",
+                    str(tree), world["sha"]], check=True, env=GIT_ENV)
+    subprocess.run(["rm", "-rf", str(tree)], check=True)
+    return tree
+
+
+def _registered(world, tree):
+    out = subprocess.run(["git", "-C", str(world["repo"]), "worktree", "list", "--porcelain"],
+                         capture_output=True, text=True, check=True).stdout
+    return f"worktree {tree}" in out or f"worktree {os.path.realpath(tree)}" in out
+
+
+def test_an_orchestrator_that_closes_sweeps_what_its_units_left(world, monkeypatch):
+    """Done: the engine's `__unit-sweep` is asked for this job, its line goes
+    into tick.log, and the analysed repo's registrations of trees that are
+    gone are pruned."""
+    calls, log = world["tmp"] / "sweeps", world["tmp"] / "tick.log"
+    monkeypatch.setenv("FAKE_ENGINE_SWEEP_CALLS", str(calls))
+    monkeypatch.setenv("FAKE_ENGINE_SWEEP_SAYS", "swept 1 unit worktree(s) (x-1) and 0 stale slot(s)")
+    tree = _stale_registration(world, "unit-tree")
+    assert _registered(world, tree)
+    assert _orchestrator(world, log=str(log)).run() == 0
+    assert _row(world)["state"] == "done"
+    assert calls.read_text() == "security-web\n"
+    assert "swept 1 unit worktree(s) (x-1) and 0 stale slot(s)" in log.read_text()
+    assert not _registered(world, tree), "the stale registration outlived the analysis"
+
+
+def test_an_orchestrator_that_is_stopped_sweeps_too(world, monkeypatch):
+    """Interrupted, by the stop a dashboard sends: the sweep runs after the
+    units' runs were stopped and judged, once, before the lock goes."""
+    calls, log = world["tmp"] / "sweeps", world["tmp"] / "tick.log"
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "die-on-stop")
+    monkeypatch.setenv("FAKE_ENGINE_SWEEP_CALLS", str(calls))
+    monkeypatch.setenv("FAKE_ENGINE_SWEEP_SAYS", "swept 3 unit worktree(s) (a b c) and 1 stale slot(s) (36115)")
+    tree = _stale_registration(world, "stopped-unit-tree")
+    lock = world["tmp"] / "lock"
+    lock.mkdir()
+    proc = _spawn(world, log=str(log), lock_dir=str(lock))
+    (lock / "pid").write_text(f"{proc.pid}\n")
+    logs = world["tmp"] / "logs" / "security-web"
+    deadline = time.time() + 60
+    while time.time() < deadline and not list(logs.glob("*.stream.ndjson")):
+        time.sleep(0.1)
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=60) == 0
+    assert _row(world)["state"] == "interrupted"
+    assert calls.read_text() == "security-web\n"
+    text = log.read_text()
+    assert "swept 3 unit worktree(s) (a b c) and 1 stale slot(s) (36115)" in text
+    # After the interruption was written, never before: the sweep must come
+    # once every unit it could remove the tree of has been judged.
+    assert text.index("interrupted") < text.index("swept 3")
+    assert not _registered(world, tree)
+    assert not lock.exists(), "the lock is released after the sweep"
+
+
+def test_an_orchestrator_that_fails_still_sweeps(world, monkeypatch):
+    """A raise in the loop leaves the analysis interrupted -- and the sweep
+    still runs: the `finally` that lets the lock go runs it first."""
+    calls = world["tmp"] / "sweeps"
+    monkeypatch.setenv("FAKE_ENGINE_SWEEP_CALLS", str(calls))
+    orch = _orchestrator(world)
+
+    def boom():
+        raise RuntimeError("the loop broke")
+    monkeypatch.setattr(orch, "_loop", boom)
+    assert orch.run() == 1
+    assert _row(world)["state"] == "interrupted"
+    assert calls.read_text() == "security-web\n"
+
+
+def test_a_sweep_the_engine_cannot_run_is_said_and_never_raises(world, monkeypatch, tmp_path):
+    """An engine that answers the sweep non-zero: one line saying so, and the
+    analysis closes exactly as it would have."""
+    engine = tmp_path / "engine-sweep-fails"
+    engine.write_text("#!/bin/sh\n"
+                      f"[ \"$1\" = __unit-sweep ] && {{ echo 'no such job' >&2; exit 2; }}\n"
+                      f"exec {sys.executable} {FAKE} \"$@\"\n")
+    engine.chmod(0o755)
+    log = world["tmp"] / "tick.log"
+    assert _orchestrator(world, engine=str(engine), log=str(log)).run() == 0
+    assert _row(world)["state"] == "done"
+    assert "could not sweep what its units left (rc 2): no such job" in log.read_text()
+
+
 def test_the_close_never_settles_an_analysis_interrupted_under_it(world):
     """A stop, or the next Analyse's sweep, can interrupt the analysis while
     this loop is ending: the close is `--if-running`, so the row stays

@@ -6466,11 +6466,15 @@ PY
     && ok "a unit stopped before its agent closes its unit as stopped" \
     || bad "security_py calls: $(cat "$tmp/secpy.calls")"
   # Stopped AFTER its agent ran ($slot/child): the close gets the stream
-  # run_job wrote beside $slot/logfile and the run's root from
-  # $slot/worktree -- evidence already paid for, which the close judges the
-  # unit by (reads counted, a subagent seen) instead of by nothing.
+  # run_job wrote beside $slot/logfile and the run's root -- the PRIMARY
+  # checkout inside $slot/worktree, named by its manifest, never the run dir
+  # itself: under the run dir every repo-relative path is absent, and a gone
+  # claim is proven by exactly that absence -- evidence already paid for,
+  # which the close judges the unit by (reads counted, a subagent seen)
+  # instead of by nothing.
   local sl7="$tmp/locks/security-app/783" wt7="$tmp/stopwt7"
-  mkdir -p "$sl7" "$tmp/stoplogs/security-app" "$wt7"
+  mkdir -p "$sl7" "$tmp/stoplogs/security-app" "$wt7/app"
+  printf '{"primary":"app"}\n' > "$wt7/.run.json"
   echo 783 > "$sl7/pid"; echo 1700000000 > "$sl7/start"; : > "$sl7/stopped"; : > "$sl7/child"
   echo "$tmp/stoplogs/security-app/20260925T100000Z-783.json" > "$sl7/logfile"
   echo "$wt7" > "$sl7/worktree"
@@ -6481,7 +6485,7 @@ PY
     AL_SECURITY_ANALYSIS_ID=41 AL_SECURITY_UNIT_ID=10
     security_py() { printf '%s\n' "$*" >> "$tmp/secpy.calls"; }
     run_record_stopped_early security-app "$sl7" ) >/dev/null 2>&1
-  grep -q "^unit-close --analysis 41 --unit 10 --stream $tmp/stoplogs/security-app/20260925T100000Z-783.stream.ndjson --root $wt7 --status stopped " "$tmp/secpy.calls" \
+  grep -q "^unit-close --analysis 41 --unit 10 --stream $tmp/stoplogs/security-app/20260925T100000Z-783.stream.ndjson --root $wt7/app --status stopped " "$tmp/secpy.calls" \
     && ok "a unit stopped after its agent ran is closed with the stream and the root its run left" \
     || bad "stopped-early close with evidence: $(cat "$tmp/secpy.calls")"
   : > "$tmp/secpy.calls"
@@ -6675,6 +6679,213 @@ PY
   [ ! -d "$rd8" ] && ok "no agent ever spawned still closes the run as done" \
     || bad "a genuinely pre-agent stop was left open, unable to ever close"
   rm -rf "$tmp/locks/j2" "$tmp/wtroot/j2/stampS" "$tmp/wtroot/j2/stampS2"
+
+  echo "run_cleanup() — a security unit's worktree goes however its run ended, once its close has landed"
+  # Analysis 22 on a real install (2026-09-25): a Stop left the three stopped
+  # units' trees on disk, still in the analysed repo's `git worktree list`,
+  # kept as `open` sessions for a resume nobody can make. A unit's checkout
+  # is a detached copy of the analysis commit, and its evidence is its
+  # stream: the same stop the j2 fixture above keeps OPEN tears a unit's
+  # tree down, unregisters it, and releases the slot.
+  local urd="$tmp/wtroot/security-app/stampU" usl="$tmp/uslocks/security-app/991"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup security-app two "$tmp/g/repo" stampU ) >/dev/null 2>&1
+  mkdir -p "$usl" "$tmp/uclogs/security-app"
+  echo 991 > "$usl/pid"; echo 1700000000 > "$usl/start"
+  echo "$urd" > "$usl/worktree"
+  echo "$tmp/uclogs/security-app/20260925T100000Z-991.json" > "$usl/logfile"
+  echo 12345 > "$usl/child"; : > "$usl/stopped"
+  : > "$tmp/uclogs/security-app/20260925T100000Z-991.stream.ndjson"
+  : > "$tmp/uc.calls"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    LOCK_DIR="$tmp/uslocks"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/uc.ndjson"; STATE_FILE="$tmp/ucstate.json"
+    LOG_DIR="$tmp/uclogs"; TICK_LOG="$tmp/uc.tick"
+    AL_SECURITY_ANALYSIS_ID=41 AL_SECURITY_UNIT_ID=11
+    security_py() { printf '%s\n' "$*" >> "$tmp/uc.calls"; }
+    run_cleanup security-app "$usl" ) >/dev/null 2>&1
+  grep -q "^unit-close --analysis 41 --unit 11 .* --root $urd/one --status stopped " "$tmp/uc.calls" \
+    && ok "the unit is closed first, judged against its primary checkout" \
+    || bad "unit close: $(cat "$tmp/uc.calls")"
+  [ -d "$tmp/wtroot/security-app" ] && [ ! -d "$urd" ] \
+    && ok "then its worktree is torn down, not kept open for a resume" \
+    || bad "a stopped unit's tree survived its run"
+  got="$(git -C "$tmp/g/repo" worktree list --porcelain 2>/dev/null | grep -c stampU || true)"
+  [ "$(num "$got")" = "0" ] && ok "and the analysed repo no longer lists it" \
+    || bad "git worktree list still names stampU $got time(s)"
+  [ ! -d "$usl" ] && ok "and its slot is released" || bad "the unit's slot survived"
+
+  echo "run_cleanup() — a unit whose close failed keeps its tree for the orchestrator's judgement"
+  # Still `running`: the orchestrator judges it from its stream against this
+  # checkout (a gone claim is proven by a file's absence there) and sweeps
+  # the tree afterwards. The slot goes either way.
+  local urd2="$tmp/wtroot/security-app/stampU2" usl2="$tmp/uslocks/security-app/992"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup security-app two "$tmp/g/repo" stampU2 ) >/dev/null 2>&1
+  mkdir -p "$usl2"
+  echo 992 > "$usl2/pid"; echo 1700000000 > "$usl2/start"; echo "$urd2" > "$usl2/worktree"
+  echo "$tmp/uclogs/security-app/20260925T100001Z-992.json" > "$usl2/logfile"
+  echo 12346 > "$usl2/child"; : > "$usl2/stopped"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    LOCK_DIR="$tmp/uslocks"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/uc.ndjson"; STATE_FILE="$tmp/ucstate.json"
+    LOG_DIR="$tmp/uclogs"; TICK_LOG="$tmp/uc.tick"
+    AL_SECURITY_ANALYSIS_ID=41 AL_SECURITY_UNIT_ID=12
+    security_py() { return 1; }
+    run_cleanup security-app "$usl2" ) >/dev/null 2>&1
+  [ -d "$urd2/one" ] && ok "a close that did not land leaves the checkout for the judgement" \
+    || bad "the tree went before the orchestrator could judge the unit"
+  [ ! -d "$usl2" ] && ok "and still releases the slot" || bad "the slot survived a failed close"
+
+  echo "run_cleanup() — a re-issued stop cannot kill the cleanup halfway (the slot of analysis 22)"
+  # The slot that survived on the real install: the orchestrator re-issues
+  # `stop` on every poll of its grace, _stop_slot TERMs the run wrapper once
+  # its agent is gone, and the first TERM sets off the EXIT trap -- run_cleanup.
+  # With TERM at its default, bash 3.2 died on the SECOND one inside the
+  # trap: record half written, close never landed, tree kept, slot left on
+  # disk with a dead pid. Here the unit's close is slow (a stub that sleeps)
+  # and two more TERMs land while it runs.
+  local urd3="$tmp/wtroot/security-app/stampU3" usl3="$tmp/uslocks/security-app/993"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup security-app two "$tmp/g/repo" stampU3 ) >/dev/null 2>&1
+  mkdir -p "$usl3"
+  echo 993 > "$usl3/pid"; echo 1700000000 > "$usl3/start"; echo "$urd3" > "$usl3/worktree"
+  echo "$tmp/uclogs/security-app/20260925T100002Z-993.json" > "$usl3/logfile"
+  echo 12347 > "$usl3/child"; : > "$usl3/stopped"
+  rm -f "$tmp/uterm.ready" "$tmp/uterm.closing" "$tmp/uterm.closed" "$tmp/uterm.sleep"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    LOCK_DIR="$tmp/uslocks"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/uc.ndjson"; STATE_FILE="$tmp/ucstate.json"
+    LOG_DIR="$tmp/uclogs"; TICK_LOG="$tmp/uc.tick"
+    AL_SECURITY_ANALYSIS_ID=41 AL_SECURITY_UNIT_ID=13
+    security_py() { : > "$tmp/uterm.closing"; sleep 2; : > "$tmp/uterm.closed"; }
+    trap 'run_cleanup security-app "'"$usl3"'"' EXIT
+    sleep 30 & echo $! > "$tmp/uterm.sleep"
+    : > "$tmp/uterm.ready"
+    wait ) >/dev/null 2>&1 &
+  local upid=$! _i=0
+  while [ ! -f "$tmp/uterm.ready" ] && [ "$_i" -lt 200 ]; do sleep 0.05; _i=$((_i + 1)); done
+  kill -TERM "$upid" 2>/dev/null
+  _i=0
+  while [ ! -f "$tmp/uterm.closing" ] && [ "$_i" -lt 200 ]; do sleep 0.05; _i=$((_i + 1)); done
+  kill -TERM "$upid" 2>/dev/null; sleep 0.2; kill -TERM "$upid" 2>/dev/null
+  wait "$upid" 2>/dev/null
+  kill "$(cat "$tmp/uterm.sleep" 2>/dev/null)" 2>/dev/null
+  [ -f "$tmp/uterm.closing" ] && ok "the stop reached the cleanup while the unit's close was running" \
+    || bad "the fixture never reached the unit's close"
+  [ -f "$tmp/uterm.closed" ] && ok "the TERMs that followed did not cut the close short" \
+    || bad "a re-issued TERM killed the cleanup mid-close"
+  [ ! -d "$usl3" ] && ok "the slot is released however many stops arrive" \
+    || bad "a re-issued TERM left the slot behind (dead pid, 'stopped' file)"
+  [ ! -d "$urd3" ] && ok "and the unit's tree is gone" || bad "the tree survived a TERM storm"
+
+  echo "run_cleanup() — a stop that ends the run mid-write does not wedge the cleanup on the write's own lock"
+  # CI, 2026-09-26 (scenario 56 of the e2e suite): the re-issued stop TERM'd
+  # a unit's wrapper while it held .state.lock, inside the classifier's own
+  # state write. The EXIT trap's cleanup then asked for that lock -- naming
+  # the wrapper's own pid, alive -- and waited on itself for ever; the second
+  # unit waited behind it, and the analysis stayed `running` past the whole
+  # grace with both slots and trees on disk. Here the run holds the state lock
+  # when the TERM lands; the cleanup must still finish, promptly.
+  local urd4="$tmp/wtroot/security-app/stampU4" usl4="$tmp/uslocks/security-app/994"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup security-app two "$tmp/g/repo" stampU4 ) >/dev/null 2>&1
+  mkdir -p "$usl4"
+  echo 994 > "$usl4/pid"; echo 1700000000 > "$usl4/start"; echo "$urd4" > "$usl4/worktree"
+  echo "$tmp/uclogs/security-app/20260925T100003Z-994.json" > "$usl4/logfile"
+  echo 12348 > "$usl4/child"; : > "$usl4/stopped"
+  rm -rf "$tmp/uslocks/.state.lock"; rm -f "$tmp/ulock.ready" "$tmp/ulock.sleep" "$tmp/ulock.closed"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    LOCK_DIR="$tmp/uslocks"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/uc.ndjson"; STATE_FILE="$tmp/ucstate.json"
+    LOG_DIR="$tmp/uclogs"; TICK_LOG="$tmp/uc.tick"
+    AL_SECURITY_ANALYSIS_ID=41 AL_SECURITY_UNIT_ID=14
+    security_py() { : > "$tmp/ulock.closed"; }
+    trap 'run_cleanup security-app "'"$usl4"'"' EXIT
+    _state_lock                       # the write the TERM cuts short
+    sleep 30 & echo $! > "$tmp/ulock.sleep"
+    : > "$tmp/ulock.ready"
+    wait ) >/dev/null 2>&1 &
+  # disowned: it is polled, not waited for, and bash would otherwise print
+  # its signal death into the suite's output
+  local lpid4=$! _i=0
+  disown "$lpid4" 2>/dev/null || true
+  while [ ! -f "$tmp/ulock.ready" ] && [ "$_i" -lt 200 ]; do sleep 0.05; _i=$((_i + 1)); done
+  kill -TERM "$lpid4" 2>/dev/null
+  _i=0
+  while kill -0 "$lpid4" 2>/dev/null && [ "$_i" -lt 300 ]; do sleep 0.05; _i=$((_i + 1)); done
+  if kill -0 "$lpid4" 2>/dev/null; then
+    bad "the cleanup was still waiting 15s after the stop -- on the state lock its own run left held ($(cat "$tmp/uslocks/.state.lock/pid" 2>/dev/null))"
+    kill -9 "$lpid4" 2>/dev/null
+  else
+    ok "the cleanup finished although the stop cut the run's state write short"
+  fi
+  kill "$(cat "$tmp/ulock.sleep" 2>/dev/null)" 2>/dev/null
+  [ -f "$tmp/ulock.closed" ] && [ ! -d "$usl4" ] && [ ! -d "$urd4" ] \
+    && ok "the unit was closed, its slot released and its tree torn down" \
+    || bad "after a stop mid-write: closed=$([ -f "$tmp/ulock.closed" ] && echo y || echo n) slot=$([ -d "$usl4" ] && echo kept || echo gone) tree=$([ -d "$urd4" ] && echo kept || echo gone)"
+  [ ! -d "$tmp/uslocks/.state.lock" ] && ok "and the state lock is free for every other run" \
+    || bad "the state lock outlived the cleanup: pid $(cat "$tmp/uslocks/.state.lock/pid" 2>/dev/null)"
+  grep -qF "security-app: dropped .state.lock, the lock a signal left this run holding" "$tmp/uc.tick" \
+    && ok "tick.log names the lock the stop left held" \
+    || bad "no tick.log line for the dropped lock: $(tail -2 "$tmp/uc.tick" 2>/dev/null)"
+  # Only its OWN: a lock this shell once took that now names somebody else
+  # (broken and taken over meanwhile) is that somebody's, and stays.
+  mkdir -p "$tmp/uslocks/.other.lock"; echo 424242 > "$tmp/uslocks/.other.lock/pid"
+  ( LOCK_DIR="$tmp/uslocks"; TICK_LOG="$tmp/uc.tick"
+    AL_LOCKS_HELD="$tmp/uslocks/.other.lock"$'\n'
+    lock_drop_held security-app ) >/dev/null 2>&1
+  [ -d "$tmp/uslocks/.other.lock" ] && ok "a lock that names another holder is never dropped" \
+    || bad "lock_drop_held removed a lock another process holds"
+  rm -rf "$tmp/uslocks/.other.lock"
+  # And lock_drop keeps the list honest: a lock taken and dropped normally
+  # leaves nothing behind for a cleanup to drop.
+  got="$( LOCK_DIR="$tmp/uslocks"; AL_LOCKS_HELD=""
+          lock_take "$tmp/uslocks/.a b.lock"; lock_take "$tmp/uslocks/.c.lock"
+          lock_drop "$tmp/uslocks/.a b.lock"; printf '[%s]' "$AL_LOCKS_HELD"; lock_drop "$tmp/uslocks/.c.lock"
+          printf '[%s]' "$AL_LOCKS_HELD" )"
+  [ "$got" = "[$tmp/uslocks/.c.lock"$'\n'"][]" ] && ok "lock_take lists what this shell holds and lock_drop takes it off" \
+    || bad "held-lock list after take/take/drop/drop: $got"
+
+  echo "security_unit_sweep() — what an analysis's units left goes; a live unit keeps its own"
+  # The orchestrator's sweep as it exits (`__unit-sweep`): a slot whose pid
+  # is dead (slot_alive), a pid-less one older than the grace
+  # (lock_abandoned), a tree no live slot claims (wt_is_claimed). A live
+  # unit's slot and tree, a pid-less slot still being claimed, and the
+  # analysis lock itself stay.
+  local srd_dead="$tmp/wtroot/security-sw/stampDead" srd_live="$tmp/wtroot/security-sw/stampLive"
+  local ssl="$tmp/uslocks/security-sw" dpid lpid
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup security-sw two "$tmp/g/repo" stampDead
+    wt_setup security-sw two "$tmp/g/repo" stampLive ) >/dev/null 2>&1
+  ( : ) & dpid=$!; wait "$dpid" 2>/dev/null
+  mkdir -p "$ssl/$dpid" "$ssl/424242" "$ssl/434343" "$ssl/.analysis"
+  echo "$dpid" > "$ssl/$dpid/pid"; boot_id > "$ssl/$dpid/boot"; echo "$srd_dead" > "$ssl/$dpid/worktree"
+  touch -t 202001010000 "$ssl/424242"
+  sleep 60 & lpid=$!
+  mkdir -p "$ssl/$lpid"; echo "$lpid" > "$ssl/$lpid/pid"; boot_id > "$ssl/$lpid/boot"
+  echo "$srd_live" > "$ssl/$lpid/worktree"
+  echo "$lpid" > "$ssl/.analysis/pid"
+  got="$( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+          LOCK_DIR="$tmp/uslocks"; TICK_LOG="$tmp/uc.tick"
+          security_unit_sweep security-sw 2>&1 )"
+  [ ! -d "$srd_dead" ] && ok "an unclaimed unit tree is torn down" || bad "the dead unit's tree survived the sweep"
+  [ "$(num "$(git -C "$tmp/g/repo" worktree list --porcelain 2>/dev/null | grep -c stampDead || true)")" = "0" ] \
+    && ok "and unregistered from the analysed repo" || bad "git still lists stampDead"
+  [ -d "$srd_live/one" ] && [ -d "$ssl/$lpid" ] \
+    && ok "a live unit keeps its tree and its slot" || bad "the sweep took a live unit's tree or slot"
+  [ ! -d "$ssl/$dpid" ] && [ ! -d "$ssl/424242" ] \
+    && ok "a dead slot and an abandoned pid-less one are removed" || bad "a stale slot survived the sweep"
+  [ -d "$ssl/434343" ] && [ -d "$ssl/.analysis" ] \
+    && ok "a slot still being claimed, and the analysis lock, are left alone" \
+    || bad "the sweep removed a young pid-less slot or the analysis lock"
+  case "$got" in
+    "swept 1 unit worktree(s) (stampDead) and 2 stale slot(s) ("*) ok "and it says, in one line, what went" ;;
+    *) bad "sweep said '$got'" ;;
+  esac
+  got="$( LOCK_DIR="$tmp/uslocks"; WORKTREES_DIR="$tmp/wtroot"; security_unit_sweep j2 2>&1 )"; rc=$?
+  [ "$rc" -eq 2 ] && ok "an ordinary job is refused: its open sessions are not the sweep's to end" \
+    || bad "an ordinary job was swept (rc $rc: $got)"
+  kill "$lpid" 2>/dev/null; wait "$lpid" 2>/dev/null
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"
+    wt_remove_all "$srd_live"; wt_remove_all "$urd2" ) >/dev/null 2>&1
+  rm -rf "$tmp/uslocks" "$tmp/wtroot/security-sw" "$tmp/wtroot/security-app"
 
   echo "_stop_slot() — a live pid from an earlier boot is cleared, never signalled"
   # Same reboot-recycled-pid risk slot_alive exists for, but with teeth: the old
