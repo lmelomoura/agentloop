@@ -699,6 +699,17 @@ wt_prune_orphans() {
     # through claiming. The identical race 9.5 closed for a human's
     # worktree-drop, reopened here for the sweep that runs every tick.
     wt_is_claimed "$id" "$d" && return 0
+    # GONE WHILE THIS SWEEP WAITED FOR THE LOCK. The loop below tests `-d`
+    # BEFORE taking $rlock, and every run_job takes the same lock as it
+    # starts: a unit that tore its tree down and released its slot in that
+    # wait reached the adoption branch below with no marker and no owner,
+    # and its `touch` left a 0-byte FILE where the run dir had been
+    # (analysis 12, 2026-09-26; OpenCode then failed every boot of the
+    # project on that path, measurement 39). Asked AFTER the claim, never
+    # before: run_cleanup removes a tree first and releases its slot last,
+    # so once nothing claims $d, a teardown that was under way has finished
+    # and this answer is final.
+    [ -d "$d" ] || return 0
     # A directory this engine never bound to a session has no age we can
     # trust. Before this branch, a retained run dir was one the OLD teardown
     # kept BECAUSE git said it held work on no remote — and its mtime is
@@ -707,8 +718,13 @@ wt_prune_orphans() {
     # mark it open and restart its clock, so it gets a full TTL window and
     # shows up on the dashboard with a countdown the operator can act on.
     if [ ! -f "$d/.ended" ] && [ ! -f "$d/.session" ]; then
-      printf 'open\n' > "$d/.ended" 2>/dev/null || true
-      touch "$d" 2>/dev/null || true
+      # The braces take the redirection's own error too: a bare
+      # `> file 2>/dev/null` reports a missing directory before the
+      # 2>/dev/null applies, and launchd.err.log caught exactly that.
+      { printf 'open\n' > "$d/.ended"; } 2>/dev/null || true
+      # -c: restart the clock of a directory that exists, never create one.
+      # A `touch` that CREATES is how a vanished run dir came back as a file.
+      touch -c "$d" 2>/dev/null || true
       # "no marker at all" is a SHAPE, not a version check -- it is the
       # signature a pre-upgrade dir leaves, but nothing here actually
       # confirms that is why. Naming the observed condition instead of

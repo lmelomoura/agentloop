@@ -4402,6 +4402,44 @@ EOF
     || bad "the sweep removed a tree that had already been claimed by a reattach"
   rm -rf "$tmp/locks/jSweepRace" "$tmp/wtroot/jSweepRace"
 
+  echo "wt_prune_orphans() — a run dir torn down while the sweep waited for the lock never comes back as a file"
+  # Analysis 12 (2026-09-26): the sweep tested `-d` before taking
+  # $LOCK_DIR/.resume, which every run_job also takes as it starts. A unit's
+  # run tore its tree down and released its slot while the sweep waited, the
+  # adoption branch found no marker and no owner, and its `touch` left a
+  # 0-byte FILE where the run dir had been -- which OpenCode then failed every
+  # boot of the project on (measurement 39). Its own worktree root, so the
+  # sweep meets THIS directory first and blocks on the lock the holder has,
+  # instead of blocking on another test's directory and arriving after the fact.
+  local rdGone="$tmp/wtgone/jGone/stampG" goneTick="$tmp/gone.tick"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtgone"
+    wt_setup jGone two "$tmp/g/repo" stampG ) >/dev/null 2>&1
+  : > "$goneTick"
+  (
+    LOCK_DIR="$tmp/locks"; WORKTREES_DIR="$tmp/wtgone"; TICK_LOG="$goneTick"
+    rlock="$LOCK_DIR/.resume"; rm -rf "$rlock"
+    mkdir -p "$LOCK_DIR/jGone"
+    sleep 5 & pidG=$!
+    slotG="$LOCK_DIR/jGone/$pidG"; mkdir -p "$slotG"
+    echo "$pidG" > "$slotG/pid"; boot_id > "$slotG/boot"; echo "$rdGone" > "$slotG/worktree"
+    # The unit's own end, holding the lock the way a run_job starting beside
+    # it does: the tree goes, then the slot -- run_cleanup's order.
+    ( lock_take "$rlock"; sleep 0.5; wt_remove_all "$rdGone"; rm -rf "$slotG"; lock_drop "$rlock" ) \
+      & holder=$!
+    i=0; while [ ! -d "$rlock" ] && [ "$i" -lt 200 ]; do sleep 0.01; i=$(( i + 1 )); done
+    ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"
+      wt_prune_orphans ) >/dev/null 2>&1
+    wait "$holder"
+    kill "$pidG" 2>/dev/null; wait "$pidG" 2>/dev/null
+  )
+  [ ! -e "$rdGone" ] && [ ! -L "$rdGone" ] \
+    && ok "nothing is left where the run dir was" \
+    || bad "the sweep left a $(stat -f %HT "$rdGone" 2>/dev/null) of $(stat -f %z "$rdGone" 2>/dev/null) bytes where the run dir was"
+  grep -q "adopted" "$goneTick" \
+    && bad "it logged the adoption of a directory that was gone: $(cat "$goneTick")" \
+    || ok "and no adoption is logged for it"
+  rm -rf "$tmp/wtgone" "$tmp/locks/jGone"
+
   echo "wt_undelivered_work() — what provisioning left behind is not the agent's work"
   printf '%s\n' '#!/usr/bin/env bash' 'echo residue > provisioned.txt' \
     > "$tmp/cfg/provision/two.up.sh"

@@ -578,6 +578,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The tick's orphan sweep can no longer leave a file where a run dir was.**
+  It tested a run dir before taking the lock every `run_job` also takes as it
+  starts, and a unit that tore its tree down and released its slot in that
+  window was "adopted": the marker write failed, and `touch` created a 0-byte
+  file at the run dir's path. OpenCode keeps every directory it boots in as a
+  sandbox of the project and fails every boot on a sandbox whose parent is a
+  file (measurement 39), so on a real install a deep analysis lost 231 of its
+  267 verify units, three attempts each, before it closed `capped`. The sweep
+  now asks whether the directory is still there once it holds the lock and
+  knows nobody claims it, and an adoption only ever restarts an existing
+  directory's clock (`touch -c`).
+
 - **A stopped, killed, watchdog-timed-out or crashed run's cost is now
   estimated from its own stream instead of lost as $0.00.** A run never
   writes its final `result` event (which carries the reported dollar cost)
