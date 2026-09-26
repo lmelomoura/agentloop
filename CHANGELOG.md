@@ -61,6 +61,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   many units ran again. Before, the only way on from a `capped` analysis was
   a new one, repeating hours of reading that had already been proved.
   From the terminal: `agentloop security retry <project> <analysis-id>`.
+  `reopen` is refused to a unit's own session, and the analysis skill says so
+  beside the other lifecycle verbs.
   The dashboard asks for it through a new security_retry operation.
   The old close is found by the words its sentences begin with, never by
   their numbers, so an analysis closed by an older engine (whose counts are
