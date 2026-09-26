@@ -897,3 +897,50 @@ def test_three_outages_in_a_row_give_the_lineage_up(world, monkeypatch):
     row = _row(world)
     assert row["state"] == "capped"
     assert "3 runs in a row were cut short by the provider (rate_limited" in row["coverage_note"]
+
+
+def test_units_that_cannot_start_pause_the_analysis_after_one_wave(world, monkeypatch):
+    """Analysis 12 (2026-09-26): OpenCode failed every boot of the project,
+    and the orchestrator spent three attempts on each of 231 lineages, in 42
+    minutes, before it closed capped. Every unit failing to start is the
+    environment: the gate closes after START_FAIL_BREAKER of them over two
+    lineages or more, the analysis is left interrupted with the error in its
+    note, and no lineage is given up for it."""
+    runs = world["tmp"] / "runs"
+    monkeypatch.setenv("FAKE_ENGINE_BUDGETS", str(runs))
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "start-fail")
+    assert _orchestrator(world).run() == 0
+    row = _row(world)
+    assert row["state"] == "interrupted", row["coverage_note"]
+    assert ("the agent could not start: 3 units in a row ended before a session opened "
+            "(last error: BadResource: FileSystem.access (/gone/repo))") in row["coverage_note"]
+    launched = len(runs.read_text().splitlines())
+    assert 3 <= launched <= 3 + orchestrator.START_FAIL_BREAKER - 1, launched
+    assert not [u for u in _units(world) if u["state"] == "failed"], "no lineage given up for the environment"
+    assert all(u["attempt"] == 1 for u in _units(world)), "a start failure keeps its attempt"
+
+
+def test_one_unit_that_cannot_start_is_given_up_without_pausing_the_rest(world, monkeypatch):
+    """One lineage failing to start is that unit's own trouble: the others
+    run, the gate stays open, and after LAUNCH_STRIKES start failures in a
+    row the unit is given up with the agent's own words in its note."""
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "start-fail-hunt")
+    assert _orchestrator(world).run() == 0
+    hunt = [u for u in _last_attempts(world).values() if u["kind"] == "hunt"]
+    assert hunt and hunt[0]["state"] == "failed"
+    assert hunt[0]["note"] == ("The engine could not run this unit: its agent could not start 3 times "
+                               "in a row (BadResource: FileSystem.access (/gone/repo); see tick.log).")
+    row = _row(world)
+    assert row["state"] == "capped"
+    assert "its agent could not start 3 times in a row" in row["coverage_note"]
+    assert "the agent could not start: 3 units in a row" not in row["coverage_note"], "no gate for one lineage"
+
+
+def test_a_paused_analysis_resumes_once_the_agent_can_start_and_closes_done(world, monkeypatch):
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "start-fail")
+    _orchestrator(world).run()
+    assert _row(world)["state"] == "interrupted"
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "complete")
+    assert ledger.resume_analysis(ledger.connect(world["db"]), world["aid"]) is True
+    assert _orchestrator(world).run() == 0
+    assert _row(world)["state"] == "done", _row(world)["coverage_note"]

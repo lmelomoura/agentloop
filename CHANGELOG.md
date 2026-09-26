@@ -37,6 +37,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   attempts, and an environment problem that hit every unit alike gave each of
   them up in turn.
 
+- **A security analysis pauses when its units cannot start, instead of
+  burning them one by one.** Three start failures in a row, over two units or
+  more, close the orchestrator's gate: nothing more is launched, and the
+  analysis is left `interrupted` with the agent's own last words in its note,
+  so Resume continues it once the cause is fixed. On a real install the same
+  environment failure used every one of 231 units' three attempts in 42
+  minutes, and the analysis closed `capped` with none of them verified. One
+  unit that alone cannot start is given up after three tries, with the reason
+  named, and the rest of the analysis runs.
+
 - **The run index keeps transcripts for 30 days, and every run's summary
   forever.** A finished run's stream, result, precheck output and stderr
   used to stay in `index.db` for as long as the index existed — 751 MB on
