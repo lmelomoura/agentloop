@@ -589,6 +589,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   now asks whether the directory is still there once it holds the lock and
   knows nobody claims it, and an adoption only ever restarts an existing
   directory's clock (`touch -c`).
+  A 0-byte file with a run dir's name, which an older engine could leave, is
+  removed by the next sweep and named in tick.log; anything else in that
+  place (a file with content, a symlink) is not the engine's and is left
+  alone.
 
 - **A stopped, killed, watchdog-timed-out or crashed run's cost is now
   estimated from its own stream instead of lost as $0.00.** A run never

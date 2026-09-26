@@ -4440,6 +4440,33 @@ EOF
     || ok "and no adoption is logged for it"
   rm -rf "$tmp/wtgone" "$tmp/locks/jGone"
 
+  echo "wt_prune_orphans() — what a vanished run dir left behind is removed, and nothing else is"
+  # The 0-byte file an older engine's adoption left (Task 1) is still there
+  # after an upgrade: the sweep skipped everything that was not a directory,
+  # so nothing ever looked at it again, and OpenCode kept failing on it. Only
+  # an EMPTY REGULAR FILE with a run dir's name can be that; the rest is not
+  # the engine's.
+  local strayRoot="$tmp/wtstray/jStray"
+  mkdir -p "$strayRoot"
+  : > "$strayRoot/20260926T005011Z-38238"                  # the file analysis 12 left
+  printf 'data\n' > "$strayRoot/20260926T005012Z-38239"    # the same shape, with content
+  : > "$strayRoot/notes"                                   # empty, but not a run dir's name
+  : > "$strayRoot/.20260926T005011Z.tsv"                   # a scratch file
+  ln -s /nonexistent "$strayRoot/20260926T005013Z-38240"   # the same shape, a symlink
+  : > "$tmp/stray.tick"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtstray"
+    LOCK_DIR="$tmp/locks"; TICK_LOG="$tmp/stray.tick"
+    wt_prune_orphans ) >/dev/null 2>&1
+  [ ! -e "$strayRoot/20260926T005011Z-38238" ] \
+    && ok "an empty file with a run dir's name is removed" || bad "the stray file survived the sweep"
+  grep -q "jStray: removed a stray empty file where run dir 20260926T005011Z-38238 was" "$tmp/stray.tick" \
+    && ok "and tick.log says so" || bad "tick.log: $(cat "$tmp/stray.tick")"
+  [ -s "$strayRoot/20260926T005012Z-38239" ] && [ -e "$strayRoot/notes" ] \
+    && [ -e "$strayRoot/.20260926T005011Z.tsv" ] && [ -L "$strayRoot/20260926T005013Z-38240" ] \
+    && ok "a file with content, another name, a scratch file and a symlink are all left alone" \
+    || bad "the sweep removed something it did not make: $(ls -A "$strayRoot" | tr '\n' ' ')"
+  rm -rf "$tmp/wtstray"
+
   echo "wt_undelivered_work() — what provisioning left behind is not the agent's work"
   printf '%s\n' '#!/usr/bin/env bash' 'echo residue > provisioned.txt' \
     > "$tmp/cfg/provision/two.up.sh"

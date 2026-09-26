@@ -770,7 +770,12 @@ wt_prune_orphans() {
     [ -d "$iddir" ] || continue
     id="$(basename "$iddir")"
     for d in "$iddir"/*; do
-      [ -d "$d" ] || continue                 # skips the .<stamp>.tsv scratch files
+      if [ ! -d "$d" ]; then
+        # Not a run dir. What a vanished one left behind goes; nothing else
+        # is touched (the .<stamp>.tsv scratch files never match).
+        wt_remove_stray_file "$id" "$d" || true
+        continue
+      fi
       # PER DIRECTORY, not once for the whole sweep: wt_teardown below can run
       # a provisioning `down` hook, seconds to minutes, the same as a human's
       # drop -- taking the lock once for the entire sweep would hold it, and
@@ -788,6 +793,28 @@ wt_prune_orphans() {
 # nothing so the caller's own default applies.
 wt_mtime() { # <dir>
   stat -f %m "${1:-}" 2>/dev/null || true
+}
+
+# The name run_job gives a run dir: the UTC stamp and the pid of the run that
+# made it (`date -u +%Y%m%dT%H%M%SZ`-$$). The `.<stamp>.tsv` scratch files
+# beside them start with a dot and never match.
+wt_is_run_dir_name() { # <basename>
+  [[ "${1:-}" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]]
+}
+
+# An EMPTY REGULAR FILE with a run dir's name can only be what is left of a
+# run dir removed while something wrote to its path: the 0-byte file an
+# older engine's adoption `touch` left (analysis 12, 2026-09-26), which
+# OpenCode then failed every boot of the project on (measurement 39). It is
+# removed, and tick.log says so. Anything else with that name -- a file with
+# content, a symlink -- was not made by the engine, and is left alone
+# without a word. 0 when it removed one.
+wt_remove_stray_file() { # <job id> <path>
+  local id="${1:-}" p="${2:-}"
+  [ -f "$p" ] && [ ! -L "$p" ] && [ ! -s "$p" ] || return 1
+  wt_is_run_dir_name "${p##*/}" || return 1
+  rm -f "$p" 2>/dev/null || return 1
+  log_tick "$id: removed a stray empty file where run dir ${p##*/} was"
 }
 
 # Clear stale worktree registrations from every canonical checkout a project
