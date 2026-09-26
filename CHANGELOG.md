@@ -48,7 +48,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   named, and the rest of the analysis runs.
 
 - **A capped or failed security analysis can be retried, running only what
-  gave up.**
+  gave up.** `security/cli.py reopen` turns the newest analysis of a branch
+  back to `interrupted` and gives every lineage that gave up a fresh unit, at
+  attempt 1, on the commit it analysed; units already done never run again.
+  The last close's gap sentences are cut from the note, so the next close
+  describes the final state, and a sentence says when it was retried and how
+  many units ran again. Before, the only way on from a `capped` analysis was
+  a new one, repeating hours of reading that had already been proved.
 
 - **The run index keeps transcripts for 30 days, and every run's summary
   forever.** A finished run's stream, result, precheck output and stderr

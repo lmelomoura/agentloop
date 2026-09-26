@@ -9072,7 +9072,7 @@ case "${1:-}" in
                # this message names every verb the door actually accepts, not
                # just the subset any one caller uses (tests/security/
                # test_cli_doors.py pins it against the CLI's own parser).
-               "")      die "usage: agentloop security <analyze|resume|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|unit-close|units|read|verify-queue|interrupt|abandon|orchestrate|finish|checklist|render|export-findings|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
+               "")      die "usage: agentloop security <analyze|resume|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|unit-close|units|read|verify-queue|interrupt|abandon|reopen|orchestrate|finish|checklist|render|export-findings|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
                *)       security_py "$@" ;;
              esac ;;
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"
