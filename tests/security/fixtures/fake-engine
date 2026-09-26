@@ -13,6 +13,12 @@ __run-unit <job> <analysis> <unit> <commit> <repo>
       crash               exits without a close and without a stream
       crash-after-read    a read unit reads every range, then exits WITHOUT a
                           close; the other kinds play `complete`
+      crash-with-usage    writes a stream with assistant usage (two "turns",
+                          each repeated under the same message id -- the
+                          shape a real killed run's stream has), then exits
+                          WITHOUT a close: proves the orchestrator's own
+                          dead-run judgement (_judge_orphan) prices it from
+                          FAKE_ENGINE_MODEL's usage instead of spend_usd 0
       verify-dies         a verify unit records its verdict, then exits WITHOUT
                           a close and without a stream; the other kinds play
                           `complete`
@@ -100,6 +106,28 @@ def write_stream(job, ranges):
     return str(stream)
 
 
+def write_stream_with_usage(job, model):
+    """Two assistant "turns", each repeated twice under the SAME message id
+    and the SAME usage object -- exactly the shape a real killed run's
+    stream measured against the live install had (one line per content
+    block, all carrying that turn's cumulative usage). No result event: the
+    orchestrator's own dead-run judgement has to price this from the stream
+    alone, the same way bin/agentloop's run_job salvage path does."""
+    events = [{"type": "system", "subtype": "init", "cwd": ROOT, "model": model}]
+    for mid, usage in (
+            ("msg_turn_a", {"input_tokens": 2, "cache_creation_input_tokens": 1000,
+                            "cache_read_input_tokens": 500, "output_tokens": 5}),
+            ("msg_turn_b", {"input_tokens": 3, "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 2000, "output_tokens": 45})):
+        events.append({"type": "assistant", "message": {"id": mid, "usage": usage}})
+        events.append({"type": "assistant", "message": {"id": mid, "usage": usage}})
+    folder = Path(os.environ.get("FAKE_ENGINE_LOG_ROOT") or os.environ.get("TMPDIR", "/tmp")) / job
+    folder.mkdir(parents=True, exist_ok=True)
+    stream = folder / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}.stream.ndjson"
+    stream.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return str(stream)
+
+
 def wait_for_stop():
     marker = Path(os.environ["FAKE_ENGINE_STOP"])
     while not marker.exists():
@@ -129,6 +157,9 @@ def run_unit(job, aid, uid):
         close(aid, uid, "error", write_stream(job, []), cause="rate_limited")
         return
     if MODE == "crash":
+        sys.exit(3)
+    if MODE == "crash-with-usage":
+        write_stream_with_usage(job, os.environ.get("FAKE_ENGINE_MODEL", "claude-opus-5-5"))
         sys.exit(3)
     if MODE in ("slow", "die-on-stop"):
         if MODE == "die-on-stop" and unit["kind"] == "read":

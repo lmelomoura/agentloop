@@ -1659,6 +1659,22 @@ JSON
     [ "$(num "$(pr '._refreshed_at // 0')")" -gt 1 ] && [ "$(pr '._source_url')" = "$AGENTLOOP_PRICING_URL" ] \
       && ok "resolve_pricing_openai: the table records when and where from" || bad "meta '$(pr '[._refreshed_at,._source_url]')'"
     [ -z "$(pricing_unpriced)" ] && ok "pricing_unpriced: every visible slug has a price (the kept row counts)" || bad "unpriced '$(pricing_unpriced | tr '\n' ' ')'"
+    # anthropic own rows: the SAME source, the SAME reduce shape, matched on
+    # litellm_provider "anthropic" -- what lets a stopped/killed Claude run
+    # get cost_basis "estimated" instead of staying at "none" for want of any
+    # price to read (bin/platforms/costing.py). CLAUDE_BIN pinned off, same
+    # as OPENCODE_BIN above: anthropic_catalog_ids also greps the real CLI
+    # binary for claude-* ids, and a real one installed on the box running
+    # this would leak in and make the assertions below depend on it.
+    CLAUDE_BIN=/nonexistent
+    printf '{"jobs":[{"id":"j","model":"claude-opus-5-5"}]}' > "$tmp/pr/jobs.json"
+    JOBS_FILE="$tmp/pr/jobs.json" resolve_pricing_openai >/dev/null
+    [ "$(pr '.anthropic["claude-opus-5-5"] | [.input,.cached_input,.output,.cache_write,.source] | join(" ")')" = "4 0.2 20 0 litellm" ] \
+      && ok "resolve_pricing_openai: anthropic rows are refreshed from the same litellm source" \
+      || bad "anthropic row '$(pr '.anthropic["claude-opus-5-5"]')'"
+    [ -z "$(JOBS_FILE="$tmp/pr/jobs.json" anthropic_unpriced)" ] \
+      && ok "anthropic_unpriced: the visible claude id now has a price" \
+      || bad "anthropic_unpriced '$(JOBS_FILE="$tmp/pr/jobs.json" anthropic_unpriced | tr '\n' ' ')'"
     # gpt-5.5 has no cache_read in the sample: the manual row shields it here, so
     # test the fallback on a fresh table.
     "$JQ" -n '{openai:{}}' > "$PRICING_FILE"
@@ -1748,8 +1764,8 @@ JSON
     printf 'RESULT ok=%s bad=%s\n' "$_upass" "$_ufail"
   )"
   printf '%s\n' "$_prout" | grep -v '^RESULT '
-  printf '%s\n' "$_prout" | grep -qx 'RESULT ok=28 bad=0' \
-    && ok "resolve_pricing_openai: all 28 refresh assertions passed" \
+  printf '%s\n' "$_prout" | grep -qx 'RESULT ok=30 bad=0' \
+    && ok "resolve_pricing_openai: all 30 refresh assertions passed" \
     || bad "resolve_pricing_openai over the sample source did not: $(printf '%s\n' "$_prout" | tail -1)"
 
   echo "cmd_skills() — links into the Claude skills root, and into the Codex home only when that home exists"

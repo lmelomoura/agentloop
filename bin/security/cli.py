@@ -2247,7 +2247,7 @@ def cmd_orchestrate(args):
         repo=args.repo, repo_path=args.repo_path, prepare_root=args.prepare_root,
         log_root=args.log_root or None, parallel=args.parallel, budget=args.budget,
         ignore=args.ignore, log=args.log or None, lock_dir=args.lock_dir or None,
-        offline=args.offline).run())
+        pricing_file=args.pricing_file or None, offline=args.offline).run())
 
 
 def cmd_interrupt(args):
@@ -4396,6 +4396,11 @@ def main(argv=None):
     oc.add_argument("--log", default="")
     oc.add_argument("--lock-dir", default="", dest="lock_dir")
     oc.add_argument("--offline", action="store_true")
+    # config/pricing.json: how a run that died before its own close ran gets
+    # its spend ESTIMATED from its stream's own usage instead of 0.0 --
+    # _judge_orphan, through bin/platforms/costing.py. Empty: no price table
+    # to read, so such a run is judged with no estimate, same as before.
+    oc.add_argument("--pricing", default="", dest="pricing_file")
 
     fn = sub.add_parser("finish", parents=[dbflag]); fn.set_defaults(fn=cmd_finish)
     fn.add_argument("--analysis", type=int, required=True)

@@ -156,6 +156,39 @@ def test_units_whose_runs_never_close_are_struck_out_and_their_reads_are_owed(wo
     assert "src/a.py:1-40" in row["coverage_note"]
 
 
+def test_a_dead_runs_spend_is_estimated_from_its_stream_not_lost_as_zero(world, monkeypatch, tmp_path):
+    """_judge_orphan used to hand units.close spend_usd=0.0 unconditionally
+    for a run that died before its own close ran -- a run that had genuinely
+    spent several minutes of real tokens settled at $0.00 regardless. Priced
+    from config/pricing.json (bin/platforms/costing.py, deduplicated by
+    message id), the same table run_job's own salvage path reads, the
+    estimate must be the non-zero figure the stream's usage prices to."""
+    pricing = tmp_path / "pricing.json"
+    pricing.write_text(json.dumps({"anthropic": {"claude-opus-5-5": {
+        "input": 4.0, "cached_input": 0.2, "output": 20.0, "cache_write": 0.0}}}))
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "crash-with-usage")
+    assert _orchestrator(world, pricing_file=str(pricing)).run() == 0
+    # Every attempt that actually ran (LAUNCH_STRIKES of them, per lineage)
+    # gets the estimate; the final row -- the lineage given up, never
+    # launched -- has nothing to estimate from and stays at 0.0, as before.
+    ran = [u for u in _units(world) if u["kind"] in ("hunt", "read") and u["spend_usd"] > 0]
+    assert len(ran) == 2 * orchestrator.LAUNCH_STRIKES, "not every dead run's attempt was priced"
+    # (5*4 + 2500*0.2 + 1000*0 + 50*20) / 1e6, from the deduplicated usage of
+    # write_stream_with_usage's two turns.
+    assert all(u["spend_usd"] == pytest.approx(0.00152) for u in ran)
+
+
+def test_a_dead_run_with_no_pricing_file_settles_at_zero_as_before(world, monkeypatch):
+    """No --pricing given (an install with no table, or one not yet
+    refreshed): a dead run's judgement must not raise, and it settles at
+    0.0 exactly as it always has -- the estimate is a bonus, never a
+    requirement for the orchestrator to keep working."""
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "crash-with-usage")
+    assert _orchestrator(world).run() == 0
+    struck = [u for u in _units(world) if u["kind"] in ("hunt", "read")]
+    assert struck and all(u["spend_usd"] == 0.0 for u in struck)
+
+
 def test_a_read_whose_run_died_after_reading_everything_is_done_not_run_again(world, monkeypatch):
     monkeypatch.setenv("FAKE_ENGINE_MODE", "crash-after-read")
     _orchestrator(world).run()

@@ -1753,6 +1753,33 @@ sleep 1
 echo
 }
 
+scenario_57() {
+echo "57. a run killed mid-turn with usage on its stream has that cost ESTIMATED, never lost as \$0.00"
+# The bug: a stopped/killed/crashed run never writes the final `result` event
+# that carries total_cost_usd, so the engine used to record cost 0 even after
+# several real minutes on the model -- FAKE_KILLED_USAGE plays a hang that
+# DID stream real usage (two "turns", each repeated under the same message
+# id, the shape a real killed run's stream has) before going quiet.
+mkjob j57
+sed -i '' 's/"max_parallel":1/"max_parallel":1,"stall_timeout_seconds":4/' "$ROOT/config/jobs.json"
+AGENTLOOP_WATCHDOG_POLL=2 FAKE_MODE=hang FAKE_KILLED_USAGE=1 FAKE_SESSION=sess-57 "$AL" run j57 >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .status)" = "error" ] && [ "$(lastrun | jq -r .cause)" = "killed" ] \
+  && ok "error / killed, same as any other hung run" || bad "$(lastrun | jq -c '{status,cause}')"
+[ "$(lastrun | jq -r .cost_basis)" = "estimated" ] \
+  && ok "cost_basis is estimated, not the \"none\" a killed run used to settle for" \
+  || bad "cost_basis $(lastrun | jq -r .cost_basis)"
+cost57="$(lastrun | jq -r .cost)"
+awk -v c="$cost57" 'BEGIN{exit !(c > 0)}' \
+  && ok "and the cost is non-zero ($cost57), priced from config/pricing.json" || bad "cost was $cost57"
+[ "$(lastrun | jq -r '.tokens.input')" = "5" ] && [ "$(lastrun | jq -r '.tokens.cached')" = "2500" ] \
+  && [ "$(lastrun | jq -r '.tokens.cache_write')" = "1000" ] && [ "$(lastrun | jq -r '.tokens.output')" = "50" ] \
+  && ok "and the tokens are the DEDUPLICATED usage (one figure per turn, not one per stream line)" \
+  || bad "tokens $(lastrun | jq -c .tokens)"
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1782,11 +1809,11 @@ echo
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # re-measure when the last list grows -- and the count assertion below fails
 # if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37"
 E2E_LIST_3="38 39 40 41 41b 41c 42 43 44 45 46"
-E2E_LIST_4="47 48 49 50 51 52 53 54 55 56"
+E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

@@ -11,5 +11,10 @@
     "gpt-5.4-mini":  {"input": 0.75, "cached_input": 0.075, "output": 4.5,  "cache_write": 0,    "source": "litellm", "at": 1788800000}
   },
   "_opencode_note": "OpenCode prices a run itself from its own catalog (models.dev) when the model has a price there. Rows here price the models it does not: a custom provider's, keyed by provider/model. A row of zeros declares a model free; a model with no row and no catalog price records cost_basis none and the dollar caps do not see its spend.",
-  "opencode": {}
+  "opencode": {},
+  "_anthropic_note": "Anthropic's own CLI reports a run's real dollar cost (cost_basis reported) — these rows only price a run that never got that far: stopped, killed, watchdog-timed-out or crashed before its result event, estimated from the stream's own usage instead of recorded as a lost $0.00 (bin/platforms/costing.py, cost_basis estimated). Refreshed the same way as openai's rows, from the source's litellm_provider \"anthropic\" entries.",
+  "anthropic": {
+    "claude-opus-5":   {"input": 5.0, "cached_input": 0.5,  "output": 25.0, "cache_write": 0, "source": "litellm", "at": 1788800000},
+    "claude-opus-5-5": {"input": 4.0, "cached_input": 0.2,  "output": 20.0, "cache_write": 0, "source": "litellm", "at": 1788800000}
+  }
 }
