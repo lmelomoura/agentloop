@@ -5890,7 +5890,7 @@ NASTY
       cause=""
       # The derivation itself, lifted verbatim from run_job by anchor so this
       # cannot drift into testing a copy that no longer matches the engine.
-      eval "$(sed -n '/^  cause=""$/,/^  fi$/p' "$BIN_DIR/agentloop" | head -30)"
+      eval "$(sed -n '/^  cause=""$/,/^  fi$/p' "$BIN_DIR/agentloop" | head -40)"
       printf '%s' "$cause" )
   }
   [ "$(cause_of '{"api_error_status":529,"subtype":"success"}')" = "api_error" ] \
@@ -5914,6 +5914,16 @@ NASTY
   [ "$(cause_of '{"api_error_status":529,"subtype":"success"}' 3)" = "api_error" ] \
     && ok "an API failure outranks a denial count on the same run" \
     || bad "denials masked the API failure"
+  # 2026-09-26: the provider's router refused connections for minutes, and
+  # OpenCode ended each run with the AI SDK's "Cannot connect to API" and no
+  # HTTP status -- filed `agent_error`, so every such run spent one of its
+  # unit's attempts and the analysis breaker never counted it.
+  [ "$(cause_of '{"subtype":"error_during_execution","result":"Cannot connect to API: Was there a typo in the url or port?"}')" = "api_error" ] \
+    && ok "a provider that cannot be reached is an api_error, not the agent's" \
+    || bad "unreachable provider -> '$(cause_of '{"subtype":"error_during_execution","result":"Cannot connect to API: Was there a typo in the url or port?"}')'"
+  [ "$(cause_of '{"subtype":"error_during_execution","result":"the agent said: I cannot connect to API docs"}')" = "agent_error" ] \
+    && ok "and only the SDK's own sentence counts, not the words anywhere in a result" \
+    || bad "prose mentioning a connection -> '$(cause_of '{"subtype":"error_during_execution","result":"the agent said: I cannot connect to API docs"}')'"
 
   echo "failure causes — an agent that never started is start_failed, and its stderr says why"
   # Analysis 12 (2026-09-26): OpenCode failed every boot of the project
@@ -5933,7 +5943,7 @@ NASTY
       slot="$tmp/startf/slot"
       subtype="$("$JQ" -r '.subtype // "success"' "$logfile")"
       cause=""
-      eval "$(sed -n '/^  cause=""$/,/^  fi$/p' "$BIN_DIR/agentloop" | head -30)"
+      eval "$(sed -n '/^  cause=""$/,/^  fi$/p' "$BIN_DIR/agentloop" | head -40)"
       printf '%s|%s' "$cause" "$wdreason" )
   }
   got="$(start_cause_of '\033[91m\033[1mError: \033[0mUnexpected error\n\nBadResource: FileSystem.access (/gone/run/repo)\n')"

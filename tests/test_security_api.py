@@ -456,7 +456,11 @@ def test_the_checklist_says_whether_the_orchestrator_is_alive_and_in_which_phase
     (lock / "boot").write_text(srv.boot_id())
     (lock / "analysis").write_text("7\n")
     (lock / "phase").write_text("preparing\n")
-    assert srv.security_checklist("7")[1]["orchestrator"] == {"alive": True, "phase": "preparing"}
+    assert srv.security_checklist("7")[1]["orchestrator"] == {"alive": True, "phase": "preparing",
+                                                             "detail": ""}
+    (lock / "detail").write_text("history 2000/21398 commits\n")
+    assert srv.security_checklist("7")[1]["orchestrator"]["detail"] == "history 2000/21398 commits", \
+        "what the phase last said it did rides beside the phase"
     (lock / "analysis").write_text("8\n")
     assert srv.security_checklist("7")[1]["orchestrator"]["alive"] is False, "the lock is another analysis's"
     (lock / "analysis").write_text("7\n")

@@ -20,6 +20,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The deterministic phase of a security analysis says what it is doing.**
+  Its progress lines ("sbom done (48s)", "history 2000/21398 commits") go to
+  tick.log as they are written, and the analysis page shows the last one
+  beside the phase. A full history sweep of a large repository ran for a
+  quarter of an hour behind a page that said only "preparing" and a tick.log
+  that said nothing, which read as a stuck analysis.
+- **Every live unit of a running analysis can be opened from its card.** A
+  pipeline analysis runs several units at once, each a run of its own; the
+  eye on the analysis card opened only the one that started nearest the
+  analysis. With more than one live, it is a menu of them, by unit label and
+  start time.
+- **The Runs page badges a security run "security", not "forced".** Every
+  unit is launched forced by its orchestrator, so every row of an analysis
+  said "forced", which said nothing.
+
 - **A run whose agent never started says so, and says why.** An agent CLI
   that exits non-zero before its stream holds a single event or a session is
   bound (OpenCode does exactly that for every boot of a project whose
@@ -660,6 +675,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Default it already is.
 
 ### Fixed
+
+- **A provider that cannot be reached is an outage, not the agent's error.**
+  When OpenCode ends a run with the AI SDK's "Cannot connect to API" (no HTTP
+  status), the run is now `api_error`: kept out of the failure backoff, the
+  security unit keeps its attempt, and the analysis breaker counts it. On a
+  real install the router refused connections for minutes and every such run
+  was filed `agent_error`, spending one attempt of its unit each time while
+  the breaker, which does not count agent errors, never paused the analysis.
 
 - **The tick's orphan sweep can no longer leave a file where a run dir was.**
   It tested a run dir before taking the lock every `run_job` also takes as it

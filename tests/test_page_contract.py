@@ -12655,3 +12655,60 @@ def test_reopening_an_editor_redraws_the_stored_account_with_keep(srv):
     assert i_sec_apply < i_sec_set < i_sec_keep, \
         "same three-step order for the Security block's account: apply(keep=false), then set the stored " \
         "value, then the keep=true redraw"
+
+
+def test_a_security_run_is_badged_security_never_forced(srv):
+    """A unit of a security analysis is always launched `forced`, by its
+    orchestrator: on a page of its units every row said "forced", which
+    said nothing. A security run says it is one; any other forced run still
+    says forced."""
+    js = _app_js(srv)
+    assert 'if(isSec) tdWhen.appendChild(el("span", "trigger-badge security", "security"));' in js
+    assert 'else if(r.forced) tdWhen.appendChild(el("span", "trigger-badge", "forced"));' in js
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_live_orchestrator_says_what_its_phase_last_did(srv, tmp_path):
+    """A full history sweep is a quarter of an hour of the deterministic
+    phase: the notice says what the phase last reported beside the phase."""
+    block = _security_js(srv)
+    long_ago = {"id": 22, "state": "running", "run_id": "security-web", "started": 1}
+    script = tmp_path / "notice-detail.js"
+    script.write_text(_run_notice_script(block, long_ago, {"alive": True, "phase": "preparing",
+                                                           "detail": "history 2000/21398 commits"}))
+    text = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True,
+                                     check=True).stdout)["text"]
+    assert "deterministic phase" in text and "Now: history 2000/21398 commits." in text
+    script.write_text(_run_notice_script(block, long_ago, {"alive": True, "phase": "preparing"}))
+    text = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True,
+                                     check=True).stdout)["text"]
+    assert "Now:" not in text, "no detail, no empty 'Now:'"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_every_live_unit_of_a_running_analysis_can_be_opened(srv, tmp_path):
+    """Three units of one analysis run at once, each a run of its own under
+    the analysis's one job: the eye used to open only the one that started
+    nearest the analysis. secLiveRunsFor lists every live one, newest first,
+    never one from before the analysis, and none for a finished analysis."""
+    block = _security_js(srv)
+    fn = _plainfn(block, "secLiveRunsFor")
+    script = tmp_path / "live-runs.js"
+    script.write_text("""
+    const SEC_RUN_WINDOW = 120;
+    function unjournaledLive(){ return [
+      {id: "security-web", start: 1000, label: "read 1/9"},
+      {id: "security-web", start: 3000, label: "read 3/9"},
+      {id: "security-web", start: 2000, label: "read 2/9"},
+      {id: "security-web", start: 100,  label: "an earlier analysis"},
+      {id: "j9",           start: 2500, label: "another job"}]; }
+    """ + fn + """
+    console.log(JSON.stringify({
+      running: secLiveRunsFor({run_id: "security-web", state: "running", started: 900}).map(r => r.label),
+      done: secLiveRunsFor({run_id: "security-web", state: "done", started: 900}).length}));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True,
+                                    check=True).stdout)
+    assert out == {"running": ["read 3/9", "read 2/9", "read 1/9"], "done": 0}
+    card = _security_js(srv)
+    assert "if(live.length > 1){" in card and 'units running — open one' in card

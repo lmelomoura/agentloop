@@ -2253,7 +2253,8 @@
     const when = el("span", "when-rel", fmtAgo(r.start));
     when.title = fmtWhen(r.start);
     tdWhen.appendChild(when);
-    if (r.forced) tdWhen.appendChild(el("span", "trigger-badge", "forced"));
+    if (isSec) tdWhen.appendChild(el("span", "trigger-badge security", "security"));
+    else if (r.forced) tdWhen.appendChild(el("span", "trigger-badge", "forced"));
     if (parent) {
       const badge = el("span", "trigger-badge resumed", "resumed");
       badge.dataset.tip = encodeURIComponent(resumedBadgeTip(parent));
@@ -3275,5 +3276,5 @@
     newerModelNotes
   };
 })();
-/* ui-bundle: 3660842cb4794874812b5e4f42a799e5cdbbe251880be3258c1468a0cea1e9c7 */
-/* ui-sources: 441724cef213b094db68793c17c7f6998d637fe1ea1f018abc79c25fc787b160 */
+/* ui-bundle: 5fff1654a6d72c0ff3dbad934f6481c5b2ea153b8e214983d620f7f0b39d8f19 */
+/* ui-sources: 86977597d2509df299e13589cd6072612f6b9b1ccc8164c5666fde7b84572969 */

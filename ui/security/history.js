@@ -23,6 +23,19 @@ export function secRunFor(a){
   return bestd <= SEC_RUN_WINDOW ? best : null;
 }
 
+/* Every live run of a RUNNING analysis, newest first. A pipeline analysis
+   runs up to its parallel limit of units at once -- each unit a run of its
+   own, all under the analysis's one derived job -- and secRunFor, built when
+   an analysis was one run, picks just the one that started nearest the
+   analysis: with three units going, two of them could not be opened from
+   here at all. Never a run from before the analysis started. */
+export function secLiveRunsFor(a){
+  if(!a || !a.run_id || a.state !== "running") return [];
+  return unjournaledLive()
+    .filter(r => r.id === a.run_id && (r.start || 0) >= (a.started || 0) - SEC_RUN_WINDOW)
+    .sort((x, y) => (y.start || 0) - (x.start || 0));
+}
+
 /* "Earlier analyses of THIS branch" -- this branch being the one belonging to
    the analysis ON SCREEN, not the one the picker at the top happens to be
    pointing at.

@@ -82,6 +82,7 @@ analysis that died.
 """
 
 import calendar
+import collections
 import json
 import math
 import os
@@ -375,6 +376,24 @@ class Orchestrator:
             os.replace(tmp, Path(self.lock_dir, "phase"))
         except OSError:
             pass
+        self._set_detail("")                 # a new phase starts with nothing said about it
+
+    def _set_detail(self, detail):
+        """The last thing the current phase said it did ("history 2000/21398
+        commits"), beside `phase` in the lock, for the page; "" clears it.
+        Same rules as `phase`: only this process's own lock, atomically."""
+        if not self.lock_dir or not self._lock_is_mine():
+            return
+        path = Path(self.lock_dir, "detail")
+        try:
+            if not detail:
+                path.unlink(missing_ok=True)
+                return
+            tmp = Path(self.lock_dir, ".detail.tmp")
+            tmp.write_text(detail + "\n")
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
     def _in_flight(self) -> bool:
         return bool(self.children or self.adopted or self.unjudged)
@@ -541,7 +560,23 @@ class Orchestrator:
                                      f"{_started_at(self.prepare_proc.pid)}\n")
             except OSError:
                 pass
-            _out, err = self.prepare_proc.communicate()
+            # THE PHASE'S PROGRESS, AS IT HAPPENS. `prepare` says what it
+            # finished on stderr ("prepare: sbom done (48s)", "prepare:
+            # history 2000/21398 commits"); read to the end in one
+            # communicate(), none of it was seen until the phase was over, and
+            # a history sweep of a large repository is a quarter of an hour of
+            # a page that says only "preparing" and a tick.log that says
+            # nothing (2026-09-26). Each line goes to tick.log and to the
+            # lock's `detail`, which the page shows beside the phase.
+            tail = collections.deque(maxlen=40)
+            for line in self.prepare_proc.stderr:
+                line = line.rstrip("\n")
+                tail.append(line)
+                if line.startswith("prepare: "):
+                    self.log(line)
+                    self._set_detail(line[len("prepare: "):])
+            self.prepare_proc.wait()
+            err = "\n".join(tail)
             code = self.prepare_proc.returncode
         finally:
             self.prepare_proc = None
