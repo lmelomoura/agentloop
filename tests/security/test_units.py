@@ -1247,3 +1247,19 @@ def test_the_close_part_is_found_by_its_first_words_even_when_its_numbers_change
                 "The deep scope was never listed or cannot be read: no inventory is recorded."):
         quick = f"Secrets were scanned. {gap}"
         assert quick[:units.close_part_start(quick)].strip() == "Secrets were scanned.", gap
+
+
+AWS = "AKIA" + "IOSFODNN7EXAMPLE"
+
+
+def test_a_start_error_that_carries_a_credential_is_withheld():
+    """The agent's last stderr line reaches the unit's note, the gap sentences
+    and the gate sentence -- and through them the coverage note and every
+    report format, the path security/cli.py gates with looks_like_a_secret
+    for text anyone writes. A line that carries a credential is withheld; the
+    raw line stays in tick.log and the run's own record, on this machine."""
+    got = units.start_error(f"START FAILED: 401 Unauthorized for key {AWS}")
+    assert AWS not in got
+    assert got == ("the agent's error line was withheld: it looks like it carries a "
+                   "credential (aws_access_key); see tick.log")
+    assert units.start_error("START FAILED: BadResource: x") == "BadResource: x"

@@ -36,6 +36,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (<the agent's words>)". Before, every such run was one of the unit's three
   attempts, and an environment problem that hit every unit alike gave each of
   them up in turn.
+  A stderr line that looks like it carries a credential is withheld from the
+  unit's note and from every report; the raw line stays in tick.log.
 
 - **A security analysis pauses when its units cannot start, instead of
   burning them one by one.** Three start failures in a row, over two units or

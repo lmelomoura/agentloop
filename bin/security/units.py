@@ -39,7 +39,7 @@ import re
 import sqlite3
 import time
 
-from . import diff, evidence, ledger, queries, slices
+from . import diff, evidence, ledger, queries, secrets, slices
 
 TRIAGE_BATCH = 25
 MAX_ATTEMPTS = 3
@@ -67,17 +67,30 @@ KEPT_ATTEMPT_CAUSES = OUTAGE_CAUSES + (START_FAILED,)
 START_FAILED_NOTE = "The agent could not start ({error}); nothing ran, so the attempt is kept."
 # The engine's note for such a run: `START FAILED: <the agent's last stderr line>`.
 _START_FAILED_PREFIX = "START FAILED: "
+START_ERROR_WITHHELD = ("the agent's error line was withheld: it looks like it carries a "
+                        "credential ({rule}); see tick.log")
 NO_STREAM_NOTE = ("The run left no stream -- the only proof of what a session did, and of "
                   "whether it launched a subagent -- so nothing it did counts.")
 
 
 def start_error(reason) -> str:
     """The agent's own words in a `start_failed` run's note -- the engine
-    writes `START FAILED: <its last stderr line>` -- at most 300 characters."""
+    writes `START FAILED: <its last stderr line>` -- at most 300 characters.
+
+    THIS TEXT LEAVES THE MACHINE. It becomes the unit's note, the gap
+    sentence that quotes it, and the gate sentence, and through them the
+    coverage note and every report format -- the path security/cli.py gates
+    with looks_like_a_secret for text anyone writes (`_refuse_if_secret`),
+    while the gaps are exempt only because they quote names our own scanners
+    mint. A stderr line is neither, so a line that looks like it carries a
+    credential is withheld here; the raw line stays in tick.log and the
+    run's own record, which never leave this machine."""
     text = (reason or "").strip()
     if text.startswith(_START_FAILED_PREFIX):
         text = text[len(_START_FAILED_PREFIX):].strip()
-    return text[:300] or "no reason given"
+    text = text[:300] or "no reason given"
+    rule = secrets.looks_like_a_secret(text)
+    return START_ERROR_WITHHELD.format(rule=rule) if rule else text
 
 
 def triage_items(conn, analysis_id) -> list:
