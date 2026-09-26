@@ -918,39 +918,46 @@ def failed_lineages(conn, analysis_id) -> list:
             if last["state"] == "failed"]
 
 
-def retry_refusal(conn, analysis_id) -> str:
-    """Why this analysis cannot be retried, as the words that follow
-    `analysis <id> `; "" when it can. A retry reopens a closed analysis to run
-    again only what gave up, on the commit it analysed. So: only one that
-    ended `capped` or `failed`; only the newest of its scope -- the same
+def retry_state(conn, analysis_id):
+    """(refusal, leaves): why this analysis cannot be retried -- the words
+    that follow `analysis <id> `, "" when it can -- and the last unit of every
+    lineage that gave up, which a retry runs again. ONE read of the units:
+    the page asks for this on every poll of the checklist (retryable).
+
+    A retry reopens a closed analysis on the commit it analysed. So: only one
+    that ended `capped` or `failed`; only the newest of its scope -- the same
     (project, repo, branch) with which a new analysis already supersedes an
-    interrupted one (cli.cmd_open_analysis), because retrying an older one
-    would file two readings of one branch out of order; and only one with a
-    lineage that gave up (an analysis capped by its budget alone has none)."""
+    interrupted one (cli.cmd_open_analysis); and only one with a lineage that
+    gave up. Whether the budget can pay for a unit is the engine's to say
+    (cmd_security_retry): the budget is the project's, not the ledger's."""
     row = conn.execute("SELECT * FROM analysis WHERE id=?", (analysis_id,)).fetchone()
     if row is None:
-        return "does not exist"
+        return "does not exist", []
     if row["state"] not in REOPENABLE:
-        return f"is {row['state']}: only a capped or failed analysis is retried"
+        return f"is {row['state']}: only a capped or failed analysis is retried", []
     newer = conn.execute(
         "SELECT id FROM analysis WHERE project=? AND repo=? AND branch=? AND id>?"
         " ORDER BY id LIMIT 1",
         (row["project"], row["repo"], row["branch"], analysis_id)).fetchone()
     if newer is not None:
         return (f"was superseded by analysis {newer['id']} of the same branch: "
-                "run Analyse again instead")
-    if not failed_lineages(conn, analysis_id):
-        return "has no unit that gave up: there is nothing to retry"
-    return ""
+                "run Analyse again instead"), []
+    leaves = failed_lineages(conn, analysis_id)
+    if not leaves:
+        return "has no unit that gave up: there is nothing to retry", []
+    return "", leaves
+
+
+def retry_refusal(conn, analysis_id) -> str:
+    return retry_state(conn, analysis_id)[0]
 
 
 def retryable(conn, analysis_id) -> int:
-    """How many units a retry would run again; 0 when it would be refused. The
-    page shows the Retry button by this number, computed by the very rule the
-    retry applies, so the button and the refusal never disagree."""
-    if retry_refusal(conn, analysis_id):
-        return 0
-    return len(failed_lineages(conn, analysis_id))
+    """How many units a retry would run again; 0 when it would be refused --
+    the number the page shows the Retry button by, from the very rule the
+    retry applies."""
+    why, leaves = retry_state(conn, analysis_id)
+    return 0 if why else len(leaves)
 
 
 # The sentences only `finish --from-units` writes, by the words each one

@@ -1366,6 +1366,18 @@ cmd_security_retry() { # cmd_security_retry <project> <analysis-id>
   security_analysis_live "$jid" && die "an analysis of '$project' is already running (job $jid)"
   [ "$(slots_active "$jid")" -eq 0 ] \
     || die "units of '$project' are still winding down — try again in a moment"
+  # A BUDGET THAT CANNOT PAY ONE MORE UNIT: the resumed orchestrator would
+  # launch nothing and close the analysis capped again. The budget is the
+  # project's (security_analysis_budget), so the ledger's `reopen` cannot
+  # see it; asked here, before anything is reopened. MIN_UNIT_BUDGET is
+  # 0.50 (security/orchestrator.py).
+  local budget spent
+  budget="$(security_analysis_budget "$jid")"
+  if [ -n "$budget" ]; then
+    spent="$(printf '%s' "$row" | "$JQ" -r '.spend_usd // 0')"
+    awk -v b="$budget" -v s="$spent" 'BEGIN { exit !(b - s < 0.5) }' \
+      && die "analysis $aid has spent \$$spent of its \$$budget budget, too little is left for one unit: raise the project's security budget before retrying"
+  fi
   out="$(security_engine_py reopen --analysis "$aid" 2>&1)" || die "$out"
   n="$(num "$(printf '%s' "$out" | "$JQ" -r '.units // 0' 2>/dev/null)" 0)"
   security_engine_py resume --analysis "$aid" >/dev/null 2>&1 \

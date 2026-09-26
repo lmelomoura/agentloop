@@ -8917,6 +8917,24 @@ FAKESELF
     && ! grep -q "launch" "$sec/retry.calls" \
     && ok "a refused reopen stops it, with the ledger's own sentence, and launches nothing" \
     || bad "refused retry (rc $rc): $(cat "$sec/retry.out"); calls: $(tr '\n' ' ' < "$sec/retry.calls")"
+  : > "$sec/retry.calls"
+  ( sec_env
+    security_engine_py() {
+      printf '%s\n' "$1" >> "$sec/retry.calls"
+      case "$1" in
+        analysis) printf '{"project":"Sec App","branch":"main","repo":"Sec App","spend_usd":4.8}' ;;
+        reopen)   printf '{"state":"interrupted","units":2}' ;;
+      esac
+    }
+    security_analysis_live() { return 1; }
+    slots_active() { echo 0; }
+    security_analysis_budget() { echo 5; }
+    security_launch_detached() { printf 'launch\n' >> "$sec/retry.calls"; }
+    cmd_security_retry "Sec App" 41 ) > "$sec/retry.out" 2>&1; rc=$?
+  [ "$rc" -ne 0 ] && grep -q "raise the project's security budget" "$sec/retry.out" \
+    && ! grep -q "reopen\|launch" "$sec/retry.calls" \
+    && ok "a budget that cannot pay one more unit refuses the retry before anything is reopened" \
+    || bad "budget retry (rc $rc): $(cat "$sec/retry.out"); calls: $(tr '\n' ' ' < "$sec/retry.calls")"
 
   echo "cmd_security_branches() — local and origin branches, HEAD excluded, deduped"
   # A real checkout with an origin, not faked refs: local-only never leaves the

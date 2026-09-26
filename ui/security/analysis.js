@@ -664,8 +664,9 @@ async function secRetryAnalysis(a, n){
   // commit the analysis read, not the branch's HEAD.
   const yes = await showConfirm({tone: "warn", icon: "shield",
     title: "Retry the " + units + " that gave up?",
-    message: "Runs again only the " + units + " that failed, on commit "
-      + String(a.commit_sha || "").slice(0, 7) + ". Everything already done stays done.",
+    message: "Runs again the " + units + " that gave up, on commit "
+      + String(a.commit_sha || "").slice(0, 7) + ", and any unit that never finished."
+      + " Everything already done stays done.",
     confirmLabel: "Retry " + units});
   if(!yes) return;
   markPending(...k);

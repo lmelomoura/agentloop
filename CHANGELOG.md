@@ -65,6 +65,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The old close is found by the words its sentences begin with, never by
   their numbers, so an analysis closed by an older engine (whose counts are
   worded differently today) is cut cleanly too.
+    A retry is refused, before anything is reopened, when the project's
+    security budget cannot pay for one more unit.
   On the dashboard, a capped or failed analysis with units that gave up shows
   **Retry failed units**, which says how many will run and on which commit
   before it runs them.

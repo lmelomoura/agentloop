@@ -2282,10 +2282,9 @@ def cmd_reopen(args):
     reason, when units.retry_refusal gives one."""
     conn = _conn(args)
     _analysis(conn, args.analysis)
-    why = units.retry_refusal(conn, args.analysis)
+    why, leaves = units.retry_state(conn, args.analysis)
     if why:
         sys.exit(f"analysis {args.analysis} {why}")
-    leaves = units.failed_lineages(conn, args.analysis)
     stored = conn.execute("SELECT coverage_note FROM analysis WHERE id=?",
                           (args.analysis,)).fetchone()["coverage_note"] or ""
     kept = stored[:units.close_part_start(stored)].strip()

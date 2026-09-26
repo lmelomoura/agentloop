@@ -938,7 +938,7 @@
       tone: "warn",
       icon: "shield",
       title: "Retry the " + units + " that gave up?",
-      message: "Runs again only the " + units + " that failed, on commit " + String(a.commit_sha || "").slice(0, 7) + ". Everything already done stays done.",
+      message: "Runs again the " + units + " that gave up, on commit " + String(a.commit_sha || "").slice(0, 7) + ", and any unit that never finished. Everything already done stays done.",
       confirmLabel: "Retry " + units
     });
     if (!yes) return;
@@ -5598,5 +5598,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: c4cf640113b8cebfb7c20d9119a070529fdf2972a0d6d7752c90cf0e6c121d05 */
-/* ui-sources: d65d6fbaf4187e5d9066b707beb13d6194b36238929d63bad0cbb6e8062a1092 */
+/* ui-bundle: 735cd4838eeb2638b52d21eff60925417b35548c56f8b40adbf87c8bff437648 */
+/* ui-sources: be8d0bd9c982c0bff6c898264f746014f39bf4ab20f24cf2ed3a25dac9194aed */

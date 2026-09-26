@@ -1263,3 +1263,17 @@ def test_a_start_error_that_carries_a_credential_is_withheld():
     assert got == ("the agent's error line was withheld: it looks like it carries a "
                    "credential (aws_access_key); see tick.log")
     assert units.start_error("START FAILED: BadResource: x") == "BadResource: x"
+
+
+def test_the_retry_state_reads_the_units_once(conn, monkeypatch):
+    """The page polls the checklist every four seconds, and `retryable` used
+    to walk every unit twice per poll (once in retry_refusal, once more for
+    the count): analysis 12 has ~1,100 units."""
+    aid = _analysis(conn)
+    _failed_hunt(conn, aid)
+    ledger.finish_analysis(conn, aid, "capped")
+    calls = []
+    real = ledger.units_of
+    monkeypatch.setattr(ledger, "units_of", lambda *a, **k: calls.append(1) or real(*a, **k))
+    assert units.retryable(conn, aid) == 1
+    assert len(calls) == 1
