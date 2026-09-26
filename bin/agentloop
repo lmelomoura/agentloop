@@ -1435,10 +1435,19 @@ security_unit_sweep() { # security_unit_sweep <job-id>
   done
   if [ -d "$WORKTREES_DIR/$jid" ]; then
     for d in "$WORKTREES_DIR/$jid"/*; do
-      [ -d "$d" ] || continue              # skips the .<stamp>.tsv scratch files
+      if [ ! -d "$d" ]; then
+        # What a vanished run dir left behind goes (wt_remove_stray_file);
+        # the .<stamp>.tsv scratch files never match.
+        wt_remove_stray_file "$jid" "$d" || true
+        continue
+      fi
       lock_take "$rlock"
-      if ! wt_is_claimed "$jid" "$d"; then
-        printf 'done\n' > "$d/.ended" 2>/dev/null || true
+      # Claimed first, then asked whether it is still here -- the order
+      # wt_prune_orphans follows, for the same reason: run_cleanup removes a
+      # unit's tree before it releases the slot, so a tree whose unit tore it
+      # down while this waited for the lock is simply gone, not swept.
+      if ! wt_is_claimed "$jid" "$d" && [ -d "$d" ]; then
+        { printf 'done\n' > "$d/.ended"; } 2>/dev/null || true
         wt_teardown "$jid" "" "$d"
         [ -d "$d" ] || trees="$trees ${d##*/}"
       fi

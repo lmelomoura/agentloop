@@ -593,6 +593,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   removed by the next sweep and named in tick.log; anything else in that
   place (a file with content, a symlink) is not the engine's and is left
   alone.
+  The orchestrator's own sweep (`__unit-sweep`, run as every analysis ends)
+  asks the same way, removes the same stray file, and no longer reports as
+  swept a tree a unit had already removed.
 
 - **A stopped, killed, watchdog-timed-out or crashed run's cost is now
   estimated from its own stream instead of lost as $0.00.** A run never

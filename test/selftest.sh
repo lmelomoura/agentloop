@@ -6968,6 +6968,42 @@ PY
     wt_remove_all "$srd_live"; wt_remove_all "$urd2" ) >/dev/null 2>&1
   rm -rf "$tmp/uslocks" "$tmp/wtroot/security-sw" "$tmp/wtroot/security-app"
 
+  echo "security_unit_sweep() — a tree torn down while it waited is not counted, and a stray file goes"
+  # The same shape as wt_prune_orphans' (Task 1): the orchestrator's sweep
+  # also tested `-d` before the lock. It creates nothing -- it only writes
+  # INSIDE the directory -- but it counted as swept a tree the unit's own
+  # cleanup had removed. And it is the sweep that runs as every analysis
+  # ends, so it is where an older engine's stray file goes first.
+  local usRoot="$tmp/wtus" usd="$tmp/wtus/security-gone/stampUG"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$usRoot"
+    wt_setup security-gone two "$tmp/g/repo" stampUG ) >/dev/null 2>&1
+  : > "$usRoot/security-gone/20260926T005011Z-38238"
+  : > "$tmp/us.tick"
+  (
+    LOCK_DIR="$tmp/uslocks2"; WORKTREES_DIR="$usRoot"; TICK_LOG="$tmp/us.tick"
+    rlock="$LOCK_DIR/.resume"; mkdir -p "$LOCK_DIR/security-gone"
+    sleep 5 & pidU=$!
+    slotU="$LOCK_DIR/security-gone/$pidU"; mkdir -p "$slotU"
+    echo "$pidU" > "$slotU/pid"; boot_id > "$slotU/boot"; echo "$usd" > "$slotU/worktree"
+    ( lock_take "$rlock"; sleep 0.5; wt_remove_all "$usd"; rm -rf "$slotU"; lock_drop "$rlock" ) \
+      & holder=$!
+    i=0; while [ ! -d "$rlock" ] && [ "$i" -lt 200 ]; do sleep 0.01; i=$(( i + 1 )); done
+    security_unit_sweep security-gone > "$tmp/us.out" 2>&1
+    wait "$holder"
+    kill "$pidU" 2>/dev/null; wait "$pidU" 2>/dev/null
+  )
+  [ ! -e "$usd" ] && ok "nothing is left where the unit's tree was" \
+    || bad "the unit sweep left a $(stat -f %HT "$usd" 2>/dev/null) where the tree was"
+  grep -q "stampUG" "$tmp/us.out" \
+    && bad "it counted as swept a tree it never removed: $(cat "$tmp/us.out")" \
+    || ok "and it does not count a tree it never removed"
+  [ ! -e "$usRoot/security-gone/20260926T005011Z-38238" ] \
+    && ok "an older engine's stray file goes with the analysis's own sweep" \
+    || bad "the stray file survived the unit sweep"
+  grep -q "security-gone: removed a stray empty file where run dir 20260926T005011Z-38238 was" "$tmp/us.tick" \
+    && ok "and tick.log says so" || bad "tick.log: $(cat "$tmp/us.tick")"
+  rm -rf "$usRoot" "$tmp/uslocks2"
+
   echo "_stop_slot() — a live pid from an earlier boot is cleared, never signalled"
   # Same reboot-recycled-pid risk slot_alive exists for, but with teeth: the old
   # bare kill -0 here did not just miscount a slot, it aimed a real TERM at
