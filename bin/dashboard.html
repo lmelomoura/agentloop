@@ -2230,6 +2230,10 @@ const AL = {
   // so its actions need the same page-wide pending state, not a second copy
   // that could disagree about what is in flight.
   markPending, clearPending, isPending, markIfPending,
+  // The page's one confirmation dialog, for an action that spends: the
+  // Security page's Retry says what it will run before it runs it.
+  // Hoisted, like openProjectEditor below.
+  showConfirm,
   fmtAgo, fmtWhen, fmtDur, money,
   pageHeader: ALApp.pageHeader, kpiCard: ALApp.kpiCard, tableFooter: ALApp.tableFooter,
   // The project screen's "Project settings" link opens the SAME editor the

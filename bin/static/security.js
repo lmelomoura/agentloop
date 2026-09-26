@@ -20,6 +20,7 @@
   var clearPending;
   var isPending;
   var markIfPending;
+  var showConfirm;
   var pageHeader;
   var kpiCard;
   var tableFooter;
@@ -51,6 +52,7 @@
       clearPending,
       isPending,
       markIfPending,
+      showConfirm,
       pageHeader,
       kpiCard,
       tableFooter,
@@ -271,7 +273,8 @@
     seq: 0,
     pinned: false,
     units: null,
-    orchestrator: null
+    orchestrator: null,
+    retryable: 0
   };
 
   // ui/security/dom.js
@@ -676,6 +679,7 @@
       secState.findings = [];
       secState.units = null;
       secState.orchestrator = null;
+      secState.retryable = 0;
       secPaint();
       return;
     }
@@ -686,12 +690,14 @@
       secState.findings = j.findings || [];
       secState.units = j.units || null;
       secState.orchestrator = j.orchestrator || null;
+      secState.retryable = j.retryable || 0;
     } catch (e) {
       if (seq !== secState.seq) return;
       secState.analysis = null;
       secState.findings = [];
       secState.units = null;
       secState.orchestrator = null;
+      secState.retryable = 0;
       secStatus("Could not read that analysis \u2014 " + e.message);
       return;
     }
@@ -851,7 +857,7 @@
     read: "Deep read",
     verify: "Verification"
   };
-  function secRenderPipeline(a, summary) {
+  function secRenderPipeline(a, summary, retryable) {
     const host = $("sec-pipeline");
     host.textContent = "";
     if (!a || !summary || !summary.units) {
@@ -892,6 +898,12 @@
       btn.onclick = () => running ? secStopAnalysis(a) : secResumeAnalysis(a);
       host.appendChild(btn);
     }
+    if ((a.state === "capped" || a.state === "failed") && retryable > 0) {
+      const btn = secEl("button", "btn", "Retry failed units");
+      btn.type = "button";
+      btn.onclick = () => secRetryAnalysis(a, retryable);
+      host.appendChild(btn);
+    }
   }
   async function secStopAnalysis(a) {
     const k = ["security_stop", secState.project, String(a.id)];
@@ -911,6 +923,29 @@
     try {
       if (await api("security_resume", { project: secState.project, analysis: a.id })) {
         toast("Analysis resumed", false, "shield");
+        await secReload();
+        secSyncPoll();
+      }
+    } finally {
+      clearPending(...k);
+    }
+  }
+  async function secRetryAnalysis(a, n) {
+    const k = ["security_retry", secState.project, String(a.id)];
+    if (isPending(...k)) return;
+    const units = n === 1 ? "1 unit" : n + " units";
+    const yes = await showConfirm({
+      tone: "warn",
+      icon: "shield",
+      title: "Retry the " + units + " that gave up?",
+      message: "Runs again the " + units + " that gave up, on commit " + String(a.commit_sha || "").slice(0, 7) + ", and any unit that never finished. While it runs, the branch shows its previous finished analysis. Everything already done stays done.",
+      confirmLabel: "Retry " + units
+    });
+    if (!yes) return;
+    markPending(...k);
+    try {
+      if (await api("security_retry", { project: secState.project, analysis: a.id })) {
+        toast("Retrying " + units, false, "shield");
         await secReload();
         secSyncPoll();
       }
@@ -958,7 +993,7 @@
       inc.appendChild(secEl("span", "grow", incomplete + " What is below is what it had reached, not what is there."));
       inc.hidden = false;
     } else inc.hidden = true;
-    secRenderPipeline(a, secState.units);
+    secRenderPipeline(a, secState.units, secState.retryable);
     secRenderCoveragePhases(a);
     const note = $("sec-coverage");
     note.textContent = "";
@@ -5563,5 +5598,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: cd66d63bc5fa3735cff69a4ebc0e20d8b60549d7c396b2adeef353ff2c0a4c4c */
-/* ui-sources: d5c393951ee7a88cd89e096ff73a1628dd91d4547a0c24203cbc12ca7cf6a929 */
+/* ui-bundle: 0fda10df7667c0fb95ab114671bdd8ded85729d0164af228125a63dbbb9e841c */
+/* ui-sources: 441724cef213b094db68793c17c7f6998d637fe1ea1f018abc79c25fc787b160 */

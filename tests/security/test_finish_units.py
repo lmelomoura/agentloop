@@ -1,8 +1,9 @@
 # tests/security/test_finish_units.py
 """The close the engine makes: done only with every unit's proof, capped with each gap named."""
 import json
+import os
 
-from test_cli import run
+from test_cli import fails, run
 
 from security import cli as security_cli
 from security import ledger
@@ -226,3 +227,51 @@ def test_from_units_keeps_the_passed_spend_when_summary_is_none(tmp_path, monkey
                        "--from-units", "--spend", "4.25", "--db", str(db)])
     row = _analysis(db, aid)
     assert row["spend_usd"] == 4.25
+
+
+def _gave_up(db, tmp_path):
+    """A deep analysis closed from its units with one lineage given up: the
+    read proved its lines, the hunt never ran."""
+    aid, conn = _deep(db, tmp_path)
+    hunt = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    read = ledger.add_unit(conn, aid, "read", {"ranges": [{"path": "a.py", "first": 1, "last": 10, "bytes": 100}]})
+    _done(conn, read, 1.5, ["ATTACK-CLASSES"], covered={"a.py": [[1, 10]]})
+    ledger.start_unit(conn, hunt)
+    ledger.settle_unit(conn, hunt, "failed", 0, {}, "The engine could not run this unit.")
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--from-units")
+    return aid, conn, hunt, read
+
+
+def test_a_retry_reopens_only_what_gave_up_and_the_next_close_drops_the_old_gaps(tmp_path):
+    db = tmp_path / "security.db"
+    aid, conn, hunt, read = _gave_up(db, tmp_path)
+    before = _analysis(db, aid)
+    assert before["state"] == "capped" and "gave up" in before["coverage_note"]
+    assert run(db, "checklist", "--analysis", str(aid))["retryable"] == 1
+    assert run(db, "reopen", "--analysis", str(aid)) == {"state": "interrupted", "units": 1}
+    child = [u for u in ledger.units_of(conn, aid) if u["parent"] == hunt]
+    assert [(c["kind"], c["state"], c["attempt"]) for c in child] == [("hunt", "pending", 1)]
+    assert ledger.get_unit(conn, read)["state"] == "done", "what was done stays done"
+    reopened = _analysis(db, aid)
+    assert "gave up" not in reopened["coverage_note"], "the old close's gaps are cut"
+    assert "1 unit that had given up was run again." in reopened["coverage_note"]
+    ledger.resume_analysis(conn, aid)
+    _done(conn, child[0]["id"], 0.5, ["ATTACK-CLASSES"])
+    run(db, "finish", "--analysis", str(aid), "--state", "done", "--from-units")
+    after = _analysis(db, aid)
+    assert after["state"] == "done", after["coverage_note"]
+    assert "gave up" not in after["coverage_note"]
+    assert "1 unit that had given up was run again." in after["coverage_note"]
+    assert run(db, "checklist", "--analysis", str(aid))["retryable"] == 0
+
+
+def test_reopen_refuses_with_the_reason_and_never_inside_an_agent_session(tmp_path):
+    db = tmp_path / "security.db"
+    aid, conn, _hunt, _read = _gave_up(db, tmp_path)
+    agent = fails(db, "reopen", "--analysis", str(aid), env={**os.environ, "AL_SECURITY_AGENT": "1"})
+    assert agent.returncode != 0, "a unit's session never reopens an analysis"
+    assert _analysis(db, aid)["state"] == "capped"
+    run(db, "reopen", "--analysis", str(aid))
+    again = fails(db, "reopen", "--analysis", str(aid))
+    assert again.returncode != 0
+    assert f"analysis {aid} is interrupted: only a capped or failed analysis is retried" in again.stderr

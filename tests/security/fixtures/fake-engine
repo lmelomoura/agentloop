@@ -33,6 +33,14 @@ __run-unit <job> <analysis> <unit> <commit> <repo>
                           classifier's cause `rate_limited` (a stream, no
                           work); later runs play `complete`
       always-outage       every run ends `error` / `rate_limited`
+      always-api-error    every run ends `error` / `api_error` (a stream, no
+                          work): the provider refusing every unit alike, as an
+                          expired OAuth token does
+      start-fail          every run ends `error` / `start_failed` with no
+                          stream, its reason FAKE_ENGINE_START_ERROR (default
+                          a BadResource line, measurement 39)
+      start-fail-hunt     a hunt unit's runs end as `start-fail`; the other
+                          kinds play `complete`
       no-stream-close     a hunt unit closes `success` WITHOUT a stream; the
                           other kinds play `complete`
     FAKE_ENGINE_SPEND: what each close records (default 0.1).
@@ -79,10 +87,11 @@ def cli(*args, env=None, stdin=None):
 SPEND = os.environ.get("FAKE_ENGINE_SPEND", "0.1")
 
 
-def close(aid, uid, status, stream="", cause=""):
+def close(aid, uid, status, stream="", cause="", reason=""):
     cli("unit-close", "--analysis", aid, "--unit", uid, "--status", status, "--spend", SPEND,
         "--root", ROOT, *(["--stream", stream] if stream else []),
-        *(["--cause", cause] if cause else []))
+        *(["--cause", cause] if cause else []),
+        *(["--reason", reason] if reason else []))
 
 
 def write_stream(job, ranges):
@@ -153,6 +162,14 @@ def run_unit(job, aid, uid):
     if budgets:
         with open(budgets, "a", encoding="utf-8") as out:
             out.write(os.environ.get("AL_SECURITY_UNIT_BUDGET", "") + "\n")
+    if MODE == "start-fail" or (MODE == "start-fail-hunt" and unit["kind"] == "hunt"):
+        close(aid, uid, "error", cause="start_failed",
+              reason="START FAILED: " + os.environ.get(
+                  "FAKE_ENGINE_START_ERROR", "BadResource: FileSystem.access (/gone/repo)"))
+        return
+    if MODE == "always-api-error":
+        close(aid, uid, "error", write_stream(job, []), cause="api_error")
+        return
     if MODE == "always-outage" or (MODE == "outage" and not unit["parent"]):
         close(aid, uid, "error", write_stream(job, []), cause="rate_limited")
         return

@@ -1537,6 +1537,24 @@ it is abandoned (`failed`, with a note saying so), its finished units kept,
 so a machine that crashes every time stops spending. Your own Resume is
 never counted against that limit.
 
+**An agent that cannot start** (its CLI exits before a single event, as
+OpenCode does for every boot of a project whose sandbox list names a path
+under a file) is recorded `error` / `start_failed`, with the CLI's own last
+stderr line as the run's note, instead of `killed`. Its unit keeps its
+attempt; three in a row give that unit up, and three in a row across two or
+more units pause the whole analysis: it is left `interrupted`, the note names
+the error, and Resume continues it once the cause is fixed.
+
+**Retry failed units.** A `capped` or `failed` analysis whose units gave up is
+not a dead end. `agentloop security retry <project> <analysis>`, or **Retry
+failed units** on the analysis, reopens it and runs again only those units,
+each with a fresh round of attempts, on the commit it analysed. Every unit
+already done is kept. Only the newest analysis of its branch can be retried;
+its next close describes the final state, and its note says when it was
+retried. While it runs the analysis is not finished, so the branch's posture
+and the next analysis's baseline are the previous finished one until it closes
+again.
+
 Each unit's own contract is versioned rather than typed into a prompt
 (`skills/security-analysis/SKILL.md`), and it is written **per unit role**: a
 section of rules every unit follows, then one section per kind — `triage`
@@ -1967,6 +1985,14 @@ agentloop security resume <project> <analysis-id>
 continues an `interrupted` analysis — one that was stopped, or found with no
 orchestrator behind it by the next Analyse of another branch — in the
 background, without repeating a finished unit.
+
+```bash
+agentloop security retry <project> <analysis-id>
+```
+
+reopens a `capped` or `failed` analysis (the newest of its branch) and runs
+again, in the background, only the units that gave up, on the commit it
+analysed.
 
 The rest of the vocabulary is the ledger's own and belongs to the units and the
 page. A unit's half is `findings`, `fingerprint`, `report-finding`,

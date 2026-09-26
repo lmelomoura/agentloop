@@ -143,7 +143,7 @@ AGENT_FORBIDDEN = ("decide", "rename-project", "open-analysis", "event",
                    # unit, in a checkout of its own (it strips the flag), and
                    # a second one from a unit's shell would re-run the
                    # deterministic phases over the analysis mid-pipeline.
-                   "finish", "unit-close", "orchestrate", "interrupt", "resume", "abandon",
+                   "finish", "unit-close", "orchestrate", "interrupt", "resume", "abandon", "reopen",
                    "prepare")
 
 
@@ -2272,6 +2272,28 @@ def cmd_abandon(args):
                 "failed", "is not interrupted: only an interrupted analysis is abandoned")
 
 
+def cmd_reopen(args):
+    """The operator's retry of a capped or failed analysis: the units that
+    gave up run again, and nothing else (`agentloop security retry` calls
+    this, then `resume`). What the last close appended to the note -- the
+    units' sentence and its gaps -- is cut, so the next close describes the
+    final state instead of stacking a second verdict on the first; a
+    sentence saying when, and how many, takes its place. Refused, with the
+    reason, when units.retry_refusal gives one."""
+    conn = _conn(args)
+    _analysis(conn, args.analysis)
+    why, leaves = units.retry_state(conn, args.analysis)
+    if why:
+        sys.exit(f"analysis {args.analysis} {why}")
+    stored = conn.execute("SELECT coverage_note FROM analysis WHERE id=?",
+                          (args.analysis,)).fetchone()["coverage_note"] or ""
+    kept = stored[:units.close_part_start(stored)].strip()
+    note = f"{kept} {units.retry_sentence(len(leaves))}".strip()
+    if not ledger.reopen_analysis(conn, args.analysis, leaves, note):
+        sys.exit(f"analysis {args.analysis} changed while it was being reopened: try again")
+    print(json.dumps({"state": ledger.INTERRUPTED, "units": len(leaves)}))
+
+
 def cmd_fingerprint(args):
     """Print the 64-hex identity of a finding -- computed, never typed.
 
@@ -3263,6 +3285,10 @@ def cmd_checklist(args):
                       # The pipeline's progress, for the page's Pipeline block:
                       # small, and read while the analysis runs.
                       "units": units.summary(conn, args.analysis),
+                      # How many units a Retry would run again -- 0 when it
+                      # would be refused -- by the rule `reopen` itself
+                      # applies (units.retry_refusal), for the page's button.
+                      "retryable": units.retryable(conn, args.analysis),
                       "decided_sast": queries.decided_sast(conn, args.analysis, listed=findings),
                       "findings": findings},
                      indent=2))
@@ -4369,7 +4395,7 @@ def main(argv=None):
     rd.add_argument("--path", required=True)
     rd.add_argument("--from", type=int, default=1, dest="start")
 
-    # The pipeline's lifecycle, the engine's to drive (all three in AGENT_FORBIDDEN).
+    # The pipeline's lifecycle, the engine's to drive (all four in AGENT_FORBIDDEN).
     it = sub.add_parser("interrupt", parents=[dbflag]); it.set_defaults(fn=cmd_interrupt)
     it.add_argument("--analysis", type=int, required=True)
 
@@ -4380,6 +4406,9 @@ def main(argv=None):
     ab = sub.add_parser("abandon", parents=[dbflag]); ab.set_defaults(fn=cmd_abandon)
     ab.add_argument("--analysis", type=int, required=True)
     ab.add_argument("--note", required=True)
+
+    ro = sub.add_parser("reopen", parents=[dbflag]); ro.set_defaults(fn=cmd_reopen)
+    ro.add_argument("--analysis", type=int, required=True)
 
     # The engine's orchestrator of a pipeline analysis (in AGENT_FORBIDDEN).
     oc = sub.add_parser("orchestrate", parents=[dbflag]); oc.set_defaults(fn=cmd_orchestrate)

@@ -35,9 +35,11 @@ continuation with no work done.
 """
 
 import os
+import re
 import sqlite3
+import time
 
-from . import diff, evidence, ledger, queries, slices
+from . import diff, evidence, ledger, queries, secrets, slices
 
 TRIAGE_BATCH = 25
 MAX_ATTEMPTS = 3
@@ -54,8 +56,41 @@ _TRUNCATED = ("BUDGET LIMITED", "UNDECLARED ENDING", "UNDELIVERED")
 # The classifier's causes for a run the PROVIDER ended (run_classify in
 # bin/agentloop): not the unit's failure, so its close keeps the attempt.
 OUTAGE_CAUSES = ("rate_limited", "api_error")
+# The classifier's cause for a run whose agent never started (run_start_failed
+# in bin/agentloop): it exited on its own, non-zero, before a single event.
+# Nothing the unit could fix -- OpenCode failing every boot of a project on a
+# poisoned sandbox (measurement 39) -- so, like an outage, it keeps its
+# attempt, and the orchestrator counts it toward giving the lineage up and
+# toward pausing the whole analysis (security/orchestrator.py).
+START_FAILED = "start_failed"
+KEPT_ATTEMPT_CAUSES = OUTAGE_CAUSES + (START_FAILED,)
+START_FAILED_NOTE = "The agent could not start ({error}); nothing ran, so the attempt is kept."
+# The engine's note for such a run: `START FAILED: <the agent's last stderr line>`.
+_START_FAILED_PREFIX = "START FAILED: "
+START_ERROR_WITHHELD = ("the agent's error line was withheld: it looks like it carries a "
+                        "credential ({rule}); see tick.log")
 NO_STREAM_NOTE = ("The run left no stream -- the only proof of what a session did, and of "
                   "whether it launched a subagent -- so nothing it did counts.")
+
+
+def start_error(reason) -> str:
+    """The agent's own words in a `start_failed` run's note -- the engine
+    writes `START FAILED: <its last stderr line>` -- at most 300 characters.
+
+    THIS TEXT LEAVES THE MACHINE. It becomes the unit's note, the gap
+    sentence that quotes it, and the gate sentence, and through them the
+    coverage note and every report format -- the path security/cli.py gates
+    with looks_like_a_secret for text anyone writes (`_refuse_if_secret`),
+    while the gaps are exempt only because they quote names our own scanners
+    mint. A stderr line is neither, so a line that looks like it carries a
+    credential is withheld here; the raw line stays in tick.log and the
+    run's own record, which never leave this machine."""
+    text = (reason or "").strip()
+    if text.startswith(_START_FAILED_PREFIX):
+        text = text[len(_START_FAILED_PREFIX):].strip()
+    text = text[:300] or "no reason given"
+    rule = secrets.looks_like_a_secret(text)
+    return START_ERROR_WITHHELD.format(rule=rule) if rule else text
 
 
 def triage_items(conn, analysis_id) -> list:
@@ -771,6 +806,7 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     if unit["state"] not in ("pending", "running"):
         return {"state": unit["state"], "continuation": None}
     outage = cause in OUTAGE_CAUSES
+    kept = cause in KEPT_ATTEMPT_CAUSES
     if not evidence.stream_proves(stream):
         # NO STREAM, NOTHING COUNTS -- whoever closes: the engine's
         # `unit-close` handed an empty or unreadable one, or the orchestrator
@@ -786,13 +822,17 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
         ev = {"stream": "none", "guides": []}
         if unit["kind"] == "read":
             ev.update({"ranges": len(unit["payload"].get("ranges") or []), "covered": {}})
-        if outage:
+        note = NO_STREAM_NOTE
+        if kept:
             ev["cause"] = cause
+        if cause == START_FAILED:
+            ev["error"] = start_error(reason)
+            note = START_FAILED_NOTE.format(error=ev["error"])
         clear = None
         if unit["kind"] == "verify":
             clear = (unit["analysis_id"], unit["payload"].get("fingerprint", ""), f"unit:{unit['id']}")
-        return conclude(conn, unit, done=False, evidence=ev, note=NO_STREAM_NOTE,
-                        spend_usd=spend_usd, stopped=status == "stopped" or outage,
+        return conclude(conn, unit, done=False, evidence=ev, note=note,
+                        spend_usd=spend_usd, stopped=status == "stopped" or kept,
                         clear_verdict=clear)
     session = evidence.read_session(stream or None, root or ".")
     # A LINE THE READ TOOL CUT IS NOT READ BY IT (I5). The inventory records,
@@ -864,3 +904,87 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     return conclude(conn, unit, done=done, evidence=ev, note=note, spend_usd=spend_usd,
                     remaining=remaining, stopped=status == "stopped" or outage,
                     clear_verdict=clear)
+
+
+# A retry reopens only an analysis that ended; `running` and `interrupted`
+# are the orchestrator's and the resume's, and `done` has nothing to retry.
+REOPENABLE = ("capped", "failed")
+
+
+def failed_lineages(conn, analysis_id) -> list:
+    """The last unit of every lineage that gave up (`failed`), in the order of
+    their roots -- what a retry runs again."""
+    return [last for _root, last in _lineages(ledger.units_of(conn, analysis_id))
+            if last["state"] == "failed"]
+
+
+def retry_state(conn, analysis_id):
+    """(refusal, leaves): why this analysis cannot be retried -- the words
+    that follow `analysis <id> `, "" when it can -- and the last unit of every
+    lineage that gave up, which a retry runs again. ONE read of the units:
+    the page asks for this on every poll of the checklist (retryable).
+
+    A retry reopens a closed analysis on the commit it analysed. So: only one
+    that ended `capped` or `failed`; only the newest of its scope -- the same
+    (project, repo, branch) with which a new analysis already supersedes an
+    interrupted one (cli.cmd_open_analysis); and only one with a lineage that
+    gave up. Whether the budget can pay for a unit is the engine's to say
+    (cmd_security_retry): the budget is the project's, not the ledger's."""
+    row = conn.execute("SELECT * FROM analysis WHERE id=?", (analysis_id,)).fetchone()
+    if row is None:
+        return "does not exist", []
+    if row["state"] not in REOPENABLE:
+        return f"is {row['state']}: only a capped or failed analysis is retried", []
+    newer = conn.execute(
+        "SELECT id FROM analysis WHERE project=? AND repo=? AND branch=? AND id>?"
+        " ORDER BY id LIMIT 1",
+        (row["project"], row["repo"], row["branch"], analysis_id)).fetchone()
+    if newer is not None:
+        return (f"was superseded by analysis {newer['id']} of the same branch: "
+                "run Analyse again instead"), []
+    leaves = failed_lineages(conn, analysis_id)
+    if not leaves:
+        return "has no unit that gave up: there is nothing to retry", []
+    return "", leaves
+
+
+def retry_refusal(conn, analysis_id) -> str:
+    return retry_state(conn, analysis_id)[0]
+
+
+def retryable(conn, analysis_id) -> int:
+    """How many units a retry would run again; 0 when it would be refused --
+    the number the page shows the Retry button by, from the very rule the
+    retry applies."""
+    why, leaves = retry_state(conn, analysis_id)
+    return 0 if why else len(leaves)
+
+
+# The sentences only `finish --from-units` writes, by the words each one
+# begins with: the units' coverage sentence (coverage_sentence) and the gaps
+# (gaps). NEVER by their numbers or their full wording -- a later engine
+# counts and phrases them differently (analysis 12's "Deep read" said 6,670
+# files where today's count of the same inventory says 6,656), and a close
+# looked for by rebuilding its sentence is a close that is not found.
+_CLOSE_PART = re.compile(
+    r"(?:^|(?<=\s))(?:Reachability pass: |Deep read: "
+    r"|[\d,]+ units? never finished: |[\d,]+ units? gave up after "
+    r"|[\d,]+ of [\d,]+ lines in the deep scope "
+    r"|The deep scope was never listed or cannot be read: )")
+
+
+def close_part_start(note) -> int:
+    """Where the last close from the units began in `note`: `finish
+    --from-units` appends the units' coverage sentence first, then the gaps,
+    after whatever `prepare` stored -- so the first of their opening words is
+    where the close begins. len(note) when none is in it."""
+    found = _CLOSE_PART.search(note or "")
+    return found.start() if found else len(note or "")
+
+
+def retry_sentence(n, day=None) -> str:
+    """What a retry leaves in the analysis's note: when, and how many units."""
+    day = day or time.strftime("%Y-%m-%d", time.gmtime())
+    if n == 1:
+        return f"Retried on {day}: 1 unit that had given up was run again."
+    return f"Retried on {day}: {n} units that had given up were run again."

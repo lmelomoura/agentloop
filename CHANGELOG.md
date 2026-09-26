@@ -20,6 +20,65 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A run whose agent never started says so, and says why.** An agent CLI
+  that exits non-zero before its stream holds a single event or a session is
+  bound (OpenCode does exactly that for every boot of a project whose
+  sandbox list names a path under a file, measurement 39) is recorded
+  `error` / `start_failed` instead of `killed`, and its note carries the
+  CLI's own last stderr line. On a real install 693 such runs were filed as
+  kills that never happened, with the cause left unread in each run's
+  stderr. `test/fake-opencode` plays it with `FAKE_OPENCODE_START_FAIL`.
+  The run's note and its tick.log line read `START FAILED: <the line>`.
+
+- **An agent that cannot start no longer spends its unit's attempts.** A unit
+  whose run ended `start_failed` keeps its attempt, as one cut short by a
+  provider outage already does, and its note reads "The agent could not start
+  (<the agent's words>)". Before, every such run was one of the unit's three
+  attempts, and an environment problem that hit every unit alike gave each of
+  them up in turn.
+  A stderr line that looks like it carries a credential is withheld from the
+  unit's note and from every report; the raw line stays in tick.log.
+
+- **A security analysis pauses when its units cannot start, instead of
+  burning them one by one.** Three start failures in a row, over two units or
+  more, close the orchestrator's gate: nothing more is launched, and the
+  analysis is left `interrupted` with the agent's own last words in its note,
+  so Resume continues it once the cause is fixed. On a real install the same
+  environment failure used every one of 231 units' three attempts in 42
+  minutes, and the analysis closed `capped` with none of them verified. One
+  unit that alone cannot start is given up after three tries, with the reason
+  named, and the rest of the analysis runs.
+  A provider that answers every unit with an error (`api_error`: an expired
+  or revoked credential answers them all alike) pauses it the same way; a
+  rate limit (429) does not, being transient.
+  An analysis whose agent exits before its first event on every unit is
+  therefore left `interrupted`, not `capped`.
+
+- **A capped or failed security analysis can be retried, running only what
+  gave up.** `security/cli.py reopen` turns the newest analysis of a branch
+  back to `interrupted` and gives every lineage that gave up a fresh unit, at
+  attempt 1, on the commit it analysed; units already done never run again.
+  The last close's gap sentences are cut from the note, so the next close
+  describes the final state, and a sentence says when it was retried and how
+  many units ran again. Before, the only way on from a `capped` analysis was
+  a new one, repeating hours of reading that had already been proved.
+  From the terminal: `agentloop security retry <project> <analysis-id>`.
+  `reopen` is refused to a unit's own session, and the analysis skill says so
+  beside the other lifecycle verbs.
+  The dashboard asks for it through a new security_retry operation.
+  The old close is found by the words its sentences begin with, never by
+  their numbers, so an analysis closed by an older engine (whose counts are
+  worded differently today) is cut cleanly too.
+  A retry is refused, before anything is reopened, when the project's
+  security budget cannot pay for one more unit.
+  The count it reports is read from the ledger's answer alone.
+  While it runs the analysis is not finished, so the branch's posture and
+  the next analysis's baseline are the previous finished one until it closes
+  again.
+  On the dashboard, a capped or failed analysis with units that gave up shows
+  **Retry failed units**, which says how many will run and on which commit
+  before it runs them.
+
 - **The run index keeps transcripts for 30 days, and every run's summary
   forever.** A finished run's stream, result, precheck output and stderr
   used to stay in `index.db` for as long as the index existed — 751 MB on
@@ -601,6 +660,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Default it already is.
 
 ### Fixed
+
+- **The tick's orphan sweep can no longer leave a file where a run dir was.**
+  It tested a run dir before taking the lock every `run_job` also takes as it
+  starts, and a unit that tore its tree down and released its slot in that
+  window was "adopted": the marker write failed, and `touch` created a 0-byte
+  file at the run dir's path. OpenCode keeps every directory it boots in as a
+  sandbox of the project and fails every boot on a sandbox whose parent is a
+  file (measurement 39), so on a real install a deep analysis lost 231 of its
+  267 verify units, three attempts each, before it closed `capped`. The sweep
+  now asks whether the directory is still there once it holds the lock and
+  knows nobody claims it, and an adoption only ever restarts an existing
+  directory's clock (`touch -c`).
+  A 0-byte file with a run dir's name, which an older engine could leave, is
+  removed by the next sweep and named in tick.log; anything else in that
+  place (a file with content, a symlink) is not the engine's and is left
+  alone.
+  The orchestrator's own sweep (`__unit-sweep`, run as every analysis ends)
+  asks the same way, removes the same stray file, and no longer reports as
+  swept a tree a unit had already removed.
+  Every other refresh of a run dir's clock is `touch -c` too, and the
+  selftest refuses a `touch` that could create a run dir's path again.
 
 - **A stopped, killed, watchdog-timed-out or crashed run's cost is now
   estimated from its own stream instead of lost as $0.00.** A run never

@@ -1348,6 +1348,54 @@ cmd_security_resume() { # cmd_security_resume <project> <analysis-id>
   printf '{"analysis_id":%s,"resumed":true}\n' "$aid"
 }
 
+# `agentloop security retry <project> <analysis-id>`: a CAPPED or FAILED
+# analysis reopened to run again only the lineages that gave up, on the
+# commit it analysed -- the ledger's `reopen` decides when that is allowed
+# (security/units.py retry_refusal) and says why when it is not -- then
+# continued exactly as a resume continues an interrupted one. Refused, like
+# a resume, while anything of the project's is still alive.
+cmd_security_retry() { # cmd_security_retry <project> <analysis-id>
+  [ $# -ge 2 ] || die "usage: agentloop security retry <project> <analysis-id>"
+  local project="$1" aid="$2" jid row out n
+  security_enabled "$project" || die "security is not enabled for project '$project'"
+  case "$aid" in ''|*[!0-9]*) die "security: '$aid' is not an analysis id" ;; esac
+  jid="$(security_job_id "$project")"
+  row="$(security_engine_py analysis --id "$aid" 2>/dev/null)" || die "no such analysis: $aid"
+  [ "$(printf '%s' "$row" | "$JQ" -r '.project')" = "$project" ] \
+    || die "analysis $aid is not an analysis of '$project'"
+  security_analysis_live "$jid" && die "an analysis of '$project' is already running (job $jid)"
+  [ "$(slots_active "$jid")" -eq 0 ] \
+    || die "units of '$project' are still winding down — try again in a moment"
+  # A BUDGET THAT CANNOT PAY ONE MORE UNIT: the resumed orchestrator would
+  # launch nothing and close the analysis capped again. The budget is the
+  # project's (security_analysis_budget), so the ledger's `reopen` cannot
+  # see it; asked here, before anything is reopened. MIN_UNIT_BUDGET is
+  # 0.50 (security/orchestrator.py).
+  local budget spent
+  budget="$(security_analysis_budget "$jid")"
+  if [ -n "$budget" ]; then
+    spent="$(printf '%s' "$row" | "$JQ" -r '.spend_usd // 0')"
+    awk -v b="$budget" -v s="$spent" 'BEGIN { exit !(b - s < 0.5) }' \
+      && die "analysis $aid has spent \$$spent of its \$$budget budget, too little is left for one unit: raise the project's security budget before retrying"
+  fi
+  # stdout is the JSON, stderr is the refusal: never read one as the other
+  # -- a warning on stderr made the count unparseable and read as 0.
+  local errf
+  errf="$(mktemp "${TMPDIR:-/tmp}/al-reopen.XXXXXX")"
+  if ! out="$(security_engine_py reopen --analysis "$aid" 2>"$errf")"; then
+    out="$(cat "$errf" 2>/dev/null)"; rm -f "$errf"
+    die "${out:-analysis $aid could not be reopened}"
+  fi
+  rm -f "$errf"
+  n="$(num "$(printf '%s' "$out" | "$JQ" -r '.units // 0' 2>/dev/null)" 0)"
+  security_engine_py resume --analysis "$aid" >/dev/null 2>&1 \
+    || die "analysis $aid was reopened but could not be resumed: run agentloop security resume '$project' $aid"
+  security_launch_detached "$jid" "$aid" "$(printf '%s' "$row" | "$JQ" -r '.branch')" \
+    "$(printf '%s' "$row" | "$JQ" -r '.repo')"
+  log_tick "$jid: retried analysis $aid: $n failed unit(s) run again $(stop_origin)"
+  printf '{"analysis_id":%s,"retried":%s}\n' "$aid" "$n"
+}
+
 # THE CLOSE OF A UNIT'S RUN. Called from run_job at the same point
 # run_end_hook already is, and BEFORE it: the user hook runs detached with a
 # timeout and only exists if they wrote the script. A no-op for every job that
@@ -1435,10 +1483,19 @@ security_unit_sweep() { # security_unit_sweep <job-id>
   done
   if [ -d "$WORKTREES_DIR/$jid" ]; then
     for d in "$WORKTREES_DIR/$jid"/*; do
-      [ -d "$d" ] || continue              # skips the .<stamp>.tsv scratch files
+      if [ ! -d "$d" ]; then
+        # What a vanished run dir left behind goes (wt_remove_stray_file);
+        # the .<stamp>.tsv scratch files never match.
+        wt_remove_stray_file "$jid" "$d" || true
+        continue
+      fi
       lock_take "$rlock"
-      if ! wt_is_claimed "$jid" "$d"; then
-        printf 'done\n' > "$d/.ended" 2>/dev/null || true
+      # Claimed first, then asked whether it is still here -- the order
+      # wt_prune_orphans follows, for the same reason: run_cleanup removes a
+      # unit's tree before it releases the slot, so a tree whose unit tore it
+      # down while this waited for the lock is simply gone, not swept.
+      if ! wt_is_claimed "$jid" "$d" && [ -d "$d" ]; then
+        { printf 'done\n' > "$d/.ended"; } 2>/dev/null || true
         wt_teardown "$jid" "" "$d"
         [ -d "$d" ] || trees="$trees ${d##*/}"
       fi
@@ -6210,6 +6267,36 @@ run_launch_and_watch() {
   return 0
 }
 
+# A RUN WHOSE AGENT NEVER STARTED: it exited on its own, non-zero, before
+# its stream held a single event or a session was bound -- no stop, no
+# watchdog, no normalizer to blame. OpenCode 1.18.30 does exactly this for
+# every boot of a project whose sandbox list names a path under a regular
+# file (measurement 39), and the classifier called all 693 such runs of
+# analysis 12 `killed` -- a kill that never happened -- while the cause sat
+# unread in each run's stderr. Reads run_classify's scope: rc, wdreason,
+# slot, streamfile, run_dir.
+run_start_failed() {
+  [ "${rc:-0}" -ne 0 ] || return 1
+  [ -z "${wdreason:-}" ] || return 1
+  if [ -n "${slot:-}" ] && [ -f "$slot/stopped" ]; then return 1; fi
+  if [ -n "${streamfile:-}" ] && [ -s "$streamfile" ]; then return 1; fi
+  if [ -n "${run_dir:-}" ] && [ -s "$run_dir/.session" ]; then return 1; fi
+  return 0
+}
+
+# What such an agent said as it went: the LAST non-empty line of its stderr,
+# colour codes dropped, at most 300 characters. OpenCode prints "Error:
+# Unexpected error", a blank line, then the cause -- so the last line is the
+# one that names it. Reads run_classify's scope: logfile, rc.
+run_start_error() {
+  local esc line
+  esc="$(printf '\033')"
+  line="$(sed "s/${esc}\[[0-9;]*m//g" "$logfile.err" 2>/dev/null \
+            | awk 'NF { l = $0 } END { print l }' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | cut -c1-300)"
+  printf '%s' "${line:-the agent exited ${rc:-?} with nothing on stderr}"
+}
+
 # run_classify -> the verdict, from everything the run left behind. Reads
 #   from run_job: id, rc, logfile, wdreason, slot, run_dir, cost, cost_basis,
 #   _no_result, tokens_json, model, model_id. The classifier, the stop
@@ -6290,6 +6377,9 @@ run_classify() {
       esac
     elif [ "${denials:-0}" -gt 0 ]; then
       cause="tools_denied"
+    elif run_start_failed; then
+      cause="start_failed"
+      wdreason="START FAILED: $(run_start_error)"
     elif [ "$subtype" = "no_result_event" ]; then
       # Killed, crashed, or stalled out. wdreason carries which, when we know.
       cause="killed"
@@ -6470,7 +6560,9 @@ run_classify() {
     # ttl on its own would then read as already-expired the instant it stops.
     # The first ending gets this for free; this is what makes every later one
     # measure the same event.
-    touch "$run_dir" 2>/dev/null || true
+    # -c: a clock refresh never creates the path (the 0-byte file of
+    # analysis 12 came from a `touch` that did).
+    touch -c "$run_dir" 2>/dev/null || true
   fi
   # What goes back to run_job, and nothing else does. (The selftest lifts the
   # block above by anchor, from `declared_ending=false` to this comment, and
@@ -6869,7 +6961,7 @@ ${prompt}"
       # resumed at hour 20 of a 24h ttl that then runs for 5h is already past
       # it the moment it stops, and the very next sweep deletes it while the
       # operator is reading a card that says "resume this run to finish it".
-      touch "$run_dir" 2>/dev/null || true
+      touch -c "$run_dir" 2>/dev/null || true   # -c: refresh, never create
       port_base="$("$JQ" -r '.port_base // ""' "$run_dir/.run.json" 2>/dev/null)"
       case "$port_base" in null) port_base="" ;; esac
       if [ -z "$port_base" ]; then
@@ -8863,6 +8955,10 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop security resume <project> <analysis-id>
                               continue an interrupted analysis (stopped, or
                               swept) without repeating a finished unit
+  agentloop security retry <project> <analysis-id>
+                              reopen a capped or failed analysis (the newest
+                              of its branch) and run again only the units
+                              that gave up, on the commit it analysed
   agentloop security render --analysis <n> --format <json|md|html|sbom>
                               the report for one analysis, or (sbom) the
                               stored SBOM document itself (see agentloop
@@ -9019,6 +9115,9 @@ case "${1:-}" in
                # transition is the CLI's `resume --analysis`, reached through
                # security_engine_py and never through this dispatch.
                resume)  shift; cmd_security_resume "$@" ;;
+               # The operator's retry of a capped or failed analysis: the
+               # ledger's `reopen`, then the same launch a resume makes.
+               retry)   shift; cmd_security_retry "$@" ;;
                # Everything else is the ledger's own vocabulary. A unit's
                # session types findings, fingerprint, report-finding,
                # report-verdict, report-gone, read, verify-queue, checklist,
@@ -9041,7 +9140,7 @@ case "${1:-}" in
                # this message names every verb the door actually accepts, not
                # just the subset any one caller uses (tests/security/
                # test_cli_doors.py pins it against the CLI's own parser).
-               "")      die "usage: agentloop security <analyze|resume|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|unit-close|units|read|verify-queue|interrupt|abandon|orchestrate|finish|checklist|render|export-findings|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
+               "")      die "usage: agentloop security <analyze|resume|retry|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|unit-close|units|read|verify-queue|interrupt|abandon|reopen|orchestrate|finish|checklist|render|export-findings|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
                *)       security_py "$@" ;;
              esac ;;
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"

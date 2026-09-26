@@ -5143,16 +5143,16 @@ def test_an_analysis_with_no_structured_coverage_draws_no_phase_summary(
         assert state["text"] == "", out
 
 
-def _pipeline_script(block, analysis, summary):
+def _pipeline_script(block, analysis, summary, retryable=0):
     deps = (_const(block, "SEC_UNIT_KIND_LABEL")
             + _index_screen_deps(block, "secEl", "secRenderPipeline"))
     return _INDEX_DOM_HARNESS + """
     const HOSTS = {};
     function $(id){ if(!HOSTS[id]) HOSTS[id] = document.createElement("div"); return HOSTS[id]; }
     function money(v){ return "$" + Number(v).toFixed(2); }
-    function secStopAnalysis(){} function secResumeAnalysis(){}
+    function secStopAnalysis(){} function secResumeAnalysis(){} function secRetryAnalysis(){}
     """ + deps + f"""
-    secRenderPipeline({json.dumps(analysis)}, {json.dumps(summary)});
+    secRenderPipeline({json.dumps(analysis)}, {json.dumps(summary)}, {json.dumps(retryable)});
     const host = $("sec-pipeline");
     console.log(JSON.stringify({{hidden: host.hidden, nodes: collectAll(host, []),
       buttons: collectAll(host, []).filter(n => n.cls === "btn").map(n => n.text)}}));
@@ -5241,6 +5241,28 @@ def test_an_interrupted_analysis_offers_resume_and_a_closed_one_offers_nothing(s
         script.write_text(_pipeline_script(_security_js(srv), {"id": 22, "state": state, "run_id": "security-web"}, SUMMARY))
         out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
         assert out["buttons"] == want, state
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_closed_analysis_with_units_that_gave_up_offers_retry(srv, tmp_path):
+    cases = (("capped", 3, ["Retry failed units"]), ("failed", 1, ["Retry failed units"]),
+             ("capped", 0, []), ("done", 0, []), ("interrupted", 0, ["Resume"]))
+    for n, (state, retryable, want) in enumerate(cases):
+        script = tmp_path / f"pipeline-retry-{n}.js"
+        script.write_text(_pipeline_script(_security_js(srv), {"id": 22, "state": state, "run_id": "security-web"},
+                                           SUMMARY, retryable))
+        out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True).stdout)
+        assert out["buttons"] == want, (state, retryable)
+
+
+def test_retry_says_what_it_will_run_before_it_asks_the_engine(srv):
+    block = _security_js(srv)
+    retry = _anyfn(block, "secRetryAnalysis")
+    assert 'api("security_retry", {project: secState.project, analysis: a.id})' in retry
+    assert "showConfirm(" in retry
+    assert "on commit" in retry and "stays done" in retry
+    assert "never finished" in retry
+    assert "previous finished analysis" in retry
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")

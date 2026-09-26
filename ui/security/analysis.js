@@ -1,6 +1,6 @@
 /* --------------------------------------------------------- one project */
 import { $, AL, api, toast, projById, fmtDur, fmtWhen, money, createCombo,
-         makePicker, pushNav, markPending, clearPending, isPending } from "./page.js";
+         makePicker, pushNav, markPending, clearPending, isPending, showConfirm } from "./page.js";
 import { secIcon, secIconHTML, secEl, secFetch, secPlaceMenu } from "./dom.js";
 import { secConfidenceChip, secVerdictChip, secCandidateBlock } from "./candidate.js";
 import { SEC_POLL_MS, SEC_PROFILES, SEC_STATES, SEC_STATE_HELP, SEC_STATE_LABEL,
@@ -284,7 +284,7 @@ export async function secShowAnalysis(id, pinned){
   secState.pinned = !!pinned;
   if(id == null){
     secState.analysis = null; secState.findings = [];
-    secState.units = null; secState.orchestrator = null;
+    secState.units = null; secState.orchestrator = null; secState.retryable = 0;
     secPaint();
     return;
   }
@@ -295,10 +295,11 @@ export async function secShowAnalysis(id, pinned){
     secState.findings = j.findings || [];
     secState.units = j.units || null;
     secState.orchestrator = j.orchestrator || null;
+    secState.retryable = j.retryable || 0;
   }catch(e){
     if(seq !== secState.seq) return;
     secState.analysis = null; secState.findings = [];
-    secState.units = null; secState.orchestrator = null;
+    secState.units = null; secState.orchestrator = null; secState.retryable = 0;
     secStatus("Could not read that analysis — " + e.message);
     return;
   }
@@ -560,7 +561,7 @@ export function secRenderCoveragePhases(a){
 export const SEC_UNIT_KIND_LABEL = {triage: "Triage", hunt: "Reachability",
                                     read: "Deep read", verify: "Verification"};
 
-export function secRenderPipeline(a, summary){
+export function secRenderPipeline(a, summary, retryable){
   const host = $("sec-pipeline");
   host.textContent = "";
   if(!a || !summary || !summary.units){ host.hidden = true; return; }
@@ -617,6 +618,15 @@ export function secRenderPipeline(a, summary){
     btn.onclick = () => running ? secStopAnalysis(a) : secResumeAnalysis(a);
     host.appendChild(btn);
   }
+  // A closed analysis with units that gave up: `retryable` is the checklist's
+  // count, by the rule the engine's own `reopen` applies, so the button is
+  // never offered for an analysis the engine would refuse.
+  if((a.state === "capped" || a.state === "failed") && retryable > 0){
+    const btn = secEl("button", "btn", "Retry failed units");
+    btn.type = "button";
+    btn.onclick = () => secRetryAnalysis(a, retryable);
+    host.appendChild(btn);
+  }
 }
 
 async function secStopAnalysis(a){
@@ -640,6 +650,32 @@ async function secResumeAnalysis(a){
     // down), which api() puts on screen.
     if(await api("security_resume", {project: secState.project, analysis: a.id})){
       toast("Analysis resumed", false, "shield");
+      await secReload();
+      secSyncPoll();
+    }
+  } finally { clearPending(...k); }
+}
+
+async function secRetryAnalysis(a, n){
+  const k = ["security_retry", secState.project, String(a.id)];
+  if(isPending(...k)) return;
+  const units = n === 1 ? "1 unit" : n + " units";
+  // What it will run, before it runs it: a retry spends, and it reruns the
+  // commit the analysis read, not the branch's HEAD.
+  const yes = await showConfirm({tone: "warn", icon: "shield",
+    title: "Retry the " + units + " that gave up?",
+    message: "Runs again the " + units + " that gave up, on commit "
+      + String(a.commit_sha || "").slice(0, 7) + ", and any unit that never finished."
+      + " While it runs, the branch shows its previous finished analysis."
+      + " Everything already done stays done.",
+    confirmLabel: "Retry " + units});
+  if(!yes) return;
+  markPending(...k);
+  try{
+    // The engine refuses with its own sentence (a newer analysis, nothing
+    // gave up, units still winding down), which api() puts on screen.
+    if(await api("security_retry", {project: secState.project, analysis: a.id})){
+      toast("Retrying " + units, false, "shield");
       await secReload();
       secSyncPoll();
     }
@@ -716,7 +752,7 @@ export function secPaint(){
     inc.hidden = false;
   }else inc.hidden = true;
 
-  secRenderPipeline(a, secState.units);
+  secRenderPipeline(a, secState.units, secState.retryable);
 
   // ABOVE the paragraph, and the reason is the paragraph. See
   // secRenderCoveragePhases.

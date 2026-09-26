@@ -4087,11 +4087,11 @@ EOF
   # later, alongside the classifier's OWN .ended write (10.4) -- a real,
   # separate touch this count must not trip on, so a bare whole-function grep
   # is no longer precise enough here.
-  got="$(printf '%s\n' "$body" | sed -n "1,${refuse_line:-0}p" | grep -c 'touch "\$run_dir" 2>/dev/null')"
+  got="$(printf '%s\n' "$body" | sed -n "1,${refuse_line:-0}p" | grep -c 'touch -c "\$run_dir" 2>/dev/null')"
   [ "${got:-0}" -eq 1 ] \
     && ok "the reattach branch touches its run dir exactly once ($got)" \
     || bad "run_job touches \$run_dir $got times in the reattach branch, expected 1"
-  touch_line="$(printf '%s\n' "$body" | sed -n "1,${refuse_line:-0}p" | grep -n 'touch "\$run_dir" 2>/dev/null' | head -1 | cut -d: -f1)"
+  touch_line="$(printf '%s\n' "$body" | sed -n "1,${refuse_line:-0}p" | grep -n 'touch -c "\$run_dir" 2>/dev/null' | head -1 | cut -d: -f1)"
   [ -n "${ld2_line:-}" ] && [ -n "${touch_line:-}" ] && [ "$touch_line" -gt "$ld2_line" ] \
     && ok "and it happens after the claim succeeds, at line $touch_line vs drop at $ld2_line" \
     || bad "touch (line ${touch_line:-?}) is not after the successful claim's lock_drop (line ${ld2_line:-?})"
@@ -4414,6 +4414,78 @@ EOF
     && ok "the tree the reattach claimed first survives a concurrent sweep" \
     || bad "the sweep removed a tree that had already been claimed by a reattach"
   rm -rf "$tmp/locks/jSweepRace" "$tmp/wtroot/jSweepRace"
+
+  echo "wt_prune_orphans() — a run dir torn down while the sweep waited for the lock never comes back as a file"
+  # Analysis 12 (2026-09-26): the sweep tested `-d` before taking
+  # $LOCK_DIR/.resume, which every run_job also takes as it starts. A unit's
+  # run tore its tree down and released its slot while the sweep waited, the
+  # adoption branch found no marker and no owner, and its `touch` left a
+  # 0-byte FILE where the run dir had been -- which OpenCode then failed every
+  # boot of the project on (measurement 39). Its own worktree root, so the
+  # sweep meets THIS directory first and blocks on the lock the holder has,
+  # instead of blocking on another test's directory and arriving after the fact.
+  local rdGone="$tmp/wtgone/jGone/stampG" goneTick="$tmp/gone.tick"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtgone"
+    wt_setup jGone two "$tmp/g/repo" stampG ) >/dev/null 2>&1
+  : > "$goneTick"
+  (
+    LOCK_DIR="$tmp/locks"; WORKTREES_DIR="$tmp/wtgone"; TICK_LOG="$goneTick"
+    rlock="$LOCK_DIR/.resume"; rm -rf "$rlock"
+    mkdir -p "$LOCK_DIR/jGone"
+    sleep 5 & pidG=$!
+    slotG="$LOCK_DIR/jGone/$pidG"; mkdir -p "$slotG"
+    echo "$pidG" > "$slotG/pid"; boot_id > "$slotG/boot"; echo "$rdGone" > "$slotG/worktree"
+    # The unit's own end, holding the lock the way a run_job starting beside
+    # it does: the tree goes, then the slot -- run_cleanup's order.
+    ( lock_take "$rlock"; sleep 0.5; wt_remove_all "$rdGone"; rm -rf "$slotG"; lock_drop "$rlock" ) \
+      & holder=$!
+    i=0; while [ ! -d "$rlock" ] && [ "$i" -lt 200 ]; do sleep 0.01; i=$(( i + 1 )); done
+    ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"
+      wt_prune_orphans ) >/dev/null 2>&1
+    wait "$holder"
+    kill "$pidG" 2>/dev/null; wait "$pidG" 2>/dev/null
+  )
+  [ ! -e "$rdGone" ] && [ ! -L "$rdGone" ] \
+    && ok "nothing is left where the run dir was" \
+    || bad "the sweep left a $(stat -f %HT "$rdGone" 2>/dev/null) of $(stat -f %z "$rdGone" 2>/dev/null) bytes where the run dir was"
+  grep -q "adopted" "$goneTick" \
+    && bad "it logged the adoption of a directory that was gone: $(cat "$goneTick")" \
+    || ok "and no adoption is logged for it"
+  rm -rf "$tmp/wtgone" "$tmp/locks/jGone"
+
+  echo "no clock refresh on a run dir can create its path"
+  # The 0-byte file of analysis 12 was a `touch` on a run dir that was gone.
+  # Every refresh of a run dir's clock is `touch -c`, which never creates.
+  local bare
+  bare="$(grep -nE 'touch +"\$(d|run_dir|wt|rd)"' "$BIN_DIR/agentloop" "$BIN_DIR/worktree-lib.sh" | grep -v '^[^:]*:[0-9]*: *#' || true)"
+  [ -z "$bare" ] && ok "every touch of a run dir is touch -c" || bad "a touch that can create a run dir path: $bare"
+
+  echo "wt_prune_orphans() — what a vanished run dir left behind is removed, and nothing else is"
+  # The 0-byte file an older engine's adoption left (Task 1) is still there
+  # after an upgrade: the sweep skipped everything that was not a directory,
+  # so nothing ever looked at it again, and OpenCode kept failing on it. Only
+  # an EMPTY REGULAR FILE with a run dir's name can be that; the rest is not
+  # the engine's.
+  local strayRoot="$tmp/wtstray/jStray"
+  mkdir -p "$strayRoot"
+  : > "$strayRoot/20260926T005011Z-38238"                  # the file analysis 12 left
+  printf 'data\n' > "$strayRoot/20260926T005012Z-38239"    # the same shape, with content
+  : > "$strayRoot/notes"                                   # empty, but not a run dir's name
+  : > "$strayRoot/.20260926T005011Z.tsv"                   # a scratch file
+  ln -s /nonexistent "$strayRoot/20260926T005013Z-38240"   # the same shape, a symlink
+  : > "$tmp/stray.tick"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtstray"
+    LOCK_DIR="$tmp/locks"; TICK_LOG="$tmp/stray.tick"
+    wt_prune_orphans ) >/dev/null 2>&1
+  [ ! -e "$strayRoot/20260926T005011Z-38238" ] \
+    && ok "an empty file with a run dir's name is removed" || bad "the stray file survived the sweep"
+  grep -q "jStray: removed a stray empty file where run dir 20260926T005011Z-38238 was" "$tmp/stray.tick" \
+    && ok "and tick.log says so" || bad "tick.log: $(cat "$tmp/stray.tick")"
+  [ -s "$strayRoot/20260926T005012Z-38239" ] && [ -e "$strayRoot/notes" ] \
+    && [ -e "$strayRoot/.20260926T005011Z.tsv" ] && [ -L "$strayRoot/20260926T005013Z-38240" ] \
+    && ok "a file with content, another name, a scratch file and a symlink are all left alone" \
+    || bad "the sweep removed something it did not make: $(ls -A "$strayRoot" | tr '\n' ' ')"
+  rm -rf "$tmp/wtstray"
 
   echo "wt_undelivered_work() — what provisioning left behind is not the agent's work"
   printf '%s\n' '#!/usr/bin/env bash' 'echo residue > provisioned.txt' \
@@ -5808,13 +5880,17 @@ NASTY
   mkdir -p "$tmp/cause"
   cause_of() { # cause_of <result-json> <denials> <wdreason> -> the derived cause
     printf '%s' "$1" > "$tmp/cause/log.json"
-    ( logfile="$tmp/cause/log.json"; status="error"
+    # A run that STARTED: its stream holds an event. Every case here is one;
+    # a run whose agent never started is start_cause_of's, below.
+    printf '%s\n' '{"type":"step_start"}' > "$tmp/cause/stream.ndjson"
+    ( logfile="$tmp/cause/log.json"; status="error"; rc=1
+      streamfile="$tmp/cause/stream.ndjson"; run_dir=""; slot=""
       denials="${2:-0}"; wdreason="${3:-}"
       subtype="$("$JQ" -r '.subtype // "success"' "$logfile")"
       cause=""
       # The derivation itself, lifted verbatim from run_job by anchor so this
       # cannot drift into testing a copy that no longer matches the engine.
-      eval "$(sed -n '/^  cause=""$/,/^  fi$/p' "$BIN_DIR/agentloop" | head -20)"
+      eval "$(sed -n '/^  cause=""$/,/^  fi$/p' "$BIN_DIR/agentloop" | head -30)"
       printf '%s' "$cause" )
   }
   [ "$(cause_of '{"api_error_status":529,"subtype":"success"}')" = "api_error" ] \
@@ -5838,6 +5914,51 @@ NASTY
   [ "$(cause_of '{"api_error_status":529,"subtype":"success"}' 3)" = "api_error" ] \
     && ok "an API failure outranks a denial count on the same run" \
     || bad "denials masked the API failure"
+
+  echo "failure causes — an agent that never started is start_failed, and its stderr says why"
+  # Analysis 12 (2026-09-26): OpenCode failed every boot of the project
+  # (measurement 39) and all 693 runs were filed `killed`, the cause left
+  # unread in each run's stderr. The same derivation, lifted by the same
+  # anchor as cause_of, with the run's own files around it.
+  mkdir -p "$tmp/startf"
+  start_cause_of() { # <stderr, printf %b> [rc] [stream text] [session] [stopped] [wdreason] -> "<cause>|<note>"
+    printf '%s' '{"subtype":"no_result_event"}' > "$tmp/startf/log.json"
+    printf '%b' "$1" > "$tmp/startf/log.json.err"
+    printf '%s' "${3:-}" > "$tmp/startf/stream.ndjson"
+    rm -rf "$tmp/startf/run" "$tmp/startf/slot"; mkdir -p "$tmp/startf/run" "$tmp/startf/slot"
+    [ -z "${4:-}" ] || printf '%s\n' "$4" > "$tmp/startf/run/.session"
+    [ -z "${5:-}" ] || : > "$tmp/startf/slot/stopped"
+    ( logfile="$tmp/startf/log.json"; status="error"; denials=0; wdreason="${6:-}"
+      rc="${2:-1}"; streamfile="$tmp/startf/stream.ndjson"; run_dir="$tmp/startf/run"
+      slot="$tmp/startf/slot"
+      subtype="$("$JQ" -r '.subtype // "success"' "$logfile")"
+      cause=""
+      eval "$(sed -n '/^  cause=""$/,/^  fi$/p' "$BIN_DIR/agentloop" | head -30)"
+      printf '%s|%s' "$cause" "$wdreason" )
+  }
+  got="$(start_cause_of '\033[91m\033[1mError: \033[0mUnexpected error\n\nBadResource: FileSystem.access (/gone/run/repo)\n')"
+  [ "$got" = "start_failed|START FAILED: BadResource: FileSystem.access (/gone/run/repo)" ] \
+    && ok "an agent that exits 1 before its first event is start_failed, named by its last stderr line" \
+    || bad "start failure -> '$got'"
+  got="$(start_cause_of '')"
+  [ "$got" = "start_failed|START FAILED: the agent exited 1 with nothing on stderr" ] \
+    && ok "with nothing on stderr, the note says so" || bad "silent start failure -> '$got'"
+  got="$(start_cause_of "$(printf 'x%.0s' $(seq 1 400))\n")"
+  local sfprefix="start_failed|START FAILED: "
+  [ "${#got}" -eq $(( ${#sfprefix} + 300 )) ] \
+    && ok "and the line is cut at 300 characters" || bad "long line -> ${#got} characters"
+  [ "$(start_cause_of 'boom\n' 1 '{"type":"step_start"}')" = "killed|" ] \
+    && ok "a run whose stream holds an event did start: killed, as before" \
+    || bad "stream with an event -> '$(start_cause_of 'boom\n' 1 '{"type":"step_start"}')'"
+  [ "$(start_cause_of 'boom\n' 1 '' ses_x)" = "killed|" ] \
+    && ok "a bound session means it started" || bad "bound session -> '$(start_cause_of 'boom\n' 1 '' ses_x)'"
+  [ "$(start_cause_of 'boom\n' 1 '' '' stopped)" = "killed|" ] \
+    && ok "a stopped run is the stop's to name" || bad "stopped -> '$(start_cause_of 'boom\n' 1 '' '' stopped)'"
+  [ "$(start_cause_of 'boom\n' 1 '' '' '' 'WATCHDOG: stalled')" = "killed|WATCHDOG: stalled" ] \
+    && ok "the watchdog's ending stays killed" \
+    || bad "watchdog -> '$(start_cause_of 'boom\n' 1 '' '' '' 'WATCHDOG: stalled')'"
+  [ "$(start_cause_of 'boom\n' 0)" = "killed|" ] \
+    && ok "an agent that exited 0 did not fail to start" || bad "rc 0 -> '$(start_cause_of 'boom\n' 0)'"
 
   # The half that changes behaviour. Read the real rule out of the script: a
   # copy of it here would pass happily while the engine did something else.
@@ -6764,6 +6885,27 @@ PY
     || bad "the tree went before the orchestrator could judge the unit"
   [ ! -d "$usl2" ] && ok "and still releases the slot" || bad "the slot survived a failed close"
 
+  echo "run_cleanup() — a unit whose agent never started goes the same way, once its close has landed"
+  # The error path, which the stop tests above do not take: each of
+  # analysis 12's 693 start failures left a 371 MB tree behind (an engine
+  # from before a unit kept nothing). A unit's close lands for an error
+  # exactly as for a stop (RJ_UNIT_CLOSED), and then its tree goes.
+  local urd4="$tmp/wtroot/security-app/stampU4" usl4="$tmp/uslocks/security-app/994"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup security-app two "$tmp/g/repo" stampU4 ) >/dev/null 2>&1
+  mkdir -p "$usl4"
+  echo 994 > "$usl4/pid"; echo 1700000000 > "$usl4/start"; echo "$urd4" > "$usl4/worktree"
+  echo "$tmp/uclogs/security-app/20260925T100004Z-994.json" > "$usl4/logfile"
+  echo 12349 > "$usl4/child"                 # an agent was spawned, and ended on its own: no stop
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    LOCK_DIR="$tmp/uslocks"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/uc.ndjson"; STATE_FILE="$tmp/ucstate.json"
+    LOG_DIR="$tmp/uclogs"; TICK_LOG="$tmp/uc.tick"
+    AL_SECURITY_ANALYSIS_ID=41 AL_SECURITY_UNIT_ID=14 RJ_UNIT_CLOSED=1
+    run_cleanup security-app "$usl4" ) >/dev/null 2>&1
+  [ ! -d "$urd4" ] && ok "its tree is torn down, not kept open for a resume" \
+    || bad "an error-ended unit's tree survived its run"
+  [ ! -d "$usl4" ] && ok "and its slot is released" || bad "the error-ended unit's slot survived"
+
   echo "run_cleanup() — a re-issued stop cannot kill the cleanup halfway (the slot of analysis 22)"
   # The slot that survived on the real install: the orchestrator re-issues
   # `stop` on every poll of its grace, _stop_slot TERMs the run wrapper once
@@ -6915,6 +7057,42 @@ PY
   ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"
     wt_remove_all "$srd_live"; wt_remove_all "$urd2" ) >/dev/null 2>&1
   rm -rf "$tmp/uslocks" "$tmp/wtroot/security-sw" "$tmp/wtroot/security-app"
+
+  echo "security_unit_sweep() — a tree torn down while it waited is not counted, and a stray file goes"
+  # The same shape as wt_prune_orphans' (Task 1): the orchestrator's sweep
+  # also tested `-d` before the lock. It creates nothing -- it only writes
+  # INSIDE the directory -- but it counted as swept a tree the unit's own
+  # cleanup had removed. And it is the sweep that runs as every analysis
+  # ends, so it is where an older engine's stray file goes first.
+  local usRoot="$tmp/wtus" usd="$tmp/wtus/security-gone/stampUG"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$usRoot"
+    wt_setup security-gone two "$tmp/g/repo" stampUG ) >/dev/null 2>&1
+  : > "$usRoot/security-gone/20260926T005011Z-38238"
+  : > "$tmp/us.tick"
+  (
+    LOCK_DIR="$tmp/uslocks2"; WORKTREES_DIR="$usRoot"; TICK_LOG="$tmp/us.tick"
+    rlock="$LOCK_DIR/.resume"; mkdir -p "$LOCK_DIR/security-gone"
+    sleep 5 & pidU=$!
+    slotU="$LOCK_DIR/security-gone/$pidU"; mkdir -p "$slotU"
+    echo "$pidU" > "$slotU/pid"; boot_id > "$slotU/boot"; echo "$usd" > "$slotU/worktree"
+    ( lock_take "$rlock"; sleep 0.5; wt_remove_all "$usd"; rm -rf "$slotU"; lock_drop "$rlock" ) \
+      & holder=$!
+    i=0; while [ ! -d "$rlock" ] && [ "$i" -lt 200 ]; do sleep 0.01; i=$(( i + 1 )); done
+    security_unit_sweep security-gone > "$tmp/us.out" 2>&1
+    wait "$holder"
+    kill "$pidU" 2>/dev/null; wait "$pidU" 2>/dev/null
+  )
+  [ ! -e "$usd" ] && ok "nothing is left where the unit's tree was" \
+    || bad "the unit sweep left a $(stat -f %HT "$usd" 2>/dev/null) where the tree was"
+  grep -q "stampUG" "$tmp/us.out" \
+    && bad "it counted as swept a tree it never removed: $(cat "$tmp/us.out")" \
+    || ok "and it does not count a tree it never removed"
+  [ ! -e "$usRoot/security-gone/20260926T005011Z-38238" ] \
+    && ok "an older engine's stray file goes with the analysis's own sweep" \
+    || bad "the stray file survived the unit sweep"
+  grep -q "security-gone: removed a stray empty file where run dir 20260926T005011Z-38238 was" "$tmp/us.tick" \
+    && ok "and tick.log says so" || bad "tick.log: $(cat "$tmp/us.tick")"
+  rm -rf "$usRoot" "$tmp/uslocks2"
 
   echo "_stop_slot() — a live pid from an earlier boot is cleared, never signalled"
   # Same reboot-recycled-pid risk slot_alive exists for, but with teeth: the old
@@ -8712,6 +8890,80 @@ FAKESELF
         || bad "superseded resume said: $(cat "$sec/sup.out" 2>/dev/null)" ;;
     *) bad "resume vs supersede -> $secsup (id, rc resume, rc after supersede, state, launches): $(cat "$sec/sup.out" 2>/dev/null)" ;;
   esac
+
+  echo "cmd_security_retry() — reopen, resume and launch, in that order; nothing launched when the reopen refuses"
+  # The engine's half of a Retry: the ledger decides (security/cli.py reopen,
+  # tested with it); this is the glue, stubbed at its edges.
+  : > "$sec/retry.calls"
+  ( sec_env
+    security_engine_py() {
+      printf '%s\n' "$1" >> "$sec/retry.calls"
+      case "$1" in
+        analysis) printf '{"project":"Sec App","branch":"main","repo":"Sec App"}' ;;
+        reopen)   printf '{"state":"interrupted","units":2}' ;;
+        resume)   printf '{"state":"running"}' ;;
+      esac
+    }
+    security_analysis_live() { return 1; }
+    slots_active() { echo 0; }
+    security_launch_detached() { printf 'launch %s %s %s\n' "$2" "$3" "$4" >> "$sec/retry.calls"; }
+    cmd_security_retry "Sec App" 41 ) > "$sec/retry.out" 2>&1
+  [ "$(tr '\n' ' ' < "$sec/retry.calls")" = "analysis reopen resume launch 41 main Sec App " ] \
+    && ok "it reopens, resumes and launches the analysis on its own branch and repo" \
+    || bad "retry calls: $(tr '\n' ' ' < "$sec/retry.calls")"
+  grep -q '{"analysis_id":41,"retried":2}' "$sec/retry.out" \
+    && ok "and says how many units run again" || bad "retry printed: $(cat "$sec/retry.out")"
+  : > "$sec/retry.calls"
+  ( sec_env
+    security_engine_py() {
+      printf '%s\n' "$1" >> "$sec/retry.calls"
+      case "$1" in
+        analysis) printf '{"project":"Sec App","branch":"main","repo":"Sec App"}' ;;
+        reopen)   echo "analysis 41 is done: only a capped or failed analysis is retried" >&2; return 1 ;;
+      esac
+    }
+    security_analysis_live() { return 1; }
+    slots_active() { echo 0; }
+    security_launch_detached() { printf 'launch\n' >> "$sec/retry.calls"; }
+    cmd_security_retry "Sec App" 41 ) > "$sec/retry.out" 2>&1; rc=$?
+  [ "$rc" -ne 0 ] && grep -q "only a capped or failed analysis is retried" "$sec/retry.out" \
+    && ! grep -q "launch" "$sec/retry.calls" \
+    && ok "a refused reopen stops it, with the ledger's own sentence, and launches nothing" \
+    || bad "refused retry (rc $rc): $(cat "$sec/retry.out"); calls: $(tr '\n' ' ' < "$sec/retry.calls")"
+  : > "$sec/retry.calls"
+  ( sec_env
+    security_engine_py() {
+      printf '%s\n' "$1" >> "$sec/retry.calls"
+      case "$1" in
+        analysis) printf '{"project":"Sec App","branch":"main","repo":"Sec App","spend_usd":4.8}' ;;
+        reopen)   printf '{"state":"interrupted","units":2}' ;;
+      esac
+    }
+    security_analysis_live() { return 1; }
+    slots_active() { echo 0; }
+    security_analysis_budget() { echo 5; }
+    security_launch_detached() { printf 'launch\n' >> "$sec/retry.calls"; }
+    cmd_security_retry "Sec App" 41 ) > "$sec/retry.out" 2>&1; rc=$?
+  [ "$rc" -ne 0 ] && grep -q "raise the project's security budget" "$sec/retry.out" \
+    && ! grep -q "reopen\|launch" "$sec/retry.calls" \
+    && ok "a budget that cannot pay one more unit refuses the retry before anything is reopened" \
+    || bad "budget retry (rc $rc): $(cat "$sec/retry.out"); calls: $(tr '\n' ' ' < "$sec/retry.calls")"
+  : > "$sec/retry.calls"
+  ( sec_env
+    security_engine_py() {
+      case "$1" in
+        analysis) printf '{"project":"Sec App","branch":"main","repo":"Sec App"}' ;;
+        reopen)   echo "DeprecationWarning: something" >&2; printf '{"state":"interrupted","units":2}' ;;
+        resume)   printf '{"state":"running"}' ;;
+      esac
+    }
+    security_analysis_live() { return 1; }
+    slots_active() { echo 0; }
+    security_launch_detached() { :; }
+    cmd_security_retry "Sec App" 41 ) > "$sec/retry.out" 2>&1
+  grep -q '{"analysis_id":41,"retried":2}' "$sec/retry.out" \
+    && ok "a warning on the reopen's stderr does not zero the count" \
+    || bad "retry with a stderr warning printed: $(cat "$sec/retry.out")"
 
   echo "cmd_security_branches() — local and origin branches, HEAD excluded, deduped"
   # A real checkout with an origin, not faked refs: local-only never leaves the

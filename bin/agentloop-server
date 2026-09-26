@@ -4104,6 +4104,19 @@ def security_resume(body):
     return (200, {"ok": True, "output": out}) if ok else (500, {"error": out})
 
 
+def security_retry(body):
+    """Retry the units of a capped or failed analysis that gave up: the
+    engine checks the rest (that it is this project's, the newest of its
+    branch, that something gave up, that nothing of it still runs) and says
+    why in its own sentence when it refuses."""
+    project = str(body.get("project", "")).strip()
+    analysis = str(body.get("analysis", "")).strip()
+    if not project or not analysis.isdigit():
+        return 400, {"error": "project and a numeric analysis id are required"}
+    ok, out = al(["security", "retry", project, analysis])
+    return (200, {"ok": True, "output": out}) if ok else (500, {"error": out})
+
+
 FINDINGS_SORT = ("severity", "title", "category", "branch", "first_seen", "state",
                  "confidence")
 # Every value below mirrors a closed set defined in bin/security/ — duplicated
@@ -4892,6 +4905,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(*security_analyze(body))
         if op == "security_resume":
             return self._send(*security_resume(body))
+        if op == "security_retry":
+            return self._send(*security_retry(body))
         if op == "security_decide":
             return self._send(*security_decide(body))
         if op == "security_filter_save":

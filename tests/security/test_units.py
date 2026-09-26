@@ -1131,3 +1131,149 @@ def test_without_lines_cuts_named_lines_out_of_every_span():
     out = evidence.without_lines(session, {"a.py": [1, 5, 10, 99]})
     assert out.reads == {"a.py": [(2, 4), (6, 9)], "b.py": [(1, 2)]}
     assert evidence.without_lines(session, {}) is session
+
+
+def test_a_run_whose_agent_never_started_keeps_its_attempt_and_names_the_error(conn):
+    """Analysis 12 (2026-09-26): OpenCode failed every boot of the project,
+    and each run spent one of its unit's three attempts. Nothing ran, so
+    nothing is the unit's fault: the close keeps the attempt, as it does for
+    a provider outage, and the unit's note carries the agent's own words."""
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    ledger.start_unit(conn, uid)
+    out = units.close(conn, ledger.get_unit(conn, uid), status="error", cause=units.START_FAILED,
+                      reason="START FAILED: BadResource: FileSystem.access (/gone/repo)")
+    assert out["state"] == "incomplete"
+    unit = ledger.get_unit(conn, uid)
+    assert unit["evidence"]["cause"] == "start_failed"
+    assert unit["evidence"]["error"] == "BadResource: FileSystem.access (/gone/repo)"
+    assert unit["note"] == ("The agent could not start (BadResource: FileSystem.access (/gone/repo)); "
+                            "nothing ran, so the attempt is kept.")
+    assert ledger.get_unit(conn, out["continuation"])["attempt"] == 1
+
+
+def test_a_run_killed_with_no_stream_still_spends_its_attempt(conn):
+    """The control: only the causes that are nobody's fault keep it."""
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    ledger.start_unit(conn, uid)
+    out = units.close(conn, ledger.get_unit(conn, uid), status="error", cause="killed")
+    assert ledger.get_unit(conn, out["continuation"])["attempt"] == 2
+    assert "cause" not in ledger.get_unit(conn, uid)["evidence"]
+
+
+def test_the_start_error_is_the_agents_words_without_the_engines_prefix():
+    assert units.start_error("START FAILED: BadResource: x") == "BadResource: x"
+    assert units.start_error("BadResource: x") == "BadResource: x"
+    assert units.start_error("") == "no reason given"
+    assert len(units.start_error("START FAILED: " + "y" * 900)) == 300
+
+
+def _failed_hunt(conn, aid):
+    uid = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    ledger.start_unit(conn, uid)
+    ledger.settle_unit(conn, uid, "failed", 0, {}, "The engine could not run this unit.")
+    return uid
+
+
+def test_a_retry_is_for_the_newest_closed_analysis_of_its_branch_with_a_lineage_that_gave_up(conn):
+    aid = _analysis(conn)
+    uid = _failed_hunt(conn, aid)
+    assert units.retry_refusal(conn, aid) == "is running: only a capped or failed analysis is retried"
+    ledger.finish_analysis(conn, aid, "capped")
+    assert units.retry_refusal(conn, aid) == ""
+    assert units.retryable(conn, aid) == 1
+    assert [u["id"] for u in units.failed_lineages(conn, aid)] == [uid]
+    ledger.start_analysis(conn, "web", "web", "feature", "c2", "deep", "security-web")
+    assert units.retry_refusal(conn, aid) == "", "another branch does not supersede it"
+    newer = _analysis(conn)
+    assert units.retry_refusal(conn, aid) == (f"was superseded by analysis {newer} of the same branch: "
+                                              "run Analyse again instead")
+    assert units.retryable(conn, aid) == 0
+
+
+def test_a_closed_analysis_where_nothing_gave_up_has_nothing_to_retry(conn):
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    ledger.start_unit(conn, uid)
+    ledger.settle_unit(conn, uid, "done", 0, {}, "ok")
+    ledger.finish_analysis(conn, aid, "capped")
+    assert units.retry_refusal(conn, aid) == "has no unit that gave up: there is nothing to retry"
+    assert units.retryable(conn, aid) == 0
+    done = ledger.start_analysis(conn, "web", "web", "other", "c3", "deep", "security-web")
+    _failed_hunt(conn, done)
+    ledger.finish_analysis(conn, done, "done")
+    assert units.retry_refusal(conn, done) == "is done: only a capped or failed analysis is retried"
+
+
+def test_a_lineage_retried_is_judged_by_its_new_last_unit(conn):
+    """The close judges a lineage by its last unit (units._lineages): once a
+    child hangs off the failed leaf, the leaf is history, not a gap."""
+    aid = _analysis(conn)
+    uid = _failed_hunt(conn, aid)
+    ledger.finish_analysis(conn, aid, "capped")
+    assert ledger.reopen_analysis(conn, aid, units.failed_lineages(conn, aid), "n") is True
+    assert units.failed_lineages(conn, aid) == []
+    assert not [g for g in units.gaps(conn, aid) if "gave up" in g]
+    assert ledger.get_unit(conn, uid)["state"] == "failed", "the leaf stays what it was"
+
+
+def test_the_retry_sentence_says_when_and_how_many():
+    assert units.retry_sentence(1, day="2026-09-27") == (
+        "Retried on 2026-09-27: 1 unit that had given up was run again.")
+    assert units.retry_sentence(231, day="2026-09-27") == (
+        "Retried on 2026-09-27: 231 units that had given up were run again.")
+
+
+def test_the_close_part_is_found_by_its_first_words_even_when_its_numbers_changed():
+    """Analysis 12 was closed by an older engine: its "Deep read" says 6,670
+    files, where today's count of the same inventory says 6,656 (only files
+    with content count now). Rebuilding the sentence to look for it finds
+    nothing, and the old close survived a retry beside the new one. The
+    close's part is found by the words its sentences begin with -- never by
+    their numbers."""
+    head = ("Secrets were scanned. The deep scope is 6,670 files (1,241,385 lines), "
+            "each to be read in full.")
+    close = ("Reachability pass: 1 of 1 unit(s) done. Deep read: 277 read unit(s), 15 "
+             "continuation(s); read in full: 6,670 of 6,670 files, 1,241,385 of 1,241,385 "
+             "lines. Guides read: ATTACK-CLASSES. 231 units gave up after 3 runs (3 "
+             "attempts): verify 37/267 · attempt 3 (x).")
+    note = f"{head} {close}"
+    assert note[:units.close_part_start(note)].strip() == head
+    assert units.close_part_start(head) == len(head), "nothing of a close in it: all kept"
+    for gap in ("2 units never finished: hunt 1/1.",
+                "1 unit gave up after 1 run (1 attempt): hunt 1/1 (x).",
+                "12,000 of 90,000 lines in the deep scope (3 of 40 files) were never read in full.",
+                "The deep scope was never listed or cannot be read: no inventory is recorded."):
+        quick = f"Secrets were scanned. {gap}"
+        assert quick[:units.close_part_start(quick)].strip() == "Secrets were scanned.", gap
+
+
+AWS = "AKIA" + "IOSFODNN7EXAMPLE"
+
+
+def test_a_start_error_that_carries_a_credential_is_withheld():
+    """The agent's last stderr line reaches the unit's note, the gap sentences
+    and the gate sentence -- and through them the coverage note and every
+    report format, the path security/cli.py gates with looks_like_a_secret
+    for text anyone writes. A line that carries a credential is withheld; the
+    raw line stays in tick.log and the run's own record, on this machine."""
+    got = units.start_error(f"START FAILED: 401 Unauthorized for key {AWS}")
+    assert AWS not in got
+    assert got == ("the agent's error line was withheld: it looks like it carries a "
+                   "credential (aws_access_key); see tick.log")
+    assert units.start_error("START FAILED: BadResource: x") == "BadResource: x"
+
+
+def test_the_retry_state_reads_the_units_once(conn, monkeypatch):
+    """The page polls the checklist every four seconds, and `retryable` used
+    to walk every unit twice per poll (once in retry_refusal, once more for
+    the count): analysis 12 has ~1,100 units."""
+    aid = _analysis(conn)
+    _failed_hunt(conn, aid)
+    ledger.finish_analysis(conn, aid, "capped")
+    calls = []
+    real = ledger.units_of
+    monkeypatch.setattr(ledger, "units_of", lambda *a, **k: calls.append(1) or real(*a, **k))
+    assert units.retryable(conn, aid) == 1
+    assert len(calls) == 1

@@ -1585,6 +1585,41 @@ def close_interrupted(conn, analysis_id, note) -> bool:
     return cur.rowcount > 0
 
 
+def reopen_analysis(conn, analysis_id, leaves, note) -> bool:
+    """capped|failed -> interrupted, for a retry (the operator's; security/
+    units.py decides when one is allowed). One new `pending` unit per leaf
+    in `leaves` -- the last unit of a lineage that gave up -- with the leaf's
+    kind and payload, attempt 1 and the leaf as its parent: the lineage
+    continues from where it gave up, and the close, which judges a lineage by
+    its last unit, judges it by the retry. The leaves stay `failed`: they are
+    what happened. `note` replaces the coverage note and `ended` is cleared,
+    in ONE transaction, and only while the row is still `capped` or
+    `failed` -- False with nothing written otherwise."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            "UPDATE analysis SET state=?, ended=NULL, coverage_note=?"
+            " WHERE id=? AND state IN ('capped','failed')",
+            (INTERRUPTED, note, analysis_id))
+        if cur.rowcount == 0:
+            conn.rollback()
+            return False
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM unit WHERE analysis_id=?",
+                           (analysis_id,)).fetchone()[0]
+        for leaf in leaves:
+            seq += 1
+            conn.execute(
+                "INSERT INTO unit (analysis_id, seq, kind, payload, attempt, parent)"
+                " VALUES (?,?,?,?,?,?)",
+                (analysis_id, seq, leaf["kind"], json.dumps(leaf["payload"], sort_keys=True),
+                 1, leaf["id"]))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return True
+
+
 def set_inventory(conn, analysis_id, inventory) -> None:
     with conn:
         conn.execute(

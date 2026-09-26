@@ -318,8 +318,10 @@ def test_the_engine_s_usage_line_names_every_verb_the_door_accepts():
     source = (root / "bin" / "security" / "cli.py").read_text()
     verbs = set(re.findall(r'\bsub\.add_parser\(\s*"([a-z-]+)"', source))
     assert "migrate-rules" in verbs and "verify-prompt" not in verbs
-    # `analyze` is the engine's own (cmd_security_analyze), `resume` both.
-    assert set(usage) == verbs | {"analyze"}, (set(usage) ^ (verbs | {"analyze"}))
+    # `analyze` and `retry` are the engine's own (cmd_security_analyze,
+    # cmd_security_retry, which calls the ledger's `reopen`); `resume` both.
+    own = {"analyze", "retry"}
+    assert set(usage) == verbs | own, (set(usage) ^ (verbs | own))
 
 
 # ---- `finish --if-running` decides in the write, not only in a read before it

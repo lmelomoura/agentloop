@@ -318,7 +318,7 @@ echo
 }
 
 scenario_9() {
-echo "9. an agent that dies on launch still closes its analysis -- capped, not stuck running"
+echo "9. an agent that dies on launch pauses its analysis -- interrupted and resumable, never stuck running"
 cat > "$ROOT/dead-claude" <<'SH'
 #!/usr/bin/env bash
 exit 3
@@ -326,17 +326,20 @@ SH
 chmod +x "$ROOT/dead-claude"
 out9="$(AGENTLOOP_CLAUDE_BIN="$ROOT/dead-claude" "$AL" security analyze --detach sandbox anything main quick)"
 aid9="$(secid "$out9")"
-# Three runs of the hunt unit, each leaving nothing: the unit gives up and
-# the orchestrator closes the analysis from what the units proved -- capped,
-# with the give-up in the note, never a `running` row nobody closes.
+# Every unit's agent exits 3 before its first event: start failures, which
+# keep the unit's attempt. Three in a row, over two lineages, close the
+# orchestrator's gate, and the analysis is left interrupted with the cause in
+# its note -- for a Resume once it is fixed, never a `running` row nobody
+# closes, and never every unit given up one by one.
 w=0
 while [ "$w" -lt 60 ] && [ "$(secstate sandbox "$aid9")" = "running" ]; do sleep 1; w=$((w + 1)); done
-[ "$(secstate sandbox "$aid9")" = "capped" ] \
-  && ok "a claude that exits without a word still gets the row closed capped (waited ${w}s)" \
+[ "$(secstate sandbox "$aid9")" = "interrupted" ] \
+  && ok "a claude that exits without a word leaves the row interrupted, not running (waited ${w}s)" \
   || bad "left '$(secstate sandbox "$aid9")' after ${w}s"
 case "$(secnote sandbox "$aid9")" in
-  *"gave up after 3 runs"*) ok "and the note says the unit gave up after three runs" ;;
-  *) bad "no give-up in the coverage note: '$(secnote sandbox "$aid9")'" ;;
+  *"the agent could not start: 3 units in a row"*"the agent exited 3 with nothing on stderr"*)
+    ok "and the note names the pause and the agent's exit" ;;
+  *) bad "no pause in the coverage note: '$(secnote sandbox "$aid9")'" ;;
 esac
 sleep 1
 
@@ -1780,6 +1783,26 @@ awk -v c="$cost57" 'BEGIN{exit !(c > 0)}' \
 echo
 }
 
+scenario_58() {
+echo "58. an OpenCode run that dies before its first event is start_failed, and its note says why"
+# measurement 39: a project whose sandbox list names a path under a regular
+# file fails every OpenCode boot before a session exists. Analysis 12
+# (2026-09-26) filed 693 of them as `killed`.
+mkjob_opencode j58
+FAKE_OPENCODE_START_FAIL="BadResource: FileSystem.access (/gone/run/repo)" "$AL" run j58 >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .status)" = "error" ] && [ "$(lastrun | jq -r .cause)" = "start_failed" ] \
+  && ok "error / start_failed, not killed" || bad "$(lastrun | jq -c '{status,cause}')"
+case "$(lastrun | jq -r .note)" in
+  *"START FAILED: BadResource: FileSystem.access (/gone/run/repo)"*) ok "the note carries the CLI's own last stderr line" ;;
+  *) bad "note: $(lastrun | jq -r .note)" ;;
+esac
+grep -q "j58: finished status=error cause=start_failed .*START FAILED: BadResource" "$ROOT/data/tick.log" \
+  && ok "and so does tick.log" || bad "no start_failed line in tick.log"
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1809,11 +1832,11 @@ echo
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # re-measure when the last list grows -- and the count assertion below fails
 # if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37"
 E2E_LIST_3="38 39 40 41 41b 41c 42 43 44 45 46"
-E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57"
+E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

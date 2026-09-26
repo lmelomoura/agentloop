@@ -124,6 +124,23 @@ STRUCK_OUT_NOTE = ("The engine could not run this unit: {n} runs ended without a
                    "(see tick.log).")
 STRUCK_OUT_OUTAGE_NOTE = ("The engine could not run this unit: {n} runs in a row were cut short "
                           "by the provider ({cause}; see tick.log).")
+STRUCK_OUT_START_NOTE = ("The engine could not run this unit: its agent could not start {n} "
+                         "times in a row ({error}; see tick.log).")
+# THE ANALYSIS-WIDE BREAKER. Runs of BREAKER_CAUSES in a row, over two
+# lineages or more, are the environment failing every unit alike -- analysis 12 spent
+# 693 runs and 42 minutes proving that one lineage at a time. The gate
+# closes, nothing more is launched, and the analysis is left interrupted
+# for a resume once the cause is fixed (see _count_cannot_run).
+BREAKER_RUNS = 3
+START_FAIL_GATE = ("the agent could not start: {n} units in a row ended before a session "
+                   "opened (last error: {error})")
+PROVIDER_GATE = "the provider refused {n} units in a row ({cause})"
+# What the breaker counts: an agent that never started, and a provider that
+# answered with an error (an expired or revoked credential answers every
+# unit alike). NOT `rate_limited`: a 429 is transient and has its own pace,
+# and pausing the analysis on every burst would ask for a manual Resume each
+# time. Both still keep the unit's attempt (units.KEPT_ATTEMPT_CAUSES).
+BREAKER_CAUSES = (units.START_FAILED, "api_error")
 # The judgement of a dead run that raised: by id, never by label -- the
 # label reads the ledger, which may be the very thing failing.
 JUDGE_RETRY_LOG = "could not judge unit {uid} ({why}) — trying again"
@@ -140,6 +157,10 @@ FAILED_NOTE = ("The engine interrupted this analysis because its orchestrator fa
 # PROVIDER ended: the unit's close keeps the attempt for them (units.close),
 # and this loop counts them as runs the engine could not run.
 OUTAGE_CAUSES = units.OUTAGE_CAUSES
+# Every cause whose run keeps its attempt: an outage, or an agent that never
+# started (units.close). Runs of either, in a row, are runs the engine could
+# not run, and LAUNCH_STRIKES of them give a lineage up.
+KEPT_ATTEMPT_CAUSES = units.KEPT_ATTEMPT_CAUSES
 # `__unit-gate`'s answer when one of the engine's gates is closed; the
 # sentence naming it is on its stdout.
 GATE_CLOSED_RC = 3
@@ -290,6 +311,7 @@ class Orchestrator:
         self.budget_spent = False
         self.budget_left = None   # set when the floor, not the spend, stopped the launches
         self.gate = ""            # the engine's gate that closed, in the engine's words
+        self.cannot_run = []      # (lineage, cause, error) of the breaker's causes in a row
         self.keep_lock = False    # nothing could be written: the tick must find us dead
         self.prepare_proc = None
         self.env = {k: v for k, v in os.environ.items() if k not in _SESSION_VARS}
@@ -642,16 +664,19 @@ class Orchestrator:
         docstring), and each only past the engine's own gates."""
         room = self.parallel - len(self.children) - len(self.adopted)
         for n, unit in enumerate(units.launchable(self.conn, self.aid, room)):
-            outages, cause = self._outages_before(unit)
+            outages, cause, error = self._outages_before(unit)
             if outages >= LAUNCH_STRIKES:
-                # THE PROVIDER CUT SHORT THE LINEAGE'S LAST LAUNCH_STRIKES RUNS
-                # IN A ROW: given up, as three runs that died unclosed are.
+                # THE ENGINE COULD NOT RUN THE LINEAGE'S LAST LAUNCH_STRIKES
+                # RUNS IN A ROW -- a provider outage, or an agent that never
+                # started: given up, as three runs that died unclosed are.
                 # Counted off the ledger at the launch, never off this
                 # process's memory: a continuation is pending the moment its
                 # parent's close commits, before this loop has even reaped
                 # that parent's process -- and a resume must count the same.
-                ledger.settle_unit(self.conn, unit["id"], "failed", 0, {},
-                                   STRUCK_OUT_OUTAGE_NOTE.format(n=outages, cause=cause))
+                note = (STRUCK_OUT_START_NOTE.format(n=outages, error=error)
+                        if cause == units.START_FAILED
+                        else STRUCK_OUT_OUTAGE_NOTE.format(n=outages, cause=cause))
+                ledger.settle_unit(self.conn, unit["id"], "failed", 0, {}, note)
                 self.log(f"unit {units.label(self.conn, unit)} failed: the engine could not run it")
                 continue
             cap = None
@@ -757,6 +782,7 @@ class Orchestrator:
             self.log(f"unit {units.label(self.conn, unit)} {unit['state']} "
                      f"(${unit['spend_usd']:.2f}) — {unit['note']}")
             self.strikes.pop(lineage, None)      # a run closed it: the engine can run it
+            self._count_cannot_run(unit, lineage)
             return
         # THE RUN ENDED WITHOUT CLOSING ITS UNIT -- killed, crashed, or
         # orphaned by an orchestrator that died. Judged from what it left, as
@@ -776,18 +802,48 @@ class Orchestrator:
             self.log(f"unit {units.label(self.conn, unit)} ended without its close — judged "
                      f"{out.get('state')} from what its run left")
 
+    def _count_cannot_run(self, unit, lineage):
+        """The analysis-wide breaker. A unit closed on one of BREAKER_CAUSES
+        -- an agent that never started, a provider that answered with an
+        error -- adds to the run of them; any other close ends it. BREAKER_RUNS
+        in a row, over two lineages or more, is the environment failing every
+        unit alike (analysis 12 spent 693 runs and 42 minutes proving that one
+        lineage at a time): the gate closes with the last cause's words,
+        _loop stops launching and waits for what is in flight, and run()
+        leaves the analysis interrupted (GATE_NOTE), for a resume once the
+        cause is fixed. The tick never resumes it on its own: no orchestrator
+        died. One lineage alone is that unit's own trouble, given up by
+        _launch_pass."""
+        evidence = unit.get("evidence") or {}
+        cause = evidence.get("cause")
+        if cause not in BREAKER_CAUSES:
+            self.cannot_run = []
+            return
+        self.cannot_run.append((lineage, cause, evidence.get("error", "")))
+        if (not self.gate and len(self.cannot_run) >= BREAKER_RUNS
+                and len({lin for lin, _cause, _error in self.cannot_run}) >= 2):
+            _lin, cause, error = self.cannot_run[-1]
+            n = len(self.cannot_run)
+            self.gate = (START_FAIL_GATE.format(n=n, error=error) if cause == units.START_FAILED
+                         else PROVIDER_GATE.format(n=n, cause=cause))
+            self.log(f"stops launching: {self.gate}")
+
     def _outages_before(self, unit):
-        """(n, cause): how many of `unit`'s ancestors IN A ROW, nearest first,
-        closed on a provider outage (their evidence carries the classifier's
-        cause, units.close) -- and the nearest one's cause."""
-        n, cause, node = 0, "", unit
+        """(n, cause, error): how many of `unit`'s ancestors IN A ROW, nearest
+        first, closed on a run the engine could not run -- a provider outage,
+        or an agent that never started (their evidence carries the
+        classifier's cause, units.close) -- the nearest one's cause and, for a
+        start failure, the agent's own words."""
+        n, cause, error, node = 0, "", "", unit
         while node["parent"]:
             node = ledger.get_unit(self.conn, node["parent"])
-            if node is None or (node.get("evidence") or {}).get("cause") not in OUTAGE_CAUSES:
+            evidence = (node.get("evidence") or {}) if node is not None else {}
+            if evidence.get("cause") not in KEPT_ATTEMPT_CAUSES:
                 break
-            cause = cause or node["evidence"]["cause"]
+            if not cause:
+                cause, error = evidence["cause"], evidence.get("error", "")
             n += 1
-        return n, cause
+        return n, cause, error
 
     def _strike(self, unit, next_id):
         """One more run of `unit`'s lineage that ended without a close;
