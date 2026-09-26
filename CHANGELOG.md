@@ -588,7 +588,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   second TERM inside the EXIT trap the first one had set off — record half
   written, the unit's close never landed, the tree never torn down, the slot
   never released. The run's cleanup now ignores a further TERM, INT or HUP
-  (a no-op handler, so the processes it forks keep the default). A unit's
+  (a no-op handler, so the processes it forks keep the default), and first
+  drops any lock the stop left the run holding: a TERM that ended a wrapper
+  inside its own state or journal write left that lock naming the wrapper's
+  live pid, and the cleanup waited on itself for ever — with every other
+  unit queued behind the same lock, the analysis stayed `running` past the
+  whole grace, both slots and trees on disk (the e2e suite on CI, where a
+  slow runner lets the re-issued stop land mid-write). A unit's
   tree is torn down as its run ends — success, error or stopped — once its
   close has landed; a unit whose close failed keeps it for the
   orchestrator's judgement. The orchestrator, as it exits (done, capped,

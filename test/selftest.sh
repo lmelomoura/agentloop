@@ -6776,6 +6776,73 @@ PY
     || bad "a re-issued TERM left the slot behind (dead pid, 'stopped' file)"
   [ ! -d "$urd3" ] && ok "and the unit's tree is gone" || bad "the tree survived a TERM storm"
 
+  echo "run_cleanup() — a stop that ends the run mid-write does not wedge the cleanup on the write's own lock"
+  # CI, 2026-09-26 (scenario 56 of the e2e suite): the re-issued stop TERM'd
+  # a unit's wrapper while it held .state.lock, inside the classifier's own
+  # state write. The EXIT trap's cleanup then asked for that lock -- naming
+  # the wrapper's own pid, alive -- and waited on itself for ever; the second
+  # unit waited behind it, and the analysis stayed `running` past the whole
+  # grace with both slots and trees on disk. Here the run holds the state lock
+  # when the TERM lands; the cleanup must still finish, promptly.
+  local urd4="$tmp/wtroot/security-app/stampU4" usl4="$tmp/uslocks/security-app/994"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup security-app two "$tmp/g/repo" stampU4 ) >/dev/null 2>&1
+  mkdir -p "$usl4"
+  echo 994 > "$usl4/pid"; echo 1700000000 > "$usl4/start"; echo "$urd4" > "$usl4/worktree"
+  echo "$tmp/uclogs/security-app/20260925T100003Z-994.json" > "$usl4/logfile"
+  echo 12348 > "$usl4/child"; : > "$usl4/stopped"
+  rm -rf "$tmp/uslocks/.state.lock"; rm -f "$tmp/ulock.ready" "$tmp/ulock.sleep" "$tmp/ulock.closed"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    LOCK_DIR="$tmp/uslocks"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/uc.ndjson"; STATE_FILE="$tmp/ucstate.json"
+    LOG_DIR="$tmp/uclogs"; TICK_LOG="$tmp/uc.tick"
+    AL_SECURITY_ANALYSIS_ID=41 AL_SECURITY_UNIT_ID=14
+    security_py() { : > "$tmp/ulock.closed"; }
+    trap 'run_cleanup security-app "'"$usl4"'"' EXIT
+    _state_lock                       # the write the TERM cuts short
+    sleep 30 & echo $! > "$tmp/ulock.sleep"
+    : > "$tmp/ulock.ready"
+    wait ) >/dev/null 2>&1 &
+  # disowned: it is polled, not waited for, and bash would otherwise print
+  # its signal death into the suite's output
+  local lpid4=$! _i=0
+  disown "$lpid4" 2>/dev/null || true
+  while [ ! -f "$tmp/ulock.ready" ] && [ "$_i" -lt 200 ]; do sleep 0.05; _i=$((_i + 1)); done
+  kill -TERM "$lpid4" 2>/dev/null
+  _i=0
+  while kill -0 "$lpid4" 2>/dev/null && [ "$_i" -lt 300 ]; do sleep 0.05; _i=$((_i + 1)); done
+  if kill -0 "$lpid4" 2>/dev/null; then
+    bad "the cleanup was still waiting 15s after the stop -- on the state lock its own run left held ($(cat "$tmp/uslocks/.state.lock/pid" 2>/dev/null))"
+    kill -9 "$lpid4" 2>/dev/null
+  else
+    ok "the cleanup finished although the stop cut the run's state write short"
+  fi
+  kill "$(cat "$tmp/ulock.sleep" 2>/dev/null)" 2>/dev/null
+  [ -f "$tmp/ulock.closed" ] && [ ! -d "$usl4" ] && [ ! -d "$urd4" ] \
+    && ok "the unit was closed, its slot released and its tree torn down" \
+    || bad "after a stop mid-write: closed=$([ -f "$tmp/ulock.closed" ] && echo y || echo n) slot=$([ -d "$usl4" ] && echo kept || echo gone) tree=$([ -d "$urd4" ] && echo kept || echo gone)"
+  [ ! -d "$tmp/uslocks/.state.lock" ] && ok "and the state lock is free for every other run" \
+    || bad "the state lock outlived the cleanup: pid $(cat "$tmp/uslocks/.state.lock/pid" 2>/dev/null)"
+  grep -qF "security-app: dropped .state.lock, the lock a signal left this run holding" "$tmp/uc.tick" \
+    && ok "tick.log names the lock the stop left held" \
+    || bad "no tick.log line for the dropped lock: $(tail -2 "$tmp/uc.tick" 2>/dev/null)"
+  # Only its OWN: a lock this shell once took that now names somebody else
+  # (broken and taken over meanwhile) is that somebody's, and stays.
+  mkdir -p "$tmp/uslocks/.other.lock"; echo 424242 > "$tmp/uslocks/.other.lock/pid"
+  ( LOCK_DIR="$tmp/uslocks"; TICK_LOG="$tmp/uc.tick"
+    AL_LOCKS_HELD="$tmp/uslocks/.other.lock"$'\n'
+    lock_drop_held security-app ) >/dev/null 2>&1
+  [ -d "$tmp/uslocks/.other.lock" ] && ok "a lock that names another holder is never dropped" \
+    || bad "lock_drop_held removed a lock another process holds"
+  rm -rf "$tmp/uslocks/.other.lock"
+  # And lock_drop keeps the list honest: a lock taken and dropped normally
+  # leaves nothing behind for a cleanup to drop.
+  got="$( LOCK_DIR="$tmp/uslocks"; AL_LOCKS_HELD=""
+          lock_take "$tmp/uslocks/.a b.lock"; lock_take "$tmp/uslocks/.c.lock"
+          lock_drop "$tmp/uslocks/.a b.lock"; printf '[%s]' "$AL_LOCKS_HELD"; lock_drop "$tmp/uslocks/.c.lock"
+          printf '[%s]' "$AL_LOCKS_HELD" )"
+  [ "$got" = "[$tmp/uslocks/.c.lock"$'\n'"][]" ] && ok "lock_take lists what this shell holds and lock_drop takes it off" \
+    || bad "held-lock list after take/take/drop/drop: $got"
+
   echo "security_unit_sweep() — what an analysis's units left goes; a live unit keeps its own"
   # The orchestrator's sweep as it exits (`__unit-sweep`): a slot whose pid
   # is dead (slot_alive), a pid-less one older than the grace

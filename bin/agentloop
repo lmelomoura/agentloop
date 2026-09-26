@@ -1611,6 +1611,9 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
     fi
     sleep 0.01
   done
+  # Held by THIS shell from here to its lock_drop (lock_drop_held), noted
+  # before the pid is written: from the pid on, the lock reads as alive.
+  AL_LOCKS_HELD="${AL_LOCKS_HELD:-}$d"$'\n'
   echo $$ > "$d/pid" 2>/dev/null || true
   # Written for the same reason a slot writes one: without it, a lock taken
   # before this change (or read by slot_alive's own predate-fallback) reads as
@@ -1619,7 +1622,41 @@ lock_take() { # lock_take <lockdir> [<seconds>] — blocks until held (0); with 
   boot_id > "$d/boot" 2>/dev/null || true
   return 0
 }
-lock_drop() { rm -rf "${1:-}"; }   # rm -rf, not rmdir: the dir holds a pid file
+lock_drop() { # rm -rf, not rmdir: the dir holds a pid file
+  local nl=$'\n' held
+  rm -rf "${1:-}"
+  held="$nl${AL_LOCKS_HELD:-}"
+  held="${held/"$nl${1:-}$nl"/$nl}"
+  AL_LOCKS_HELD="${held#$nl}"
+}
+
+# THE LOCKS A SIGNAL LEFT THIS SHELL HOLDING, dropped. A run wrapper's EXIT
+# trap (run_cleanup) writes the state and the journal under the same locks
+# the run itself takes -- and a TERM that ends the wrapper INSIDE one of those
+# writes (a stop re-issued on every poll of the orchestrator's grace reaches
+# a unit's wrapper in its classifier) leaves that lock naming the wrapper's
+# own pid, alive. The cleanup's lock_take then waits on itself for ever, and
+# every other run behind it on that lock: two units of a stopped analysis
+# (CI, 2026-09-26) spun past the whole grace with .state.lock naming one of
+# them, their analysis left `running`, their slots and trees on disk.
+# AL_LOCKS_HELD is this shell's own list (lock_take adds, lock_drop removes;
+# a subshell's changes never reach its parent), so what is left in it when
+# the cleanup starts is exactly a write the signal cut short: gone with it,
+# never finished, and the write itself is atomic (a temp file and an mv).
+# Only while the lock still names this shell -- one taken over since
+# (lock_break) is somebody else's.
+lock_drop_held() { # lock_drop_held <job-id> -- the id names the run in tick.log
+  local rest="${AL_LOCKS_HELD:-}" d
+  while [ -n "$rest" ]; do
+    d="${rest%%$'\n'*}"; rest="${rest#*$'\n'}"
+    [ -n "$d" ] || continue
+    if [ "$(cat "$d/pid" 2>/dev/null || true)" = "$$" ]; then
+      rm -rf "$d"
+      log_tick "$1: dropped ${d#"$LOCK_DIR"/}, the lock a signal left this run holding"
+    fi
+  done
+  AL_LOCKS_HELD=""
+}
 
 # A slot is a LEASE, and a pid alone cannot express one. $LOCK_DIR lives under
 # data/, so every slot survives a reboot — and the kernel reissues pids from 1
@@ -4262,6 +4299,10 @@ run_cleanup() { # <id> <slot-dir>
   # a trapped one is reset to the default in them. Dropped at the end, the
   # run being over.
   trap ':' TERM INT HUP
+  # And nothing it needs is still held by the run it cleans up after: a TERM
+  # that ended the run mid-write left that write's lock naming this very
+  # process, and every lock_take below would wait on it for ever.
+  lock_drop_held "$id"
   run_record_stopped_early "$id" "$slot"
   wt="$(cat "$slot/worktree" 2>/dev/null || true)"
   if [ -n "$wt" ]; then
