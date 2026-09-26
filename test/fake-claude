@@ -39,6 +39,14 @@
 #   FAKE_CLAUDE_LOGGED_OUT  set to play a CLI with no session: `auth status` exits 1,
 #                      and in the probe world below every model probe gets the
 #                      CLI's not-logged-in answer
+#   FAKE_KILLED_USAGE  set to emit two assistant "turns" carrying real usage,
+#                      each repeated twice under the SAME message id (the
+#                      shape a real killed run's stream has -- one line per
+#                      content block, all carrying that turn's cumulative
+#                      usage) -- for a mode that then ends with no result
+#                      event (hang, killed by the watchdog or a stop): proves
+#                      run_job's salvage path estimates that run's cost from
+#                      the stream instead of recording it lost as $0.00
 #   FAKE_RATE_LIMIT_EVENT  set to emit one rate_limit_event line into the
 #                      stream, shaped like the real one (see the fixture in
 #                      test/selftest.sh's rate-limits block): status
@@ -174,6 +182,15 @@ fi
 
 sid="${FAKE_SESSION:-sess-fake-0001}"
 mode="${FAKE_MODE:-complete}"
+# The `--model` this launch asked for (run_job's own -- see run_job's
+# `args="... --model $model ..."`), echoed into the init event below exactly
+# as a real session does: the engine reads it back (run_job's model_id) to
+# price a killed run's estimate against the right row of config/pricing.json.
+model=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "--model" ] && model="$a"
+  prev="$a"
+done
 
 # A UNIT OF A SECURITY ANALYSIS (security/orchestrator.py). The prompt is the
 # last argument (after `--`). The ledger side is test/fake-unit.sh's; the
@@ -233,11 +250,18 @@ fi
     printf '"a-tool-with-a-fairly-long-name-%s"' "$i"
     i=$((i + 1))
   done
-  printf ']}\n'
+  printf '],"model":"%s"}\n' "$model"
 }
 
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}\n'
 [ -z "$FAKE_UNIT_EVENTS" ] || printf '%s' "$FAKE_UNIT_EVENTS"
+
+if [ -n "${FAKE_KILLED_USAGE:-}" ]; then
+  printf '{"type":"assistant","message":{"id":"msg_turn_a","usage":{"input_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":500,"output_tokens":5}}}\n'
+  printf '{"type":"assistant","message":{"id":"msg_turn_a","usage":{"input_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":500,"output_tokens":5}}}\n'
+  printf '{"type":"assistant","message":{"id":"msg_turn_b","usage":{"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":2000,"output_tokens":45}}}\n'
+  printf '{"type":"assistant","message":{"id":"msg_turn_b","usage":{"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":2000,"output_tokens":45}}}\n'
+fi
 
 [ -z "${FAKE_RATE_LIMIT_EVENT:-}" ] || printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785427200,"rateLimitType":"seven_day","utilization":0.98,"surpassedThreshold":0.75}}\n'
 

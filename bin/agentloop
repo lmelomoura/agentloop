@@ -1099,7 +1099,7 @@ security_orchestrate() { # security_orchestrate <job-id> <analysis-id> <repo>
     --analysis "$aid" --engine "$SELF" --job "$jid" --commit "$commit" --repo "$repo" \
     --repo-path "$cwd" --prepare-root "$DATA_DIR/security/prepare" --log-root "$LOG_DIR" \
     --parallel "$parallel" --budget "$budget" --ignore "$ignore" --log "$TICK_LOG" \
-    --lock-dir "$lock"
+    --lock-dir "$lock" --pricing "$PRICING_FILE"
 }
 
 # The detached launch of an analysis's orchestrator: what `security analyze
@@ -3440,6 +3440,15 @@ pricing_unpriced() { # the visible catalog slugs with no numeric price, one per 
   done
 }
 
+anthropic_unpriced() { # the visible claude-* ids with no numeric price, one per line -- pricing_unpriced's sibling for the platform that reports dollars itself, except when a run never gets that far (see costing.py)
+  local s
+  [ -s "$PRICING_FILE" ] || { anthropic_catalog_ids; return 0; }
+  for s in $(anthropic_catalog_ids); do
+    "$JQ" -e --arg s "$s" '.anthropic[$s] | (.input|type) == "number" and (.cached_input|type) == "number" and (.output|type) == "number"' \
+      "$PRICING_FILE" >/dev/null 2>&1 || printf '%s\n' "$s"
+  done
+}
+
 opencode_unpriced() { # the enabled opencode ids with no price in the catalog nor in the table, one per line
   local m
   for m in $(platform_models_enabled opencode); do
@@ -3460,7 +3469,7 @@ _pricing_cleanup() { # the temporaries of the caller, by dynamic scope: $tmp is 
 }
 
 resolve_pricing_openai() { # refresh config/pricing.json from the source; 0 = current (or unchanged), 1 = could not refresh
-  local url tmp src hdr base code now etag refreshed_at age_text new_etag slugs changes
+  local url tmp src hdr base code now etag refreshed_at age_text new_etag slugs aslugs changes achanges
   local -a hopt=()
   url="$(pricing_source_url)"
   now="$(now_epoch)"
@@ -3481,7 +3490,7 @@ resolve_pricing_openai() { # refresh config/pricing.json from the source; 0 = cu
   # The conditional request is an optimisation, and it is only sound while the
   # table is complete: a source that has not changed still carries the row a
   # visible slug is missing, so when anything is unpriced ask for the body.
-  [ -z "$etag" ] || [ -n "$(pricing_unpriced)" ] || hopt=(-H "If-None-Match: $etag")
+  [ -z "$etag" ] || [ -n "$(pricing_unpriced)$(anthropic_unpriced)" ] || hopt=(-H "If-None-Match: $etag")
   refreshed_at="$(num "$("$JQ" -r '._refreshed_at // 0' "$base" 2>/dev/null)")"
   if [ "$refreshed_at" -eq 0 ]; then
     age_text="never refreshed"
@@ -3505,7 +3514,7 @@ resolve_pricing_openai() { # refresh config/pricing.json from the source; 0 = cu
       # An unchanged source is not the same as a complete table: the daily
       # warning belongs here too, or a slug that has no price never gets one
       # named for as long as the etag holds.
-      pricing_report_missing "$(pricing_unpriced | tr '\n' ' ')"
+      pricing_report_missing "$(pricing_unpriced | tr '\n' ' ')$(anthropic_unpriced | tr '\n' ' ')"
       return 0
     fi
     log_tick "pricing: could not stamp $PRICING_FILE — table unchanged"
@@ -3527,7 +3536,13 @@ resolve_pricing_openai() { # refresh config/pricing.json from the source; 0 = cu
   # plus whatever the table already carries (a job may pin a slug the catalog
   # since dropped).
   slugs="$( { openai_catalog_slugs; "$JQ" -r '.openai // {} | if type == "object" then . else {} end | keys[]' "$base" 2>/dev/null; } | sort -u | "$JQ" -R . | "$JQ" -sc .)"
-  if ! "$JQ" --slurpfile s "$src" --argjson now "$now" --arg url "$url" --arg etag "$new_etag" --argjson slugs "$slugs" '
+  # Anthropic's own rows, from the SAME source and the SAME reduce shape as
+  # openai's above (the litellm dump prices claude-* ids under
+  # litellm_provider "anthropic") -- this is what lets a stopped Claude run
+  # get an "estimated" cost_basis (bin/platforms/costing.py) instead of
+  # staying at "none" for want of ANY price row to read.
+  aslugs="$( { anthropic_catalog_ids; "$JQ" -r '.anthropic // {} | if type == "object" then . else {} end | keys[]' "$base" 2>/dev/null; } | sort -u | "$JQ" -R . | "$JQ" -sc .)"
+  if ! "$JQ" --slurpfile s "$src" --argjson now "$now" --arg url "$url" --arg etag "$new_etag" --argjson slugs "$slugs" --argjson aslugs "$aslugs" '
       ($s[0]) as $src
       | def per_m: if type == "number" then ((. * 1000000 * 1000000) | round) / 1000000 else null end;
       .openai = (reduce $slugs[] as $slug (((.openai // {}) | if type == "object" then . else {} end);
@@ -3535,6 +3550,19 @@ resolve_pricing_openai() { # refresh config/pricing.json from the source; 0 = cu
           | $src[$slug] as $row
           | if ($old.source // "") == "manual" then .
             elif ($row | type) == "object" and (($row.litellm_provider // "") == "openai")
+                 and (($row.input_cost_per_token | type) == "number") and (($row.output_cost_per_token | type) == "number") then
+              .[$slug] = ({input: ($row.input_cost_per_token | per_m),
+                           cached_input: ((if ($row.cache_read_input_token_cost | type) == "number" then $row.cache_read_input_token_cost else $row.input_cost_per_token end) | per_m),
+                           output: ($row.output_cost_per_token | per_m),
+                           cache_write: ((if ($row.cache_creation_input_token_cost | type) == "number" then $row.cache_creation_input_token_cost else 0 end) | per_m),
+                           source: "litellm", at: $now}
+                          + (if ($row.cache_read_input_token_cost | type) == "number" then {} else {cached_input_assumed: true} end))
+            else . end))
+      | .anthropic = (reduce $aslugs[] as $slug (((.anthropic // {}) | if type == "object" then . else {} end);
+          ((.[$slug] // {}) | if type == "object" then . else {} end) as $old
+          | $src[$slug] as $row
+          | if ($old.source // "") == "manual" then .
+            elif ($row | type) == "object" and (($row.litellm_provider // "") == "anthropic")
                  and (($row.input_cost_per_token | type) == "number") and (($row.output_cost_per_token | type) == "number") then
               .[$slug] = ({input: ($row.input_cost_per_token | per_m),
                            cached_input: ((if ($row.cache_read_input_token_cost | type) == "number" then $row.cache_read_input_token_cost else $row.input_cost_per_token end) | per_m),
@@ -3577,14 +3605,43 @@ resolve_pricing_openai() { # refresh config/pricing.json from the source; 0 = cu
       [ -z "$line" ] || log_tick "pricing: $line"
     done
   fi
+  # anthropic's own change log, the same shape as openai's above.
+  achanges="$("$JQ" -r --slurpfile old "$base" '
+      ((($old[0] // {}).anthropic // {}) | if type == "object" then . else {} end) as $o
+      | ((.anthropic // {}) | if type == "object" then . else {} end)
+      | to_entries[]
+      | .key as $slug | .value as $new
+      | ($o[$slug]) as $prev
+      | if ($new | type) != "object" then empty
+        elif ($prev | type) != "object" then
+          "\($slug) priced: input \($new.input) cached \($new.cached_input) output \($new.output) cache_write \($new.cache_write)"
+        else
+          ("input", "cached_input", "output", "cache_write") as $f
+          | ($prev[$f]) as $a | ($new[$f]) as $b
+          | select(($b | type) == "number" and (($a | type) != "number" or $a != $b))
+          | "\($slug) \($f) \($a) -> \($b)"
+            + (if ($a | type) != "number" or $a == 0 then ""
+               elif $b == 0 then " — now free at the source; runs will estimate $0"
+               elif ($b / $a) >= 3 or ($b / $a) <= (1 / 3) then " — check the source"
+               else "" end)
+        end' "$tmp" 2>/dev/null)" || log_tick "pricing: could not compare the old and new anthropic tables — their changes are not listed below"
+  if [ -n "$achanges" ]; then
+    printf '%s\n' "$achanges" | while IFS= read -r line; do
+      [ -z "$line" ] || log_tick "pricing: $line"
+    done
+  fi
   mv "$tmp" "$PRICING_FILE" || { _pricing_cleanup; return 1; }
   _pricing_cleanup
-  local priced manual missing
+  local priced manual missing priced_a manual_a missing_a
   priced="$(num "$("$JQ" -r '[.openai[] | select(.source == "litellm")] | length' "$PRICING_FILE")")"
   manual="$(num "$("$JQ" -r '[.openai[] | select(.source == "manual")] | length' "$PRICING_FILE")")"
   missing="$(pricing_unpriced | tr '\n' ' ')"
+  priced_a="$(num "$("$JQ" -r '[.anthropic[]? | select(.source == "litellm")] | length' "$PRICING_FILE")")"
+  manual_a="$(num "$("$JQ" -r '[.anthropic[]? | select(.source == "manual")] | length' "$PRICING_FILE")")"
+  missing_a="$(anthropic_unpriced | tr '\n' ' ')"
   echo "pricing -> $priced row(s) from the source, $manual manual, refreshed $(date -u -r "$now" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)${missing:+; no price for: $missing}"
-  pricing_report_missing "$missing"
+  echo "pricing -> anthropic: $priced_a row(s) from the source, $manual_a manual${missing_a:+; no price for: $missing_a}"
+  pricing_report_missing "$missing$missing_a"
   return 0
 }
 
@@ -6986,8 +7043,10 @@ If the work turns out to be already finished, or it can no longer be done at all
 
   # How the cost is known, and the token counts. Anthropic reports dollars
   # (`reported`); the normalizer estimates them from tokens (`estimated`) or
-  # says it cannot (`none`); a run that died without a final event knows
-  # neither, and records null tokens rather than a zero that reads as free.
+  # says it cannot (`none`); a run that died without a final event starts at
+  # `none` with null tokens (never a zero that reads as free) and, below —
+  # once the model that ran is known — gets its own chance at `estimated`
+  # from whatever usage its stream carries.
   local cost_basis tokens_json
   local _no_result=false
   cost_basis="$("$JQ" -r '.cost_basis // empty' "$logfile" 2>/dev/null)"
@@ -7022,6 +7081,31 @@ If the work turns out to be already finished, or it can no longer be done at all
   # (opencode). platform_finish also feeds the usage gate on openai.
   platform_finish "$platform" "$streamfile" "$session" "$id" "$run_cwd" "${account_dir:-$(account_cli_default openai)}"
   [ -z "$PF_MODEL_ID" ] || model_id="$PF_MODEL_ID"
+
+  # A stopped/killed/crashed run (no result event) never got the chance to
+  # report a cost — but it may have spent several real minutes on
+  # claude-opus first (measured: a read unit stopped mid-run, 7,600 lines
+  # read, spend_usd recorded 0.0). Estimate it from the assistant events the
+  # stream DOES carry, deduplicated per message id and priced from the same
+  # table the normalizer already uses for openai/opencode (bin/platforms/costing.py,
+  # one implementation shared with the orchestrator's own dead-run judgement
+  # — see security/orchestrator.py's _judge_orphan). Only when nothing
+  # better is already known: a platform that finished cleanly keeps its
+  # reported/estimated basis untouched.
+  if [ "$_no_result" = true ]; then
+    local _est _est_cost _est_basis _est_tokens
+    _est="$("$PYTHON" "$BIN_DIR/platforms/costing.py" --stream "$streamfile" --pricing "$PRICING_FILE" \
+      --provider "$platform" --model "$model_id" 2>/dev/null)"
+    _est_basis="$(printf '%s' "$_est" | "$JQ" -r '.cost_basis // "none"' 2>/dev/null)"
+    if [ "$_est_basis" = "estimated" ]; then
+      _est_cost="$(printf '%s' "$_est" | "$JQ" -r '.cost // empty' 2>/dev/null)"
+      _est_tokens="$(printf '%s' "$_est" | "$JQ" -c '.tokens + {reasoning:0} // empty' 2>/dev/null)"
+      if [ -n "$_est_cost" ]; then
+        cost="$_est_cost"; cost_basis="estimated"
+        [ -n "$_est_tokens" ] && [ "$_est_tokens" != "null" ] && tokens_json="$_est_tokens"
+      fi
+    fi
+  fi
 
   run_classify
   status="$RJ_STATUS"; wdreason="$RJ_REASON"

@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","session_id":"sess-stopped-1","cwd":"/tmp/x","model":"claude-opus-5-5","permissionMode":"bypassPermissions"}
+{"type":"assistant","message":{"id":"msg_turn_1","usage":{"input_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":500,"output_tokens":5}}}
+{"type":"assistant","message":{"id":"msg_turn_1","usage":{"input_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":500,"output_tokens":5}}}
+{"type":"assistant","message":{"id":"msg_turn_1","usage":{"input_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":500,"output_tokens":5}}}
+{"type":"assistant","message":{"id":"msg_turn_2","usage":{"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":2000,"output_tokens":45}}}
+{"type":"assistant","message":{"id":"msg_turn_2","usage":{"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":2000,"output_tokens":45}}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}

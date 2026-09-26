@@ -94,6 +94,12 @@ from pathlib import Path
 
 from . import ledger, units
 
+# bin/platforms is this repo's other python package, a sibling of security/
+# (both live under bin/, on sys.path via cli.py's own insert) -- costing.py
+# is the one place a run's cost is ESTIMATED after the fact, from its own
+# stream, shared with bin/agentloop's run_job salvage path.
+from platforms import costing
+
 MIN_UNIT_BUDGET = 0.50
 LAUNCH_STRIKES = 3
 # How many polls a unit whose judgement raised is retried on before this
@@ -261,11 +267,15 @@ def _stream_root(stream):
 class Orchestrator:
     def __init__(self, db, analysis_id, *, engine, job, commit, repo, repo_path, prepare_root,
                  log_root=None, parallel=3, budget=None, ignore="", log=None, lock_dir=None,
-                 poll=2.0, offline=False):
+                 poll=2.0, pricing_file=None, offline=False):
         self.db, self.aid = str(db), int(analysis_id)
         self.engine, self.job, self.commit, self.repo = str(engine), job, commit, repo
         self.repo_path, self.prepare_root = str(repo_path), Path(prepare_root)
         self.log_root = Path(log_root) if log_root else None
+        # config/pricing.json: a dead run's judgement (_judge_orphan) prices
+        # whatever usage its stream carries from this table, same as
+        # bin/agentloop's own salvage path -- see bin/platforms/costing.py.
+        self.pricing_file = str(pricing_file) if pricing_file else None
         self.parallel = max(1, min(8, int(parallel or 3)))
         self.budget, self.budget_error = _parse_budget(budget)
         self.ignore, self.log_path, self.lock_dir, self.poll = ignore or "", log, lock_dir, poll
@@ -795,11 +805,26 @@ class Orchestrator:
         and a verify unit's own verdict is cleared in the settle's
         transaction -- and, being `stopped`, the whole unit runs again at the
         same attempt. The rule lives in the close, not here, so the engine's
-        `unit-close` handed an empty stream is held to it too."""
+        `unit-close` handed an empty stream is held to it too.
+
+        SPEND, ESTIMATED FROM THE STREAM. A run that died here never told
+        run_job its cost either -- there is no run_job frame left to tell it
+        anything -- so without this the unit would settle at spend_usd 0.0
+        despite whatever real tokens it spent. costing.estimate_stream_cost
+        reads the same table bin/agentloop's own salvage path does
+        (config/pricing.json, --pricing above); with no stream, no usage in
+        it, or no price for the model, it comes back None and this unit
+        settles at 0.0 exactly as it always has."""
         try:
             stream = self._stream_of(unit, pid) or ""
+            spend = 0.0
+            if stream and self.pricing_file:
+                cost, _basis, _tokens = costing.estimate_stream_cost(stream, self.pricing_file)
+                if cost is not None:
+                    spend = cost
             out = units.close(self.conn, unit, stream=stream,
-                              root=_stream_root(stream) if stream else "", status="stopped")
+                              root=_stream_root(stream) if stream else "", status="stopped",
+                              spend_usd=spend)
         except Exception as exc:  # noqa: BLE001 -- a unit must never stay `running` for ever
             tries = self.unjudged.get(unit["id"], [pid, 0])[1] + 1
             why = f"{type(exc).__name__}: {exc}"

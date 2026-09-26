@@ -553,6 +553,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A stopped, killed, watchdog-timed-out or crashed run's cost is now
+  estimated from its own stream instead of lost as $0.00.** A run never
+  writes its final `result` event (which carries the reported dollar cost)
+  when it does not end cleanly, so the engine recorded `cost_basis "none"`
+  and spend 0.0 no matter how many real minutes and tokens it had spent —
+  measured on a real pipeline analysis where three read units running on
+  claude-opus were settled at $0.00 after the operator pressed Stop, one of
+  them after reading 7,600 lines, under-reporting the analysis's spend and
+  letting a budget cap run past what actually happened. `run_job`'s salvage
+  path (`bin/agentloop`, the `no_result_event` case) now estimates the cost
+  from the assistant events the stream DOES carry — deduplicated by message
+  id first (a turn is repeated once per content block on the stream, always
+  with the same cumulative usage; summing every line instead of the turn's
+  one figure used to overcount by however many blocks a turn had) — and
+  prices it from `config/pricing.json`, exactly the table and formula
+  `openai_stream.py`/`opencode_stream.py` already use for their own
+  platforms (`bin/platforms/costing.py`, one implementation, `cost_basis
+  "estimated"`). `config/pricing.json` now also carries Anthropic's own
+  rows (`resolve_pricing_openai`, `anthropic_unpriced`), refreshed from the
+  same litellm source the OpenAI rows already come from, so a killed
+  claude-opus/claude-sonnet run has a price to be estimated against. The
+  security unit's own close (`security_close_analysis`) and the
+  orchestrator's judgement of a run that died before its own close ran
+  (`_judge_orphan`, `security/orchestrator.py`, which used to hand
+  `units.close` `spend_usd=0.0` unconditionally) both now receive the
+  estimate instead of a hardcoded zero. A run that DOES report a cost keeps
+  it untouched.
+
 - **The Security project page's two "lines" numbers now say what each one
   counts, and where it comes from.** The header's "Lines of code"
   (`cmd_project_data`, `bin/security/cli.py`) counts every text line of the
