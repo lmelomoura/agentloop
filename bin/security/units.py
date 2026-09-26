@@ -35,6 +35,7 @@ continuation with no work done.
 """
 
 import os
+import re
 import sqlite3
 import time
 
@@ -939,16 +940,26 @@ def retryable(conn, analysis_id) -> int:
     return len(failed_lineages(conn, analysis_id))
 
 
-def close_part_start(conn, analysis_id, note) -> int:
+# The sentences only `finish --from-units` writes, by the words each one
+# begins with: the units' coverage sentence (coverage_sentence) and the gaps
+# (gaps). NEVER by their numbers or their full wording -- a later engine
+# counts and phrases them differently (analysis 12's "Deep read" said 6,670
+# files where today's count of the same inventory says 6,656), and a close
+# looked for by rebuilding its sentence is a close that is not found.
+_CLOSE_PART = re.compile(
+    r"(?:^|(?<=\s))(?:Reachability pass: |Deep read: "
+    r"|[\d,]+ units? never finished: |[\d,]+ units? gave up after "
+    r"|[\d,]+ of [\d,]+ lines in the deep scope "
+    r"|The deep scope was never listed or cannot be read: )")
+
+
+def close_part_start(note) -> int:
     """Where the last close from the units began in `note`: `finish
     --from-units` appends the units' coverage sentence first, then the gaps,
-    after whatever `prepare` stored. The index of the earliest of them;
-    len(note) when none is in it. Computed now from the ledger that close
-    read, which nothing has changed since: every unit of a closed analysis is
-    settled."""
-    marks = [coverage_sentence(conn, analysis_id)] + gaps(conn, analysis_id)
-    found = [note.find(mark) for mark in marks if mark and note.find(mark) >= 0]
-    return min(found) if found else len(note)
+    after whatever `prepare` stored -- so the first of their opening words is
+    where the close begins. len(note) when none is in it."""
+    found = _CLOSE_PART.search(note or "")
+    return found.start() if found else len(note or "")
 
 
 def retry_sentence(n, day=None) -> str:

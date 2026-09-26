@@ -57,6 +57,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a new one, repeating hours of reading that had already been proved.
   From the terminal: `agentloop security retry <project> <analysis-id>`.
   The dashboard asks for it through a new security_retry operation.
+  The old close is found by the words its sentences begin with, never by
+  their numbers, so an analysis closed by an older engine (whose counts are
+  worded differently today) is cut cleanly too.
   On the dashboard, a capped or failed analysis with units that gave up shows
   **Retry failed units**, which says how many will run and on which commit
   before it runs them.

@@ -2288,7 +2288,7 @@ def cmd_reopen(args):
     leaves = units.failed_lineages(conn, args.analysis)
     stored = conn.execute("SELECT coverage_note FROM analysis WHERE id=?",
                           (args.analysis,)).fetchone()["coverage_note"] or ""
-    kept = stored[:units.close_part_start(conn, args.analysis, stored)].strip()
+    kept = stored[:units.close_part_start(stored)].strip()
     note = f"{kept} {units.retry_sentence(len(leaves))}".strip()
     if not ledger.reopen_analysis(conn, args.analysis, leaves, note):
         sys.exit(f"analysis {args.analysis} changed while it was being reopened: try again")

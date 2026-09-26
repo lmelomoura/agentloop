@@ -1225,10 +1225,25 @@ def test_the_retry_sentence_says_when_and_how_many():
         "Retried on 2026-09-27: 231 units that had given up were run again.")
 
 
-def test_the_close_part_starts_at_the_units_sentence(conn):
-    aid = _analysis(conn)
-    _failed_hunt(conn, aid)
-    head = "Scope and secrets as prepare wrote them."
-    closed = f"{head} {units.coverage_sentence(conn, aid)} {' '.join(units.gaps(conn, aid))}".strip()
-    assert closed[:units.close_part_start(conn, aid, closed)].strip() == head
-    assert units.close_part_start(conn, aid, head) == len(head), "nothing of a close in it: all kept"
+def test_the_close_part_is_found_by_its_first_words_even_when_its_numbers_changed():
+    """Analysis 12 was closed by an older engine: its "Deep read" says 6,670
+    files, where today's count of the same inventory says 6,656 (only files
+    with content count now). Rebuilding the sentence to look for it finds
+    nothing, and the old close survived a retry beside the new one. The
+    close's part is found by the words its sentences begin with -- never by
+    their numbers."""
+    head = ("Secrets were scanned. The deep scope is 6,670 files (1,241,385 lines), "
+            "each to be read in full.")
+    close = ("Reachability pass: 1 of 1 unit(s) done. Deep read: 277 read unit(s), 15 "
+             "continuation(s); read in full: 6,670 of 6,670 files, 1,241,385 of 1,241,385 "
+             "lines. Guides read: ATTACK-CLASSES. 231 units gave up after 3 runs (3 "
+             "attempts): verify 37/267 · attempt 3 (x).")
+    note = f"{head} {close}"
+    assert note[:units.close_part_start(note)].strip() == head
+    assert units.close_part_start(head) == len(head), "nothing of a close in it: all kept"
+    for gap in ("2 units never finished: hunt 1/1.",
+                "1 unit gave up after 1 run (1 attempt): hunt 1/1 (x).",
+                "12,000 of 90,000 lines in the deep scope (3 of 40 files) were never read in full.",
+                "The deep scope was never listed or cannot be read: no inventory is recorded."):
+        quick = f"Secrets were scanned. {gap}"
+        assert quick[:units.close_part_start(quick)].strip() == "Secrets were scanned.", gap
