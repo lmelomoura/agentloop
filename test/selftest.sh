@@ -3454,12 +3454,7 @@ EOF
   # one person's (gitignored) jobs.json, everyone else clones a scheduler that
   # files every run as a warning. So injection must reach a prompt that has never
   # heard of it, and must not double up on one that has.
-  inject() { # inject <prompt> -> the prompt as the agent will receive it
-    case "$1" in
-      *"$RUN_ENDING_MARKER"*) printf '%s' "$1" ;;
-      *) printf '%s\n\n%s' "$1" "$(run_ending_contract)" ;;
-    esac
-  }
+  inject() { inject_contract "job-x" "$1"; }   # the engine's own function
   local plain injected twice
   plain="Do the thing."
   injected="$(inject "$plain")"
@@ -3481,15 +3476,33 @@ EOF
   # The reviewer prompts carried ids that were correct FROM `Review - DEV` and
   # wrong from `In Review - DEV` -- and the precheck moves the card to the latter
   # before the session starts, so every closing transition used the wrong number.
-  # The durable cure is in the contract every job receives: resolve by to.name.
-  case "$(run_ending_contract)" in
+  # The durable cure is in the board rules every job with a board receives:
+  # resolve by to.name.
+  case "$(tracker_contract)" in
     *"resolve it by name"*) ok "the contract tells every run to resolve ids by name" ;;
     *) bad "the contract never warns about hard-coded transition ids" ;;
   esac
-  case "$(run_ending_contract)" in
+  case "$(tracker_contract)" in
     *"per SOURCE STATE"*) ok "and says WHY a correct id goes stale (source state)" ;;
     *) bad "the contract states the rule without the reason it exists" ;;
   esac
+
+  echo "the board rules reach every job that has a board, and no security unit"
+  # A security unit reads code and moves no card; handed the board rules it is
+  # told about a READY queue and transitions it does not have. Both sides of
+  # the boundary: an ordinary job still gets them, a unit gets the contract
+  # without them.
+  local job_prompt unit_prompt
+  job_prompt="$(inject_contract "review-dev" "Review the ticket.")"
+  unit_prompt="$(inject_contract "${SECURITY_JOB_PREFIX}web" "Triage these rows.")"
+  case "$job_prompt" in *"resolve it by name"*"block only on something NEW"*|*"block only on something NEW"*"resolve it by name"*)
+    ok "an ordinary job receives the board rules" ;;
+    *) bad "an ordinary job lost the board rules" ;; esac
+  case "$unit_prompt" in *"RUN COMPLETE:"*) ok "a security unit still receives the run-ending contract" ;;
+    *) bad "a security unit lost the run-ending contract" ;; esac
+  case "$unit_prompt" in *"resolve it by name"*|*"READY"*|*"human decision"*)
+    bad "a security unit is handed the board rules" ;;
+    *) ok "a security unit is not handed the board rules" ;; esac
 
   echo "the changelog moves when main moves"
   # Other people run this scheduler on their own projects: a change they cannot
@@ -3584,11 +3597,11 @@ EOF
   # the next run read the spent rounds, decided the board was glitched, and put it
   # straight back in Blocked. The human's only lever moves it forward; the agent's
   # caution moved it back. Both halves of the cure must be present.
-  case "$(run_ending_contract)" in
+  case "$(tracker_contract)" in
     *"a human's move is an answer"*|*"human decision"*) ok "the injected contract tells a run not to re-block a human's move" ;;
     *) bad "the contract never mentions the human-released case" ;;
   esac
-  case "$(run_ending_contract)" in
+  case "$(tracker_contract)" in
     *"block only on something NEW"*) ok "and says what DOES still justify blocking" ;;
     *) bad "the contract removed blocking without saying when it is still right" ;;
   esac

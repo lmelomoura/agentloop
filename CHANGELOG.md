@@ -433,6 +433,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A security unit is no longer handed the board rules.** The run-ending
+  contract every run receives carried two sections about a tracker (a card
+  moved to READY is a human's answer; resolve a transition id by its
+  destination name), and every unit of a security analysis got them too: a
+  session that reads code and moves no card, told about a queue and
+  transitions it does not have. They are now `tracker_contract`, appended
+  after the contract to every job except a `security-*` unit
+  (`inject_contract` in `bin/agentloop`, which the selftest now exercises
+  directly instead of a copy of it). Ordinary jobs receive exactly the text
+  they did before.
+- **The security-analysis skill no longer describes another repository as
+  the one under analysis.** Its triage section said "measured on this
+  repository, all three of [the Semgrep pre-pass's] findings were false
+  positives" and quoted a rule count per language: measurements taken on
+  agentloop itself, read by a unit analysing some other project as a fact
+  about that project, and a nudge toward dismissing a pre-pass row before
+  reading it. The paragraph now states the criterion (judge the row by the
+  code around it) and that Semgrep's coverage is uneven by language. The
+  paragraph on `decide` no longer walks a unit through how the refusal is
+  implemented and which routes do not get past it; it says the verb is
+  refused while any analysis of the project runs. Four sentences phrased
+  against an earlier version of the skill ("now has a field", "used to
+  mean") state the current rule instead.
+
 - **CI answers in about five minutes instead of fifteen to twenty-two, with
   every test still run exactly once.** The three jobs took 16, 14 and 22
   minutes on GitHub's three-core macOS runner. Now: the pytest suites run one
