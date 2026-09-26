@@ -1,0 +1,37 @@
+measurement 39 -- a project sandbox whose parent path became a regular file
+opencode-ai 1.18.30, macOS, 2026-09-26, after a deep security analysis closed
+`capped` with 231 of its 267 verify units given up (design:
+../2026-09-26-security-analysis-recovery-design.md)
+
+Script: 39-sandbox-parent-is-a-file.sh <empty scratch dir>. Every XDG_* is
+redirected under the scratch dir, so the operator's ~/.local/share/opencode is
+never read or written. `opencode debug config` is the probe: it boots the
+project (the code path that failed in production) and never calls a model.
+
+Layout: one repository `main` and three git worktrees laid out as the engine
+lays out a unit's run dir, `runs/<run>/repo`. OpenCode keys a project by its
+root commit, so all four checkouts are ONE project; the first directory it
+boots in becomes the project's worktree and every later one is appended to
+`project.sandboxes` in opencode.db.
+
+Result (39-sandbox-parent-is-a-file.out.txt):
+- a sandbox removed cleanly (the directory is gone: ENOENT) is tolerated:
+  rc 0, and it is pruned from the list on the next boot;
+- a sandbox whose PARENT is a regular file (ENOTDIR) is not: every boot of
+  the project -- in any worktree, the main checkout included -- exits 1
+  before a session exists, with `Error: Unexpected error` and
+  `BadResource: FileSystem.access (<sandbox>)` on stderr and nothing on
+  stdout;
+- removing the file heals it: the next boot is rc 0 and prunes the entry.
+
+Why: OpenCode's Effect file system answers `exists` by `access`, and maps
+only NotFound to false; ENOTDIR maps to BadResource and propagates out of
+the boot.
+
+Checked again on the operator's real state, never on the live database: an
+APFS clone (`cp -c`) of opencode.db, -wal and -shm under a scratch
+XDG_DATA_HOME, and `opencode debug config` in the analysed repository's own
+checkout. Before the clean-up: rc 1, the same BadResource on the unit run
+dir the tick sweep had turned into a 0-byte file. After it (the file and the
+700 leftover unit run dirs removed): rc 0, and the project's 10 stale
+sandboxes pruned to 0.

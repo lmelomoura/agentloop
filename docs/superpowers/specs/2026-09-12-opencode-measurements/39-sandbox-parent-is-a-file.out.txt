@@ -1,0 +1,32 @@
+== opencode 1.18.30
+data       $S/xdg-data/opencode
+log        $S/xdg-data/opencode/log
+repos      $S/xdg-data/opencode/repos
+
+== 1. start in A  (cwd runs/A/repo)
+rc=0
+sandboxes: []
+
+== 2. start in C  (cwd runs/C/repo)
+rc=0
+sandboxes: ["runs/C/repo"]
+
+== 3. A removed cleanly (ENOENT); start in B  (cwd runs/B/repo)
+rc=0
+sandboxes: ["runs/C/repo","runs/B/repo"]
+
+== 4. C removed, then its run dir re-created as a 0-byte file (what touch did); start in B  (cwd runs/B/repo)
+rc=1
+Error: Unexpected error
+BadResource: FileSystem.access ($S/runs/C/repo)
+sandboxes: ["runs/C/repo","runs/B/repo"]
+
+== 5. same poison; start in the main checkout  (cwd main)
+rc=1
+Error: Unexpected error
+BadResource: FileSystem.access ($S/runs/C/repo)
+sandboxes: ["runs/C/repo","runs/B/repo"]
+
+== 6. the 0-byte file removed; start in B  (cwd runs/B/repo)
+rc=0
+sandboxes: ["runs/B/repo"]
