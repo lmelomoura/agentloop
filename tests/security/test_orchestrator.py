@@ -362,10 +362,19 @@ def test_the_caps_in_flight_never_add_up_to_more_than_the_budget(world, monkeypa
         launched.append(proc)
         return proc
 
-    def one_pass(_seconds):
-        raise _OnePass()
+    class one_pass_clock:
+        """`time` as the orchestrator module sees it, whose `sleep` ends the
+        pass. NOT `time.sleep` itself: that is the one function every module
+        shares, and `subprocess` calls it inside `wait(timeout=)` whenever a
+        child (the `ps` that `_started_at` runs per launch) has closed its
+        pipes but is not yet reaped -- which, on a loaded machine, ended the
+        pass after the FIRST launch and failed this test with one cap."""
+        sleep = staticmethod(lambda _seconds: (_ for _ in ()).throw(_OnePass()))
+
+        def __getattr__(self, name):
+            return getattr(time, name)
     monkeypatch.setattr(orchestrator.subprocess, "Popen", held)
-    monkeypatch.setattr(orchestrator.time, "sleep", one_pass)
+    monkeypatch.setattr(orchestrator, "time", one_pass_clock())
     orch = _orchestrator(world, budget=budget, parallel=parallel)
     monkeypatch.setattr(orch, "_gate", lambda: "", raising=False)
     with pytest.raises(_OnePass):

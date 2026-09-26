@@ -878,7 +878,11 @@
     if (d) {
       const n = (v) => Number(v || 0).toLocaleString("en-US");
       const emptyNote = d.files_empty ? " (" + n(d.files_empty) + " empty)" : "";
-      host.appendChild(secEl("div", "secpipe-deep", "Deep scope read in full: " + n(d.files_read) + " of " + n(d.files) + " files with content" + emptyNote + ", " + n(d.lines_read) + " of " + n(d.lines) + " lines."));
+      let deepText = "Deep scope read in full: " + n(d.files_read) + " of " + n(d.files) + " files with content" + emptyNote + ", " + n(d.lines_read) + " of " + n(d.lines) + " lines in scope after the exclusion rules.";
+      if (a.lines_of_code) {
+        deepText += " The tree has " + n(a.lines_of_code) + " text lines.";
+      }
+      host.appendChild(secEl("div", "secpipe-deep", deepText));
     }
     host.appendChild(secEl("div", "secpipe-spend", "Spent by the units: " + money(summary.spend_usd || 0)));
     if (a.state === "running" || a.state === "interrupted") {
@@ -4128,6 +4132,21 @@
       " project. A quick summary of the latest analysis and key metrics."
     ));
   }
+  function secLinesOfCodeTitle(h) {
+    if (!h.lines_of_code) {
+      return "Not counted \u2014 this analysis predates the line count, or nothing has been analysed yet. It is not a claim that the repository is empty.";
+    }
+    const sources = h.lines_of_code_sources || [];
+    if (!sources.length) {
+      return "Counts every text line of the tree, at the commit of the analysis it was read from.";
+    }
+    const name = (s) => "#" + s.analysis_id + " at " + String(s.commit_sha || "").slice(0, 12) + (s.running ? " (running)" : "");
+    if (sources.length === 1) {
+      const s = sources[0];
+      return "Counts every text line of the tree at the commit of analysis " + name(s) + (s.running ? " -- the analysis currently running, read fresh at its own commit." : ".");
+    }
+    return "Counts every text line of the tree, across " + sources.length + " repositories, each at its own latest reading: " + sources.map(name).join(", ") + ".";
+  }
   function secRenderProjectHeader(payload) {
     const host = $("sec-pj-head");
     if (!host) return;
@@ -4160,7 +4179,7 @@
       "code",
       "Lines of code",
       h.lines_of_code ? h.lines_of_code.toLocaleString() : "\u2014",
-      h.lines_of_code ? "" : "Not counted \u2014 this analysis predates the line count, or nothing has been analysed yet. It is not a claim that the repository is empty."
+      secLinesOfCodeTitle(h)
     ));
     meta.appendChild(secHeaderBit(
       "clock",
@@ -5544,5 +5563,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: e0e1ddbea38d8a1d88a06af644d23a1df3554a18e95a7c676b41fb4c6169dc1f */
-/* ui-sources: 76d38eae516b9a65d296e3e4a0b470860b13f724013d06ebf4c13e5050b287a6 */
+/* ui-bundle: cd66d63bc5fa3735cff69a4ebc0e20d8b60549d7c396b2adeef353ff2c0a4c4c */
+/* ui-sources: d5c393951ee7a88cd89e096ff73a1628dd91d4547a0c24203cbc12ca7cf6a929 */

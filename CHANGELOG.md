@@ -20,6 +20,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The run index keeps transcripts for 30 days, and every run's summary
+  forever.** A finished run's stream, result, precheck output and stderr
+  used to stay in `index.db` for as long as the index existed — 751 MB on
+  the operator's own install, unbounded on every install. Past a
+  configurable window (Settings › Data, `index_retention_days`, default 30
+  days, 0 keeps everything) the index clears an already-pruned run's large
+  text columns and marks the row trimmed; the row itself — job, start,
+  status, cost, duration, session, model, note, cause and the rest — is
+  never touched, and no row is ever deleted. The trim runs inside the
+  existing index pass, under the same write lock, at most once a day and in
+  bounded batches, and hands the freed space back with `VACUUM` the same way
+  a run delete already does. A trimmed run's Terminal and Timeline say the
+  transcript was removed after N days instead of rendering as if it never
+  had one.
 - **End-to-end scenarios for the pipeline.** A deep analysis of the sandbox
   runs every unit and closes `done` with every line read; a read unit that
   leaves a range unread is continued and the analysis still closes `done`;
@@ -364,6 +378,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **CI answers in about five minutes instead of fifteen to twenty-two, with
+  every test still run exactly once.** The three jobs took 16, 14 and 22
+  minutes on GitHub's three-core macOS runner. Now: the pytest suites run one
+  worker per core (`pytest-xdist`, pinned); the end-to-end suite runs as two
+  jobs of its own (`E2E_LISTS="1 2"` / `"3 4"`) while the selftest job skips
+  it (`AGENTLOOP_SELFTEST_E2E=separate`, honoured on GitHub Actions only —
+  anywhere else it fails the selftest, so it cannot become a local opt-out);
+  and the e2e's four worker lists are rebalanced — "new scenarios go into the
+  last list" had made list 4 take 297 s against 109 / 85 / 70 s, so four
+  workers waited on it; they are 109 / 155 / 145 / 152 s now, and the whole
+  e2e went from ~300 s to ~160 s locally. Measured locally (10 cores, idle):
+  security engines-off 518 s → 50 s, engines-on 782 s → 90 s (178 s at three
+  workers, a runner's count), server suite 35 s → 10 s. `prepare` stopped
+  paying for what it does not use: it probed the version of all four engines
+  on every run, switched off or not — semgrep's `--version` alone is a python
+  start-up — and now probes only the engines `engine_path` reaches, and not
+  semgrep under `--offline`, which skips the SAST pre-pass anyway (an
+  engines-off `prepare` 0.8 s → 0.09 s, engines-on 1.7 s → 0.8 s). Two
+  tests reported their dozens of setup findings in-process instead of one
+  python start-up each (26 s → 1 s apiece). Two tests that failed under load
+  were fixed: the phases-at-once timing had counted those four probes, and
+  the budget-caps test patched `time.sleep` for every module, so a
+  `subprocess` wait on a loaded machine ended its pass after one launch. Two
+  assertions left stale by the empty-files count (`files_empty`) were
+  updated; they had kept the security suite red on `main`.
 - **The security-analysis skill is written for a unit, not for a whole
   analysis.** It opens with the rules every unit follows — what qualifies
   as a finding, the reporting door, the closed rule vocabulary, never a
@@ -561,6 +600,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   holding it, and a close whose checkout is no longer on disk proves no
   file absent — either used to settle a claimed-gone finding on nothing.
   Ordinary jobs keep their retention unchanged.
+
+- **The Security project page's two "lines" numbers now say what each one
+  counts, and where it comes from.** The header's "Lines of code"
+  (`cmd_project_data`, `bin/security/cli.py`) counts every text line of the
+  tree — prose and generated files included — as a by-product of the
+  secret sweep at `prepare` (`ledger.set_lines_of_code`), and read off the
+  latest COMPLETED analysis; the Pipeline block's "Deep scope" numbers come
+  from the RUNNING analysis's own inventory (`bin/security/inventory.py`)
+  at its own commit, after the exclusion rules drop generated/prose files.
+  The two disagreed in public with nothing on screen saying why — one real
+  project showed header 318,477 against deep scope 260,999 (1,421
+  generated and 48 prose files excluded) for the exact same run. The header
+  now names the analysis (`#N`) and short commit its own count came from in
+  its tooltip (`lines_of_code_sources`, `queries.py`), and prefers a
+  RUNNING analysis of the header's branch over a stale finished one the
+  moment that running analysis has recorded its own count. The Pipeline
+  block's own sentence now says its "lines" total is in scope AFTER the
+  exclusion rules, and adds the running analysis's own tree total beside
+  it when one has been recorded, so the two sentences can be read
+  together instead of as a silent contradiction.
+
+- **A triage unit is now told how its "gone" reading is proven, per
+  platform.** Its report-gone rule said to read the file first but never
+  said what counts as reading it; a session reported a
+  carried `sast` finding gone after reading it with `sed -n` in a shell
+  call, and the judge (`_unread_files`/`_judge_triage`,
+  `bin/security/units.py`) refused the claim three times in a row because
+  only the Read tool's own result or `agentloop security read` proves a
+  read there — a `cat`/`sed`/`grep` never does, on any platform. The
+  triage prompt (`_triage`, `bin/security/prompts.py`) now names the same
+  rule the read unit's prompt already states, reusing its wording, and
+  `skills/security-analysis/SKILL.md`'s "Unit: triage" section says the
+  same.
+
 - **The Pipeline block no longer claims files were read before any read unit
   ran.** `units.summary`'s `deep.files_read` counted a file as read once
   nothing was left owed on it (`owed`, `bin/security/units.py`) — but an

@@ -758,7 +758,18 @@ E2E_WORKERS=1 bash test/e2e.test.sh    # the file order, in one sandbox: bisect 
 The four worker lists are contiguous ranges of the file order (a few
 scenarios resume an earlier one's run, and a range keeps that), balanced on
 measured durations. A new scenario goes at the end of the file and into the
-last list; the script refuses to start if a scenario is in no list.
+last list; the script refuses to start if a scenario is in no list — and when
+the last list grows heavy, re-measure and move the boundaries, or four workers
+wait on that one list. `E2E_LISTS="1 2"` runs a subset of the lists (CI runs
+the suite as two jobs, `1 2` and `3 4`).
+
+With `pytest-xdist` installed, both pytest suites run one worker per core —
+every test works in its own `tmp_path`, so nothing needs to be serialised:
+
+```bash
+python3 -m pytest tests/ --ignore=tests/security -n auto
+python3 -m pytest tests/security/ -n auto
+```
 
 `selftest` exercises the logic that can end a run early, lose money or corrupt
 state: integer parsing from command output, the assertion that decides an
@@ -821,7 +832,10 @@ Run both after touching either side.
 **On a pull request this no longer depends on who is typing.**
 `.github/workflows/ci.yml` installs `gitleaks`, `trivy`, `syft` and `semgrep` at
 pinned versions and runs `tests/security/` as two named jobs, one per
-configuration — plus `agentloop selftest` and the server suite. It **refuses
+configuration — plus `agentloop selftest` with the server suite, and the
+end-to-end suite as two jobs of its own (the selftest skips it there, on
+GitHub Actions only, with `AGENTLOOP_SELFTEST_E2E=separate`; anywhere else
+that variable fails the selftest). The pytest suites run with `-n auto`. It **refuses
 to be green over a skip**: every engine-gated test skips rather than fails when
 its binary is absent (measured: 45 skips in `test_adapters.py` alone, and the
 run still reports "passed"), so the workflow checks each engine's reported

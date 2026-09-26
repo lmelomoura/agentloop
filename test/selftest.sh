@@ -7279,7 +7279,21 @@ PY
   # It stays offline and free: test/fake-claude stands in for the CLI, and the
   # run redirects CONFIG and DATA into its own sandbox, so an operator's jobs and
   # run history are neither read nor written.
-  if [ -x "$BASE_DIR/test/e2e.test.sh" ]; then
+  #
+  # ON GITHUB ACTIONS ONLY, the workflow may run it as jobs of its own
+  # (AGENTLOOP_SELFTEST_E2E=separate, with E2E_LISTS "1 2" and "3 4"): there it
+  # was two thirds of this job's fifteen minutes on a three-core runner.
+  # Anywhere else the variable FAILS the selftest rather than skipping --
+  # an opt-out exported once into a shell profile would silently drop the e2e
+  # from every local gate after it, which is the switch this project refuses
+  # to have (see test_both_configurations.py).
+  if [ -n "${AGENTLOOP_SELFTEST_E2E:-}" ]; then
+    if [ "$AGENTLOOP_SELFTEST_E2E" = separate ] && [ "${GITHUB_ACTIONS:-}" = true ]; then
+      ok "end-to-end suite runs as its own CI jobs (AGENTLOOP_SELFTEST_E2E=separate)"
+    else
+      bad "AGENTLOOP_SELFTEST_E2E='$AGENTLOOP_SELFTEST_E2E' is honoured only as 'separate' on GitHub Actions -- unset it; the end-to-end suite did not run"
+    fi
+  elif [ -x "$BASE_DIR/test/e2e.test.sh" ]; then
     local e2eout
     if e2eout="$("$BASE_DIR/test/e2e.test.sh" 2>&1)"; then
       ok "end-to-end suite ($(printf '%s' "$e2eout" | grep -c '  ok ') checks)"

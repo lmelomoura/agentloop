@@ -68,7 +68,10 @@ def repo(tmp_path):
     return {"path": r, "c1": c1, "c2": c2, "dev": dev}
 
 
-def _analysis(db, tmp_path, branch, commit, fps, project="web", repo="web"):
+def _analysis(db, tmp_path, branch, commit, fps, project="web", repo="web", run=None):
+    """`run` is the CLI door: the subprocess by default, or conftest's
+    `cli_inproc` where a test needs dozens of findings as scaffolding."""
+    _run = run or globals()["_run"]
     aid = json.loads(_run(db, "open-analysis", "--project", project, "--repo", repo,
                           "--branch", branch, "--commit", commit, "--profile", "quick",
                           "--run-id", f"r-{branch}-{commit[:6]}"))["analysis_id"]
@@ -174,7 +177,7 @@ def test_a_finding_nobody_fixed_anywhere_carries_no_annotation(tmp_path, repo):
     assert "fixed_elsewhere" not in r
 
 
-def test_git_is_asked_per_branch_pair_not_per_finding(tmp_path, repo, monkeypatch):
+def test_git_is_asked_per_branch_pair_not_per_finding(tmp_path, repo, monkeypatch, cli_inproc):
     # 40 findings open on develop, all fixed on main: one head_of, one
     # contains. A version that asked per finding would be 40x that and
     # nobody would notice on a small project.
@@ -185,9 +188,12 @@ def test_git_is_asked_per_branch_pair_not_per_finding(tmp_path, repo, monkeypatc
     monkeypatch.setattr(branchgit, "contains", lambda *a, **k: (calls.__setitem__("contains", calls["contains"] + 1), real_contains(*a, **k))[1])
     fps = [f"{i:064x}" for i in range(40)]
     db = tmp_path / "l.db"
-    _analysis(db, tmp_path, "develop", repo["dev"], fps)
-    _analysis(db, tmp_path, "main", repo["c1"], fps)
-    _analysis(db, tmp_path, "main", repo["c2"], [])
+    # 80 findings and verdicts of scaffolding, reported in-process: a python
+    # start-up each was nearly all of this test's time, and the question it
+    # asks (how often git is asked) is answered by `_rows`, in-process anyway.
+    _analysis(db, tmp_path, "develop", repo["dev"], fps, run=cli_inproc)
+    _analysis(db, tmp_path, "main", repo["c1"], fps, run=cli_inproc)
+    _analysis(db, tmp_path, "main", repo["c2"], [], run=cli_inproc)
     rows = _rows(db, {"web": str(repo["path"])}, branch=["develop"])
     assert len(rows) == 40 and all("fixed_elsewhere" in r for r in rows)
     assert calls == {"head_of": 1, "contains": 1}, calls

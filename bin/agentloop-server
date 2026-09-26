@@ -435,6 +435,62 @@ def set_pref(key, value):
     return 200, {"ok": True, "prefs": load_prefs()}
 
 
+# Admin settings -- same table and shape as the prefs above (a small
+# key/value store in app.db, not in index.db: the module docstring promises
+# index.db is derived and safe to delete, and a setting a `rm index.db`
+# silently reset would be a trap same as the operator profile would be).
+# The difference from PREF_KEYS is who reads them: a pref is only ever
+# painted back onto the page; a setting is also read by the engine itself
+# (ingest()'s retention trim reads index_retention_days on every pass).
+SETTING_KEYS = {"index_retention_days"}
+SETTING_DEFAULTS = {"index_retention_days": 30}
+# 0 keeps every transcript forever; the upper bound is just generous enough
+# to catch a fat-fingered value (days, not years).
+SETTING_BOUNDS = {"index_retention_days": (0, 3650)}
+
+
+def load_settings():
+    """Admin-facing server settings, defaulted so a caller never tests for
+    absence -- same convention as load_prefs()."""
+    out = dict(SETTING_DEFAULTS)
+    try:
+        conn = app_conn()
+    except sqlite3.Error:
+        return out
+    try:
+        for row in conn.execute("SELECT key, value FROM prefs"):
+            if row["key"] not in SETTING_KEYS:
+                continue
+            try:
+                val = json.loads(row["value"])
+            except ValueError:
+                continue
+            if isinstance(val, int) and not isinstance(val, bool):
+                out[row["key"]] = val
+    finally:
+        conn.close()
+    return out
+
+
+def set_setting(key, value):
+    """Write one admin setting. Returns (http_status, payload)."""
+    if key not in SETTING_KEYS:
+        return 400, {"error": "unknown setting"}
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 400, {"error": "that setting is a whole number"}
+    lo, hi = SETTING_BOUNDS[key]
+    if not (lo <= value <= hi):
+        return 400, {"error": f"that setting must be between {lo} and {hi}"}
+    conn = app_conn()
+    try:
+        conn.execute("INSERT OR REPLACE INTO prefs (key, value, updated) VALUES (?,?,?)",
+                     (key, json.dumps(value), int(time.time())))
+        conn.commit()
+    finally:
+        conn.close()
+    return 200, {"ok": True, "settings": load_settings()}
+
+
 def load_user():
     """The operator profile as the page is allowed to see it.
 
@@ -667,6 +723,87 @@ STREAM_CAP = 2_000_000
 STREAM_GAP_SUBTYPE = "stream_truncated"
 STREAM_GAP_ROOM = 128
 
+# The large text columns the retention trim clears once a run is old enough
+# -- everything _read_artifacts stores off the run's files, the same set
+# _finish_prune measures to decide a row is worth keeping files for. `doc`
+# is not in this list: it is rebuilt (not just cleared) by _trim_old_runs so
+# search stops surfacing a transcript that is no longer there to open.
+TRIM_LARGE_COLUMNS = ("result_json", "stream", "precheck_txt", "stderr")
+# The trim runs at most once a day (the last run is remembered as meta
+# "trim_at") -- it is a maintenance pass, not something that needs to react
+# within minutes of a run crossing the retention window.
+TRIM_INTERVAL_SECONDS = 86_400
+# Rows trimmed per UPDATE, and UPDATEs per ingest() pass -- bounds how long
+# one pass can spend trimming, the same concern COMPACT_MIN_FREE_BYTES
+# addresses for VACUUM below: this runs under ingest()'s own write lock
+# (BEGIN IMMEDIATE), so an unbounded trim would stall every poll of the
+# dashboard behind a single huge backlog. At 500 rows a batch, 40 batches is
+# 20,000 rows a day -- far more than one install produces between polls; any
+# backlog past that is simply finished on the next day's pass, since a
+# trimmed row is marked and never revisited.
+TRIM_BATCH_ROWS = 500
+TRIM_MAX_BATCHES = 40
+
+
+def _trim_old_runs(conn, fts, now=None):
+    """Clear the large text columns of runs older than the retention window,
+    keeping the row and every summary field (job, start, status, cost,
+    duration, session, model, note, cause, ...). Returns the number of rows
+    trimmed.
+
+    Only ever touches rows already `pruned`: their source files are already
+    gone, so the DB row is the only copy of anything -- the retention window
+    is this function's own decision about how long THAT copy is kept, not
+    about whether one exists. A row is marked `trimmed=1` once cleared, so
+    a later pass never re-examines it and the dashboard can say the
+    transcript was removed instead of rendering an empty one.
+
+    Runs at most once a day (see TRIM_INTERVAL_SECONDS) and in bounded
+    batches (TRIM_BATCH_ROWS, TRIM_MAX_BATCHES) inside ingest()'s own write
+    lock, so a large backlog spreads across days rather than stalling one
+    pass. A retention of 0 means keep forever -- the whole pass is skipped,
+    after still recording that "today" was checked, so flipping the setting
+    back on later does not immediately try to trim years of backlog in one
+    pass either.
+    """
+    now = now if now is not None else time.time()
+    last = float(_meta_get(conn, "trim_at", "0") or 0)
+    if now - last < TRIM_INTERVAL_SECONDS:
+        return 0
+    days = load_settings().get("index_retention_days", SETTING_DEFAULTS["index_retention_days"])
+    _meta_set(conn, "trim_at", str(int(now)))
+    if not days:
+        return 0
+    cutoff = int(now - days * 86_400)
+    set_clause = ", ".join(f"{c}=''" for c in TRIM_LARGE_COLUMNS)
+    trimmed_total = 0
+    for _ in range(TRIM_MAX_BATCHES):
+        rows = conn.execute(
+            "SELECT key, job, status, session FROM runs"
+            " WHERE pruned=1 AND trimmed=0 AND start<? LIMIT ?",
+            (cutoff, TRIM_BATCH_ROWS)).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            key = row["key"]
+            # The minimal doc a trimmed run still deserves in search: its
+            # job, status and session survive, its transcript does not --
+            # leaving the old doc in place would keep the removed text
+            # findable by search after the run it came from can no longer
+            # show it.
+            doc = "\n".join(p for p in (row["job"], row["status"], row["session"]) if p)
+            conn.execute(f"UPDATE runs SET {set_clause}, trimmed=1, doc=? WHERE key=?",
+                        (doc, key))
+            if fts:
+                conn.execute("DELETE FROM runs_fts WHERE key=?", (key,))
+                conn.execute("INSERT INTO runs_fts (key, content) VALUES (?,?)", (key, doc))
+        trimmed_total += len(rows)
+        if len(rows) < TRIM_BATCH_ROWS:
+            break
+    if trimmed_total:
+        _log(f"ingest: trimmed {trimmed_total} run(s) past the {days}-day retention window")
+    return trimmed_total
+
 
 def _log(msg):
     """One line to stderr — launchd captures it. Used where staying silent would
@@ -683,7 +820,8 @@ def db_init(conn):
         precheck_note TEXT, result_json TEXT, stream TEXT, precheck_txt TEXT,
         stderr TEXT, doc TEXT, project TEXT, model TEXT, model_id TEXT,
         note TEXT, resumed_from TEXT, cause TEXT, platform TEXT, cost_basis TEXT,
-        tokens TEXT, account TEXT, account_dir TEXT, pruned INTEGER DEFAULT 0)""")
+        tokens TEXT, account TEXT, account_dir TEXT, pruned INTEGER DEFAULT 0,
+        trimmed INTEGER DEFAULT 0)""")
     # Runs whose files could not all be read into their row, with the journal
     # record each is read again from: their files are kept until a pass reads
     # them in full (_finish_prune, _reread_unread). A table of its own rather
@@ -1012,21 +1150,26 @@ def _upsert(conn, fts, rec, preserve=None, art=None, quiet=False):
         art = {"result_json": preserve["result_json"], "stream": preserve["stream"],
                "precheck_txt": preserve["precheck_txt"], "stderr": preserve["stderr"]}
         doc, pruned = preserve["doc"], 1
+        # A row the retention trim already cleared stays cleared across a
+        # resync -- its preserved `art` above is already empty, this just
+        # carries the flag along so the dashboard keeps saying so.
+        trimmed = 1 if preserve["trimmed"] else 0
     else:
         art = art if art is not None else _read_artifacts(rec, quiet=quiet)
         doc = _build_doc(rec, art)
         pruned = 0
+        trimmed = 0
     conn.execute(
         "INSERT OR REPLACE INTO runs (key, job, start, status, duration, cost, session,"
         " log, forced, precheck_note, result_json, stream, precheck_txt, stderr, doc, project,"
         " model, model_id, note, resumed_from, cause, platform, cost_basis, tokens, account,"
-        " account_dir, pruned)"
-        # 27 columns, 27 placeholders. This line shipped with 21 once (the
+        " account_dir, pruned, trimmed)"
+        # 28 columns, 28 placeholders. This line shipped with 21 once (the
         # `cause` column arrived without its `?`), and the failure mode was
         # vicious: nothing broke until the FIRST new journal line reached this
         # code, then every ingest raised, load_data's except swallowed it, and
         # the dashboard said "No runs recorded yet" over an intact journal.
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (key, rec.get("id", ""), rec.get("start", 0), rec.get("status", ""),
          rec.get("duration", 0), rec.get("cost", 0), rec.get("session", ""),
          rec.get("log", ""), 1 if rec.get("forced") else 0,
@@ -1043,7 +1186,7 @@ def _upsert(conn, fts, rec, preserve=None, art=None, quiet=False):
          _tokens_json(rec, art),
          rec.get("account") or "",
          rec.get("account_dir") or "",
-         pruned))
+         pruned, trimmed))
     if fts:
         conn.execute("DELETE FROM runs_fts WHERE key=?", (key,))
         conn.execute("INSERT INTO runs_fts (key, content) VALUES (?,?)", (key, doc))
@@ -1187,6 +1330,15 @@ def ingest():
                 # The account a run signed in as, and the directory its variable carried.
                 ("account", "TEXT"), ("account_dir", "TEXT"),
                 ("pruned", "INTEGER DEFAULT 0"),
+                # Set by the retention trim (_trim_old_runs) once a pruned
+                # run's large text columns have been cleared for age. Added
+                # here rather than through LIGHT_SCHEMA_BUMPS: its value
+                # comes from the trim's own decision, not straight off a
+                # journal record, so it does not qualify for that path (see
+                # LIGHT_SCHEMA_BUMPS's own comment) -- but this loop runs on
+                # every ingest() regardless of schema_changed, so the column
+                # still needs no resync of its own to appear.
+                ("trimmed", "INTEGER DEFAULT 0"),
             ]
             for name, decl in canon:
                 if name not in cols:
@@ -1283,14 +1435,26 @@ def ingest():
                         pending.append((k, rec, failed))
                 offset += consumed
             _finish_prune(conn, pending)
+        # The retention trim, same write lock, same pass: it only ever
+        # touches rows this pass (or an earlier one) already pruned, so it
+        # cannot race the ingest work above it -- everything it might clear
+        # was already settled by the time it runs.
+        trimmed = _trim_old_runs(conn, fts)
         _meta_set(conn, "offset", offset)
         _meta_set(conn, "sig", sig)
         _meta_set(conn, "schema", SCHEMA_VERSION)
         _meta_set(conn, "fts", "1" if fts else "0")
         conn.commit()
-        return fts
+        fts_result = fts
     finally:
         conn.close()
+    # A trim that cleared a real batch of rows can free real space; compact_db
+    # is a cheap no-op below its own threshold (COMPACT_MIN_FREE_BYTES) and
+    # never runs inside a transaction, so it is safe to call unconditionally
+    # here, after this pass's own transaction is committed and closed.
+    if trimmed:
+        compact_db()
+    return fts_result
 
 
 def search_runs(q):
@@ -2351,7 +2515,8 @@ def load_config():
             "jobs": read_json(JOBS_FILE, {}).get("jobs", []),
             "projects": read_json(PROJECTS_FILE, {}).get("projects", []),
             "user": load_user(),
-            "prefs": load_prefs()}
+            "prefs": load_prefs(),
+            "settings": load_settings()}
 
 
 # The last listing that actually came back. A read of the index can fail because
@@ -2614,7 +2779,13 @@ def load_run_detail(jid, start):
            "cost_basis": row["cost_basis"] or "reported",
            "account": row["account"] or "", "account_dir": row["account_dir"] or ""}
     detail = {"record": rec, "agent": {}, "precheck": row["precheck_txt"] or "",
-              "stderr": (row["stderr"] or "")[:8000], "turns": []}
+              "stderr": (row["stderr"] or "")[:8000], "turns": [],
+              # Whether the retention trim already cleared this row's large
+              # text columns, and the window it did it under -- the page
+              # reads these to say the transcript was removed rather than
+              # render an empty Terminal/Timeline as if there never was one.
+              "trimmed": bool(row["trimmed"]),
+              "retention_days": load_settings()["index_retention_days"]}
     try:
         data = json.loads(row["result_json"] or "{}")
         if isinstance(data, dict) and data:
@@ -4609,6 +4780,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if op == "prefs_set":
             code, payload = set_pref(str(body.get("key", "")), body.get("value"))
+            return self._send(code, payload)
+
+        if op == "setting_set":
+            code, payload = set_setting(str(body.get("key", "")), body.get("value"))
             return self._send(code, payload)
 
         if op in ("platform_check", "platform_enable", "platform_disable",
