@@ -1378,7 +1378,15 @@ cmd_security_retry() { # cmd_security_retry <project> <analysis-id>
     awk -v b="$budget" -v s="$spent" 'BEGIN { exit !(b - s < 0.5) }' \
       && die "analysis $aid has spent \$$spent of its \$$budget budget, too little is left for one unit: raise the project's security budget before retrying"
   fi
-  out="$(security_engine_py reopen --analysis "$aid" 2>&1)" || die "$out"
+  # stdout is the JSON, stderr is the refusal: never read one as the other
+  # -- a warning on stderr made the count unparseable and read as 0.
+  local errf
+  errf="$(mktemp "${TMPDIR:-/tmp}/al-reopen.XXXXXX")"
+  if ! out="$(security_engine_py reopen --analysis "$aid" 2>"$errf")"; then
+    out="$(cat "$errf" 2>/dev/null)"; rm -f "$errf"
+    die "${out:-analysis $aid could not be reopened}"
+  fi
+  rm -f "$errf"
   n="$(num "$(printf '%s' "$out" | "$JQ" -r '.units // 0' 2>/dev/null)" 0)"
   security_engine_py resume --analysis "$aid" >/dev/null 2>&1 \
     || die "analysis $aid was reopened but could not be resumed: run agentloop security resume '$project' $aid"

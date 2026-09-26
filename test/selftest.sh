@@ -8935,6 +8935,22 @@ FAKESELF
     && ! grep -q "reopen\|launch" "$sec/retry.calls" \
     && ok "a budget that cannot pay one more unit refuses the retry before anything is reopened" \
     || bad "budget retry (rc $rc): $(cat "$sec/retry.out"); calls: $(tr '\n' ' ' < "$sec/retry.calls")"
+  : > "$sec/retry.calls"
+  ( sec_env
+    security_engine_py() {
+      case "$1" in
+        analysis) printf '{"project":"Sec App","branch":"main","repo":"Sec App"}' ;;
+        reopen)   echo "DeprecationWarning: something" >&2; printf '{"state":"interrupted","units":2}' ;;
+        resume)   printf '{"state":"running"}' ;;
+      esac
+    }
+    security_analysis_live() { return 1; }
+    slots_active() { echo 0; }
+    security_launch_detached() { :; }
+    cmd_security_retry "Sec App" 41 ) > "$sec/retry.out" 2>&1
+  grep -q '{"analysis_id":41,"retried":2}' "$sec/retry.out" \
+    && ok "a warning on the reopen's stderr does not zero the count" \
+    || bad "retry with a stderr warning printed: $(cat "$sec/retry.out")"
 
   echo "cmd_security_branches() — local and origin branches, HEAD excluded, deduped"
   # A real checkout with an origin, not faked refs: local-only never leaves the
