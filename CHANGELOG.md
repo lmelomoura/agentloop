@@ -30,6 +30,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stderr. `test/fake-opencode` plays it with `FAKE_OPENCODE_START_FAIL`.
   The run's note and its tick.log line read `START FAILED: <the line>`.
 
+- **An agent that cannot start no longer spends its unit's attempts.** A unit
+  whose run ended `start_failed` keeps its attempt, as one cut short by a
+  provider outage already does, and its note reads "The agent could not start
+  (<the agent's words>)". Before, every such run was one of the unit's three
+  attempts, and an environment problem that hit every unit alike gave each of
+  them up in turn.
+
 - **The run index keeps transcripts for 30 days, and every run's summary
   forever.** A finished run's stream, result, precheck output and stderr
   used to stay in `index.db` for as long as the index existed — 751 MB on

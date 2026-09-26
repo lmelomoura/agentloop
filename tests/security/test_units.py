@@ -1131,3 +1131,39 @@ def test_without_lines_cuts_named_lines_out_of_every_span():
     out = evidence.without_lines(session, {"a.py": [1, 5, 10, 99]})
     assert out.reads == {"a.py": [(2, 4), (6, 9)], "b.py": [(1, 2)]}
     assert evidence.without_lines(session, {}) is session
+
+
+def test_a_run_whose_agent_never_started_keeps_its_attempt_and_names_the_error(conn):
+    """Analysis 12 (2026-09-26): OpenCode failed every boot of the project,
+    and each run spent one of its unit's three attempts. Nothing ran, so
+    nothing is the unit's fault: the close keeps the attempt, as it does for
+    a provider outage, and the unit's note carries the agent's own words."""
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    ledger.start_unit(conn, uid)
+    out = units.close(conn, ledger.get_unit(conn, uid), status="error", cause=units.START_FAILED,
+                      reason="START FAILED: BadResource: FileSystem.access (/gone/repo)")
+    assert out["state"] == "incomplete"
+    unit = ledger.get_unit(conn, uid)
+    assert unit["evidence"]["cause"] == "start_failed"
+    assert unit["evidence"]["error"] == "BadResource: FileSystem.access (/gone/repo)"
+    assert unit["note"] == ("The agent could not start (BadResource: FileSystem.access (/gone/repo)); "
+                            "nothing ran, so the attempt is kept.")
+    assert ledger.get_unit(conn, out["continuation"])["attempt"] == 1
+
+
+def test_a_run_killed_with_no_stream_still_spends_its_attempt(conn):
+    """The control: only the causes that are nobody's fault keep it."""
+    aid = _analysis(conn)
+    uid = ledger.add_unit(conn, aid, "hunt", {"profile": "deep"})
+    ledger.start_unit(conn, uid)
+    out = units.close(conn, ledger.get_unit(conn, uid), status="error", cause="killed")
+    assert ledger.get_unit(conn, out["continuation"])["attempt"] == 2
+    assert "cause" not in ledger.get_unit(conn, uid)["evidence"]
+
+
+def test_the_start_error_is_the_agents_words_without_the_engines_prefix():
+    assert units.start_error("START FAILED: BadResource: x") == "BadResource: x"
+    assert units.start_error("BadResource: x") == "BadResource: x"
+    assert units.start_error("") == "no reason given"
+    assert len(units.start_error("START FAILED: " + "y" * 900)) == 300

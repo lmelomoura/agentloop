@@ -54,8 +54,28 @@ _TRUNCATED = ("BUDGET LIMITED", "UNDECLARED ENDING", "UNDELIVERED")
 # The classifier's causes for a run the PROVIDER ended (run_classify in
 # bin/agentloop): not the unit's failure, so its close keeps the attempt.
 OUTAGE_CAUSES = ("rate_limited", "api_error")
+# The classifier's cause for a run whose agent never started (run_start_failed
+# in bin/agentloop): it exited on its own, non-zero, before a single event.
+# Nothing the unit could fix -- OpenCode failing every boot of a project on a
+# poisoned sandbox (measurement 39) -- so, like an outage, it keeps its
+# attempt, and the orchestrator counts it toward giving the lineage up and
+# toward pausing the whole analysis (security/orchestrator.py).
+START_FAILED = "start_failed"
+KEPT_ATTEMPT_CAUSES = OUTAGE_CAUSES + (START_FAILED,)
+START_FAILED_NOTE = "The agent could not start ({error}); nothing ran, so the attempt is kept."
+# The engine's note for such a run: `START FAILED: <the agent's last stderr line>`.
+_START_FAILED_PREFIX = "START FAILED: "
 NO_STREAM_NOTE = ("The run left no stream -- the only proof of what a session did, and of "
                   "whether it launched a subagent -- so nothing it did counts.")
+
+
+def start_error(reason) -> str:
+    """The agent's own words in a `start_failed` run's note -- the engine
+    writes `START FAILED: <its last stderr line>` -- at most 300 characters."""
+    text = (reason or "").strip()
+    if text.startswith(_START_FAILED_PREFIX):
+        text = text[len(_START_FAILED_PREFIX):].strip()
+    return text[:300] or "no reason given"
 
 
 def triage_items(conn, analysis_id) -> list:
@@ -771,6 +791,7 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
     if unit["state"] not in ("pending", "running"):
         return {"state": unit["state"], "continuation": None}
     outage = cause in OUTAGE_CAUSES
+    kept = cause in KEPT_ATTEMPT_CAUSES
     if not evidence.stream_proves(stream):
         # NO STREAM, NOTHING COUNTS -- whoever closes: the engine's
         # `unit-close` handed an empty or unreadable one, or the orchestrator
@@ -786,13 +807,17 @@ def close(conn, unit, *, stream="", root="", status="error", reason="", spend_us
         ev = {"stream": "none", "guides": []}
         if unit["kind"] == "read":
             ev.update({"ranges": len(unit["payload"].get("ranges") or []), "covered": {}})
-        if outage:
+        note = NO_STREAM_NOTE
+        if kept:
             ev["cause"] = cause
+        if cause == START_FAILED:
+            ev["error"] = start_error(reason)
+            note = START_FAILED_NOTE.format(error=ev["error"])
         clear = None
         if unit["kind"] == "verify":
             clear = (unit["analysis_id"], unit["payload"].get("fingerprint", ""), f"unit:{unit['id']}")
-        return conclude(conn, unit, done=False, evidence=ev, note=NO_STREAM_NOTE,
-                        spend_usd=spend_usd, stopped=status == "stopped" or outage,
+        return conclude(conn, unit, done=False, evidence=ev, note=note,
+                        spend_usd=spend_usd, stopped=status == "stopped" or kept,
                         clear_verdict=clear)
     session = evidence.read_session(stream or None, root or ".")
     # A LINE THE READ TOOL CUT IS NOT READ BY IT (I5). The inventory records,
