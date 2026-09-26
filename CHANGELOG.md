@@ -637,6 +637,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The orchestrator's own sweep (`__unit-sweep`, run as every analysis ends)
   asks the same way, removes the same stray file, and no longer reports as
   swept a tree a unit had already removed.
+  Every other refresh of a run dir's clock is `touch -c` too, and the
+  selftest refuses a `touch` that could create a run dir's path again.
 
 - **A stopped, killed, watchdog-timed-out or crashed run's cost is now
   estimated from its own stream instead of lost as $0.00.** A run never

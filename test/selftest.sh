@@ -4074,11 +4074,11 @@ EOF
   # later, alongside the classifier's OWN .ended write (10.4) -- a real,
   # separate touch this count must not trip on, so a bare whole-function grep
   # is no longer precise enough here.
-  got="$(printf '%s\n' "$body" | sed -n "1,${refuse_line:-0}p" | grep -c 'touch "\$run_dir" 2>/dev/null')"
+  got="$(printf '%s\n' "$body" | sed -n "1,${refuse_line:-0}p" | grep -c 'touch -c "\$run_dir" 2>/dev/null')"
   [ "${got:-0}" -eq 1 ] \
     && ok "the reattach branch touches its run dir exactly once ($got)" \
     || bad "run_job touches \$run_dir $got times in the reattach branch, expected 1"
-  touch_line="$(printf '%s\n' "$body" | sed -n "1,${refuse_line:-0}p" | grep -n 'touch "\$run_dir" 2>/dev/null' | head -1 | cut -d: -f1)"
+  touch_line="$(printf '%s\n' "$body" | sed -n "1,${refuse_line:-0}p" | grep -n 'touch -c "\$run_dir" 2>/dev/null' | head -1 | cut -d: -f1)"
   [ -n "${ld2_line:-}" ] && [ -n "${touch_line:-}" ] && [ "$touch_line" -gt "$ld2_line" ] \
     && ok "and it happens after the claim succeeds, at line $touch_line vs drop at $ld2_line" \
     || bad "touch (line ${touch_line:-?}) is not after the successful claim's lock_drop (line ${ld2_line:-?})"
@@ -4439,6 +4439,13 @@ EOF
     && bad "it logged the adoption of a directory that was gone: $(cat "$goneTick")" \
     || ok "and no adoption is logged for it"
   rm -rf "$tmp/wtgone" "$tmp/locks/jGone"
+
+  echo "no clock refresh on a run dir can create its path"
+  # The 0-byte file of analysis 12 was a `touch` on a run dir that was gone.
+  # Every refresh of a run dir's clock is `touch -c`, which never creates.
+  local bare
+  bare="$(grep -nE 'touch +"\$(d|run_dir|wt|rd)"' "$BIN_DIR/agentloop" "$BIN_DIR/worktree-lib.sh" | grep -v '^[^:]*:[0-9]*: *#' || true)"
+  [ -z "$bare" ] && ok "every touch of a run dir is touch -c" || bad "a touch that can create a run dir path: $bare"
 
   echo "wt_prune_orphans() — what a vanished run dir left behind is removed, and nothing else is"
   # The 0-byte file an older engine's adoption left (Task 1) is still there

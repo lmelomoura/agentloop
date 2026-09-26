@@ -6519,7 +6519,9 @@ run_classify() {
     # ttl on its own would then read as already-expired the instant it stops.
     # The first ending gets this for free; this is what makes every later one
     # measure the same event.
-    touch "$run_dir" 2>/dev/null || true
+    # -c: a clock refresh never creates the path (the 0-byte file of
+    # analysis 12 came from a `touch` that did).
+    touch -c "$run_dir" 2>/dev/null || true
   fi
   # What goes back to run_job, and nothing else does. (The selftest lifts the
   # block above by anchor, from `declared_ending=false` to this comment, and
@@ -6928,7 +6930,7 @@ ${prompt}"
       # resumed at hour 20 of a 24h ttl that then runs for 5h is already past
       # it the moment it stops, and the very next sweep deletes it while the
       # operator is reading a card that says "resume this run to finish it".
-      touch "$run_dir" 2>/dev/null || true
+      touch -c "$run_dir" 2>/dev/null || true   # -c: refresh, never create
       port_base="$("$JQ" -r '.port_base // ""' "$run_dir/.run.json" 2>/dev/null)"
       case "$port_base" in null) port_base="" ;; esac
       if [ -z "$port_base" ]; then
