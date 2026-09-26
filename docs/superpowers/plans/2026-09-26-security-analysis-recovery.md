@@ -2222,6 +2222,736 @@ code.** Nada de atribuição a agentes. O merge é do operador.
 
 ---
 
+## Correções do review (2026-09-26)
+
+O review da branch (`fix/security-analysis-recovery`, 16 commits) achou oito
+problemas. Dois deles foram confirmados com dados reais, numa **cópia** do
+`security.db` instalado:
+
+- o `close_part_start` não acha o fecho da análise 12 (a frase das unidades
+  mudou de redacção desde então);
+- durante um retry, `latest_analysis` devolve a análise anterior.
+
+As tarefas abaixo corrigem os oito. Seguem as mesmas regras das Tasks 1 a
+13: teste primeiro, só os ficheiros tocados, CHANGELOG no mesmo commit,
+inglês no código e sem atribuição. A `main` avançou (PR #92): a Task 20 junta
+a `main` antes da verificação final. O merge textual é limpo (`git
+merge-tree`).
+
+| achado | tarefa |
+|---|---|
+| `close_part_start` não reconhece um fecho de outra versão do engine (e o teste não o podia apanhar) | 14 |
+| a linha do stderr chega ao relatório sem passar pelo detector de credenciais | 15 |
+| uma falha de ambiente que chega como `api_error` (o token OAuth expirado de hoje) continua a queimar todas as linhagens | 16 |
+| o retry é oferecido quando o orçamento já não paga uma unidade, a confirmação promete menos do que o resume corre, e `failed_lineages` é calculado duas vezes por poll | 17 |
+| `cmd_security_retry` lê o stderr do `reopen` como JSON | 18 |
+| durante o retry, a postura e o baseline do ramo voltam à análise anterior | 19 |
+
+---
+
+### Task 14: O fecho anterior reconhece-se pelas palavras com que começa
+
+**Files:**
+- Modify: `bin/security/units.py` (`close_part_start`, e `import re`)
+- Modify: `bin/security/cli.py` (`cmd_reopen`)
+- Test: `tests/security/test_units.py`
+
+**Interfaces:**
+- Produces: `units.close_part_start(note) -> int`. A função deixa de
+  receber `conn` e `analysis_id`; o único chamador é o `cmd_reopen`.
+
+- [ ] **Step 1: Substituir o teste que não podia falhar**
+
+Em `tests/security/test_units.py`, substituir
+`test_the_close_part_starts_at_the_units_sentence` inteiro por:
+
+```python
+def test_the_close_part_is_found_by_its_first_words_even_when_its_numbers_changed():
+    """Analysis 12 was closed by an older engine: its "Deep read" says 6,670
+    files, where today's count of the same inventory says 6,656 (only files
+    with content count now). Rebuilding the sentence to look for it finds
+    nothing, and the old close survived a retry beside the new one. The
+    close's part is found by the words its sentences begin with -- never by
+    their numbers."""
+    head = ("Secrets were scanned. The deep scope is 6,670 files (1,241,385 lines), "
+            "each to be read in full.")
+    close = ("Reachability pass: 1 of 1 unit(s) done. Deep read: 277 read unit(s), 15 "
+             "continuation(s); read in full: 6,670 of 6,670 files, 1,241,385 of 1,241,385 "
+             "lines. Guides read: ATTACK-CLASSES. 231 units gave up after 3 runs (3 "
+             "attempts): verify 37/267 · attempt 3 (x).")
+    note = f"{head} {close}"
+    assert note[:units.close_part_start(note)].strip() == head
+    assert units.close_part_start(head) == len(head), "nothing of a close in it: all kept"
+    for gap in ("2 units never finished: hunt 1/1.",
+                "1 unit gave up after 1 run (1 attempt): hunt 1/1 (x).",
+                "12,000 of 90,000 lines in the deep scope (3 of 40 files) were never read in full.",
+                "The deep scope was never listed or cannot be read: no inventory is recorded."):
+        quick = f"Secrets were scanned. {gap}"
+        assert quick[:units.close_part_start(quick)].strip() == "Secrets were scanned.", gap
+```
+
+- [ ] **Step 2: Correr e confirmar que falha**
+
+```bash
+python3.13 -m pytest tests/security/test_units.py -k close_part -p no:cacheprovider -q
+```
+
+Esperado: FAIL com `TypeError` (a função ainda pede três argumentos).
+
+- [ ] **Step 3: A correcção**
+
+Em `bin/security/units.py`, acrescentar `import re` aos imports (a seguir a
+`import os`) e substituir `close_part_start` inteira por:
+
+```python
+# The sentences only `finish --from-units` writes, by the words each one
+# begins with: the units' coverage sentence (coverage_sentence) and the gaps
+# (gaps). NEVER by their numbers or their full wording -- a later engine
+# counts and phrases them differently (analysis 12's "Deep read" said 6,670
+# files where today's count of the same inventory says 6,656), and a close
+# looked for by rebuilding its sentence is a close that is not found.
+_CLOSE_PART = re.compile(
+    r"(?:^|(?<=\s))(?:Reachability pass: |Deep read: "
+    r"|[\d,]+ units? never finished: |[\d,]+ units? gave up after "
+    r"|[\d,]+ of [\d,]+ lines in the deep scope "
+    r"|The deep scope was never listed or cannot be read: )")
+
+
+def close_part_start(note) -> int:
+    """Where the last close from the units began in `note`: `finish
+    --from-units` appends the units' coverage sentence first, then the gaps,
+    after whatever `prepare` stored -- so the first of their opening words is
+    where the close begins. len(note) when none is in it."""
+    found = _CLOSE_PART.search(note or "")
+    return found.start() if found else len(note or "")
+```
+
+Em `bin/security/cli.py`, em `cmd_reopen`, trocar
+`units.close_part_start(conn, args.analysis, stored)` por
+`units.close_part_start(stored)`.
+
+- [ ] **Step 4: Correr e confirmar que passa**
+
+```bash
+python3.13 -m pytest tests/security/test_units.py tests/security/test_finish_units.py -p no:cacheprovider -q
+```
+
+Depois, a prova com os dados do incidente, sobre uma cópia (o ledger
+instalado nunca é aberto):
+
+```bash
+cp ~/projects/agentloop/data/security.db "$TMPDIR/sec-copy.db"
+python3.13 -c "
+import sys; sys.path.insert(0, 'bin')
+from security import ledger, units
+c = ledger.connect(sys.argv[1]); n = c.execute('SELECT coverage_note FROM analysis WHERE id=12').fetchone()[0]
+kept = n[:units.close_part_start(n)]
+print([m for m in ('Reachability pass', 'Deep read', 'Guides read', 'gave up after') if m in kept])
+" "$TMPDIR/sec-copy.db"
+rm -f "$TMPDIR/sec-copy.db"
+```
+
+Esperado: `[]`. Nada do fecho antigo sobrevive; a parte que o `prepare`
+escreveu fica.
+
+- [ ] **Step 5: Commit**
+
+Acrescentar à entrada do retry no CHANGELOG (a que começa por
+`**A capped or failed security analysis can be retried`):
+
+```markdown
+  The old close is found by the words its sentences begin with, never by
+  their numbers, so an analysis closed by an older engine (whose counts are
+  worded differently today) is cut cleanly too.
+```
+
+```bash
+git add bin/security/units.py bin/security/cli.py tests/security/test_units.py CHANGELOG.md
+git commit -m "fix(security): a retry finds the old close by its opening words, not its numbers"
+```
+
+---
+
+### Task 15: A linha do stderr não leva uma credencial para o relatório
+
+**Files:**
+- Modify: `bin/security/units.py` (`start_error`, import de `secrets`)
+- Test: `tests/security/test_units.py`
+
+**Interfaces:**
+- Produces: `units.start_error(reason)` passa a devolver
+  `the agent's error line was withheld: it looks like it carries a credential (<regra>); see tick.log`
+  quando `secrets.looks_like_a_secret` reconhece a linha.
+
+- [ ] **Step 1: Escrever o teste que falha**
+
+No fim de `tests/security/test_units.py`:
+
+```python
+AWS = "AKIA" + "IOSFODNN7EXAMPLE"
+
+
+def test_a_start_error_that_carries_a_credential_is_withheld():
+    """The agent's last stderr line reaches the unit's note, the gap sentences
+    and the gate sentence -- and through them the coverage note and every
+    report format, the path security/cli.py gates with looks_like_a_secret
+    for text anyone writes. A line that carries a credential is withheld; the
+    raw line stays in tick.log and the run's own record, on this machine."""
+    got = units.start_error(f"START FAILED: 401 Unauthorized for key {AWS}")
+    assert AWS not in got
+    assert got == ("the agent's error line was withheld: it looks like it carries a "
+                   "credential (aws_access_key); see tick.log")
+    assert units.start_error("START FAILED: BadResource: x") == "BadResource: x"
+```
+
+- [ ] **Step 2: Correr e confirmar que falha**
+
+```bash
+python3.13 -m pytest tests/security/test_units.py -k withheld -p no:cacheprovider -q
+```
+
+Esperado: FAIL (a linha volta inteira, com a chave).
+
+- [ ] **Step 3: A correcção**
+
+Em `bin/security/units.py`, trocar
+`from . import diff, evidence, ledger, queries, slices` por
+`from . import diff, evidence, ledger, queries, secrets, slices`. A seguir a
+`_START_FAILED_PREFIX`:
+
+```python
+START_ERROR_WITHHELD = ("the agent's error line was withheld: it looks like it carries a "
+                        "credential ({rule}); see tick.log")
+```
+
+e substituir `start_error` por:
+
+```python
+def start_error(reason) -> str:
+    """The agent's own words in a `start_failed` run's note -- the engine
+    writes `START FAILED: <its last stderr line>` -- at most 300 characters.
+
+    THIS TEXT LEAVES THE MACHINE. It becomes the unit's note, the gap
+    sentence that quotes it, and the gate sentence, and through them the
+    coverage note and every report format -- the path security/cli.py gates
+    with looks_like_a_secret for text anyone writes (`_refuse_if_secret`),
+    while the gaps are exempt only because they quote names our own scanners
+    mint. A stderr line is neither, so a line that looks like it carries a
+    credential is withheld here; the raw line stays in tick.log and the
+    run's own record, which never leave this machine."""
+    text = (reason or "").strip()
+    if text.startswith(_START_FAILED_PREFIX):
+        text = text[len(_START_FAILED_PREFIX):].strip()
+    text = text[:300] or "no reason given"
+    rule = secrets.looks_like_a_secret(text)
+    return START_ERROR_WITHHELD.format(rule=rule) if rule else text
+```
+
+- [ ] **Step 4: Correr e confirmar que passa**
+
+```bash
+python3.13 -m pytest tests/security/test_units.py tests/security/test_orchestrator.py -k "start or withheld or cannot_start or paused" -p no:cacheprovider -q
+```
+
+- [ ] **Step 5: Commit**
+
+Acrescentar à entrada `**An agent that cannot start no longer spends its unit's attempts.**`:
+
+```markdown
+  A stderr line that looks like it carries a credential is withheld from the
+  unit's note and from every report; the raw line stays in tick.log.
+```
+
+```bash
+git add bin/security/units.py tests/security/test_units.py CHANGELOG.md
+git commit -m "fix(security): a start error that carries a credential never reaches a report"
+```
+
+---
+
+### Task 16: O disjuntor conta também o provider que recusa todas as unidades
+
+**Decisão tomada no review** (o operador pode revertê-la): o disjuntor conta
+`start_failed` **e** `api_error`. O `rate_limited` (429) continua de fora:
+é transitório, e pausar a análise à primeira rajada obrigaria a um Resume
+manual a cada limite de taxa. O token OAuth expirado desta manhã (401) chega
+como `api_error`, e com esta tarefa pára a análise na primeira vaga em vez
+de dar como perdidas todas as linhagens.
+
+**Files:**
+- Modify: `bin/security/orchestrator.py` (`_count_start` passa a `_count_cannot_run`; `start_fails` passa a `cannot_run`; `PROVIDER_GATE` novo)
+- Modify: `tests/security/fixtures/fake-engine` (modo `always-api-error`)
+- Test: `tests/security/test_orchestrator.py`
+
+**Interfaces:**
+- Produces: `orchestrator.BREAKER_CAUSES = (units.START_FAILED, "api_error")`
+  e `orchestrator.PROVIDER_GATE`.
+
+- [ ] **Step 1: O modo novo e o teste que falha**
+
+Em `tests/security/fixtures/fake-engine`, na docstring, a seguir a
+`always-outage`:
+
+```
+      always-api-error    every run ends `error` / `api_error` (a stream, no
+                          work): the provider refusing every unit alike, as an
+                          expired OAuth token does
+```
+
+e em `run_unit`, antes do bloco `always-outage`:
+
+```python
+    if MODE == "always-api-error":
+        close(aid, uid, "error", write_stream(job, []), cause="api_error")
+        return
+```
+
+Em `tests/security/test_orchestrator.py`, a seguir a
+`test_a_paused_analysis_resumes_once_the_agent_can_start_and_closes_done`:
+
+```python
+def test_a_provider_that_refuses_every_unit_pauses_the_analysis_too(world, monkeypatch):
+    """The morning after analysis 12, the Anthropic token had expired: every
+    run answered 401, which the classifier files as `api_error`. That keeps
+    each unit's attempt, and three in a row gave each lineage up -- the same
+    burn as the start failures, by another cause. The breaker counts it."""
+    monkeypatch.setenv("FAKE_ENGINE_MODE", "always-api-error")
+    assert _orchestrator(world).run() == 0
+    row = _row(world)
+    assert row["state"] == "interrupted", row["coverage_note"]
+    assert "the provider refused 3 units in a row (api_error)" in row["coverage_note"]
+    assert not [u for u in _units(world) if u["state"] == "failed"]
+```
+
+```bash
+python3.13 -m pytest tests/security/test_orchestrator.py -k "refuses_every_unit" -p no:cacheprovider -q
+```
+
+Esperado: FAIL (fecha `capped`, com as linhagens `failed`).
+
+- [ ] **Step 2: A correcção**
+
+Em `bin/security/orchestrator.py`:
+
+1. A seguir a `START_FAIL_GATE`:
+
+```python
+PROVIDER_GATE = "the provider refused {n} units in a row ({cause})"
+# What the breaker counts: an agent that never started, and a provider that
+# answered with an error (an expired or revoked credential answers every
+# unit alike). NOT `rate_limited`: a 429 is transient and has its own pace,
+# and pausing the analysis on every burst would ask for a manual Resume each
+# time. Both still keep the unit's attempt (units.KEPT_ATTEMPT_CAUSES).
+BREAKER_CAUSES = (units.START_FAILED, "api_error")
+```
+
+e mudar o nome `START_FAIL_BREAKER` para `BREAKER_RUNS` (actualizar a
+referência no teste de `test_units_that_cannot_start_pause_the_analysis_after_one_wave`,
+que usa `orchestrator.START_FAIL_BREAKER`).
+
+2. Em `__init__`, trocar a linha do `self.start_fails` por:
+
+```python
+        self.cannot_run = []      # (lineage, cause, error) of the breaker's causes in a row
+```
+
+3. Substituir `_count_start` inteira por:
+
+```python
+    def _count_cannot_run(self, unit, lineage):
+        """The analysis-wide breaker. A unit closed on one of BREAKER_CAUSES
+        -- an agent that never started, a provider that answered with an
+        error -- adds to the run of them; any other close ends it. BREAKER_RUNS
+        in a row, over two lineages or more, is the environment failing every
+        unit alike (analysis 12 spent 693 runs and 42 minutes proving that one
+        lineage at a time): the gate closes with the last cause's words,
+        _loop stops launching and waits for what is in flight, and run()
+        leaves the analysis interrupted (GATE_NOTE), for a resume once the
+        cause is fixed. The tick never resumes it on its own: no orchestrator
+        died. One lineage alone is that unit's own trouble, given up by
+        _launch_pass."""
+        evidence = unit.get("evidence") or {}
+        cause = evidence.get("cause")
+        if cause not in BREAKER_CAUSES:
+            self.cannot_run = []
+            return
+        self.cannot_run.append((lineage, cause, evidence.get("error", "")))
+        if (not self.gate and len(self.cannot_run) >= BREAKER_RUNS
+                and len({lin for lin, _cause, _error in self.cannot_run}) >= 2):
+            _lin, cause, error = self.cannot_run[-1]
+            n = len(self.cannot_run)
+            self.gate = (START_FAIL_GATE.format(n=n, error=error) if cause == units.START_FAILED
+                         else PROVIDER_GATE.format(n=n, cause=cause))
+            self.log(f"stops launching: {self.gate}")
+```
+
+4. Em `_after`, trocar `self._count_start(unit, lineage)` por
+`self._count_cannot_run(unit, lineage)`.
+
+- [ ] **Step 3: Correr e confirmar que passa**
+
+```bash
+perl -e 'alarm 280; exec @ARGV' python3.13 -m pytest tests/security/test_orchestrator.py -p no:cacheprovider -q
+```
+
+Esperado: tudo verde. Os dois testes de outage que já existiam
+(`outage` e `always-outage`) usam `rate_limited` e não mudam.
+
+- [ ] **Step 4: Commit**
+
+Acrescentar à entrada `**A security analysis pauses when its units cannot start**`:
+
+```markdown
+  A provider that answers every unit with an error (`api_error`: an expired
+  or revoked credential answers them all alike) pauses it the same way; a
+  rate limit (429) does not, being transient.
+```
+
+```bash
+git add bin/security/orchestrator.py tests/security/fixtures/fake-engine tests/security/test_orchestrator.py CHANGELOG.md
+git commit -m "feat(security): the breaker also pauses an analysis the provider refuses unit by unit"
+```
+
+---
+
+### Task 17: O retry só é oferecido quando pode correr, e diz o que corre
+
+**Files:**
+- Modify: `bin/security/units.py` (`retry_state` novo; `retry_refusal` e `retryable` passam a lê-lo)
+- Modify: `bin/security/cli.py` (`cmd_reopen` usa `retry_state`)
+- Modify: `bin/agentloop` (`cmd_security_retry`: a recusa por orçamento)
+- Modify: `ui/security/analysis.js` (o texto da confirmação), `bin/static/security.js`
+- Test: `tests/security/test_units.py`, `test/selftest.sh`, `tests/test_page_contract.py`
+
+**Interfaces:**
+- Produces: `units.retry_state(conn, analysis_id) -> (refusal: str, leaves: list)`,
+  que lê as unidades **uma vez**; `retry_refusal` e `retryable` passam a
+  embrulhá-lo.
+
+- [ ] **Step 1: Os testes que falham**
+
+Em `tests/security/test_units.py`, no fim:
+
+```python
+def test_the_retry_state_reads_the_units_once(conn, monkeypatch):
+    """The page polls the checklist every four seconds, and `retryable` used
+    to walk every unit twice per poll (once in retry_refusal, once more for
+    the count): analysis 12 has ~1,100 units."""
+    aid = _analysis(conn)
+    _failed_hunt(conn, aid)
+    ledger.finish_analysis(conn, aid, "capped")
+    calls = []
+    real = ledger.units_of
+    monkeypatch.setattr(ledger, "units_of", lambda *a, **k: calls.append(1) or real(*a, **k))
+    assert units.retryable(conn, aid) == 1
+    assert len(calls) == 1
+```
+
+Em `test/selftest.sh`, no fim do bloco `cmd_security_retry()`, logo a
+seguir à linha `|| bad "refused retry (rc $rc): …"`, acrescentar:
+
+```bash
+  : > "$sec/retry.calls"
+  ( sec_env
+    security_engine_py() {
+      printf '%s\n' "$1" >> "$sec/retry.calls"
+      case "$1" in
+        analysis) printf '{"project":"Sec App","branch":"main","repo":"Sec App","spend_usd":4.8}' ;;
+        reopen)   printf '{"state":"interrupted","units":2}' ;;
+      esac
+    }
+    security_analysis_live() { return 1; }
+    slots_active() { echo 0; }
+    security_analysis_budget() { echo 5; }
+    security_launch_detached() { printf 'launch\n' >> "$sec/retry.calls"; }
+    cmd_security_retry "Sec App" 41 ) > "$sec/retry.out" 2>&1; rc=$?
+  [ "$rc" -ne 0 ] && grep -q "raise the project's security budget" "$sec/retry.out" \
+    && ! grep -q "reopen\|launch" "$sec/retry.calls" \
+    && ok "a budget that cannot pay one more unit refuses the retry before anything is reopened" \
+    || bad "budget retry (rc $rc): $(cat "$sec/retry.out"); calls: $(tr '\n' ' ' < "$sec/retry.calls")"
+```
+
+E em `tests/test_page_contract.py`, em
+`test_retry_says_what_it_will_run_before_it_asks_the_engine`, acrescentar:
+
+```python
+    assert "never finished" in retry
+```
+
+- [ ] **Step 2: Correr e confirmar que falham**
+
+```bash
+python3.13 -m pytest tests/security/test_units.py -k reads_the_units_once tests/test_page_contract.py -k retry_says -p no:cacheprovider -q
+```
+
+e o selftest sem o e2e. Esperado: FAIL nos três.
+
+- [ ] **Step 3: A correcção em `units.py`**
+
+Substituir `retry_refusal` e `retryable` por:
+
+```python
+def retry_state(conn, analysis_id):
+    """(refusal, leaves): why this analysis cannot be retried -- the words
+    that follow `analysis <id> `, "" when it can -- and the last unit of every
+    lineage that gave up, which a retry runs again. ONE read of the units:
+    the page asks for this on every poll of the checklist (retryable).
+
+    A retry reopens a closed analysis on the commit it analysed. So: only one
+    that ended `capped` or `failed`; only the newest of its scope -- the same
+    (project, repo, branch) with which a new analysis already supersedes an
+    interrupted one (cli.cmd_open_analysis); and only one with a lineage that
+    gave up. Whether the budget can pay for a unit is the engine's to say
+    (cmd_security_retry): the budget is the project's, not the ledger's."""
+    row = conn.execute("SELECT * FROM analysis WHERE id=?", (analysis_id,)).fetchone()
+    if row is None:
+        return "does not exist", []
+    if row["state"] not in REOPENABLE:
+        return f"is {row['state']}: only a capped or failed analysis is retried", []
+    newer = conn.execute(
+        "SELECT id FROM analysis WHERE project=? AND repo=? AND branch=? AND id>?"
+        " ORDER BY id LIMIT 1",
+        (row["project"], row["repo"], row["branch"], analysis_id)).fetchone()
+    if newer is not None:
+        return (f"was superseded by analysis {newer['id']} of the same branch: "
+                "run Analyse again instead"), []
+    leaves = failed_lineages(conn, analysis_id)
+    if not leaves:
+        return "has no unit that gave up: there is nothing to retry", []
+    return "", leaves
+
+
+def retry_refusal(conn, analysis_id) -> str:
+    return retry_state(conn, analysis_id)[0]
+
+
+def retryable(conn, analysis_id) -> int:
+    """How many units a retry would run again; 0 when it would be refused --
+    the number the page shows the Retry button by, from the very rule the
+    retry applies."""
+    why, leaves = retry_state(conn, analysis_id)
+    return 0 if why else len(leaves)
+```
+
+Em `bin/security/cli.py`, em `cmd_reopen`, substituir
+
+```python
+    why = units.retry_refusal(conn, args.analysis)
+    if why:
+        sys.exit(f"analysis {args.analysis} {why}")
+    leaves = units.failed_lineages(conn, args.analysis)
+```
+
+por
+
+```python
+    why, leaves = units.retry_state(conn, args.analysis)
+    if why:
+        sys.exit(f"analysis {args.analysis} {why}")
+```
+
+- [ ] **Step 4: A recusa por orçamento, no motor**
+
+Em `bin/agentloop`, em `cmd_security_retry`, a seguir à verificação
+`slots_active` e antes do `reopen`:
+
+```bash
+  # A BUDGET THAT CANNOT PAY ONE MORE UNIT: the resumed orchestrator would
+  # launch nothing and close the analysis capped again. The budget is the
+  # project's (security_analysis_budget), so the ledger's `reopen` cannot
+  # see it; asked here, before anything is reopened. MIN_UNIT_BUDGET is
+  # 0.50 (security/orchestrator.py).
+  local budget spent
+  budget="$(security_analysis_budget "$jid")"
+  if [ -n "$budget" ]; then
+    spent="$(printf '%s' "$row" | "$JQ" -r '.spend_usd // 0')"
+    awk -v b="$budget" -v s="$spent" 'BEGIN { exit !(b - s < 0.5) }' \
+      && die "analysis $aid has spent \$$spent of its \$$budget budget, too little is left for one unit: raise the project's security budget before retrying"
+  fi
+```
+
+- [ ] **Step 5: O texto da confirmação**
+
+Em `ui/security/analysis.js`, em `secRetryAnalysis`, trocar a mensagem por:
+
+```js
+    message: "Runs again the " + units + " that gave up, on commit "
+      + String(a.commit_sha || "").slice(0, 7) + ", and any unit that never finished."
+      + " Everything already done stays done.",
+```
+
+Depois, `npm run build`.
+
+- [ ] **Step 6: Correr e confirmar que passa**
+
+```bash
+python3.13 -m pytest tests/security/test_units.py tests/security/test_finish_units.py tests/test_page_contract.py -k "retry or reopen or retried or close_part or reads_the_units" -p no:cacheprovider -q
+```
+
+e o selftest sem o e2e.
+
+- [ ] **Step 7: Commit**
+
+Acrescentar à entrada do retry no CHANGELOG:
+
+```markdown
+  A retry is refused, before anything is reopened, when the project's
+  security budget cannot pay for one more unit.
+```
+
+```bash
+git add bin/security/units.py bin/security/cli.py bin/agentloop ui/security/analysis.js bin/static/security.js bin/static/app.js bin/static/app.css tests/security/test_units.py test/selftest.sh tests/test_page_contract.py CHANGELOG.md
+git commit -m "fix(security): a retry is refused when the budget cannot pay a unit, and says what it runs"
+```
+
+---
+
+### Task 18: `security retry` lê só o stdout do `reopen`
+
+**Files:**
+- Modify: `bin/agentloop` (`cmd_security_retry`)
+- Test: `test/selftest.sh`
+
+- [ ] **Step 1: O teste que falha**
+
+No bloco `cmd_security_retry()` do selftest, a seguir ao teste do
+orçamento (Task 17):
+
+```bash
+  : > "$sec/retry.calls"
+  ( sec_env
+    security_engine_py() {
+      case "$1" in
+        analysis) printf '{"project":"Sec App","branch":"main","repo":"Sec App"}' ;;
+        reopen)   echo "DeprecationWarning: something" >&2; printf '{"state":"interrupted","units":2}' ;;
+        resume)   printf '{"state":"running"}' ;;
+      esac
+    }
+    security_analysis_live() { return 1; }
+    slots_active() { echo 0; }
+    security_launch_detached() { :; }
+    cmd_security_retry "Sec App" 41 ) > "$sec/retry.out" 2>&1
+  grep -q '{"analysis_id":41,"retried":2}' "$sec/retry.out" \
+    && ok "a warning on the reopen's stderr does not zero the count" \
+    || bad "retry with a stderr warning printed: $(cat "$sec/retry.out")"
+```
+
+Selftest sem o e2e. Esperado: `FAIL  retry with a stderr warning printed: … "retried":0 …`.
+
+- [ ] **Step 2: A correcção**
+
+Em `cmd_security_retry`, substituir
+
+```bash
+  out="$(security_engine_py reopen --analysis "$aid" 2>&1)" || die "$out"
+```
+
+por
+
+```bash
+  # stdout is the JSON, stderr is the refusal: never read one as the other
+  # -- a warning on stderr made the count unparseable and read as 0.
+  local errf
+  errf="$(mktemp "${TMPDIR:-/tmp}/al-reopen.XXXXXX")"
+  if ! out="$(security_engine_py reopen --analysis "$aid" 2>"$errf")"; then
+    out="$(cat "$errf" 2>/dev/null)"; rm -f "$errf"
+    die "${out:-analysis $aid could not be reopened}"
+  fi
+  rm -f "$errf"
+```
+
+(o `local … out n` do topo da função já declara `out`).
+
+- [ ] **Step 3: Correr e confirmar que passa**
+
+Selftest sem o e2e: os cinco `ok` do bloco `cmd_security_retry()`.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add bin/agentloop test/selftest.sh CHANGELOG.md
+git commit -m "fix(security): security retry reads the reopen's JSON from stdout only"
+```
+
+(com uma linha no CHANGELOG, na entrada do retry:
+`The count it reports is read from the ledger's answer alone.`)
+
+---
+
+### Task 19: A postura durante um retry fica dita, não escondida
+
+**Decisão do review:** mudar a semântica do baseline durante um retry mexe
+nas 17 consultas que lêem `state IN ('done','capped')` (`cli.py`,
+`ledger.py`, `queries.py`). Fica como follow-up próprio. Esta tarefa torna o
+comportamento explícito onde o operador decide.
+
+**Files:**
+- Modify: `ui/security/analysis.js` (confirmação), `bin/static/security.js`
+- Modify: `README.md`, `docs/superpowers/specs/2026-09-26-security-analysis-recovery-design.md`
+- Test: `tests/test_page_contract.py`
+
+- [ ] **Step 1: O teste que falha**
+
+Em `test_retry_says_what_it_will_run_before_it_asks_the_engine`, acrescentar:
+
+```python
+    assert "previous finished analysis" in retry
+```
+
+- [ ] **Step 2: A mensagem**
+
+Na mensagem da confirmação de `secRetryAnalysis` (Task 17), acrescentar
+antes de `" Everything already done stays done."`:
+
+```js
+      + " While it runs, the branch shows its previous finished analysis."
+```
+
+`npm run build`, e o teste passa.
+
+- [ ] **Step 3: README e spec**
+
+No parágrafo **Retry failed units** do README, acrescentar:
+
+```markdown
+While it runs the analysis is not finished, so the branch's posture and the
+next analysis's baseline are the previous finished one until it closes again.
+```
+
+Na spec, em «Fica de fora, de propósito», acrescentar:
+
+```markdown
+- **O baseline durante um retry.** Enquanto a análise reaberta corre, as 17
+  consultas que lêem `state IN ('done','capped')` vêem a análise anterior do
+  ramo. Os achados da análise reaberta não diminuem durante o retry (só ganham
+  veredictos), por isso ela podia continuar a ser o baseline; mudá-lo é um
+  follow-up próprio. A confirmação e o README dizem-no.
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add ui/security/analysis.js bin/static/security.js bin/static/app.js bin/static/app.css tests/test_page_contract.py README.md docs/superpowers/specs/2026-09-26-security-analysis-recovery-design.md CHANGELOG.md
+git commit -m "docs(security): say that a retrying analysis is not the branch's baseline until it closes"
+```
+
+(com uma linha no CHANGELOG, na entrada do retry, com a mesma frase do
+README).
+
+---
+
+### Task 20: Juntar a `main` e verificar
+
+- [ ] **Step 1:** `git merge origin/main` (o merge textual já foi verificado
+  limpo com `git merge-tree`; é um commit de merge normal, sem rebase de uma
+  branch que outros possam ter visto).
+- [ ] **Step 2:** repetir a Step 3 da Task 13 (os ficheiros tocados, o
+  selftest sem o e2e e a lista 4 do e2e).
+- [ ] **Step 3:** reportar o resultado de cada um dos oito achados do review
+  (corrigido, ou porque não precisou) no mesmo sítio onde o review os listou.
+
+---
+
 ## Depois do merge (fora deste plano, pelo operador)
 
 - Actualizar o checkout instalado entre runs (`git pull --ff-only` e
