@@ -118,3 +118,14 @@ def test_a_start_failure_writes_nothing_and_names_the_cause_on_stderr(tmp_path):
     assert "Unexpected error" in lines[0]
     assert lines[1] == ""
     assert lines[-1] == "BadResource: FileSystem.access (/gone/run/repo)"
+
+
+def test_an_unreachable_provider_is_an_error_with_no_status(tmp_path):
+    """2026-09-26: the router refused connections, and the CLI ended each run
+    with the AI SDK's "Cannot connect to API" and no HTTP status."""
+    p = run(["run", "--format", "json", "--dir", str(tmp_path), "--", "x"], env={"FAKE_MODE": "unreachable"})
+    assert p.returncode == 1
+    ev = events(p.stdout)[-1]
+    assert ev["type"] == "error"
+    assert ev["error"]["data"]["message"].startswith("Cannot connect to API")
+    assert "statusCode" not in ev["error"]["data"]

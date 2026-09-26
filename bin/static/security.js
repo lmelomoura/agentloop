@@ -430,6 +430,10 @@
     });
     return bestd <= SEC_RUN_WINDOW ? best : null;
   }
+  function secLiveRunsFor(a) {
+    if (!a || !a.run_id || a.state !== "running") return [];
+    return unjournaledLive().filter((r) => r.id === a.run_id && (r.start || 0) >= (a.started || 0) - SEC_RUN_WINDOW).sort((x, y) => (y.start || 0) - (x.start || 0));
+  }
   function secRenderHistory() {
     const host = $("sec-history");
     host.textContent = "";
@@ -786,7 +790,7 @@
       host.appendChild(secEl(
         "div",
         "secrun-notice",
-        SEC_ORCHESTRATOR_PHASE[orch.phase] || "The engine is running this analysis."
+        (SEC_ORCHESTRATOR_PHASE[orch.phase] || "The engine is running this analysis.") + (orch.detail ? " Now: " + orch.detail + "." : "")
       ));
       return;
     }
@@ -4418,15 +4422,47 @@
     dl.disabled = isPending("security_report", a.id, "md");
     dl.onclick = () => secDownloadReport(a.id, "md", dl);
     actions.appendChild(dl);
-    const run = secRunFor(a);
-    const eye = document.createElement("button");
-    eye.type = "button";
-    eye.className = "iconbtn";
-    eye.title = run ? "Open this run's live session" : "No live or journalled session found for this run";
-    eye.disabled = !run;
-    eye.appendChild(secIcon("eye"));
-    if (run) eye.onclick = () => openLog(run.id, run.start);
-    actions.appendChild(eye);
+    const live = secLiveRunsFor(a);
+    if (live.length > 1) {
+      const menu = document.createElement("details");
+      menu.className = "secidx-kebab";
+      const sum = document.createElement("summary");
+      sum.className = "iconbtn";
+      sum.title = live.length + " units running \u2014 open one";
+      sum.appendChild(secIcon("eye"));
+      sum.onclick = (e) => {
+        e.stopPropagation();
+        closeMenus();
+      };
+      menu.appendChild(sum);
+      const pop2 = secEl("div", "menu-pop");
+      pop2.setAttribute("role", "menu");
+      live.forEach((r) => {
+        const item = document.createElement("button");
+        item.setAttribute("role", "menuitem");
+        item.appendChild(secIcon("eye"));
+        item.appendChild(document.createTextNode((r.label || "unit") + " \xB7 started " + fmtAgo(r.start)));
+        item.onclick = (e) => {
+          e.stopPropagation();
+          menu.open = false;
+          openLog(r.id, r.start);
+        };
+        pop2.appendChild(item);
+      });
+      menu.appendChild(pop2);
+      secPlaceMenu(menu, sum, pop2, "right");
+      actions.appendChild(menu);
+    } else {
+      const run = live[0] || secRunFor(a);
+      const eye = document.createElement("button");
+      eye.type = "button";
+      eye.className = "iconbtn";
+      eye.title = run ? "Open this run's live session" : "No live or journalled session found for this run";
+      eye.disabled = !run;
+      eye.appendChild(secIcon("eye"));
+      if (run) eye.onclick = () => openLog(run.id, run.start);
+      actions.appendChild(eye);
+    }
     const kebab = document.createElement("details");
     kebab.className = "secidx-kebab";
     const summary = document.createElement("summary");
@@ -5598,5 +5634,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: 0fda10df7667c0fb95ab114671bdd8ded85729d0164af228125a63dbbb9e841c */
-/* ui-sources: 441724cef213b094db68793c17c7f6998d637fe1ea1f018abc79c25fc787b160 */
+/* ui-bundle: fa04d82b5fc7e39fe1b303bb3eb4e93dceb4144a5b12414f22ab8104b94a506f */
+/* ui-sources: 86977597d2509df299e13589cd6072612f6b9b1ccc8164c5666fde7b84572969 */

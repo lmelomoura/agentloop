@@ -42,7 +42,7 @@ import { secIndexDonut, secIndexDonutSvg, secIndexDonutLegend,
          secIndexCategories, secCappedScopeNote, secIndexRunStatusPill } from "./index-screen.js";
 import { secOpen, secShowAnalysis, secOpenLaunch } from "./analysis.js";
 import { secDownloadReport } from "./actions.js";
-import { secRunFor } from "./history.js";
+import { secRunFor, secLiveRunsFor } from "./history.js";
 import { secRenderProjectBranches, secBranchesSidebar } from "./branches-tab.js";
 import { secRenderProjectReports, secReportsSidebar } from "./reports-tab.js";
 import { renderFindings } from "./findings-screen.js";
@@ -745,16 +745,47 @@ function secRenderRunHead(){
   // openLog the same page-native opener; disabled rather than hidden when
   // none is found, so the row of three icons never reflows depending on the
   // state of the run behind it.
-  const run = secRunFor(a);
-  const eye = document.createElement("button");
-  eye.type = "button";
-  eye.className = "iconbtn";
-  eye.title = run ? "Open this run's live session"
-                  : "No live or journalled session found for this run";
-  eye.disabled = !run;
-  eye.appendChild(secIcon("eye"));
-  if(run) eye.onclick = () => openLog(run.id, run.start);
-  actions.appendChild(eye);
+  //
+  // SEVERAL UNITS AT ONCE: a running pipeline analysis has up to its parallel
+  // limit of unit runs live together, each with its own log. With more than
+  // one, the eye is a menu of them -- the unit's label and when it started --
+  // in the same kebab the downloads use, instead of the one run that started
+  // nearest the analysis.
+  const live = secLiveRunsFor(a);
+  if(live.length > 1){
+    const menu = document.createElement("details");
+    menu.className = "secidx-kebab";
+    const sum = document.createElement("summary");
+    sum.className = "iconbtn";
+    sum.title = live.length + " units running — open one";
+    sum.appendChild(secIcon("eye"));
+    sum.onclick = (e) => { e.stopPropagation(); closeMenus(); };
+    menu.appendChild(sum);
+    const pop = secEl("div", "menu-pop");
+    pop.setAttribute("role", "menu");
+    live.forEach(r => {
+      const item = document.createElement("button");
+      item.setAttribute("role", "menuitem");
+      item.appendChild(secIcon("eye"));
+      item.appendChild(document.createTextNode((r.label || "unit") + " · started " + fmtAgo(r.start)));
+      item.onclick = (e) => { e.stopPropagation(); menu.open = false; openLog(r.id, r.start); };
+      pop.appendChild(item);
+    });
+    menu.appendChild(pop);
+    secPlaceMenu(menu, sum, pop, "right");
+    actions.appendChild(menu);
+  }else{
+    const run = live[0] || secRunFor(a);
+    const eye = document.createElement("button");
+    eye.type = "button";
+    eye.className = "iconbtn";
+    eye.title = run ? "Open this run's live session"
+                    : "No live or journalled session found for this run";
+    eye.disabled = !run;
+    eye.appendChild(secIcon("eye"));
+    if(run) eye.onclick = () => openLog(run.id, run.start);
+    actions.appendChild(eye);
+  }
 
   // The rest: JSON/HTML/SBOM, the three download formats the one-click icon
   // above does not cover -- same secDownloadReport call, same house

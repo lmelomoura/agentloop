@@ -6375,6 +6375,15 @@ run_classify() {
         429) cause="rate_limited" ;;
         *)   cause="api_error" ;;
       esac
+    elif "$JQ" -e '(.result // "") | tostring | test("^Cannot connect to API")' "$logfile" >/dev/null 2>&1; then
+      # THE PROVIDER COULD NOT BE REACHED: the AI SDK's own sentence for a
+      # request that never got an answer, so there is no HTTP status to read
+      # above. On 2026-09-26 the router refused connections for minutes and
+      # every such run was filed `agent_error` -- a unit spent an attempt on
+      # an outage, and the analysis breaker never counted it. It is the
+      # provider's, like a 5xx: kept out of the backoff, the unit keeps its
+      # attempt (units.KEPT_ATTEMPT_CAUSES), and the breaker counts it.
+      cause="api_error"
     elif [ "${denials:-0}" -gt 0 ]; then
       cause="tools_denied"
     elif run_start_failed; then

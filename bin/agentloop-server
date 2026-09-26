@@ -3915,7 +3915,14 @@ def _orchestrator_status(job, analysis_id):
         phase = (lock / "phase").read_text().strip()
     except OSError:
         phase = ""
-    return {"alive": True, "phase": phase}
+    # What the phase last said it did ("history 2000/21398 commits"), when it
+    # said anything: the deterministic phase alone runs for minutes, and the
+    # page used to show only "preparing" through all of it.
+    try:
+        detail = (lock / "detail").read_text().strip()[:200]
+    except OSError:
+        detail = ""
+    return {"alive": True, "phase": phase, "detail": detail}
 
 
 def security_checklist(analysis_raw):

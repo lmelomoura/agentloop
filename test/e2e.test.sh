@@ -1803,6 +1803,20 @@ grep -q "j58: finished status=error cause=start_failed .*START FAILED: BadResour
 echo
 }
 
+scenario_59() {
+echo "59. an OpenCode run that cannot reach its provider is an api_error, not the agent's"
+# 2026-09-26: the router refused connections for minutes; OpenCode ended each
+# run with the AI SDK's "Cannot connect to API" and no HTTP status, and every
+# run was filed agent_error -- a unit spent an attempt on an outage.
+mkjob_opencode j59
+FAKE_MODE=unreachable FAKE_SESSION=ses_unreach "$AL" run j59 >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .status)" = "error" ] && [ "$(lastrun | jq -r .cause)" = "api_error" ] \
+  && ok "error / api_error, like any other provider failure" || bad "$(lastrun | jq -c '{status,cause}')"
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1832,11 +1846,11 @@ echo
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # re-measure when the last list grows -- and the count assertion below fails
 # if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37"
 E2E_LIST_3="38 39 40 41 41b 41c 42 43 44 45 46"
-E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58"
+E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

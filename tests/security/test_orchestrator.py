@@ -957,3 +957,29 @@ def test_a_provider_that_refuses_every_unit_pauses_the_analysis_too(world, monke
     assert row["state"] == "interrupted", row["coverage_note"]
     assert "the provider refused 3 units in a row (api_error)" in row["coverage_note"]
     assert not [u for u in _units(world) if u["state"] == "failed"]
+
+
+def test_the_deterministic_phase_says_what_it_did_as_it_goes(world):
+    """2026-09-26: a full history sweep ran for a quarter of an hour behind a
+    page that said only "preparing" and a tick.log that said nothing -- the
+    phase's own progress lines were read in one piece at its end. Each one
+    reaches tick.log as it is written, between the phase's start and end."""
+    log = world["tmp"] / "tick.log"
+    assert _orchestrator(world, log=str(log)).run() == 0
+    lines = log.read_text().splitlines()
+    start = next(i for i, l in enumerate(lines) if l.endswith("deterministic phase started"))
+    end = next(i for i, l in enumerate(lines) if l.endswith("deterministic phase done"))
+    said = [l for l in lines[start:end] if "— prepare: " in l]
+    assert said, "\n".join(lines[start:end + 1])
+
+
+def test_the_phase_detail_is_written_beside_the_phase_and_cleared_by_the_next(world):
+    lock = world["tmp"] / "lock"
+    lock.mkdir()
+    (lock / "pid").write_text(f"{os.getpid()}\n")
+    o = _orchestrator(world, lock_dir=str(lock))
+    o._set_phase("preparing")
+    o._set_detail("history 2000/21398 commits")
+    assert (lock / "detail").read_text().strip() == "history 2000/21398 commits"
+    o._set_phase("running units")
+    assert not (lock / "detail").exists(), "a new phase starts with nothing said about it"

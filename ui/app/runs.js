@@ -417,7 +417,11 @@ function runRow(r){
   const when = el("span", "when-rel", fmtAgo(r.start));
   when.title = fmtWhen(r.start);
   tdWhen.appendChild(when);
-  if(r.forced) tdWhen.appendChild(el("span", "trigger-badge", "forced"));
+  // A unit of a security analysis is always launched `forced` -- by its
+  // orchestrator, never by a person -- so "forced" said nothing about it,
+  // and on a page of its units it said so on every row. It is a security run.
+  if(isSec) tdWhen.appendChild(el("span", "trigger-badge security", "security"));
+  else if(r.forced) tdWhen.appendChild(el("span", "trigger-badge", "forced"));
   if(parent){
     const badge = el("span", "trigger-badge resumed", "resumed");
     badge.dataset.tip = encodeURIComponent(resumedBadgeTip(parent));

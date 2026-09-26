@@ -7,7 +7,7 @@
 # launch line; the e2e scenarios that read one back are the evidence.
 #
 #   FAKE_SESSION            the sessionID on every event (a resume keeps it)
-#   FAKE_MODE               complete | undeclared | dirty | hang | silent | reject | deny | error | quota
+#   FAKE_MODE               complete | undeclared | dirty | hang | silent | reject | deny | error | quota | unreachable
 #   FAKE_ARGV_OUT           record the argv, one line per argument, "<n><TAB><first line>", plus "ARGC<TAB><n>"
 #   FAKE_PROMPT_OUT         record the last argument (the prompt) WHOLE
 #   FAKE_CONFIG_OUT         record the OPENCODE_CONFIG_CONTENT the launch carried (the permission block)
@@ -145,6 +145,11 @@ text() { ev text '{"id":"prt_fake_text","messageID":"msg_fake","sessionID":"'"$s
 case "$mode" in
   error)   # measured 09: an unknown model or provider; the reason is only in the logs
     printf '{"type":"error","timestamp":1789223950570,"sessionID":"%s","error":{"name":"UnknownError","data":{"message":"Unexpected server error. Check server logs for details.","ref":"err_fake0001"}}}\n' "$sid"
+    exit 1 ;;
+  unreachable)   # 2026-09-26, the provider's router refusing connections: the AI SDK's
+                 # "Cannot connect to API" with no HTTP status (the message as the CLI
+                 # reported it on a real install; the event's shape is quota's, without a status)
+    printf '{"type":"error","timestamp":1790428869000,"sessionID":"%s","error":{"name":"APIError","data":{"message":"Cannot connect to API: Was there a typo in the url or port?","isRetryable":true}}}\n' "$sid"
     exit 1 ;;
   quota)   # the shape of measurement 16 with the status of a rate limit (synthetic)
     printf '{"type":"error","timestamp":1789224300390,"sessionID":"%s","error":{"name":"APIError","data":{"message":"Rate limit reached for this model. Please retry after 20 seconds.","statusCode":429,"isRetryable":true,"responseHeaders":{"retry-after":"20"}}}}\n' "$sid"

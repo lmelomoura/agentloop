@@ -455,8 +455,11 @@ function secRenderRunNotice(a){
   // died", and what it is doing is said instead.
   const orch = secState.orchestrator || {};
   if(running && orch.alive){
+    // `detail`: what the phase last said it did -- "history 2000/21398
+    // commits" through a long sweep, where the phase alone reads as stuck.
     host.appendChild(secEl("div", "secrun-notice",
-      SEC_ORCHESTRATOR_PHASE[orch.phase] || "The engine is running this analysis."));
+      (SEC_ORCHESTRATOR_PHASE[orch.phase] || "The engine is running this analysis.")
+      + (orch.detail ? " Now: " + orch.detail + "." : "")));
     return;
   }
   // With no orchestrator and no run, the old reading holds: a run killed
