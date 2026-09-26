@@ -5860,13 +5860,17 @@ NASTY
   mkdir -p "$tmp/cause"
   cause_of() { # cause_of <result-json> <denials> <wdreason> -> the derived cause
     printf '%s' "$1" > "$tmp/cause/log.json"
-    ( logfile="$tmp/cause/log.json"; status="error"
+    # A run that STARTED: its stream holds an event. Every case here is one;
+    # a run whose agent never started is start_cause_of's, below.
+    printf '%s\n' '{"type":"step_start"}' > "$tmp/cause/stream.ndjson"
+    ( logfile="$tmp/cause/log.json"; status="error"; rc=1
+      streamfile="$tmp/cause/stream.ndjson"; run_dir=""; slot=""
       denials="${2:-0}"; wdreason="${3:-}"
       subtype="$("$JQ" -r '.subtype // "success"' "$logfile")"
       cause=""
       # The derivation itself, lifted verbatim from run_job by anchor so this
       # cannot drift into testing a copy that no longer matches the engine.
-      eval "$(sed -n '/^  cause=""$/,/^  fi$/p' "$BIN_DIR/agentloop" | head -20)"
+      eval "$(sed -n '/^  cause=""$/,/^  fi$/p' "$BIN_DIR/agentloop" | head -30)"
       printf '%s' "$cause" )
   }
   [ "$(cause_of '{"api_error_status":529,"subtype":"success"}')" = "api_error" ] \
@@ -5890,6 +5894,51 @@ NASTY
   [ "$(cause_of '{"api_error_status":529,"subtype":"success"}' 3)" = "api_error" ] \
     && ok "an API failure outranks a denial count on the same run" \
     || bad "denials masked the API failure"
+
+  echo "failure causes — an agent that never started is start_failed, and its stderr says why"
+  # Analysis 12 (2026-09-26): OpenCode failed every boot of the project
+  # (measurement 39) and all 693 runs were filed `killed`, the cause left
+  # unread in each run's stderr. The same derivation, lifted by the same
+  # anchor as cause_of, with the run's own files around it.
+  mkdir -p "$tmp/startf"
+  start_cause_of() { # <stderr, printf %b> [rc] [stream text] [session] [stopped] [wdreason] -> "<cause>|<note>"
+    printf '%s' '{"subtype":"no_result_event"}' > "$tmp/startf/log.json"
+    printf '%b' "$1" > "$tmp/startf/log.json.err"
+    printf '%s' "${3:-}" > "$tmp/startf/stream.ndjson"
+    rm -rf "$tmp/startf/run" "$tmp/startf/slot"; mkdir -p "$tmp/startf/run" "$tmp/startf/slot"
+    [ -z "${4:-}" ] || printf '%s\n' "$4" > "$tmp/startf/run/.session"
+    [ -z "${5:-}" ] || : > "$tmp/startf/slot/stopped"
+    ( logfile="$tmp/startf/log.json"; status="error"; denials=0; wdreason="${6:-}"
+      rc="${2:-1}"; streamfile="$tmp/startf/stream.ndjson"; run_dir="$tmp/startf/run"
+      slot="$tmp/startf/slot"
+      subtype="$("$JQ" -r '.subtype // "success"' "$logfile")"
+      cause=""
+      eval "$(sed -n '/^  cause=""$/,/^  fi$/p' "$BIN_DIR/agentloop" | head -30)"
+      printf '%s|%s' "$cause" "$wdreason" )
+  }
+  got="$(start_cause_of '\033[91m\033[1mError: \033[0mUnexpected error\n\nBadResource: FileSystem.access (/gone/run/repo)\n')"
+  [ "$got" = "start_failed|START FAILED: BadResource: FileSystem.access (/gone/run/repo)" ] \
+    && ok "an agent that exits 1 before its first event is start_failed, named by its last stderr line" \
+    || bad "start failure -> '$got'"
+  got="$(start_cause_of '')"
+  [ "$got" = "start_failed|START FAILED: the agent exited 1 with nothing on stderr" ] \
+    && ok "with nothing on stderr, the note says so" || bad "silent start failure -> '$got'"
+  got="$(start_cause_of "$(printf 'x%.0s' $(seq 1 400))\n")"
+  local sfprefix="start_failed|START FAILED: "
+  [ "${#got}" -eq $(( ${#sfprefix} + 300 )) ] \
+    && ok "and the line is cut at 300 characters" || bad "long line -> ${#got} characters"
+  [ "$(start_cause_of 'boom\n' 1 '{"type":"step_start"}')" = "killed|" ] \
+    && ok "a run whose stream holds an event did start: killed, as before" \
+    || bad "stream with an event -> '$(start_cause_of 'boom\n' 1 '{"type":"step_start"}')'"
+  [ "$(start_cause_of 'boom\n' 1 '' ses_x)" = "killed|" ] \
+    && ok "a bound session means it started" || bad "bound session -> '$(start_cause_of 'boom\n' 1 '' ses_x)'"
+  [ "$(start_cause_of 'boom\n' 1 '' '' stopped)" = "killed|" ] \
+    && ok "a stopped run is the stop's to name" || bad "stopped -> '$(start_cause_of 'boom\n' 1 '' '' stopped)'"
+  [ "$(start_cause_of 'boom\n' 1 '' '' '' 'WATCHDOG: stalled')" = "killed|WATCHDOG: stalled" ] \
+    && ok "the watchdog's ending stays killed" \
+    || bad "watchdog -> '$(start_cause_of 'boom\n' 1 '' '' '' 'WATCHDOG: stalled')'"
+  [ "$(start_cause_of 'boom\n' 0)" = "killed|" ] \
+    && ok "an agent that exited 0 did not fail to start" || bad "rc 0 -> '$(start_cause_of 'boom\n' 0)'"
 
   # The half that changes behaviour. Read the real rule out of the script: a
   # copy of it here would pass happily while the engine did something else.
@@ -6815,6 +6864,27 @@ PY
   [ -d "$urd2/one" ] && ok "a close that did not land leaves the checkout for the judgement" \
     || bad "the tree went before the orchestrator could judge the unit"
   [ ! -d "$usl2" ] && ok "and still releases the slot" || bad "the slot survived a failed close"
+
+  echo "run_cleanup() — a unit whose agent never started goes the same way, once its close has landed"
+  # The error path, which the stop tests above do not take: each of
+  # analysis 12's 693 start failures left a 371 MB tree behind (an engine
+  # from before a unit kept nothing). A unit's close lands for an error
+  # exactly as for a stop (RJ_UNIT_CLOSED), and then its tree goes.
+  local urd4="$tmp/wtroot/security-app/stampU4" usl4="$tmp/uslocks/security-app/994"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup security-app two "$tmp/g/repo" stampU4 ) >/dev/null 2>&1
+  mkdir -p "$usl4"
+  echo 994 > "$usl4/pid"; echo 1700000000 > "$usl4/start"; echo "$urd4" > "$usl4/worktree"
+  echo "$tmp/uclogs/security-app/20260925T100004Z-994.json" > "$usl4/logfile"
+  echo 12349 > "$usl4/child"                 # an agent was spawned, and ended on its own: no stop
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    LOCK_DIR="$tmp/uslocks"; DATA_DIR="$tmp"; RUNS_FILE="$tmp/uc.ndjson"; STATE_FILE="$tmp/ucstate.json"
+    LOG_DIR="$tmp/uclogs"; TICK_LOG="$tmp/uc.tick"
+    AL_SECURITY_ANALYSIS_ID=41 AL_SECURITY_UNIT_ID=14 RJ_UNIT_CLOSED=1
+    run_cleanup security-app "$usl4" ) >/dev/null 2>&1
+  [ ! -d "$urd4" ] && ok "its tree is torn down, not kept open for a resume" \
+    || bad "an error-ended unit's tree survived its run"
+  [ ! -d "$usl4" ] && ok "and its slot is released" || bad "the error-ended unit's slot survived"
 
   echo "run_cleanup() — a re-issued stop cannot kill the cleanup halfway (the slot of analysis 22)"
   # The slot that survived on the real install: the orchestrator re-issues

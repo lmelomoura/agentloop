@@ -6198,6 +6198,36 @@ run_launch_and_watch() {
   return 0
 }
 
+# A RUN WHOSE AGENT NEVER STARTED: it exited on its own, non-zero, before
+# its stream held a single event or a session was bound -- no stop, no
+# watchdog, no normalizer to blame. OpenCode 1.18.30 does exactly this for
+# every boot of a project whose sandbox list names a path under a regular
+# file (measurement 39), and the classifier called all 693 such runs of
+# analysis 12 `killed` -- a kill that never happened -- while the cause sat
+# unread in each run's stderr. Reads run_classify's scope: rc, wdreason,
+# slot, streamfile, run_dir.
+run_start_failed() {
+  [ "${rc:-0}" -ne 0 ] || return 1
+  [ -z "${wdreason:-}" ] || return 1
+  if [ -n "${slot:-}" ] && [ -f "$slot/stopped" ]; then return 1; fi
+  if [ -n "${streamfile:-}" ] && [ -s "$streamfile" ]; then return 1; fi
+  if [ -n "${run_dir:-}" ] && [ -s "$run_dir/.session" ]; then return 1; fi
+  return 0
+}
+
+# What such an agent said as it went: the LAST non-empty line of its stderr,
+# colour codes dropped, at most 300 characters. OpenCode prints "Error:
+# Unexpected error", a blank line, then the cause -- so the last line is the
+# one that names it. Reads run_classify's scope: logfile, rc.
+run_start_error() {
+  local esc line
+  esc="$(printf '\033')"
+  line="$(sed "s/${esc}\[[0-9;]*m//g" "$logfile.err" 2>/dev/null \
+            | awk 'NF { l = $0 } END { print l }' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | cut -c1-300)"
+  printf '%s' "${line:-the agent exited ${rc:-?} with nothing on stderr}"
+}
+
 # run_classify -> the verdict, from everything the run left behind. Reads
 #   from run_job: id, rc, logfile, wdreason, slot, run_dir, cost, cost_basis,
 #   _no_result, tokens_json, model, model_id. The classifier, the stop
@@ -6278,6 +6308,9 @@ run_classify() {
       esac
     elif [ "${denials:-0}" -gt 0 ]; then
       cause="tools_denied"
+    elif run_start_failed; then
+      cause="start_failed"
+      wdreason="START FAILED: $(run_start_error)"
     elif [ "$subtype" = "no_result_event" ]; then
       # Killed, crashed, or stalled out. wdreason carries which, when we know.
       cause="killed"
