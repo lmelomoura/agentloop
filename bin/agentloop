@@ -3966,7 +3966,14 @@ the right outcome when you really were cut off mid-task, and pure waste when you
 simply forgot to say you were done: it holds a full checkout and a live database
 per repo, on a machine running several of these at once. Push what you finished,
 and say how you ended.
+CONTRACT
+}
 
+# The board rules, appended after the contract to every job that can touch a
+# tracker. A security unit reads code and moves no card: handed these, it gets
+# instructions about a board and a READY queue it does not have.
+tracker_contract() {
+  cat <<'CONTRACT'
 ## Blocking is for NEW blockers — a human's move is an answer, not an anomaly
 
 `BLOCKED:` exists for something that genuinely stops you: an unanswered business
@@ -4010,6 +4017,20 @@ taking some other action that happens to reach the status you wanted.
 Ids quoted anywhere in your instructions are a hint for recognising the right
 transition, never a value to send unverified.
 CONTRACT
+}
+
+# inject_contract <job id> <prompt> -> the prompt as the agent receives it.
+# The run-ending contract is appended unless the prompt already states it. The
+# classifier downgrades an undeclared ending to a warning, so the rule has to
+# reach EVERY job -- including one written by someone who never saw this
+# scheduler's release notes -- and a job's own jobs.json is the one place that
+# cannot carry it, being personal and unversioned. The board rules follow it,
+# except on a security unit, which has no board.
+inject_contract() {
+  local id="$1" prompt="$2"
+  case "$prompt" in *"$RUN_ENDING_MARKER"*) printf '%s' "$prompt"; return ;; esac
+  printf '%s\n\n%s' "$prompt" "$(run_ending_contract)"
+  case "$id" in "$SECURITY_JOB_PREFIX"*) ;; *) printf '\n\n%s' "$(tracker_contract)" ;; esac
 }
 
 # ------------------------------------------------------------------- locking
@@ -6631,17 +6652,7 @@ ${prompt}"
     fi
   fi
 
-  # Append the run-ending contract, unless this prompt already states it. The
-  # classifier downgrades an undeclared ending to a warning, so the rule has to
-  # reach EVERY job -- including one written by someone who never saw this
-  # scheduler's release notes -- and a job's own jobs.json is the one place that
-  # cannot carry it, being personal and unversioned.
-  case "$prompt" in
-    *"$RUN_ENDING_MARKER"*) ;;
-    *) prompt="${prompt}
-
-$(run_ending_contract)" ;;
-  esac
+  prompt="$(inject_contract "$id" "$prompt")"
 
   # How many runs of THIS job may work at once — a job-level setting only, never
   # inherited. Blank or missing means 3; zero means no ceiling at all.
