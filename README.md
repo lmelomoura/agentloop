@@ -514,7 +514,10 @@ open:
   reported as a `warning` on the card (`UNDELIVERED: unpushed commits in
   api`) and its tree is kept too, whether or not it declared an ending —
   pushing is how work is delivered, and a resume is how the ticket gets back
-  to a state where it can be.
+  to a state where it can be. Changes are counted against what the tree held
+  once provisioning finished (a `.env` a hook copied in is not the agent's
+  work), and a resume adds only what its own second provisioning pass left,
+  never the interrupted session's uncommitted edits.
 
 Exit code, stderr and a spent budget cap describe how *well* a run went, not
 whether its session has more to do, so none of them decide this.

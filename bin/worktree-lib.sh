@@ -288,22 +288,85 @@ wt_main_of() { # <worktree>
   git -C "${1:-}" worktree list --porcelain 2>/dev/null | awk 'NR==1{print $2; exit}'
 }
 
-# A fingerprint of everything git currently calls dirty in a worktree. Taken
-# once after provisioning and again at teardown: what provisioning left behind
+# Everything git currently calls dirty in a worktree: its `git status
+# --porcelain` lines, as a sorted JSON array. Taken once after provisioning
+# (the manifest's `dirt`) and again at teardown: what provisioning left behind
 # is not the agent's work, and mistaking the two preserves every run dir for
-# ever. Comparing fingerprints rather than listing paths keeps this O(1) to
-# store, and "created then deleted" correctly reads as "nothing changed".
+# ever.
 #
-# 0 and a fingerprint, or non-zero when git could not answer. The distinction is
-# the whole point: `git status --porcelain` prints nothing both for a clean tree
-# and for a tree it cannot read, and hashing that gives the SAME value — so a
-# broken .git pointer used to be indistinguishable from "no changes". That was
-# survivable while this only decided a note. Since the session marker learned to
-# ask it, the same answer authorises `git worktree remove --force`.
+# LINES, not a fingerprint, because the question is "is anything dirty that
+# the snapshot does not account for", and a fingerprint can only answer "is
+# the tree exactly as it was". Both of its wrong answers happened. A tree
+# CLEANER than the snapshot -- a file that was dirty when it was taken, since
+# committed or removed -- read as uncommitted changes. And a resume that
+# re-took the snapshot over the interrupted session's own uncommitted edits
+# made those edits invisible: the tree still "matched", the session was done,
+# and teardown removes the only copy (see wt_dirt_fold).
+#
+# 0 and the array, or non-zero and NOTHING when git could not answer. The
+# distinction is the whole point: `git status --porcelain` prints nothing both
+# for a clean tree and for a tree it cannot read, so an empty list would make a
+# broken .git pointer indistinguishable from "no changes". That was survivable
+# while this only decided a note. Since the session marker learned to ask it,
+# the same answer authorises `git worktree remove --force`.
+wt_dirt() { # <worktree> -> prints a JSON array; non-zero, printing nothing, if git could not look
+  local out
+  out="$(git -C "${1:-}" status --porcelain 2>/dev/null)" || return 1
+  printf '%s' "$out" | "$JQ" -Rsc 'split("\n") | map(select(. != "")) | unique'
+}
+
+# The fingerprint an older engine recorded instead (`dirt_sha`): a hash of the
+# same porcelain text. Read only by wt_dirt_fold, to adopt such a manifest when
+# a resume can prove what it meant. Same failure rule as wt_dirt: nothing
+# printed when git could not look, never the hash of an empty answer.
 wt_dirt_sha() { # <worktree> -> prints a fingerprint; non-zero if git could not look
   local out
   out="$(git -C "${1:-}" status --porcelain 2>/dev/null)" || return 1
   printf '%s\n' "$out" | shasum | awk '{print $1}'
+}
+
+# Fold what a resume's own second `up` left behind into the manifest's
+# snapshot, and nothing else. <tsv> holds one line per re-provisioned repo:
+#   name <TAB> wt_dirt before up <TAB> wt_dirt after up <TAB> wt_dirt_sha before up
+# An empty field is a reading git could not give.
+#
+# The tree a resume finds is not the tree setup left: the interrupted session
+# may have edited files it never committed. Re-taking the snapshot after the
+# second `up` recorded those edits as provisioning residue, and both endings
+# were then wrong. A real run, cut by a rate limit with one test file edited,
+# was resumed, committed and pushed everything, and still came back
+# UNDELIVERED: the tree no longer matched a snapshot that held the edit. Left
+# uncommitted, the edit would have matched -- delivered, `.ended=done`, and the
+# sweep removes the only copy. What the second `up` made is the difference it
+# made: the lines after it that were not there before it.
+#
+# A manifest an older engine wrote has `dirt_sha` and no `dirt`. It is adopted
+# when the tree before `up` still hashes to it: nothing but setup's residue is
+# there, so those lines ARE the residue. Otherwise the residue and the
+# interrupted session's edits cannot be told apart, and the snapshot starts
+# empty -- the strict reading, which may keep a tree that could go but never
+# lets a sweep remove work. A repo with no usable reading keeps the snapshot
+# it had: folding a guess would be wrong one way or the other.
+wt_dirt_fold() { # <run dir> <tsv> -> 0 when the manifest was rewritten
+  local mf="${1:-}/.run.json" tsv="${2:-}"
+  [ -f "$mf" ] && [ -f "$tsv" ] || return 1
+  if "$JQ" -R -n --slurpfile mf "$mf" '
+        ([inputs | split("\t") | select(.[0] != "")
+          | {(.[0]): {pre: (.[1] // ""), post: (.[2] // ""), sha: (.[3] // "")}}] | add // {}) as $d
+        | $mf[0] | .repos = [.repos[] | $d[.name] as $e
+            | if $e == null or $e.pre == "" or $e.post == "" then .
+              else ($e.pre | fromjson) as $pre | ($e.post | fromjson) as $post
+                | (if .dirt != null then .dirt
+                   elif (.dirt_sha // "") != "" and .dirt_sha == $e.sha then $pre
+                   else [] end) as $base
+                | .dirt = ($base + ($post - $pre) | unique)
+                | del(.dirt_sha)
+              end]' "$tsv" > "$mf.new" 2>/dev/null; then
+    mv -f "$mf.new" "$mf"
+  else
+    rm -f "$mf.new"
+    return 1
+  fi
 }
 
 # Every worktree a run dir currently holds. Reads the DISK, not the manifest, so
@@ -427,25 +490,25 @@ wt_setup() { # <id> <project> <canonical_cwd> <stamp> [port_base]
         return 1
       fi
     fi
-    # A failed wt_dirt_sha here (git could not read the tree moments after
-    # provisioning just succeeded in it) records an empty snapshot, same as
-    # $d[.name] never having a line at all -- indistinguishable from "no
-    # snapshot was ever taken". wt_undelivered_work already has a defined
-    # meaning for that: fall back to a strict, live check at teardown, which
-    # goes through this same wt_dirt_sha and so is reported, not silently
-    # read as clean, if the failure is still there by then. A transient
-    # failure self-heals before teardown ever asks again. Aborting the whole
-    # run here instead -- when provisioning itself just succeeded moments
-    # earlier -- would be a new, disproportionate failure mode this task does
-    # not add.
-    printf '%s\t%s\n' "$name" "$(wt_dirt_sha "$wt")" >> "$tsv"
+    # A failed wt_dirt here (git could not read the tree moments after
+    # provisioning just succeeded in it) prints nothing, and the repo is
+    # recorded with no snapshot (null), same as $d[.name] never having a line
+    # at all. wt_undelivered_work already has a defined meaning for that:
+    # fall back to a strict, live check at teardown, which goes through this
+    # same wt_dirt and so is reported, not silently read as clean, if the
+    # failure is still there by then. A transient failure self-heals before
+    # teardown ever asks again. Aborting the whole run here instead -- when
+    # provisioning itself just succeeded moments earlier -- would be a new,
+    # disproportionate failure mode this task does not add.
+    printf '%s\t%s\n' "$name" "$(wt_dirt "$wt")" >> "$tsv"
   done < <("$JQ" -r '.repos[] | [.name,.canonical,.worktree,.base] | @tsv' "$run_dir/.run.json" 2>/dev/null)
 
   # Record what the tree looked like once provisioning was done, so teardown can
   # tell the hook's leftovers from anything the agent went on to write.
   if "$JQ" -R -n --slurpfile mf "$run_dir/.run.json" '
         ([inputs | split("\t") | {(.[0]): .[1]}] | add // {}) as $d
-        | $mf[0] | .repos = [.repos[] | . + {dirt_sha: ($d[.name] // "")}]' \
+        | $mf[0] | .repos = [.repos[] | . + {dirt:
+            (($d[.name] // "") | if . == "" then null else fromjson end)}]' \
         "$tsv" > "$run_dir/.run.json.new" 2>/dev/null; then
     mv "$run_dir/.run.json.new" "$run_dir/.run.json"
   else
@@ -489,7 +552,7 @@ wt_setup() { # <id> <project> <canonical_cwd> <stamp> [port_base]
 #     untracked on top of it.
 # Anything the agent added fails the third test and is reported exactly as
 # before. If git cannot answer any of the three, the answer is the strict one --
-# the same rule wt_dirt_sha follows for a status it could not read.
+# the same rule wt_dirt follows for a status it could not read.
 wt_merge_probe_only() { # <worktree> -> 0 when it holds a trial merge and nothing else
   local wt="${1:-}" mh am idx
   [ -d "$wt" ] || return 1
@@ -517,27 +580,31 @@ wt_undelivered_work() { # <run dir> -> 0 and a description, or 1
     name="$(basename "$wt")"
     # Dirty compared to the END OF PROVISIONING, not to a pristine checkout:
     # the hook just copied a .env and a vendor/ in, and calling that the agent's
-    # work marks every single run as undelivered. With no snapshot (setup died
-    # before provisioning, or its own dirt_sha call failed) fall back to the
-    # strict reading.
+    # work marks every single run as undelivered. Only a line the snapshot does
+    # not hold is the agent's; a snapshot line that is gone is not work left
+    # behind (it was committed, which the check below answers for, or
+    # removed). With no snapshot (setup died before provisioning, its own
+    # wt_dirt call failed, or an older engine's manifest a resume could not
+    # adopt) fall back to the strict reading: any dirt at all.
     #
-    # wt_dirt_sha failing is reported, not silently read as clean: `git status
+    # wt_dirt failing is reported, not silently read as clean: `git status
     # --porcelain` prints nothing both for a clean tree and for one it cannot
-    # read, and hashing that gives the SAME fingerprint either way (see
-    # wt_dirt_sha's own comment). Since Task 9.3 this decides `.ended`, so a
-    # broken .git pointer must never be mistaken for "nothing changed" here.
+    # read (see wt_dirt's own comment). Since Task 9.3 this decides `.ended`,
+    # so a broken .git pointer must never be mistaken for "nothing changed".
     snap=""
-    [ -f "$mf" ] && snap="$("$JQ" -r --arg w "$wt" \
-        '.repos[] | select(.worktree==$w) | .dirt_sha // ""' "$mf" 2>/dev/null)"
-    if ! live="$(wt_dirt_sha "$wt")"; then
+    [ -f "$mf" ] && snap="$("$JQ" -c --arg w "$wt" \
+        '.repos[] | select(.worktree==$w) | .dirt | if type == "array" then . else empty end' \
+        "$mf" 2>/dev/null)"
+    [ -n "$snap" ] || snap="[]"
+    if ! live="$(wt_dirt "$wt")"; then
       found="$found, cannot read git in $name"
     elif wt_merge_probe_only "$wt"; then
       : # a trial merge of what is already on a remote -- see the function above
-    elif [ -n "$snap" ]; then
-      [ "$live" != "$snap" ] && found="$found, uncommitted changes in $name"
     else
-      [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ] \
-        && found="$found, uncommitted changes in $name"
+      # On stdin, not as --argjson: a tree with thousands of edited files is a
+      # list the argument limit would refuse.
+      [ "$(printf '%s\n%s\n' "$live" "$snap" | "$JQ" -s '.[0] - .[1] | length' 2>/dev/null)" = 0 ] \
+        || found="$found, uncommitted changes in $name"
     fi
     # A rev-parse that fails is "could not look", not "no commits": every
     # worktree here was cut from a ref that had already resolved (wt_setup

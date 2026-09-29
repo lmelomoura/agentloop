@@ -676,6 +676,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A resumed run no longer reports as UNDELIVERED work it delivered, nor
+  hides work it did not.** A resume re-took the provisioning snapshot over
+  whatever the interrupted session had left, so that session's uncommitted
+  edits counted as provisioning residue. A real run, cut by a rate limit
+  with one test file edited, was resumed, committed and pushed everything,
+  and still ended `warning` with "uncommitted changes": the clean tree no
+  longer matched a snapshot that held the edit. The other way round was
+  worse: had the edit stayed uncommitted, the tree would have matched, the
+  session read as done, and the next sweep removed the only copy. The
+  snapshot is now the tree's `git status --porcelain` lines instead of a
+  hash of them. The check reports only a line the snapshot does not hold, so
+  a tree cleaner than its snapshot is no longer undelivered work, and a
+  resume adds only what its own second `up` added, read before and after
+  it. A run dir an older engine made (`dirt_sha`) is adopted on resume when
+  its tree still hashes to that value; otherwise it starts from an empty
+  snapshot, which may keep a tree that could go but never removes work.
+
 - **A provider that cannot be reached is an outage, not the agent's error.**
   When OpenCode ends a run with the AI SDK's "Cannot connect to API" (no HTTP
   status), the run is now `api_error`: kept out of the failure backoff, the
