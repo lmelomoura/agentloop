@@ -358,6 +358,7 @@ const CAUSE_LABEL={
   tools_denied: ["blocked",  "the agent asked for a tool it is not allowed, so it could not do the work"],
   killed:       ["killed",   "the run was cut off — a watchdog, a crash, or a kill — and never reported a result"],
   agent_error:  ["agent",    "the agent itself ended in error"],
+  setup_failed: ["setup",    "the run could not be set up — its worktree was refused, or the resume had nothing to continue in — so no agent was launched and nothing was spent; the note says why"],
 };
 // `data-tip`, not `title`: the page's own bubble (tipShow in bin/dashboard.html,
 // reached by the delegated mouseover on `[data-tip]`) appears on hover instead

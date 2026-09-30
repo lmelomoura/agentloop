@@ -20,6 +20,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A job can have a base branch of its own.** `base` on a job (the editor's
+  "Base branch" field, or `agentloop set-field <job> base`) is where that
+  job's worktree is cut from, whatever its project declares; it is never
+  inherited, and an analysis's branch still outranks it. A project on
+  `release/*` refuses every run while that family is empty, which is right
+  for the jobs that work on a release and left the one job that *cuts* the
+  first release with no way to start: it needed the branch it exists to
+  create.
+
 - **The deterministic phase of a security analysis says what it is doing.**
   Its progress lines ("sbom done (48s)", "history 2000/21398 commits") go to
   tick.log as they are written, and the analysis page shows the last one
@@ -675,6 +684,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Default it already is.
 
 ### Fixed
+
+- **A run that could not be set up no longer vanishes.** A worktree that was
+  refused (no base resolvable, a failing `up` hook, a missing repo path) and a
+  resume with nothing to continue in both ended with one line in tick.log and
+  no record: on the dashboard the run started, died and was gone from the
+  runs list, with nothing saying why. It is now recorded `error` /
+  `setup_failed`, the reason as its note (`NOT STARTED: …`), with a log body,
+  no session and no cost; a refused resume does not claim the session it
+  named. The note of an empty base family names the pattern and the way out.
+  A refused worktree also counts towards the failure backoff, like any
+  failing run, so a scheduled job does not file that record every interval.
 
 - **A provider that cannot be reached is an outage, not the agent's error.**
   When OpenCode ends a run with the AI SDK's "Cannot connect to API" (no HTTP

@@ -5078,7 +5078,7 @@ class Handler(BaseHTTPRequestHandler):
                              "max_budget_usd", "daily_budget_usd", "model", "timeout_seconds",
                              "stall_timeout_seconds", "effort", "interactive", "max_parallel",
                              "description", "cwd", "permission_mode", "project", "platform",
-                             "account"):
+                             "account", "base"):
                 return self._send(400, {"error": "bad field"})
             ok, out = al(["set-field", jid, field], stdin=value)
         else:

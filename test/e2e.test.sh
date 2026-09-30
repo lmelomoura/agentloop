@@ -1817,6 +1817,77 @@ sleep 1
 echo
 }
 
+scenario_60() {
+echo "60. a release train nobody has opened yet: the job that opens it names its own base, and a run that could not be set up leaves a record"
+# 2026-09-30: a project on `release/*` whose first release nobody had cut. The
+# wave planner -- the one job whose work IS to cut it -- took a slot, was
+# refused its worktree for want of that very branch, and vanished from the
+# runs list: the abort wrote a line to tick.log and no record at all.
+jq --arg cwd "$ROOT/work/app" \
+  '.projects += [{name:"train", cwd:$cwd, base:"release/*", worktree:{enabled:true}}]' \
+  "$ROOT/config/projects.json" > "$ROOT/config/projects.json.new" \
+  && mv "$ROOT/config/projects.json.new" "$ROOT/config/projects.json"
+E2E_JOB=j60
+printf '{"jobs":[{"id":"j60","project":"train","enabled":false,"prompt":"do the thing",
+  "interval_seconds":3600,"permission_mode":"bypassPermissions","max_parallel":1}]}\n' \
+  > "$ROOT/config/jobs.json"
+FAKE_MODE=complete FAKE_SESSION=sess-train-0 "$AL" run j60 >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .status)" = "error" ] && [ "$(lastrun | jq -r .cause)" = "setup_failed" ] \
+  && ok "the refused run is in the journal: error / setup_failed" || bad "journal: $(lastrun | jq -c '{status,cause}')"
+case "$(lastrun | jq -r .note)" in
+  "NOT STARTED: no base ref resolvable in $ROOT/work/app"*"'release/*'"*"base of its own"*"nothing was spent"*)
+    ok "its note says which pattern matched nothing, and the way out" ;;
+  *) bad "note: $(lastrun | jq -r .note)" ;;
+esac
+[ "$(lastrun | jq -r '[.session, .resumed_from, (.cost|tostring), (.turns|tostring)] | join("|")')" = "||0|0" ] \
+  && ok "with no session, no cost and no turns: no agent ever ran" \
+  || bad "$(lastrun | jq -c '{session,resumed_from,cost,turns}')"
+log60="$(lastrun | jq -r .log)"
+[ "$(jq -r '.is_error' "$log60" 2>/dev/null)" = "true" ] && jq -r '.result' "$log60" 2>/dev/null | grep -q "release/\*" \
+  && ok "and opening the run explains itself" || bad "log body: $(cat "$log60" 2>/dev/null)"
+[ -z "$(dirs j60)" ] && ok "nothing of it is left on disk" || bad "left $(dirs j60)"
+[ "$(jq -r '.j60 | .last_status + " " + .last_run_status' "$ROOT/data/state.json")" = "error error" ] \
+  && ok "and the card's last run is that error" || bad "state: $(jq -c '.j60' "$ROOT/data/state.json")"
+
+# The way out is the job's own base. A value git could read as an option is
+# refused before it is ever written.
+printf -- '-delete' | "$AL" set-field j60 base >/dev/null 2>&1
+[ $? -ne 0 ] && [ "$(jq -r '.jobs[0] | has("base")' "$ROOT/config/jobs.json")" = "false" ] \
+  && ok "set-field refuses a base shaped like a flag" || bad "a flag-shaped base was accepted: $(jq -c '.jobs[0].base' "$ROOT/config/jobs.json")"
+printf 'main' | "$AL" set-field j60 base >/dev/null 2>&1
+[ "$(jq -r '.jobs[0].base' "$ROOT/config/jobs.json")" = "main" ] \
+  && ok "set-field gives the job a base of its own" || bad "base: $(jq -c '.jobs[0].base' "$ROOT/config/jobs.json")"
+FAKE_MODE=undeclared FAKE_SESSION=sess-train "$AL" run j60 >/dev/null 2>&1
+sleep 2
+d60="$(dirs j60 | head -1)"
+[ "$(lastrun | jq -r .session)" = "sess-train" ] && [ "$(lastrun | jq -r .cause)" != "setup_failed" ] \
+  && ok "and the same job now runs, in a project whose family is still empty" \
+  || bad "journal: $(lastrun | jq -c '{status,cause,session,note}')"
+[ "$(jq -r '.repos[0] | .base + " " + .base_ref' "$ROOT/data/worktrees/j60/$d60/.run.json" 2>/dev/null)" = "main origin/main" ] \
+  && ok "in a worktree cut from its own base" \
+  || bad "manifest: $(jq -c '.repos[0]' "$ROOT/data/worktrees/j60/$d60/.run.json" 2>/dev/null)"
+printf '' | "$AL" set-field j60 base >/dev/null 2>&1
+[ "$(jq -r '.jobs[0] | has("base")' "$ROOT/config/jobs.json")" = "false" ] \
+  && ok "an empty value clears it: the job is back on its project's base" \
+  || bad "base after clearing: $(jq -c '.jobs[0].base' "$ROOT/config/jobs.json")"
+
+# A refused resume is the same kind of ending, with one difference that
+# matters: the session it named was NOT continued, so the record must not
+# claim it -- `resumed_from` is what marks a session as already picked up.
+"$AL" resume j60 sess-never-was >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .cause)" = "setup_failed" ] && [ "$(lastrun | jq -r .resumed_from)" = "" ] \
+  && ok "a refused resume is recorded too, without claiming the session" \
+  || bad "journal: $(lastrun | jq -c '{status,cause,resumed_from}')"
+case "$(lastrun | jq -r .note)" in
+  "NOT STARTED: refusing to resume sess-never-was"*) ok "and its note names the session it could not continue" ;;
+  *) bad "note: $(lastrun | jq -r .note)" ;;
+esac
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1846,11 +1917,11 @@ echo
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # re-measure when the last list grows -- and the count assertion below fails
 # if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37"
 E2E_LIST_3="38 39 40 41 41b 41c 42 43 44 45 46"
-E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59"
+E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59 60"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to
