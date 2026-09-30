@@ -4419,6 +4419,49 @@ run_record_stopped_early() { # <id> <slot-dir>
   fi
 }
 
+# A RUN THAT COULD NOT BE SET UP IS STILL A RUN THAT ENDED. It took a slot --
+# so the dashboard showed it running -- and then its worktree was refused, or
+# the resume it was asked for had nothing to continue in. Every one of those
+# exits used to write a line to tick.log and nothing else: no record, no log
+# body, so the run started, died and was gone from the runs list, and the only
+# trace of why was a file nobody had been told to open (2026-09-30: a wave
+# planner refused its worktree twice in a minute, invisibly).
+#
+# So it files the record an ended run files: `error`, cause `setup_failed`,
+# the reason as its note, and a log body so opening the run explains itself.
+# No session, no cost, no turns -- no agent ever ran. And NO `resumed_from`,
+# whatever was asked: that field is what marks a session as already picked up,
+# and a resume that was refused picked nothing up.
+#
+# <counts> = "streak" for a failure the next tick would simply repeat (a
+# worktree that cannot be cut): it feeds the failure backoff like any failing
+# run, or a job on a schedule would file this record every interval for ever.
+# A refused resume is one deliberate click and counts for nothing.
+#
+# Not closed as a unit of an analysis: a derived job that never launched leaves
+# its unit for the orchestrator to judge, exactly as before.
+run_record_aborted() { # <id> <slot-dir> <start> <forced> <precheck-out> <project> <model> <platform> <account> <account-dir> <logfile> <reason> [counts]
+  local id="$1" slot="$2" start="$3" forced="$4" pc_out="$5" project="$6" model="$7" platform="$8"
+  local account="$9" account_dir="${10}" logf="${11}" reason="${12}" counts="${13:-}" end note streak
+  case "$start" in ''|*[!0-9]*) start="$(now_epoch)" ;; esac
+  end="$(now_epoch)"
+  [ -n "$reason" ] || reason="the run could not be set up (tick.log has the line)"
+  note="NOT STARTED: $reason — no agent was launched and nothing was spent."
+  "$JQ" -nc --arg r "$note" '{is_error:true, subtype:"setup_failed", num_turns:0, session_id:"",
+    stop_reason:"setup_failed", result:("**Not started.**\n\n"+$r)}' > "$logf" 2>/dev/null || logf=""
+  streak="$(num "$(state_get "$id" fail_streak 0)")"
+  [ "$counts" != "streak" ] || streak="$(( streak + 1 ))"
+  state_set_many "$id" "$("$JQ" -nc --argjson end "$end" --argjson start "$start" --argjson streak "$streak" \
+    '{last_start:$start, last_end:$end, last_status:"error", last_run_start:$start,
+      last_run_status:"error", fail_streak:$streak}')"
+  record_run "$id" "error" "$start" "$end" "0" "0" "" "$logf" "$note" "$forced" "$pc_out" "$project" \
+             "$model" "" "" "setup_failed" "$platform" "none" "null" "$account" "$account_dir"
+  # The same marker the classifier drops: a stop that lands while this run is
+  # on its way out must not file a second record for it.
+  : > "$slot/journaled" 2>/dev/null || true
+  run_end_hook "$id" "error" "0" "$note" "$project" "" "$logf" "$start" "$end" "$platform" "none" "null"
+}
+
 run_cleanup() { # <id> <slot-dir>
   local id="$1" slot="${2:-}" wt project
   [ -n "$slot" ] || return 0
@@ -6589,7 +6632,7 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   local id="$1" force="${2:-}" resume_sid="${3:-}"
   [ -n "$resume_sid" ] && force="--force"
   local cwd prompt model effort budget timeout stall permission allowed disallowed precheck project proj_desc interactive fifo
-  local run_cwd worktree run_dir run_env account account_dir _envln slot max_par
+  local run_cwd worktree run_dir run_env account account_dir _envln slot max_par job_base _why
   # Loop variables for replaying a reattached run's manifest through `up` again
   # (see the isolation branch below). Declared here, not just inside the loop,
   # because `read` happily creates GLOBALS for anything not already local, and
@@ -6955,9 +6998,9 @@ ${prompt}"
       lock_take "$rlock"
       if wt_is_claimed "$id" "$run_dir"; then
         lock_drop "$rlock"
-        log_tick "$id: cannot resume $resume_sid — another run is already working in $run_dir"
-        state_set "$id" last_start "$start"
-        state_set "$id" last_status '"error"'
+        _why="cannot resume $resume_sid — another run is already working in $run_dir"
+        log_tick "$id: $_why"
+        run_record_aborted "$id" "$slot" "$start" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$platform" "$account" "$account_dir" "$logfile" "$_why"
         run_cleanup "$id" "$slot"; trap - EXIT
         return 1
       fi
@@ -6989,9 +7032,9 @@ ${prompt}"
         # Its services are still bound to that block and somebody else holds it.
         # Refusing is the honest answer: a fresh block would silently point the
         # resumed agent's config at ports nothing is listening on.
-        log_tick "$id: cannot resume $resume_sid — its port block $port_base is held by a live run"
-        state_set "$id" last_start "$start"
-        state_set "$id" last_status '"error"'
+        _why="cannot resume $resume_sid — its port block $port_base is held by a live run"
+        log_tick "$id: $_why"
+        run_record_aborted "$id" "$slot" "$start" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$platform" "$account" "$account_dir" "$logfile" "$_why"
         run_cleanup "$id" "$slot"; trap - EXIT
         return 1
       fi
@@ -7006,9 +7049,9 @@ ${prompt}"
       # the worktrees instead of to a checkout. The port block four lines up is
       # read defensively for exactly this reason; so is this.
       if [ -z "$primary_name" ] || [ ! -d "$worktree" ]; then
-        log_tick "$id: cannot resume $resume_sid — its primary worktree is gone or unnamed"
-        state_set "$id" last_start "$start"
-        state_set "$id" last_status '"error"'
+        _why="cannot resume $resume_sid — its primary worktree is gone or unnamed"
+        log_tick "$id: $_why"
+        run_record_aborted "$id" "$slot" "$start" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$platform" "$account" "$account_dir" "$logfile" "$_why"
         run_cleanup "$id" "$slot"; trap - EXIT
         return 1
       fi
@@ -7097,9 +7140,9 @@ ${prompt}"
       # either branch below has written anything: run_cleanup sees an
       # empty run dir and skips teardown, so there is nothing half-started
       # to unwind.
-      log_tick "$id: refusing to resume $resume_sid — no open session directory holds it (already finished, expired, or removed by hand)"
-      state_set "$id" last_start "$start"
-      state_set "$id" last_status '"error"'
+      _why="refusing to resume $resume_sid — no open session directory holds it (already finished, expired, or removed by hand)"
+      log_tick "$id: $_why"
+      run_record_aborted "$id" "$slot" "$start" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$platform" "$account" "$account_dir" "$logfile" "$_why"
       run_cleanup "$id" "$slot"; trap - EXIT
       return 1
     else
@@ -7113,10 +7156,15 @@ ${prompt}"
       # block: they are what write the run's ports into its config.
       port_base="$(alloc_port_base "$slot")"
       export AL_PORT_BASE="$port_base" AL_PORT_SPAN AL_PROVISION_LIB="$BIN_DIR/provision-lib.sh"
-      if ! worktree="$(wt_setup "$id" "$project" "$cwd" "$stamp" "$port_base")"; then
-        state_set "$id" last_start "$start"
-        state_set "$id" last_status '"error"'
+      # The job's own base, when it has one: where THIS job's worktree is cut
+      # from, whatever its project declares (see wt_setup). Never inherited.
+      job_base="$(job_get "$id" '.base' '')"
+      case "$job_base" in null) job_base="" ;; esac
+      # wt_setup answers on stdout with the primary worktree, so the reason for
+      # a refusal comes back through a file of the slot's.
+      if ! worktree="$(WT_FAIL_NOTE="$slot/setup-note" wt_setup "$id" "$project" "$cwd" "$stamp" "$port_base" "$job_base")"; then
         log_tick "$id: worktree isolation failed — run aborted (no shared-checkout fallback)"
+        run_record_aborted "$id" "$slot" "$start" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$platform" "$account" "$account_dir" "$logfile" "$(cat "$slot/setup-note" 2>/dev/null || true)" streak
         run_cleanup "$id" "$slot"; trap - EXIT
         return 1
       fi
@@ -8190,6 +8238,18 @@ cmd_set_prompt() { # reads the new prompt from stdin
   echo "prompt updated for $id"
 }
 
+# What may be written as a job's own base: a branch name, or a family ending in
+# `*` (wt_base_ref resolves both). Refused: anything git could read as an
+# option, anything with whitespace in it, and a `*` that is not the last
+# character -- the one shape the resolver reads as a family.
+job_base_ok() { # <value>
+  case "$1" in
+    ''|-*|*[[:space:]]*) return 1 ;;
+    *'*'?*) return 1 ;;
+  esac
+  return 0
+}
+
 cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
   local id="$1" field="$2" value
   security_refuse_derived "$id"
@@ -8208,6 +8268,16 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
         "") write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.interactive) else . end]' ;;
         *) die "interactive must be true or false" ;;
       esac ;;
+    base)
+      # Where THIS job's worktree is cut from, whatever its project declares
+      # (wt_setup). Empty clears it: the job is back on its project's base.
+      if [ -z "$value" ]; then
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.base) else . end]'
+      else
+        job_base_ok "$value" || die "base must be a branch name, or a family ending in * (release/*) — not '$value'"
+        write_jobs --arg id "$id" --arg v "$value" \
+          '.jobs = [.jobs[] | if .id == $id then .base = $v else . end]'
+      fi ;;
     max_parallel)
       # How many runs of this job may work at once. Empty clears it (the engine
       # then uses its default of 3); 0 is a value in its own right — no ceiling.
@@ -8589,6 +8659,14 @@ cmd_create() { # reads a partial job object (JSON) from stdin
   platform_model_enabled "$cplat" "$cm" || die "create: model '$cm' is not enabled in Settings — $cplat enables: $(platform_models_enabled_line "$cplat")"
   platform_permission_ok "$cplat" "$cp" || die "create: permission_mode '$cp' is not a $cplat mode"
   platform_effort_ok "$cplat" "$cm" "$ce" || die "create: effort '$ce' is not a level of $cm on $cplat"
+  # A base of its own is optional, and an empty one is no base at all.
+  local cb
+  cb="$(echo "$merged" | "$JQ" -r '.base // ""')"
+  if [ -n "$cb" ]; then
+    job_base_ok "$cb" || die "create: base must be a branch name, or a family ending in * (release/*) — not '$cb'"
+  else
+    merged="$(echo "$merged" | "$JQ" 'del(.base)')"
+  fi
   write_jobs --argjson j "$merged" '.jobs += [$j]'
   if [ ! -f "$path" ]; then
     mkdir -p "$CONFIG_DIR/prechecks"
@@ -8941,7 +9019,7 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop set-prompt <id> replace a job's prompt, read from stdin
   agentloop set-field <id> <field>   set interval_seconds|active_hours|active_days|
                               platform|account|model|max_budget_usd|timeout_seconds|
-                              stall_timeout_seconds, value from stdin
+                              stall_timeout_seconds|base, value from stdin
   agentloop set-precheck <id>   replace a job's precheck script, read from stdin
   agentloop provision-set <project> <up|down>   replace a worktree provisioning hook (stdin)
   agentloop provision-get <project> <up|down>   print one

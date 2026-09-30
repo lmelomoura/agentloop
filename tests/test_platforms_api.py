@@ -876,6 +876,16 @@ def test_api_models_lists_the_registered_accounts(srv):
     assert "accounts" not in p["opencode"]
 
 
+def test_the_server_lets_a_jobs_base_through_set_field():
+    """The job editor saves field by field through `set_field`, and the server
+    refuses any field it does not name: without `base` here the editor's new
+    field would fail on save with "bad field"."""
+    src = (REPO / "bin" / "agentloop-server").read_text()
+    allow = src[src.index('elif op == "set_field"'):]
+    allow = allow[:allow.index('return self._send(400, {"error": "bad field"})')]
+    assert '"base"' in allow
+
+
 def test_the_server_lets_account_through_set_field():
     src = (REPO / "bin" / "agentloop-server").read_text()
     allow = src[src.index('elif op == "set_field"'):][:900]

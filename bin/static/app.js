@@ -2222,7 +2222,8 @@
     rate_limited: ["limit", "the account is over its rate or usage limit \u2014 it does not count towards the failure backoff"],
     tools_denied: ["blocked", "the agent asked for a tool it is not allowed, so it could not do the work"],
     killed: ["killed", "the run was cut off \u2014 a watchdog, a crash, or a kill \u2014 and never reported a result"],
-    agent_error: ["agent", "the agent itself ended in error"]
+    agent_error: ["agent", "the agent itself ended in error"],
+    setup_failed: ["setup", "the run could not be set up \u2014 its worktree was refused, or the resume had nothing to continue in \u2014 so no agent was launched and nothing was spent; the note says why"]
   };
   function causeTag(rec) {
     const c = CAUSE_LABEL[rec && rec.cause || ""];
@@ -3276,5 +3277,5 @@
     newerModelNotes
   };
 })();
-/* ui-bundle: 5fff1654a6d72c0ff3dbad934f6481c5b2ea153b8e214983d620f7f0b39d8f19 */
-/* ui-sources: 86977597d2509df299e13589cd6072612f6b9b1ccc8164c5666fde7b84572969 */
+/* ui-bundle: e519caf2367ae337e998b2a8e20be2680403314782d70bee5af5b44f5ed8ed98 */
+/* ui-sources: 17b970f20f6a68b5dbd5058b4fd0c449b4ad28a661dbcba52a43497c7cfd26f5 */

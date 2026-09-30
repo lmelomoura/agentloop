@@ -245,6 +245,7 @@ A job is one object in `config/jobs.json`. Fields:
 | `active_hours` | `"08:00-20:00"` (empty = 24h) |
 | `active_days` | `[1..7]`, 1=Mon |
 | `project` | optional group; the job inherits the project's `cwd` (see **Projects**) |
+| `base` | optional: the branch **this job's** worktree is cut from, when that is not the project's (a branch, or a family such as `release/*`). Never inherited; omit it and the job is cut from its project's base — see **Isolation** |
 | `platform` | `anthropic` (Claude Code), `openai` (Codex CLI) or `opencode` (OpenCode CLI); omit to inherit the project's, which defaults to `anthropic`. `model`, `effort` and `permission_mode` keep their names and take that platform's vocabulary — see **Platforms** |
 | `account` | the sign-in the job runs under: the id of an account registered for its platform in Settings › Platforms, or `default`; omit to inherit — the project's account when the job runs on the project's platform, else the platform's Default. `set-field` and `create` refuse an id the platform does not have, and a platform change that leaves the job's own account behind clears it, and says so. OpenCode has no accounts — see [Accounts](#accounts--which-sign-in-a-run-uses) |
 | `model` | an exact model id (`claude-opus-5`, …) or a family (`opus`/`sonnet`/`haiku`/`fable`). On `openai`: a catalog slug (`gpt-5.6-sol`), verbatim. On `opencode`: `provider/model`, the CLI's own id (`pdm_ai/glm-5.3-flash`), verbatim; the first slash separates the provider |
@@ -369,6 +370,28 @@ unaffected.
 Ending a base in `*` follows a family rather than one branch: `release/*` resolves
 to the newest `release/x.y.z` at run time, so a project shipping through release
 trains is configured once instead of pointing at last month's train.
+
+A family with **no branch yet** refuses the run rather than fall back to some
+other branch — agents working from the wrong baseline is the failure a declared
+base exists to prevent. That leaves one job stranded on a new project: the one
+whose work is to *cut* the first release has nothing to be cut from. Give that
+job a base of its own and nothing else changes:
+
+```bash
+printf 'main' | agentloop set-field wave-planner base    # or the editor's "Base branch" field
+```
+
+A job's `base` replaces the declared base of every repo of its run; the
+project's other jobs keep following the family, and keep being refused until
+its first branch exists, which is correct — they have nothing to work from yet.
+
+**A run that cannot be set up is still recorded.** A worktree that was refused
+(an unresolvable base, a failing `up` hook, a missing repo path) or a resume
+with nothing to continue in ends as `error` / `setup_failed`: the reason is the
+run's note (`NOT STARTED: …`), no session, no cost. It used to leave one line in
+`tick.log` and nothing in the runs list. A worktree failure also counts towards
+the failure backoff, like any failing run, so a scheduled job does not file the
+same record every interval.
 
 **Declare `base` whenever `origin/HEAD` is not the branch your work targets.**
 Leaving it empty means *infer it*, and inference resolves to the canonical
@@ -2334,7 +2357,8 @@ agentloop set-field <id> <field>   # value on stdin (interval_seconds, active_ho
                                #   active_days, platform, account, model, effort,
                                #   max_budget_usd, daily_budget_usd,
                                #   stall_timeout_seconds, timeout_seconds,
-                               #   permission_mode, description, cwd, project)
+                               #   permission_mode, description, cwd, project,
+                               #   base)
 agentloop delete <id>        # remove the job (its logs are kept)
 agentloop project-set        # create/update a project (JSON on stdin)
 agentloop project-list | project-delete <name>

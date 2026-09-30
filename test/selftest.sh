@@ -3863,6 +3863,67 @@ EOF
   [ "$got" = "main" ] && ok "a declared repo's base still wins over the project's" \
     || bad "with both declared the base came out '$got'"
 
+  echo "wt_setup() — a job's own base overrides the project's, for the job that opens the family"
+  # A release-train project declares `release/*`, and that family is EMPTY
+  # until the job that cuts releases has run once. With only the project's
+  # base to go by, that job was refused for want of the very branch it exists
+  # to create: it took a slot, died in setup and left no record. The pattern's
+  # refusal stays (every other job of the project has nothing to work from
+  # yet); the job that opens the family says where ITS worktree is cut from.
+  printf '%s' '{"projects":[{"name":"train","cwd":"'"$tmp"'/g/repo","base":"nosuch/*"}]}' \
+    > "$tmp/proj/train.json"
+  local rdT="$tmp/wtroot/jTrain" tnote="$tmp/train.note"
+  rm -f "$tnote"
+  ( PROJECTS_FILE="$tmp/proj/train.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    WT_FAIL_NOTE="$tnote"; wt_setup jTrain train "$tmp/g/repo" stampT1 ) >/dev/null 2>&1
+  want "with no base of its own, an empty family still refuses the run" 1 $?
+  [ ! -d "$rdT/stampT1" ] && ok "and leaves no run dir behind" || bad "the refused run left $rdT/stampT1"
+  got="$(cat "$tnote" 2>/dev/null)"
+  case "$got" in
+    *"no base ref resolvable in $tmp/g/repo"*"'nosuch/*'"*"base of its own"*)
+      ok "the reason is handed to the caller, naming the pattern and the way out" ;;
+    *) bad "the refusal's reason came out '$got'" ;;
+  esac
+  prim="$( PROJECTS_FILE="$tmp/proj/train.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+           wt_setup jTrain train "$tmp/g/repo" stampT2 "" develop 2>/dev/null )"
+  [ "$prim" = "$rdT/stampT2/repo" ] && ok "with a base of its own the same job is set up" \
+    || bad "a job with its own base was set up as '$prim'"
+  [ -n "$prim" ] && [ "$(git -C "$prim" rev-parse HEAD 2>/dev/null)" = "$(git -C "$tmp/g/repo" rev-parse origin/develop)" ] \
+    && ok "cut from the job's base, not from the project's pattern" \
+    || bad "the worktree is at '$(git -C "$rdT/stampT2/repo" rev-parse HEAD 2>/dev/null)'"
+  got="$("$JQ" -r '.repos[0] | .base + " " + .base_ref' "$rdT/stampT2/.run.json" 2>/dev/null)"
+  [ "$got" = "develop origin/develop" ] && ok "and the manifest records the base the run was really cut from" \
+    || bad "the manifest recorded '$got'"
+  # A declared repo row is the more specific statement about the PROJECT; the
+  # job's base is a statement about that one job, so it wins there too.
+  prim="$( PROJECTS_FILE="$tmp/proj/both.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+           wt_setup jTrain solo3 "$tmp/g/repo2" stampT3 "" feat/only-two 2>/dev/null )"
+  [ -n "$prim" ] && [ "$(git -C "$prim" rev-parse HEAD 2>/dev/null)" = "$(git -C "$tmp/g/repo2" rev-parse feat/only-two)" ] \
+    && ok "a job's base wins over a declared repo row's as well" \
+    || bad "with a repo row declared, the job's base gave '$(git -C "$rdT/stampT3/repo2" rev-parse HEAD 2>/dev/null)'"
+  # An analysis names its branch at run time, and that still outranks everything.
+  prim="$( PROJECTS_FILE="$tmp/proj/both.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+           AL_BASE_OVERRIDE=feat/only-two wt_setup jTrain solo3 "$tmp/g/repo2" stampT4 "" develop 2>/dev/null )"
+  [ -n "$prim" ] && [ "$(git -C "$prim" rev-parse HEAD 2>/dev/null)" = "$(git -C "$tmp/g/repo2" rev-parse feat/only-two)" ] \
+    && ok "an analysis's branch still outranks the job's base" \
+    || bad "an analysis with a job base was cut from '$(git -C "$rdT/stampT4/repo2" rev-parse HEAD 2>/dev/null)'"
+  # Structural, like the isolation rule above: the setting is worth nothing if
+  # its one caller never reads it.
+  case "$rjbody" in
+    *"job_get \"\$id\" '.base' ''"*'wt_setup "$id" "$project" "$cwd" "$stamp" "$port_base" "$job_base"'*)
+      ok "and run_job hands wt_setup the job's base" ;;
+    *) bad "run_job never passes the job's base to wt_setup" ;;
+  esac
+  # Nothing of this block outlives it: the sweep cases further down read the
+  # whole of $tmp/wtroot.
+  for got in stampT2 stampT3 stampT4; do
+    [ ! -d "$rdT/$got" ] || printf 'done\n' > "$rdT/$got/.ended"
+  done
+  ( PROJECTS_FILE="$tmp/proj/train.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_teardown jTrain train "$rdT/stampT2" ) >/dev/null 2>&1
+  ( PROJECTS_FILE="$tmp/proj/both.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_teardown jTrain solo3 "$rdT/stampT3"; wt_teardown jTrain solo3 "$rdT/stampT4" ) >/dev/null 2>&1
+
   echo "wt_setup() — a failing hook aborts, takes down what it built, leaves nothing"
   printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$tmp/cfg/provision/two.up.sh"
   printf '%s\n' '#!/usr/bin/env bash' 'echo "$AL_REPO_NAME" >> "$tmp_down_log"' \

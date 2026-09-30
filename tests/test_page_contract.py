@@ -2267,6 +2267,65 @@ def test_the_job_editor_re_sends_what_a_platform_change_governs(srv, tmp_path):
         f"a job saved unchanged sends no set_field at all: {same}"
 
 
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_job_editor_saves_a_base_of_the_jobs_own(srv, tmp_path):
+    """A job's own base branch is a field of the editor like any other: a job
+    that opens a release train runs in a project on `release/*` whose family
+    is still empty, and the only way to give it a base was to edit jobs.json
+    by hand. Editing sends `set_field base` only when it changed -- and an
+    emptied field IS a change, the one that puts the job back on its
+    project's base; creating writes the key only when there is a value."""
+    page_html = _page(srv)
+    job_pane = page_html[page_html.index('data-edpane="job"'):page_html.index("<!-- /pane job -->")]
+    assert 'id="ed-base"' in job_pane, "the job pane has no base-branch field"
+    assert job_pane.index('id="ed-cwd"') < job_pane.index('id="ed-base"') < job_pane.index("<label>Description</label>"), \
+        "the base branch belongs with the working directory it is cut in, ahead of Description"
+    page = _js(srv)
+    assert '$("ed-base").value=j.base||"";' in _plainfn(page, "fill"), \
+        "opening a job does not load its base, so the next save would clear it"
+    app = _app_js(srv)
+
+    def run(stored, typed, creating=False):
+        script = tmp_path / f"save-editor-base-{stored or 'none'}-{typed or 'none'}-{creating}.js".replace("/", "_").replace("*", "x")
+        script.write_text(_const(app, "KNOWN_PLATFORMS") + _plainfn(app, "platformKey") + _plainfn(app, "platformOf") + """
+        const ALApp = {platformOf};
+        const sent = [];
+        const vals = {"ed-id": "j", "ed-prompt": "p", "ed-precheck": "", "ed-project": "",
+                      "ed-desc": "", "ed-cwd": "", "ed-perm": "dontAsk", "ed-base": %s};
+        const $ = (id) => ({ get value(){ return vals[id] ?? ""; }, set value(v){ vals[id] = v; },
+                             disabled: false, close(){} });
+        async function api(op, extra){ sent.push([op, extra]); return true; }
+        const DATA = {jobs: [{id: "j", platform: "anthropic", model: "claude-opus-5", prompt: "p",
+                              permission_mode: "dontAsk"%s}],
+                      projects: []};
+        const projById = (name) => DATA.projects.find(p => p.name === name) || null;
+        const readForm = () => ({platform: "anthropic", secs: 300, model: "claude-opus-5", effort: "",
+                                 interactive: false, hours: "", days: [], budget: null, maxPar: null,
+                                 daily: null, timeoutSecs: null, stallSecs: null});
+        const ED_STEPS = [], validateStep = () => "", stepForward = () => true;
+        const edWiz = {markClean(){}}, toast = () => {}, refresh = () => {};
+        let creating = %s, editingId = "j", editingPrecheck = "";
+        """ % (json.dumps(typed), (', base: ' + json.dumps(stored)) if stored else "",
+               "true" if creating else "false")
+                          + _fn(page, "saveEditor")
+                          + "\nsaveEditor().then(() => console.log(JSON.stringify(sent)));\n")
+        out = subprocess.run(["node", str(script)], capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)
+
+    def base_writes(sent):
+        return [e["value"] for op, e in sent if op == "set_field" and e["field"] == "base"]
+
+    assert base_writes(run("", "main")) == ["main"], "a base typed into the editor was not saved"
+    assert base_writes(run("main", "main")) == [], "an unchanged base was sent again"
+    assert base_writes(run("main", "")) == [""], \
+        "emptying the field must send the empty value -- that is what clears the job's base"
+    assert base_writes(run("", "")) == [], "a job with no base of its own sends none"
+    made = [e["job"] for op, e in run("", "release/*", creating=True) if op == "create"]
+    assert made and made[0].get("base") == "release/*", f"a new job lost the base it was given: {made}"
+    made = [e["job"] for op, e in run("", "", creating=True) if op == "create"]
+    assert made and "base" not in made[0], f"a new job with no base must not carry the key: {made}"
+
+
 def test_the_job_editors_model_default_is_the_platforms(srv):
     """createCombo reads cfg.def on every set(): with the catalog empty or not
     yet fetched, an empty model falls back to it. "opus" is Anthropic's and a
