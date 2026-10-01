@@ -5986,6 +5986,44 @@ NASTY
     && ok "and only the SDK's own sentence counts, not the words anywhere in a result" \
     || bad "prose mentioning a connection -> '$(cause_of '{"subtype":"error_during_execution","result":"the agent said: I cannot connect to API docs"}')'"
 
+  echo "failure causes — a denial the CLI's own safety check made is not the agent being blocked"
+  # 2026-09-30: the CLI refused one `rm` on a command substitution (no mode can
+  # allow that shape), the agent ran the literal path next and delivered its
+  # ticket, and the run was filed error / tools_denied. run_safety_denials
+  # counts the result's denials the stream calls a safetyCheck; scenario 61 in
+  # the e2e drives the whole verdict.
+  mkdir -p "$tmp/safety"
+  safety_of() { # safety_of <result-json> <stream-lines> -> "<count>|<reason>"
+    printf '%s' "$1" > "$tmp/safety/log.json"
+    printf '%s\n' "$2" > "$tmp/safety/stream.ndjson"
+    ( logfile="$tmp/safety/log.json"; streamfile="$tmp/safety/stream.ndjson"
+      run_safety_denials | tr '\t' '|' )
+  }
+  _sres='{"subtype":"success","permission_denials":[{"tool_name":"Bash","tool_use_id":"t1"}]}'
+  _sev() { # _sev <tool_use_id> <decision_reason_type> [extra-fields] -> one permission_denied event
+    printf '{"type":"system","subtype":"permission_denied","tool_name":"Bash","tool_use_id":"%s","decision_reason_type":"%s"%s,"decision_reason":"no\\tway"}' "$1" "$2" "${3:-}"
+  }
+  [ "$(safety_of "$_sres" "$(_sev t1 safetyCheck)")" = "1|no way" ] \
+    && ok "a safetyCheck denial is counted, with its reason on one line" \
+    || bad "safetyCheck -> '$(safety_of "$_sres" "$(_sev t1 safetyCheck)")'"
+  [ "$(safety_of "$_sres" "$(_sev t1 rule)")" = "0|" ] \
+    && ok "a deny rule's is not: that is the job's own configuration" \
+    || bad "rule -> '$(safety_of "$_sres" "$(_sev t1 rule)")'"
+  [ "$(safety_of "$_sres" "$(_sev t1 safetyCheck ',"decision_reason_code":"outside_reads_blocked"')")" = "0|" ] \
+    && ok "nor a safetyCheck with a reason code: that is a setting the operator can change" \
+    || bad "coded safetyCheck -> '$(safety_of "$_sres" "$(_sev t1 safetyCheck ',"decision_reason_code":"outside_reads_blocked"')")'"
+  [ "$(safety_of "$_sres" "$(_sev t9 safetyCheck)")" = "0|" ] \
+    && ok "an event for a call the result did not deny counts nothing" \
+    || bad "other call -> '$(safety_of "$_sres" "$(_sev t9 safetyCheck)")'"
+  [ "$(safety_of "$_sres" '{"type":"system","subtype":"permiss'"
+$(_sev t1 safetyCheck)")" = "1|no way" ] \
+    && ok "a stream cut off mid-line still yields the rest" \
+    || bad "truncated line cost the count"
+  [ "$( logfile="$tmp/safety/log.json"; streamfile=""; run_safety_denials | tr '\t' '|' )" = "0|" ] \
+    && ok "no stream (a platform without one) leaves every denial a denial" \
+    || bad "no stream -> '$( logfile="$tmp/safety/log.json"; streamfile=""; run_safety_denials | tr '\t' '|' )'"
+  unset -f safety_of _sev
+
   echo "failure causes — an agent that never started is start_failed, and its stderr says why"
   # Analysis 12 (2026-09-26): OpenCode failed every boot of the project
   # (measurement 39) and all 693 runs were filed `killed`, the cause left

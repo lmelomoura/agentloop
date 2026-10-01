@@ -225,7 +225,9 @@ launchd ──60s──▶ agentloop tick
 Every run is classified **success** / **warning** / **error** (error = the
 process failed, the CLI errored, or the agent had tools denied — a blocked agent
 doing nothing is a failure, not a success; warning = finished but empty result or
-stderr).
+stderr). A command the CLI's own safety check refused is not a denied tool: no
+permission setting can allow it, so the run is a warning whose note starts
+`SAFETY CHECK:` and names the CLI's reason.
 
 ---
 

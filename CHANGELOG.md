@@ -685,6 +685,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A command the CLI's own safety check refused no longer files the run as a
+  blocked agent.** Claude Code refuses a few command shapes whatever the
+  permission mode says (an `rm` whose target is a command substitution is the
+  one measured), and a headless run has nobody to approve them. A dev run hit
+  one, removed the literal path on its next call, opened its PR and moved its
+  ticket. It was still filed `error` / `tools_denied` ("it could not do the
+  work") and stepped up the failure backoff, for a refusal no job setting
+  could have prevented. The stream names why each call was denied: a denial
+  it calls a `safetyCheck` (without a reason code, which would be a setting
+  the operator can change) is no longer counted as denied tools. The run is
+  a `warning` whose note says `SAFETY CHECK:` with the CLI's reason. A
+  denial by rule or by mode is still `tools_denied`.
+
 - **A run that could not be set up no longer vanishes.** A worktree that was
   refused (no base resolvable, a failing `up` hook, a missing repo path) and a
   resume with nothing to continue in both ended with one line in tick.log and

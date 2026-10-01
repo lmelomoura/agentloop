@@ -53,6 +53,14 @@
 #                      allowed_warning, rateLimitType seven_day, utilization
 #                      0.98. rl_capture reads it off the account's own stream,
 #                      whichever account's directory this launch ran with.
+#   FAKE_DENIAL        safetyCheck | rule: one Bash call denied without a
+#                      prompt, in the four pieces CLI 2.1.284 writes for it --
+#                      the tool_use, a `system/permission_denied` event naming
+#                      the reason, the error tool_result, and the call on the
+#                      result event's `permission_denials`. safetyCheck is the
+#                      CLI's own refusal of an `rm` on a command substitution
+#                      (its type and reason as captured 2026-09-30, the
+#                      command neutral); rule is a deny rule's.
 #   $CLAUDE_CONFIG_DIR/.fake-logged-out  that one directory has no session (an account signed out)
 #   $CLAUDE_CONFIG_DIR/.fake-email       the email `auth status` names for that directory
 #   FAKE_CLAUDE_VERSION  the build this stand-in plays (default 2.1.258): what
@@ -263,6 +271,20 @@ if [ -n "${FAKE_KILLED_USAGE:-}" ]; then
   printf '{"type":"assistant","message":{"id":"msg_turn_b","usage":{"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":2000,"output_tokens":45}}}\n'
 fi
 
+denied='[]'
+if [ -n "${FAKE_DENIAL:-}" ]; then
+  case "$FAKE_DENIAL" in
+    safetyCheck) why="Dangerous rm operation on statically-unresolvable target: command substitution output" ;;
+    *)           why="Permission to use Bash has been denied by a deny rule" ;;
+  esac
+  cmd='rm -rf "$(cat /tmp/scratch-dir)"'
+  jq -nc --arg c "$cmd" '{type:"assistant",parent_tool_use_id:null,message:{content:[{type:"tool_use",id:"toolu_denied_1",name:"Bash",input:{command:$c}}]}}'
+  jq -nc --arg t "$FAKE_DENIAL" --arg w "$why" --arg s "$sid" \
+    '{type:"system",subtype:"permission_denied",tool_name:"Bash",tool_use_id:"toolu_denied_1",decision_reason_type:$t,decision_reason:$w,message:$w,session_id:$s}'
+  jq -nc --arg w "$why" '{type:"user",parent_tool_use_id:null,message:{content:[{type:"tool_result",tool_use_id:"toolu_denied_1",content:$w,is_error:true}]}}'
+  denied="$(jq -nc --arg c "$cmd" '[{tool_name:"Bash",tool_use_id:"toolu_denied_1",tool_input:{command:$c}}]')"
+fi
+
 [ -z "${FAKE_RATE_LIMIT_EVENT:-}" ] || printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785427200,"rateLimitType":"seven_day","utilization":0.98,"surpassedThreshold":0.75}}\n'
 
 case "$mode" in
@@ -287,5 +309,5 @@ case "$mode" in
     ;;
 esac
 
-printf '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"%s","total_cost_usd":0,"result":"%s"}\n' \
-  "$sid" "$result"
+printf '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"%s","total_cost_usd":0,"result":"%s","permission_denials":%s}\n' \
+  "$sid" "$result" "$denied"
