@@ -1920,6 +1920,32 @@ sleep 1
 echo
 }
 
+scenario_62() {
+echo "62. a run's usage event refreshes every window it carries, so a stale reading stops holding the fleet"
+# 2026-09-30: the seven-day reading was a statusline's from 42 hours before,
+# at 100%, and the gate held every scheduled run back on it for a night. The
+# forced runs in between went through, and each one's own events said 49% --
+# in unifiedWindows, next to the five-hour window they named, which was the
+# only one recorded.
+mkjob j62
+rl62="$ROOT/data/rate-limits.json"
+jq -n --argjson r "$(( $(date +%s) + 86400 ))" \
+  '{anthropic:{seven_day:{status:"allowed_warning",utilization:1,resets_at:$r,overage:null,seen_at:1,source:"statusline"}}}' > "$rl62"
+"$AL" usage 2>&1 | grep -q "SCHEDULED anthropic RUNS ARE BEING HELD BACK" \
+  && ok "the stale 100% holds scheduled runs back" || bad "usage: $("$AL" usage 2>&1 | head -4)"
+FAKE_MODE=complete FAKE_SESSION=sess-62 FAKE_RATE_LIMIT_EVENT=unified "$AL" run j62 >/dev/null 2>&1
+sleep 1
+[ "$(jq -r '.anthropic.seven_day | "\(.utilization) \(.status) \(.source)"' "$rl62")" = "0.49 null null" ] \
+  && ok "the run's event replaced the seven-day reading it did not name" || bad "seven_day: $(jq -c .anthropic.seven_day "$rl62")"
+[ "$(jq -r '.anthropic.five_hour | "\(.utilization) \(.status)"' "$rl62")" = "0.74 allowed" ] \
+  && ok "and the window it named keeps the event's own status" || bad "five_hour: $(jq -c .anthropic.five_hour "$rl62")"
+"$AL" usage 2>&1 | grep -q "HELD BACK" \
+  && bad "still held back: $("$AL" usage 2>&1 | head -4)" || ok "and scheduled runs go again"
+rm -f "$rl62"
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1949,11 +1975,11 @@ echo
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # re-measure when the last list grows -- and the count assertion below fails
 # if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37"
 E2E_LIST_3="38 39 40 41 41b 41c 42 43 44 45 46"
-E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59 60 61"
+E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

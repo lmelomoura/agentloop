@@ -53,6 +53,10 @@
 #                      allowed_warning, rateLimitType seven_day, utilization
 #                      0.98. rl_capture reads it off the account's own stream,
 #                      whichever account's directory this launch ran with.
+#                      `unified` emits the CLI 2.1.284 shape instead: status
+#                      allowed for the five_hour window it names, and BOTH
+#                      windows in unifiedWindows (five_hour 0.74, seven_day
+#                      0.49), each resetting a day from now.
 #   FAKE_DENIAL        safetyCheck | rule: one Bash call denied without a
 #                      prompt, in the four pieces CLI 2.1.284 writes for it --
 #                      the tool_use, a `system/permission_denied` event naming
@@ -285,7 +289,15 @@ if [ -n "${FAKE_DENIAL:-}" ]; then
   denied="$(jq -nc --arg c "$cmd" '[{tool_name:"Bash",tool_use_id:"toolu_denied_1",tool_input:{command:$c}}]')"
 fi
 
-[ -z "${FAKE_RATE_LIMIT_EVENT:-}" ] || printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785427200,"rateLimitType":"seven_day","utilization":0.98,"surpassedThreshold":0.75}}\n'
+case "${FAKE_RATE_LIMIT_EVENT:-}" in
+  "") ;;
+  unified)
+    day="$(( $(date +%s) + 86400 ))"
+    printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":%s,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.74,"resetsAt":%s},"seven_day":{"utilization":0.49,"resetsAt":%s}}}}\n' \
+      "$day" "$day" "$day" ;;
+  *)
+    printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785427200,"rateLimitType":"seven_day","utilization":0.98,"surpassedThreshold":0.75}}\n' ;;
+esac
 
 case "$mode" in
   dirty)

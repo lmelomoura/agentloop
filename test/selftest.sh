@@ -5733,6 +5733,53 @@ NASTY
     printf 'not json at all\n' > "$tmp/rl/junk.ndjson"; rl_capture "$tmp/rl/junk.ndjson" ) \
     && ok "a stream with no events is not an error" || bad "rl_capture failed on a clean stream"
 
+  # CLI 2.1.284 puts EVERY window on EVERY event, in unifiedWindows, and only
+  # the one rateLimitType names used to be recorded. 2026-09-30: a statusline's
+  # seven-day reading from 42 hours before, at 100%, held every scheduled run
+  # back while each forced run's own events said 49% -- this event is the last
+  # one such a run wrote (the times moved to the future, so the gate reads it).
+  printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":%s,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.74,"resetsAt":%s},"seven_day":{"utilization":0.49,"resetsAt":%s}}}}\n' \
+    "$soon" "$soon" "$((soon + 1))" > "$tmp/rl/u.ndjson"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/uni.json"
+    "$JQ" -n --argjson r "$soon" \
+      '{anthropic:{seven_day:{status:"allowed_warning",utilization:1,resets_at:$r,overage:null,seen_at:1,source:"statusline"}}}' \
+      > "$RATE_LIMIT_FILE"
+    [ -n "$(rl_gate)" ] || exit 3
+    rl_capture "$tmp/rl/u.ndjson"
+    "$JQ" -e --argjson r "$((soon + 1))" \
+      '.anthropic.seven_day | .utilization == 0.49 and .resets_at == $r and .status == null and (has("source") | not)' \
+      "$RATE_LIMIT_FILE" >/dev/null || exit 4
+    "$JQ" -e '.anthropic.five_hour | .utilization == 0.74 and .status == "allowed"' "$RATE_LIMIT_FILE" >/dev/null || exit 5
+    [ -z "$(rl_gate)" ] ) 2>/dev/null
+  case "$?" in
+    0) ok "a run's event records every window it carries, and a stale 100% stops holding the fleet" ;;
+    3) bad "the stale statusline reading did not gate in the first place -- the fixture proves nothing" ;;
+    4) bad "the window the event does not name was not recorded: $(cat "$tmp/rl/uni.json")" ;;
+    5) bad "the window the event names lost its own status or utilization: $(cat "$tmp/rl/uni.json")" ;;
+    *) bad "the gate still holds after the run's reading: $(cat "$tmp/rl/uni.json")" ;;
+  esac
+  # A window a later event reports at the ceiling gates on its number alone,
+  # with no status of its own to say so.
+  printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":%s,"unifiedWindows":{"seven_day":{"utilization":0.97,"resetsAt":%s}}}}\n' \
+    "$soon" "$soon" > "$tmp/rl/u2.ndjson"
+  got="$( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/uni2.json"
+          printf '{}' > "$RATE_LIMIT_FILE"; rl_capture "$tmp/rl/u2.ndjson"; rl_gate 2>/dev/null )"
+  case "$got" in
+    *"seven_day window is 97% used"*) ok "and an unnamed window at the ceiling gates on its utilization" ;;
+    *) bad "an unnamed window at 97% did not gate: '$got'" ;;
+  esac
+  # Neither field is required of a stream: an event that carries only one of
+  # the two, or a malformed unifiedWindows, records what it can.
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/uni3.json"
+    printf '{}' > "$RATE_LIMIT_FILE"
+    printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"seven_day":{"utilization":0.3,"resetsAt":5}}}}' \
+                  '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":7,"unifiedWindows":"x"}}' \
+      > "$tmp/rl/u3.ndjson"
+    rl_capture "$tmp/rl/u3.ndjson"
+    "$JQ" -e '.anthropic.seven_day.utilization == 0.3 and .anthropic.five_hour.resets_at == 7' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "an event with only unifiedWindows, or a malformed one, records what it carries" \
+    || bad "partial events: $(cat "$tmp/rl/uni3.json")"
+
   # The gate itself.
   printf '%s' '{}' > "$tmp/rl/rate-limits.json"
   got="$( DATA_DIR="$tmp/rl"; RATE_LIMIT_FILE="$tmp/rl/rate-limits.json"; rl_gate 2>/dev/null )"

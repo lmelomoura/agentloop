@@ -651,11 +651,15 @@ normal cadence. A broken precheck (see above) counts too. The card says so:
 
 ### Is the usage gate awake? `agentloop usage`
 
-The scheduler holds scheduled runs back when a usage window is spent. That gate
-reads a figure the CLI only volunteers once it has decided to warn (at 0.75), so
-`bin/statusline-rate-limits.sh` keeps it fresh from your own interactive
-sessions. Both halves are invisible when they work and invisible when they do
-not, which is a bad way to run a fleet — so the command says which:
+The scheduler holds scheduled runs back when a usage window is spent. Every
+Claude run feeds that gate from its own stream: from CLI 2.1.284 on, each
+usage event carries both windows (`unifiedWindows`), and both are recorded, so
+any run, a forced one included, replaces whatever an older reading said. Older
+CLIs only volunteer a figure once they have decided to warn (at 0.75), and only
+for one window, so `bin/statusline-rate-limits.sh` keeps the gate fresh from
+your own interactive sessions as well. Both halves are invisible when they work
+and invisible when they do not, which is a bad way to run a fleet — so the
+command says which:
 
 ```
 $ agentloop usage
