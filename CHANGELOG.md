@@ -685,6 +685,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A call a hook held once no longer files the run as a blocked agent.**
+  A knowledge-base PreToolUse hook holds every session's first change until
+  the agent has searched the project's knowledge, and lets the identical call
+  through on the retry. A reviewer did exactly that, then merged its PR and
+  moved its ticket. It was filed `error` / `tools_denied` ("it could not do
+  the work"), the morning after the same verdict had been fixed for the CLI's
+  safety checks alone. A hook leaves no `permission_denied` event, so the
+  reason cannot tell a hold from a block, but the retry can. A deny rule, a
+  mode, or a hook that keeps refusing refuses the identical call again. A
+  denial followed later in the stream by the same tool, with the same input,
+  succeeding is no longer counted.
+
 - **Run now comes back after its precheck dialog.** Cancel, or Run anyway, on
   "Nothing to do right now" left the job's Run now grey, and so did a run or
   resume refused with 409. The click handler declared `extra` twice. The second

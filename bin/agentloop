@@ -6395,6 +6395,44 @@ run_safety_denials() {
   ' "$streamfile" 2>/dev/null || printf '0\t'
 }
 
+# A DENIAL THE SAME CALL GOT PAST. A hook can hold a call once and let the
+# identical call through on the retry: a knowledge-base PreToolUse hook holds
+# every session's first change until the agent has searched the project's knowledge
+# ("It is held only once"), so nearly every run that changes anything now has
+# one denial. A reviewer did its review, merged its PR, moved its ticket and
+# was filed error / tools_denied (2026-10-01) -- the morning after the same
+# verdict had been fixed for safety checks alone. What tells a hold from a
+# block is not the reason (a hook leaves no `system/permission_denied` event
+# at all) but what happened next: a deny rule, a mode or a hook that keeps
+# refusing refuses the identical call again; a hold lets it through. Prints
+# how many of the result's denials were followed, later in the stream, by a
+# call of the same tool with the same input that succeeded. A safetyCheck is
+# left to run_safety_denials, so no denial is counted twice. Reads
+# run_classify's scope: logfile, streamfile.
+run_retried_denials() {
+  if [ -z "${streamfile:-}" ] || [ ! -s "$streamfile" ]; then printf '0'; return 0; fi
+  "$JQ" -n -R -r --slurpfile res "$logfile" '
+    [inputs | fromjson? | objects] as $ev
+    | [$ev[] | select(.type == "system" and .subtype == "permission_denied"
+                      and .decision_reason_type == "safetyCheck"
+                      and ((.decision_reason_code // "") == "")) | .tool_use_id] as $safe
+    | [$ev | to_entries[] | .key as $n
+       | (.value.message.content? // []) | arrays | .[] | objects
+       | {type, n: $n, id: (.id // .tool_use_id), name, input, failed: (.is_error == true)}] as $blocks
+    | ([$blocks[] | select(.type == "tool_result" and (.id | type) == "string")
+        | {key: .id, value: (.failed | not)}]
+       | from_entries) as $ok
+    | [$blocks[] | select(.type == "tool_use")] as $uses
+    | [($res[0].permission_denials // [])[] | . as $d
+       | select(($safe | index($d.tool_use_id)) == null)
+       | (([$uses[] | select(.id == $d.tool_use_id) | .n] | first) // -1) as $at
+       | select(any($uses[]; .id != $d.tool_use_id and .n > $at
+                             and .name == $d.tool_name and .input == $d.tool_input
+                             and $ok[.id] == true))]
+    | length
+  ' "$streamfile" 2>/dev/null || printf '0'
+}
+
 # run_classify -> the verdict, from everything the run left behind. Reads
 #   from run_job: id, rc, logfile, wdreason, slot, run_dir, cost, cost_basis,
 #   _no_result, tokens_json, model, model_id. The classifier, the stop
@@ -6431,14 +6469,18 @@ run_classify() {
   #   success — clean run, agent produced a result, nothing denied.
   # A denial the CLI's own safety check made is not "tools denied": no
   # permission could have allowed it, so it is taken out of the count here and
-  # said as a warning below (SAFETY CHECK).
-  local denials safety_denials safety_why subtype result_len errbytes cause
+  # said as a warning below (SAFETY CHECK). Nor is a denial the identical call
+  # got past on a retry (run_retried_denials): a hook that holds a call once
+  # blocked nothing, and it is taken out without a word -- it is the hook
+  # working as its owner meant, on nearly every run.
+  local denials safety_denials safety_why retried_denials subtype result_len errbytes cause
   denials="$("$JQ" -r '.permission_denials // [] | length' "$logfile" 2>/dev/null || echo 0)"
   IFS=$'\t' read -r safety_denials safety_why <<EOF
 $(run_safety_denials)
 EOF
   safety_denials="$(num "$safety_denials")"
-  denials=$(( $(num "$denials") - safety_denials ))
+  retried_denials="$(num "$(run_retried_denials)")"
+  denials=$(( $(num "$denials") - safety_denials - retried_denials ))
   [ "$denials" -ge 0 ] || denials=0
   subtype="$("$JQ" -r '.subtype // "success"' "$logfile" 2>/dev/null || echo success)"
   result_len="$("$JQ" -r '.result // "" | length' "$logfile" 2>/dev/null || echo 0)"
