@@ -6340,6 +6340,36 @@ run_start_error() {
   printf '%s' "${line:-the agent exited ${rc:-?} with nothing on stderr}"
 }
 
+# A DENIAL NO PERMISSION COULD HAVE PREVENTED. Claude Code refuses a few
+# command shapes whatever the permission mode says, and a headless run has
+# nobody to approve them: an `rm` whose target is the output of a command
+# substitution is the one measured (CLI 2.1.284, 2026-09-30), refused with the
+# way around it in the message -- "Run the substitution on its own first, then
+# remove the literal paths it prints." The agent did exactly that on its next
+# call and delivered its ticket, and the run was filed error / tools_denied --
+# "it could not do the work" -- with a backoff step, for a refusal neither the
+# job nor the operator could have prevented. The result's permission_denials
+# do not say why a call was denied; the stream does, one
+# `system/permission_denied` event per denial, with its `decision_reason_type`.
+# Prints "<count><TAB><first reason>" for the result's denials that the
+# stream calls a `safetyCheck`. A safetyCheck that carries a
+# `decision_reason_code` is a setting the operator CAN change (reads outside
+# the working directory, paused memory), so it stays a denial like any other.
+# Reads run_classify's scope: logfile, streamfile.
+run_safety_denials() {
+  if [ -z "${streamfile:-}" ] || [ ! -s "$streamfile" ]; then printf '0\t'; return 0; fi
+  "$JQ" -n -R -r --slurpfile res "$logfile" '
+    [inputs | fromjson? | objects
+       | select(.type == "system" and .subtype == "permission_denied"
+                and .decision_reason_type == "safetyCheck"
+                and ((.decision_reason_code // "") == ""))] as $safe
+    | [($res[0].permission_denials // [])[] | .tool_use_id as $t
+       | ($safe | map(select(.tool_use_id == $t)) | first) // empty] as $hit
+    | [($hit | length | tostring),
+       (($hit[0].decision_reason // "") | gsub("[\t\n]+"; " "))] | @tsv
+  ' "$streamfile" 2>/dev/null || printf '0\t'
+}
+
 # run_classify -> the verdict, from everything the run left behind. Reads
 #   from run_job: id, rc, logfile, wdreason, slot, run_dir, cost, cost_basis,
 #   _no_result, tokens_json, model, model_id. The classifier, the stop
@@ -6374,8 +6404,17 @@ run_classify() {
   #   warning — the run completed but something smells: stderr output, or an
   #             empty agent result;
   #   success — clean run, agent produced a result, nothing denied.
-  local denials subtype result_len errbytes cause
+  # A denial the CLI's own safety check made is not "tools denied": no
+  # permission could have allowed it, so it is taken out of the count here and
+  # said as a warning below (SAFETY CHECK).
+  local denials safety_denials safety_why subtype result_len errbytes cause
   denials="$("$JQ" -r '.permission_denials // [] | length' "$logfile" 2>/dev/null || echo 0)"
+  IFS=$'\t' read -r safety_denials safety_why <<EOF
+$(run_safety_denials)
+EOF
+  safety_denials="$(num "$safety_denials")"
+  denials=$(( $(num "$denials") - safety_denials ))
+  [ "$denials" -ge 0 ] || denials=0
   subtype="$("$JQ" -r '.subtype // "success"' "$logfile" 2>/dev/null || echo success)"
   result_len="$("$JQ" -r '.result // "" | length' "$logfile" 2>/dev/null || echo 0)"
   errbytes="$(wc -c < "$logfile.err" 2>/dev/null | tr -d ' ')"
@@ -6574,8 +6613,17 @@ run_classify() {
   # because a run that failed has a cause worth more than its symptom. Neither
   # exclusion touches whether `undelivered` was CHECKED (it always is, above)
   # — only whether it gets to overwrite what the card already says.
+  #
+  # A SAFETY CHECK is said here too, for the same reasons. The denials the CLI
+  # made on its own rules left the status alone above (run_safety_denials),
+  # but they still belong on the card: a refused command can be work that
+  # never happened.
   case "$status" in
     success|warning)
+      if [ "${safety_denials:-0}" -gt 0 ]; then
+        wdreason="${wdreason:-}${wdreason:+ · }SAFETY CHECK: the CLI refused ${safety_denials} command(s) that no permission setting can allow${safety_why:+ ($safety_why)}, and the run went on with the agent told why. Check that the result's claims hold."
+        status="warning"
+      fi
       if [ -n "$undelivered" ]; then
         wdreason="${wdreason:-}${wdreason:+ · }$(undelivered_note "$undelivered")"
         status="warning"
