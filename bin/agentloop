@@ -4639,6 +4639,19 @@ spent_today_all() { _spend_since_midnight ""; }
 #   utilization:   0..1, present ONLY on a warning (the CLI warns at 0.75)
 #   resetsAt:      epoch seconds -- when this window starts over
 #   overageStatus: rejected, with overageDisabledReason: org_level_disabled
+#   unifiedWindows: {five_hour: {utilization, resetsAt}, seven_day: {...}}
+#                  -- CLI 2.1.284 and later: EVERY window, on EVERY event,
+#                  utilization included even when nothing warns
+#
+# The fields above speak for the one window `rateLimitType` names, and only
+# that window used to be recorded. So a window no run's event happened to
+# name was never read again: on 2026-09-30 the seven-day reading was a
+# statusline's from 42 hours before, at 100%, and the gate held every
+# scheduled run back on it while each forced run's own events said 46-49% --
+# in unifiedWindows, which nothing read. Every window an event carries is
+# recorded now. Its `status` is the event's only for the window the event
+# names; another window's is not stated, and null is what the gate already
+# reads as "no refusal".
 #
 # `overageStatus: rejected` is what makes this worth gating on rather than
 # merely showing: with no overage to fall through to, hitting the ceiling is a
@@ -4700,16 +4713,28 @@ rl_capture() { # rl_capture <streamfile> [key] -- key: rl_key's block (anthropic
   # cost us the other 300.
   "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg k "$key" '
     ($prev[0] // {}) as $was
-    | [inputs | fromjson? | select(.type == "rate_limit_event") | .rate_limit_info // empty]
-    | map(select(.rateLimitType != null))
+    | [inputs | fromjson? | objects | select(.type == "rate_limit_event") | .rate_limit_info // empty | objects]
     | reduce .[] as $e ($was;
-        .[$k][$e.rateLimitType] = {
-          status:      ($e.status // "unknown"),
-          utilization: ($e.utilization // null),
-          resets_at:   ($e.resetsAt // null),
-          overage:     ($e.overageStatus // null),
-          seen_at:     $now
-        })
+        # Every window the event carries, the one it names or not.
+        reduce ($e.unifiedWindows | objects | to_entries[] | select(.value | type == "object")) as $w (.;
+          .[$k][$w.key] = {
+            status:      (if $w.key == $e.rateLimitType then ($e.status // "unknown") else null end),
+            utilization: ($w.value.utilization // null),
+            resets_at:   ($w.value.resetsAt // null),
+            overage:     ($e.overageStatus // null),
+            seen_at:     $now
+          })
+        # The window it names, from its own fields: what every CLI before
+        # unifiedWindows reported, and still the one place its status lives.
+        | if $e.rateLimitType == null then . else
+            .[$k][$e.rateLimitType] = {
+              status:      ($e.status // "unknown"),
+              utilization: ($e.utilization // ($e.unifiedWindows | objects | .[$e.rateLimitType] | objects | .utilization) // null),
+              resets_at:   ($e.resetsAt // null),
+              overage:     ($e.overageStatus // null),
+              seen_at:     $now
+            }
+          end)
   ' "$sf" > "$tmp" 2>/dev/null && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
   rm -f "$tmp" 2>/dev/null
   lock_drop "$lock"

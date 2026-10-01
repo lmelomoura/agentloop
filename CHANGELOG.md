@@ -685,6 +685,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A stale usage reading no longer holds the whole fleet back.** Claude Code
+  2.1.284 reports both usage windows on every `rate_limit_event`, in
+  `unifiedWindows`. Only the window the event names (`rateLimitType`, nearly
+  always the five-hour one) was recorded, so the seven-day reading was never
+  refreshed by a run. A statusline's reading from 42 hours earlier, at 100%,
+  then held every scheduled run back for a night, and a ticket waiting for
+  review sat in the queue. Each forced run in between said 49% in the very
+  events nothing read. Every window an event carries is recorded now, with
+  the event's status kept for the window it names. Any run, a forced one
+  included, replaces an older reading of either window.
+
 - **A command the CLI's own safety check refused no longer files the run as a
   blocked agent.** Claude Code refuses a few command shapes whatever the
   permission mode says (an `rm` whose target is a command substitution is the
