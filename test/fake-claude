@@ -65,6 +65,12 @@
 #                      CLI's own refusal of an `rm` on a command substitution
 #                      (its type and reason as captured 2026-09-30, the
 #                      command neutral); rule is a deny rule's.
+#                      hook | hook-refuses: a PreToolUse hook refuses one Write
+#                      (no `permission_denied` event: a hook leaves none, as
+#                      captured 2026-10-01) and the agent sends the identical
+#                      call again. `hook` lets the retry through, the way
+#                      a knowledge-base hook holds a session's first change
+#                      only once; `hook-refuses` refuses it too.
 #   $CLAUDE_CONFIG_DIR/.fake-logged-out  that one directory has no session (an account signed out)
 #   $CLAUDE_CONFIG_DIR/.fake-email       the email `auth status` names for that directory
 #   FAKE_CLAUDE_VERSION  the build this stand-in plays (default 2.1.258): what
@@ -276,6 +282,22 @@ if [ -n "${FAKE_KILLED_USAGE:-}" ]; then
 fi
 
 denied='[]'
+case "${FAKE_DENIAL:-}" in
+  hook|hook-refuses)
+    held="PreToolUse:Write hook error: the hook holds this session's first change; retry it"
+    w='{"file_path":"notes/finding.md","content":"a finding"}'
+    jq -nc --argjson i "$w" '{type:"assistant",parent_tool_use_id:null,message:{content:[{type:"tool_use",id:"toolu_held_1",name:"Write",input:$i}]}}'
+    jq -nc --arg h "$held" '{type:"user",parent_tool_use_id:null,message:{content:[{type:"tool_result",tool_use_id:"toolu_held_1",content:$h,is_error:true}]}}'
+    jq -nc --argjson i "$w" '{type:"assistant",parent_tool_use_id:null,message:{content:[{type:"tool_use",id:"toolu_held_2",name:"Write",input:$i}]}}'
+    if [ "$FAKE_DENIAL" = hook ]; then
+      jq -nc '{type:"user",parent_tool_use_id:null,message:{content:[{type:"tool_result",tool_use_id:"toolu_held_2",content:"File created successfully at: notes/finding.md"}]}}'
+      denied="$(jq -nc --argjson i "$w" '[{tool_name:"Write",tool_use_id:"toolu_held_1",tool_input:$i}]')"
+    else
+      jq -nc --arg h "$held" '{type:"user",parent_tool_use_id:null,message:{content:[{type:"tool_result",tool_use_id:"toolu_held_2",content:$h,is_error:true}]}}'
+      denied="$(jq -nc --argjson i "$w" '[{tool_name:"Write",tool_use_id:"toolu_held_1",tool_input:$i},{tool_name:"Write",tool_use_id:"toolu_held_2",tool_input:$i}]')"
+    fi
+    FAKE_DENIAL="" ;;
+esac
 if [ -n "${FAKE_DENIAL:-}" ]; then
   case "$FAKE_DENIAL" in
     safetyCheck) why="Dangerous rm operation on statically-unresolvable target: command substitution output" ;;

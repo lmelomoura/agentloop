@@ -227,7 +227,11 @@ process failed, the CLI errored, or the agent had tools denied — a blocked age
 doing nothing is a failure, not a success; warning = finished but empty result or
 stderr). A command the CLI's own safety check refused is not a denied tool: no
 permission setting can allow it, so the run is a warning whose note starts
-`SAFETY CHECK:` and names the CLI's reason.
+`SAFETY CHECK:` and names the CLI's reason. Nor is a call a hook held once and
+then let through when the agent sent the identical call again, which is what a
+hook that wants something done first (such as searching the project's
+knowledge) does. That blocked nothing, so it does not count against the run.
+A denial the identical retry met again is still a denied tool.
 
 ---
 

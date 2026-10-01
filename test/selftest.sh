@@ -6071,6 +6071,79 @@ $(_sev t1 safetyCheck)")" = "1|no way" ] \
     || bad "no stream -> '$( logfile="$tmp/safety/log.json"; streamfile=""; run_safety_denials | tr '\t' '|' )'"
   unset -f safety_of _sev
 
+  echo "failure causes — a denial the identical call got past on a retry is not the agent being blocked"
+  # 2026-10-01: a knowledge-base PreToolUse hook holds every session's first
+  # change until the agent has searched the project's knowledge. A reviewer sent the
+  # identical Write again, it went through, the review was merged -- and the
+  # run was filed error / tools_denied. A hook leaves no permission_denied
+  # event, so what tells a hold from a block is the retry: a rule, a mode or a
+  # hook that keeps refusing refuses the identical call again.
+  mkdir -p "$tmp/retry"
+  retried_of() { # retried_of <result-json> <stream-lines> -> run_retried_denials' count
+    printf '%s' "$1" > "$tmp/retry/log.json"
+    printf '%s\n' "$2" > "$tmp/retry/stream.ndjson"
+    ( logfile="$tmp/retry/log.json"; streamfile="$tmp/retry/stream.ndjson"; run_retried_denials )
+  }
+  _use() { printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"%s","name":"%s","input":%s}]}}' "$1" "$2" "$3"; }
+  _res() { printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"%s","content":"x","is_error":%s}]}}' "$1" "$2"; }
+  _w='{"file_path":"a.md","content":"x"}'
+  _rres="{\"permission_denials\":[{\"tool_name\":\"Write\",\"tool_use_id\":\"w1\",\"tool_input\":$_w}]}"
+  _held="$(_use w1 Write "$_w")
+$(_res w1 true)"
+  [ "$(retried_of "$_rres" "$_held
+$(_use w2 Write "$_w")
+$(_res w2 false)")" = "1" ] \
+    && ok "a call held once and let through on the identical retry is counted" \
+    || bad "held then passed -> '$(retried_of "$_rres" "$_held
+$(_use w2 Write "$_w")
+$(_res w2 false)")'"
+  [ "$(retried_of "$_rres" "$_held
+$(_use w2 Write "$_w")
+$(_res w2 true)")" = "0" ] \
+    && ok "a retry refused again is not: that is a block" \
+    || bad "refused twice was counted as got past"
+  [ "$(retried_of "$_rres" "$_held
+$(_use w2 Write '{"file_path":"b.md","content":"x"}')
+$(_res w2 false)")" = "0" ] \
+    && ok "a different call that succeeded is not the same call" \
+    || bad "a different input was taken for the retry"
+  [ "$(retried_of "$_rres" "$(_use w0 Write "$_w")
+$(_res w0 false)
+$_held")" = "0" ] \
+    && ok "an identical call that succeeded only BEFORE the denial is no retry" \
+    || bad "an earlier success was taken for the retry"
+  [ "$(retried_of "$_rres" "$_held
+$(_use w2 Edit "$_w")
+$(_res w2 false)")" = "0" ] \
+    && ok "the same input under another tool is not the same call" \
+    || bad "another tool was taken for the retry"
+  [ "$(retried_of "$_rres" "$_held
+$(_use w2 Write '{"content":"x","file_path":"a.md"}')
+$(_res w2 false)")" = "1" ] \
+    && ok "the input is compared as JSON, whatever its key order" \
+    || bad "key order made the identical call look different"
+  # Single-quoted into variables first: a `\"` inside `$( )` inside double
+  # quotes reaches bash 3.2 unquoted, and the braces of a JSON line with commas
+  # in it are brace-expanded into separate words.
+  _safe='{"type":"system","subtype":"permission_denied","tool_use_id":"w1","decision_reason_type":"safetyCheck"}'
+  _cut='{"type":"assist'
+  [ "$(retried_of "$_rres" "$_held
+$_safe
+$(_use w2 Write "$_w")
+$(_res w2 false)")" = "0" ] \
+    && ok "a safetyCheck denial is left to run_safety_denials, never counted twice" \
+    || bad "a safetyCheck denial was also counted as retried"
+  [ "$(retried_of "$_rres" "$_held
+$_cut
+$(_use w2 Write "$_w")
+$(_res w2 false)")" = "1" ] \
+    && ok "a stream line cut off mid-write costs nothing" \
+    || bad "a truncated line cost the count"
+  [ "$( logfile="$tmp/retry/log.json"; streamfile=""; run_retried_denials )" = "0" ] \
+    && ok "no stream leaves every denial a denial" \
+    || bad "no stream -> '$( logfile="$tmp/retry/log.json"; streamfile=""; run_retried_denials )'"
+  unset -f retried_of _use _res
+
   echo "failure causes — an agent that never started is start_failed, and its stderr says why"
   # Analysis 12 (2026-09-26): OpenCode failed every boot of the project
   # (measurement 39) and all 693 runs were filed `killed`, the cause left

@@ -1946,6 +1946,33 @@ rm -f "$rl62"
 echo
 }
 
+scenario_63() {
+echo "63. a call a hook held once and let through on the identical retry blocked nothing"
+# 2026-10-01: a knowledge-base PreToolUse hook holds every session's first
+# change until the agent has searched the project's knowledge. The reviewer sent the
+# same Write again, it went through, the review was merged and the ticket
+# moved -- and the run was filed error / tools_denied, the morning after that
+# verdict had been fixed for the CLI's safety checks alone.
+mkjob j63
+FAKE_MODE=complete FAKE_DENIAL=hook FAKE_SESSION=sess-held "$AL" run j63 >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r '.status + "/" + .cause')" = "success/" ] \
+  && ok "success, with no failure cause" || bad "$(lastrun | jq -c '{status,cause,note}')"
+[ "$(jq -r '.j63.fail_streak' "$ROOT/data/state.json")" = "0" ] \
+  && ok "and no step of the failure backoff" || bad "fail_streak: $(jq -c '.j63' "$ROOT/data/state.json")"
+grep -q "j63: finished status=success rc=0 denials=0 " "$ROOT/data/tick.log" \
+  && ok "tick.log counts no blocking denial" || bad "tick.log: $(grep 'j63: finished' "$ROOT/data/tick.log" | tail -1)"
+
+# A hook that refuses the retry too is blocking the agent.
+FAKE_MODE=complete FAKE_DENIAL=hook-refuses FAKE_SESSION=sess-refused "$AL" run j63 >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r '.status + "/" + .cause')" = "error/tools_denied" ] \
+  && ok "a hook that refuses the identical retry as well is still error / tools_denied" \
+  || bad "$(lastrun | jq -c '{status,cause}')"
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -1975,11 +2002,11 @@ echo
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # re-measure when the last list grows -- and the count assertion below fails
 # if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37"
 E2E_LIST_3="38 39 40 41 41b 41c 42 43 44 45 46"
-E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62"
+E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to
