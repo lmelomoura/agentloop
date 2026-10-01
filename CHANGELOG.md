@@ -685,6 +685,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Run now comes back after its precheck dialog.** Cancel, or Run anyway, on
+  "Nothing to do right now" left the job's Run now grey, and so did a run or
+  resume refused with 409. The click handler declared `extra` twice. The second
+  declaration, the request body of the plain actions, sat at the top of the
+  `try` block, so every earlier use of `extra` in that block threw a
+  ReferenceError before the button was handed back. This had been so since
+  the pending-button guard went in on 2026-09-04; the tests read the handler's
+  text and never ran it. A new test runs it, with the real pending helpers,
+  through every exit.
+
 - **A stale usage reading no longer holds the whole fleet back.** Claude Code
   2.1.284 reports both usage windows on every `rate_limit_event`, in
   `unifiedWindows`. Only the window the event names (`rateLimitType`, nearly
