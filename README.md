@@ -1314,7 +1314,12 @@ which has no session is refused in `tick.log` before a slot is taken; the
 Codex rollout is read from the run's own `CODEX_HOME`; the usage-window gate
 is the account's own (`data/rate-limits.json` keys every account directory as
 `<platform>@<dir>`), and the statusline feeds the account its session runs as
-— wire it in each account's own `settings.json`; the agentloop skills are
+— wire it in each account's own `settings.json`. Every reading also carries
+the account it was measured on (the account and organization in the
+directory's `.claude.json`, the account in Codex's `auth.json`), and the gate
+reads a reading only while that account is still the one logged in on the
+directory: logging a directory into another account lifts a hold the first
+account's window had placed, at once; the agentloop skills are
 linked into every account directory. The model probes and the catalog
 refreshes run on the Default. OpenCode has no accounts: its credentials are
 the providers configured in opencode itself.

@@ -5888,6 +5888,53 @@ NASTY
           rl_gate "anthropic@/x/.claude-a" "Client A" 2>/dev/null )"
   case "$got" in *"the anthropic five_hour window of Client A is spent (API says rejected)"*) ok "and so does the refusal sentence" ;; *) bad "named refusal gate: '$got'" ;; esac
 
+  # A READING IS AN ACCOUNT'S, NOT A DIRECTORY'S. On 2026-10-02 the operator
+  # logged the CLI's own directory into a second account to get past a spent
+  # five-hour window, and the gate held every launch back on the first
+  # account's 99% for another 90 minutes: the block is keyed by the directory,
+  # and nothing said whose the reading was. A reading now carries the account
+  # it was measured on, and the gate reads it only while that account is the
+  # one logged in on the key's directory.
+  mkdir -p "$tmp/rl/who"
+  printf '%s' '{"oauthAccount":{"accountUuid":"acct-a","organizationUuid":"org-1"}}' > "$tmp/rl/who/.claude.json"
+  got="$(account_identity anthropic "$tmp/rl/who")"
+  [ "$got" = "acct-a:org-1" ] \
+    && ok "account_identity reads the account and organization the CLI logged in there" || bad "account_identity: '$got'"
+  printf '%s' '{"tokens":{"account_id":"oa-1"}}' > "$tmp/rl/who/auth.json"
+  got="$(account_identity openai "$tmp/rl/who")"
+  [ "$got" = "oa-1" ] && ok "and the account the Codex CLI logged in there" || bad "account_identity openai: '$got'"
+  [ -z "$(account_identity anthropic "$tmp/rl/nobody")" ] \
+    && ok "and nothing for a directory nobody logged in on" || bad "identity for an empty directory"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/who.json"
+    printf '%s' '{}' > "$RATE_LIMIT_FILE"
+    rl_capture "$tmp/rl/s.ndjson" "anthropic@$tmp/rl/who" "acct-a:org-1"
+    "$JQ" -e --arg k "anthropic@$tmp/rl/who" '.[$k].seven_day.account == "acct-a:org-1"' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "rl_capture stamps a reading with the account it was measured on" || bad "rl_capture stamp: $(cat "$tmp/rl/who.json")"
+  ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/who-oa.json"
+    printf '%s' '{}' > "$RATE_LIMIT_FILE"
+    rl_capture_openai "$BASE_DIR/test/fixtures/codex/rollout-sample.stripped.jsonl" "" "openai@$tmp/rl/who" "oa-1"
+    "$JQ" -e --arg k "openai@$tmp/rl/who" '.[$k].five_hour.account == "oa-1"' "$RATE_LIMIT_FILE" >/dev/null ) \
+    && ok "and so does rl_capture_openai" || bad "rl_capture_openai stamp: $(cat "$tmp/rl/who-oa.json")"
+  who_gate() { # who_gate <stamp, or - for none> [verb] -> rl_gate (or the verb) over a 97% five-hour reading carrying it
+    ( DATA_DIR="$tmp/rl"; LOCK_DIR="$tmp/rl/locks"; RATE_LIMIT_FILE="$tmp/rl/who-gate.json"
+      "$JQ" -n --arg k "anthropic@$tmp/rl/who" --argjson r "$soon" --arg a "$1" \
+        '{($k): {five_hour: ({status:"allowed", utilization:0.97, resets_at:$r, overage:null, seen_at:0}
+                             + (if $a == "-" then {} else {account:$a} end))}}' > "$RATE_LIMIT_FILE"
+      "${2:-rl_gate}" "anthropic@$tmp/rl/who" 2>/dev/null )
+  }
+  [ -n "$(who_gate "acct-a:org-1")" ] \
+    && ok "a spent reading of the account logged in holds its runs back" || bad "the logged-in account's 97% held nothing"
+  got="$(who_gate "acct-b:org-1")"
+  [ -z "$got" ] && ok "one measured on another account does not: the login was switched" || bad "another account's reading held: $got"
+  [ -n "$(who_gate -)" ] && ok "an unstamped reading still holds, as every reading did before" || bad "an unstamped reading was dropped"
+  [ "$(who_gate "acct-a:org-1" rl_gate_until)" = "$soon" ] \
+    && ok "rl_gate_until says when the windows holding it back reset" || bad "rl_gate_until: '$(who_gate "acct-a:org-1" rl_gate_until)'"
+  [ -z "$(who_gate "acct-b:org-1" rl_gate_until)" ] \
+    && ok "and says nothing when none does" || bad "rl_gate_until for another account: '$(who_gate "acct-b:org-1" rl_gate_until)'"
+  rm -f "$tmp/rl/who/.claude.json"
+  [ -n "$(who_gate "acct-b:org-1")" ] \
+    && ok "with nobody to compare against, a stamped reading is read as before" || bad "a stamped reading was dropped with no login to compare"
+
   echo "statusline-rate-limits.sh — the figure the run stream never carries"
   # The stream only reports utilisation once the CLI has decided to warn (0.75),
   # so below that the gate is armed and blind. The statusLine payload has the
@@ -5935,6 +5982,23 @@ NASTY
   # healthy run the moment this script was installed.
   got="$( DATA_DIR="$tmp/sl"; RATE_LIMIT_FILE="$tmp/sl/rate-limits.json"; rl_gate 2>/dev/null )"
   [ -z "$got" ] && ok "a reading with no status is not a refusal" || bad "gated on a status-less reading: $got"
+
+  # Whose windows they are: the account logged in on the session's own
+  # directory, stamped on what it writes -- the gate reads a reading only
+  # while its account is still the one logged in there. And a switched
+  # account never inherits the status a stream gave the previous one, even
+  # for a window that resets at the same moment.
+  mkdir -p "$tmp/sl/who"
+  printf '%s' '{"oauthAccount":{"accountUuid":"acct-a","organizationUuid":"org-1"}}' > "$tmp/sl/who/.claude.json"
+  "$JQ" -n --arg k "anthropic@$tmp/sl/who" \
+    '{($k): {five_hour: {status:"allowed_warning", utilization:0.99, resets_at:111, overage:"rejected", seen_at:0, account:"acct-z:org-1"}}}' \
+    > "$tmp/sl/rate-limits.json"
+  printf '%s' '{"rate_limits":{"five_hour":{"used_percentage":40,"resets_at":111}}}' \
+    | CLAUDE_CONFIG_DIR="$tmp/sl/who" AGENTLOOP_DATA="$tmp/sl" AGENTLOOP_STATUSLINE_MIN_SECONDS=0 sh "$sl" >/dev/null 2>&1
+  got="$("$JQ" -c --arg k "anthropic@$tmp/sl/who" '.[$k].five_hour | [.account, .status, .overage, .utilization]' "$tmp/sl/rate-limits.json" 2>/dev/null)"
+  [ "$got" = '["acct-a:org-1",null,null,0.4]' ] \
+    && ok "the statusline stamps its reading with the account logged in, and keeps nothing of another account's" \
+    || bad "statusline stamp: $got"
 
   # Its `$was` migration carries rl_migrate's precedence rule, for the same
   # reason: a file holding BOTH shapes must not lose the fresher top-level

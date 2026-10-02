@@ -685,6 +685,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Logging the CLI into another account lifts a usage hold at once.** A
+  usage reading was filed under the account's directory alone, so after
+  `~/.claude` was logged into a second account to get past a spent
+  five-hour window, every launch (and every Resume of a paused analysis)
+  was still held back on the first account's 99% until that window reset,
+  90 minutes later. Every reading now carries the account it was measured
+  on — the account and organization in the directory's `.claude.json`, the
+  account in Codex's `auth.json`, read as the run launched, or by the
+  statusline as it writes — and the gate reads a reading only while that
+  account is still the one logged in there. `agentloop usage` says when a
+  reading is another account's. A reading with no account (written before
+  this, or by a login that has none) holds as it always did.
+
 - **A call a hook held once no longer files the run as a blocked agent.**
   A knowledge-base PreToolUse hook holds every session's first change until
   the agent has searched the project's knowledge, and lets the identical call

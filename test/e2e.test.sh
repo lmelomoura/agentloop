@@ -1973,6 +1973,45 @@ sleep 1
 echo
 }
 
+scenario_64() {
+echo "64. a usage reading is the account's that was logged in, so switching the login lifts the hold"
+# 2026-10-02: an analysis paused at 98% of the five-hour window; the operator
+# logged the CLI's directory into a second account, and every launch was
+# still held back on the first account's 99% until it reset 90 minutes later.
+mkdir -p "$ROOT/accounts/claude-64"
+"$AL" platform account-add anthropic "Switched" "$ROOT/accounts/claude-64" >/dev/null 2>&1 || bad "account-add failed"
+login64() { printf '{"oauthAccount":{"accountUuid":"%s","organizationUuid":"org-64"}}\n' "$1" > "$ROOT/accounts/claude-64/.claude.json"; }
+k64="anthropic@$ROOT/accounts/claude-64"
+rl64="$ROOT/data/rate-limits.json"
+rm -f "$rl64"
+mkjob_acct j64 switched
+login64 acct-first
+FAKE_MODE=complete FAKE_SESSION=sess-64 FAKE_RATE_LIMIT_EVENT=unified "$AL" run j64 >/dev/null 2>&1
+sleep 1
+[ "$(jq -r --arg k "$k64" '[.[$k][].account] | unique | join(",")' "$rl64" 2>/dev/null)" = "acct-first:org-64" ] \
+  && ok "the run's readings carry the account logged in as it launched" || bad "readings: $(jq -c --arg k "$k64" '.[$k]' "$rl64" 2>/dev/null)"
+
+jq --arg k "$k64" --argjson r "$(( $(date +%s) + 3600 ))" \
+  '.[$k].five_hour = {status:"allowed_warning", utilization:0.99, resets_at:$r, overage:null, seen_at:1, account:"acct-first:org-64"}' \
+  "$rl64" > "$rl64.next" && mv "$rl64.next" "$rl64"
+"$AL" _exec j64 >/dev/null 2>&1
+grep -qF "j64: usage limit reached — the anthropic five_hour window of Switched is 99% used" "$ROOT/data/tick.log" \
+  && ok "that account's 99% holds its scheduled runs back" || bad "no hold: $(tail -3 "$ROOT/data/tick.log")"
+
+login64 acct-second
+"$AL" usage 2>&1 | grep -q "measured on another account than the one logged in there now" \
+  && ok "after the login switch, usage says the reading is another account's" || bad "usage: $("$AL" usage 2>&1 | head -6)"
+"$AL" usage 2>&1 | grep -q "SCHEDULED anthropic (Switched) RUNS ARE BEING HELD BACK" \
+  && bad "usage still reports the hold: $("$AL" usage 2>&1 | grep -A1 HELD)" || ok "and no hold"
+FAKE_MODE=complete FAKE_SESSION=sess-64b "$AL" _exec j64 >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .session)" = "sess-64b" ] \
+  && ok "and the next scheduled run goes ahead on the new account" || bad "still held: $(tail -3 "$ROOT/data/tick.log")"
+rm -f "$rl64"
+
+echo
+}
+
 
 # ---------------------------------------------------------------- the runner
 # The scenarios in file order. E2E_WORKERS=4, the default, runs the four
@@ -2002,11 +2041,11 @@ echo
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # re-measure when the last list grows -- and the count assertion below fails
 # if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37"
 E2E_LIST_3="38 39 40 41 41b 41c 42 43 44 45 46"
-E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63"
+E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to
