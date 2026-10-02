@@ -697,7 +697,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   11:00 AM.* The downloaded report opens with the same sentence. A Resume
   while the usage window or a daily cap is still closed is refused, naming
   the gate (the same for Retry). The tick resumes an analysis those two
-  gates paused once they reopen, and the page wakes up then to show it. A
+  gates paused once they reopen (`agentloop security paused` lists them),
+  and the page wakes up then to show it. A
   stop, a failure, or units that cannot start still wait for a person. The
   sentences older pauses left in a paragraph are cut from it.
 - **The coverage box no longer repeats the whole paragraph.** Under the

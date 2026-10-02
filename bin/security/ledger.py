@@ -399,6 +399,9 @@ _PAUSE_SENTENCE = re.compile(
 
 
 def _drop_pause_sentences(conn):
+    # A table older than the paragraph itself has nothing to cut.
+    if "coverage_note" not in {r["name"] for r in conn.execute("PRAGMA table_info(analysis)")}:
+        return
     rows = conn.execute("SELECT id, coverage_note FROM analysis WHERE coverage_note LIKE ?",
                         ("%The engine interrupted this analysis because %",)).fetchall()
     for r in rows:

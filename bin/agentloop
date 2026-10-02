@@ -9495,8 +9495,8 @@ case "${1:-}" in
                # (AGENT_FORBIDDEN in bin/security/cli.py refuses every one of
                # those to an agent session; the engine reaches them through
                # security_engine_py, or the orchestrator's own environment,
-               # with the flag unset); unit-prompt and units are the engine's
-               # reads of the pipeline; migrate-rules is the operator's too,
+               # with the flag unset); unit-prompt, units and paused are the
+               # engine's reads of the pipeline; migrate-rules is the operator's too,
                # though NOT refused the agent -- it takes no arguments and
                # can only apply the rename map this repository declares;
                # export-findings is the operator's export; and index-data,
@@ -9506,7 +9506,7 @@ case "${1:-}" in
                # this message names every verb the door actually accepts, not
                # just the subset any one caller uses (tests/security/
                # test_cli_doors.py pins it against the CLI's own parser).
-               "")      die "usage: agentloop security <analyze|resume|retry|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|unit-close|units|read|verify-queue|interrupt|abandon|reopen|orchestrate|finish|checklist|render|export-findings|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
+               "")      die "usage: agentloop security <analyze|resume|retry|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|unit-close|units|read|verify-queue|interrupt|paused|abandon|reopen|orchestrate|finish|checklist|render|export-findings|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
                *)       security_py "$@" ;;
              esac ;;
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"

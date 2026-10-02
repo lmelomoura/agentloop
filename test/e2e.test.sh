@@ -329,17 +329,18 @@ aid9="$(secid "$out9")"
 # Every unit's agent exits 3 before its first event: start failures, which
 # keep the unit's attempt. Three in a row, over two lineages, close the
 # orchestrator's gate, and the analysis is left interrupted with the cause in
-# its note -- for a Resume once it is fixed, never a `running` row nobody
+# its pause -- for a Resume once it is fixed, never a `running` row nobody
 # closes, and never every unit given up one by one.
 w=0
 while [ "$w" -lt 60 ] && [ "$(secstate sandbox "$aid9")" = "running" ]; do sleep 1; w=$((w + 1)); done
 [ "$(secstate sandbox "$aid9")" = "interrupted" ] \
   && ok "a claude that exits without a word leaves the row interrupted, not running (waited ${w}s)" \
   || bad "left '$(secstate sandbox "$aid9")' after ${w}s"
-case "$(secnote sandbox "$aid9")" in
-  *"the agent could not start: 3 units in a row"*"the agent exited 3 with nothing on stderr"*)
-    ok "and the note names the pause and the agent's exit" ;;
-  *) bad "no pause in the coverage note: '$(secnote sandbox "$aid9")'" ;;
+pause9="$("$AL" security list --project sandbox | jq -r --argjson a "$aid9" '.[] | select(.id == $a) | .pause | fromjson? | "\(.kind) \(.reason)"')"
+case "$pause9" in
+  "breaker the agent could not start: 3 units in a row"*"the agent exited 3 with nothing on stderr"*)
+    ok "and its pause names the cause and the agent's exit, for a person to fix" ;;
+  *) bad "no such pause: '$pause9'" ;;
 esac
 sleep 1
 
