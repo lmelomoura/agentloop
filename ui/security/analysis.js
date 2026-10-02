@@ -72,6 +72,67 @@ export function wireLaunchDialog(){
 let secTimer = null;
 export function secStopPoll(){ if(secTimer){ clearInterval(secTimer); secTimer = null; } }
 
+/* WHY AN INTERRUPTED ANALYSIS STOPPED -- the row's own `pause` column
+   (security/ledger.py pause_doc): {kind, at, reason, until}, or {} for a row
+   from before the column, an interruption nobody named, or a value this
+   screen cannot read. Parsed here and never trusted to be anything, the way
+   secRenderCoveragePhases treats `coverage`. */
+export const SEC_SELF_LIFTING = ["usage", "cap"];
+export function secPauseOf(a){
+  try{
+    const p = JSON.parse((a && a.pause) || "");
+    return p && typeof p === "object" && !Array.isArray(p) && p.kind ? p : {};
+  }catch(e){ return {}; }
+}
+
+// A pause's moment on the reader's own clock: the time alone today, the day
+// as well otherwise ("Sat 12:00 AM" for a daily cap that reopens at
+// midnight). "en-US", as the rest of the page's dates.
+export function secPauseTime(epoch){
+  const d = new Date(Number(epoch) * 1000);
+  const time = {hour: "numeric", minute: "2-digit"};
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString("en-US", time)
+    : d.toLocaleString("en-US", {weekday: "short", ...time});
+}
+
+/* WHAT PAUSED IT AND WHAT HAPPENS NEXT, in one line -- the twin of the
+   downloaded report's own (bin/security/report.py, pause_sentence). On
+   2026-10-02 the reason was the last sentence of a two-thousand-character
+   paragraph, said twice (98%, then 99%), and the Resume pressed under it
+   ran for one second and stopped on the same limit -- "nothing happens".
+   '' with no pause: the caller says "interrupted" alone. */
+export function secPauseSentence(p){
+  if(!p || !p.kind) return "";
+  const at = p.at ? secPauseTime(p.at) : "an unrecorded time";
+  const reason = String(p.reason || "").trim().replace(/\.$/, "");
+  if(p.kind === "stopped") return "Stopped at " + at + ". Resume continues it where it left off.";
+  const head = "Paused at " + at;
+  if(SEC_SELF_LIFTING.includes(p.kind)){
+    return head + " by " + (p.kind === "usage" ? "the usage limit" : "the daily cap") + ": "
+      + reason + ". It resumes by itself "
+      + (p.until ? "at " + secPauseTime(p.until) : "once that reopens") + ".";
+  }
+  if(p.kind === "breaker") return head + ": " + reason + ". Resume it once that is fixed.";
+  return head + ": " + reason + ". Resume continues it where it left off.";
+}
+
+/* One wake-up for the soonest moment a self-lifting pause on screen reopens:
+   the tick resumes the analysis within a minute of it (security_resume_paused
+   in bin/agentloop), and the screen should show that without a reload --
+   without polling every four seconds for the hour before it, either. Past
+   that moment secSyncPoll polls until the row moves. */
+let secPauseWake = null;
+function secArmPauseWake(until){
+  if(secPauseWake){ clearTimeout(secPauseWake); secPauseWake = null; }
+  if(!until) return;
+  const ms = Math.min(Math.max(until * 1000 - Date.now(), 0) + 5000, 2147483647);
+  secPauseWake = setTimeout(() => {
+    secPauseWake = null;
+    if(AL.currentView === "security" && secState.project) secReload(false);
+  }, ms);
+}
+
 /* Whether the run behind an analysis of this project still holds its slot.
    An analysis is closed TWICE: by the agent (`finish`), and again by the
    engine once the agent's process has exited -- with the run's real cost,
@@ -99,8 +160,21 @@ export function secSyncPoll(){
   // reload, over $19.29 already recorded -- and an agent's `done` the engine
   // lowered to `capped` would have stayed on screen as Done.
   const here = AL.currentView === "security" && secState.project;
+  // A pause that lifts by itself and whose moment has come: the tick is about
+  // to resume it, so watch until the row moves -- for ten minutes at most, so
+  // a scheduler that is not ticking cannot keep this screen polling. One whose
+  // moment is still ahead arms a single wake-up for it instead
+  // (secArmPauseWake).
+  const now = Date.now() / 1000;
+  const lifting = secState.analyses
+    .filter(a => a.state === "interrupted")
+    .map(secPauseOf)
+    .filter(p => SEC_SELF_LIFTING.includes(p.kind) && p.until);
   const watch = here && (secState.analyses.some(a => a.state === "running")
-                         || secRunStillHeld());
+                         || secRunStillHeld()
+                         || lifting.some(p => p.until <= now && now - p.until < 600));
+  const ahead = lifting.map(p => p.until).filter(t => t > now);
+  secArmPauseWake(here && ahead.length ? Math.min(...ahead) : null);
   // The poll tick itself must not force a full header/tabs/sidebar refetch
   // (see secReload's own comment) -- every OTHER caller of secReload still
   // does, by leaving its argument at the default.
@@ -119,7 +193,7 @@ export function secSyncPoll(){
 /* Coming back to a project screen re-reads it and picks the poll back up: what
    is on it may be minutes old, and leaving the page stopped the watching. */
 export function secEnter(){ if(secState.project) secReload(); else secLoadIndex(false); }
-export function secLeave(){ secStopPoll(); }
+export function secLeave(){ secStopPoll(); secArmPauseWake(null); }
 
 /* `fromHistory` (F4 history layer): true for exactly two kinds of caller,
    neither of which is a reader pressing "All projects" -- ALSecurity.navigate
@@ -500,6 +574,28 @@ function secRenderRunNotice(a){
    rather than an empty disclosure that opens onto nothing. An analysis
    written before the `coverage` column existed carries no phases at all, and
    this hides itself: that screen is exactly what it was. */
+/* THE PARAGRAPH, MINUS WHAT THE PHASES ALREADY SAY. Every phase's prose is a
+   character-for-character run of `coverage_note` (security/coverage.py, and
+   test_every_phases_prose_is_a_substring_of_the_paragraph pins it), so it is
+   cut out by identity, never by reading the prose: what is left is what
+   belongs to no phase -- a retry, an abandon, a close's own sentence. A
+   phase note that is not found is simply not cut, so nothing can be hidden
+   by a mismatch. An analysis with no structured coverage keeps the whole
+   paragraph: there is nothing else on screen to say it. */
+export function secCoverageRest(a){
+  let rest = String((a && a.coverage_note) || "");
+  let phases = [];
+  try{
+    const doc = JSON.parse((a && a.coverage) || "");
+    if(doc && Array.isArray(doc.phases)) phases = doc.phases;
+  }catch(e){ phases = []; }
+  for(const p of phases){
+    const n = String((p && p.note) || "").trim();
+    if(n) rest = rest.split(n).join(" ");
+  }
+  return rest.replace(/\s+/g, " ").trim();
+}
+
 const SEC_PHASE_STATUS = {
   ran: "ran",
   // "partly" and not "warning": the row is already coloured, and the word a
@@ -744,28 +840,35 @@ export function secPaint(){
   // one.
   const inc = $("sec-incomplete");
   inc.textContent = "";
+  // An interrupted analysis says WHAT paused it and what happens next
+  // (secPauseSentence), in place of the bare INTERRUPTED line.
   const incomplete = a.state === "capped" ? "This analysis is INCOMPLETE: it stopped before covering the whole scope."
                    : a.state === "failed" ? "This analysis is INCOMPLETE: it did not finish."
-                   : a.state === "interrupted" ? "This analysis is INTERRUPTED: it stopped before covering the whole scope, and Resume continues it where it left off."
+                   : a.state === "interrupted" ? (secPauseSentence(secPauseOf(a))
+                       || "This analysis is INTERRUPTED: it stopped before covering the whole scope, and Resume continues it where it left off.")
                    : "";
   if(incomplete){
     inc.appendChild(secIcon("alert"));
     inc.appendChild(secEl("span", "grow", incomplete
-      + " What is below is what it had reached, not what is there."));
+      + " What is below is only what it had reached."));
     inc.hidden = false;
   }else inc.hidden = true;
 
   secRenderPipeline(a, secState.units, secState.retryable);
 
-  // ABOVE the paragraph, and the reason is the paragraph. See
+  // The phases first, each with its own prose folded under it. See
   // secRenderCoveragePhases.
   secRenderCoveragePhases(a);
 
+  // Then ONLY what no phase already says (secCoverageRest): the box used to
+  // repeat every phase's prose as one two-thousand-character paragraph under
+  // the very table that had just folded it away -- "who can read this?".
   const note = $("sec-coverage");
   note.textContent = "";
-  if((a.coverage_note || "").trim()){
+  const rest = secCoverageRest(a);
+  if(rest){
     note.appendChild(secIcon("alert"));
-    note.appendChild(secEl("span", "grow", a.coverage_note));
+    note.appendChild(secEl("span", "grow", rest));
     note.hidden = false;
   }else note.hidden = true;
 

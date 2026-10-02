@@ -2264,6 +2264,17 @@ def cmd_resume(args):
                 args.analysis, "running", "is not interrupted: there is nothing to resume")
 
 
+def cmd_paused(args):
+    """Every analysis paused by a gate that lifts by itself -- the usage
+    window, a daily cap (ledger.SELF_LIFTING_PAUSES) -- as JSON, oldest
+    first: what the tick asks the engine's gates about, and resumes once
+    they are open (security_resume_paused in bin/agentloop). Read-only."""
+    rows = ledger.self_lifting_paused(_conn(args))
+    print(json.dumps([{"id": r["id"], "project": r["project"], "repo": r["repo"],
+                       "branch": r["branch"], "run_id": r["run_id"],
+                       "pause": ledger.pause_of(r)} for r in rows]))
+
+
 def cmd_abandon(args):
     _refuse_if_secret("abandon: --note", args.note)
     conn = _conn(args)
@@ -4402,6 +4413,8 @@ def main(argv=None):
     rs = sub.add_parser("resume", parents=[dbflag]); rs.set_defaults(fn=cmd_resume)
     rs.add_argument("--analysis", type=int, required=True)
     rs.add_argument("--automatic", action="store_true")
+
+    pz = sub.add_parser("paused", parents=[dbflag]); pz.set_defaults(fn=cmd_paused)
 
     ab = sub.add_parser("abandon", parents=[dbflag]); ab.set_defaults(fn=cmd_abandon)
     ab.add_argument("--analysis", type=int, required=True)

@@ -1322,15 +1322,30 @@ EOF
   security_orchestrate "$jid" "$aid" "$repo"
 }
 
+# A GATE THAT WOULD STOP THE RESUME ON ITS FIRST LAUNCH, asked before the
+# analysis is resumed rather than after: the orchestrator asks the same gate
+# (`__unit-gate`) before every launch, so a resume past a closed one ran for
+# one second, interrupted the analysis again, and answered the page with
+# success -- the operator pressed Resume twice and saw nothing happen at all.
+# Its first line, the gate's own sentence, when one is closed; nothing when
+# all are open.
+security_resume_refusal() { # security_resume_refusal <job-id>
+  local said
+  said="$(security_unit_gate "$1")" && return 0
+  printf '%s\n' "$said" | head -1
+}
+
 # `agentloop security resume <project> <analysis-id>`: an INTERRUPTED analysis
 # -- stopped, or swept by the next Analyse of another branch -- continued by a
 # new orchestrator, which adopts what is still running, judges what died and
 # never runs a settled unit twice (security/orchestrator.py). Refused while
 # anything of the project's is still alive: a live orchestrator (or one taking
-# the lock, security_analysis_live), or units still winding down after a stop.
+# the lock, security_analysis_live), or units still winding down after a stop;
+# and while one of the engine's gates is closed (security_resume_refusal),
+# saying which, and that the analysis resumes by itself when it reopens.
 cmd_security_resume() { # cmd_security_resume <project> <analysis-id>
   [ $# -ge 2 ] || die "usage: agentloop security resume <project> <analysis-id>"
-  local project="$1" aid="$2" jid row
+  local project="$1" aid="$2" jid row gate
   security_enabled "$project" || die "security is not enabled for project '$project'"
   case "$aid" in ''|*[!0-9]*) die "security: '$aid' is not an analysis id" ;; esac
   jid="$(security_job_id "$project")"
@@ -1340,12 +1355,61 @@ cmd_security_resume() { # cmd_security_resume <project> <analysis-id>
   security_analysis_live "$jid" && die "an analysis of '$project' is already running (job $jid)"
   [ "$(slots_active "$jid")" -eq 0 ] \
     || die "units of '$project' are still winding down — try again in a moment"
+  [ "$(printf '%s' "$row" | "$JQ" -r '.state')" = "interrupted" ] \
+    || die "analysis $aid is not interrupted: there is nothing to resume"
+  gate="$(security_resume_refusal "$jid")"
+  if [ -n "$gate" ]; then
+    # What happens next depends on what paused it: the tick lifts only the
+    # pauses of a self-lifting gate (security_resume_paused).
+    case "$(printf '%s' "$row" | "$JQ" -r '.pause // "" | fromjson? | .kind // empty' 2>/dev/null)" in
+      usage|cap) die "analysis $aid cannot resume yet: $gate. It resumes by itself once that reopens." ;;
+      *)         die "analysis $aid cannot resume yet: $gate. Resume it once that reopens." ;;
+    esac
+  fi
   security_engine_py resume --analysis "$aid" >/dev/null 2>&1 \
     || die "analysis $aid is not interrupted: there is nothing to resume"
   security_launch_detached "$jid" "$aid" "$(printf '%s' "$row" | "$JQ" -r '.branch')" \
     "$(printf '%s' "$row" | "$JQ" -r '.repo')"
-  log_tick "$jid: resumed analysis $aid $(stop_origin)"
+  log_tick "$jid: resumed analysis $aid $(stop_origin "agentloop security resume")"
   printf '{"analysis_id":%s,"resumed":true}\n' "$aid"
+}
+
+# THE TICK'S RESUME OF A PAUSE THAT LIFTS BY ITSELF. An analysis the engine
+# paused on its own ceiling -- the account's usage window, a daily cap
+# (security/ledger.py SELF_LIFTING_PAUSES) -- is resumed by the tick once the
+# same gate reopens, with no Resume pressed: the engine stopped it, so the
+# engine continues it. On 2026-10-02 a deep analysis paused at 98% of the
+# five-hour window, 32 of 37 units in, and sat there until somebody came back
+# to press Resume at the right minute. A stop, a failure, or units that could
+# not start are never resumed here: those need a person. Not counted against
+# SECURITY_MAX_AUTO_RESUMES, which caps an orchestrator that keeps dying, not
+# the number of usage windows a long analysis spans. One analysis per job per
+# tick, and none while anything of the job's is alive; never blocking.
+security_resume_paused() {
+  local aid project jid row paused resumed=" "
+  # No ledger, nothing paused -- and never one created by asking.
+  [ -s "$(security_db)" ] || return 0
+  paused="$(security_engine_py paused 2>/dev/null | "$JQ" -r '.[] | [.id, .project, .run_id] | @tsv' 2>/dev/null)"
+  [ -n "$paused" ] || return 0
+  while IFS="$(printf '\t')" read -r aid project jid; do
+    case "$aid" in ''|*[!0-9]*) continue ;; esac
+    security_enabled "$project" || continue
+    [ "$jid" = "$(security_job_id "$project")" ] || continue
+    # One per job: the orchestrator just launched takes its lock a moment
+    # later, and security_analysis_live would not see it yet.
+    case "$resumed" in *" $jid "*) continue ;; esac
+    security_analysis_live "$jid" && continue
+    [ "$(slots_active "$jid")" -eq 0 ] || continue
+    [ -z "$(security_resume_refusal "$jid")" ] || continue
+    row="$(security_engine_py analysis --id "$aid" 2>/dev/null)" || continue
+    security_engine_py resume --analysis "$aid" >/dev/null 2>&1 || continue
+    security_launch_detached "$jid" "$aid" "$(printf '%s' "$row" | "$JQ" -r '.branch')" \
+      "$(printf '%s' "$row" | "$JQ" -r '.repo')"
+    resumed="$resumed$jid "
+    log_tick "$jid: analysis $aid resumed by itself — the limit that paused it has reopened"
+  done <<EOF
+$paused
+EOF
 }
 
 # `agentloop security retry <project> <analysis-id>`: a CAPPED or FAILED
@@ -1366,6 +1430,12 @@ cmd_security_retry() { # cmd_security_retry <project> <analysis-id>
   security_analysis_live "$jid" && die "an analysis of '$project' is already running (job $jid)"
   [ "$(slots_active "$jid")" -eq 0 ] \
     || die "units of '$project' are still winding down — try again in a moment"
+  # A CLOSED GATE, before anything is reopened: the retry would launch
+  # nothing and pause the analysis on its first launch (see
+  # security_resume_refusal).
+  local gate
+  gate="$(security_resume_refusal "$jid")"
+  [ -z "$gate" ] || die "analysis $aid cannot be retried yet: $gate."
   # A BUDGET THAT CANNOT PAY ONE MORE UNIT: the resumed orchestrator would
   # launch nothing and close the analysis capped again. The budget is the
   # project's (security_analysis_budget), so the ledger's `reopen` cannot
@@ -1392,7 +1462,7 @@ cmd_security_retry() { # cmd_security_retry <project> <analysis-id>
     || die "analysis $aid was reopened but could not be resumed: run agentloop security resume '$project' $aid"
   security_launch_detached "$jid" "$aid" "$(printf '%s' "$row" | "$JQ" -r '.branch')" \
     "$(printf '%s' "$row" | "$JQ" -r '.repo')"
-  log_tick "$jid: retried analysis $aid: $n failed unit(s) run again $(stop_origin)"
+  log_tick "$jid: retried analysis $aid: $n failed unit(s) run again $(stop_origin "agentloop security retry")"
   printf '{"analysis_id":%s,"retried":%s}\n' "$aid" "$n"
 }
 
@@ -5160,8 +5230,15 @@ daily_gate() { # daily_gate <id>
 # job's account, daily_gate -- never a second copy of them. Exit 3 with the
 # gate named in a sentence when one is closed (the orchestrator then stops
 # launching and interrupts the analysis, naming it); 0 when all are open.
+#
+# A SECOND LINE, for the analysis's pause (security/ledger.py pause_doc):
+# `<kind> <until> <reason>` -- `usage` or `cap`, the epoch the gate reopens
+# (`-` when not known), and the gate in a few words, without the "resets in
+# N min" that is stale the minute it is written. The page says from it when
+# the analysis resumes by itself, and the tick resumes it then
+# (security_resume_paused).
 security_unit_gate() { # security_unit_gate <job-id>
-  local id="$1" platform account account_dir name reason dg scope spent cap
+  local id="$1" platform account account_dir name key reason dg scope spent cap until
   platform="$(resolve "$id" platform 'anthropic')"
   case "$platform" in ''|null) platform="anthropic" ;; esac
   account="$(job_account "$id")"
@@ -5170,19 +5247,27 @@ security_unit_gate() { # security_unit_gate <job-id>
   if [ "$account" != "default" ]; then
     name="$(account_field "$platform" "$account" name)"; [ -n "$name" ] || name="$account"
   fi
-  if reason="$(rl_gate "$(rl_key "$platform" "$account_dir")" "$name")" && [ -n "$reason" ]; then
+  key="$(rl_key "$platform" "$account_dir")"
+  if reason="$(rl_gate "$key" "$name")" && [ -n "$reason" ]; then
     printf 'the usage limit was reached (%s)\n' "$reason"
+    until="$(rl_gate_until "$key")"
+    printf 'usage %s %s\n' "${until:--}" "${reason%% -- it resets in *}"
     return 3
   fi
   if dg="$(daily_gate "$id")"; then
     read -r scope spent cap <<EOF
 $dg
 EOF
+    # Spend is counted from local midnight (_spend_since_midnight), so that
+    # is when the cap reopens.
+    until="$(date -v+1d -v0H -v0M -v0S +%s 2>/dev/null)"
     if [ "$scope" = "job" ]; then
-      printf 'the daily cap of %s was reached ($%s / $%s)\n' "$id" "$spent" "$cap"
+      reason="$(printf 'the daily cap of %s was reached ($%s / $%s)' "$id" "$spent" "$cap")"
     else
-      printf 'the global daily cap was reached ($%s / $%s across all jobs)\n' "$spent" "$cap"
+      reason="$(printf 'the global daily cap was reached ($%s / $%s across all jobs)' "$spent" "$cap")"
     fi
+    printf '%s\n' "$reason"
+    printf 'cap %s %s\n' "${until:--}" "$reason"
     return 3
   fi
   return 0
@@ -5737,10 +5822,13 @@ cmd_runs() { # <id> — one active run per line: <run-pid>\t<agent-pid>\t<logfil
 # reach the same function, and nothing told them apart. On 2026-09-24 an
 # analysis was stopped 28 s in that its operator had not stopped, and the
 # record named them. The dashboard vouches for itself (the control server
-# sets AL_STOP_SOURCE on the one call it makes); for anything else, the two
-# processes above this one are the only witness to who asked.
-stop_origin() { # -> "from the dashboard" | "from outside the dashboard (...)"
-  if [ "${AL_STOP_SOURCE:-}" = "dashboard" ]; then
+# sets AL_CALLER on the stop, resume and retry it asks for); for anything
+# else, the two processes above this one are the only witness to who asked.
+# A resume or a retry names its own command: both used to be logged as
+# "`agentloop stop`, run by Python under launchd" -- the dashboard's Resume,
+# misnamed twice over.
+stop_origin() { # stop_origin [command] -> "from the dashboard" | "from outside the dashboard (`<command>`, ...)"; command: agentloop stop when unnamed
+  if [ "${AL_CALLER:-}" = "dashboard" ]; then
     printf 'from the dashboard\n'
     return 0
   fi
@@ -5748,8 +5836,8 @@ stop_origin() { # -> "from the dashboard" | "from outside the dashboard (...)"
   c1="$(ps -o comm= -p "$PPID" 2>/dev/null)"
   p2="$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')"
   c2="$(ps -o comm= -p "${p2:-0}" 2>/dev/null)"
-  printf 'from outside the dashboard (`agentloop stop`, run by %s under %s)\n' \
-    "$(basename "${c1:-unknown}")" "$(basename "${c2:-unknown}")"
+  printf 'from outside the dashboard (`%s`, run by %s under %s)\n' \
+    "${1:-agentloop stop}" "$(basename "${c1:-unknown}")" "$(basename "${c2:-unknown}")"
 }
 
 # The origin a stop marker carries, for the record. Empty -- a marker left by
@@ -7811,6 +7899,7 @@ cmd_tick() {
     models_refresh_launch
   fi
   security_resume_orphans
+  security_resume_paused
   local days hours interval last streak max_par
   # IFS is tick_plan's own separator, never a tab: see the note on TICK_SEP
   # for the job that a folded tab run kept off the schedule.

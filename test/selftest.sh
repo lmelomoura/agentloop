@@ -8326,21 +8326,31 @@ JSON
     && ok "with every gate open a unit may launch" || bad "security_unit_gate with open gates"
   ( resolve() { printf 'anthropic\n'; }; job_account() { printf 'default\n'; }
     account_env_dir() { :; }; rl_key() { printf 'k\n'; }
-    rl_gate() { printf 'the five-hour window is at 100%%\n'; return 0; }; daily_gate() { return 1; }
+    rl_gate() { printf 'the five-hour window is at 100%% -- it resets in 97 min\n'; return 0; }; daily_gate() { return 1; }
+    rl_gate_until() { printf '1790935200\n'; }
     out="$(security_unit_gate security-x)"; rc=$?
-    [ "$rc" -eq 3 ] && [ "$out" = "the usage limit was reached (the five-hour window is at 100%)" ] ) \
-    && ok "a usage window at its limit closes the gate, named" || bad "security_unit_gate on the usage window"
+    [ "$rc" -eq 3 ] \
+      && [ "$(printf '%s\n' "$out" | sed -n 1p)" = "the usage limit was reached (the five-hour window is at 100% -- it resets in 97 min)" ] \
+      && [ "$(printf '%s\n' "$out" | sed -n 2p)" = "usage 1790935200 the five-hour window is at 100%" ] ) \
+    && ok "a usage window at its limit closes the gate, named -- and its pause line says when it reopens" \
+    || bad "security_unit_gate on the usage window"
   ( resolve() { printf 'anthropic\n'; }; job_account() { printf 'default\n'; }
     account_env_dir() { :; }; rl_key() { printf 'k\n'; }
     rl_gate() { return 1; }; daily_gate() { printf 'job 3.10 3.00\n'; }
     out="$(security_unit_gate security-x)"; rc=$?
-    [ "$rc" -eq 3 ] && [ "$out" = 'the daily cap of security-x was reached ($3.10 / $3.00)' ] ) \
-    && ok "the job's daily cap closes the gate, named" || bad "security_unit_gate on the daily cap"
+    midnight="$(date -v+1d -v0H -v0M -v0S +%s)"
+    [ "$rc" -eq 3 ] && [ "$out" = "$(printf '%s\n%s' 'the daily cap of security-x was reached ($3.10 / $3.00)' \
+                                       "cap $midnight the daily cap of security-x was reached (\$3.10 / \$3.00)")" ] ) \
+    && ok "the job's daily cap closes the gate, named -- reopening at local midnight" || bad "security_unit_gate on the daily cap"
   ( resolve() { printf 'anthropic\n'; }; job_account() { printf 'default\n'; }
     account_env_dir() { :; }; rl_key() { printf 'k\n'; }
     rl_gate() { return 1; }; daily_gate() { printf 'global 12 10\n'; }
     out="$(security_unit_gate security-x)"; rc=$?
-    [ "$rc" -eq 3 ] && [ "$out" = 'the global daily cap was reached ($12 / $10 across all jobs)' ] ) \
+    [ "$rc" -eq 3 ] && [ "$(printf '%s\n' "$out" | sed -n 1p)" = 'the global daily cap was reached ($12 / $10 across all jobs)' ] \
+      && case "$(printf '%s\n' "$out" | sed -n 2p)" in
+           "cap "[0-9]*" the global daily cap was reached (\$12 / \$10 across all jobs)") true ;;
+           *) false ;;
+         esac ) \
     && ok "the global daily cap closes the gate, named" || bad "security_unit_gate on the global cap"
   # A security run that is not a unit -- no unit id in its environment -- is
   # refused before any slot, worktree or log exists, and closes nothing.

@@ -3041,6 +3041,13 @@ def al(args, stdin=None, background=False, env=None):
         return False, str(e)
 
 
+# What the dashboard's own stop, resume and retry say about themselves in the
+# environment of the one call each makes (bin/agentloop `stop_origin`): the
+# engine cannot tell this process from a shell, and the Resume button used to
+# be logged as "`agentloop stop`, run by Python under launchd".
+DASHBOARD_CALLER = {"AL_CALLER": "dashboard"}
+
+
 def stop_run(jid, pid=None):
     """`agentloop stop`, saying that it comes from the dashboard.
 
@@ -3051,8 +3058,7 @@ def stop_run(jid, pid=None):
     the operator's from the dashboard, typed in a terminal or not, and on
     2026-09-24 one the operator had not made was put down to them.
     """
-    return al(["stop", jid, str(pid)] if pid else ["stop", jid],
-              env={"AL_STOP_SOURCE": "dashboard"})
+    return al(["stop", jid, str(pid)] if pid else ["stop", jid], env=DASHBOARD_CALLER)
 
 
 # The permission vocabulary lives in the engine (platform_permissions); this
@@ -4107,7 +4113,7 @@ def security_resume(body):
     analysis = str(body.get("analysis", "")).strip()
     if not project or not analysis.isdigit():
         return 400, {"error": "project and a numeric analysis id are required"}
-    ok, out = al(["security", "resume", project, analysis])
+    ok, out = al(["security", "resume", project, analysis], env=DASHBOARD_CALLER)
     return (200, {"ok": True, "output": out}) if ok else (500, {"error": out})
 
 
@@ -4120,7 +4126,7 @@ def security_retry(body):
     analysis = str(body.get("analysis", "")).strip()
     if not project or not analysis.isdigit():
         return 400, {"error": "project and a numeric analysis id are required"}
-    ok, out = al(["security", "retry", project, analysis])
+    ok, out = al(["security", "retry", project, analysis], env=DASHBOARD_CALLER)
     return (200, {"ok": True, "output": out}) if ok else (500, {"error": out})
 
 

@@ -58,8 +58,10 @@ __unit-sweep <job>
     FAKE_ENGINE_SWEEP_SAYS when set (the engine's one line of what went).
 __unit-gate <job>
     the engine's gates for a launch: exits 0 (open), or -- with
-    FAKE_ENGINE_GATE set -- prints it and exits 3, as a closed gate does. Each
-    call is counted in FAKE_ENGINE_GATE_CALLS when that names a file.
+    FAKE_ENGINE_GATE set -- prints it and exits 3, as a closed gate does,
+    followed by FAKE_ENGINE_GATE_PAUSE when set: the second line the real
+    engine prints for the analysis's pause, `<usage|cap> <epoch|-> <reason>`.
+    Each call is counted in FAKE_ENGINE_GATE_CALLS when that names a file.
 """
 import json
 import os
@@ -258,4 +260,6 @@ elif sys.argv[1] == "__unit-gate":
             out.write("gate\n")
     if os.environ.get("FAKE_ENGINE_GATE"):
         print(os.environ["FAKE_ENGINE_GATE"])
+        if os.environ.get("FAKE_ENGINE_GATE_PAUSE"):
+            print(os.environ["FAKE_ENGINE_GATE_PAUSE"])
         sys.exit(3)
