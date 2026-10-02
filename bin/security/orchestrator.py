@@ -56,7 +56,8 @@ THE ENGINE'S OWN GATES STILL HOLD. A unit runs as a forced run of the
 derived job, which skips run_job's usage-window, daily and global-cap gates
 -- so the orchestrator asks the engine for them (`__unit-gate`) before every
 launch, and a closed one stops the launches and leaves the analysis
-`interrupted` with a note naming the gate, to be resumed once it reopens. A
+`interrupted` with its `pause` naming the gate and when it reopens
+(ledger.pause_doc); the tick resumes it then (security_resume_paused). A
 run the provider cut short (the classifier's `rate_limited` or `api_error`)
 is not the unit's failure either: its close keeps the attempt, and three
 such runs in a row of one lineage give it up as the engine not being able to
@@ -150,10 +151,10 @@ JUDGE_GAVE_UP_LOG = ("could not judge unit {uid} ({why}) — left running after 
 BUDGET_SPENT_NOTE ="The analysis budget of ${budget:.2f} was spent before every unit ran."
 BUDGET_FLOOR_NOTE = ("The analysis budget of ${budget:.2f} had ${left:.2f} left -- less than the "
                      "${floor:.2f} one unit is given -- before every unit ran.")
-GATE_NOTE = ("The engine interrupted this analysis because {gate}; the units it finished are "
-             "kept, and a resume continues it once the gate reopens.")
-FAILED_NOTE = ("The engine interrupted this analysis because its orchestrator failed "
-               "({what}); the units it finished are kept, and a resume continues it.")
+# The pause of an orchestrator that failed (ledger.pause_doc, kind `failed`):
+# what failed, in a few words, for the page's one-line banner. It used to be
+# a sentence appended to the coverage paragraph, once per failure.
+FAILED_REASON = "its orchestrator failed ({what})"
 # The classifier's causes (run_classify in bin/agentloop) for a run the
 # PROVIDER ended: the unit's close keeps the attempt for them (units.close),
 # and this loop counts them as runs the engine could not run.
@@ -172,6 +173,21 @@ GATE_CLOSED_RC = 3
 # analysis lock: the tick breaks a dead orchestrator's lock (lock_break)
 # before it resumes the analysis, and the file would go with it.
 PREPARE_PGID = ".pgid"
+
+
+def _gate_pause(line):
+    """(kind, until, reason) from the second line `__unit-gate` prints with a
+    closed gate -- `<usage|cap> <epoch|-> <reason>` (security_unit_gate in
+    bin/agentloop). A line it cannot read is a gate of no known kind
+    (`gate`): the analysis is paused all the same, and waits for a person
+    rather than for a reopening nothing can see."""
+    parts = (line or "").strip().split(" ", 2)
+    kind = parts[0] if parts and parts[0] in ledger.SELF_LIFTING_PAUSES else "gate"
+    until = None
+    if len(parts) > 1 and parts[1].isdigit():
+        until = int(parts[1])
+    reason = parts[2].strip() if len(parts) > 2 and kind != "gate" else ""
+    return kind, until, reason
 
 
 def _alive(pid) -> bool:
@@ -312,6 +328,9 @@ class Orchestrator:
         self.budget_spent = False
         self.budget_left = None   # set when the floor, not the spend, stopped the launches
         self.gate = ""            # the engine's gate that closed, in the engine's words
+        self.gate_kind = ""       # ...and what it is, for the pause: ledger.PAUSE_KINDS
+        self.gate_until = None    # ...and when it reopens, when the engine knows
+        self.gate_reason = ""     # ...and the gate in a few words, for the page
         self.cannot_run = []      # (lineage, cause, error) of the breaker's causes in a row
         self.keep_lock = False    # nothing could be written: the tick must find us dead
         self.prepare_proc = None
@@ -465,7 +484,7 @@ class Orchestrator:
             return 0
         if not row["prepared"] and not self._prepare():
             if self.stopping:
-                return self._interrupt()
+                return self._interrupt(ledger.pause_doc("stopped"))
             self._finish(PREPARE_FAILED_NOTE, state="capped")
             return 0
         if not ledger.units_of(self.conn, self.aid) and not self._plan():
@@ -474,9 +493,11 @@ class Orchestrator:
         self._set_phase("running units")
         self._loop()
         if self.stopping:
-            return self._interrupt()
+            return self._interrupt(ledger.pause_doc("stopped"))
         if self.gate:
-            return self._interrupt(GATE_NOTE.format(gate=self.gate))
+            return self._interrupt(ledger.pause_doc(self.gate_kind or "gate",
+                                                    self.gate_reason or self.gate,
+                                                    self.gate_until))
         # THE BUDGET SENTENCE ONLY WHEN IT IS TRUE: units left unsettled. A
         # budget the last unit spent to the cent left nothing unrun, and
         # "spent before every unit ran" would be a false line in the report.
@@ -497,15 +518,15 @@ class Orchestrator:
         is kept: the tick finds its owner dead, interrupts the analysis and
         resumes it (security_resume_orphans in bin/agentloop)."""
         self.log(f"failed: {what}")
-        note = FAILED_NOTE.format(what=what.split(":", 1)[0])
+        pause = ledger.pause_doc("failed", FAILED_REASON.format(what=what.split(":", 1)[0]))
         try:
-            self._interrupt(note)
+            self._interrupt(pause)
             return 1
         except Exception as exc:  # noqa: BLE001 -- the last resort follows
             self.log(f"could not stop and interrupt cleanly ({type(exc).__name__}: {exc})")
         try:
             conn = ledger.connect(self.db)
-            ledger.interrupt_analysis(conn, self.aid, note)
+            ledger.interrupt_analysis(conn, self.aid, pause)
             state = conn.execute("SELECT state FROM analysis WHERE id=?", (self.aid,)).fetchone()
             if state is not None and state["state"] == "running":
                 raise RuntimeError("the analysis is still running")
@@ -752,7 +773,11 @@ class Orchestrator:
             self.log(f"could not ask the engine for its gates: {exc}")
             return ""
         if out.returncode == GATE_CLOSED_RC:
-            return out.stdout.strip() or "one of the engine's spend or usage gates is closed"
+            lines = out.stdout.strip().splitlines()
+            said = lines[0].strip() if lines else ""
+            self.gate_kind, self.gate_until, self.gate_reason = _gate_pause(
+                lines[1] if len(lines) > 1 else "")
+            return said or "one of the engine's spend or usage gates is closed"
         if out.returncode != 0:
             self.log(f"could not ask the engine for its gates (rc {out.returncode}): "
                      f"{out.stderr.strip()[-200:]}")
@@ -845,10 +870,10 @@ class Orchestrator:
         unit alike (analysis 12 spent 693 runs and 42 minutes proving that one
         lineage at a time): the gate closes with the last cause's words,
         _loop stops launching and waits for what is in flight, and run()
-        leaves the analysis interrupted (GATE_NOTE), for a resume once the
-        cause is fixed. The tick never resumes it on its own: no orchestrator
-        died. One lineage alone is that unit's own trouble, given up by
-        _launch_pass."""
+        leaves the analysis interrupted (a `breaker` pause), for a resume once
+        the cause is fixed. The tick never resumes it on its own: no
+        orchestrator died, and no gate reopens by itself. One lineage alone is
+        that unit's own trouble, given up by _launch_pass."""
         evidence = unit.get("evidence") or {}
         cause = evidence.get("cause")
         if cause not in BREAKER_CAUSES:
@@ -861,6 +886,7 @@ class Orchestrator:
             n = len(self.cannot_run)
             self.gate = (START_FAIL_GATE.format(n=n, error=error) if cause == units.START_FAILED
                          else PROVIDER_GATE.format(n=n, cause=cause))
+            self.gate_kind, self.gate_until, self.gate_reason = "breaker", None, self.gate
             self.log(f"stops launching: {self.gate}")
 
     def _outages_before(self, unit):
@@ -961,10 +987,10 @@ class Orchestrator:
         self.unjudged.pop(unit["id"], None)
         return out
 
-    def _interrupt(self, note="") -> int:
-        """Stop the units' runs and leave the analysis `interrupted` -- with
-        `note` in its paragraph when something other than a stop is the
-        reason (a gate that closed, a failure)."""
+    def _interrupt(self, pause=None) -> int:
+        """Stop the units' runs and leave the analysis `interrupted`, with
+        `pause` (ledger.pause_doc) saying why: a stop, a gate that closed, a
+        failure."""
         self._set_phase("stopping")
         self.log("stopping its units")
         deadline = time.time() + STOP_GRACE_SECONDS
@@ -993,7 +1019,7 @@ class Orchestrator:
         for u in ledger.units_of(self.conn, self.aid):
             if u["state"] == "running" and not self._run_alive(u):
                 self._judge_orphan(u, _pid_of(u["run_key"]))
-        ledger.interrupt_analysis(self.conn, self.aid, note)
+        ledger.interrupt_analysis(self.conn, self.aid, pause)
         self.log("interrupted — `agentloop security resume` continues it")
         return 0
 
@@ -1020,8 +1046,8 @@ class Orchestrator:
                 time.sleep(min(self.poll, 1.0))
         row = self._row()
         if row["state"] == "running":
-            ledger.interrupt_analysis(self.conn, self.aid,
-                                      FAILED_NOTE.format(what="its close failed"))
+            ledger.interrupt_analysis(self.conn, self.aid, ledger.pause_doc(
+                "failed", FAILED_REASON.format(what="its close failed")))
             self.log("interrupted — the close failed; `agentloop security resume` continues it")
             return
         self.log(f"closed {row['state']} (${row['spend_usd']:.2f})")

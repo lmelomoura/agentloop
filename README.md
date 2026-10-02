@@ -1314,7 +1314,12 @@ which has no session is refused in `tick.log` before a slot is taken; the
 Codex rollout is read from the run's own `CODEX_HOME`; the usage-window gate
 is the account's own (`data/rate-limits.json` keys every account directory as
 `<platform>@<dir>`), and the statusline feeds the account its session runs as
-— wire it in each account's own `settings.json`; the agentloop skills are
+— wire it in each account's own `settings.json`. Every reading also carries
+the account it was measured on (the account and organization in the
+directory's `.claude.json`, the account in Codex's `auth.json`), and the gate
+reads a reading only while that account is still the one logged in on the
+directory: logging a directory into another account lifts a hold the first
+account's window had placed, at once; the agentloop skills are
 linked into every account directory. The model probes and the catalog
 refreshes run on the Default. OpenCode has no accounts: its credentials are
 the providers configured in opencode itself.
@@ -1558,9 +1563,14 @@ an API error) keeps its attempt, and three of those in a row give the unit up
 as one the engine could not run. The analysis closes from what the units
 proved. Every launch first asks the engine for the gates a unit's run would
 otherwise skip — the usage window, the job's `daily_budget_usd`, the global
-daily cap — and a closed one leaves the analysis `interrupted` with the gate
-named, to be resumed once it reopens; each unit's budget share is reserved
-while it runs, so the units together never exceed `max_budget_usd`.
+daily cap — and a closed one leaves the analysis `interrupted`, paused by
+that gate: the analysis page says by what, since when and until when ("Paused
+at 9:19 AM by the usage limit: … It resumes by itself at 11:00 AM."), a
+Resume pressed before then is refused with the same reason, and **the tick
+resumes it by itself once the gate reopens**. Only those two gates are lifted
+by the tick: a Stop, a failure, or units that cannot start wait for you. Each
+unit's budget share is reserved while it runs, so the units together never
+exceed `max_budget_usd`.
 **Stop** on any run of an analysis stops the whole analysis and leaves it
 `interrupted`; `agentloop security resume <project> <analysis>` continues it
 without repeating a finished unit. **An analysis whose orchestrator died** —
@@ -1575,7 +1585,7 @@ OpenCode does for every boot of a project whose sandbox list names a path
 under a file) is recorded `error` / `start_failed`, with the CLI's own last
 stderr line as the run's note, instead of `killed`. Its unit keeps its
 attempt; three in a row give that unit up, and three in a row across two or
-more units pause the whole analysis: it is left `interrupted`, the note names
+more units pause the whole analysis: it is left `interrupted`, its pause names
 the error, and Resume continues it once the cause is fixed.
 
 **Retry failed units.** A `capped` or `failed` analysis whose units gave up is
@@ -2017,7 +2027,9 @@ agentloop security resume <project> <analysis-id>
 
 continues an `interrupted` analysis — one that was stopped, or found with no
 orchestrator behind it by the next Analyse of another branch — in the
-background, without repeating a finished unit.
+background, without repeating a finished unit. While the usage window or a
+daily cap is still closed it refuses, naming the gate: the analysis would stop
+on it at its first launch, and the tick resumes it when it reopens.
 
 ```bash
 agentloop security retry <project> <analysis-id>

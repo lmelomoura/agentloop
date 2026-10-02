@@ -556,13 +556,56 @@
       secTimer = null;
     }
   }
+  var SEC_SELF_LIFTING = ["usage", "cap"];
+  function secPauseOf(a) {
+    try {
+      const p = JSON.parse(a && a.pause || "");
+      return p && typeof p === "object" && !Array.isArray(p) && p.kind ? p : {};
+    } catch (e) {
+      return {};
+    }
+  }
+  function secPauseTime(epoch) {
+    const d = new Date(Number(epoch) * 1e3);
+    const time = { hour: "numeric", minute: "2-digit" };
+    return d.toDateString() === (/* @__PURE__ */ new Date()).toDateString() ? d.toLocaleTimeString("en-US", time) : d.toLocaleString("en-US", { weekday: "short", ...time });
+  }
+  function secPauseSentence(p) {
+    if (!p || !p.kind) return "";
+    const at = p.at ? secPauseTime(p.at) : "an unrecorded time";
+    const reason = String(p.reason || "").trim().replace(/\.$/, "");
+    if (p.kind === "stopped") return "Stopped at " + at + ". Resume continues it where it left off.";
+    const head = "Paused at " + at;
+    if (SEC_SELF_LIFTING.includes(p.kind)) {
+      return head + " by " + (p.kind === "usage" ? "the usage limit" : "the daily cap") + ": " + reason + ". It resumes by itself " + (p.until ? "at " + secPauseTime(p.until) : "once that reopens") + ".";
+    }
+    if (p.kind === "breaker") return head + ": " + reason + ". Resume it once that is fixed.";
+    return head + ": " + reason + ". Resume continues it where it left off.";
+  }
+  var secPauseWake = null;
+  function secArmPauseWake(until) {
+    if (secPauseWake) {
+      clearTimeout(secPauseWake);
+      secPauseWake = null;
+    }
+    if (!until) return;
+    const ms = Math.min(Math.max(until * 1e3 - Date.now(), 0) + 5e3, 2147483647);
+    secPauseWake = setTimeout(() => {
+      secPauseWake = null;
+      if (AL.currentView === "security" && secState.project) secReload(false);
+    }, ms);
+  }
   function secRunStillHeld() {
     const slots = AL.DATA.active_runs || {};
     return secState.analyses.some((a) => a.run_id && (slots[a.run_id] || []).length > 0);
   }
   function secSyncPoll() {
     const here = AL.currentView === "security" && secState.project;
-    const watch = here && (secState.analyses.some((a) => a.state === "running") || secRunStillHeld());
+    const now = Date.now() / 1e3;
+    const lifting = secState.analyses.filter((a) => a.state === "interrupted").map(secPauseOf).filter((p) => SEC_SELF_LIFTING.includes(p.kind) && p.until);
+    const watch = here && (secState.analyses.some((a) => a.state === "running") || secRunStillHeld() || lifting.some((p) => p.until <= now && now - p.until < 600));
+    const ahead = lifting.map((p) => p.until).filter((t) => t > now);
+    secArmPauseWake(here && ahead.length ? Math.min(...ahead) : null);
     if (watch && !secTimer) secTimer = setInterval(() => secReload(false), SEC_POLL_MS);
     if (!watch && secTimer) {
       secStopPoll();
@@ -575,6 +618,7 @@
   }
   function secLeave() {
     secStopPoll();
+    secArmPauseWake(null);
   }
   function secBack(fromHistory) {
     secStopPoll();
@@ -811,6 +855,21 @@
       }
     }
   }
+  function secCoverageRest(a) {
+    let rest = String(a && a.coverage_note || "");
+    let phases = [];
+    try {
+      const doc = JSON.parse(a && a.coverage || "");
+      if (doc && Array.isArray(doc.phases)) phases = doc.phases;
+    } catch (e) {
+      phases = [];
+    }
+    for (const p of phases) {
+      const n = String(p && p.note || "").trim();
+      if (n) rest = rest.split(n).join(" ");
+    }
+    return rest.replace(/\s+/g, " ").trim();
+  }
   var SEC_PHASE_STATUS = {
     ran: "ran",
     // "partly" and not "warning": the row is already coloured, and the word a
@@ -991,19 +1050,20 @@
     secRenderRunNotice(a);
     const inc = $("sec-incomplete");
     inc.textContent = "";
-    const incomplete = a.state === "capped" ? "This analysis is INCOMPLETE: it stopped before covering the whole scope." : a.state === "failed" ? "This analysis is INCOMPLETE: it did not finish." : a.state === "interrupted" ? "This analysis is INTERRUPTED: it stopped before covering the whole scope, and Resume continues it where it left off." : "";
+    const incomplete = a.state === "capped" ? "This analysis is INCOMPLETE: it stopped before covering the whole scope." : a.state === "failed" ? "This analysis is INCOMPLETE: it did not finish." : a.state === "interrupted" ? secPauseSentence(secPauseOf(a)) || "This analysis is INTERRUPTED: it stopped before covering the whole scope, and Resume continues it where it left off." : "";
     if (incomplete) {
       inc.appendChild(secIcon("alert"));
-      inc.appendChild(secEl("span", "grow", incomplete + " What is below is what it had reached, not what is there."));
+      inc.appendChild(secEl("span", "grow", incomplete + " What is below is only what it had reached."));
       inc.hidden = false;
     } else inc.hidden = true;
     secRenderPipeline(a, secState.units, secState.retryable);
     secRenderCoveragePhases(a);
     const note = $("sec-coverage");
     note.textContent = "";
-    if ((a.coverage_note || "").trim()) {
+    const rest = secCoverageRest(a);
+    if (rest) {
       note.appendChild(secIcon("alert"));
-      note.appendChild(secEl("span", "grow", a.coverage_note));
+      note.appendChild(secEl("span", "grow", rest));
       note.hidden = false;
     } else note.hidden = true;
     secRenderSummary();
@@ -5634,5 +5694,5 @@
     SEC_PROFILES
   };
 })();
-/* ui-bundle: fa04d82b5fc7e39fe1b303bb3eb4e93dceb4144a5b12414f22ab8104b94a506f */
-/* ui-sources: 17b970f20f6a68b5dbd5058b4fd0c449b4ad28a661dbcba52a43497c7cfd26f5 */
+/* ui-bundle: 4d463534d158060900a6949042da37baa8795cad9b956247be2020e02d49b49d */
+/* ui-sources: 40cf2e2c43341aa5369cfc9dae02ac5175bc6e7d6b0ec187404798e8f601743a */

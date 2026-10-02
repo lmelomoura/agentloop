@@ -46,6 +46,13 @@ acct="${CLAUDE_CONFIG_DIR:-}"
 while [ "${#acct}" -gt 1 ] && [ "${acct%/}" != "$acct" ]; do acct="${acct%/}"; done
 if [ -z "$acct" ] || [ "$acct" = "$HOME/.claude" ]; then KEY="anthropic"; else KEY="anthropic@$acct"; fi
 JQ="${AGENTLOOP_JQ:-${CLAUDE_CRON_JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}}"
+# And whose windows they are: the account logged in on that directory, read
+# where the engine reads it for the same key (account_identity, rl_key_identity
+# in bin/agentloop) -- the gate holds a run back only on a reading of the
+# account logged in now, and a directory can be logged into another account
+# at any moment. Empty when it cannot be read: the reading is then unstamped,
+# and counts as every reading did before.
+if [ "$KEY" = "anthropic" ]; then idf="$HOME/.claude.json"; else idf="$acct/.claude.json"; fi
 
 # The statusline is invoked several times a second while a turn streams. Writing
 # every time would be thousands of pointless file writes an hour, so a floor:
@@ -63,6 +70,10 @@ line="$(printf '%s' "$payload" | "$JQ" -r '
     (.rate_limits.seven_day.used_percentage // empty | "7d \(. | floor)%") ]
   | join(" · ")' 2>/dev/null)"
 [ -n "$line" ] && printf '%s' "$line"
+
+WHO=""
+[ -s "$idf" ] && WHO="$("$JQ" -r '.oauthAccount // empty | objects
+    | select((.accountUuid // "") != "") | .accountUuid + ":" + (.organizationUuid // "")' "$idf" 2>/dev/null)"
 
 # Nothing to record: not a subscription, or no response yet this session.
 printf '%s' "$payload" | "$JQ" -e '.rate_limits | (.five_hour? // .seven_day?) != null' >/dev/null 2>&1 || exit 0
@@ -84,7 +95,7 @@ tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX" 2>/dev/null)" || exit 0
 # forward while `resets_at` says it is still the same window, and dropped the
 # moment it is not. Keeping a spent window's `status` against a fresh window
 # would hold the whole fleet back on a fact that expired.
-printf '%s' "$payload" | "$JQ" --slurpfile prev "$OUT" --argjson now "$now" --arg k "$KEY" '
+printf '%s' "$payload" | "$JQ" --slurpfile prev "$OUT" --argjson now "$now" --arg k "$KEY" --arg who "$WHO" '
   # A file from before platforms held the windows at the top level; they are
   # the anthropic block now, and move there on this write. A file carrying BOTH
   # shapes is merged per window, greater seen_at wins — the same rule, and for
@@ -98,6 +109,7 @@ printf '%s' "$payload" | "$JQ" --slurpfile prev "$OUT" --argjson now "$now" --ar
                 then . else .[$w] = $top[$w] end)))
       else . end) as $was
   | .rate_limits as $rl
+  | (if $who == "" then null else $who end) as $acct
   | reduce ["five_hour", "seven_day"][] as $w ($was;
       # `// null`, never `// empty`: an update that yields nothing collapses a
       # jq reduce to null, which would truncate the file to the string "null"
@@ -106,14 +118,20 @@ printf '%s' "$payload" | "$JQ" --slurpfile prev "$OUT" --argjson now "$now" --ar
       | if $new == null or $new.used_percentage == null then .
         else
           (.[$k][$w] // {}) as $old
-          | (if $old.resets_at == ($new.resets_at // null) then $old else {} end) as $keep
+          # The same window OF THE SAME ACCOUNT: the status of another account
+          # says nothing about this one, even when both reset together. A side
+          # with no stamp is not known to be another account (the gate rule).
+          | (if $old.resets_at == ($new.resets_at // null)
+                and ($old.account == null or $acct == null or $old.account == $acct)
+             then $old else {} end) as $keep
           | .[$k][$w] = {
               status:      ($keep.status // null),
               utilization: (($new.used_percentage) / 100),
               resets_at:   ($new.resets_at // null),
               overage:     ($keep.overage // null),
               seen_at:     $now,
-              source:      "statusline"
+              source:      "statusline",
+              account:     $acct
             }
         end)
 ' > "$tmp" 2>/dev/null && mv "$tmp" "$OUT" 2>/dev/null

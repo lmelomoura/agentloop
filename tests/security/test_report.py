@@ -71,6 +71,25 @@ def test_an_interrupted_analysis_says_so_and_that_resume_continues_it():
                      "scope, and Resume continues it where it left off."]
 
 
+def test_a_paused_analysis_says_what_paused_it_and_what_happens_next():
+    """The pause used to be the last sentence of the coverage paragraph,
+    once per pause; it is the analysis's `pause` now, and the report opens
+    with it in place of the bare INTERRUPTED line."""
+    usage = {"kind": "usage", "at": 1790929160, "until": 1790935200,
+             "reason": "the anthropic five_hour window is 99% used"}
+    parts = report._coverage({"state": "interrupted", "pause": json.dumps(usage)}, "Scope: 3 files.")
+    assert parts == ["This analysis was PAUSED at 2026-10-02 08:19 UTC by the usage limit: "
+                     "the anthropic five_hour window is 99% used. It resumes by itself at "
+                     "2026-10-02 10:00 UTC.", "Scope: 3 files."]
+    assert report.pause_sentence({"kind": "stopped", "at": 1790929160}) == (
+        "This analysis was STOPPED at 2026-10-02 08:19 UTC; Resume continues it where it left off.")
+    assert report.pause_sentence({"kind": "breaker", "at": 1790929160,
+                                  "reason": "the provider refused 3 units in a row (api_error)"}) == (
+        "This analysis was PAUSED at 2026-10-02 08:19 UTC: the provider refused 3 units in a row "
+        "(api_error). Resume it once that is fixed.")
+    assert report.pause_sentence({}) == ""
+
+
 def test_html_escapes_a_finding_title():
     hostile = [dict(FINDINGS[0], title="<script>alert(1)</script>")]
     html = report.as_html(ANALYSIS, hostile, "")

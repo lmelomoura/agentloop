@@ -6,6 +6,7 @@ deterministic phase writes while the page is already reading.
 """
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -296,6 +297,17 @@ _ANALYSIS_COLUMNS = (
     # died, never an operator's Resume: the automatic ones are capped, so a
     # machine that keeps crashing stops spending.
     ("resumes", "INTEGER NOT NULL DEFAULT 0"),
+    # WHY AN INTERRUPTED ANALYSIS STOPPED, as one small JSON document --
+    # {"kind", "at", "reason", "until"}, see `interrupt_analysis` and
+    # `pause_of` -- written when it is interrupted and cleared when it is
+    # resumed or closed. The reason used to be appended to `coverage_note`,
+    # once per pause: the page showed it as the last sentence of a
+    # two-thousand-character paragraph, twice (98%, then 99%), and nothing
+    # could tell a usage-limit pause the engine may lift by itself from a
+    # stop the operator asked for. '' for every row from before the column,
+    # and for an interruption nobody named: the page then says only
+    # "interrupted".
+    ("pause", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -368,8 +380,33 @@ def connect(path) -> sqlite3.Connection:
             # literals in the tuple, and PRAGMA has said the column is absent.
             conn.execute(f"ALTER TABLE finding ADD COLUMN {name} {ddl}")
     conn.execute(_FOLD_DUPLICATE_CLOSES)
+    _drop_pause_sentences(conn)
     conn.commit()
     return conn
+
+
+# THE SENTENCES AN INTERRUPTION USED TO APPEND TO THE PARAGRAPH, one per
+# pause -- "The engine interrupted this analysis because <gate>; the units it
+# finished are kept, and a resume continues it[ once the gate reopens]." --
+# before the `pause` column held the reason instead. Exactly the two shapes
+# the orchestrator wrote (its GATE_NOTE and FAILED_NOTE), cut out of every
+# analysis that still carries one, so an analysis paused before this change
+# does not keep "98%" and "99%" in its paragraph -- and in every report of it
+# -- for ever. Idempotent and cheap: the LIKE finds nothing once they are gone.
+_PAUSE_SENTENCE = re.compile(
+    r"\s*The engine interrupted this analysis because .*?; the units it finished are kept, "
+    r"and a resume continues it(?: once the gate reopens)?\.")
+
+
+def _drop_pause_sentences(conn):
+    # A table older than the paragraph itself has nothing to cut.
+    if "coverage_note" not in {r["name"] for r in conn.execute("PRAGMA table_info(analysis)")}:
+        return
+    rows = conn.execute("SELECT id, coverage_note FROM analysis WHERE coverage_note LIKE ?",
+                        ("%The engine interrupted this analysis because %",)).fetchall()
+    for r in rows:
+        conn.execute("UPDATE analysis SET coverage_note=? WHERE id=?",
+                     (_PAUSE_SENTENCE.sub("", r["coverage_note"]).strip(), r["id"]))
 
 
 # Every analysis closed before `record_event` grew `replace` holds TWO
@@ -1551,25 +1588,77 @@ def reset_unit(conn, unit_id, spend_usd=0.0) -> bool:
     return cur.rowcount > 0
 
 
-def interrupt_analysis(conn, analysis_id, note="") -> bool:
-    """running -> interrupted. `note`, when given, joins the paragraph (the
-    orchestrator names the gate that closed, or the failure that stopped it)
-    -- once: the same sentence already there is not written twice."""
-    note = (note or "").strip()
+# WHAT STOPPED AN ANALYSIS, the `kind` of its `pause`:
+#   usage    -- the account's usage window (the engine's rl_gate)
+#   cap      -- a daily spending cap, the job's or the fleet's
+#   gate     -- one of the engine's gates whose kind it did not say
+#   breaker  -- every unit alike could not run: an agent that never started,
+#               a provider that refused (orchestrator._count_cannot_run)
+#   failed   -- the orchestrator itself failed, or its close did
+#   stopped  -- somebody stopped it
+# The first two are the engine's own ceilings, and lift by themselves: the
+# tick resumes an analysis they paused once the same gate reopens
+# (security_resume_paused in bin/agentloop). The others need a person.
+PAUSE_KINDS = ("usage", "cap", "gate", "breaker", "failed", "stopped")
+SELF_LIFTING_PAUSES = ("usage", "cap")
+
+
+def pause_doc(kind, reason="", until=None, at=None) -> dict:
+    """The `pause` document: `kind` (one of PAUSE_KINDS), `at` (when it
+    stopped), `reason` (one sentence, the engine's or the orchestrator's
+    own words) and `until` (when a self-lifting gate reopens, else None)."""
+    if kind not in PAUSE_KINDS:
+        raise ValueError(f"unknown pause kind: {kind}")
+    try:
+        until = int(until) if until not in (None, "") else None
+    except (TypeError, ValueError):
+        until = None
+    return {"kind": kind, "at": int(at if at is not None else time.time()),
+            "reason": (reason or "").strip(), "until": until}
+
+
+def pause_of(row) -> dict:
+    """The `pause` document of an analysis row, `{}` when there is none --
+    a running or closed analysis, a row from before the column, or a
+    document this module cannot read. Never raises, for the reason
+    `coverage.decode` never does."""
+    try:
+        stored = row["pause"]
+    except (KeyError, IndexError, TypeError):
+        return {}
+    if not stored:
+        return {}
+    try:
+        doc = json.loads(stored)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(doc, dict) or doc.get("kind") not in PAUSE_KINDS:
+        return {}
+    return doc
+
+
+def interrupt_analysis(conn, analysis_id, pause=None) -> bool:
+    """running -> interrupted, with `pause` (pause_doc) saying why, or ''
+    when the caller cannot say -- a sweep of a row whose orchestrator is
+    gone, a resume the tick could not start. The paragraph is not touched:
+    a pause is not a gap in what the analysis looked at, and it ends when
+    the analysis is resumed (see the `pause` column)."""
+    stored = json.dumps(pause, sort_keys=True) if pause else ""
     with conn:
         cur = conn.execute(
-            "UPDATE analysis SET state=?, coverage_note=CASE"
-            " WHEN ?='' OR instr(coverage_note, ?)>0 THEN coverage_note"
-            " ELSE TRIM(coverage_note || ' ' || ?) END"
-            " WHERE id=? AND state='running'",
-            (INTERRUPTED, note, note, note, analysis_id))
+            "UPDATE analysis SET state=?, pause=? WHERE id=? AND state='running'",
+            (INTERRUPTED, stored, analysis_id))
     return cur.rowcount > 0
 
 
 def resume_analysis(conn, analysis_id, automatic=False) -> bool:
+    """interrupted -> running, and its pause is over. `automatic` counts the
+    resume against SECURITY_MAX_AUTO_RESUMES (an orchestrator that died);
+    neither an operator's Resume nor the tick's resume of a self-lifting
+    pause is counted."""
     with conn:
         cur = conn.execute(
-            "UPDATE analysis SET state='running', resumes=resumes+? WHERE id=? AND state=?",
+            "UPDATE analysis SET state='running', pause='', resumes=resumes+? WHERE id=? AND state=?",
             (1 if automatic else 0, analysis_id, INTERRUPTED))
     return cur.rowcount > 0
 
@@ -1579,10 +1668,19 @@ def close_interrupted(conn, analysis_id, note) -> bool:
     or out of automatic resumes. The units it finished stay in the ledger."""
     with conn:
         cur = conn.execute(
-            "UPDATE analysis SET state='failed', ended=?,"
+            "UPDATE analysis SET state='failed', ended=?, pause='',"
             " coverage_note=TRIM(coverage_note || ' ' || ?) WHERE id=? AND state=?",
             (int(time.time()), note, analysis_id, INTERRUPTED))
     return cur.rowcount > 0
+
+
+def self_lifting_paused(conn) -> list:
+    """Every interrupted analysis whose pause lifts by itself (usage, cap),
+    oldest first: what the tick asks the engine's gate about, and resumes
+    once it is open."""
+    rows = conn.execute("SELECT * FROM analysis WHERE state=? AND pause<>'' ORDER BY id",
+                        (INTERRUPTED,)).fetchall()
+    return [r for r in rows if pause_of(r).get("kind") in SELF_LIFTING_PAUSES]
 
 
 def reopen_analysis(conn, analysis_id, leaves, note) -> bool:
