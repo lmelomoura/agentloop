@@ -505,6 +505,14 @@ ends. A live job whose project cannot be resolved — a derived security job, or
 job deleted from `jobs.json` while its run was still going — counts as a run of
 *every* project, so an unresolvable id can never license a sweep of all of them.
 
+A project that almost always has *some* run going is, by that rule, almost never
+swept. `"worktree": {"sweep_during_runs": true}` in the project opts out of the
+second guarantee: the hook is then called during live runs too, with
+`AL_SWEEP_LIVE_RUN=1`, and must restrict itself to what holds no data — images
+and build cache, never a container, a volume or a directory — because the trial
+merge's tree is still indistinguishable from garbage. It is opt-in because a
+hook written without the flag in mind would ignore it and sweep everything.
+
 A hook that outlives `worktree.sweep_timeout_seconds` (default 300) is killed:
 it runs inside the tick's own mutex, so one blocked on an unresponsive daemon
 would stop the scheduler launching anything at all. `AGENTLOOP_SWEEP_INTERVAL=0`

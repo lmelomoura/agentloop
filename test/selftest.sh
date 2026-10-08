@@ -5179,6 +5179,29 @@ NASTY
   [ ! -f "$tmp/data/sweep.log" ] \
     && ok "a project with a live run is not swept" \
     || bad "the sweep ran while a run of that project was still live"
+  # A project that opts in (worktree.sweep_during_runs) is swept anyway, but
+  # TOLD that a run is live, so its hook can restrict itself to what holds no
+  # data. Revenue Copilot always has a run going, and without this its sweep
+  # never ran at all: a day of finished runs' images piled up behind it.
+  "$JQ" '(.projects[] | select(.name == "two") | .worktree) |= ((. // {}) + {sweep_during_runs: true})' \
+    "$tmp/proj/two.json" > "$tmp/proj/two-live.json"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "swept live=${AL_SWEEP_LIVE_RUN:-}" >> "$AL_SWEEP_LOG"' \
+    > "$tmp/cfg/provision/two.sweep.sh"
+  rm -f "$tmp/data/.sweep.stamp" "$tmp/data/sweep.log"
+  ( PROJECTS_FILE="$tmp/proj/two-live.json"; CONFIG_DIR="$tmp/cfg"; JOBS_FILE="$tmp/cfg/jobs.json"
+    DATA_DIR="$tmp/data"; LOCK_DIR="$tmp/locks"; WORKTREES_DIR="$tmp/wtroot"
+    AL_SWEEP_LOG="$tmp/data/sweep.log"; export AL_SWEEP_LOG
+    wt_sweep_projects ) >/dev/null 2>&1
+  [ "$(cat "$tmp/data/sweep.log" 2>/dev/null)" = "swept live=1" ] \
+    && ok "a project that opted in is swept during a live run, told AL_SWEEP_LIVE_RUN=1" \
+    || bad "an opted-in project with a live run: $(cat "$tmp/data/sweep.log" 2>/dev/null || echo 'not swept')"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "swept" >> "$AL_SWEEP_LOG"' \
+    'cp "$AL_LIVE_WORKTREES" "$AL_SWEEP_LOG.live"' \
+    'cp "$AL_CANONICALS" "$AL_SWEEP_LOG.canon"' \
+    > "$tmp/cfg/provision/two.sweep.sh"
+  rm -f "$tmp/data/sweep.log"
   # Kill the claim and it runs.
   rm -rf "$tmp/locks/jLive"
   rm -f "$tmp/data/.sweep.stamp"

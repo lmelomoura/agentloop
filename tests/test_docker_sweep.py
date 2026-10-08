@@ -67,7 +67,8 @@ def dock(tmp_path):
                       "FAKE_DOCKER_STATE": str(state)})
             for k in ("DK_DRY_RUN", "DK_IMAGE_PROJECT_RE", "AL_LIVE_WORKTREES", "AL_CANONICALS",
                       "DK_ORPHAN_NAME_GLOB", "DK_PROTECTED_NAMES",
-                      "AL_SWEEP_GRACE_SECONDS"):
+                      "AL_SWEEP_GRACE_SECONDS", "AL_SWEEP_LIVE_RUN",
+                      "AL_SWEEP_IMAGE_GRACE_SECONDS"):
                 e.pop(k, None)
             e.update({k: str(v) for k, v in env.items()})
             p = subprocess.run(
@@ -240,6 +241,55 @@ def test_sweep_leaves_images_of_a_project_that_still_has_containers(dock):
     dock.state["images"] = [img("i1", "rc-kept-api", "rc-kept")]
     sweep(dock)
     assert dock.images() == ["rc-kept-api:latest"]
+
+
+# ------------------------------------------------ while a run is live
+
+def ago(seconds):
+    from datetime import timedelta
+    t = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    return t.strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
+
+
+def test_live_run_mode_reclaims_images_and_nothing_else(dock):
+    # AL_SWEEP_LIVE_RUN: a run of the project is alive, so its trial tree
+    # looks exactly like garbage. Containers and volumes wait; images go.
+    dock.state["containers"] = [
+        {"id": "c1", "project": "rc-gone", "workdir": "/no/such/dir", "created": OLD}]
+    dock.state["volumes"] = [{"name": "rc-vol_pg", "project": "rc-vol"}]
+    dock.state["images"] = [img("i1", "rc-old-api", "rc-old")]
+    p = sweep(dock, AL_SWEEP_LIVE_RUN=1)
+    assert dock.images() == [], p.stdout
+    assert [c["id"] for c in dock.state["containers"]] == ["c1"]
+    assert [v["name"] for v in dock.state["volumes"]] == ["rc-vol_pg"]
+
+
+def test_the_image_pass_removes_images_only(dock):
+    # A finished run that ran `make down` keeps its volumes; the image pass
+    # must not take them -- while a run is live, nothing but images may go.
+    dock.state["volumes"] = [{"name": "rc-old_pg", "project": "rc-old"}]
+    dock.state["networks"] = [{"id": "n1", "project": "rc-old"}]
+    dock.state["images"] = [img("i1", "rc-old-api", "rc-old")]
+    p = sweep(dock, AL_SWEEP_LIVE_RUN=1)
+    assert dock.images() == [], p.stdout
+    assert [v["name"] for v in dock.state["volumes"]] == ["rc-old_pg"]
+    assert [n["id"] for n in dock.state["networks"]] == ["n1"]
+    assert not any(x.startswith("compose ") for x in dock.state["log"])
+
+
+def test_images_have_their_own_shorter_grace(dock):
+    # An image holds no data: an hour is enough not to race a build, and a
+    # finished run's images are gone the same afternoon, not six hours later.
+    dock.state["images"] = [img("i1", "rc-done-api", "rc-done", created=ago(7200)),
+                            img("i2", "rc-busy-api", "rc-busy", created=ago(600))]
+    sweep(dock)
+    assert dock.images() == ["rc-busy-api:latest"]
+
+
+def test_the_image_grace_can_be_set(dock):
+    dock.state["images"] = [img("i1", "rc-done-api", "rc-done", created=ago(7200))]
+    sweep(dock, AL_SWEEP_IMAGE_GRACE_SECONDS=10800)
+    assert dock.images() == ["rc-done-api:latest"]
 
 
 # ------------------------------------- images compose's classic builder made
