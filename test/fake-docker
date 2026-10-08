@@ -12,9 +12,12 @@ file's "log" list so a test can assert on what was destroyed. Shape:
      "log":        []}
 
 `created` is docker's human form ("2026-10-07 14:31:12 +0100 WEST"). An image
-with `"project": ""` carries no compose label. An image is "in use" while a
+with `"project": ""` carries no compose project label; `"builder"` is the
+`com.docker.compose.image.builder` label compose's classic builder sets
+INSTEAD of the project label. An image is "in use" while a
 container's "image" field names its id, which is how `docker image rm` (no -f)
-refuses it, as the real one does.
+refuses it, as the real one does. An image tagged "<none>" is listed only
+with -a, as the real one does.
 """
 
 import json
@@ -85,7 +88,8 @@ def cfields(c):
 def ifields(i):
     return {"ID": i["id"], "Repository": i["repo"], "Tag": i["tag"],
             "CreatedAt": i["created"],
-            "label:com.docker.compose.project": i.get("project", "")}
+            "label:com.docker.compose.project": i.get("project", ""),
+            "label:com.docker.compose.image.builder": i.get("builder", "")}
 
 
 def main(argv):
@@ -115,6 +119,10 @@ def main(argv):
 
     if cmd == "image" and rest and rest[0] in ("ls", "list"):
         rows = select(s["images"], rest[1:])
+        # As Docker 29 does: an untagged image is listed only with -a or a
+        # dangling filter. A label filter alone does not bring it back.
+        if not ("-a" in rest or "--all" in rest or "dangling=true" in rest):
+            rows = [i for i in rows if i["tag"] != "<none>"]
         fmt = opt(rest, "--format")
         for i in rows:
             print(i["id"] if "-q" in rest or fmt is None else render(fmt, ifields(i)))

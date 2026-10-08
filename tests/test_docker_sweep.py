@@ -37,9 +37,15 @@ def young():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
 
 
-def img(iid, repo, project, created=OLD, tag="latest"):
+def img(iid, repo, project, created=OLD, tag="latest", builder=""):
     return {"id": iid, "repo": repo, "tag": tag, "project": project,
-            "created": created}
+            "created": created, "builder": builder}
+
+
+def classic(iid, repo, created=OLD):
+    """An image compose's classic builder made: it carries
+    com.docker.compose.image.builder=classic and NO project label."""
+    return img(iid, repo, "", created=created, builder="classic")
 
 
 @pytest.fixture
@@ -59,7 +65,7 @@ def dock(tmp_path):
             e = dict(os.environ)
             e.update({"PATH": "%s:%s" % (bin_dir, os.environ["PATH"]),
                       "FAKE_DOCKER_STATE": str(state)})
-            for k in ("DK_DRY_RUN", "AL_LIVE_WORKTREES", "AL_CANONICALS",
+            for k in ("DK_DRY_RUN", "DK_IMAGE_PROJECT_RE", "AL_LIVE_WORKTREES", "AL_CANONICALS",
                       "DK_ORPHAN_NAME_GLOB", "DK_PROTECTED_NAMES",
                       "AL_SWEEP_GRACE_SECONDS"):
                 e.pop(k, None)
@@ -152,6 +158,18 @@ def test_sweep_reclaims_the_images_of_an_old_orphan_matching_the_glob(dock):
     assert "rc-20261007t175858z-27548" in p.stdout
 
 
+def test_sweep_reclaims_a_projects_untagged_images(dock):
+    # A rebuild that moves a tag leaves the old image untagged but still
+    # labelled; `docker image ls` without -a does not list it. Observed:
+    # 13 such images of one finished run, 1-4 GB each, missed by the sweep.
+    dock.state["images"] = [
+        img("u1", "<none>", "rc-old", tag="<none>"),
+        img("u2", "<none>", "rc-old", tag="<none>")]
+    p = sweep(dock)
+    assert dock.images() == [], p.stdout + p.stderr
+    assert dock.removed_images() == ["u1", "u2"]
+
+
 def test_sweep_image_pass_honours_dry_run(dock):
     dock.state["images"] = [img("i1", "rc-old-tools", "rc-old")]
     p = sweep(dock, DK_DRY_RUN=1)
@@ -224,6 +242,57 @@ def test_sweep_leaves_images_of_a_project_that_still_has_containers(dock):
     assert dock.images() == ["rc-kept-api:latest"]
 
 
+# ------------------------------------- images compose's classic builder made
+
+RC_RE = "^rc-([0-9]{8}t[0-9]{6}z-[0-9]+|rc-trial-[a-z][a-z0-9]*-[0-9]+-[0-9]+)"
+
+
+def test_stack_down_takes_the_classic_builders_images_of_the_project(dock):
+    dock.state["images"] = [
+        classic("k1", "rc-20261007t220833z-71858-rms"),
+        classic("k2", "rc-20261007t220833z-71858-tools"),
+        classic("k3", "rc-20261007t220833z-7185-rms"),   # another run
+        img("k4", "rc-20261007t220833z-71858-x", ""),    # no compose label
+        classic("k5", "rc-php-base")]
+    dock.run("dk_stack_down rc-20261007t220833z-71858")
+    assert dock.images() == ["rc-20261007t220833z-7185-rms:latest",
+                             "rc-20261007t220833z-71858-x:latest",
+                             "rc-php-base:latest"]
+
+
+def test_stack_down_dry_run_counts_the_classic_builders_images(dock):
+    dock.state["images"] = [classic("k1", "rc-20261007t220833z-71858-rms")]
+    p = dock.run("dk_stack_down rc-20261007t220833z-71858", DK_DRY_RUN=1)
+    assert "1 images" in p.stdout
+    assert dock.removed_images() == []
+
+
+def test_sweep_finds_a_classic_only_project_by_the_declared_name(dock):
+    dock.state["images"] = [
+        classic("k1", "rc-20261007t220833z-71858-rms"),
+        classic("k2", "rc-rc-trial-rc-15-1960-api"),
+        classic("k5", "rc-php-base"),
+        classic("k6", "rc-tools", created=OLD)]
+    p = sweep(dock, DK_IMAGE_PROJECT_RE=RC_RE)
+    assert dock.images() == ["rc-php-base:latest", "rc-tools:latest"], p.stdout
+
+
+def test_sweep_leaves_classic_images_without_a_declared_name(dock):
+    dock.state["images"] = [classic("k1", "rc-20261007t220833z-71858-rms")]
+    sweep(dock)
+    assert dock.images() == ["rc-20261007t220833z-71858-rms:latest"]
+
+
+def test_sweep_refuses_young_or_live_classic_images(dock):
+    live = dock.tmp / "live.txt"
+    live.write_text("/al/data/worktrees/rc-dev-agent/20261008T054537Z-7799\n")
+    dock.state["images"] = [
+        classic("k1", "rc-20261008t054537z-7799-rms"),
+        classic("k2", "rc-20261008t060000z-1-rms", created=young())]
+    sweep(dock, DK_IMAGE_PROJECT_RE=RC_RE, AL_LIVE_WORKTREES=live)
+    assert len(dock.images()) == 2
+
+
 # ------------------------------------------------- dk_down_prefixed (trials)
 
 def test_down_prefixed_takes_the_trial_stacks_of_one_ticket(dock):
@@ -254,6 +323,12 @@ def test_down_prefixed_spares_a_trial_whose_tree_still_exists(dock):
     assert dock.images() == ["rc-rc-trial-rc-15-3000-api:latest"]
     assert len(dock.state["containers"]) == 1
     assert "rc-rc-trial-rc-15-3000" in p.stdout
+
+
+def test_down_prefixed_finds_classic_trial_images(dock):
+    dock.state["images"] = [classic("k1", "rc-rc-trial-rc-15-1960-api", young())]
+    dock.run("dk_down_prefixed rc-rc-trial-rc-15-", DK_IMAGE_PROJECT_RE=RC_RE)
+    assert dock.images() == []
 
 
 def test_down_prefixed_refuses_an_empty_or_protected_prefix(dock):

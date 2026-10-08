@@ -685,6 +685,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The Docker sweep tests cover the two kinds of image it used to miss.**
+  An untagged image is listed by `docker image ls` only with `-a`, even under
+  a label filter, so a project's images left untagged by a rebuild were
+  invisible to the sweep: 13 of them, 1-4 GB each, from one finished run.
+  And compose's classic builder labels its images
+  `com.docker.compose.image.builder` but sets no project label at all, so a
+  run built that way could not be found by label: 29 tags from two finished
+  runs. `test/fake-docker` now hides untagged images without `-a` and models
+  the builder label; the new cases pin that both kinds are reclaimed, that a
+  classic-built image is taken only by the `<project>-` name of a project
+  already vetted (or one named by a declared run-name pattern) and only while
+  it carries the builder label, and that shared base images never are.
+
 - **Tests for a Docker sweep library that removes images too.**
   `tests/test_docker_sweep.py` runs a personal `config/lib/docker-sweep.sh`
   (not shipped; the module is skipped where it is absent) against
