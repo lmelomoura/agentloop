@@ -685,6 +685,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Tests for a Docker sweep library that removes images too.**
+  `tests/test_docker_sweep.py` runs a personal `config/lib/docker-sweep.sh`
+  (not shipped; the module is skipped where it is absent) against
+  `test/fake-docker`, a stand-in CLI that records every removal. It pins that
+  taking a compose stack down also removes the images compose built for it
+  (`docker image rm`, never `-f`, an image still in use kept and reported),
+  that a project with only images left is reclaimed only past the grace
+  period, outside live runs, by name glob and never when protected or
+  unlabelled. Without that, every agent run left one tagged image per service
+  for ever, out of reach of a dangling-only prune, and the build cache could
+  not shrink below the layers they pinned: 164 images and 40.7 GB of cache
+  against a 20 GiB ceiling on one machine.
+
 - **A call a hook held once no longer files the run as a blocked agent.**
   A knowledge-base PreToolUse hook holds every session's first change until
   the agent has searched the project's knowledge, and lets the identical call
