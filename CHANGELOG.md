@@ -696,8 +696,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   expected to reclaim only what holds no data -- images and build cache. It
   is opt-in because a hook written before the flag would ignore it and sweep
   everything. The sweep library's tests pin the image-only mode, its own
-  shorter grace for images (`AL_SWEEP_IMAGE_GRACE_SECONDS`, an hour), and
-  that the image pass removes images and nothing else.
+  shorter grace for images (`AL_SWEEP_IMAGE_GRACE_SECONDS`, an hour), that
+  the image pass removes images and nothing else, and that the global prune
+  takes dangling images after an hour rather than a day (at a day, 11 of
+  them, 13 GB, filled the image list) and never more than dangling ones.
 
 - **The Docker sweep tests cover the two kinds of image it used to miss.**
   An untagged image is listed by `docker image ls` only with `-a`, even under

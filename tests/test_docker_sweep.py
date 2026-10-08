@@ -68,7 +68,7 @@ def dock(tmp_path):
             for k in ("DK_DRY_RUN", "DK_IMAGE_PROJECT_RE", "AL_LIVE_WORKTREES", "AL_CANONICALS",
                       "DK_ORPHAN_NAME_GLOB", "DK_PROTECTED_NAMES",
                       "AL_SWEEP_GRACE_SECONDS", "AL_SWEEP_LIVE_RUN",
-                      "AL_SWEEP_IMAGE_GRACE_SECONDS"):
+                      "AL_SWEEP_IMAGE_GRACE_SECONDS", "DK_PRUNE_MIN_AGE_HOURS"):
                 e.pop(k, None)
             e.update({k: str(v) for k, v in env.items()})
             p = subprocess.run(
@@ -387,3 +387,20 @@ def test_down_prefixed_refuses_an_empty_or_protected_prefix(dock):
     dock.run("dk_down_prefixed revenue-copilot",
              DK_PROTECTED_NAMES="revenue-copilot")
     assert dock.images() == ["revenue-copilot-api:latest"]
+
+
+# ------------------------------------------------------------ dk_prune_global
+
+def test_global_prune_takes_dangling_images_after_an_hour(dock):
+    # An untagged image nothing names any more is garbage by definition; the
+    # delay only avoids racing a build. 24 h left 11 of them, 13 GB, sitting
+    # in the image list for most of a day.
+    dock.run("dk_prune_global")
+    assert "image prune -f --filter until=1h" in dock.state["log"]
+
+
+def test_global_prune_never_prunes_more_than_dangling_images(dock):
+    dock.run("dk_prune_global")
+    prunes = [x for x in dock.state["log"] if x.startswith("image prune")]
+    assert prunes and all("-a" not in x.split() for x in prunes)
+    assert not any(x.startswith("system") for x in dock.state["log"])
