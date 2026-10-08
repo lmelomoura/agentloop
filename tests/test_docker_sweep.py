@@ -67,7 +67,8 @@ def dock(tmp_path):
                       "FAKE_DOCKER_STATE": str(state)})
             for k in ("DK_DRY_RUN", "DK_IMAGE_PROJECT_RE", "AL_LIVE_WORKTREES", "AL_CANONICALS",
                       "DK_ORPHAN_NAME_GLOB", "DK_PROTECTED_NAMES",
-                      "AL_SWEEP_GRACE_SECONDS"):
+                      "AL_SWEEP_GRACE_SECONDS", "AL_SWEEP_LIVE_RUN",
+                      "AL_SWEEP_IMAGE_GRACE_SECONDS", "DK_PRUNE_MIN_AGE_HOURS"):
                 e.pop(k, None)
             e.update({k: str(v) for k, v in env.items()})
             p = subprocess.run(
@@ -242,6 +243,55 @@ def test_sweep_leaves_images_of_a_project_that_still_has_containers(dock):
     assert dock.images() == ["rc-kept-api:latest"]
 
 
+# ------------------------------------------------ while a run is live
+
+def ago(seconds):
+    from datetime import timedelta
+    t = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    return t.strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
+
+
+def test_live_run_mode_reclaims_images_and_nothing_else(dock):
+    # AL_SWEEP_LIVE_RUN: a run of the project is alive, so its trial tree
+    # looks exactly like garbage. Containers and volumes wait; images go.
+    dock.state["containers"] = [
+        {"id": "c1", "project": "rc-gone", "workdir": "/no/such/dir", "created": OLD}]
+    dock.state["volumes"] = [{"name": "rc-vol_pg", "project": "rc-vol"}]
+    dock.state["images"] = [img("i1", "rc-old-api", "rc-old")]
+    p = sweep(dock, AL_SWEEP_LIVE_RUN=1)
+    assert dock.images() == [], p.stdout
+    assert [c["id"] for c in dock.state["containers"]] == ["c1"]
+    assert [v["name"] for v in dock.state["volumes"]] == ["rc-vol_pg"]
+
+
+def test_the_image_pass_removes_images_only(dock):
+    # A finished run that ran `make down` keeps its volumes; the image pass
+    # must not take them -- while a run is live, nothing but images may go.
+    dock.state["volumes"] = [{"name": "rc-old_pg", "project": "rc-old"}]
+    dock.state["networks"] = [{"id": "n1", "project": "rc-old"}]
+    dock.state["images"] = [img("i1", "rc-old-api", "rc-old")]
+    p = sweep(dock, AL_SWEEP_LIVE_RUN=1)
+    assert dock.images() == [], p.stdout
+    assert [v["name"] for v in dock.state["volumes"]] == ["rc-old_pg"]
+    assert [n["id"] for n in dock.state["networks"]] == ["n1"]
+    assert not any(x.startswith("compose ") for x in dock.state["log"])
+
+
+def test_images_have_their_own_shorter_grace(dock):
+    # An image holds no data: an hour is enough not to race a build, and a
+    # finished run's images are gone the same afternoon, not six hours later.
+    dock.state["images"] = [img("i1", "rc-done-api", "rc-done", created=ago(7200)),
+                            img("i2", "rc-busy-api", "rc-busy", created=ago(600))]
+    sweep(dock)
+    assert dock.images() == ["rc-busy-api:latest"]
+
+
+def test_the_image_grace_can_be_set(dock):
+    dock.state["images"] = [img("i1", "rc-done-api", "rc-done", created=ago(7200))]
+    sweep(dock, AL_SWEEP_IMAGE_GRACE_SECONDS=10800)
+    assert dock.images() == ["rc-done-api:latest"]
+
+
 # ------------------------------------- images compose's classic builder made
 
 RC_RE = "^rc-([0-9]{8}t[0-9]{6}z-[0-9]+|rc-trial-[a-z][a-z0-9]*-[0-9]+-[0-9]+)"
@@ -337,3 +387,20 @@ def test_down_prefixed_refuses_an_empty_or_protected_prefix(dock):
     dock.run("dk_down_prefixed revenue-copilot",
              DK_PROTECTED_NAMES="revenue-copilot")
     assert dock.images() == ["revenue-copilot-api:latest"]
+
+
+# ------------------------------------------------------------ dk_prune_global
+
+def test_global_prune_takes_dangling_images_after_an_hour(dock):
+    # An untagged image nothing names any more is garbage by definition; the
+    # delay only avoids racing a build. 24 h left 11 of them, 13 GB, sitting
+    # in the image list for most of a day.
+    dock.run("dk_prune_global")
+    assert "image prune -f --filter until=1h" in dock.state["log"]
+
+
+def test_global_prune_never_prunes_more_than_dangling_images(dock):
+    dock.run("dk_prune_global")
+    prunes = [x for x in dock.state["log"] if x.startswith("image prune")]
+    assert prunes and all("-a" not in x.split() for x in prunes)
+    assert not any(x.startswith("system") for x in dock.state["log"])

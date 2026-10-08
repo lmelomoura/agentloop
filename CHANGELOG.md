@@ -685,6 +685,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A project that always has a run going can still be swept.** The tick
+  skipped a project's sweep hook while ANY run of it was alive, which is
+  right for containers and volumes (a trial merge's tree looks exactly like
+  garbage until the run ends) and meant a busy project was never swept at
+  all: one machine held a day of finished runs' images, a gigabyte or more
+  each, behind a project that had a dev, a reviewer or a promote run going
+  at almost every tick. `"worktree": {"sweep_during_runs": true}` now calls
+  the hook during live runs too, with `AL_SWEEP_LIVE_RUN=1`, and the hook is
+  expected to reclaim only what holds no data -- images and build cache. It
+  is opt-in because a hook written before the flag would ignore it and sweep
+  everything. The sweep library's tests pin the image-only mode, its own
+  shorter grace for images (`AL_SWEEP_IMAGE_GRACE_SECONDS`, an hour), that
+  the image pass removes images and nothing else, and that the global prune
+  takes dangling images after an hour rather than a day (at a day, 11 of
+  them, 13 GB, filled the image list) and never more than dangling ones.
+
 - **The Docker sweep tests cover the two kinds of image it used to miss.**
   An untagged image is listed by `docker image ls` only with `-a`, even under
   a label filter, so a project's images left untagged by a rebuild were
