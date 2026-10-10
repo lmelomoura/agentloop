@@ -5,11 +5,16 @@ It answers exactly the commands that library issues, from a JSON state file
 named by FAKE_DOCKER_STATE, and appends every removal it performs to the same
 file's "log" list so a test can assert on what was destroyed. Shape:
 
-    {"containers": [{"id", "project", "workdir", "created"}],
+    {"containers": [{"id", "project", "workdir", "created"[, "name", "state"]}],
      "images":     [{"id", "repo", "tag", "project", "created"}],
      "volumes":    [{"name", "project"}],
      "networks":   [{"id", "project"}],
      "log":        []}
+
+A container with a "name" is listed by `ps --format '{{.Names}}'`; without
+`-a`, `ps` lists only containers whose "state" is "running" (the default).
+FAKE_DOCKER_HANG=<seconds> makes `ps` sleep first (a daemon that does not
+answer), FAKE_DOCKER_PS_FAIL=1 makes it fail (one that refuses).
 
 `created` is docker's human form ("2026-10-07 14:31:12 +0100 WEST"). An image
 with `"project": ""` carries no compose project label; `"builder"` is the
@@ -24,6 +29,7 @@ import json
 import os
 import re
 import sys
+import time
 
 STATE = os.environ["FAKE_DOCKER_STATE"]
 
@@ -80,7 +86,7 @@ def render(fmt, fields):
 
 
 def cfields(c):
-    return {"ID": c["id"], "CreatedAt": c["created"],
+    return {"ID": c["id"], "Names": c.get("name", ""), "CreatedAt": c["created"],
             "label:com.docker.compose.project": c["project"],
             "label:com.docker.compose.project.working_dir": c.get("workdir", "")}
 
@@ -104,7 +110,18 @@ def main(argv):
         return 0
 
     if cmd == "ps":
+        # FAKE_DOCKER_HANG=<seconds>: the daemon that does not answer (it did,
+        # on 2026-10-10, for minutes). FAKE_DOCKER_PS_FAIL=1: one that refuses.
+        if os.environ.get("FAKE_DOCKER_HANG"):
+            time.sleep(float(os.environ["FAKE_DOCKER_HANG"]))
+        if os.environ.get("FAKE_DOCKER_PS_FAIL"):
+            print("Cannot connect to the Docker daemon", file=sys.stderr)
+            return 1
         rows = select(s["containers"], rest)
+        # As the real one does: without -a only RUNNING containers are listed.
+        # A container with no "state" is running.
+        if not ("-a" in rest or "-aq" in rest or "--all" in rest):
+            rows = [c for c in rows if c.get("state", "running") == "running"]
         fmt = opt(rest, "--format")
         for c in rows:
             print(c["id"] if "-aq" in rest or fmt is None else render(fmt, cfields(c)))

@@ -690,15 +690,34 @@ mechanisms now limit the host, both shared by every job of every project:
   gated, like it is not gated by the precheck. The load is `sysctl -n vm.loadavg`
   (macOS) or `/proc/loadavg`; one that cannot be read opens the gate.
 
+- **A running CI step.** A Bitbucket Pipelines runner on the same machine is host
+  load the slots cannot see: a suite started beside a pipeline step made both fail
+  by timeouts (2026-10-10). While a container named like the runner's step
+  (`<runner-uuid>_<step-uuid>_pause` or `_build`; `_pause` lives for the whole
+  step) runs, `agentloop host` is **busy**, lists it as a holder
+  (`ci step 8648124f (bitbucket runner)`, once per step) and `agentloop heavy`
+  waits for it to end, holding no slot meanwhile. A step is not a slot: it does
+  not count against `heavy_slots`. It is one `docker ps` per look, bounded by a
+  timeout, and it **fails open**: a Docker that does not answer in time (or is
+  down, or absent) counts as "no CI step", and `agentloop host` says so, because
+  a gate that waits on a hung daemon would stop the whole fleet. The tick does not
+  look: a CI step holds heavy work, not launches. The gate is checked when a
+  command asks for a slot; a step that starts after the command began is not
+  waited for.
+
 `agentloop host` (or `agentloop heavy --status`) prints the load, the cap, the
-slots in use and their holders, and exits **0 when the host is quiet** (a slot is
-free and the 5-minute load is under the cap) and **1 when it is busy**. A
-precheck that deferred a job because of the host calls it to re-measure.
+CI line, the slots in use and their holders, and exits **0 when the host is quiet**
+(a slot is free, the 5-minute load is under the cap and no CI step runs) and **1
+when it is busy**. A precheck that deferred a job because of the host calls it to
+re-measure.
 
 | Setting | Environment | `projects.json` | Default |
 |---|---|---|---|
 | Heavy slots (`0` = no ceiling) | `AGENTLOOP_HEAVY_SLOTS` | `host.heavy_slots` | `1` |
 | Load cap on the 5-minute load (`0` = no gate) | `AGENTLOOP_LOAD_CAP` | `host.load_cap` | `1.5 ×` the CPU count |
+| CI steps hold heavy work (`0`, `off` or `false` = off) | `AGENTLOOP_CI_GATE` | `host.ci_gate` | `1` |
+| Which containers are a CI step (extended regex over `docker ps` names) | `AGENTLOOP_CI_PATTERN` | `host.ci_pattern` | the runner's `<uuid>_<uuid>_(pause\|build)` |
+| Seconds `docker ps` may take before the gate fails open (1-60) | `AGENTLOOP_CI_TIMEOUT` | `host.ci_timeout` | `5` |
 
 The environment wins, then the top-level `host` block of `config/projects.json`
 (`{"projects": [...], "host": {"heavy_slots": 1, "load_cap": 15}}`), then the
