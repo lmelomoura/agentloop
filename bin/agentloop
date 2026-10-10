@@ -4580,23 +4580,21 @@ host_contract() {
   cat <<CONTRACT
 ## Heavy work goes through the host gate — one machine runs every project's agents
 
-Starting containers or running a full suite or build costs this one machine more
-than a run's share, and unthrottled it takes the whole fleet down (a load
-average of 250, suites failing on timeouts, Docker hung). So:
-- Run every command that starts containers or runs a full suite or build — \`make
-  test\`, \`make check\`, \`make test-*\`, \`docker compose up\`, the repo's
-  integration and end-to-end suites — as \`${bin} heavy -- <command>\`
-  (the same path is in \`\$AL_BIN\`). It blocks until a host-wide slot is free,
-  runs the command in the foreground and returns its exit code unchanged.
-- One suite at a time, in the foreground. Never two in parallel. Measure the
-  head and the trial merge one after the other in the SAME worktree, never in a
-  second worktree with a stack of its own.
+Unthrottled suites take the whole fleet down (load 250, timeouts, Docker hung).
+- Run every command that starts containers or runs a full suite or build
+  (\`make test\`, \`make check\`, \`make test-*\`, \`docker compose up\`, the
+  repo's integration and e2e suites) as \`${bin} heavy -- <command>\` (also
+  \`\$AL_BIN\`). It waits for a host-wide slot and returns the exit code unchanged.
+- One suite at a time. Never two in parallel. Measure the head and the trial
+  merge one after the other in the SAME worktree, never in a second worktree.
 - Take down the stack a suite started (the repo's own teardown target) as soon
   as its result is read, before starting anything else.
-- Waiting for a slot is normal, not a failure, and the watchdog knows it: keep
-  blocking on it. Never write a deferral, or "environment failure", because the
-  host is busy while \`agentloop heavy\` is waiting. If your tool call is cut off
-  by its timeout while waiting, run the same command again.
+- Waiting for a slot is normal and the watchdog knows it: keep blocking. Never
+  write a deferral or "environment failure" because the host is busy.
+- The wait plus the suite can outlast one tool call, and a call cut off leaves
+  the command running. So start it as \`${bin} heavy -- make test > <log> 2>&1;
+  echo \$? > <rc>\` and block with \`until [ -f <rc> ]; do sleep 30; done\`
+  (re-issued if cut off). Never start a suite again while it is still alive.
 - A suite that failed only by timeouts while the host was overloaded is run
   again through \`agentloop heavy\`; it is not a red build.
 CONTRACT

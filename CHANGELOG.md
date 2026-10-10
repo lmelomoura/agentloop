@@ -46,7 +46,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   watchdog does not kill a run that is waiting for a slot**: a waiter's
   heartbeat counts as activity, because a run queued behind the gate sleeps
   with no output and no CPU, which is exactly what the stall rule kills.
-  Without that exemption the gate would have killed the runs it queues.
+  Without that exemption the gate would have killed the runs it queues. The
+  contract also tells the agent to start a long suite with its output in a file
+  and its exit code in a marker and to block on the marker: a tool call cut off
+  by its own time limit leaves the command running, and re-running it would
+  have queued a second copy of the suite behind the first.
 
 - **A job can have a base branch of its own.** `base` on a job (the editor's
   "Base branch" field, or `agentloop set-field <job> base`) is where that
