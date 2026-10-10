@@ -4585,10 +4585,12 @@ Unthrottled suites take the whole fleet down (load 250, timeouts, Docker hung).
   (\`make test\`, \`make check\`, \`make test-*\`, \`docker compose up\`, the
   repo's integration and e2e suites) as \`${bin} heavy -- <command>\` (also
   \`\$AL_BIN\`). It waits for a host-wide slot and returns the exit code unchanged.
-- One suite at a time. Never two in parallel. Measure the head and the trial
-  merge one after the other in the SAME worktree, never in a second worktree.
-- Take down the stack a suite started (the repo's own teardown target) as soon
-  as its result is read, before starting anything else.
+- One suite and one stack at a time, never two in parallel: measure the head
+  and the trial merge one after the other. If the trial merge needs a worktree
+  of its own, take the first stack down before bringing up the second, and take
+  the trial's stack down and remove its worktree when done.
+- Take down a suite's stack (the repo's teardown target) as soon as its result
+  is read, before starting anything else.
 - Waiting for a slot is normal and the watchdog knows it: keep blocking. Never
   write a deferral or "environment failure" because the host is busy.
 - The wait plus the suite can outlast one tool call, and a call cut off leaves

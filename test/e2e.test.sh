@@ -2062,11 +2062,17 @@ cat > "$ROOT/config/jobs.json" <<JSON
           "interval_seconds":3600,"permission_mode":"bypassPermissions","max_parallel":1}]}
 JSON
 oa="$ROOT/heavy-66a.out"; ob="$ROOT/heavy-66b.out"; rm -f "$oa" "$ob"
-AGENTLOOP_HEAVY_POLL=1 FAKE_MODE=heavy FAKE_HEAVY_CMD="sleep 6" FAKE_HEAVY_OUT="$oa" FAKE_SESSION=sess-66a "$AL" run j66a >/dev/null 2>&1 &
+AGENTLOOP_HEAVY_POLL=1 FAKE_MODE=heavy FAKE_HEAVY_CMD="sleep 8" FAKE_HEAVY_OUT="$oa" FAKE_SESSION=sess-66a "$AL" run j66a >/dev/null 2>&1 &
 pa=$!
-AGENTLOOP_HEAVY_POLL=1 FAKE_MODE=heavy FAKE_HEAVY_CMD="sleep 6" FAKE_HEAVY_OUT="$ob" FAKE_SESSION=sess-66b "$AL" run j66b >/dev/null 2>&1 &
+AGENTLOOP_HEAVY_POLL=1 FAKE_MODE=heavy FAKE_HEAVY_CMD="sleep 8" FAKE_HEAVY_OUT="$ob" FAKE_SESSION=sess-66b "$AL" run j66b >/dev/null 2>&1 &
 pb=$!
-sleep 4
+# Sample the status once the contention is OBSERVABLE: one of the two has said
+# it is waiting, so the other holds the slot right now. A fixed sleep guessed how
+# long two runs take to reach their `heavy` call, and a slow, loaded CI runner
+# (worktree set-up, provisioning) sampled before either had (CI, 2026-10-10:
+# "0 of 1 slot(s) in use"). If the slot were not shared nobody would ever wait,
+# and this gives up after a minute and fails the checks below.
+w=0; while [ "$w" -lt 60 ] && ! grep -qs 'agentloop heavy: waiting' "$oa" "$ob"; do sleep 1; w=$((w + 1)); done
 host66="$("$AL" host 2>&1)"; host_rc=$?
 wait "$pa" "$pb" 2>/dev/null
 [ "$host_rc" = 1 ] && printf '%s\n' "$host66" | grep -q '1 of 1 slot' \

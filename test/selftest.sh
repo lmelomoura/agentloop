@@ -3663,8 +3663,12 @@ EOF
   case "$hc" in *"$(printf '%q' "$SELF") heavy -- "*) ok "it gives the invocation as an absolute path that works without a PATH" ;; *) bad "no absolute invocation in the contract" ;; esac
   case "$hc" in *'$AL_BIN'*) ok "and the variable that holds it" ;; *) bad "AL_BIN not named" ;; esac
   case "$hc" in *"make"*"test"*"docker compose up"*) ok "it names the commands that count as heavy" ;; *) bad "heavy commands not named" ;; esac
-  case "$hc" in *"One suite at a time"*"SAME worktree"*) ok "one suite at a time, the head and the trial merge in the same worktree" ;; *) bad "one-at-a-time rule missing" ;; esac
-  case "$hc" in *"Take down the stack"*"before starting anything else"*) ok "teardown as soon as the result is read" ;; *) bad "teardown rule missing" ;; esac
+  # The trial merge legitimately runs in a scratch worktree of its own (git worktree add --detach, then
+  # make reset and git worktree remove), so the rule is ONE STACK AT A TIME, not one worktree.
+  case "$hc" in *"One suite and one stack at a time"*"one after the other"*"take the first stack down before bringing up the second"*"remove its worktree"*)
+    ok "one suite and one stack at a time; a trial merge's own worktree is allowed once the first stack is down" ;; *) bad "one-stack-at-a-time rule missing" ;; esac
+  case "$hc" in *"same worktree"*|*"SAME worktree"*|*"never in a second worktree"*) bad "the contract forbids the trial merge's scratch worktree" ;; *) ok "and it no longer forbids a second worktree outright" ;; esac
+  case "$hc" in *"Take down a suite's stack"*"before starting anything else"*) ok "teardown as soon as the result is read" ;; *) bad "teardown rule missing" ;; esac
   case "$hc" in *"Waiting for a slot is normal"*"deferral"*) ok "waiting is normal, never a deferral" ;; *) bad "waiting rule missing" ;; esac
   case "$hc" in *"only by timeouts"*"not a red build"*) ok "a suite that failed only by timeouts under load is re-run, not reported red" ;; *) bad "timeout rule missing" ;; esac
   [ "$(printf '%s\n' "$hc" | wc -l | tr -d ' ')" -le 24 ] && ok "and it is short (read by every run)" || bad "the host contract grew past 24 lines"

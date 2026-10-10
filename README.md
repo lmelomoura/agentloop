@@ -711,8 +711,8 @@ environment of its own. A value that is not a number is skipped, never half-read
 (`host_contract` in `bin/agentloop`): run every command that starts containers or
 runs a full suite or build as `<absolute path of agentloop> heavy -- <command>`
 (the same path is in `$AL_BIN`, and `$AL_RUN_SLOT` is the run's own slot); one
-suite at a time, in the foreground, the head and the trial merge in the same
-worktree; take the stack down as soon as the result is read; waiting is normal,
+suite and one stack at a time, the head and the trial merge one after the other
+(a trial merge's own worktree is fine once the first stack is down); take the stack down as soon as the result is read; waiting is normal,
 never a deferral; a suite that failed only by timeouts under load is re-run, not
 reported red. Security units are not given it: they read code, are never
 provisioned and run no suite.
