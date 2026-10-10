@@ -119,6 +119,10 @@ def test_every_decision_the_engine_logs_is_classified(clean_data):
         "GLOBAL daily cap reached ($9 / $5 across all jobs) — skipping": "capped",
         "already at max_parallel=3 run(s), not launching another": "blocked",
         "at max_parallel=3 run(s), not launching another": "blocked",
+        # The tick's host gate (cmd_tick): the 5-minute load is over the cap and
+        # a due job was held back. Without this branch the line is unclassified
+        # and the band shows the held-back jobs as not looked at at all.
+        "host busy (load 28.4 > 15.0), not launching": "blocked",
         "no prompt, skipped": "failed",
         "cwd missing (/nope), skipped": "failed",
         "claude_config_dir missing (/nope), skipped": "failed",
