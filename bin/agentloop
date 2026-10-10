@@ -7743,15 +7743,20 @@ ${prompt}"
       # all are), and this is what puts a stack back that a reboot took down
       # while the session sat open.
       #
-      # dirt_sha is refreshed too, the same way wt_setup's own first pass
-      # records it (see there). A second `up` can leave DIFFERENT residue than
-      # the first — a regenerated .env, a compose state file with a new
-      # timestamp — and wt_undelivered_work compares the worktree's current
-      # dirt_sha against whatever is stored to tell provisioning noise from
-      # the agent's own work. Left at the first pass's value, that residue
-      # reads as the RESUMED agent's work and is reported UNDELIVERED for
-      # something it never touched.
-      local rdirt="$run_dir/.dirt.tsv"
+      # The snapshot (the manifest's `dirt`, see wt_setup) is extended too. A
+      # second `up` can leave DIFFERENT residue than the first — a regenerated
+      # .env, a compose state file with a new timestamp — and
+      # wt_undelivered_work reports any dirty line the snapshot does not hold
+      # as the agent's own work. Left as it was, that residue reads as the
+      # RESUMED agent's work and is reported UNDELIVERED for something it
+      # never touched.
+      #
+      # Extended by what the second `up` ADDED, read before it and again after
+      # it, never re-taken whole: the interrupted session's uncommitted edits
+      # are in this tree too, and re-taking the snapshot here recorded them as
+      # residue (wt_dirt_fold says what that cost). The fingerprint is read
+      # before `up` only so a manifest an older engine wrote can be adopted.
+      local rdirt="$run_dir/.dirt.tsv" rpre rsha
       : > "$rdirt" 2>/dev/null || rdirt=""
       while IFS="$(printf '\t')" read -r rname rrepo rwt rbase; do
         [ -n "$rname" ] || continue
@@ -7766,6 +7771,8 @@ ${prompt}"
         case "$id" in
           "$SECURITY_JOB_PREFIX"*) ;;
           *)
+            rpre="$(wt_dirt "$rwt")" || rpre=""
+            rsha="$(wt_dirt_sha "$rwt")" || rsha=""
             # `|| true` here, unlike the fresh path which aborts. A reattach finds a
             # stack that is usually already up, so the common failure is a hook
             # declining work it has done rather than a tree left half-built — and
@@ -7774,39 +7781,20 @@ ${prompt}"
             # log itself.
             wt_provision up "$project" "$id" "$run_dir" "$rname" "$rrepo" "$rwt" "$rbase" || true
             # No `up` ran for a security job above, so there is no new residue to
-            # fold in -- leave $rdirt without an entry for this repo and the merge
-            # below falls back to the manifest's existing dirt_sha unchanged. Only
-            # the provisioned path refreshes it, the same reason it needs
-            # refreshing at all: a second `up` can leave different residue than
-            # the first (see below).
-            [ -n "$rdirt" ] && printf '%s\t%s\n' "$rname" "$(wt_dirt_sha "$rwt")" >> "$rdirt"
+            # fold in -- leave $rdirt without an entry for this repo and the fold
+            # below keeps the manifest's snapshot unchanged. A reading git could
+            # not give (10.1: wt_dirt prints nothing) goes in as an empty field,
+            # and the fold keeps that repo's snapshot too.
+            [ -n "$rdirt" ] && printf '%s\t%s\t%s\t%s\n' \
+              "$rname" "$rpre" "$(wt_dirt "$rwt")" "$rsha" >> "$rdirt"
             ;;
         esac
       done < <("$JQ" -r '.repos[] | [.name,.canonical,.worktree,.base] | @tsv' \
                   "$run_dir/.run.json" 2>/dev/null)
-      # Falls back to the EXISTING dirt_sha, not to empty, when a repo's fresh
-      # reading is missing (a provisioning failure, an empty $rdirt from the
-      # `: >` above failing on a read-only disk) OR present but empty (10.1:
-      # wt_dirt_sha itself now prints nothing when git could not read that
-      # repo during this re-up pass): an empty dirt_sha makes
-      # wt_undelivered_work fall back to its strict, no-snapshot reading,
-      # which would flag every ordinary bit of provisioning residue as the
-      # agent's own work — worse than just keeping the stale-but-valid value.
-      # `//` alone is not enough here: it treats an ABSENT entry (null) as
-      # falling through, but a PRESENT, empty-string one -- exactly what a
-      # failed wt_dirt_sha now writes -- is not null, so `$d[.name] // X`
-      # would keep the "" and silently discard X. Normalising "" to null
-      # first is what makes both shapes of "no fresh reading" fall back the
-      # same way.
-      if [ -n "$rdirt" ] && "$JQ" -R -n --slurpfile mf "$run_dir/.run.json" '
-            ([inputs | split("\t") | {(.[0]): .[1]}] | add // {}) as $d
-            | $mf[0] | .repos = [.repos[] | . + {dirt_sha:
-                (($d[.name] // "" | if . == "" then null else . end) // .dirt_sha // "")}]' \
-            "$rdirt" > "$run_dir/.run.json.new" 2>/dev/null; then
-        mv -f "$run_dir/.run.json.new" "$run_dir/.run.json"
-      else
-        rm -f "$run_dir/.run.json.new"
-      fi
+      # No fold (the `: >` above failed on a read-only disk, or jq did) leaves
+      # the manifest as it was: short of the second `up`'s residue at worst,
+      # which errs toward reporting work, never toward hiding it.
+      if [ -n "$rdirt" ]; then wt_dirt_fold "$run_dir" "$rdirt" || true; fi
       rm -f "$rdirt"
       log_tick "$id: resumed $resume_sid in its own tree $run_dir (cwd $worktree)"
     elif [ -n "$resume_sid" ] && [ -z "$reattached" ]; then

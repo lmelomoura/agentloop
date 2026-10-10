@@ -4514,27 +4514,42 @@ PY
   [ -n "${ld2_line:-}" ] && [ -n "${touch_line:-}" ] && [ "$touch_line" -gt "$ld2_line" ] \
     && ok "and it happens after the claim succeeds, at line $touch_line vs drop at $ld2_line" \
     || bad "touch (line ${touch_line:-?}) is not after the successful claim's lock_drop (line ${ld2_line:-?})"
-  # 9.10: the reattach's second `up` pass has to refresh dirt_sha, or its own
-  # residue reads as the resumed agent's work. Structural only, guarding the
-  # line that recomputes it -- the behavioural proof (that the refresh
-  # actually clears a false UNDELIVERED report) is below, driving the real
-  # wt_provision/wt_dirt_sha/wt_undelivered_work.
-  got="$(printf '%s\n' "$body" | grep -c 'wt_dirt_sha "\$rwt"')"
+  # 9.10, and what a resume showed it got wrong: the reattach reads the tree
+  # BEFORE its second `up` and again AFTER it, and folds only the difference
+  # into the snapshot. Structural only, guarding the order of those three
+  # lines -- the behavioural proof is below, running the real block.
+  got="$(printf '%s\n' "$body" | grep -c 'wt_dirt_fold "\$run_dir"')"
   [ "${got:-0}" -eq 1 ] \
-    && ok "the reattach's second provisioning pass recomputes dirt_sha ($got)" \
-    || bad "run_job no longer recomputes dirt_sha after a reattach's second up pass ($got)"
+    && ok "the reattach folds its second provisioning pass into the snapshot ($got)" \
+    || bad "run_job no longer folds a reattach's second up pass into the snapshot ($got)"
+  local pre_at up_at post_at
+  pre_at="$(printf '%s\n' "$body" | grep -n 'rpre="\$(wt_dirt "\$rwt")"' | head -1 | cut -d: -f1)"
+  up_at="$(printf '%s\n' "$body" | grep -n 'wt_provision up "\$project" "\$id" "\$run_dir" "\$rname"' | head -1 | cut -d: -f1)"
+  post_at="$(printf '%s\n' "$body" | grep -n '"\$rpre" "\$(wt_dirt "\$rwt")"' | head -1 | cut -d: -f1)"
+  [ -n "$pre_at" ] && [ -n "$up_at" ] && [ -n "$post_at" ] \
+    && [ "$pre_at" -lt "$up_at" ] && [ "$up_at" -lt "$post_at" ] \
+    && ok "the tree is read before the second up and again after it ($pre_at < $up_at < $post_at)" \
+    || bad "the reattach's readings are out of order or gone: before=${pre_at:-?} up=${up_at:-?} after=${post_at:-?}"
 
-  echo "run_job() — a reattach's second provisioning pass refreshes dirt_sha too"
-  # Not structural alone: this drives the REAL wt_setup / wt_provision /
-  # wt_dirt_sha / wt_undelivered_work, replicating exactly what the reattach
-  # branch does inline (run_job itself cannot be called here). wt_dirt_sha
-  # hashes `git status --porcelain`'s TEXT, which for an untracked file is
-  # its PATH, not its content -- overwriting the same filename each run would
-  # leave that text, and the sha, identical. The hook instead names the file
-  # after its own pid -- a fresh bash subprocess every invocation -- so a
-  # second pass leaves a DIFFERENT untracked path behind, standing in for
-  # what a real hook can do (a compose lockfile or a temp dir named after its
-  # own pid).
+  # The reattach block itself, extracted from the engine and run for real
+  # (the technique errsnippet uses below): run_job cannot be called here, and
+  # a copy of the loop would go on passing after the engine's own changed.
+  local reupsnippet
+  reupsnippet="$(sed -n '/^      local rdirt="\$run_dir\/.dirt.tsv" rpre rsha$/,/^      rm -f "\$rdirt"$/p' \
+                   "$BIN_DIR/agentloop")"
+  [ -n "$reupsnippet" ] || bad "could not extract the reattach's provisioning block -- its anchors moved"
+  _reattach_up() { # <job id> <run dir> -- what the reattach branch does between the claim and the launch
+    local id="$1" run_dir="$2" project=two
+    eval "$reupsnippet"
+  }
+
+  echo "run_job() — a reattach folds in only what its own second up left behind"
+  # wt_dirt lists `git status --porcelain`, which for an untracked file is its
+  # PATH, not its content -- overwriting the same filename each run would
+  # leave the listing identical. The hook instead names the file after its
+  # own pid -- a fresh bash subprocess every invocation -- so a second pass
+  # leaves a DIFFERENT untracked path behind, standing in for what a real
+  # hook can do (a compose lockfile or a temp dir named after its own pid).
   printf '%s\n' '#!/usr/bin/env bash' 'echo hi > "$AL_WORKTREE/build-$$.txt"' \
     > "$tmp/cfg/provision/two.up.sh"
   chmod +x "$tmp/cfg/provision/two.up.sh"
@@ -4545,67 +4560,143 @@ PY
   ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
     wt_undelivered_work "$rdDirt" ) >/dev/null 2>&1
   want "right after setup, nothing is undelivered" 1 $?
-  # Re-run `up`, exactly as the reattach branch does -- WITHOUT refreshing
-  # dirt_sha yet. This reproduces the bug on its own: the hook's second
-  # stamp differs from its first, so the snapshot taken after the FIRST up
-  # no longer matches, and it now reads as the resumed agent's own work.
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    _reattach_up jDirt "$rdDirt" ) >/dev/null 2>&1
+  got="$(find "$wtDirt" -maxdepth 1 -name 'build-*.txt' | wc -l | tr -d ' ')"
+  [ "$got" = "2" ] && ok "the fixture is valid: the reattach's up left a second file ($got)" \
+    || bad "the reattach's up left $got build files, expected 2 -- fixture invalid"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_undelivered_work "$rdDirt" ) >/dev/null 2>&1
+  want "the reattach's own residue is not undelivered" 1 $?
+  got="$("$JQ" -r '[.repos[] | select(.name=="one") | .dirt[]] | length' "$rdDirt/.run.json" 2>/dev/null)"
+  [ "$got" = "2" ] \
+    && ok "the snapshot holds setup's residue and the reattach's own ($got lines)" \
+    || bad "the snapshot for 'one' holds '$got' lines, expected 2: $("$JQ" -c '.repos[0].dirt' "$rdDirt/.run.json" 2>/dev/null)"
+  # The control: an `up` the fold never saw. Its file is not in the snapshot,
+  # so it reads as the agent's work -- 9.10 as it was, and what the fold is for.
   ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"
     wt_provision up two jDirt "$rdDirt" one "$tmp/g/repo" "$wtDirt" develop ) >/dev/null 2>&1
   ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
     wt_undelivered_work "$rdDirt" ) >/dev/null 2>&1
-  want "WITHOUT a refresh, the second pass's own residue reads as undelivered work" 0 $?
-  # Refresh dirt_sha the way the fix does. The false report clears even
-  # though nothing about the actual residue changed since the check just
-  # above -- only the snapshot it is compared against did.
-  new_sha="$(wt_dirt_sha "$wtDirt")"
-  "$JQ" --arg n "one" --arg s "$new_sha" \
-    '.repos = [.repos[] | if .name==$n then .dirt_sha=$s else . end]' \
-    "$rdDirt/.run.json" > "$rdDirt/.run.json.new" 2>/dev/null \
-    && mv -f "$rdDirt/.run.json.new" "$rdDirt/.run.json"
-  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
-    wt_undelivered_work "$rdDirt" ) >/dev/null 2>&1
-  want "and WITH the refresh, that same residue is no longer undelivered" 1 $?
+  want "WITHOUT the fold, a second pass's own residue reads as undelivered work" 0 $?
   rm -rf "$tmp/wtroot/jDirt" "$tmp/cfg/provision/two.up.sh"
+  git -C "$tmp/g/repo" worktree prune >/dev/null 2>&1 || true
 
-  echo "run_job() — the reattach's dirt_sha merge keeps the stale value, not empty, when wt_dirt_sha itself fails"
-  # Found by an independent review of 10.1, not by the brief: 10.1 made
-  # wt_dirt_sha print NOTHING (not a hash) when git cannot read a worktree.
-  # This merge's own comment says a missing fresh reading should fall back to
-  # the EXISTING dirt_sha -- but a failed wt_dirt_sha still writes a TSV line
-  # for that repo, just with an EMPTY value, which is present, not absent.
-  # jq's `//` treats an empty string as truthy, so `$d[.name] // .dirt_sha`
-  # kept the "" and silently discarded the stale-but-valid value -- exactly
-  # the fallback the comment says exists. Reproduced against the REAL merge
-  # code (sed-extracted, the same technique errsnippet uses above), not a
-  # reimplementation of the jq filter.
-  local rdMerge="$tmp/wtroot/jMerge/stampMerge" mergesnippet
+  echo "run_job() — a reattach never takes the interrupted session's own edits for residue"
+  # The reattach used to re-take the snapshot after its second `up`, over
+  # whatever the interrupted session had left: a real run, cut by a rate
+  # limit, left one test file edited and uncommitted, and the resume
+  # recorded that edit as provisioning residue. Both ways that ends were
+  # wrong, and both are here. The resumed agent committed and pushed
+  # everything, and the run still came back UNDELIVERED -- the tree no longer
+  # matched a snapshot that held the edit. Had it NOT committed the edit,
+  # the tree would have matched: delivered, `.ended=done`, and the next sweep
+  # removes the only copy of the work.
+  local rdWip="$tmp/wtroot/jWip/stampWip" wtWip
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup jWip two "$tmp/g/repo" stampWip ) >/dev/null 2>&1
+  wtWip="$rdWip/one"
+  echo "the interrupted session's edit" >> "$wtWip/f"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    _reattach_up jWip "$rdWip" ) >/dev/null 2>&1
+  got="$( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+          wt_undelivered_work "$rdWip" )"
+  want "the edit the interrupted session never committed is still undelivered after the reattach" 0 $?
+  case "$got" in *"uncommitted changes in one"*) ok "and it names the repo it is in" ;;
+    *) bad "the description was '$got'" ;;
+  esac
+  # The resumed agent finishes the job: commits the edit and pushes it.
+  ( cd "$wtWip" && git add f && $gitc commit -qm "finish the interrupted edit" \
+      && git push -q origin HEAD:refs/heads/resume-wip ) >/dev/null 2>&1
+  [ -n "$(git -C "$wtWip" branch -r --contains HEAD 2>/dev/null)" ] \
+    && ok "the fixture is valid: the edit is committed and on the remote" \
+    || bad "the commit never reached the remote -- fixture invalid"
+  got="$( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+          wt_undelivered_work "$rdWip" )"
+  want "once it is committed and pushed, nothing is undelivered" 1 $?
+  [ -z "$got" ] && ok "and there is no note at all" || bad "the note was '$got'"
+  git -C "$tmp/g/repo" push -q origin :refs/heads/resume-wip >/dev/null 2>&1 || true
+  rm -rf "$tmp/wtroot/jWip"
+  git -C "$tmp/g/repo" worktree prune >/dev/null 2>&1 || true
+
+  echo "wt_dirt_fold() — a manifest from before the list is adopted only when that can be proved"
+  # A run dir an older engine made carries a fingerprint (`dirt_sha`), not
+  # lines. When the tree before the second `up` still hashes to it, nothing
+  # but setup's residue is there, and those lines ARE the residue. When it
+  # does not, residue and the interrupted session's edits cannot be told
+  # apart, and the snapshot starts empty: the strict reading, which may keep
+  # a tree that could go but never lets a sweep remove work.
+  printf '%s\n' '#!/usr/bin/env bash' 'echo residue > "$AL_WORKTREE/residue.txt"' \
+    > "$tmp/cfg/provision/two.up.sh"
+  chmod +x "$tmp/cfg/provision/two.up.sh"
+  local rdOld="$tmp/wtroot/jOld/stampOld" sha_one sha_two
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup jOld two "$tmp/g/repo" stampOld ) >/dev/null 2>&1
+  sha_one="$(wt_dirt_sha "$rdOld/one")"; sha_two="$(wt_dirt_sha "$rdOld/two")"
+  "$JQ" --arg a "$sha_one" --arg b "$sha_two" \
+    '.repos = [.repos[] | del(.dirt) | .dirt_sha = (if .name == "one" then $a else $b end)]' \
+    "$rdOld/.run.json" > "$rdOld/.run.json.new" 2>/dev/null && mv -f "$rdOld/.run.json.new" "$rdOld/.run.json"
+  got="$("$JQ" -r '[.repos[] | has("dirt")] | any' "$rdOld/.run.json" 2>/dev/null)"
+  [ "$got" = "false" ] && ok "the fixture is valid: the manifest has only the old fingerprint" \
+    || bad "the fixture still has a list: $got"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    _reattach_up jOld "$rdOld" ) >/dev/null 2>&1
+  got="$("$JQ" -c '.repos[] | select(.name=="one") | [.dirt, has("dirt_sha")]' "$rdOld/.run.json" 2>/dev/null)"
+  [ "$got" = '[["?? residue.txt"],false]' ] \
+    && ok "an untouched tree adopts its lines as the residue, and the fingerprint goes" \
+    || bad "the adopted manifest reads '$got'"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_undelivered_work "$rdOld" ) >/dev/null 2>&1
+  want "and that residue is not undelivered" 1 $?
+  rm -rf "$tmp/wtroot/jOld"; git -C "$tmp/g/repo" worktree prune >/dev/null 2>&1 || true
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_setup jOld two "$tmp/g/repo" stampOld ) >/dev/null 2>&1
+  sha_one="$(wt_dirt_sha "$rdOld/one")"; sha_two="$(wt_dirt_sha "$rdOld/two")"
+  "$JQ" --arg a "$sha_one" --arg b "$sha_two" \
+    '.repos = [.repos[] | del(.dirt) | .dirt_sha = (if .name == "one" then $a else $b end)]' \
+    "$rdOld/.run.json" > "$rdOld/.run.json.new" 2>/dev/null && mv -f "$rdOld/.run.json.new" "$rdOld/.run.json"
+  echo "the interrupted session's edit" >> "$rdOld/one/f"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    _reattach_up jOld "$rdOld" ) >/dev/null 2>&1
+  got="$("$JQ" -c '.repos[] | select(.name=="one") | .dirt' "$rdOld/.run.json" 2>/dev/null)"
+  [ "$got" = '[]' ] \
+    && ok "a tree that no longer hashes to it starts from an empty snapshot" \
+    || bad "the snapshot for 'one' reads '$got', expected []"
+  got="$( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+          wt_undelivered_work "$rdOld" )"
+  want "so the interrupted session's edit is reported, not hidden" 0 $?
+  case "$got" in *"uncommitted changes in one"*) ok "in the repo it is in" ;;
+    *) bad "the description was '$got'" ;;
+  esac
+  case "$got" in *"in two"*) bad "the untouched sibling was blamed too: '$got'" ;;
+    *) ok "and the untouched sibling, adopted, is not blamed" ;;
+  esac
+  rm -rf "$tmp/wtroot/jOld" "$tmp/cfg/provision/two.up.sh"
+  git -C "$tmp/g/repo" worktree prune >/dev/null 2>&1 || true
+
+  echo "wt_dirt_fold() — a repo with no usable reading keeps the snapshot it had"
+  # An empty field is a reading git could not give (wt_dirt prints nothing
+  # when it fails). Folding it would mean guessing, and either guess is
+  # wrong somewhere; the snapshot the repo already had is still valid.
+  local rdMerge="$tmp/wtroot/jMerge/stampMerge"
   ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
     wt_setup jMerge two "$tmp/g/repo" stampMerge ) >/dev/null 2>&1
-  "$JQ" --arg n "one" --arg s "STALE-BUT-VALID" \
-    '.repos = [.repos[] | if .name==$n then .dirt_sha=$s else . end]' \
-    "$rdMerge/.run.json" > "$rdMerge/.run.json.new" 2>/dev/null \
-    && mv -f "$rdMerge/.run.json.new" "$rdMerge/.run.json"
-  mergesnippet="$(sed -n '/^      if \[ -n "\$rdirt" \] && "\$JQ" -R -n --slurpfile mf "\$run_dir\/.run.json" .$/,/^      rm -f "\$rdirt"$/p' \
-                    "$BIN_DIR/agentloop")"
-  [ -n "$mergesnippet" ] || bad "could not extract the reattach dirt_sha merge block -- its anchors moved"
-  # "one" has an empty fresh reading (exactly what a failed wt_dirt_sha now
-  # writes); "two" has a real one, to prove a genuine refresh still wins and
-  # this fix does not just make the merge ignore fresh readings altogether.
-  (
-    run_dir="$rdMerge"
-    rdirt="$rdMerge/.dirt.tsv"
-    printf 'one\t\ntwo\tFRESH-VALID\n' > "$rdirt"
-    eval "$mergesnippet"
-  )
-  got="$("$JQ" -r '.repos[] | select(.name=="one") | .dirt_sha' "$rdMerge/.run.json" 2>/dev/null)"
-  [ "$got" = "STALE-BUT-VALID" ] \
-    && ok "an empty fresh reading falls back to the stale-but-valid dirt_sha" \
-    || bad "dirt_sha for 'one' reads '$got', expected the stale value STALE-BUT-VALID to survive"
-  got="$("$JQ" -r '.repos[] | select(.name=="two") | .dirt_sha' "$rdMerge/.run.json" 2>/dev/null)"
-  [ "$got" = "FRESH-VALID" ] \
-    && ok "a real fresh reading still wins over whatever was there before" \
-    || bad "dirt_sha for 'two' reads '$got', expected the fresh value FRESH-VALID"
-  rm -rf "$tmp/wtroot/jMerge"
+  "$JQ" '.repos = [.repos[] | .dirt = ["?? kept.txt"]]' \
+    "$rdMerge/.run.json" > "$rdMerge/.run.json.new" 2>/dev/null && mv -f "$rdMerge/.run.json.new" "$rdMerge/.run.json"
+  printf 'one\t\t["?? after.txt"]\t\ntwo\t[]\t["?? fresh.txt"]\t\n' > "$tmp/fold.tsv"
+  ( wt_dirt_fold "$rdMerge" "$tmp/fold.tsv" ) >/dev/null 2>&1
+  got="$("$JQ" -c '[.repos[] | .dirt]' "$rdMerge/.run.json" 2>/dev/null)"
+  [ "$got" = '[["?? kept.txt"],["?? fresh.txt","?? kept.txt"]]' ] \
+    && ok "no reading before up keeps the old snapshot; a real pair still folds in its difference" \
+    || bad "after the fold the snapshots read '$got'"
+  printf 'one\t["?? before.txt"]\t\t\n' > "$tmp/fold.tsv"
+  ( wt_dirt_fold "$rdMerge" "$tmp/fold.tsv" ) >/dev/null 2>&1
+  got="$("$JQ" -c '.repos[] | select(.name=="one") | .dirt' "$rdMerge/.run.json" 2>/dev/null)"
+  [ "$got" = '["?? kept.txt"]' ] \
+    && ok "no reading after up keeps it too" \
+    || bad "after a missing post-up reading the snapshot reads '$got'"
+  rm -rf "$tmp/wtroot/jMerge" "$tmp/fold.tsv"
+  git -C "$tmp/g/repo" worktree prune >/dev/null 2>&1 || true
 
   echo "run_job() — an error run with a declared ending but undelivered work stays open"
   # The regression this task's own self-review caught (three independent
@@ -4924,6 +5015,18 @@ PY
       ok "and it names the repo it is in" ;;
     *) bad "the description was '$got'" ;;
   esac
+  got="$("$JQ" -c '.repos[] | select(.name=="one") | .dirt' "$rd3/.run.json" 2>/dev/null)"
+  [ "$got" = '["?? provisioned.txt"]' ] \
+    && ok "the snapshot is the residue's own porcelain lines" \
+    || bad "the snapshot for 'one' reads '$got'"
+  # A tree CLEANER than its snapshot left nothing behind: whatever was dirty
+  # when the snapshot was taken was committed (which the unpushed-commits
+  # check below answers for) or removed. A fingerprint could only say "not
+  # the same" here, and that read as uncommitted changes.
+  rm -f "$rd3/two/agent.txt" "$rd3/one/provisioned.txt"
+  ( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
+    wt_undelivered_work "$rd3" ) >/dev/null 2>&1
+  want "residue that is gone is not undelivered work" 1 $?
   rm -f "$tmp/cfg/provision/two.up.sh"
 
   echo "wt_merge_probe_only() — a trial merge of what is already on a remote is not work"
@@ -5007,11 +5110,12 @@ PY
   esac
   rm -rf "$tmp/wtroot/jMerge"
 
-  echo "wt_dirt_sha() / wt_undelivered_work() — git that cannot answer is reported, not read as clean"
+  echo "wt_dirt() / wt_undelivered_work() — git that cannot answer is reported, not read as clean"
   # `git status --porcelain` prints nothing for a clean tree AND for one it
   # cannot read at all — hashing empty stdout used to give the SAME
   # fingerprint either way, measured for real: da39a3ee5e6b4b0d3255bfef9560
-  # 1890afd80709 for a clean repo, a missing path, and a non-repo alike. So a
+  # 1890afd80709 for a clean repo, a missing path, and a non-repo alike, and
+  # an empty list of lines would be just as blind. So a
   # broken .git pointer — the operator moves or renames the canonical
   # checkout, which breaks every one of its linked worktrees' pointers at
   # once — used to compare equal to "nothing changed". Reproduced against the
@@ -5040,18 +5144,23 @@ PY
   git -C "$rdG/one" status --porcelain >/dev/null 2>&1
   [ $? -ne 0 ] && ok "the fixture really is unreadable: git status fails on it" \
     || bad "breaking .git did not actually break git -- fixture invalid"
+  ( wt_dirt "$rdG/one" ) >/dev/null 2>&1
+  want "wt_dirt itself reports failure rather than an empty list" 1 $?
   ( wt_dirt_sha "$rdG/one" ) >/dev/null 2>&1
-  want "wt_dirt_sha itself reports failure rather than a colliding fingerprint" 1 $?
+  want "and so does wt_dirt_sha, which a resume still reads" 1 $?
   # The return code alone is not the whole story: `set -o pipefail` (active
   # throughout this codebase) already made the OLD one-liner's OWN exit
   # status non-zero on a git failure, by accident, since nothing ever CHECKED
   # it -- wt_setup's snapshot pass still does not. What actually protects
   # that call site is stdout: printing NOTHING on failure, instead of the
-  # collision hash, is what keeps a setup-time failure from being recorded as
-  # a real (but wrong) snapshot.
+  # collision hash or an empty `[]`, is what keeps a setup-time failure from
+  # being recorded as a real (but wrong) snapshot.
+  got="$(wt_dirt "$rdG/one" 2>/dev/null)"
+  [ -z "$got" ] && ok "and prints nothing on failure, not an empty list" \
+    || bad "wt_dirt printed '$got' on a git failure -- a caller that only checks stdout, like wt_setup's snapshot pass, would still be fooled"
   got="$(wt_dirt_sha "$rdG/one" 2>/dev/null)"
-  [ -z "$got" ] && ok "and prints nothing on failure, not the colliding hash" \
-    || bad "wt_dirt_sha printed '$got' on a git failure -- a caller that only checks stdout, like wt_setup's snapshot pass, would still be fooled"
+  [ -z "$got" ] && ok "nor does wt_dirt_sha print the colliding hash" \
+    || bad "wt_dirt_sha printed '$got' on a git failure -- the hash of an empty answer, which a clean tree gives too"
   got="$( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
           wt_undelivered_work "$rdG" )"
   want "the SAME real uncommitted file is still reported once git cannot look" 0 $?
@@ -5075,11 +5184,12 @@ PY
   # The OTHER caller: a hook can succeed and still leave git unable to read
   # the tree right afterward (corrupts its own index, say) -- provisioning
   # itself is not at fault, so wt_setup does not abort the run over this
-  # alone. The manifest records an empty snapshot, the same shape as "no
+  # alone. The manifest records no snapshot (null), the same shape as "no
   # snapshot was ever taken", which wt_undelivered_work already has a defined
-  # meaning for. The safety net is downstream, not here: the live check at
-  # teardown time goes through this SAME wt_dirt_sha, so a failure still
-  # there when it matters is still reported, not silently read as clean.
+  # meaning for -- and NOT an empty list, which would claim a clean tree. The
+  # safety net is downstream, not here: the live check at teardown time goes
+  # through this SAME wt_dirt, so a failure still there when it matters is
+  # still reported, not silently read as clean.
   printf '%s\n' '#!/usr/bin/env bash' \
     'echo residue > "$AL_WORKTREE/leftover.txt"' \
     'echo "gitdir: $AL_WORKTREE/nonexistent-gitdir" > "$AL_WORKTREE/.git"' \
@@ -5090,10 +5200,10 @@ PY
            wt_setup jSnapFail two "$tmp/g/repo" stampSF )"
   [ -n "$prim" ] && [ -d "$rdSF" ] \
     && ok "setup still completes: a post-provisioning snapshot failure alone does not abort the run" \
-    || bad "wt_setup aborted (or left nothing behind) over a dirt_sha failure alone -- prim='$prim'"
-  got="$("$JQ" -r '.repos[] | select(.name=="one") | .dirt_sha // "FIELD-ABSENT"' "$rdSF/.run.json" 2>/dev/null)"
-  [ "$got" = "" ] && ok "the manifest records an empty snapshot, not a crash or a stale value" \
-    || bad "dirt_sha recorded as '$got', expected empty"
+    || bad "wt_setup aborted (or left nothing behind) over a snapshot failure alone -- prim='$prim'"
+  got="$("$JQ" -r '.repos[] | select(.name=="one") | if has("dirt") then (.dirt | tojson) else "FIELD-ABSENT" end' "$rdSF/.run.json" 2>/dev/null)"
+  [ "$got" = "null" ] && ok "the manifest records no snapshot (null), not a crash, an empty list or a stale value" \
+    || bad "dirt recorded as '$got', expected null"
   got="$( PROJECTS_FILE="$tmp/proj/two.json"; CONFIG_DIR="$tmp/cfg"; WORKTREES_DIR="$tmp/wtroot"
           wt_undelivered_work "$rdSF" )"
   want "the live check still catches it -- git is STILL broken at teardown time" 0 $?
