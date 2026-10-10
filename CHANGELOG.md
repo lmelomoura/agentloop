@@ -20,6 +20,82 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A running CI step occupies the host's heavy gate.** `agentloop host` and
+  `agentloop heavy` only saw agent runs, but a Bitbucket Pipelines runner shares
+  the same Mac. On 2026-10-10 an agent's `make test` held the heavy slot while a
+  pull-request pipeline ran beside it: Playwright hit its 30 s timeout, the pull
+  request's pipeline and the branch's both failed, and a release merge waited
+  for hours, while `agentloop host` read "quiet" throughout. Now a running
+  container named like the runner's step (`<runner-uuid>_<step-uuid>_pause` or
+  `_build`, the shape in the runner's own log; `_pause` lives for the whole step)
+  makes `agentloop host` print `BUSY — a CI step is running` and list it as a
+  holder (`ci step 8648124f (bitbucket runner)`, once per step), and
+  `agentloop heavy` waits for the step to end, saying so and naming it, before it
+  takes a slot (it holds none while it waits). A CI step is not a slot: it does
+  not count against `heavy_slots`. The check is one `docker ps` per look,
+  bounded by a timeout (5 s), and **fails open**: Docker hung on the day this
+  was found, and a gate that waits on a hung daemon would stop every agent of
+  every project, so a `docker ps` that times out, fails or cannot be run counts
+  as "no CI step", `agentloop host` says so (`docker did not answer within 5s —
+  not counting CI steps (failing open)`) and `heavy` says it once. The tick does
+  not look: a CI step holds heavy work, not launches (launching an agent is
+  light, and a `docker ps` per due job would put a slow daemon in the
+  scheduler's own path). Settings, in the order of the other host ones:
+  `AGENTLOOP_CI_GATE` / `host.ci_gate` (`0`, `off` or `false` = off, default on),
+  `AGENTLOOP_CI_PATTERN` / `host.ci_pattern` (an extended regex over container
+  names; an invalid one is skipped) and `AGENTLOOP_CI_TIMEOUT` /
+  `host.ci_timeout` (seconds, 1-60). The gate is checked when a command asks for
+  a slot: a step that starts while a command already runs is not waited for.
+  `test/fake-docker` learned `ps --format '{{.Names}}'`, `FAKE_DOCKER_HANG` and
+  `FAKE_DOCKER_PS_FAIL`; the selftest and the e2e suite switch the gate off
+  (`AGENTLOOP_CI_GATE=0`) so a pipeline on the developer's machine cannot turn a
+  test of something else busy.
+
+- **The host has a limit of its own: heavy slots and a load gate.**
+  `max_parallel` only limits the runs of one job, so nothing stopped every
+  project's agents, a reviewer measuring two suites at once and a CI runner
+  from each bringing up a compose stack on the same ten CPUs. On 2026-10-10
+  the load average passed 250: Vitest died of "Test timed out", Docker hung,
+  the runner went offline and promoters parked tickets as "verification
+  deferred" for three hours. Now `agentloop heavy [--max-wait S] [--] <cmd>`
+  runs a command in the foreground while holding one of N host-wide slots
+  (default 1), shared by every job of every project, waiting for one and
+  saying who holds them; the exit code comes back unchanged, a TERM/INT/HUP
+  releases the slot and ends the command's process group, and a holder killed
+  with `-9` is pruned by the same pid-and-boot lease as a dead run (and takes
+  its command with it). `agentloop host` prints the load, the cap, the slots
+  and their holders, and exits 0 when the host is quiet and 1 when busy, for a
+  precheck to re-measure a deferral whose cause was the host. The tick no
+  longer launches a due job while the 5-minute load average is above the cap
+  (default 1.5 x CPUs; `tick.log`: `<id>: host busy (load X > Y), not
+  launching`), before the precheck so nothing is claimed; Run now is not gated.
+  Both settings are `AGENTLOOP_HEAVY_SLOTS` / `AGENTLOOP_LOAD_CAP` or the
+  `host` block of `projects.json`. Every job (not security units) is handed a
+  short host contract telling the agent to run suites through
+  `agentloop heavy`, one suite and one stack at a time (a trial merge may use
+  a worktree of its own once the first stack is down), to tear the stack down
+  after reading the result, never to write a deferral because the host is busy,
+  and, because a tool call cut off by its limit leaves the command running, to
+  start a long suite with its output and exit code in files and block on the
+  exit-code file rather than start it a second time. **The stall
+  watchdog does not kill a run that is waiting for a slot**: a waiter's
+  heartbeat counts as activity, because a run queued behind the gate sleeps
+  with no output and no CPU, which is exactly what the stall rule kills.
+  Without that exemption the gate would have killed the runs it queues. The
+  contract also tells the agent to start a long suite with its output in a file
+  and its exit code in a marker and to block on the marker: a tool call cut off
+  by its own time limit leaves the command running, and re-running it would
+  have queued a second copy of the suite behind the first.
+
+- **A job can have a base branch of its own.** `base` on a job (the editor's
+  "Base branch" field, or `agentloop set-field <job> base`) is where that
+  job's worktree is cut from, whatever its project declares; it is never
+  inherited, and an analysis's branch still outranks it. A project on
+  `release/*` refuses every run while that family is empty, which is right
+  for the jobs that work on a release and left the one job that *cuts* the
+  first release with no way to start: it needed the branch it exists to
+  create.
+
 - **The deterministic phase of a security analysis says what it is doing.**
   Its progress lines ("sbom done (48s)", "history 2000/21398 commits") go to
   tick.log as they are written, and the analysis page shows the last one
@@ -692,6 +768,105 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it. A run dir an older engine made (`dirt_sha`) is adopted on resume when
   its tree still hashes to that value; otherwise it starts from an empty
   snapshot, which may keep a tree that could go but never removes work.
+
+- **A project that always has a run going can still be swept.** The tick
+  skipped a project's sweep hook while ANY run of it was alive, which is
+  right for containers and volumes (a trial merge's tree looks exactly like
+  garbage until the run ends) and meant a busy project was never swept at
+  all: one machine held a day of finished runs' images, a gigabyte or more
+  each, behind a project that had a dev, a reviewer or a promote run going
+  at almost every tick. `"worktree": {"sweep_during_runs": true}` now calls
+  the hook during live runs too, with `AL_SWEEP_LIVE_RUN=1`, and the hook is
+  expected to reclaim only what holds no data -- images and build cache. It
+  is opt-in because a hook written before the flag would ignore it and sweep
+  everything. The sweep library's tests pin the image-only mode, its own
+  shorter grace for images (`AL_SWEEP_IMAGE_GRACE_SECONDS`, an hour), that
+  the image pass removes images and nothing else, and that the global prune
+  takes dangling images after an hour rather than a day (at a day, 11 of
+  them, 13 GB, filled the image list) and never more than dangling ones.
+
+- **The Docker sweep tests cover the two kinds of image it used to miss.**
+  An untagged image is listed by `docker image ls` only with `-a`, even under
+  a label filter, so a project's images left untagged by a rebuild were
+  invisible to the sweep: 13 of them, 1-4 GB each, from one finished run.
+  And compose's classic builder labels its images
+  `com.docker.compose.image.builder` but sets no project label at all, so a
+  run built that way could not be found by label: 29 tags from two finished
+  runs. `test/fake-docker` now hides untagged images without `-a` and models
+  the builder label; the new cases pin that both kinds are reclaimed, that a
+  classic-built image is taken only by the `<project>-` name of a project
+  already vetted (or one named by a declared run-name pattern) and only while
+  it carries the builder label, and that shared base images never are.
+
+- **Tests for a Docker sweep library that removes images too.**
+  `tests/test_docker_sweep.py` runs a personal `config/lib/docker-sweep.sh`
+  (not shipped; the module is skipped where it is absent) against
+  `test/fake-docker`, a stand-in CLI that records every removal. It pins that
+  taking a compose stack down also removes the images compose built for it
+  (`docker image rm`, never `-f`, an image still in use kept and reported),
+  that a project with only images left is reclaimed only past the grace
+  period, outside live runs, by name glob and never when protected or
+  unlabelled. Without that, every agent run left one tagged image per service
+  for ever, out of reach of a dangling-only prune, and the build cache could
+  not shrink below the layers they pinned: 164 images and 40.7 GB of cache
+  against a 20 GiB ceiling on one machine.
+
+- **A call a hook held once no longer files the run as a blocked agent.**
+  A knowledge-base PreToolUse hook holds every session's first change until
+  the agent has searched the project's knowledge, and lets the identical call
+  through on the retry. A reviewer did exactly that, then merged its PR and
+  moved its ticket. It was filed `error` / `tools_denied` ("it could not do
+  the work"), the morning after the same verdict had been fixed for the CLI's
+  safety checks alone. A hook leaves no `permission_denied` event, so the
+  reason cannot tell a hold from a block, but the retry can. A deny rule, a
+  mode, or a hook that keeps refusing refuses the identical call again. A
+  denial followed later in the stream by the same tool, with the same input,
+  succeeding is no longer counted.
+
+- **Run now comes back after its precheck dialog.** Cancel, or Run anyway, on
+  "Nothing to do right now" left the job's Run now grey, and so did a run or
+  resume refused with 409. The click handler declared `extra` twice. The second
+  declaration, the request body of the plain actions, sat at the top of the
+  `try` block, so every earlier use of `extra` in that block threw a
+  ReferenceError before the button was handed back. This had been so since
+  the pending-button guard went in on 2026-09-04; the tests read the handler's
+  text and never ran it. A new test runs it, with the real pending helpers,
+  through every exit.
+
+- **A stale usage reading no longer holds the whole fleet back.** Claude Code
+  2.1.284 reports both usage windows on every `rate_limit_event`, in
+  `unifiedWindows`. Only the window the event names (`rateLimitType`, nearly
+  always the five-hour one) was recorded, so the seven-day reading was never
+  refreshed by a run. A statusline's reading from 42 hours earlier, at 100%,
+  then held every scheduled run back for a night, and a ticket waiting for
+  review sat in the queue. Each forced run in between said 49% in the very
+  events nothing read. Every window an event carries is recorded now, with
+  the event's status kept for the window it names. Any run, a forced one
+  included, replaces an older reading of either window.
+
+- **A command the CLI's own safety check refused no longer files the run as a
+  blocked agent.** Claude Code refuses a few command shapes whatever the
+  permission mode says (an `rm` whose target is a command substitution is the
+  one measured), and a headless run has nobody to approve them. A dev run hit
+  one, removed the literal path on its next call, opened its PR and moved its
+  ticket. It was still filed `error` / `tools_denied` ("it could not do the
+  work") and stepped up the failure backoff, for a refusal no job setting
+  could have prevented. The stream names why each call was denied: a denial
+  it calls a `safetyCheck` (without a reason code, which would be a setting
+  the operator can change) is no longer counted as denied tools. The run is
+  a `warning` whose note says `SAFETY CHECK:` with the CLI's reason. A
+  denial by rule or by mode is still `tools_denied`.
+
+- **A run that could not be set up no longer vanishes.** A worktree that was
+  refused (no base resolvable, a failing `up` hook, a missing repo path) and a
+  resume with nothing to continue in both ended with one line in tick.log and
+  no record: on the dashboard the run started, died and was gone from the
+  runs list, with nothing saying why. It is now recorded `error` /
+  `setup_failed`, the reason as its note (`NOT STARTED: …`), with a log body,
+  no session and no cost; a refused resume does not claim the session it
+  named. The note of an empty base family names the pattern and the way out.
+  A refused worktree also counts towards the failure backoff, like any
+  failing run, so a scheduled job does not file that record every interval.
 
 - **A provider that cannot be reached is an outage, not the agent's error.**
   When OpenCode ends a run with the AI SDK's "Cannot connect to API" (no HTTP

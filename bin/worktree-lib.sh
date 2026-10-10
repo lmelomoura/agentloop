@@ -402,6 +402,15 @@ wt_find_by_session() { # <id> <session-id> -> prints a run dir, or nothing
   done
 }
 
+# Why a setup was refused: to tick.log, as always, and to the file the caller
+# named in $WT_FAIL_NOTE. wt_setup's stdout is the primary worktree, so its
+# reason could only ever reach the log -- and the run that was refused ended
+# with no record of why (see run_record_aborted).
+wt_setup_fail() { # <id> <reason>
+  log_tick "$1: $2"
+  [ -z "${WT_FAIL_NOTE:-}" ] || printf '%s\n' "$2" > "$WT_FAIL_NOTE" 2>/dev/null || true
+}
+
 # Create this run's dir and one worktree per repo the project spans, provision
 # each, and write the manifest. Prints the PRIMARY worktree (the repo whose path
 # is the project's .cwd) — that becomes the agent's cwd. Returns non-zero if
@@ -424,31 +433,54 @@ wt_find_by_session() { # <id> <session-id> -> prints a run dir, or nothing
 # died after the agent started and wrong here: "no marker yet" would read a
 # failed setup as a live run and keep it forever, the exact leak this whole
 # rollback exists to prevent.
-wt_setup() { # <id> <project> <canonical_cwd> <stamp> [port_base]
-  local id="${1:-}" project="${2:-}" cwd="${3:-}" stamp="${4:-}" port_base="${5:-}"
+#
+# THE JOB'S OWN BASE, when it has one, replaces the declared base of every repo
+# of the run. A project's base says where its work is cut from; one job of it
+# can need another answer, and the case that forced this is a release train
+# nobody has opened yet: the project is on `release/*`, that family is empty,
+# and the job whose work is to cut the first release was refused its worktree
+# for want of the very branch it exists to create. The refusal of an empty
+# family stays -- every other job of the project has nothing to work from --
+# and the job that opens it says where ITS tree comes from (`main`, usually).
+# An analysis's branch (AL_BASE_OVERRIDE) still outranks it: wt_base_ref reads
+# that first, whatever base it is handed.
+wt_setup() { # <id> <project> <canonical_cwd> <stamp> [port_base] [job_base]
+  local id="${1:-}" project="${2:-}" cwd="${3:-}" stamp="${4:-}" port_base="${5:-}" job_base="${6:-}"
   local run_dir="$WORKTREES_DIR/$id/$stamp" tsv="$WORKTREES_DIR/$id/.$stamp.tsv"
-  local name repo base ref wt sha primary=""
+  local name repo base ref wt sha why primary=""
   # How long a single repo's fetch may block before the base is resolved from
   # local refs instead. Declared per project, like every other worktree knob.
   local fetch_t; fetch_t="$(num "$(project_get "$project" '.worktree.fetch_timeout_seconds' '120')" 120)"
-  mkdir -p "$run_dir" || { log_tick "$id: cannot create the run dir $run_dir"; return 1; }
+  mkdir -p "$run_dir" || { wt_setup_fail "$id" "cannot create the run dir $run_dir"; return 1; }
   : > "$tsv"
   while IFS="$(printf '\t')" read -r name repo base; do
     [ -n "$name" ] || continue
+    [ -z "$job_base" ] || base="$job_base"
     if [ ! -d "$repo" ]; then
-      log_tick "$id: repo path missing ($name -> $repo)"
+      wt_setup_fail "$id" "repo path missing ($name -> $repo)"
       rm -f "$tsv"; printf 'done\n' > "$run_dir/.ended" 2>/dev/null || true
       wt_teardown "$id" "$project" "$run_dir"; return 1
     fi
     if ! ref="$(wt_base_ref "$repo" "$base" "$fetch_t")"; then
-      log_tick "$id: no base ref resolvable in $repo"
+      # An empty family is the one refusal with a way out the operator has to
+      # be told about: nothing is broken, the first branch of it is simply not
+      # cut yet, and the job that cuts it needs a base of its own. Not under
+      # an analysis: there the branch that failed to resolve is the one the
+      # analysis named, whatever the declared base looks like.
+      why="no base ref resolvable in $repo"
+      if [ -z "${AL_BASE_OVERRIDE:-}" ]; then
+        case "$base" in
+          *'*') why="$why — the base pattern '$base' matches no branch yet; a job that opens the first one needs a base of its own (agentloop set-field <job> base <branch>)" ;;
+        esac
+      fi
+      wt_setup_fail "$id" "$why"
       rm -f "$tsv"; printf 'done\n' > "$run_dir/.ended" 2>/dev/null || true
       wt_teardown "$id" "$project" "$run_dir"; return 1
     fi
     wt="$run_dir/$name"
     git -C "$repo" worktree prune >/dev/null 2>&1 || true
     if ! git -C "$repo" worktree add --detach "$wt" "$ref" >/dev/null 2>>"$DATA_DIR/exec.log"; then
-      log_tick "$id: worktree add failed ($wt from $ref) — see exec.log"
+      wt_setup_fail "$id" "worktree add failed ($wt from $ref) — see exec.log"
       rm -f "$tsv"; printf 'done\n' > "$run_dir/.ended" 2>/dev/null || true
       wt_teardown "$id" "$project" "$run_dir"; return 1
     fi
@@ -458,7 +490,7 @@ wt_setup() { # <id> <project> <canonical_cwd> <stamp> [port_base]
   done < <(wt_repos "$project" "$cwd")
 
   if [ -z "$primary" ]; then
-    log_tick "$id: no repo matches the project's cwd ($cwd) — cannot choose a primary"
+    wt_setup_fail "$id" "no repo matches the project's cwd ($cwd) — cannot choose a primary"
     rm -f "$tsv"; printf 'done\n' > "$run_dir/.ended" 2>/dev/null || true
     wt_teardown "$id" "$project" "$run_dir"; return 1
   fi
@@ -484,7 +516,7 @@ wt_setup() { # <id> <project> <canonical_cwd> <stamp> [port_base]
     # not pay for -- or be blocked by -- a project's provisioning.
     if [ "${AL_SKIP_PROVISION:-}" != "1" ]; then
       if ! wt_provision up "$project" "$id" "$run_dir" "$name" "$repo" "$wt" "$base"; then
-        log_tick "$id: provisioning failed for $name — aborting the run"
+        wt_setup_fail "$id" "provisioning failed for $name — aborting the run"
         rm -f "$tsv"; printf 'done\n' > "$run_dir/.ended" 2>/dev/null || true
         wt_teardown "$id" "$project" "$run_dir"
         return 1
@@ -1026,7 +1058,7 @@ wt_project_has_live_run() { # <project>
 # step. A sweep shells out to whatever the project uses, so once a minute is far
 # too often; five minutes is the default.
 wt_sweep_projects() {
-  local interval grace now last stamp project cwd script t rc live canon
+  local interval grace now last stamp project cwd script t rc live canon live_run
   interval="$(num "${AGENTLOOP_SWEEP_INTERVAL:-}" 300)"
   [ "$interval" -gt 0 ] || return 0
   grace="$(num "${AGENTLOOP_SWEEP_GRACE:-}" 21600)"
@@ -1043,7 +1075,20 @@ wt_sweep_projects() {
     [ -n "$project" ] || continue
     script="$CONFIG_DIR/provision/$project.sweep.sh"
     [ -f "$script" ] || continue
-    wt_project_has_live_run "$project" && continue
+    # A live run puts the whole project off-limits (see wt_project_has_live_run)
+    # -- unless the project opted in with worktree.sweep_during_runs. Then the
+    # hook still runs, TOLD a run is live (AL_SWEEP_LIVE_RUN=1), and is expected
+    # to restrict itself to what holds no data: images and build cache, never a
+    # container or a volume. That is opt-in because a hook written before the
+    # flag existed would ignore it and sweep everything. It exists because a
+    # project that always has some run going -- a dev, a reviewer, a promote,
+    # one after another -- was otherwise never swept at all: Revenue Copilot
+    # piled up a day of finished runs' images, gigabytes each, behind it.
+    live_run=""
+    if wt_project_has_live_run "$project"; then
+      [ "$(project_get "$project" '.worktree.sweep_during_runs' 'false')" = "true" ] || continue
+      live_run=1
+    fi
     # Built once, lazily: a machine whose projects declare no sweep hook must
     # not pay two jq forks and a walk of every lock directory per tick.
     if [ -z "$live" ]; then
@@ -1069,7 +1114,7 @@ wt_sweep_projects() {
       cd "$cwd" 2>/dev/null || return 1
       AL_PROJECT="$project" CC_PROJECT="$project" \
       AL_LIVE_WORKTREES="$live" AL_CANONICALS="$canon" \
-      AL_SWEEP_GRACE_SECONDS="$grace" \
+      AL_SWEEP_GRACE_SECONDS="$grace" AL_SWEEP_LIVE_RUN="$live_run" \
       AL_PROVISION_LIB="${AL_PROVISION_LIB:-}" CC_PROVISION_LIB="${AL_PROVISION_LIB:-}" \
         bash "$script" >>"$DATA_DIR/exec.log" 2>&1
     }

@@ -15,7 +15,9 @@
 #
 # Behaviour is steered by env vars the harness sets:
 #   FAKE_SESSION  the session id to report in the init event
-#   FAKE_MODE     complete | undeclared | dirty | hang | silent
+#   FAKE_MODE     complete | undeclared | dirty | hang | silent | heavy
+#                 (heavy: one `agentloop heavy -- $FAKE_HEAVY_CMD` call, its
+#                 output and exit code written to $FAKE_HEAVY_OUT)
 #   FAKE_SKIP_PREPARE  set to skip `security prepare` inside a security run
 #                      that is NOT a unit (a hand launch); a unit never runs
 #                      it -- its orchestrator did, once, engine-side
@@ -53,6 +55,24 @@
 #                      allowed_warning, rateLimitType seven_day, utilization
 #                      0.98. rl_capture reads it off the account's own stream,
 #                      whichever account's directory this launch ran with.
+#                      `unified` emits the CLI 2.1.284 shape instead: status
+#                      allowed for the five_hour window it names, and BOTH
+#                      windows in unifiedWindows (five_hour 0.74, seven_day
+#                      0.49), each resetting a day from now.
+#   FAKE_DENIAL        safetyCheck | rule: one Bash call denied without a
+#                      prompt, in the four pieces CLI 2.1.284 writes for it --
+#                      the tool_use, a `system/permission_denied` event naming
+#                      the reason, the error tool_result, and the call on the
+#                      result event's `permission_denials`. safetyCheck is the
+#                      CLI's own refusal of an `rm` on a command substitution
+#                      (its type and reason as captured 2026-09-30, the
+#                      command neutral); rule is a deny rule's.
+#                      hook | hook-refuses: a PreToolUse hook refuses one Write
+#                      (no `permission_denied` event: a hook leaves none, as
+#                      captured 2026-10-01) and the agent sends the identical
+#                      call again. `hook` lets the retry through, the way
+#                      a knowledge-base hook holds a session's first change
+#                      only once; `hook-refuses` refuses it too.
 #   $CLAUDE_CONFIG_DIR/.fake-logged-out  that one directory has no session (an account signed out)
 #   $CLAUDE_CONFIG_DIR/.fake-email       the email `auth status` names for that directory
 #   FAKE_CLAUDE_VERSION  the build this stand-in plays (default 2.1.258): what
@@ -263,7 +283,45 @@ if [ -n "${FAKE_KILLED_USAGE:-}" ]; then
   printf '{"type":"assistant","message":{"id":"msg_turn_b","usage":{"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":2000,"output_tokens":45}}}\n'
 fi
 
-[ -z "${FAKE_RATE_LIMIT_EVENT:-}" ] || printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785427200,"rateLimitType":"seven_day","utilization":0.98,"surpassedThreshold":0.75}}\n'
+denied='[]'
+case "${FAKE_DENIAL:-}" in
+  hook|hook-refuses)
+    held="PreToolUse:Write hook error: the hook holds this session's first change; retry it"
+    w='{"file_path":"notes/finding.md","content":"a finding"}'
+    jq -nc --argjson i "$w" '{type:"assistant",parent_tool_use_id:null,message:{content:[{type:"tool_use",id:"toolu_held_1",name:"Write",input:$i}]}}'
+    jq -nc --arg h "$held" '{type:"user",parent_tool_use_id:null,message:{content:[{type:"tool_result",tool_use_id:"toolu_held_1",content:$h,is_error:true}]}}'
+    jq -nc --argjson i "$w" '{type:"assistant",parent_tool_use_id:null,message:{content:[{type:"tool_use",id:"toolu_held_2",name:"Write",input:$i}]}}'
+    if [ "$FAKE_DENIAL" = hook ]; then
+      jq -nc '{type:"user",parent_tool_use_id:null,message:{content:[{type:"tool_result",tool_use_id:"toolu_held_2",content:"File created successfully at: notes/finding.md"}]}}'
+      denied="$(jq -nc --argjson i "$w" '[{tool_name:"Write",tool_use_id:"toolu_held_1",tool_input:$i}]')"
+    else
+      jq -nc --arg h "$held" '{type:"user",parent_tool_use_id:null,message:{content:[{type:"tool_result",tool_use_id:"toolu_held_2",content:$h,is_error:true}]}}'
+      denied="$(jq -nc --argjson i "$w" '[{tool_name:"Write",tool_use_id:"toolu_held_1",tool_input:$i},{tool_name:"Write",tool_use_id:"toolu_held_2",tool_input:$i}]')"
+    fi
+    FAKE_DENIAL="" ;;
+esac
+if [ -n "${FAKE_DENIAL:-}" ]; then
+  case "$FAKE_DENIAL" in
+    safetyCheck) why="Dangerous rm operation on statically-unresolvable target: command substitution output" ;;
+    *)           why="Permission to use Bash has been denied by a deny rule" ;;
+  esac
+  cmd='rm -rf "$(cat /tmp/scratch-dir)"'
+  jq -nc --arg c "$cmd" '{type:"assistant",parent_tool_use_id:null,message:{content:[{type:"tool_use",id:"toolu_denied_1",name:"Bash",input:{command:$c}}]}}'
+  jq -nc --arg t "$FAKE_DENIAL" --arg w "$why" --arg s "$sid" \
+    '{type:"system",subtype:"permission_denied",tool_name:"Bash",tool_use_id:"toolu_denied_1",decision_reason_type:$t,decision_reason:$w,message:$w,session_id:$s}'
+  jq -nc --arg w "$why" '{type:"user",parent_tool_use_id:null,message:{content:[{type:"tool_result",tool_use_id:"toolu_denied_1",content:$w,is_error:true}]}}'
+  denied="$(jq -nc --arg c "$cmd" '[{tool_name:"Bash",tool_use_id:"toolu_denied_1",tool_input:{command:$c}}]')"
+fi
+
+case "${FAKE_RATE_LIMIT_EVENT:-}" in
+  "") ;;
+  unified)
+    day="$(( $(date +%s) + 86400 ))"
+    printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":%s,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.74,"resetsAt":%s},"seven_day":{"utilization":0.49,"resetsAt":%s}}}}\n' \
+      "$day" "$day" "$day" ;;
+  *)
+    printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785427200,"rateLimitType":"seven_day","utilization":0.98,"surpassedThreshold":0.75}}\n' ;;
+esac
 
 case "$mode" in
   dirty)
@@ -276,6 +334,21 @@ case "$mode" in
     # Stop without saying how it ended: the signature of a run cut off.
     result="I did some work."
     ;;
+  heavy)
+    # An agent that obeys the host contract: its one tool call is
+    # `agentloop heavy -- $FAKE_HEAVY_CMD`, which blocks until a heavy slot is
+    # free -- the shape of a run queued behind another's suite, silent and
+    # burning no CPU for as long as the queue is long. Everything the call said
+    # (the waiting line, the got-it line) lands in $FAKE_HEAVY_OUT, with the
+    # slot the engine handed this run and the call's own exit code, so a
+    # scenario can read who was waiting for whom.
+    {
+      printf 'AL_RUN_SLOT=%s\n' "${AL_RUN_SLOT:-}"
+      "${AL_BIN:-$(cd "$(dirname "$0")/../bin" && pwd)/agentloop}" heavy -- ${FAKE_HEAVY_CMD:-true} 2>&1
+      printf 'heavy-rc=%s\n' "$?"
+    } > "${FAKE_HEAVY_OUT:-/dev/null}"
+    result="RUN COMPLETE: went through the host gate."
+    ;;
   hang)
     # `exec`, as `silent` does above: the process the engine signals has to
     # be the one that ends. A bash waiting on a foreground `sleep` dies of
@@ -287,5 +360,5 @@ case "$mode" in
     ;;
 esac
 
-printf '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"%s","total_cost_usd":0,"result":"%s"}\n' \
-  "$sid" "$result"
+printf '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"%s","total_cost_usd":0,"result":"%s","permission_denials":%s}\n' \
+  "$sid" "$result" "$denied"

@@ -1555,6 +1555,11 @@ def classify_tick(msg):
         return "rate_limited"
     if "max_parallel" in msg:
         return "blocked"
+    # Held back by the host, not by the job or by money: the 5-minute load is
+    # above the cap (cmd_tick's host gate). The same outcome as a job at its
+    # ceiling -- it did not run, and nothing about it needs a human.
+    if "host busy" in msg:
+        return "blocked"
     # A tick that could not even get as far as the probe: no prompt, a cwd that
     # has gone missing, a config dir that is not there, a worktree or a
     # provisioning step that failed. All of them mean the job did not run and
@@ -5078,7 +5083,7 @@ class Handler(BaseHTTPRequestHandler):
                              "max_budget_usd", "daily_budget_usd", "model", "timeout_seconds",
                              "stall_timeout_seconds", "effort", "interactive", "max_parallel",
                              "description", "cwd", "permission_mode", "project", "platform",
-                             "account"):
+                             "account", "base"):
                 return self._send(400, {"error": "bad field"})
             ok, out = al(["set-field", jid, field], stdin=value)
         else:

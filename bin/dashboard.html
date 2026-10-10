@@ -889,6 +889,11 @@ document.documentElement.dataset.theme =
     <p class="fieldhelp" id="ed-cwd-help">The directory the agent runs in — pick a project above to inherit one.</p>
     <div class="hint" id="ed-cwd-note" hidden></div></div>
   </div>
+  <label>Base branch — this job only (optional)</label>
+  <input id="ed-base" type="text" placeholder="empty — the project's base branch" autocomplete="off" spellcheck="false">
+  <p class="fieldhelp">The branch this job's worktree is cut from, when that is not the project's. The job
+    that opens a release train needs one: its project follows <code>release/*</code>, and until the first
+    release exists there is nothing there to cut from — so it cuts from <code>main</code>.</p>
   <label>Description</label>
   <textarea id="ed-desc" class="shorttext" placeholder="What this job does"></textarea>
   <p class="fieldhelp">Describe the purpose and behaviour of this job.</p>
@@ -4088,6 +4093,7 @@ function fill(j){
   projectCombo.set(j.project||"", projs);
   $("ed-desc").value=j.description||"";
   $("ed-cwd").value=j.cwd||"";
+  $("ed-base").value=j.base||"";
   syncCwdField(j.project||"");
   $("ed-prompt").value=j.prompt||"";
   paintPromptHighlight();
@@ -4281,6 +4287,8 @@ async function saveEditor(){
       // an inherited directory belongs to the project, never to the job
       const cwd=$("ed-cwd").disabled ? "" : $("ed-cwd").value.trim();
       if(cwd) job.cwd=cwd;
+      // a base of its own is the exception: left empty, the key is not written
+      const base=$("ed-base").value.trim(); if(base) job.base=base;
       if(!await api("create",{id, job, precheck:$("ed-precheck").value})) return;
       edWiz.markClean(); $("editor").close(); toast("Created "+id); refresh(); return;
     }
@@ -4348,6 +4356,8 @@ async function saveEditor(){
     if(!await setF("description",$("ed-desc").value.trim(),j.description||"")) return;
     const cwdVal = $("ed-cwd").disabled ? "" : $("ed-cwd").value.trim();
     if(!await setF("cwd",cwdVal,j.cwd||"")) return;
+    // empty clears it: the job goes back to its project's base
+    if(!await setF("base",$("ed-base").value.trim(),j.base||"")) return;
     if(!await setF("permission_mode",$("ed-perm").value,j.permission_mode||"bypassPermissions",platSent)) return;
     edWiz.markClean(); $("editor").close(); toast("Saved "+id); refresh();
   } finally { btn.disabled=false; }
@@ -6044,8 +6054,13 @@ document.addEventListener("click", async (e)=>{
     markPending(op, id, extra);   // restart the clock from the real fork
     setTimeout(refresh, 1200); b.disabled=true; return;
   }
-  const extra={id};
-  if(op==="stop" && b.dataset.runPid) extra.pid=b.dataset.runPid;
+  // The request body, NOT a second `extra`. A `const extra` here is the try
+  // block's own, and every `extra` above it in this block -- clearPending on a
+  // declined precheck, markPending after a start, both 409 exits -- then named
+  // it before it existed: a ReferenceError that left Run now dead for good
+  // after either answer to "Nothing to do right now".
+  const body={id};
+  if(op==="stop" && b.dataset.runPid) body.pid=b.dataset.runPid;
   // Recorded BEFORE the request, not after it answers. `stopping` is the only
   // repaint-proof guard the Stop button has, and a poll landing inside the round
   // trip rebuilt the row with `stopping` still empty -- a live Stop on a run
@@ -6053,7 +6068,7 @@ document.addEventListener("click", async (e)=>{
   // Harmless if the request then fails: forgetDeadStops drops any pid that is
   // no longer live on the next render.
   if(op==="stop") markStopping(b.dataset.runPid);
-  const ok=await api(op,extra);
+  const ok=await api(op,body);
   if(ok) toast((op==="run"?"Started ":op+"d ")+id, false, op==="run"?"play":"check");
   setTimeout(refresh, op==="run"?1200:250);
   // A used resume button stays disabled; so does a stop, until the run is gone.

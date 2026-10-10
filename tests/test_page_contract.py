@@ -2267,6 +2267,65 @@ def test_the_job_editor_re_sends_what_a_platform_change_governs(srv, tmp_path):
         f"a job saved unchanged sends no set_field at all: {same}"
 
 
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_job_editor_saves_a_base_of_the_jobs_own(srv, tmp_path):
+    """A job's own base branch is a field of the editor like any other: a job
+    that opens a release train runs in a project on `release/*` whose family
+    is still empty, and the only way to give it a base was to edit jobs.json
+    by hand. Editing sends `set_field base` only when it changed -- and an
+    emptied field IS a change, the one that puts the job back on its
+    project's base; creating writes the key only when there is a value."""
+    page_html = _page(srv)
+    job_pane = page_html[page_html.index('data-edpane="job"'):page_html.index("<!-- /pane job -->")]
+    assert 'id="ed-base"' in job_pane, "the job pane has no base-branch field"
+    assert job_pane.index('id="ed-cwd"') < job_pane.index('id="ed-base"') < job_pane.index("<label>Description</label>"), \
+        "the base branch belongs with the working directory it is cut in, ahead of Description"
+    page = _js(srv)
+    assert '$("ed-base").value=j.base||"";' in _plainfn(page, "fill"), \
+        "opening a job does not load its base, so the next save would clear it"
+    app = _app_js(srv)
+
+    def run(stored, typed, creating=False):
+        script = tmp_path / f"save-editor-base-{stored or 'none'}-{typed or 'none'}-{creating}.js".replace("/", "_").replace("*", "x")
+        script.write_text(_const(app, "KNOWN_PLATFORMS") + _plainfn(app, "platformKey") + _plainfn(app, "platformOf") + """
+        const ALApp = {platformOf};
+        const sent = [];
+        const vals = {"ed-id": "j", "ed-prompt": "p", "ed-precheck": "", "ed-project": "",
+                      "ed-desc": "", "ed-cwd": "", "ed-perm": "dontAsk", "ed-base": %s};
+        const $ = (id) => ({ get value(){ return vals[id] ?? ""; }, set value(v){ vals[id] = v; },
+                             disabled: false, close(){} });
+        async function api(op, extra){ sent.push([op, extra]); return true; }
+        const DATA = {jobs: [{id: "j", platform: "anthropic", model: "claude-opus-5", prompt: "p",
+                              permission_mode: "dontAsk"%s}],
+                      projects: []};
+        const projById = (name) => DATA.projects.find(p => p.name === name) || null;
+        const readForm = () => ({platform: "anthropic", secs: 300, model: "claude-opus-5", effort: "",
+                                 interactive: false, hours: "", days: [], budget: null, maxPar: null,
+                                 daily: null, timeoutSecs: null, stallSecs: null});
+        const ED_STEPS = [], validateStep = () => "", stepForward = () => true;
+        const edWiz = {markClean(){}}, toast = () => {}, refresh = () => {};
+        let creating = %s, editingId = "j", editingPrecheck = "";
+        """ % (json.dumps(typed), (', base: ' + json.dumps(stored)) if stored else "",
+               "true" if creating else "false")
+                          + _fn(page, "saveEditor")
+                          + "\nsaveEditor().then(() => console.log(JSON.stringify(sent)));\n")
+        out = subprocess.run(["node", str(script)], capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)
+
+    def base_writes(sent):
+        return [e["value"] for op, e in sent if op == "set_field" and e["field"] == "base"]
+
+    assert base_writes(run("", "main")) == ["main"], "a base typed into the editor was not saved"
+    assert base_writes(run("main", "main")) == [], "an unchanged base was sent again"
+    assert base_writes(run("main", "")) == [""], \
+        "emptying the field must send the empty value -- that is what clears the job's base"
+    assert base_writes(run("", "")) == [], "a job with no base of its own sends none"
+    made = [e["job"] for op, e in run("", "release/*", creating=True) if op == "create"]
+    assert made and made[0].get("base") == "release/*", f"a new job lost the base it was given: {made}"
+    made = [e["job"] for op, e in run("", "", creating=True) if op == "create"]
+    assert made and "base" not in made[0], f"a new job with no base must not carry the key: {made}"
+
+
 def test_the_job_editors_model_default_is_the_platforms(srv):
     """createCombo reads cfg.def on every set(): with the catalog empty or not
     yet fetched, an empty model falls back to it. "opus" is Anthropic's and a
@@ -11560,6 +11619,98 @@ console.log(JSON.stringify(out));
     assert got["entryDropped"] is True
 
 
+def _data_op_handler(js):
+    """The data-op branch of the page's click listener, from the button lookup
+    to the listener's end, as one async function of the click event -- the
+    code that actually runs, not a reading of its text."""
+    start = js.index('const b=e.target.closest("button[data-op]")')
+    fin = js.index("}finally{", start)
+    end = js.index("\n});", fin)
+    return "async function handleClick(e){\n" + js[start:end] + "\n}\n"
+
+
+def test_answering_the_precheck_dialog_gives_run_now_back(srv, tmp_path):
+    """2026-10-01: after Cancel -- or Run anyway -- on "Nothing to do right
+    now", the job's Run now stayed grey for good.
+
+    The handler held `const extra=btnExtra(b)` above its `try`, and a second
+    `const extra={id}` (the request body of the plain ops) at the top of the
+    `try` block. Inside that block every earlier `extra` -- clearPending on
+    Cancel, markPending after a start, both 409 exits -- named the inner one
+    before it existed: a ReferenceError from the temporal dead zone, thrown
+    before the button was handed back. The source-reading tests around this
+    one all passed throughout, because they read the text and never ran it.
+    So this runs it, with the real pending helpers, through every exit."""
+    js = _js(srv)
+    helpers = "\n".join(_plainfn(js, name) for name in (
+        "btnOp", "btnId", "btnExtra", "pendKey", "markPending", "clearPending"))
+    script = tmp_path / "run-now.js"
+    script.write_text("""
+const pending = new Map();
+const START_OPS = {run:1, resume:1};
+const ACTION_SELECTOR = "button[data-op]";
+let BUTTONS = [];
+const document = { querySelectorAll: () => BUTTONS };
+function activeRunsOf(){ return []; }
+const TOKEN = "t";
+let PRECHECK = {}, RUN_STATUS = 200, CONFIRM = false, CALLS = [];
+async function fetch(url, opts){
+  const body = JSON.parse(opts.body); CALLS.push(body.op);
+  if (body.op === "precheck") return {ok: true, status: 200, json: async () => PRECHECK};
+  return {ok: RUN_STATUS < 400, status: RUN_STATUS, json: async () => ({error: "busy"})};
+}
+async function showConfirm(o){ CALLS.push("confirm:" + o.title); return o.alertOnly ? true : CONFIRM; }
+async function api(op, body){ CALLS.push([op, body]); return true; }
+function toast(){} function refresh(){} function openEditor(){}
+function markResumed(){} function markStopping(){}
+const setTimeout = () => 0;
+""" + helpers + "\n" + _data_op_handler(js) + """
+async function click(b){
+  BUTTONS = [b]; CALLS = [];
+  try { await handleClick({target: {closest: s => s === "button[data-op]" ? b : null}}); return "ok"; }
+  catch (err) { return err.constructor.name + ": " + err.message; }
+}
+(async () => {
+  const out = {};
+  // Cancel on "Nothing to do right now": nothing starts, the button is back.
+  let b = {dataset: {op: "run", id: "wave"}, disabled: false};
+  PRECHECK = {ok: true, work: false, output: "ready=0"}; CONFIRM = false;
+  out.cancel = [await click(b), b.disabled, pending.has("run|wave|"), CALLS.includes("run")];
+  // Run anyway: the run is posted, and the start is held until it appears.
+  b = {dataset: {op: "run", id: "wave"}, disabled: false}; CONFIRM = true;
+  out.anyway = [await click(b), CALLS.includes("run"), pending.has("run|wave|")];
+  // A run refused with 409: the operator is told, and the button is back.
+  pending.clear();
+  b = {dataset: {op: "run", id: "dev"}, disabled: false};
+  PRECHECK = {ok: true, work: true}; RUN_STATUS = 409;
+  out.busy = [await click(b), b.disabled, pending.has("run|dev|")];
+  // A resume refused with 409: the same.
+  b = {dataset: {op: "resume", id: "rev", session: "sid-A"}, disabled: false};
+  out.resumeBusy = [await click(b), b.disabled, pending.has("resume|rev|sid-A")];
+  // A stop still sends the run's pid in its request body.
+  b = {dataset: {op: "stop", id: "dev", runPid: "4242"}, disabled: false};
+  out.stop = [await click(b), JSON.stringify(CALLS.find(c => Array.isArray(c)))];
+  console.log(JSON.stringify(out));
+})();
+""")
+    got = json.loads(subprocess.run(["node", str(script)], capture_output=True,
+                                    text=True, check=True).stdout)
+    assert got["cancel"] == ["ok", False, False, False], (
+        "Cancel on the precheck dialog did not hand Run now back "
+        "[outcome, disabled, still pending, run posted]: " + repr(got["cancel"]))
+    assert got["anyway"] == ["ok", True, True], (
+        "Run anyway did not post the run and hold the start "
+        "[outcome, run posted, pending]: " + repr(got["anyway"]))
+    assert got["busy"] == ["ok", False, False], (
+        "a run refused with 409 left Run now dead [outcome, disabled, pending]: "
+        + repr(got["busy"]))
+    assert got["resumeBusy"] == ["ok", False, False], (
+        "a resume refused with 409 left its button dead [outcome, disabled, pending]: "
+        + repr(got["resumeBusy"]))
+    assert got["stop"] == ["ok", '["stop",{"id":"dev","pid":"4242"}]'], (
+        "a stop no longer sends the run's pid: " + repr(got["stop"]))
+
+
 def test_every_run_and_resume_button_asks_about_the_pending_start_as_it_is_built(srv):
     """render() is not the only thing that rebuilds these buttons.
 
@@ -11637,7 +11788,7 @@ def test_every_side_effecting_button_is_held_from_the_click(srv):
 
     # 2. Stop records itself before the request, not after it answers.
     i_stop = js.index('if(op==="stop") markStopping(b.dataset.runPid);')
-    i_api = js.index("const ok=await api(op,extra);")
+    i_api = js.index("const ok=await api(op,body);")
     assert i_stop < i_api, (
         "markStopping runs after the POST returns, so a poll inside the round trip "
         "rebuilds the row with `stopping` still empty and offers Stop again on a run "

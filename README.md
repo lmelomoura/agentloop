@@ -225,7 +225,13 @@ launchd ──60s──▶ agentloop tick
 Every run is classified **success** / **warning** / **error** (error = the
 process failed, the CLI errored, or the agent had tools denied — a blocked agent
 doing nothing is a failure, not a success; warning = finished but empty result or
-stderr).
+stderr). A command the CLI's own safety check refused is not a denied tool: no
+permission setting can allow it, so the run is a warning whose note starts
+`SAFETY CHECK:` and names the CLI's reason. Nor is a call a hook held once and
+then let through when the agent sent the identical call again, which is what a
+hook that wants something done first (such as searching the project's
+knowledge) does. That blocked nothing, so it does not count against the run.
+A denial the identical retry met again is still a denied tool.
 
 ---
 
@@ -245,6 +251,7 @@ A job is one object in `config/jobs.json`. Fields:
 | `active_hours` | `"08:00-20:00"` (empty = 24h) |
 | `active_days` | `[1..7]`, 1=Mon |
 | `project` | optional group; the job inherits the project's `cwd` (see **Projects**) |
+| `base` | optional: the branch **this job's** worktree is cut from, when that is not the project's (a branch, or a family such as `release/*`). Never inherited; omit it and the job is cut from its project's base — see **Isolation** |
 | `platform` | `anthropic` (Claude Code), `openai` (Codex CLI) or `opencode` (OpenCode CLI); omit to inherit the project's, which defaults to `anthropic`. `model`, `effort` and `permission_mode` keep their names and take that platform's vocabulary — see **Platforms** |
 | `account` | the sign-in the job runs under: the id of an account registered for its platform in Settings › Platforms, or `default`; omit to inherit — the project's account when the job runs on the project's platform, else the platform's Default. `set-field` and `create` refuse an id the platform does not have, and a platform change that leaves the job's own account behind clears it, and says so. OpenCode has no accounts — see [Accounts](#accounts--which-sign-in-a-run-uses) |
 | `model` | an exact model id (`claude-opus-5`, …) or a family (`opus`/`sonnet`/`haiku`/`fable`). On `openai`: a catalog slug (`gpt-5.6-sol`), verbatim. On `opencode`: `provider/model`, the CLI's own id (`pdm_ai/glm-5.3-flash`), verbatim; the first slash separates the provider |
@@ -370,6 +377,28 @@ Ending a base in `*` follows a family rather than one branch: `release/*` resolv
 to the newest `release/x.y.z` at run time, so a project shipping through release
 trains is configured once instead of pointing at last month's train.
 
+A family with **no branch yet** refuses the run rather than fall back to some
+other branch — agents working from the wrong baseline is the failure a declared
+base exists to prevent. That leaves one job stranded on a new project: the one
+whose work is to *cut* the first release has nothing to be cut from. Give that
+job a base of its own and nothing else changes:
+
+```bash
+printf 'main' | agentloop set-field wave-planner base    # or the editor's "Base branch" field
+```
+
+A job's `base` replaces the declared base of every repo of its run; the
+project's other jobs keep following the family, and keep being refused until
+its first branch exists, which is correct — they have nothing to work from yet.
+
+**A run that cannot be set up is still recorded.** A worktree that was refused
+(an unresolvable base, a failing `up` hook, a missing repo path) or a resume
+with nothing to continue in ends as `error` / `setup_failed`: the reason is the
+run's note (`NOT STARTED: …`), no session, no cost. It used to leave one line in
+`tick.log` and nothing in the runs list. A worktree failure also counts towards
+the failure backoff, like any failing run, so a scheduled job does not file the
+same record every interval.
+
 **Declare `base` whenever `origin/HEAD` is not the branch your work targets.**
 Leaving it empty means *infer it*, and inference resolves to the canonical
 checkout's current branch, then to `origin/HEAD` — for a detached checkout, that
@@ -475,6 +504,14 @@ that no manifest names and no lock points at (the pre-push trial merge is a
 ends. A live job whose project cannot be resolved — a derived security job, or a
 job deleted from `jobs.json` while its run was still going — counts as a run of
 *every* project, so an unresolvable id can never license a sweep of all of them.
+
+A project that almost always has *some* run going is, by that rule, almost never
+swept. `"worktree": {"sweep_during_runs": true}` in the project opts out of the
+second guarantee: the hook is then called during live runs too, with
+`AL_SWEEP_LIVE_RUN=1`, and must restrict itself to what holds no data — images
+and build cache, never a container, a volume or a directory — because the trial
+merge's tree is still indistinguishable from garbage. It is opt-in because a
+hook written without the flag in mind would ignore it and sweep everything.
 
 A hook that outlives `worktree.sweep_timeout_seconds` (default 300) is killed:
 it runs inside the tick's own mutex, so one blocked on an unresponsive daemon
@@ -627,13 +664,99 @@ not an error resets the count, so one good run puts the job straight back on its
 normal cadence. A broken precheck (see above) counts too. The card says so:
 *backing off 4× after 4 failed runs*.
 
+### One machine, every project: heavy slots and the load gate
+
+`max_parallel` limits the runs of **one job**. Nothing limited the **host**, and
+every project's agents (and a human at the keyboard) share it. A repository's
+`make test` brings up a whole compose stack per worktree by design; three dev
+runs, a reviewer measuring two suites at once and a CI runner on one 10-CPU Mac
+took the load average past 250, Vitest died of `Test timed out in 5000ms`,
+Docker hung and promoters parked tickets as "verification deferred". Two
+mechanisms now limit the host, both shared by every job of every project:
+
+- **Heavy slots.** `agentloop heavy [--max-wait S] [--] <command…>` runs a
+  command in the foreground while holding one of N host-wide slots, and waits
+  for one when none is free. It returns the command's exit code unchanged (`128+n`
+  when a signal ended it, 127/126 when it cannot start). It says once, on
+  stderr, that it is waiting and **who holds the slots** (job and run id, taken
+  from the run's environment), and once when it gets the slot. A TERM, INT or
+  HUP releases the slot and ends the command's whole process group; a holder
+  killed with `-9` is pruned by the same pid-and-boot lease that prunes dead runs,
+  and the command it was running is ended with it. `--max-wait` gives up with exit
+  75 instead of waiting for ever. A command that itself calls `agentloop heavy`
+  runs straight away: it is already inside a slot.
+- **The load gate.** The tick does not launch a due job while the **5-minute
+  load average** is above the cap, and writes
+  `<id>: host busy (load X > Y), not launching` to `tick.log` instead (the
+  precheck, which claims tickets, has not run). `agentloop heavy` does not
+  start a command above it either. A forced run (Run now, `agentloop run`) is not
+  gated, like it is not gated by the precheck. The load is `sysctl -n vm.loadavg`
+  (macOS) or `/proc/loadavg`; one that cannot be read opens the gate.
+
+- **A running CI step.** A Bitbucket Pipelines runner on the same machine is host
+  load the slots cannot see: a suite started beside a pipeline step made both fail
+  by timeouts (2026-10-10). While a container named like the runner's step
+  (`<runner-uuid>_<step-uuid>_pause` or `_build`; `_pause` lives for the whole
+  step) runs, `agentloop host` is **busy**, lists it as a holder
+  (`ci step 8648124f (bitbucket runner)`, once per step) and `agentloop heavy`
+  waits for it to end, holding no slot meanwhile. A step is not a slot: it does
+  not count against `heavy_slots`. It is one `docker ps` per look, bounded by a
+  timeout, and it **fails open**: a Docker that does not answer in time (or is
+  down, or absent) counts as "no CI step", and `agentloop host` says so, because
+  a gate that waits on a hung daemon would stop the whole fleet. The tick does not
+  look: a CI step holds heavy work, not launches. The gate is checked when a
+  command asks for a slot; a step that starts after the command began is not
+  waited for.
+
+`agentloop host` (or `agentloop heavy --status`) prints the load, the cap, the
+CI line, the slots in use and their holders, and exits **0 when the host is quiet**
+(a slot is free, the 5-minute load is under the cap and no CI step runs) and **1
+when it is busy**. A precheck that deferred a job because of the host calls it to
+re-measure.
+
+| Setting | Environment | `projects.json` | Default |
+|---|---|---|---|
+| Heavy slots (`0` = no ceiling) | `AGENTLOOP_HEAVY_SLOTS` | `host.heavy_slots` | `1` |
+| Load cap on the 5-minute load (`0` = no gate) | `AGENTLOOP_LOAD_CAP` | `host.load_cap` | `1.5 ×` the CPU count |
+| CI steps hold heavy work (`0`, `off` or `false` = off) | `AGENTLOOP_CI_GATE` | `host.ci_gate` | `1` |
+| Which containers are a CI step (extended regex over `docker ps` names) | `AGENTLOOP_CI_PATTERN` | `host.ci_pattern` | the runner's `<uuid>_<uuid>_(pause\|build)` |
+| Seconds `docker ps` may take before the gate fails open (1-60) | `AGENTLOOP_CI_TIMEOUT` | `host.ci_timeout` | `5` |
+
+The environment wins, then the top-level `host` block of `config/projects.json`
+(`{"projects": [...], "host": {"heavy_slots": 1, "load_cap": 15}}`), then the
+default. Put it in `projects.json` to reach the tick: launchd starts it with an
+environment of its own. A value that is not a number is skipped, never half-read.
+`AGENTLOOP_HEAVY_POLL` (seconds between two looks for a slot, default 12) and
+`AGENTLOOP_LOADAVG` (a fixed `"1m 5m 15m"` reading) exist for the tests.
+
+**What the agents are told.** Every job's prompt is given a short host contract
+(`host_contract` in `bin/agentloop`): run every command that starts containers or
+runs a full suite or build as `<absolute path of agentloop> heavy -- <command>`
+(the same path is in `$AL_BIN`, and `$AL_RUN_SLOT` is the run's own slot); one
+suite and one stack at a time, the head and the trial merge one after the other
+(a trial merge's own worktree is fine once the first stack is down); take the stack down as soon as the result is read; waiting is normal,
+never a deferral; a suite that failed only by timeouts under load is re-run, not
+reported red. Security units are not given it: they read code, are never
+provisioned and run no suite.
+
+**The stall watchdog knows.** A run whose agent waits for a slot sleeps: no
+output and no CPU, which the stall rule would call a hang. While a waiter is alive
+it touches `heavy-wait` in its run's slot on every poll, and the watchdog reads a
+fresh one as activity, however long the wait. A killed waiter's file goes stale
+within three polls and the run is judged by the ordinary rules again. Only the
+stall rule is held off; `timeout_seconds` still counts wall-clock time.
+
 ### Is the usage gate awake? `agentloop usage`
 
-The scheduler holds scheduled runs back when a usage window is spent. That gate
-reads a figure the CLI only volunteers once it has decided to warn (at 0.75), so
-`bin/statusline-rate-limits.sh` keeps it fresh from your own interactive
-sessions. Both halves are invisible when they work and invisible when they do
-not, which is a bad way to run a fleet — so the command says which:
+The scheduler holds scheduled runs back when a usage window is spent. Every
+Claude run feeds that gate from its own stream: from CLI 2.1.284 on, each
+usage event carries both windows (`unifiedWindows`), and both are recorded, so
+any run, a forced one included, replaces whatever an older reading said. Older
+CLIs only volunteer a figure once they have decided to warn (at 0.75), and only
+for one window, so `bin/statusline-rate-limits.sh` keeps the gate fresh from
+your own interactive sessions as well. Both halves are invisible when they work
+and invisible when they do not, which is a bad way to run a fleet — so the
+command says which:
 
 ```
 $ agentloop usage
@@ -2328,6 +2451,8 @@ agentloop dashboard          # open the control UI
 agentloop status             # jobs + last run + cost, and one line per platform: enabled, signed in as whom, models on
 agentloop run <id>           # force a run now (ignores precheck + daily cap)
 agentloop check <id>         # run only the precheck, report what it saw
+agentloop heavy -- <cmd…>    # run a command holding a host-wide heavy slot (waits for one)
+agentloop host               # load, cap, heavy slots and holders; exit 0 quiet, 1 busy
 agentloop enable|disable <id>
 agentloop toggle-many true|false   # ids on stdin (JSON array or one per line)
 agentloop create <id>        # JSON object on stdin
@@ -2337,7 +2462,8 @@ agentloop set-field <id> <field>   # value on stdin (interval_seconds, active_ho
                                #   active_days, platform, account, model, effort,
                                #   max_budget_usd, daily_budget_usd,
                                #   stall_timeout_seconds, timeout_seconds,
-                               #   permission_mode, description, cwd, project)
+                               #   permission_mode, description, cwd, project,
+                               #   base)
 agentloop delete <id>        # remove the job (its logs are kept)
 agentloop project-set        # create/update a project (JSON on stdin)
 agentloop project-list | project-delete <name>
@@ -2378,7 +2504,9 @@ for `models --verbose`; the server's first in-request resolve uses 10),
 `AGENTLOOP_PRICING_URL` (where the price table refreshes from),
 `AGENTLOOP_PYTHON`, `AGENTLOOP_JQ`, `AGENTLOOP_LOG_MAX` (log rotation
 threshold, default 4 MiB), `AGENTLOOP_HOOK_TIMEOUT`, `AGENTLOOP_LOCK_GRACE`,
-`AGENTLOOP_SESSION_TTL` (open-session expiry, in seconds, default 86400).
+`AGENTLOOP_SESSION_TTL` (open-session expiry, in seconds, default 86400),
+`AGENTLOOP_HEAVY_SLOTS` and `AGENTLOOP_LOAD_CAP` (the host gate; see
+[One machine, every project](#one-machine-every-project-heavy-slots-and-the-load-gate)).
 
 ---
 

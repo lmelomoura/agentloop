@@ -4085,9 +4085,19 @@ CONTRACT
 # except on a security unit, which has no board.
 inject_contract() {
   local id="$1" prompt="$2"
-  case "$prompt" in *"$RUN_ENDING_MARKER"*) printf '%s' "$prompt"; return ;; esac
-  printf '%s\n\n%s' "$prompt" "$(run_ending_contract)"
-  case "$id" in "$SECURITY_JOB_PREFIX"*) ;; *) printf '\n\n%s' "$(tracker_contract)" ;; esac
+  case "$prompt" in
+    *"$RUN_ENDING_MARKER"*) printf '%s' "$prompt" ;;
+    *) printf '%s\n\n%s' "$prompt" "$(run_ending_contract)"
+       case "$id" in "$SECURITY_JOB_PREFIX"*) ;; *) printf '\n\n%s' "$(tracker_contract)" ;; esac ;;
+  esac
+  # The host contract has a marker of its own: a prompt that already carries the
+  # run-ending contract (a job worded its own way, a re-injection) still has to
+  # learn about the host gate. Not for a security unit: it reads code through
+  # `agentloop security read`, is never provisioned (no stack, no compose) and
+  # runs no suite -- and one analysis launches hundreds of units, each of which
+  # would read these tokens for nothing.
+  case "$prompt" in *"$HOST_CONTRACT_MARKER"*) return ;; esac
+  case "$id" in "$SECURITY_JOB_PREFIX"*) ;; *) printf '\n\n%s' "$(host_contract)" ;; esac
 }
 
 # ------------------------------------------------------------------- locking
@@ -4187,6 +4197,554 @@ acquire_slot() { # <id> <max> -> prints the slot dir; non-zero when at capacity
 }
 
 release_slot() { rm -rf "$1"; }          # <slot-dir>
+
+# ---- host-wide heavy work: slots and a load gate ---------------------------
+# `max_parallel` caps the runs of ONE job. Nothing capped the HOST: on
+# 2026-10-10 three dev runs, a reviewer measuring two suites at once, two other
+# projects' `make check` and a CI runner all brought up compose stacks on one
+# 10-CPU Mac, the load average passed 250, suites died of "Test timed out",
+# Docker hung and the promoters parked tickets as "verification deferred".
+#
+# Two mechanisms, both host-wide and shared by every job of every project:
+#
+#   1. HEAVY SLOTS. `agentloop heavy -- <cmd>` runs a command while holding one
+#      of N slots (default 1), waiting for one when none is free. They are
+#      ordinary run slots under a reserved pseudo job id (HEAVY_ID), so
+#      acquire_slot / slots_active / slot_alive -- the pid-and-boot lease that
+#      already prunes the slots of dead runs -- prune a holder killed with
+#      -9 the same way. There is no second lock scheme.
+#   2. A LOAD GATE. The tick does not launch a due job while the 5-minute load
+#      average is above a cap (default 1.5 x CPUs), and `heavy` does not start
+#      a command above it either. A forced run (Run now, `agentloop run`) is
+#      not gated, like it is not gated by the precheck.
+#
+# Settings, in this order: the environment (AGENTLOOP_HEAVY_SLOTS,
+# AGENTLOOP_LOAD_CAP), then the top-level `host` block of projects.json
+# ({"host": {"heavy_slots": 1, "load_cap": 15}}), then the defaults. The
+# environment alone would be unreachable for the tick, which launchd starts
+# with its own.
+HEAVY_ID="_heavy"
+# Fields of a holder's record, joined by \037 and NOT a tab: a tab is IFS
+# whitespace, so `read` folds the empty run of a holder started by hand into
+# one delimiter and every later field slides left (the same trap TICK_SEP
+# documents).
+HEAVY_SEP="$(printf '\037')"
+HEAVY_POLL=$(( 10#$(num "${AGENTLOOP_HEAVY_POLL:-}" 12) ))   # seconds between two looks for a free slot; the tests shorten it
+[ "$HEAVY_POLL" -ge 1 ] || HEAVY_POLL=12
+# How long a waiter's heartbeat keeps vouching for its run (heavy_wait_fresh).
+# Three polls, never under 45 s: the watchdog looks every 30 s, and a heartbeat
+# that went stale between two of its looks would let a queued run be judged.
+HEAVY_BEAT_MAX=$(( HEAVY_POLL * 3 )); [ "$HEAVY_BEAT_MAX" -ge 45 ] || HEAVY_BEAT_MAX=45
+
+# host_setting <ENV NAME> <host key> <default> <int|float> -> the value in force.
+# A value that is not a number is skipped, never half-read: a typed "1o" must
+# not become 1, nor take the whole gate down.
+host_setting() {
+  local name="$1" key="$2" def="$3" kind="$4" v pat
+  case "$kind" in int) pat='^[0-9]+$' ;; *) pat='^[0-9]+(\.[0-9]+)?$' ;; esac
+  v="${!name:-}"
+  if [ -n "$v" ] && printf '%s' "$v" | grep -Eq "$pat"; then printf '%s' "$v"; return 0; fi
+  v="$("$JQ" -r --arg k "$key" '.host[$k] // empty | tostring' "$PROJECTS_FILE" 2>/dev/null || true)"
+  if [ -n "$v" ] && printf '%s' "$v" | grep -Eq "$pat"; then printf '%s' "$v"; return 0; fi
+  printf '%s' "$def"
+}
+
+host_ncpu() { # the CPUs the load average is measured against (at least 1)
+  local n
+  n="$(num "$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || true)" 1)"
+  [ "$n" -ge 1 ] || n=1
+  printf '%s' "$n"
+}
+
+heavy_slots() { # how many heavy commands may run at once; 0 = no ceiling, as for max_parallel
+  printf '%s' $(( 10#$(host_setting AGENTLOOP_HEAVY_SLOTS heavy_slots 1 int) ))
+}
+
+host_load_cap() { # the 5-minute load above which nothing new starts; 0 = no gate
+  local v; v="$(host_setting AGENTLOOP_LOAD_CAP load_cap '' float)"
+  if [ -z "$v" ]; then v="$(awk -v n="$(host_ncpu)" 'BEGIN { printf "%.1f", n * 1.5 }')"; fi
+  printf '%s' "$v"
+}
+
+host_loadavg() { # -> "<1m> <5m> <15m>"; non-zero when it cannot be read
+  local la=""
+  if [ -n "${AGENTLOOP_LOADAVG:-}" ]; then
+    la="$AGENTLOOP_LOADAVG"                           # tests only: a fixed reading
+  elif [ -r /proc/loadavg ]; then
+    la="$(awk '{ print $1, $2, $3 }' /proc/loadavg 2>/dev/null)"
+  else
+    la="$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}')"
+  fi
+  la="$(printf '%s' "$la" | awk 'NF >= 3 && $1 ~ /^[0-9.]+$/ && $2 ~ /^[0-9.]+$/ && $3 ~ /^[0-9.]+$/ { print $1, $2, $3 }')"
+  [ -n "$la" ] || return 1
+  printf '%s\n' "$la"
+}
+
+# host_load_over -> 0 when the 5-minute load is above the cap. Leaves the
+# reading in HOST_L1/HOST_L5/HOST_L15 and the cap in HOST_CAP, for the caller to
+# say. A load that cannot be read, and a cap of 0, are "not over": a gate that
+# cannot measure must not hold the fleet.
+HOST_L1=""; HOST_L5=""; HOST_L15=""; HOST_CAP=""
+host_load_over() {
+  local la
+  HOST_L1=""; HOST_L5=""; HOST_L15=""; HOST_CAP="$(host_load_cap)"
+  la="$(host_loadavg)" || return 1
+  read -r HOST_L1 HOST_L5 HOST_L15 <<EOF
+$la
+EOF
+  awk -v c="$HOST_CAP" 'BEGIN { exit !(c + 0 > 0) }' || return 1
+  awk -v l="$HOST_L5" -v c="$HOST_CAP" 'BEGIN { exit !(l + 0 > c + 0) }'
+}
+
+# ---- a CI step on this host occupies it too -------------------------------
+# The heavy slots and the load average only see agent runs. A Bitbucket
+# Pipelines runner shares the machine, and on 2026-10-10 an agent's `make test`
+# held the slot while a pull-request pipeline ran beside it: Playwright hit its
+# 30 s timeout, the PR pipeline and the branch pipeline both failed and a release
+# merge waited for hours. While a CI step runs, `agentloop host` says BUSY and
+# `agentloop heavy` waits.
+#
+# THE SIGNAL, captured from a runner's own log: every step creates
+#   <runner-uuid>_<step-uuid>_{clone,build,pause,system_auth-proxy}
+# `_pause` lives for the whole step and `_build` while the script runs; between
+# steps none of them exists (`docker ps` shows only the runner itself). Uuids
+# are lowercase 8-4-4-4-12 hex. The default pattern matches `_pause` and
+# `_build`, which together cover the step; a step is counted once.
+#
+# FAIL OPEN. One `docker ps` per look, bounded by a timeout (run_bounded). Docker
+# hung on the day this was written; a gate that waits on a hung daemon would
+# wedge every agent of every project. A `docker ps` that times out, fails, or
+# cannot be run counts as "no CI step" and `agentloop host` says so.
+#
+# It affects heavy slots only. The tick does not look: launching an agent is
+# light (it reads code and calls `agentloop heavy` for the suite), and a
+# `docker ps` per due job per tick would put a slow daemon in the scheduler's
+# own path.
+HOST_CI_UUID='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+HOST_CI_DEFAULT_PATTERN="^${HOST_CI_UUID}_[0-9a-f-]{36}_(pause|build)\$"
+HOST_CI_STATE="";  HOST_CI_NOTE="";  HOST_CI_NAMES="";  HOST_CI_LABELS=""   # see host_ci_running
+
+host_ci_gate() { # 0 when a running CI step is part of "busy"; AGENTLOOP_CI_GATE=0|off / host.ci_gate 0|false switches it off
+  local v
+  case "$(printf '%s' "${AGENTLOOP_CI_GATE:-}" | tr 'A-Z' 'a-z')" in off|false|no) return 1 ;; esac
+  v="$(host_setting AGENTLOOP_CI_GATE ci_gate '' int)"
+  if [ -z "$v" ] && [ "$("$JQ" -r '.host.ci_gate == false' "$PROJECTS_FILE" 2>/dev/null || true)" = "true" ]; then v=0; fi
+  [ "${v:-1}" != 0 ]
+}
+
+host_ci_timeout() { # seconds `docker ps` may take; at least 1, at most 60, default 5
+  local v; v=$(( 10#$(host_setting AGENTLOOP_CI_TIMEOUT ci_timeout 5 int) ))
+  [ "$v" -ge 1 ] || v=5
+  [ "$v" -le 60 ] || v=60
+  printf '%s' "$v"
+}
+
+# The pattern in force: the environment, then the host block, then the default.
+# One that is not a valid extended regex is skipped, never half-used (grep -E
+# exits 2 on it, 1 on a plain no-match).
+host_ci_pattern() {
+  local v name
+  for name in env block; do
+    if [ "$name" = env ]; then v="${AGENTLOOP_CI_PATTERN:-}"
+    else v="$("$JQ" -r '.host.ci_pattern // empty | strings' "$PROJECTS_FILE" 2>/dev/null || true)"; fi
+    [ -n "$v" ] || continue
+    printf '\n' | grep -Eq -e "$v" 2>/dev/null; [ $? -le 1 ] || continue
+    printf '%s' "$v"; return 0
+  done
+  printf '%s' "$HOST_CI_DEFAULT_PATTERN"
+}
+
+host_docker_bin() { # the docker CLI: the PATH first, then where Docker Desktop and Homebrew put it (launchd's PATH is short)
+  local b
+  b="$(command -v docker 2>/dev/null || true)"
+  if [ -z "$b" ]; then
+    for b in /usr/local/bin/docker /opt/homebrew/bin/docker "$HOME/.docker/bin/docker" /Applications/Docker.app/Contents/Resources/bin/docker; do
+      [ -x "$b" ] && break; b=""
+    done
+  fi
+  [ -n "$b" ] || return 1
+  printf '%s' "$b"
+}
+
+# "ci step 8f3a1c2e (bitbucket runner)" for a runner's step container; any other
+# name that the operator's pattern matched is shown as it is (at most 40 chars,
+# printable only: it is shown to every run that waits).
+host_ci_label() { # host_ci_label <container name>
+  local n="$1" re="^${HOST_CI_UUID}_(${HOST_CI_UUID})_(pause|build|clone)\$"
+  n="$(printf '%s' "$n" | tr -cd '[:print:]' | cut -c1-120)"
+  if [[ "$n" =~ $re ]]; then printf 'ci step %s (bitbucket runner)' "${BASH_REMATCH[1]:0:8}"
+  else printf 'ci container %s' "${n:0:40}"; fi
+}
+
+# host_ci_running -> 0 when a CI step container runs. Always leaves, for the
+# caller to say:
+#   HOST_CI_STATE   off | ok | open ("open": docker did not answer, so the gate failed open)
+#   HOST_CI_NOTE    why it is open
+#   HOST_CI_NAMES   the matching container names, one per line
+#   HOST_CI_LABELS  one line per step (a step's pause and build count once)
+host_ci_running() {
+  local bin secs pat out rc
+  HOST_CI_STATE="ok"; HOST_CI_NOTE=""; HOST_CI_NAMES=""; HOST_CI_LABELS=""
+  if ! host_ci_gate; then HOST_CI_STATE="off"; return 1; fi
+  secs="$(host_ci_timeout)"; pat="$(host_ci_pattern)"
+  if ! bin="$(host_docker_bin)"; then
+    HOST_CI_STATE="open"; HOST_CI_NOTE="there is no docker on this machine's PATH — not counting CI steps"; return 1
+  fi
+  out="$(run_bounded "$secs" "$bin" ps --format '{{.Names}}' 2>/dev/null)"; rc=$?
+  if [ "$rc" = 124 ]; then
+    HOST_CI_STATE="open"; HOST_CI_NOTE="docker did not answer within ${secs}s — not counting CI steps (failing open)"; return 1
+  elif [ "$rc" != 0 ]; then
+    HOST_CI_STATE="open"; HOST_CI_NOTE="docker ps failed (exit $rc) — not counting CI steps (failing open)"; return 1
+  fi
+  HOST_CI_NAMES="$(printf '%s\n' "$out" | grep -E -e "$pat" || true)"
+  [ -n "$HOST_CI_NAMES" ] || return 1
+  HOST_CI_LABELS="$(printf '%s\n' "$HOST_CI_NAMES" | while IFS= read -r out; do host_ci_label "$out"; echo; done | sort -u | grep -v '^$' || true)"
+  [ -n "$HOST_CI_LABELS" ]
+}
+
+# Who is running this: the run's own slot when we were started inside one
+# (AL_RUN_SLOT, put in every agent's environment), else the first ancestor that
+# is the agent of a live slot, else nobody in particular. Leaves HEAVY_JOB,
+# HEAVY_RUN and HEAVY_RUN_SLOT. The slot is also where a waiter leaves its
+# heartbeat for the watchdog (heavy_beat).
+HEAVY_JOB=""; HEAVY_RUN=""; HEAVY_RUN_SLOT=""
+heavy_identity() {
+  local s="${AL_RUN_SLOT:-}" p d i=0
+  HEAVY_JOB="(by hand)"; HEAVY_RUN=""; HEAVY_RUN_SLOT=""
+  if [ -z "$s" ] || [ ! -d "$s" ] || ! slot_alive "$s"; then
+    s=""
+    p="$PPID"
+    while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$i" -lt 12 ]; do
+      for d in "$LOCK_DIR"/*/*/; do
+        [ -d "$d" ] || continue
+        [ "$(cat "$d/child" 2>/dev/null || true)" = "$p" ] || continue
+        slot_alive "${d%/}" && { s="${d%/}"; break; }
+      done
+      [ -z "$s" ] || break
+      p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"; i=$(( i + 1 ))
+    done
+  fi
+  [ -n "$s" ] || return 0
+  HEAVY_RUN_SLOT="$s"; HEAVY_RUN="${s##*/}"; HEAVY_JOB="${s%/*}"; HEAVY_JOB="${HEAVY_JOB##*/}"
+}
+
+# THE WATCHDOG'S HALF. A run whose agent is blocked in `agentloop heavy` waits
+# on a sleep: no output, ~0 CPU -- exactly what the stall rule calls a hang, so
+# the gate would kill the very runs it queues. While a waiter is alive it
+# touches $slot/heavy-wait on every poll, and the watchdog reads a fresh one as
+# activity (run_launch_and_watch). Stale means the waiter is gone -- killed with
+# -9 or finished -- and the run is judged by the ordinary rules again.
+heavy_beat() { [ -z "$HEAVY_RUN_SLOT" ] || : > "$HEAVY_RUN_SLOT/heavy-wait" 2>/dev/null || true; }
+heavy_wait_fresh() { # heavy_wait_fresh <run slot> -> 0 when a waiter vouched for the run lately
+  local f="${1:-}/heavy-wait" born now
+  [ -f "$f" ] || return 1
+  now="$(now_epoch)"; born="$(num "$(stat -f %m "$f" 2>/dev/null)" 0)"
+  [ $(( now - born )) -le "$HEAVY_BEAT_MAX" ]
+}
+
+heavy_dur() { # heavy_dur <seconds> -> 4m10s
+  local s; s="$(num "${1:-}" 0)"
+  if [ "$s" -ge 3600 ]; then printf '%dh%02dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+  elif [ "$s" -ge 60 ]; then printf '%dm%02ds' $(( s / 60 )) $(( s % 60 ))
+  else printf '%ds' "$s"; fi
+}
+
+# One line per live holder: "<pid>␟<job>␟<run>␟<since>␟<command>" (HEAVY_SEP). Pruning
+# the dead ones is slots_active's job, so it runs first.
+heavy_holders() {
+  local d pid job run since cmd
+  slots_active "$HEAVY_ID" >/dev/null
+  for d in "$LOCK_DIR/$HEAVY_ID"/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"; pid="$(cat "$d/pid" 2>/dev/null || true)"; [ -n "$pid" ] || continue
+    IFS="$HEAVY_SEP" read -r job run since cmd < "$d/holder" 2>/dev/null || { job="?"; run=""; since=""; cmd=""; }
+    printf '%s\n' "$pid$HEAVY_SEP${job:-?}$HEAVY_SEP${run:-}$HEAVY_SEP${since:-}$HEAVY_SEP${cmd:-}"
+  done
+}
+
+heavy_holders_text() { # the holders on one line, for "who is in the way"
+  local pid job run since cmd out="" now l; now="$(now_epoch)"
+  while IFS="$HEAVY_SEP" read -r pid job run since cmd; do
+    [ -n "$pid" ] || continue
+    out="$out${out:+; }$job${run:+ run $run} (pid $pid${since:+, held $(heavy_dur $(( now - $(num "$since" "$now") )))})"
+  done < <(heavy_holders)
+  # The CI steps host_ci_running last saw (the loop in cmd_heavy looked just before).
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    out="$out${out:+; }$l"
+  done <<EOF
+$HOST_CI_LABELS
+EOF
+  printf '%s' "${out:-nobody}"
+}
+
+# The command that runs the heavy command. A python process, as run_bounded is,
+# for what bash 3.2 cannot do: put the command in its own process group, kill
+# THAT group (never ours) on INT/TERM/HUP, and notice that its holder was killed
+# outright. Then nothing keeps running -- or keeps a stack up -- on a slot the
+# lease has already given away. Exits with the command's own status (128+n for
+# a signal), 126/127 when it cannot be started.
+heavy_runner_py() {
+  cat <<'PY'
+import os, signal, subprocess, sys, time
+
+holder = os.getppid()        # the shell that holds the slot; if it vanishes, so does the command
+try:
+    p = subprocess.Popen(sys.argv[1:], start_new_session=True)
+except OSError as e:
+    print("agentloop heavy: cannot run %s: %s" % (sys.argv[1], e.strerror or e), file=sys.stderr)
+    sys.exit(126 if isinstance(e, PermissionError) else 127)
+
+hit = {"at": 0.0}
+
+def group(sig):
+    try:
+        os.killpg(p.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+def on_signal(num, frame):
+    if not hit["at"]:
+        hit["at"] = time.time()
+    group(num)
+
+for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(s, on_signal)
+
+while True:
+    try:
+        rc = p.wait(timeout=0.5)
+        break
+    except subprocess.TimeoutExpired:
+        pass
+    if hit["at"] and time.time() - hit["at"] >= 5:
+        group(signal.SIGKILL)          # it had its grace
+    elif not hit["at"] and os.getppid() != holder:
+        hit["at"] = time.time()        # the holder was killed outright
+        group(signal.SIGTERM)
+sys.exit(128 - rc if rc < 0 else rc)
+PY
+}
+
+# What the holder record (and so every `agentloop host` and every waiter) says
+# the command is: its name and at most two plain words after it, never the rest.
+# Arguments are where a token ends up (`KEY=value`, `--password x`), and this
+# line is shown to every other run that waits.
+heavy_cmd_label() { # heavy_cmd_label <command> [args…]
+  local out="${1##*/}" a n=0
+  shift
+  for a in "$@"; do
+    case "$a" in -*|*=*|*/*) continue ;; esac
+    out="$out ${a:0:40}"; n=$(( n + 1 ))
+    [ "$n" -lt 2 ] || break
+  done
+  printf '%s' "$out" | tr '\n\t' '  ' | cut -c1-120
+}
+
+# Is this process running INSIDE the heavy slot <dir>? The variable that says so
+# is inherited by everything the command starts, which is the point, and is also
+# just text an agent could set: it counts only for a live slot of OURS whose
+# holder is one of this process's own ancestors.
+heavy_inside_slot() { # heavy_inside_slot <slot dir>
+  local d="$1" p="$PPID" i=0
+  [ "${d%/*}" = "$LOCK_DIR/$HEAVY_ID" ] && slot_alive "$d" || return 1
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$i" -lt 30 ]; do
+    [ "$p" = "${d##*/}" ] && return 0
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"; i=$(( i + 1 ))
+  done
+  return 1
+}
+
+HEAVY_SLOT=""; HEAVY_NAPPER=""; HEAVY_PID=""; HEAVY_CI_NOTED=0
+# host_ci_running, plus ONE line on stderr the first time docker could not be
+# asked: a waiter that goes on regardless should say why it is not waiting for CI.
+heavy_ci_running() {
+  host_ci_running && return 0
+  if [ "$HOST_CI_STATE" = open ] && [ "$HEAVY_CI_NOTED" = 0 ]; then
+    HEAVY_CI_NOTED=1; printf 'agentloop heavy: %s.\n' "$HOST_CI_NOTE" >&2
+  fi
+  return 1
+}
+heavy_cleanup() { # every way out of cmd_heavy that bash can see: the slot and the heartbeat go
+  [ -z "$HEAVY_NAPPER" ] || kill "$HEAVY_NAPPER" 2>/dev/null
+  [ -z "$HEAVY_RUN_SLOT" ] || rm -f "$HEAVY_RUN_SLOT/heavy-wait" 2>/dev/null
+  [ -z "$HEAVY_SLOT" ] || release_slot "$HEAVY_SLOT"
+}
+
+# cmd_heavy: agentloop heavy [--max-wait S] [--] <command...>
+cmd_heavy() {
+  local maxwait=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --status)     cmd_host; return ;;
+      --max-wait)   [ $# -ge 2 ] || { echo "agentloop heavy: --max-wait needs a number of seconds" >&2; exit 2; }
+                    maxwait="$2"; shift 2 ;;
+      --max-wait=*) maxwait="${1#--max-wait=}"; shift ;;
+      --)           shift; break ;;
+      -*)           echo "agentloop heavy: unknown option $1 (a command that starts with a dash goes after --)" >&2; exit 2 ;;
+      *)            break ;;
+    esac
+  done
+  case "$maxwait" in *[!0-9]*) echo "agentloop heavy: --max-wait wants whole seconds, got '$maxwait'" >&2; exit 2 ;; esac
+  [ $# -ge 1 ] || { echo "usage: agentloop heavy [--max-wait SECONDS] [--] <command...>   (or: agentloop heavy --status)" >&2; exit 2; }
+
+  # Re-entrant: a command that already runs inside a slot of ours (a Makefile
+  # that itself calls `agentloop heavy`) must not queue behind its own parent.
+  if [ -n "${AL_HEAVY_HELD:-}" ] && heavy_inside_slot "$AL_HEAVY_HELD"; then exec "$@"; fi
+
+  local slots began="$SECONDS" announced=0 reason="" rc=0 cmdline now
+  HEAVY_SLOT=""; HEAVY_NAPPER=""; HEAVY_PID=""; HEAVY_CI_NOTED=0
+  slots="$(heavy_slots)"
+  heavy_identity
+  local parent="$PPID"
+  cmdline="$(heavy_cmd_label "$@")"
+
+  # Out by any road -- the command's end, a signal (see the traps), or the
+  # parent vanishing -- the slot and the heartbeat go. A -9 cannot run this;
+  # that case is the lease's (slot_alive), not ours.
+  trap heavy_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+
+  while :; do
+    if host_load_over; then
+      reason="the 5-minute load is $HOST_L5, above the cap of $HOST_CAP"
+    elif heavy_ci_running; then
+      # Before the slot, so a waiter never holds one while it waits for CI.
+      reason="a CI step is running on this host ($(printf '%s' "$HOST_CI_LABELS" | tr '\n' ',' | sed 's/,$//; s/,/, /g'))"
+    elif HEAVY_SLOT="$(acquire_slot "$HEAVY_ID" "$slots")"; then
+      break
+    else
+      HEAVY_SLOT=""; reason="all $slots heavy slot(s) are taken"
+    fi
+    if [ "$announced" = 0 ]; then
+      announced=1
+      printf 'agentloop heavy: waiting — %s. Holding the slot(s): %s. Load %s %s %s (1/5/15 min). This is normal; keep waiting.\n' \
+        "$reason" "$(heavy_holders_text)" "${HOST_L1:-?}" "${HOST_L5:-?}" "${HOST_L15:-?}" >&2
+    fi
+    heavy_beat
+    # A waiter whose caller is gone (the agent was stopped or killed) would
+    # otherwise get a slot one day and run a command nobody wants.
+    if [ "$(ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ')" != "$parent" ]; then
+      echo "agentloop heavy: the process that asked for this is gone — not waiting any longer" >&2; exit 1
+    fi
+    if [ -n "$maxwait" ] && [ $(( SECONDS - began )) -ge "$maxwait" ]; then
+      echo "agentloop heavy: gave up after $(heavy_dur $(( SECONDS - began ))) (--max-wait $maxwait) — $reason" >&2; exit 75
+    fi
+    sleep $(( HEAVY_POLL + RANDOM % 4 )) & HEAVY_NAPPER=$!      # backgrounded so a signal ends the wait at once
+    wait "$HEAVY_NAPPER"; HEAVY_NAPPER=""
+  done
+
+  [ -z "$HEAVY_RUN_SLOT" ] || rm -f "$HEAVY_RUN_SLOT/heavy-wait" 2>/dev/null
+  now="$(now_epoch)"
+  printf '%s\n' "$HEAVY_JOB$HEAVY_SEP$HEAVY_RUN$HEAVY_SEP$now$HEAVY_SEP$cmdline" > "$HEAVY_SLOT/holder" 2>/dev/null || true
+  if [ "$announced" = 1 ]; then
+    printf 'agentloop heavy: got a heavy slot after %s — load %s %s %s (1/5/15 min). Running: %s\n' \
+      "$(heavy_dur $(( SECONDS - began )))" "${HOST_L1:-?}" "${HOST_L5:-?}" "${HOST_L15:-?}" "$cmdline" >&2
+  fi
+
+  # `<&0`: a background job gets /dev/null for stdin unless told otherwise, and
+  # the command is a foreground one that may read it.
+  AL_HEAVY_HELD="$HEAVY_SLOT" "$PYTHON" -c "$(heavy_runner_py)" "$@" <&0 &
+  HEAVY_PID=$!
+  trap 'kill -INT  "$HEAVY_PID" 2>/dev/null' INT
+  trap 'kill -TERM "$HEAVY_PID" 2>/dev/null' TERM
+  trap 'kill -HUP  "$HEAVY_PID" 2>/dev/null' HUP
+  wait "$HEAVY_PID"; rc=$?
+  # A trapped signal ends the first wait early, with the signal's status and the
+  # runner still tearing the command down: wait for it to finish, then say so.
+  while kill -0 "$HEAVY_PID" 2>/dev/null; do wait "$HEAVY_PID"; rc=$?; done
+  trap - INT TERM HUP
+  exit "$rc"
+}
+
+# agentloop host: is the machine quiet enough to start heavy work? Exit 0 when
+# a heavy slot is free and the 5-minute load is under the cap, 1 otherwise. A
+# precheck calls it to re-measure a deferral whose cause was the host.
+cmd_host() {
+  local slots n over=0 busy=0 ci=0 why="" cpus now pid job run since cmd l
+  slots="$(heavy_slots)"; cpus="$(host_ncpu)"; now="$(now_epoch)"
+  host_load_over && over=1
+  n="$(slots_active "$HEAVY_ID")"
+  if [ -n "${AGENTLOOP_LOAD_CAP:-}" ] && ! printf '%s' "$AGENTLOOP_LOAD_CAP" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+    echo "note: AGENTLOOP_LOAD_CAP='$AGENTLOOP_LOAD_CAP' is not a number — ignored"
+  fi
+  if [ -n "${AGENTLOOP_HEAVY_SLOTS:-}" ] && ! printf '%s' "$AGENTLOOP_HEAVY_SLOTS" | grep -Eq '^[0-9]+$'; then
+    echo "note: AGENTLOOP_HEAVY_SLOTS='$AGENTLOOP_HEAVY_SLOTS' is not a whole number — ignored"
+  fi
+  if [ -n "$HOST_L5" ]; then
+    printf 'load        %s %s %s (1/5/15 min), %s CPUs\n' "$HOST_L1" "$HOST_L5" "$HOST_L15" "$cpus"
+  else
+    printf 'load        unreadable on this machine — not gating on it\n'
+  fi
+  if awk -v c="$HOST_CAP" 'BEGIN { exit !(c + 0 > 0) }'; then
+    printf 'load cap    %s on the 5-minute load\n' "$HOST_CAP"
+  else
+    printf 'load cap    none (0)\n'
+  fi
+  host_ci_running && ci=1
+  case "$HOST_CI_STATE" in
+    off) printf 'ci          off — a running CI step is not counted (AGENTLOOP_CI_GATE / host.ci_gate)\n' ;;
+    open) printf 'ci          %s\n' "$HOST_CI_NOTE" ;;
+    *) if [ "$ci" = 1 ]; then printf 'ci          %s CI step(s) running\n' "$(printf '%s\n' "$HOST_CI_LABELS" | grep -c .)"
+       else printf 'ci          no CI step running\n'; fi ;;
+  esac
+  if [ "$slots" -gt 0 ]; then printf 'heavy       %s of %s slot(s) in use\n' "$n" "$slots"
+  else printf 'heavy       %s in use, no ceiling (0)\n' "$n"; fi
+  while IFS="$HEAVY_SEP" read -r pid job run since cmd; do
+    [ -n "$pid" ] || continue
+    printf '  holder    %s%s (pid %s)%s  %s\n' "$job" "${run:+ run $run}" "$pid" \
+      "${since:+, held $(heavy_dur $(( now - $(num "$since" "$now") )))}" "$cmd"
+  done < <(heavy_holders)
+  # A CI step is not a slot: it is listed beside the holders and makes the host
+  # busy while it runs, and does not count against the ceiling above.
+  while IFS= read -r l; do
+    if [ -n "$l" ]; then printf '  holder    %s\n' "$l"; fi
+  done <<EOF
+$HOST_CI_LABELS
+EOF
+  if [ "$slots" -gt 0 ] && [ "$n" -ge "$slots" ]; then busy=1; why="no heavy slot is free"; fi
+  if [ "$over" = 1 ]; then busy=1; why="${why:+$why; }the load is above the cap"; fi
+  if [ "$ci" = 1 ]; then busy=1; why="${why:+$why; }a CI step is running"; fi
+  if [ "$busy" = 1 ]; then printf 'verdict     BUSY — %s\n' "$why"; return 1; fi
+  if [ "$HOST_CI_STATE" = ok ]; then
+    printf 'verdict     quiet — a heavy slot is free, the load is under the cap and no CI step is running\n'
+  else
+    printf 'verdict     quiet — a heavy slot is free and the load is under the cap\n'
+  fi
+}
+
+# The host contract every agent is handed (inject_contract). Short, because
+# every run reads it. The path is spelled out rather than trusted to the PATH of
+# the agent's shell, which a sandboxed CLI does not always inherit.
+HOST_CONTRACT_MARKER='Heavy work goes through the host gate'
+host_contract() {
+  local bin; bin="$(printf '%q' "$SELF")"
+  cat <<CONTRACT
+## Heavy work goes through the host gate — one machine runs every project's agents
+
+Unthrottled suites take the whole fleet down (load 250, timeouts, Docker hung).
+- Run every command that starts containers or runs a full suite or build
+  (\`make test\`, \`make check\`, \`make test-*\`, \`docker compose up\`, the
+  repo's integration and e2e suites) as \`${bin} heavy -- <command>\` (also
+  \`\$AL_BIN\`). It waits for a host-wide slot and returns the exit code unchanged.
+- One suite and one stack at a time, never two in parallel: measure the head
+  and the trial merge one after the other. If the trial merge needs a worktree
+  of its own, take the first stack down before bringing up the second, and take
+  the trial's stack down and remove its worktree when done.
+- Take down a suite's stack (the repo's teardown target) as soon as its result
+  is read, before starting anything else.
+- Waiting for a slot is normal and the watchdog knows it: keep blocking. Never
+  write a deferral or "environment failure" because the host is busy.
+- The wait plus the suite can outlast one tool call, and a call cut off leaves
+  the command running. So start it as \`${bin} heavy -- make test > <log> 2>&1;
+  echo \$? > <rc>\` and block with \`until [ -f <rc> ]; do sleep 30; done\`
+  (re-issued if cut off). Never start a suite again while it is still alive.
+- A suite that failed only by timeouts while the host was overloaded is run
+  again through \`agentloop heavy\`; it is not a red build.
+CONTRACT
+}
 
 # --- a port block per run ----------------------------------------------------
 # Isolation gives every run its own worktree, which fixes the filesystem. It does
@@ -4419,6 +4977,49 @@ run_record_stopped_early() { # <id> <slot-dir>
   fi
 }
 
+# A RUN THAT COULD NOT BE SET UP IS STILL A RUN THAT ENDED. It took a slot --
+# so the dashboard showed it running -- and then its worktree was refused, or
+# the resume it was asked for had nothing to continue in. Every one of those
+# exits used to write a line to tick.log and nothing else: no record, no log
+# body, so the run started, died and was gone from the runs list, and the only
+# trace of why was a file nobody had been told to open (2026-09-30: a wave
+# planner refused its worktree twice in a minute, invisibly).
+#
+# So it files the record an ended run files: `error`, cause `setup_failed`,
+# the reason as its note, and a log body so opening the run explains itself.
+# No session, no cost, no turns -- no agent ever ran. And NO `resumed_from`,
+# whatever was asked: that field is what marks a session as already picked up,
+# and a resume that was refused picked nothing up.
+#
+# <counts> = "streak" for a failure the next tick would simply repeat (a
+# worktree that cannot be cut): it feeds the failure backoff like any failing
+# run, or a job on a schedule would file this record every interval for ever.
+# A refused resume is one deliberate click and counts for nothing.
+#
+# Not closed as a unit of an analysis: a derived job that never launched leaves
+# its unit for the orchestrator to judge, exactly as before.
+run_record_aborted() { # <id> <slot-dir> <start> <forced> <precheck-out> <project> <model> <platform> <account> <account-dir> <logfile> <reason> [counts]
+  local id="$1" slot="$2" start="$3" forced="$4" pc_out="$5" project="$6" model="$7" platform="$8"
+  local account="$9" account_dir="${10}" logf="${11}" reason="${12}" counts="${13:-}" end note streak
+  case "$start" in ''|*[!0-9]*) start="$(now_epoch)" ;; esac
+  end="$(now_epoch)"
+  [ -n "$reason" ] || reason="the run could not be set up (tick.log has the line)"
+  note="NOT STARTED: $reason — no agent was launched and nothing was spent."
+  "$JQ" -nc --arg r "$note" '{is_error:true, subtype:"setup_failed", num_turns:0, session_id:"",
+    stop_reason:"setup_failed", result:("**Not started.**\n\n"+$r)}' > "$logf" 2>/dev/null || logf=""
+  streak="$(num "$(state_get "$id" fail_streak 0)")"
+  [ "$counts" != "streak" ] || streak="$(( streak + 1 ))"
+  state_set_many "$id" "$("$JQ" -nc --argjson end "$end" --argjson start "$start" --argjson streak "$streak" \
+    '{last_start:$start, last_end:$end, last_status:"error", last_run_start:$start,
+      last_run_status:"error", fail_streak:$streak}')"
+  record_run "$id" "error" "$start" "$end" "0" "0" "" "$logf" "$note" "$forced" "$pc_out" "$project" \
+             "$model" "" "" "setup_failed" "$platform" "none" "null" "$account" "$account_dir"
+  # The same marker the classifier drops: a stop that lands while this run is
+  # on its way out must not file a second record for it.
+  : > "$slot/journaled" 2>/dev/null || true
+  run_end_hook "$id" "error" "0" "$note" "$project" "" "$logf" "$start" "$end" "$platform" "none" "null"
+}
+
 run_cleanup() { # <id> <slot-dir>
   local id="$1" slot="${2:-}" wt project
   [ -n "$slot" ] || return 0
@@ -4596,6 +5197,19 @@ spent_today_all() { _spend_since_midnight ""; }
 #   utilization:   0..1, present ONLY on a warning (the CLI warns at 0.75)
 #   resetsAt:      epoch seconds -- when this window starts over
 #   overageStatus: rejected, with overageDisabledReason: org_level_disabled
+#   unifiedWindows: {five_hour: {utilization, resetsAt}, seven_day: {...}}
+#                  -- CLI 2.1.284 and later: EVERY window, on EVERY event,
+#                  utilization included even when nothing warns
+#
+# The fields above speak for the one window `rateLimitType` names, and only
+# that window used to be recorded. So a window no run's event happened to
+# name was never read again: on 2026-09-30 the seven-day reading was a
+# statusline's from 42 hours before, at 100%, and the gate held every
+# scheduled run back on it while each forced run's own events said 46-49% --
+# in unifiedWindows, which nothing read. Every window an event carries is
+# recorded now. Its `status` is the event's only for the window the event
+# names; another window's is not stated, and null is what the gate already
+# reads as "no refusal".
 #
 # `overageStatus: rejected` is what makes this worth gating on rather than
 # merely showing: with no overage to fall through to, hitting the ceiling is a
@@ -4657,16 +5271,28 @@ rl_capture() { # rl_capture <streamfile> [key] -- key: rl_key's block (anthropic
   # cost us the other 300.
   "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg k "$key" '
     ($prev[0] // {}) as $was
-    | [inputs | fromjson? | select(.type == "rate_limit_event") | .rate_limit_info // empty]
-    | map(select(.rateLimitType != null))
+    | [inputs | fromjson? | objects | select(.type == "rate_limit_event") | .rate_limit_info // empty | objects]
     | reduce .[] as $e ($was;
-        .[$k][$e.rateLimitType] = {
-          status:      ($e.status // "unknown"),
-          utilization: ($e.utilization // null),
-          resets_at:   ($e.resetsAt // null),
-          overage:     ($e.overageStatus // null),
-          seen_at:     $now
-        })
+        # Every window the event carries, the one it names or not.
+        reduce ($e.unifiedWindows | objects | to_entries[] | select(.value | type == "object")) as $w (.;
+          .[$k][$w.key] = {
+            status:      (if $w.key == $e.rateLimitType then ($e.status // "unknown") else null end),
+            utilization: ($w.value.utilization // null),
+            resets_at:   ($w.value.resetsAt // null),
+            overage:     ($e.overageStatus // null),
+            seen_at:     $now
+          })
+        # The window it names, from its own fields: what every CLI before
+        # unifiedWindows reported, and still the one place its status lives.
+        | if $e.rateLimitType == null then . else
+            .[$k][$e.rateLimitType] = {
+              status:      ($e.status // "unknown"),
+              utilization: ($e.utilization // ($e.unifiedWindows | objects | .[$e.rateLimitType] | objects | .utilization) // null),
+              resets_at:   ($e.resetsAt // null),
+              overage:     ($e.overageStatus // null),
+              seen_at:     $now
+            }
+          end)
   ' "$sf" > "$tmp" 2>/dev/null && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
   rm -f "$tmp" 2>/dev/null
   lock_drop "$lock"
@@ -4806,6 +5432,8 @@ fleet_stall_reason() { # -> 0 with a reason on stdout, 1 when all is well
     printf 'no run has started in %sh — every scheduled run is being held back by a spent usage window (`agentloop usage` says which)\n' "$STALL_HOURS"
   elif printf '%s\n' "$recent" | grep -q 'daily cap reached'; then
     printf 'no run has started in %sh — the daily spend cap is holding every run back\n' "$STALL_HOURS"
+  elif printf '%s\n' "$recent" | grep -q 'host busy'; then
+    printf 'no run has started in %sh — the host load is above its cap, so every scheduled launch is being held back (`agentloop host` says by how much)\n' "$STALL_HOURS"
   elif printf '%s\n' "$recent" | grep -q 'max_parallel'; then
     # No live slot, yet jobs are being turned away for being at their limit: the
     # slots being counted belong to processes that are gone.
@@ -6197,6 +6825,14 @@ run_launch_and_watch() {
       if [ "$size" != "$last_size" ] || [ "$cpu" != "$last_cpu" ]; then
         last_size="$size"; last_cpu="$cpu"; last_change="$now"
       fi
+      # Queued behind `agentloop heavy` is waiting, not hanging: the waiter
+      # sleeps, so it adds neither output nor CPU, and the rules below would
+      # kill the run for obeying the host gate. Its heartbeat (heavy_beat) is
+      # proof of life for as long as the wait lasts, however long that is; once
+      # the waiter is gone the beat goes stale and the run is judged as ever.
+      # Only the stall rule is held off: the empty-stream rule and the absolute
+      # timeout_seconds cap below are not about silence.
+      if heavy_wait_fresh "$slot"; then last_change="$now"; fi
       # A stream still EMPTY this long after the launch is a dead run,
       # whatever the CPU says. Measured on OpenCode (evidence 35): a CLI
       # whose provider never answers, or a resume the CLI took to another
@@ -6297,6 +6933,74 @@ run_start_error() {
   printf '%s' "${line:-the agent exited ${rc:-?} with nothing on stderr}"
 }
 
+# A DENIAL NO PERMISSION COULD HAVE PREVENTED. Claude Code refuses a few
+# command shapes whatever the permission mode says, and a headless run has
+# nobody to approve them: an `rm` whose target is the output of a command
+# substitution is the one measured (CLI 2.1.284, 2026-09-30), refused with the
+# way around it in the message -- "Run the substitution on its own first, then
+# remove the literal paths it prints." The agent did exactly that on its next
+# call and delivered its ticket, and the run was filed error / tools_denied --
+# "it could not do the work" -- with a backoff step, for a refusal neither the
+# job nor the operator could have prevented. The result's permission_denials
+# do not say why a call was denied; the stream does, one
+# `system/permission_denied` event per denial, with its `decision_reason_type`.
+# Prints "<count><TAB><first reason>" for the result's denials that the
+# stream calls a `safetyCheck`. A safetyCheck that carries a
+# `decision_reason_code` is a setting the operator CAN change (reads outside
+# the working directory, paused memory), so it stays a denial like any other.
+# Reads run_classify's scope: logfile, streamfile.
+run_safety_denials() {
+  if [ -z "${streamfile:-}" ] || [ ! -s "$streamfile" ]; then printf '0\t'; return 0; fi
+  "$JQ" -n -R -r --slurpfile res "$logfile" '
+    [inputs | fromjson? | objects
+       | select(.type == "system" and .subtype == "permission_denied"
+                and .decision_reason_type == "safetyCheck"
+                and ((.decision_reason_code // "") == ""))] as $safe
+    | [($res[0].permission_denials // [])[] | .tool_use_id as $t
+       | ($safe | map(select(.tool_use_id == $t)) | first) // empty] as $hit
+    | [($hit | length | tostring),
+       (($hit[0].decision_reason // "") | gsub("[\t\n]+"; " "))] | @tsv
+  ' "$streamfile" 2>/dev/null || printf '0\t'
+}
+
+# A DENIAL THE SAME CALL GOT PAST. A hook can hold a call once and let the
+# identical call through on the retry: a knowledge-base PreToolUse hook holds
+# every session's first change until the agent has searched the project's knowledge
+# ("It is held only once"), so nearly every run that changes anything now has
+# one denial. A reviewer did its review, merged its PR, moved its ticket and
+# was filed error / tools_denied (2026-10-01) -- the morning after the same
+# verdict had been fixed for safety checks alone. What tells a hold from a
+# block is not the reason (a hook leaves no `system/permission_denied` event
+# at all) but what happened next: a deny rule, a mode or a hook that keeps
+# refusing refuses the identical call again; a hold lets it through. Prints
+# how many of the result's denials were followed, later in the stream, by a
+# call of the same tool with the same input that succeeded. A safetyCheck is
+# left to run_safety_denials, so no denial is counted twice. Reads
+# run_classify's scope: logfile, streamfile.
+run_retried_denials() {
+  if [ -z "${streamfile:-}" ] || [ ! -s "$streamfile" ]; then printf '0'; return 0; fi
+  "$JQ" -n -R -r --slurpfile res "$logfile" '
+    [inputs | fromjson? | objects] as $ev
+    | [$ev[] | select(.type == "system" and .subtype == "permission_denied"
+                      and .decision_reason_type == "safetyCheck"
+                      and ((.decision_reason_code // "") == "")) | .tool_use_id] as $safe
+    | [$ev | to_entries[] | .key as $n
+       | (.value.message.content? // []) | arrays | .[] | objects
+       | {type, n: $n, id: (.id // .tool_use_id), name, input, failed: (.is_error == true)}] as $blocks
+    | ([$blocks[] | select(.type == "tool_result" and (.id | type) == "string")
+        | {key: .id, value: (.failed | not)}]
+       | from_entries) as $ok
+    | [$blocks[] | select(.type == "tool_use")] as $uses
+    | [($res[0].permission_denials // [])[] | . as $d
+       | select(($safe | index($d.tool_use_id)) == null)
+       | (([$uses[] | select(.id == $d.tool_use_id) | .n] | first) // -1) as $at
+       | select(any($uses[]; .id != $d.tool_use_id and .n > $at
+                             and .name == $d.tool_name and .input == $d.tool_input
+                             and $ok[.id] == true))]
+    | length
+  ' "$streamfile" 2>/dev/null || printf '0'
+}
+
 # run_classify -> the verdict, from everything the run left behind. Reads
 #   from run_job: id, rc, logfile, wdreason, slot, run_dir, cost, cost_basis,
 #   _no_result, tokens_json, model, model_id. The classifier, the stop
@@ -6331,8 +7035,21 @@ run_classify() {
   #   warning — the run completed but something smells: stderr output, or an
   #             empty agent result;
   #   success — clean run, agent produced a result, nothing denied.
-  local denials subtype result_len errbytes cause
+  # A denial the CLI's own safety check made is not "tools denied": no
+  # permission could have allowed it, so it is taken out of the count here and
+  # said as a warning below (SAFETY CHECK). Nor is a denial the identical call
+  # got past on a retry (run_retried_denials): a hook that holds a call once
+  # blocked nothing, and it is taken out without a word -- it is the hook
+  # working as its owner meant, on nearly every run.
+  local denials safety_denials safety_why retried_denials subtype result_len errbytes cause
   denials="$("$JQ" -r '.permission_denials // [] | length' "$logfile" 2>/dev/null || echo 0)"
+  IFS=$'\t' read -r safety_denials safety_why <<EOF
+$(run_safety_denials)
+EOF
+  safety_denials="$(num "$safety_denials")"
+  retried_denials="$(num "$(run_retried_denials)")"
+  denials=$(( $(num "$denials") - safety_denials - retried_denials ))
+  [ "$denials" -ge 0 ] || denials=0
   subtype="$("$JQ" -r '.subtype // "success"' "$logfile" 2>/dev/null || echo success)"
   result_len="$("$JQ" -r '.result // "" | length' "$logfile" 2>/dev/null || echo 0)"
   errbytes="$(wc -c < "$logfile.err" 2>/dev/null | tr -d ' ')"
@@ -6531,8 +7248,17 @@ run_classify() {
   # because a run that failed has a cause worth more than its symptom. Neither
   # exclusion touches whether `undelivered` was CHECKED (it always is, above)
   # — only whether it gets to overwrite what the card already says.
+  #
+  # A SAFETY CHECK is said here too, for the same reasons. The denials the CLI
+  # made on its own rules left the status alone above (run_safety_denials),
+  # but they still belong on the card: a refused command can be work that
+  # never happened.
   case "$status" in
     success|warning)
+      if [ "${safety_denials:-0}" -gt 0 ]; then
+        wdreason="${wdreason:-}${wdreason:+ · }SAFETY CHECK: the CLI refused ${safety_denials} command(s) that no permission setting can allow${safety_why:+ ($safety_why)}, and the run went on with the agent told why. Check that the result's claims hold."
+        status="warning"
+      fi
       if [ -n "$undelivered" ]; then
         wdreason="${wdreason:-}${wdreason:+ · }$(undelivered_note "$undelivered")"
         status="warning"
@@ -6589,7 +7315,7 @@ run_job() { # run_job <id> [--force] [resume-session-id]
   local id="$1" force="${2:-}" resume_sid="${3:-}"
   [ -n "$resume_sid" ] && force="--force"
   local cwd prompt model effort budget timeout stall permission allowed disallowed precheck project proj_desc interactive fifo
-  local run_cwd worktree run_dir run_env account account_dir _envln slot max_par
+  local run_cwd worktree run_dir run_env account account_dir _envln slot max_par job_base _why
   # Loop variables for replaying a reattached run's manifest through `up` again
   # (see the isolation branch below). Declared here, not just inside the loop,
   # because `read` happily creates GLOBALS for anything not already local, and
@@ -6955,9 +7681,9 @@ ${prompt}"
       lock_take "$rlock"
       if wt_is_claimed "$id" "$run_dir"; then
         lock_drop "$rlock"
-        log_tick "$id: cannot resume $resume_sid — another run is already working in $run_dir"
-        state_set "$id" last_start "$start"
-        state_set "$id" last_status '"error"'
+        _why="cannot resume $resume_sid — another run is already working in $run_dir"
+        log_tick "$id: $_why"
+        run_record_aborted "$id" "$slot" "$start" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$platform" "$account" "$account_dir" "$logfile" "$_why"
         run_cleanup "$id" "$slot"; trap - EXIT
         return 1
       fi
@@ -6989,9 +7715,9 @@ ${prompt}"
         # Its services are still bound to that block and somebody else holds it.
         # Refusing is the honest answer: a fresh block would silently point the
         # resumed agent's config at ports nothing is listening on.
-        log_tick "$id: cannot resume $resume_sid — its port block $port_base is held by a live run"
-        state_set "$id" last_start "$start"
-        state_set "$id" last_status '"error"'
+        _why="cannot resume $resume_sid — its port block $port_base is held by a live run"
+        log_tick "$id: $_why"
+        run_record_aborted "$id" "$slot" "$start" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$platform" "$account" "$account_dir" "$logfile" "$_why"
         run_cleanup "$id" "$slot"; trap - EXIT
         return 1
       fi
@@ -7006,9 +7732,9 @@ ${prompt}"
       # the worktrees instead of to a checkout. The port block four lines up is
       # read defensively for exactly this reason; so is this.
       if [ -z "$primary_name" ] || [ ! -d "$worktree" ]; then
-        log_tick "$id: cannot resume $resume_sid — its primary worktree is gone or unnamed"
-        state_set "$id" last_start "$start"
-        state_set "$id" last_status '"error"'
+        _why="cannot resume $resume_sid — its primary worktree is gone or unnamed"
+        log_tick "$id: $_why"
+        run_record_aborted "$id" "$slot" "$start" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$platform" "$account" "$account_dir" "$logfile" "$_why"
         run_cleanup "$id" "$slot"; trap - EXIT
         return 1
       fi
@@ -7085,9 +7811,9 @@ ${prompt}"
       # either branch below has written anything: run_cleanup sees an
       # empty run dir and skips teardown, so there is nothing half-started
       # to unwind.
-      log_tick "$id: refusing to resume $resume_sid — no open session directory holds it (already finished, expired, or removed by hand)"
-      state_set "$id" last_start "$start"
-      state_set "$id" last_status '"error"'
+      _why="refusing to resume $resume_sid — no open session directory holds it (already finished, expired, or removed by hand)"
+      log_tick "$id: $_why"
+      run_record_aborted "$id" "$slot" "$start" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$platform" "$account" "$account_dir" "$logfile" "$_why"
       run_cleanup "$id" "$slot"; trap - EXIT
       return 1
     else
@@ -7101,10 +7827,15 @@ ${prompt}"
       # block: they are what write the run's ports into its config.
       port_base="$(alloc_port_base "$slot")"
       export AL_PORT_BASE="$port_base" AL_PORT_SPAN AL_PROVISION_LIB="$BIN_DIR/provision-lib.sh"
-      if ! worktree="$(wt_setup "$id" "$project" "$cwd" "$stamp" "$port_base")"; then
-        state_set "$id" last_start "$start"
-        state_set "$id" last_status '"error"'
+      # The job's own base, when it has one: where THIS job's worktree is cut
+      # from, whatever its project declares (see wt_setup). Never inherited.
+      job_base="$(job_get "$id" '.base' '')"
+      case "$job_base" in null) job_base="" ;; esac
+      # wt_setup answers on stdout with the primary worktree, so the reason for
+      # a refusal comes back through a file of the slot's.
+      if ! worktree="$(WT_FAIL_NOTE="$slot/setup-note" wt_setup "$id" "$project" "$cwd" "$stamp" "$port_base" "$job_base")"; then
         log_tick "$id: worktree isolation failed — run aborted (no shared-checkout fallback)"
+        run_record_aborted "$id" "$slot" "$start" "$forced" "$pc_out" "$project" "${model_family:-$model}" "$platform" "$account" "$account_dir" "$logfile" "$(cat "$slot/setup-note" 2>/dev/null || true)" streak
         run_cleanup "$id" "$slot"; trap - EXIT
         return 1
       fi
@@ -7133,6 +7864,11 @@ ${prompt}"
   # not shift them. A unit's own ids ride beside it, stated here rather than
   # left to the inherited environment alone.
   run_env+=("AL_RUN_CWD=$run_cwd" "CC_RUN_CWD=$run_cwd")
+  # How the agent reaches the host gate, and how `agentloop heavy` knows which
+  # run is asking: the binary's absolute path, and this run's own slot (its
+  # directory names the job and the run, and is where a waiter leaves its
+  # heartbeat for the watchdog -- see heavy_beat).
+  run_env+=("AL_BIN=$SELF" "AL_RUN_SLOT=$slot")
   if [ -n "${AL_SECURITY_UNIT_ID:-}" ] && [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ]; then
     run_env+=("AL_SECURITY_ANALYSIS_ID=$AL_SECURITY_ANALYSIS_ID" "CC_SECURITY_ANALYSIS_ID=$AL_SECURITY_ANALYSIS_ID" \
               "AL_SECURITY_UNIT_ID=$AL_SECURITY_UNIT_ID" "CC_SECURITY_UNIT_ID=$AL_SECURITY_UNIT_ID")
@@ -7562,6 +8298,7 @@ cmd_tick() {
   fi
   security_resume_orphans
   local days hours interval last streak max_par
+  local hostbusy=""     # "" = not asked yet this tick; 0 = quiet; 1 = over the load cap
   # IFS is tick_plan's own separator, never a tab: see the note on TICK_SEP
   # for the job that a folded tab run kept off the schedule.
   while IFS="$TICK_SEP" read -r id days hours interval last streak max_par; do
@@ -7571,6 +8308,15 @@ cmd_tick() {
     case "$max_par" in ''|null|*[!0-9]*) max_par=3 ;; esac
     if [ "$max_par" -gt 0 ] && [ "$(slots_active "$id")" -ge "$max_par" ]; then
       log_tick "$id: at max_parallel=$max_par run(s), not launching another"
+      continue
+    fi
+    # The host gate (see "host-wide heavy work"). Before the launch, because the
+    # precheck is what CLAIMS a ticket and runs inside the detached process: a
+    # run held back here has claimed nothing. Asked once per tick, and only when
+    # something is due. A forced run never comes through the tick.
+    [ -n "$hostbusy" ] || { host_load_over && hostbusy=1 || hostbusy=0; }
+    if [ "$hostbusy" = 1 ]; then
+      log_tick "$id: host busy (load $HOST_L5 > $HOST_CAP), not launching"
       continue
     fi
     nohup /bin/bash "$SELF" _exec "$id" </dev/null >> "$DATA_DIR/exec.log" 2>&1 &
@@ -8178,6 +8924,18 @@ cmd_set_prompt() { # reads the new prompt from stdin
   echo "prompt updated for $id"
 }
 
+# What may be written as a job's own base: a branch name, or a family ending in
+# `*` (wt_base_ref resolves both). Refused: anything git could read as an
+# option, anything with whitespace in it, and a `*` that is not the last
+# character -- the one shape the resolver reads as a family.
+job_base_ok() { # <value>
+  case "$1" in
+    ''|-*|*[[:space:]]*) return 1 ;;
+    *'*'?*) return 1 ;;
+  esac
+  return 0
+}
+
 cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
   local id="$1" field="$2" value
   security_refuse_derived "$id"
@@ -8196,6 +8954,16 @@ cmd_set_field() { # cmd_set_field <id> <field> ; value on stdin
         "") write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.interactive) else . end]' ;;
         *) die "interactive must be true or false" ;;
       esac ;;
+    base)
+      # Where THIS job's worktree is cut from, whatever its project declares
+      # (wt_setup). Empty clears it: the job is back on its project's base.
+      if [ -z "$value" ]; then
+        write_jobs --arg id "$id" '.jobs = [.jobs[] | if .id == $id then del(.base) else . end]'
+      else
+        job_base_ok "$value" || die "base must be a branch name, or a family ending in * (release/*) — not '$value'"
+        write_jobs --arg id "$id" --arg v "$value" \
+          '.jobs = [.jobs[] | if .id == $id then .base = $v else . end]'
+      fi ;;
     max_parallel)
       # How many runs of this job may work at once. Empty clears it (the engine
       # then uses its default of 3); 0 is a value in its own right — no ceiling.
@@ -8577,6 +9345,14 @@ cmd_create() { # reads a partial job object (JSON) from stdin
   platform_model_enabled "$cplat" "$cm" || die "create: model '$cm' is not enabled in Settings — $cplat enables: $(platform_models_enabled_line "$cplat")"
   platform_permission_ok "$cplat" "$cp" || die "create: permission_mode '$cp' is not a $cplat mode"
   platform_effort_ok "$cplat" "$cm" "$ce" || die "create: effort '$ce' is not a level of $cm on $cplat"
+  # A base of its own is optional, and an empty one is no base at all.
+  local cb
+  cb="$(echo "$merged" | "$JQ" -r '.base // ""')"
+  if [ -n "$cb" ]; then
+    job_base_ok "$cb" || die "create: base must be a branch name, or a family ending in * (release/*) — not '$cb'"
+  else
+    merged="$(echo "$merged" | "$JQ" 'del(.base)')"
+  fi
   write_jobs --argjson j "$merged" '.jobs += [$j]'
   if [ ! -f "$path" ]; then
     mkdir -p "$CONFIG_DIR/prechecks"
@@ -8916,6 +9692,13 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop serve           run the control server in the foreground (launchd uses this)
   agentloop run <id>        run one job now, ignoring schedule and precheck
   agentloop check <id>      run only the precheck and report what it found
+  agentloop heavy [--max-wait S] [--] <command…>
+                            run a command while holding one of the host-wide
+                              heavy slots (a suite, a build, a compose stack),
+                              waiting for a free one; its exit code is returned
+                              unchanged. --status is the same as agentloop host
+  agentloop host            load, the load cap, the heavy slots and who holds
+                              them; exits 0 when the host is quiet, 1 when busy
   agentloop usage           how full the usage windows are, whether runs are
                               being held back, and whether the statusline that
                               keeps that figure fresh is actually wired up
@@ -8929,7 +9712,7 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop set-prompt <id> replace a job's prompt, read from stdin
   agentloop set-field <id> <field>   set interval_seconds|active_hours|active_days|
                               platform|account|model|max_budget_usd|timeout_seconds|
-                              stall_timeout_seconds, value from stdin
+                              stall_timeout_seconds|base, value from stdin
   agentloop set-precheck <id>   replace a job's precheck script, read from stdin
   agentloop provision-set <project> <up|down>   replace a worktree provisioning hook (stdin)
   agentloop provision-get <project> <up|down>   print one
@@ -9152,6 +9935,8 @@ case "${1:-}" in
       || die "the selftest lives in test/selftest.sh, beside the checkout this binary links to"
     . "$BASE_DIR/test/selftest.sh"
     cmd_selftest ;;
+  heavy)     shift; cmd_heavy "$@" ;;
+  host)      cmd_host ;;
   running)   [ $# -ge 2 ] || die "usage: agentloop running <job-id>"; cmd_running "$2" ;;
   runs)      [ $# -ge 2 ] || die "usage: agentloop runs <job-id>"; cmd_runs "$2" ;;
   precheck)  [ $# -ge 2 ] || die "usage: agentloop precheck <job-id>"; cmd_precheck "$2" ;;

@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""A stand-in for the `docker` CLI, for the tests of config/lib/docker-sweep.sh.
+
+It answers exactly the commands that library issues, from a JSON state file
+named by FAKE_DOCKER_STATE, and appends every removal it performs to the same
+file's "log" list so a test can assert on what was destroyed. Shape:
+
+    {"containers": [{"id", "project", "workdir", "created"[, "name", "state"]}],
+     "images":     [{"id", "repo", "tag", "project", "created"}],
+     "volumes":    [{"name", "project"}],
+     "networks":   [{"id", "project"}],
+     "log":        []}
+
+A container with a "name" is listed by `ps --format '{{.Names}}'`; without
+`-a`, `ps` lists only containers whose "state" is "running" (the default).
+FAKE_DOCKER_HANG=<seconds> makes `ps` sleep first (a daemon that does not
+answer), FAKE_DOCKER_PS_FAIL=1 makes it fail (one that refuses).
+
+`created` is docker's human form ("2026-10-07 14:31:12 +0100 WEST"). An image
+with `"project": ""` carries no compose project label; `"builder"` is the
+`com.docker.compose.image.builder` label compose's classic builder sets
+INSTEAD of the project label. An image is "in use" while a
+container's "image" field names its id, which is how `docker image rm` (no -f)
+refuses it, as the real one does. An image tagged "<none>" is listed only
+with -a, as the real one does.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+
+STATE = os.environ["FAKE_DOCKER_STATE"]
+
+
+def load():
+    with open(STATE) as f:
+        return json.load(f)
+
+
+def save(s):
+    with open(STATE, "w") as f:
+        json.dump(s, f)
+
+
+def label_filter(args):
+    """(present, value) for a `--filter label=com.docker.compose.project[=v]`."""
+    for i, a in enumerate(args):
+        if a == "--filter" and i + 1 < len(args):
+            f = args[i + 1]
+            if f == "label=com.docker.compose.project":
+                return True, None
+            if f.startswith("label=com.docker.compose.project="):
+                return True, f.split("=", 2)[2]
+    return False, None
+
+
+def opt(args, name):
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def select(items, args):
+    has, value = label_filter(args)
+    if not has:
+        return items
+    if value is None:
+        return [x for x in items if x.get("project")]
+    return [x for x in items if x.get("project") == value]
+
+
+def render(fmt, fields):
+    def sub(m):
+        key = m.group(1)
+        lab = re.fullmatch(r'\.Label "([^"]+)"', key)
+        if lab:
+            return fields.get("label:" + lab.group(1), "")
+        lab = re.fullmatch(r'index \.Config\.Labels "([^"]+)"', key)
+        if lab:
+            return fields.get("label:" + lab.group(1), "")
+        return str(fields.get(key.lstrip("."), ""))
+    return re.sub(r"\{\{\s*(.*?)\s*\}\}", sub, fmt)
+
+
+def cfields(c):
+    return {"ID": c["id"], "Names": c.get("name", ""), "CreatedAt": c["created"],
+            "label:com.docker.compose.project": c["project"],
+            "label:com.docker.compose.project.working_dir": c.get("workdir", "")}
+
+
+def ifields(i):
+    return {"ID": i["id"], "Repository": i["repo"], "Tag": i["tag"],
+            "CreatedAt": i["created"],
+            "label:com.docker.compose.project": i.get("project", ""),
+            "label:com.docker.compose.image.builder": i.get("builder", "")}
+
+
+def main(argv):
+    s = load()
+    if not argv:
+        return 0
+    cmd, rest = argv[0], argv[1:]
+
+    if cmd == "compose":
+        s["log"].append("compose " + " ".join(rest))
+        save(s)
+        return 0
+
+    if cmd == "ps":
+        # FAKE_DOCKER_HANG=<seconds>: the daemon that does not answer (it did,
+        # on 2026-10-10, for minutes). FAKE_DOCKER_PS_FAIL=1: one that refuses.
+        if os.environ.get("FAKE_DOCKER_HANG"):
+            time.sleep(float(os.environ["FAKE_DOCKER_HANG"]))
+        if os.environ.get("FAKE_DOCKER_PS_FAIL"):
+            print("Cannot connect to the Docker daemon", file=sys.stderr)
+            return 1
+        rows = select(s["containers"], rest)
+        # As the real one does: without -a only RUNNING containers are listed.
+        # A container with no "state" is running.
+        if not ("-a" in rest or "-aq" in rest or "--all" in rest):
+            rows = [c for c in rows if c.get("state", "running") == "running"]
+        fmt = opt(rest, "--format")
+        for c in rows:
+            print(c["id"] if "-aq" in rest or fmt is None else render(fmt, cfields(c)))
+        return 0
+
+    if cmd == "rm":
+        ids = [a for a in rest if not a.startswith("-")]
+        s["containers"] = [c for c in s["containers"] if c["id"] not in ids]
+        s["log"] += ["rm container " + i for i in ids]
+        save(s)
+        return 0
+
+    if cmd == "image" and rest and rest[0] in ("ls", "list"):
+        rows = select(s["images"], rest[1:])
+        # As Docker 29 does: an untagged image is listed only with -a or a
+        # dangling filter. A label filter alone does not bring it back.
+        if not ("-a" in rest or "--all" in rest or "dangling=true" in rest):
+            rows = [i for i in rows if i["tag"] != "<none>"]
+        fmt = opt(rest, "--format")
+        for i in rows:
+            print(i["id"] if "-q" in rest or fmt is None else render(fmt, ifields(i)))
+        return 0
+
+    if cmd == "image" and rest and rest[0] == "inspect":
+        fmt = opt(rest, "--format") or "{{.ID}}"
+        refs = [a for a in rest[1:] if not a.startswith("-") and a != fmt]
+        for r in refs:
+            for i in s["images"]:
+                if r in (i["id"], "%s:%s" % (i["repo"], i["tag"])):
+                    print(render(fmt, ifields(i)))
+                    break
+        return 0
+
+    if cmd == "image" and rest and rest[0] == "rm":
+        if any(a in ("-f", "--force") for a in rest):
+            print("fake-docker: image rm -f is not allowed here", file=sys.stderr)
+            return 2
+        rc = 0
+        for r in [a for a in rest[1:] if not a.startswith("-")]:
+            hit = [i for i in s["images"]
+                   if r in (i["id"], "%s:%s" % (i["repo"], i["tag"]))]
+            if not hit:
+                print("Error: No such image: " + r, file=sys.stderr)
+                rc = 1
+                continue
+            img = hit[0]
+            if any(c.get("image") == img["id"] for c in s["containers"]):
+                print("Error response from daemon: conflict: unable to remove "
+                      "repository reference \"%s\" - container is using its "
+                      "referenced image %s" % (r, img["id"]), file=sys.stderr)
+                rc = 1
+                continue
+            s["images"] = [i for i in s["images"] if i is not img]
+            s["log"].append("rm image " + r)
+        save(s)
+        return rc
+
+    if cmd == "image" and rest and rest[0] == "prune":
+        s["log"].append("image prune " + " ".join(rest[1:]))
+        save(s)
+        return 0
+
+    if cmd == "volume" and rest and rest[0] == "ls":
+        rows = select(s["volumes"], rest[1:])
+        fmt = opt(rest, "--format")
+        for v in rows:
+            if fmt == "{{.Labels}}":
+                print("com.docker.compose.project=%s,com.docker.compose.volume=x"
+                      % v["project"])
+            else:
+                print(v["name"])
+        return 0
+
+    if cmd == "volume" and rest and rest[0] == "rm":
+        names = rest[1:]
+        s["volumes"] = [v for v in s["volumes"] if v["name"] not in names]
+        s["log"] += ["rm volume " + n for n in names]
+        save(s)
+        return 0
+
+    if cmd == "network" and rest and rest[0] == "ls":
+        for n in select(s["networks"], rest[1:]):
+            print(n["id"])
+        return 0
+
+    if cmd == "network" and rest and rest[0] == "rm":
+        ids = rest[1:]
+        s["networks"] = [n for n in s["networks"] if n["id"] not in ids]
+        s["log"] += ["rm network " + i for i in ids]
+        save(s)
+        return 0
+
+    if cmd in ("system", "builder"):
+        s["log"].append(" ".join(argv))
+        save(s)
+        return 0
+
+    print("fake-docker: unsupported: " + " ".join(argv), file=sys.stderr)
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
