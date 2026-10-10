@@ -4085,9 +4085,19 @@ CONTRACT
 # except on a security unit, which has no board.
 inject_contract() {
   local id="$1" prompt="$2"
-  case "$prompt" in *"$RUN_ENDING_MARKER"*) printf '%s' "$prompt"; return ;; esac
-  printf '%s\n\n%s' "$prompt" "$(run_ending_contract)"
-  case "$id" in "$SECURITY_JOB_PREFIX"*) ;; *) printf '\n\n%s' "$(tracker_contract)" ;; esac
+  case "$prompt" in
+    *"$RUN_ENDING_MARKER"*) printf '%s' "$prompt" ;;
+    *) printf '%s\n\n%s' "$prompt" "$(run_ending_contract)"
+       case "$id" in "$SECURITY_JOB_PREFIX"*) ;; *) printf '\n\n%s' "$(tracker_contract)" ;; esac ;;
+  esac
+  # The host contract has a marker of its own: a prompt that already carries the
+  # run-ending contract (a job worded its own way, a re-injection) still has to
+  # learn about the host gate. Not for a security unit: it reads code through
+  # `agentloop security read`, is never provisioned (no stack, no compose) and
+  # runs no suite -- and one analysis launches hundreds of units, each of which
+  # would read these tokens for nothing.
+  case "$prompt" in *"$HOST_CONTRACT_MARKER"*) return ;; esac
+  case "$id" in "$SECURITY_JOB_PREFIX"*) ;; *) printf '\n\n%s' "$(host_contract)" ;; esac
 }
 
 # ------------------------------------------------------------------- locking
@@ -4187,6 +4197,410 @@ acquire_slot() { # <id> <max> -> prints the slot dir; non-zero when at capacity
 }
 
 release_slot() { rm -rf "$1"; }          # <slot-dir>
+
+# ---- host-wide heavy work: slots and a load gate ---------------------------
+# `max_parallel` caps the runs of ONE job. Nothing capped the HOST: on
+# 2026-10-10 three dev runs, a reviewer measuring two suites at once, two other
+# projects' `make check` and a CI runner all brought up compose stacks on one
+# 10-CPU Mac, the load average passed 250, suites died of "Test timed out",
+# Docker hung and the promoters parked tickets as "verification deferred".
+#
+# Two mechanisms, both host-wide and shared by every job of every project:
+#
+#   1. HEAVY SLOTS. `agentloop heavy -- <cmd>` runs a command while holding one
+#      of N slots (default 1), waiting for one when none is free. They are
+#      ordinary run slots under a reserved pseudo job id (HEAVY_ID), so
+#      acquire_slot / slots_active / slot_alive -- the pid-and-boot lease that
+#      already prunes the slots of dead runs -- prune a holder killed with
+#      -9 the same way. There is no second lock scheme.
+#   2. A LOAD GATE. The tick does not launch a due job while the 5-minute load
+#      average is above a cap (default 1.5 x CPUs), and `heavy` does not start
+#      a command above it either. A forced run (Run now, `agentloop run`) is
+#      not gated, like it is not gated by the precheck.
+#
+# Settings, in this order: the environment (AGENTLOOP_HEAVY_SLOTS,
+# AGENTLOOP_LOAD_CAP), then the top-level `host` block of projects.json
+# ({"host": {"heavy_slots": 1, "load_cap": 15}}), then the defaults. The
+# environment alone would be unreachable for the tick, which launchd starts
+# with its own.
+HEAVY_ID="_heavy"
+# Fields of a holder's record, joined by \037 and NOT a tab: a tab is IFS
+# whitespace, so `read` folds the empty run of a holder started by hand into
+# one delimiter and every later field slides left (the same trap TICK_SEP
+# documents).
+HEAVY_SEP="$(printf '\037')"
+HEAVY_POLL=$(( 10#$(num "${AGENTLOOP_HEAVY_POLL:-}" 12) ))   # seconds between two looks for a free slot; the tests shorten it
+[ "$HEAVY_POLL" -ge 1 ] || HEAVY_POLL=12
+# How long a waiter's heartbeat keeps vouching for its run (heavy_wait_fresh).
+# Three polls, never under 45 s: the watchdog looks every 30 s, and a heartbeat
+# that went stale between two of its looks would let a queued run be judged.
+HEAVY_BEAT_MAX=$(( HEAVY_POLL * 3 )); [ "$HEAVY_BEAT_MAX" -ge 45 ] || HEAVY_BEAT_MAX=45
+
+# host_setting <ENV NAME> <host key> <default> <int|float> -> the value in force.
+# A value that is not a number is skipped, never half-read: a typed "1o" must
+# not become 1, nor take the whole gate down.
+host_setting() {
+  local name="$1" key="$2" def="$3" kind="$4" v pat
+  case "$kind" in int) pat='^[0-9]+$' ;; *) pat='^[0-9]+(\.[0-9]+)?$' ;; esac
+  v="${!name:-}"
+  if [ -n "$v" ] && printf '%s' "$v" | grep -Eq "$pat"; then printf '%s' "$v"; return 0; fi
+  v="$("$JQ" -r --arg k "$key" '.host[$k] // empty | tostring' "$PROJECTS_FILE" 2>/dev/null || true)"
+  if [ -n "$v" ] && printf '%s' "$v" | grep -Eq "$pat"; then printf '%s' "$v"; return 0; fi
+  printf '%s' "$def"
+}
+
+host_ncpu() { # the CPUs the load average is measured against (at least 1)
+  local n
+  n="$(num "$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || true)" 1)"
+  [ "$n" -ge 1 ] || n=1
+  printf '%s' "$n"
+}
+
+heavy_slots() { # how many heavy commands may run at once; 0 = no ceiling, as for max_parallel
+  printf '%s' $(( 10#$(host_setting AGENTLOOP_HEAVY_SLOTS heavy_slots 1 int) ))
+}
+
+host_load_cap() { # the 5-minute load above which nothing new starts; 0 = no gate
+  local v; v="$(host_setting AGENTLOOP_LOAD_CAP load_cap '' float)"
+  if [ -z "$v" ]; then v="$(awk -v n="$(host_ncpu)" 'BEGIN { printf "%.1f", n * 1.5 }')"; fi
+  printf '%s' "$v"
+}
+
+host_loadavg() { # -> "<1m> <5m> <15m>"; non-zero when it cannot be read
+  local la=""
+  if [ -n "${AGENTLOOP_LOADAVG:-}" ]; then
+    la="$AGENTLOOP_LOADAVG"                           # tests only: a fixed reading
+  elif [ -r /proc/loadavg ]; then
+    la="$(awk '{ print $1, $2, $3 }' /proc/loadavg 2>/dev/null)"
+  else
+    la="$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}')"
+  fi
+  la="$(printf '%s' "$la" | awk 'NF >= 3 && $1 ~ /^[0-9.]+$/ && $2 ~ /^[0-9.]+$/ && $3 ~ /^[0-9.]+$/ { print $1, $2, $3 }')"
+  [ -n "$la" ] || return 1
+  printf '%s\n' "$la"
+}
+
+# host_load_over -> 0 when the 5-minute load is above the cap. Leaves the
+# reading in HOST_L1/HOST_L5/HOST_L15 and the cap in HOST_CAP, for the caller to
+# say. A load that cannot be read, and a cap of 0, are "not over": a gate that
+# cannot measure must not hold the fleet.
+HOST_L1=""; HOST_L5=""; HOST_L15=""; HOST_CAP=""
+host_load_over() {
+  local la
+  HOST_L1=""; HOST_L5=""; HOST_L15=""; HOST_CAP="$(host_load_cap)"
+  la="$(host_loadavg)" || return 1
+  read -r HOST_L1 HOST_L5 HOST_L15 <<EOF
+$la
+EOF
+  awk -v c="$HOST_CAP" 'BEGIN { exit !(c + 0 > 0) }' || return 1
+  awk -v l="$HOST_L5" -v c="$HOST_CAP" 'BEGIN { exit !(l + 0 > c + 0) }'
+}
+
+# Who is running this: the run's own slot when we were started inside one
+# (AL_RUN_SLOT, put in every agent's environment), else the first ancestor that
+# is the agent of a live slot, else nobody in particular. Leaves HEAVY_JOB,
+# HEAVY_RUN and HEAVY_RUN_SLOT. The slot is also where a waiter leaves its
+# heartbeat for the watchdog (heavy_beat).
+HEAVY_JOB=""; HEAVY_RUN=""; HEAVY_RUN_SLOT=""
+heavy_identity() {
+  local s="${AL_RUN_SLOT:-}" p d i=0
+  HEAVY_JOB="(by hand)"; HEAVY_RUN=""; HEAVY_RUN_SLOT=""
+  if [ -z "$s" ] || [ ! -d "$s" ] || ! slot_alive "$s"; then
+    s=""
+    p="$PPID"
+    while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$i" -lt 12 ]; do
+      for d in "$LOCK_DIR"/*/*/; do
+        [ -d "$d" ] || continue
+        [ "$(cat "$d/child" 2>/dev/null || true)" = "$p" ] || continue
+        slot_alive "${d%/}" && { s="${d%/}"; break; }
+      done
+      [ -z "$s" ] || break
+      p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"; i=$(( i + 1 ))
+    done
+  fi
+  [ -n "$s" ] || return 0
+  HEAVY_RUN_SLOT="$s"; HEAVY_RUN="${s##*/}"; HEAVY_JOB="${s%/*}"; HEAVY_JOB="${HEAVY_JOB##*/}"
+}
+
+# THE WATCHDOG'S HALF. A run whose agent is blocked in `agentloop heavy` waits
+# on a sleep: no output, ~0 CPU -- exactly what the stall rule calls a hang, so
+# the gate would kill the very runs it queues. While a waiter is alive it
+# touches $slot/heavy-wait on every poll, and the watchdog reads a fresh one as
+# activity (run_launch_and_watch). Stale means the waiter is gone -- killed with
+# -9 or finished -- and the run is judged by the ordinary rules again.
+heavy_beat() { [ -z "$HEAVY_RUN_SLOT" ] || : > "$HEAVY_RUN_SLOT/heavy-wait" 2>/dev/null || true; }
+heavy_wait_fresh() { # heavy_wait_fresh <run slot> -> 0 when a waiter vouched for the run lately
+  local f="${1:-}/heavy-wait" born now
+  [ -f "$f" ] || return 1
+  now="$(now_epoch)"; born="$(num "$(stat -f %m "$f" 2>/dev/null)" 0)"
+  [ $(( now - born )) -le "$HEAVY_BEAT_MAX" ]
+}
+
+heavy_dur() { # heavy_dur <seconds> -> 4m10s
+  local s; s="$(num "${1:-}" 0)"
+  if [ "$s" -ge 3600 ]; then printf '%dh%02dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+  elif [ "$s" -ge 60 ]; then printf '%dm%02ds' $(( s / 60 )) $(( s % 60 ))
+  else printf '%ds' "$s"; fi
+}
+
+# One line per live holder: "<pid>␟<job>␟<run>␟<since>␟<command>" (HEAVY_SEP). Pruning
+# the dead ones is slots_active's job, so it runs first.
+heavy_holders() {
+  local d pid job run since cmd
+  slots_active "$HEAVY_ID" >/dev/null
+  for d in "$LOCK_DIR/$HEAVY_ID"/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"; pid="$(cat "$d/pid" 2>/dev/null || true)"; [ -n "$pid" ] || continue
+    IFS="$HEAVY_SEP" read -r job run since cmd < "$d/holder" 2>/dev/null || { job="?"; run=""; since=""; cmd=""; }
+    printf '%s\n' "$pid$HEAVY_SEP${job:-?}$HEAVY_SEP${run:-}$HEAVY_SEP${since:-}$HEAVY_SEP${cmd:-}"
+  done
+}
+
+heavy_holders_text() { # the holders on one line, for "who is in the way"
+  local pid job run since cmd out="" now; now="$(now_epoch)"
+  while IFS="$HEAVY_SEP" read -r pid job run since cmd; do
+    [ -n "$pid" ] || continue
+    out="$out${out:+; }$job${run:+ run $run} (pid $pid${since:+, held $(heavy_dur $(( now - $(num "$since" "$now") )))})"
+  done < <(heavy_holders)
+  printf '%s' "${out:-nobody}"
+}
+
+# The command that runs the heavy command. A python process, as run_bounded is,
+# for what bash 3.2 cannot do: put the command in its own process group, kill
+# THAT group (never ours) on INT/TERM/HUP, and notice that its holder was killed
+# outright. Then nothing keeps running -- or keeps a stack up -- on a slot the
+# lease has already given away. Exits with the command's own status (128+n for
+# a signal), 126/127 when it cannot be started.
+heavy_runner_py() {
+  cat <<'PY'
+import os, signal, subprocess, sys, time
+
+holder = os.getppid()        # the shell that holds the slot; if it vanishes, so does the command
+try:
+    p = subprocess.Popen(sys.argv[1:], start_new_session=True)
+except OSError as e:
+    print("agentloop heavy: cannot run %s: %s" % (sys.argv[1], e.strerror or e), file=sys.stderr)
+    sys.exit(126 if isinstance(e, PermissionError) else 127)
+
+hit = {"at": 0.0}
+
+def group(sig):
+    try:
+        os.killpg(p.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+def on_signal(num, frame):
+    if not hit["at"]:
+        hit["at"] = time.time()
+    group(num)
+
+for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(s, on_signal)
+
+while True:
+    try:
+        rc = p.wait(timeout=0.5)
+        break
+    except subprocess.TimeoutExpired:
+        pass
+    if hit["at"] and time.time() - hit["at"] >= 5:
+        group(signal.SIGKILL)          # it had its grace
+    elif not hit["at"] and os.getppid() != holder:
+        hit["at"] = time.time()        # the holder was killed outright
+        group(signal.SIGTERM)
+sys.exit(128 - rc if rc < 0 else rc)
+PY
+}
+
+# What the holder record (and so every `agentloop host` and every waiter) says
+# the command is: its name and at most two plain words after it, never the rest.
+# Arguments are where a token ends up (`KEY=value`, `--password x`), and this
+# line is shown to every other run that waits.
+heavy_cmd_label() { # heavy_cmd_label <command> [args…]
+  local out="${1##*/}" a n=0
+  shift
+  for a in "$@"; do
+    case "$a" in -*|*=*|*/*) continue ;; esac
+    out="$out ${a:0:40}"; n=$(( n + 1 ))
+    [ "$n" -lt 2 ] || break
+  done
+  printf '%s' "$out" | tr '\n\t' '  ' | cut -c1-120
+}
+
+# Is this process running INSIDE the heavy slot <dir>? The variable that says so
+# is inherited by everything the command starts, which is the point, and is also
+# just text an agent could set: it counts only for a live slot of OURS whose
+# holder is one of this process's own ancestors.
+heavy_inside_slot() { # heavy_inside_slot <slot dir>
+  local d="$1" p="$PPID" i=0
+  [ "${d%/*}" = "$LOCK_DIR/$HEAVY_ID" ] && slot_alive "$d" || return 1
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$i" -lt 30 ]; do
+    [ "$p" = "${d##*/}" ] && return 0
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"; i=$(( i + 1 ))
+  done
+  return 1
+}
+
+HEAVY_SLOT=""; HEAVY_NAPPER=""; HEAVY_PID=""
+heavy_cleanup() { # every way out of cmd_heavy that bash can see: the slot and the heartbeat go
+  [ -z "$HEAVY_NAPPER" ] || kill "$HEAVY_NAPPER" 2>/dev/null
+  [ -z "$HEAVY_RUN_SLOT" ] || rm -f "$HEAVY_RUN_SLOT/heavy-wait" 2>/dev/null
+  [ -z "$HEAVY_SLOT" ] || release_slot "$HEAVY_SLOT"
+}
+
+# cmd_heavy: agentloop heavy [--max-wait S] [--] <command...>
+cmd_heavy() {
+  local maxwait=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --status)     cmd_host; return ;;
+      --max-wait)   [ $# -ge 2 ] || { echo "agentloop heavy: --max-wait needs a number of seconds" >&2; exit 2; }
+                    maxwait="$2"; shift 2 ;;
+      --max-wait=*) maxwait="${1#--max-wait=}"; shift ;;
+      --)           shift; break ;;
+      -*)           echo "agentloop heavy: unknown option $1 (a command that starts with a dash goes after --)" >&2; exit 2 ;;
+      *)            break ;;
+    esac
+  done
+  case "$maxwait" in *[!0-9]*) echo "agentloop heavy: --max-wait wants whole seconds, got '$maxwait'" >&2; exit 2 ;; esac
+  [ $# -ge 1 ] || { echo "usage: agentloop heavy [--max-wait SECONDS] [--] <command...>   (or: agentloop heavy --status)" >&2; exit 2; }
+
+  # Re-entrant: a command that already runs inside a slot of ours (a Makefile
+  # that itself calls `agentloop heavy`) must not queue behind its own parent.
+  if [ -n "${AL_HEAVY_HELD:-}" ] && heavy_inside_slot "$AL_HEAVY_HELD"; then exec "$@"; fi
+
+  local slots began="$SECONDS" announced=0 reason="" rc=0 cmdline now
+  HEAVY_SLOT=""; HEAVY_NAPPER=""; HEAVY_PID=""
+  slots="$(heavy_slots)"
+  heavy_identity
+  local parent="$PPID"
+  cmdline="$(heavy_cmd_label "$@")"
+
+  # Out by any road -- the command's end, a signal (see the traps), or the
+  # parent vanishing -- the slot and the heartbeat go. A -9 cannot run this;
+  # that case is the lease's (slot_alive), not ours.
+  trap heavy_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+
+  while :; do
+    if host_load_over; then
+      reason="the 5-minute load is $HOST_L5, above the cap of $HOST_CAP"
+    elif HEAVY_SLOT="$(acquire_slot "$HEAVY_ID" "$slots")"; then
+      break
+    else
+      HEAVY_SLOT=""; reason="all $slots heavy slot(s) are taken"
+    fi
+    if [ "$announced" = 0 ]; then
+      announced=1
+      printf 'agentloop heavy: waiting — %s. Holding the slot(s): %s. Load %s %s %s (1/5/15 min). This is normal; keep waiting.\n' \
+        "$reason" "$(heavy_holders_text)" "${HOST_L1:-?}" "${HOST_L5:-?}" "${HOST_L15:-?}" >&2
+    fi
+    heavy_beat
+    # A waiter whose caller is gone (the agent was stopped or killed) would
+    # otherwise get a slot one day and run a command nobody wants.
+    if [ "$(ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ')" != "$parent" ]; then
+      echo "agentloop heavy: the process that asked for this is gone — not waiting any longer" >&2; exit 1
+    fi
+    if [ -n "$maxwait" ] && [ $(( SECONDS - began )) -ge "$maxwait" ]; then
+      echo "agentloop heavy: gave up after $(heavy_dur $(( SECONDS - began ))) (--max-wait $maxwait) — $reason" >&2; exit 75
+    fi
+    sleep $(( HEAVY_POLL + RANDOM % 4 )) & HEAVY_NAPPER=$!      # backgrounded so a signal ends the wait at once
+    wait "$HEAVY_NAPPER"; HEAVY_NAPPER=""
+  done
+
+  [ -z "$HEAVY_RUN_SLOT" ] || rm -f "$HEAVY_RUN_SLOT/heavy-wait" 2>/dev/null
+  now="$(now_epoch)"
+  printf '%s\n' "$HEAVY_JOB$HEAVY_SEP$HEAVY_RUN$HEAVY_SEP$now$HEAVY_SEP$cmdline" > "$HEAVY_SLOT/holder" 2>/dev/null || true
+  if [ "$announced" = 1 ]; then
+    printf 'agentloop heavy: got a heavy slot after %s — load %s %s %s (1/5/15 min). Running: %s\n' \
+      "$(heavy_dur $(( SECONDS - began )))" "${HOST_L1:-?}" "${HOST_L5:-?}" "${HOST_L15:-?}" "$cmdline" >&2
+  fi
+
+  # `<&0`: a background job gets /dev/null for stdin unless told otherwise, and
+  # the command is a foreground one that may read it.
+  AL_HEAVY_HELD="$HEAVY_SLOT" "$PYTHON" -c "$(heavy_runner_py)" "$@" <&0 &
+  HEAVY_PID=$!
+  trap 'kill -INT  "$HEAVY_PID" 2>/dev/null' INT
+  trap 'kill -TERM "$HEAVY_PID" 2>/dev/null' TERM
+  trap 'kill -HUP  "$HEAVY_PID" 2>/dev/null' HUP
+  wait "$HEAVY_PID"; rc=$?
+  # A trapped signal ends the first wait early, with the signal's status and the
+  # runner still tearing the command down: wait for it to finish, then say so.
+  while kill -0 "$HEAVY_PID" 2>/dev/null; do wait "$HEAVY_PID"; rc=$?; done
+  trap - INT TERM HUP
+  exit "$rc"
+}
+
+# agentloop host: is the machine quiet enough to start heavy work? Exit 0 when
+# a heavy slot is free and the 5-minute load is under the cap, 1 otherwise. A
+# precheck calls it to re-measure a deferral whose cause was the host.
+cmd_host() {
+  local slots n over=0 busy=0 why="" cpus now pid job run since cmd
+  slots="$(heavy_slots)"; cpus="$(host_ncpu)"; now="$(now_epoch)"
+  host_load_over && over=1
+  n="$(slots_active "$HEAVY_ID")"
+  if [ -n "${AGENTLOOP_LOAD_CAP:-}" ] && ! printf '%s' "$AGENTLOOP_LOAD_CAP" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+    echo "note: AGENTLOOP_LOAD_CAP='$AGENTLOOP_LOAD_CAP' is not a number — ignored"
+  fi
+  if [ -n "${AGENTLOOP_HEAVY_SLOTS:-}" ] && ! printf '%s' "$AGENTLOOP_HEAVY_SLOTS" | grep -Eq '^[0-9]+$'; then
+    echo "note: AGENTLOOP_HEAVY_SLOTS='$AGENTLOOP_HEAVY_SLOTS' is not a whole number — ignored"
+  fi
+  if [ -n "$HOST_L5" ]; then
+    printf 'load        %s %s %s (1/5/15 min), %s CPUs\n' "$HOST_L1" "$HOST_L5" "$HOST_L15" "$cpus"
+  else
+    printf 'load        unreadable on this machine — not gating on it\n'
+  fi
+  if awk -v c="$HOST_CAP" 'BEGIN { exit !(c + 0 > 0) }'; then
+    printf 'load cap    %s on the 5-minute load\n' "$HOST_CAP"
+  else
+    printf 'load cap    none (0)\n'
+  fi
+  if [ "$slots" -gt 0 ]; then printf 'heavy       %s of %s slot(s) in use\n' "$n" "$slots"
+  else printf 'heavy       %s in use, no ceiling (0)\n' "$n"; fi
+  while IFS="$HEAVY_SEP" read -r pid job run since cmd; do
+    [ -n "$pid" ] || continue
+    printf '  holder    %s%s (pid %s)%s  %s\n' "$job" "${run:+ run $run}" "$pid" \
+      "${since:+, held $(heavy_dur $(( now - $(num "$since" "$now") )))}" "$cmd"
+  done < <(heavy_holders)
+  if [ "$slots" -gt 0 ] && [ "$n" -ge "$slots" ]; then busy=1; why="no heavy slot is free"; fi
+  if [ "$over" = 1 ]; then busy=1; why="${why:+$why; }the load is above the cap"; fi
+  if [ "$busy" = 1 ]; then printf 'verdict     BUSY — %s\n' "$why"; return 1; fi
+  printf 'verdict     quiet — a heavy slot is free and the load is under the cap\n'
+}
+
+# The host contract every agent is handed (inject_contract). Short, because
+# every run reads it. The path is spelled out rather than trusted to the PATH of
+# the agent's shell, which a sandboxed CLI does not always inherit.
+HOST_CONTRACT_MARKER='Heavy work goes through the host gate'
+host_contract() {
+  local bin; bin="$(printf '%q' "$SELF")"
+  cat <<CONTRACT
+## Heavy work goes through the host gate — one machine runs every project's agents
+
+Unthrottled suites take the whole fleet down (load 250, timeouts, Docker hung).
+- Run every command that starts containers or runs a full suite or build
+  (\`make test\`, \`make check\`, \`make test-*\`, \`docker compose up\`, the
+  repo's integration and e2e suites) as \`${bin} heavy -- <command>\` (also
+  \`\$AL_BIN\`). It waits for a host-wide slot and returns the exit code unchanged.
+- One suite and one stack at a time, never two in parallel: measure the head
+  and the trial merge one after the other. If the trial merge needs a worktree
+  of its own, take the first stack down before bringing up the second, and take
+  the trial's stack down and remove its worktree when done.
+- Take down a suite's stack (the repo's teardown target) as soon as its result
+  is read, before starting anything else.
+- Waiting for a slot is normal and the watchdog knows it: keep blocking. Never
+  write a deferral or "environment failure" because the host is busy.
+- The wait plus the suite can outlast one tool call, and a call cut off leaves
+  the command running. So start it as \`${bin} heavy -- make test > <log> 2>&1;
+  echo \$? > <rc>\` and block with \`until [ -f <rc> ]; do sleep 30; done\`
+  (re-issued if cut off). Never start a suite again while it is still alive.
+- A suite that failed only by timeouts while the host was overloaded is run
+  again through \`agentloop heavy\`; it is not a red build.
+CONTRACT
+}
 
 # --- a port block per run ----------------------------------------------------
 # Isolation gives every run its own worktree, which fixes the filesystem. It does
@@ -4874,6 +5288,8 @@ fleet_stall_reason() { # -> 0 with a reason on stdout, 1 when all is well
     printf 'no run has started in %sh — every scheduled run is being held back by a spent usage window (`agentloop usage` says which)\n' "$STALL_HOURS"
   elif printf '%s\n' "$recent" | grep -q 'daily cap reached'; then
     printf 'no run has started in %sh — the daily spend cap is holding every run back\n' "$STALL_HOURS"
+  elif printf '%s\n' "$recent" | grep -q 'host busy'; then
+    printf 'no run has started in %sh — the host load is above its cap, so every scheduled launch is being held back (`agentloop host` says by how much)\n' "$STALL_HOURS"
   elif printf '%s\n' "$recent" | grep -q 'max_parallel'; then
     # No live slot, yet jobs are being turned away for being at their limit: the
     # slots being counted belong to processes that are gone.
@@ -6265,6 +6681,14 @@ run_launch_and_watch() {
       if [ "$size" != "$last_size" ] || [ "$cpu" != "$last_cpu" ]; then
         last_size="$size"; last_cpu="$cpu"; last_change="$now"
       fi
+      # Queued behind `agentloop heavy` is waiting, not hanging: the waiter
+      # sleeps, so it adds neither output nor CPU, and the rules below would
+      # kill the run for obeying the host gate. Its heartbeat (heavy_beat) is
+      # proof of life for as long as the wait lasts, however long that is; once
+      # the waiter is gone the beat goes stale and the run is judged as ever.
+      # Only the stall rule is held off: the empty-stream rule and the absolute
+      # timeout_seconds cap below are not about silence.
+      if heavy_wait_fresh "$slot"; then last_change="$now"; fi
       # A stream still EMPTY this long after the launch is a dead run,
       # whatever the CPU says. Measured on OpenCode (evidence 35): a CLI
       # whose provider never answers, or a resume the CLI took to another
@@ -7308,6 +7732,11 @@ ${prompt}"
   # not shift them. A unit's own ids ride beside it, stated here rather than
   # left to the inherited environment alone.
   run_env+=("AL_RUN_CWD=$run_cwd" "CC_RUN_CWD=$run_cwd")
+  # How the agent reaches the host gate, and how `agentloop heavy` knows which
+  # run is asking: the binary's absolute path, and this run's own slot (its
+  # directory names the job and the run, and is where a waiter leaves its
+  # heartbeat for the watchdog -- see heavy_beat).
+  run_env+=("AL_BIN=$SELF" "AL_RUN_SLOT=$slot")
   if [ -n "${AL_SECURITY_UNIT_ID:-}" ] && [ -n "${AL_SECURITY_ANALYSIS_ID:-}" ]; then
     run_env+=("AL_SECURITY_ANALYSIS_ID=$AL_SECURITY_ANALYSIS_ID" "CC_SECURITY_ANALYSIS_ID=$AL_SECURITY_ANALYSIS_ID" \
               "AL_SECURITY_UNIT_ID=$AL_SECURITY_UNIT_ID" "CC_SECURITY_UNIT_ID=$AL_SECURITY_UNIT_ID")
@@ -7737,6 +8166,7 @@ cmd_tick() {
   fi
   security_resume_orphans
   local days hours interval last streak max_par
+  local hostbusy=""     # "" = not asked yet this tick; 0 = quiet; 1 = over the load cap
   # IFS is tick_plan's own separator, never a tab: see the note on TICK_SEP
   # for the job that a folded tab run kept off the schedule.
   while IFS="$TICK_SEP" read -r id days hours interval last streak max_par; do
@@ -7746,6 +8176,15 @@ cmd_tick() {
     case "$max_par" in ''|null|*[!0-9]*) max_par=3 ;; esac
     if [ "$max_par" -gt 0 ] && [ "$(slots_active "$id")" -ge "$max_par" ]; then
       log_tick "$id: at max_parallel=$max_par run(s), not launching another"
+      continue
+    fi
+    # The host gate (see "host-wide heavy work"). Before the launch, because the
+    # precheck is what CLAIMS a ticket and runs inside the detached process: a
+    # run held back here has claimed nothing. Asked once per tick, and only when
+    # something is due. A forced run never comes through the tick.
+    [ -n "$hostbusy" ] || { host_load_over && hostbusy=1 || hostbusy=0; }
+    if [ "$hostbusy" = 1 ]; then
+      log_tick "$id: host busy (load $HOST_L5 > $HOST_CAP), not launching"
       continue
     fi
     nohup /bin/bash "$SELF" _exec "$id" </dev/null >> "$DATA_DIR/exec.log" 2>&1 &
@@ -9121,6 +9560,13 @@ agentloop — durable local scheduler for headless Claude Code runs
   agentloop serve           run the control server in the foreground (launchd uses this)
   agentloop run <id>        run one job now, ignoring schedule and precheck
   agentloop check <id>      run only the precheck and report what it found
+  agentloop heavy [--max-wait S] [--] <command…>
+                            run a command while holding one of the host-wide
+                              heavy slots (a suite, a build, a compose stack),
+                              waiting for a free one; its exit code is returned
+                              unchanged. --status is the same as agentloop host
+  agentloop host            load, the load cap, the heavy slots and who holds
+                              them; exits 0 when the host is quiet, 1 when busy
   agentloop usage           how full the usage windows are, whether runs are
                               being held back, and whether the statusline that
                               keeps that figure fresh is actually wired up
@@ -9357,6 +9803,8 @@ case "${1:-}" in
       || die "the selftest lives in test/selftest.sh, beside the checkout this binary links to"
     . "$BASE_DIR/test/selftest.sh"
     cmd_selftest ;;
+  heavy)     shift; cmd_heavy "$@" ;;
+  host)      cmd_host ;;
   running)   [ $# -ge 2 ] || die "usage: agentloop running <job-id>"; cmd_running "$2" ;;
   runs)      [ $# -ge 2 ] || die "usage: agentloop runs <job-id>"; cmd_runs "$2" ;;
   precheck)  [ $# -ge 2 ] || die "usage: agentloop precheck <job-id>"; cmd_precheck "$2" ;;

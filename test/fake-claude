@@ -15,7 +15,9 @@
 #
 # Behaviour is steered by env vars the harness sets:
 #   FAKE_SESSION  the session id to report in the init event
-#   FAKE_MODE     complete | undeclared | dirty | hang | silent
+#   FAKE_MODE     complete | undeclared | dirty | hang | silent | heavy
+#                 (heavy: one `agentloop heavy -- $FAKE_HEAVY_CMD` call, its
+#                 output and exit code written to $FAKE_HEAVY_OUT)
 #   FAKE_SKIP_PREPARE  set to skip `security prepare` inside a security run
 #                      that is NOT a unit (a hand launch); a unit never runs
 #                      it -- its orchestrator did, once, engine-side
@@ -331,6 +333,21 @@ case "$mode" in
   undeclared)
     # Stop without saying how it ended: the signature of a run cut off.
     result="I did some work."
+    ;;
+  heavy)
+    # An agent that obeys the host contract: its one tool call is
+    # `agentloop heavy -- $FAKE_HEAVY_CMD`, which blocks until a heavy slot is
+    # free -- the shape of a run queued behind another's suite, silent and
+    # burning no CPU for as long as the queue is long. Everything the call said
+    # (the waiting line, the got-it line) lands in $FAKE_HEAVY_OUT, with the
+    # slot the engine handed this run and the call's own exit code, so a
+    # scenario can read who was waiting for whom.
+    {
+      printf 'AL_RUN_SLOT=%s\n' "${AL_RUN_SLOT:-}"
+      "${AL_BIN:-$(cd "$(dirname "$0")/../bin" && pwd)/agentloop}" heavy -- ${FAKE_HEAVY_CMD:-true} 2>&1
+      printf 'heavy-rc=%s\n' "$?"
+    } > "${FAKE_HEAVY_OUT:-/dev/null}"
+    result="RUN COMPLETE: went through the host gate."
     ;;
   hang)
     # `exec`, as `silent` does above: the process the engine signals has to

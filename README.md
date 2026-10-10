@@ -661,6 +661,69 @@ not an error resets the count, so one good run puts the job straight back on its
 normal cadence. A broken precheck (see above) counts too. The card says so:
 *backing off 4× after 4 failed runs*.
 
+### One machine, every project: heavy slots and the load gate
+
+`max_parallel` limits the runs of **one job**. Nothing limited the **host**, and
+every project's agents (and a human at the keyboard) share it. A repository's
+`make test` brings up a whole compose stack per worktree by design; three dev
+runs, a reviewer measuring two suites at once and a CI runner on one 10-CPU Mac
+took the load average past 250, Vitest died of `Test timed out in 5000ms`,
+Docker hung and promoters parked tickets as "verification deferred". Two
+mechanisms now limit the host, both shared by every job of every project:
+
+- **Heavy slots.** `agentloop heavy [--max-wait S] [--] <command…>` runs a
+  command in the foreground while holding one of N host-wide slots, and waits
+  for one when none is free. It returns the command's exit code unchanged (`128+n`
+  when a signal ended it, 127/126 when it cannot start). It says once, on
+  stderr, that it is waiting and **who holds the slots** (job and run id, taken
+  from the run's environment), and once when it gets the slot. A TERM, INT or
+  HUP releases the slot and ends the command's whole process group; a holder
+  killed with `-9` is pruned by the same pid-and-boot lease that prunes dead runs,
+  and the command it was running is ended with it. `--max-wait` gives up with exit
+  75 instead of waiting for ever. A command that itself calls `agentloop heavy`
+  runs straight away: it is already inside a slot.
+- **The load gate.** The tick does not launch a due job while the **5-minute
+  load average** is above the cap, and writes
+  `<id>: host busy (load X > Y), not launching` to `tick.log` instead (the
+  precheck, which claims tickets, has not run). `agentloop heavy` does not
+  start a command above it either. A forced run (Run now, `agentloop run`) is not
+  gated, like it is not gated by the precheck. The load is `sysctl -n vm.loadavg`
+  (macOS) or `/proc/loadavg`; one that cannot be read opens the gate.
+
+`agentloop host` (or `agentloop heavy --status`) prints the load, the cap, the
+slots in use and their holders, and exits **0 when the host is quiet** (a slot is
+free and the 5-minute load is under the cap) and **1 when it is busy**. A
+precheck that deferred a job because of the host calls it to re-measure.
+
+| Setting | Environment | `projects.json` | Default |
+|---|---|---|---|
+| Heavy slots (`0` = no ceiling) | `AGENTLOOP_HEAVY_SLOTS` | `host.heavy_slots` | `1` |
+| Load cap on the 5-minute load (`0` = no gate) | `AGENTLOOP_LOAD_CAP` | `host.load_cap` | `1.5 ×` the CPU count |
+
+The environment wins, then the top-level `host` block of `config/projects.json`
+(`{"projects": [...], "host": {"heavy_slots": 1, "load_cap": 15}}`), then the
+default. Put it in `projects.json` to reach the tick: launchd starts it with an
+environment of its own. A value that is not a number is skipped, never half-read.
+`AGENTLOOP_HEAVY_POLL` (seconds between two looks for a slot, default 12) and
+`AGENTLOOP_LOADAVG` (a fixed `"1m 5m 15m"` reading) exist for the tests.
+
+**What the agents are told.** Every job's prompt is given a short host contract
+(`host_contract` in `bin/agentloop`): run every command that starts containers or
+runs a full suite or build as `<absolute path of agentloop> heavy -- <command>`
+(the same path is in `$AL_BIN`, and `$AL_RUN_SLOT` is the run's own slot); one
+suite and one stack at a time, the head and the trial merge one after the other
+(a trial merge's own worktree is fine once the first stack is down); take the stack down as soon as the result is read; waiting is normal,
+never a deferral; a suite that failed only by timeouts under load is re-run, not
+reported red. Security units are not given it: they read code, are never
+provisioned and run no suite.
+
+**The stall watchdog knows.** A run whose agent waits for a slot sleeps: no
+output and no CPU, which the stall rule would call a hang. While a waiter is alive
+it touches `heavy-wait` in its run's slot on every poll, and the watchdog reads a
+fresh one as activity, however long the wait. A killed waiter's file goes stale
+within three polls and the run is judged by the ordinary rules again. Only the
+stall rule is held off; `timeout_seconds` still counts wall-clock time.
+
 ### Is the usage gate awake? `agentloop usage`
 
 The scheduler holds scheduled runs back when a usage window is spent. Every
@@ -2366,6 +2429,8 @@ agentloop dashboard          # open the control UI
 agentloop status             # jobs + last run + cost, and one line per platform: enabled, signed in as whom, models on
 agentloop run <id>           # force a run now (ignores precheck + daily cap)
 agentloop check <id>         # run only the precheck, report what it saw
+agentloop heavy -- <cmd…>    # run a command holding a host-wide heavy slot (waits for one)
+agentloop host               # load, cap, heavy slots and holders; exit 0 quiet, 1 busy
 agentloop enable|disable <id>
 agentloop toggle-many true|false   # ids on stdin (JSON array or one per line)
 agentloop create <id>        # JSON object on stdin
@@ -2417,7 +2482,9 @@ for `models --verbose`; the server's first in-request resolve uses 10),
 `AGENTLOOP_PRICING_URL` (where the price table refreshes from),
 `AGENTLOOP_PYTHON`, `AGENTLOOP_JQ`, `AGENTLOOP_LOG_MAX` (log rotation
 threshold, default 4 MiB), `AGENTLOOP_HOOK_TIMEOUT`, `AGENTLOOP_LOCK_GRACE`,
-`AGENTLOOP_SESSION_TTL` (open-session expiry, in seconds, default 86400).
+`AGENTLOOP_SESSION_TTL` (open-session expiry, in seconds, default 86400),
+`AGENTLOOP_HEAVY_SLOTS` and `AGENTLOOP_LOAD_CAP` (the host gate; see
+[One machine, every project](#one-machine-every-project-heavy-slots-and-the-load-gate)).
 
 ---
 

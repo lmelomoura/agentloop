@@ -20,6 +20,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The host has a limit of its own: heavy slots and a load gate.**
+  `max_parallel` only limits the runs of one job, so nothing stopped every
+  project's agents, a reviewer measuring two suites at once and a CI runner
+  from each bringing up a compose stack on the same ten CPUs. On 2026-10-10
+  the load average passed 250: Vitest died of "Test timed out", Docker hung,
+  the runner went offline and promoters parked tickets as "verification
+  deferred" for three hours. Now `agentloop heavy [--max-wait S] [--] <cmd>`
+  runs a command in the foreground while holding one of N host-wide slots
+  (default 1), shared by every job of every project, waiting for one and
+  saying who holds them; the exit code comes back unchanged, a TERM/INT/HUP
+  releases the slot and ends the command's process group, and a holder killed
+  with `-9` is pruned by the same pid-and-boot lease as a dead run (and takes
+  its command with it). `agentloop host` prints the load, the cap, the slots
+  and their holders, and exits 0 when the host is quiet and 1 when busy, for a
+  precheck to re-measure a deferral whose cause was the host. The tick no
+  longer launches a due job while the 5-minute load average is above the cap
+  (default 1.5 x CPUs; `tick.log`: `<id>: host busy (load X > Y), not
+  launching`), before the precheck so nothing is claimed; Run now is not gated.
+  Both settings are `AGENTLOOP_HEAVY_SLOTS` / `AGENTLOOP_LOAD_CAP` or the
+  `host` block of `projects.json`. Every job (not security units) is handed a
+  short host contract telling the agent to run suites through
+  `agentloop heavy`, one suite and one stack at a time (a trial merge may use
+  a worktree of its own once the first stack is down), to tear the stack down
+  after reading the result, never to write a deferral because the host is busy,
+  and, because a tool call cut off by its limit leaves the command running, to
+  start a long suite with its output and exit code in files and block on the
+  exit-code file rather than start it a second time. **The stall
+  watchdog does not kill a run that is waiting for a slot**: a waiter's
+  heartbeat counts as activity, because a run queued behind the gate sleeps
+  with no output and no CPU, which is exactly what the stall rule kills.
+  Without that exemption the gate would have killed the runs it queues. The
+  contract also tells the agent to start a long suite with its output in a file
+  and its exit code in a marker and to block on the marker: a tool call cut off
+  by its own time limit leaves the command running, and re-running it would
+  have queued a second copy of the suite behind the first.
+
 - **A job can have a base branch of its own.** `base` on a job (the editor's
   "Base branch" field, or `agentloop set-field <job> base`) is where that
   job's worktree is cut from, whatever its project declares; it is never
