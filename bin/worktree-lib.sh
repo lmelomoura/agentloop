@@ -991,7 +991,7 @@ wt_project_has_live_run() { # <project>
 # step. A sweep shells out to whatever the project uses, so once a minute is far
 # too often; five minutes is the default.
 wt_sweep_projects() {
-  local interval grace now last stamp project cwd script t rc live canon
+  local interval grace now last stamp project cwd script t rc live canon live_run
   interval="$(num "${AGENTLOOP_SWEEP_INTERVAL:-}" 300)"
   [ "$interval" -gt 0 ] || return 0
   grace="$(num "${AGENTLOOP_SWEEP_GRACE:-}" 21600)"
@@ -1008,7 +1008,20 @@ wt_sweep_projects() {
     [ -n "$project" ] || continue
     script="$CONFIG_DIR/provision/$project.sweep.sh"
     [ -f "$script" ] || continue
-    wt_project_has_live_run "$project" && continue
+    # A live run puts the whole project off-limits (see wt_project_has_live_run)
+    # -- unless the project opted in with worktree.sweep_during_runs. Then the
+    # hook still runs, TOLD a run is live (AL_SWEEP_LIVE_RUN=1), and is expected
+    # to restrict itself to what holds no data: images and build cache, never a
+    # container or a volume. That is opt-in because a hook written before the
+    # flag existed would ignore it and sweep everything. It exists because a
+    # project that always has some run going -- a dev, a reviewer, a promote,
+    # one after another -- was otherwise never swept at all: Revenue Copilot
+    # piled up a day of finished runs' images, gigabytes each, behind it.
+    live_run=""
+    if wt_project_has_live_run "$project"; then
+      [ "$(project_get "$project" '.worktree.sweep_during_runs' 'false')" = "true" ] || continue
+      live_run=1
+    fi
     # Built once, lazily: a machine whose projects declare no sweep hook must
     # not pay two jq forks and a walk of every lock directory per tick.
     if [ -z "$live" ]; then
@@ -1034,7 +1047,7 @@ wt_sweep_projects() {
       cd "$cwd" 2>/dev/null || return 1
       AL_PROJECT="$project" CC_PROJECT="$project" \
       AL_LIVE_WORKTREES="$live" AL_CANONICALS="$canon" \
-      AL_SWEEP_GRACE_SECONDS="$grace" \
+      AL_SWEEP_GRACE_SECONDS="$grace" AL_SWEEP_LIVE_RUN="$live_run" \
       AL_PROVISION_LIB="${AL_PROVISION_LIB:-}" CC_PROVISION_LIB="${AL_PROVISION_LIB:-}" \
         bash "$script" >>"$DATA_DIR/exec.log" 2>&1
     }

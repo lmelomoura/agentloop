@@ -34,7 +34,13 @@
 #                            lives. Never reclaim anything at or under one.
 #   AL_SWEEP_GRACE_SECONDS   how old something must be before it is fair game
 #                            (AGENTLOOP_SWEEP_GRACE, 21600 by default)
-#   AL_PROVISION_LIB         source it for al_port and friends, as in `.up.sh`
+#   AL_SWEEP_LIVE_RUN        "1" when a run of this project is alive. Only ever
+#                            set for a project with worktree.sweep_during_runs:
+#                            true; otherwise the hook is not called at all
+#                            while a run lives. When it is set, reclaim only what
+#                            holds no data (images, build cache) -- never a
+#                            container, a volume or a directory.
+#   AL_PROVISION_LIB        source it for al_port and friends, as in `.up.sh`
 #
 # It is killed if it outlives `.worktree.sweep_timeout_seconds` (300 by default):
 # it runs inside the tick's own mutex, so a sweep that blocks on an unresponsive

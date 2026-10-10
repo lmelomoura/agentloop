@@ -46,6 +46,16 @@ export AGENTLOOP_PRICING_URL="file://$REPO/test/fixtures/pricing/litellm-sample.
 # offline): with the scanners switched off it stays off the network and takes
 # the same time on every machine, whatever is installed.
 export AL_SECURITY_ENGINES=off
+# The tick's host gate (cmd_tick) holds a due job back while the 5-minute load is
+# above 1.5 x CPUs. This suite is run on busy laptops and on a 3-core CI runner
+# beside other jobs, where scenario 45 would find its two jobs "held back" and
+# fail for a reason that has nothing to do with it. Off here; scenario 65 turns it
+# on with a load it dictates (AGENTLOOP_LOADAVG), which is how it proves the gate.
+export AGENTLOOP_LOAD_CAP=0
+# The same for the CI gate of `agentloop host` / `heavy`: it asks the real docker
+# which containers run, and a pipeline on the developer's machine would make
+# scenarios 64 and 66 wait for it. The selftest proves the gate beside a fake docker.
+export AGENTLOOP_CI_GATE=0
 mkdir -p "$CODEX_HOME"
 git init -q --bare "$ROOT/remote/origin.git"
 git init -q "$ROOT/work/app"
@@ -1979,86 +1989,200 @@ sleep 1
 echo
 }
 
-scenario_64() {
-echo "64. a usage reading is the account's that was logged in, so switching the login lifts the hold"
+scenario_67() {
+echo "67. a usage reading is the account's that was logged in, so switching the login lifts the hold"
 # 2026-10-02: an analysis paused at 98% of the five-hour window; the operator
 # logged the CLI's directory into a second account, and every launch was
 # still held back on the first account's 99% until it reset 90 minutes later.
-mkdir -p "$ROOT/accounts/claude-64"
-"$AL" platform account-add anthropic "Switched" "$ROOT/accounts/claude-64" >/dev/null 2>&1 || bad "account-add failed"
-login64() { printf '{"oauthAccount":{"accountUuid":"%s","organizationUuid":"org-64"}}\n' "$1" > "$ROOT/accounts/claude-64/.claude.json"; }
-k64="anthropic@$ROOT/accounts/claude-64"
-rl64="$ROOT/data/rate-limits.json"
-rm -f "$rl64"
-mkjob_acct j64 switched
-login64 acct-first
-FAKE_MODE=complete FAKE_SESSION=sess-64 FAKE_RATE_LIMIT_EVENT=unified "$AL" run j64 >/dev/null 2>&1
+mkdir -p "$ROOT/accounts/claude-67"
+"$AL" platform account-add anthropic "Switched" "$ROOT/accounts/claude-67" >/dev/null 2>&1 || bad "account-add failed"
+login67() { printf '{"oauthAccount":{"accountUuid":"%s","organizationUuid":"org-67"}}\n' "$1" > "$ROOT/accounts/claude-67/.claude.json"; }
+k67="anthropic@$ROOT/accounts/claude-67"
+rl67="$ROOT/data/rate-limits.json"
+rm -f "$rl67"
+mkjob_acct j67 switched
+login67 acct-first
+FAKE_MODE=complete FAKE_SESSION=sess-67 FAKE_RATE_LIMIT_EVENT=unified "$AL" run j67 >/dev/null 2>&1
 sleep 1
-[ "$(jq -r --arg k "$k64" '[.[$k][].account] | unique | join(",")' "$rl64" 2>/dev/null)" = "acct-first:org-64" ] \
-  && ok "the run's readings carry the account logged in as it launched" || bad "readings: $(jq -c --arg k "$k64" '.[$k]' "$rl64" 2>/dev/null)"
+[ "$(jq -r --arg k "$k67" '[.[$k][].account] | unique | join(",")' "$rl67" 2>/dev/null)" = "acct-first:org-67" ] \
+  && ok "the run's readings carry the account logged in as it launched" || bad "readings: $(jq -c --arg k "$k67" '.[$k]' "$rl67" 2>/dev/null)"
 
-jq --arg k "$k64" --argjson r "$(( $(date +%s) + 3600 ))" \
-  '.[$k].five_hour = {status:"allowed_warning", utilization:0.99, resets_at:$r, overage:null, seen_at:1, account:"acct-first:org-64"}' \
-  "$rl64" > "$rl64.next" && mv "$rl64.next" "$rl64"
-"$AL" _exec j64 >/dev/null 2>&1
-grep -qF "j64: usage limit reached — the anthropic five_hour window of Switched is 99% used" "$ROOT/data/tick.log" \
+jq --arg k "$k67" --argjson r "$(( $(date +%s) + 3600 ))" \
+  '.[$k].five_hour = {status:"allowed_warning", utilization:0.99, resets_at:$r, overage:null, seen_at:1, account:"acct-first:org-67"}' \
+  "$rl67" > "$rl67.next" && mv "$rl67.next" "$rl67"
+"$AL" _exec j67 >/dev/null 2>&1
+grep -qF "j67: usage limit reached — the anthropic five_hour window of Switched is 99% used" "$ROOT/data/tick.log" \
   && ok "that account's 99% holds its scheduled runs back" || bad "no hold: $(tail -3 "$ROOT/data/tick.log")"
 
-login64 acct-second
+login67 acct-second
 "$AL" usage 2>&1 | grep -q "measured on another account than the one logged in there now" \
   && ok "after the login switch, usage says the reading is another account's" || bad "usage: $("$AL" usage 2>&1 | head -6)"
 "$AL" usage 2>&1 | grep -q "SCHEDULED anthropic (Switched) RUNS ARE BEING HELD BACK" \
   && bad "usage still reports the hold: $("$AL" usage 2>&1 | grep -A1 HELD)" || ok "and no hold"
-FAKE_MODE=complete FAKE_SESSION=sess-64b "$AL" _exec j64 >/dev/null 2>&1
+FAKE_MODE=complete FAKE_SESSION=sess-67b "$AL" _exec j67 >/dev/null 2>&1
 sleep 1
-[ "$(lastrun | jq -r .session)" = "sess-64b" ] \
+[ "$(lastrun | jq -r .session)" = "sess-67b" ] \
   && ok "and the next scheduled run goes ahead on the new account" || bad "still held: $(tail -3 "$ROOT/data/tick.log")"
-rm -f "$rl64"
+rm -f "$rl67"
+
+echo
+}
+
+scenario_68() {
+echo "68. an analysis the usage limit paused says so, refuses a Resume until it reopens, and resumes by itself"
+# 2026-10-02: a deep analysis paused at 98% of the five-hour window, 32 of 37
+# units in. Each Resume ran for one second, hit the same limit, and paused it
+# again -- answering the page with success, so "nothing happened" -- and the
+# reason was the last sentence of a two-thousand-character paragraph.
+rl68="$ROOT/data/rate-limits.json"
+reset68="$(( $(date +%s) + 3600 ))"
+jq -n --argjson r "$reset68" \
+  '{anthropic:{five_hour:{status:"allowed_warning",utilization:0.99,resets_at:$r,overage:null,seen_at:1}}}' > "$rl68"
+out68="$(FAKE_MODE=complete FAKE_SESSION=sess-68 "$AL" security analyze --detach sandbox anything main quick)"
+aid68="$(secid "$out68")"
+w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid68")" = "running" ]; do sleep 1; w=$((w + 1)); done
+pause68="$("$AL" security list --project sandbox | jq -c --argjson a "$aid68" '.[] | select(.id == $a) | .pause | fromjson? // {}')"
+[ "$(secstate sandbox "$aid68")" = "interrupted" ] \
+  && [ "$(printf '%s' "$pause68" | jq -r '"\(.kind) \(.until) \(.reason)"')" = "usage $reset68 the anthropic five_hour window is 99% used" ] \
+  && ok "the analysis is paused, and its pause says by what and until when (waited ${w}s)" \
+  || bad "state '$(secstate sandbox "$aid68")', pause $pause68"
+secnote sandbox "$aid68" | grep -q "interrupted this analysis" \
+  && bad "the pause went into the coverage paragraph: $(secnote sandbox "$aid68")" \
+  || ok "and the coverage paragraph does not carry it"
+w=0; while [ "$w" -lt 60 ] && [ -n "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ]; do sleep 1; w=$((w + 1)); done
+said68="$("$AL" security resume sandbox "$aid68" 2>&1)"; rc68=$?
+[ "$rc68" -ne 0 ] \
+  && case "$said68" in *"analysis $aid68 cannot resume yet: the usage limit was reached (the anthropic five_hour window is 99% used"*"It resumes by itself once that reopens."*) true ;; *) false ;; esac \
+  && ok "a Resume while the limit holds is refused, saying why" || bad "resume answered rc=$rc68: $said68"
+[ "$(secstate sandbox "$aid68")" = "interrupted" ] && ! grep -qF "resumed analysis $aid68" "$ROOT/data/tick.log" \
+  && ok "and the analysis was not resumed into the same limit" || bad "resumed anyway: $(grep -F "analysis $aid68" "$ROOT/data/tick.log" | tail -3)"
+FAKE_MODE=complete FAKE_SESSION=sess-68b "$AL" tick >/dev/null 2>&1
+[ "$(secstate sandbox "$aid68")" = "interrupted" ] && ! grep -qF "analysis $aid68 resumed by itself" "$ROOT/data/tick.log" \
+  && ok "a tick while it holds leaves it paused" || bad "the tick resumed it under the limit"
+# The window resets.
+jq --argjson r "$(( $(date +%s) - 60 ))" '.anthropic.five_hour.resets_at = $r' "$rl68" > "$rl68.next" && mv "$rl68.next" "$rl68"
+FAKE_MODE=complete FAKE_SESSION=sess-68c "$AL" tick >/dev/null 2>&1
+grep -qF "security-sandbox: analysis $aid68 resumed by itself — the limit that paused it has reopened" "$ROOT/data/tick.log" \
+  && ok "once it reopens, the tick resumes it by itself" || bad "no resume: $(grep -F "analysis $aid68" "$ROOT/data/tick.log" | tail -3)"
+w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid68")" != "done" ]; do sleep 1; w=$((w + 1)); done
+[ "$(secstate sandbox "$aid68")" = "done" ] \
+  && ok "and it finishes (waited ${w}s)" || bad "after the tick's resume: '$(secstate sandbox "$aid68")' -- $(secnote sandbox "$aid68")"
+rm -f "$rl68"
+sleep 1
+
+echo
+}
+
+
+scenario_64() {
+echo "64. a run queued behind agentloop heavy is not killed as stalled, however long it waits"
+# The host gate makes a run WAIT: its agent blocks in `agentloop heavy` on a
+# sleep, writing nothing and burning no CPU -- exactly the shape the stall rule
+# kills. Left like that the gate would kill the very runs it queues, and the
+# first sign would be a pile of "no output and no CPU" errors on the busiest
+# afternoon. The waiter leaves a heartbeat in its run's slot (heavy_beat) and
+# the watchdog reads a fresh one as activity. Scenario 41b is the control: the
+# same 4 s limit and 2 s poll kill a run that is quiet for any other reason.
+mkjob j64
+sed -i '' 's/"max_parallel":1/"max_parallel":1,"stall_timeout_seconds":4/' "$ROOT/config/jobs.json"
+out64="$ROOT/heavy-64.out"; rm -f "$out64"
+AGENTLOOP_HEAVY_POLL=1 "$AL" heavy -- sleep 12 >/dev/null 2>&1 &
+holder64=$!
+sleep 2            # it has taken the only slot
+AGENTLOOP_WATCHDOG_POLL=2 AGENTLOOP_HEAVY_POLL=1 FAKE_MODE=heavy FAKE_HEAVY_OUT="$out64" \
+  FAKE_SESSION=sess-64 "$AL" run j64 >/dev/null 2>&1
+wait "$holder64" 2>/dev/null
+[ "$(lastrun | jq -r .status)" = "success" ] \
+  && ok "the run waited for the slot (about 10 s against a 4 s stall limit) and succeeded" \
+  || bad "$(lastrun | jq -c '{status,cause,note}')"
+lastrun | jq -r .note | grep -q 'stalled' && bad "the watchdog called a queued run stalled: $(lastrun | jq -r .note)" \
+  || ok "and no stall is on its record"
+grep -q 'heavy-rc=0' "$out64" 2>/dev/null && ok "the agent's call returned the command's exit code" || bad "heavy-rc: $(cat "$out64" 2>/dev/null)"
+grep -q 'agentloop heavy: waiting' "$out64" 2>/dev/null && grep -q 'got a heavy slot' "$out64" 2>/dev/null \
+  && ok "it said once that it was waiting, and once that it had the slot" || bad "the agent's output: $(cat "$out64" 2>/dev/null)"
+[ ! -e "$ROOT"/data/locks/j64/*/heavy-wait ] && ok "the heartbeat is gone with the wait" || bad "a heavy-wait heartbeat outlived its wait"
 
 echo
 }
 
 scenario_65() {
-echo "65. an analysis the usage limit paused says so, refuses a Resume until it reopens, and resumes by itself"
-# 2026-10-02: a deep analysis paused at 98% of the five-hour window, 32 of 37
-# units in. Each Resume ran for one second, hit the same limit, and paused it
-# again -- answering the page with success, so "nothing happened" -- and the
-# reason was the last sentence of a two-thousand-character paragraph.
-rl65="$ROOT/data/rate-limits.json"
-reset65="$(( $(date +%s) + 3600 ))"
-jq -n --argjson r "$reset65" \
-  '{anthropic:{five_hour:{status:"allowed_warning",utilization:0.99,resets_at:$r,overage:null,seen_at:1}}}' > "$rl65"
-out65="$(FAKE_MODE=complete FAKE_SESSION=sess-65 "$AL" security analyze --detach sandbox anything main quick)"
-aid65="$(secid "$out65")"
-w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid65")" = "running" ]; do sleep 1; w=$((w + 1)); done
-pause65="$("$AL" security list --project sandbox | jq -c --argjson a "$aid65" '.[] | select(.id == $a) | .pause | fromjson? // {}')"
-[ "$(secstate sandbox "$aid65")" = "interrupted" ] \
-  && [ "$(printf '%s' "$pause65" | jq -r '"\(.kind) \(.until) \(.reason)"')" = "usage $reset65 the anthropic five_hour window is 99% used" ] \
-  && ok "the analysis is paused, and its pause says by what and until when (waited ${w}s)" \
-  || bad "state '$(secstate sandbox "$aid65")', pause $pause65"
-secnote sandbox "$aid65" | grep -q "interrupted this analysis" \
-  && bad "the pause went into the coverage paragraph: $(secnote sandbox "$aid65")" \
-  || ok "and the coverage paragraph does not carry it"
-w=0; while [ "$w" -lt 60 ] && [ -n "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ]; do sleep 1; w=$((w + 1)); done
-said65="$("$AL" security resume sandbox "$aid65" 2>&1)"; rc65=$?
-[ "$rc65" -ne 0 ] \
-  && case "$said65" in *"analysis $aid65 cannot resume yet: the usage limit was reached (the anthropic five_hour window is 99% used"*"It resumes by itself once that reopens."*) true ;; *) false ;; esac \
-  && ok "a Resume while the limit holds is refused, saying why" || bad "resume answered rc=$rc65: $said65"
-[ "$(secstate sandbox "$aid65")" = "interrupted" ] && ! grep -qF "resumed analysis $aid65" "$ROOT/data/tick.log" \
-  && ok "and the analysis was not resumed into the same limit" || bad "resumed anyway: $(grep -F "analysis $aid65" "$ROOT/data/tick.log" | tail -3)"
-FAKE_MODE=complete FAKE_SESSION=sess-65b "$AL" tick >/dev/null 2>&1
-[ "$(secstate sandbox "$aid65")" = "interrupted" ] && ! grep -qF "analysis $aid65 resumed by itself" "$ROOT/data/tick.log" \
-  && ok "a tick while it holds leaves it paused" || bad "the tick resumed it under the limit"
-# The window resets.
-jq --argjson r "$(( $(date +%s) - 60 ))" '.anthropic.five_hour.resets_at = $r' "$rl65" > "$rl65.next" && mv "$rl65.next" "$rl65"
-FAKE_MODE=complete FAKE_SESSION=sess-65c "$AL" tick >/dev/null 2>&1
-grep -qF "security-sandbox: analysis $aid65 resumed by itself — the limit that paused it has reopened" "$ROOT/data/tick.log" \
-  && ok "once it reopens, the tick resumes it by itself" || bad "no resume: $(grep -F "analysis $aid65" "$ROOT/data/tick.log" | tail -3)"
-w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid65")" != "done" ]; do sleep 1; w=$((w + 1)); done
-[ "$(secstate sandbox "$aid65")" = "done" ] \
-  && ok "and it finishes (waited ${w}s)" || bad "after the tick's resume: '$(secstate sandbox "$aid65")' -- $(secnote sandbox "$aid65")"
-rm -f "$rl65"
+echo "65. the tick does not launch above the load cap, and a forced run is not held back"
+# 2026-10-10: the host ran everything it was asked to until its load average
+# passed 250. The tick is where "everything" is decided, and it must decide
+# BEFORE the launch, because the precheck runs inside the launched process and
+# is what claims a ticket: a job held back here has claimed nothing. The
+# precheck below writes a marker, so "not launched" is observed rather than
+# inferred from a log line.
+mark65="$ROOT/precheck-65.ran"; rm -f "$mark65"
+cat > "$ROOT/config/jobs.json" <<JSON
+{"jobs":[{"id":"j65","project":"sandbox","enabled":true,"prompt":"do the thing",
+          "interval_seconds":1,"permission_mode":"bypassPermissions","max_parallel":1,
+          "precheck":"touch $mark65; exit 1"}]}
+JSON
+E2E_JOB=j65
+AGENTLOOP_LOADAVG="40 40 40" AGENTLOOP_LOAD_CAP=5 "$AL" tick >/dev/null 2>&1
+sleep 4            # long enough for a launched run to have reached its precheck
+grep -q 'j65: host busy (load 40 > 5), not launching' "$ROOT/data/tick.log" \
+  && ok "above the cap the tick logs 'host busy (load 40 > 5), not launching'" \
+  || bad "tick.log: $(grep 'j65' "$ROOT/data/tick.log" | tail -2)"
+grep -q 'j65: launched detached run' "$ROOT/data/tick.log" && bad "it launched anyway" || ok "and launches nothing"
+[ ! -e "$mark65" ] && ok "the precheck never ran, so nothing was claimed" || bad "the precheck ran under load"
+
+# Run now is a deliberate override, as it is for the precheck and the budget.
+AGENTLOOP_LOADAVG="40 40 40" AGENTLOOP_LOAD_CAP=5 FAKE_MODE=complete FAKE_SESSION=sess-65 "$AL" run j65 >/dev/null 2>&1
+[ "$(lastrun | jq -r '.status + "/" + (.forced|tostring)')" = "success/true" ] \
+  && ok "a forced run at the same load runs: success, forced" || bad "$(lastrun | jq -c '{status,forced}')"
+
+# Under the cap the same job launches: the gate is the load, not a standing ban.
+sleep 2
+AGENTLOOP_LOADAVG="1 1 1" AGENTLOOP_LOAD_CAP=5 "$AL" tick >/dev/null 2>&1
+w=0; while [ "$w" -lt 30 ] && [ ! -e "$mark65" ]; do sleep 1; w=$((w + 1)); done
+[ -e "$mark65" ] && ok "and with the load under the cap the tick launches it (its precheck ran)" \
+  || bad "under the cap nothing launched: $(grep 'j65' "$ROOT/data/tick.log" | tail -3)"
 sleep 1
+
+echo
+}
+
+scenario_66() {
+echo "66. two jobs share one heavy slot, and each knows who is in its way"
+# max_parallel only limits runs of the SAME job. The slot is host-wide: j66a and
+# j66b are different jobs, and the one that arrives second waits for the first's
+# command, saying whose it is.
+cat > "$ROOT/config/jobs.json" <<JSON
+{"jobs":[{"id":"j66a","project":"sandbox","enabled":false,"prompt":"do the thing",
+          "interval_seconds":3600,"permission_mode":"bypassPermissions","max_parallel":1},
+         {"id":"j66b","project":"sandbox","enabled":false,"prompt":"do the thing",
+          "interval_seconds":3600,"permission_mode":"bypassPermissions","max_parallel":1}]}
+JSON
+oa="$ROOT/heavy-66a.out"; ob="$ROOT/heavy-66b.out"; rm -f "$oa" "$ob"
+AGENTLOOP_HEAVY_POLL=1 FAKE_MODE=heavy FAKE_HEAVY_CMD="sleep 8" FAKE_HEAVY_OUT="$oa" FAKE_SESSION=sess-66a "$AL" run j66a >/dev/null 2>&1 &
+pa=$!
+AGENTLOOP_HEAVY_POLL=1 FAKE_MODE=heavy FAKE_HEAVY_CMD="sleep 8" FAKE_HEAVY_OUT="$ob" FAKE_SESSION=sess-66b "$AL" run j66b >/dev/null 2>&1 &
+pb=$!
+# Sample the status once the contention is OBSERVABLE: one of the two has said
+# it is waiting, so the other holds the slot right now. A fixed sleep guessed how
+# long two runs take to reach their `heavy` call, and a slow, loaded CI runner
+# (worktree set-up, provisioning) sampled before either had (CI, 2026-10-10:
+# "0 of 1 slot(s) in use"). If the slot were not shared nobody would ever wait,
+# and this gives up after a minute and fails the checks below.
+w=0; while [ "$w" -lt 60 ] && ! grep -qs 'agentloop heavy: waiting' "$oa" "$ob"; do sleep 1; w=$((w + 1)); done
+host66="$("$AL" host 2>&1)"; host_rc=$?
+wait "$pa" "$pb" 2>/dev/null
+[ "$host_rc" = 1 ] && printf '%s\n' "$host66" | grep -q '1 of 1 slot' \
+  && ok "while one command runs, \`agentloop host\` says busy (exit 1): 1 of 1 slots" || bad "host said ($host_rc): $host66"
+printf '%s\n' "$host66" | grep -Eq 'holder +j66[ab] run [0-9]+' \
+  && ok "and names the holder by job and run" || bad "holder line: $(printf '%s\n' "$host66" | grep holder)"
+na="$(grep -c 'agentloop heavy: waiting' "$oa" 2>/dev/null)"; nb="$(grep -c 'agentloop heavy: waiting' "$ob" 2>/dev/null)"
+[ $(( ${na:-0} + ${nb:-0} )) = 1 ] && ok "exactly one of the two had to wait (a ceiling of one, across two job ids)" \
+  || bad "waits: j66a=${na:-0} j66b=${nb:-0}"
+if [ "${na:-0}" = 1 ]; then waiter="$oa"; other=j66b; else waiter="$ob"; other=j66a; fi
+grep "agentloop heavy: waiting" "$waiter" | grep -q "Holding the slot(s): $other run [0-9]" \
+  && ok "the waiter names the OTHER job and its run as the holder" || bad "waiter said: $(grep 'waiting' "$waiter")"
+grep -q 'heavy-rc=0' "$oa" && grep -q 'heavy-rc=0' "$ob" && ok "both calls ended 0" || bad "rc: $(grep heavy-rc "$oa" "$ob")"
+[ "$(run_of j66a | jq -r .status)" = "success" ] && [ "$(run_of j66b | jq -r .status)" = "success" ] \
+  && ok "and both runs succeeded" || bad "$(run_of j66a | jq -c .status) $(run_of j66b | jq -c .status)"
+[ -z "$(ls "$ROOT/data/locks/_heavy" 2>/dev/null)" ] && ok "no heavy slot is left behind" || bad "left: $(ls "$ROOT/data/locks/_heavy")"
 
 echo
 }
@@ -2092,11 +2216,11 @@ echo
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # re-measure when the last list grows -- and the count assertion below fails
 # if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37"
 E2E_LIST_3="38 39 40 41 41b 41c 42 43 44 45 46"
-E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65"
+E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to

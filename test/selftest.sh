@@ -110,6 +110,10 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   # never leak that account into a fake run here.
   mkdir -p "$tmp/LaunchAgents"
   export AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents"
+  # The CI gate asks the REAL docker which containers run. A pipeline on this
+  # machine must not turn a test of something else BUSY: off for the whole
+  # suite; the block that tests it turns it on beside a fake docker (ci_al).
+  export AGENTLOOP_CI_GATE=0
   ok()   { pass=$(( pass + 1 )); printf '  ok    %s\n' "$1"; }
   bad()  { fail=$(( fail + 1 )); printf '  FAIL  %s\n' "$1"; }
   want() { # want <label> <expected 0|1> <actual-rc>
@@ -3449,6 +3453,360 @@ EOF
   cpu="$(num "$(tree_cpu_seconds '')")"
   [ "$cpu" = "0" ] && ok "an empty pid reports no CPU" || bad "empty pid: got '$cpu'"
 
+  echo "host-wide heavy work — settings, the load reading, and the gate on it"
+  # 2026-10-10: the host had no limit of its own. Three dev runs, a reviewer
+  # measuring two suites at once and two other projects' builds shared ten CPUs
+  # and a load average of 250; suites died of timeouts and Docker hung. The
+  # gate is only as good as what it reads, so each reading is pinned.
+  local hv="$tmp/hv" lv
+  mkdir -p "$hv/config" "$hv/data"
+  printf '%s' '{"projects":[]}' > "$hv/projects.json"
+  hv_set() { ( PROJECTS_FILE="$hv/projects.json"; unset AGENTLOOP_HEAVY_SLOTS AGENTLOOP_LOAD_CAP; "$@" ); }
+  [ "$(hv_set heavy_slots)" = "1" ] && ok "the default is one heavy slot" || bad "default slots: $(hv_set heavy_slots)"
+  lv="$( PROJECTS_FILE="$hv/projects.json"; unset AGENTLOOP_LOAD_CAP; host_ncpu() { echo 8; }; host_load_cap )"
+  [ "$lv" = "12.0" ] && ok "the default load cap is 1.5 x CPUs (8 CPUs -> 12.0)" || bad "default cap on 8 CPUs: '$lv'"
+  printf '%s' '{"projects":[],"host":{"heavy_slots":2,"load_cap":20}}' > "$hv/projects.json"
+  [ "$(hv_set heavy_slots)" = "2" ] && [ "$(hv_set host_load_cap)" = "20" ] \
+    && ok "projects.json's host block sets both (it is the only way the launchd-started tick can be told)" \
+    || bad "host block: slots=$(hv_set heavy_slots) cap=$(hv_set host_load_cap)"
+  [ "$( PROJECTS_FILE="$hv/projects.json"; AGENTLOOP_HEAVY_SLOTS=3 AGENTLOOP_LOAD_CAP=9.5; echo "$(heavy_slots) $(host_load_cap)" )" = "3 9.5" ] \
+    && ok "the environment wins over the host block" || bad "env precedence"
+  [ "$( PROJECTS_FILE="$hv/projects.json"; AGENTLOOP_HEAVY_SLOTS=1o AGENTLOOP_LOAD_CAP=lots; echo "$(heavy_slots) $(host_load_cap)" )" = "2 20" ] \
+    && ok "a value that is not a number is skipped, never half-read (1o is not 1)" || bad "garbage env was used"
+  [ "$( PROJECTS_FILE="$hv/projects.json"; AGENTLOOP_LOAD_CAP=0; host_loadavg() { echo "90 90 90"; }; host_load_over && echo over || echo quiet )" = "quiet" ] \
+    && ok "a load cap of 0 switches the load gate off" || bad "cap 0 still gated"
+
+  # Over means the 5-MINUTE load is ABOVE the cap: the 1-minute figure is a
+  # spike (a suite starting), the 15-minute one a memory of an hour ago.
+  over_with() { ( PROJECTS_FILE="$hv/projects.json"; AGENTLOOP_LOAD_CAP=15; unset AGENTLOOP_HEAVY_SLOTS
+                  hv_reading="$1"; host_loadavg() { echo "$hv_reading"; }; host_load_over && echo over || echo quiet ) ; }
+  [ "$(over_with '10 20 30')" = "over" ]  && ok "5-minute load 20 against a cap of 15 is over" || bad "20 > 15 not over"
+  [ "$(over_with '90 10 5')" = "quiet" ]  && ok "a 1-minute spike alone does not close the gate" || bad "1-minute spike closed the gate"
+  [ "$(over_with '1 15 1')" = "quiet" ]   && ok "exactly at the cap is not over it" || bad "equal to the cap counted as over"
+  [ "$( PROJECTS_FILE="$hv/projects.json"; host_loadavg() { return 1; }; host_load_over && echo over || echo quiet )" = "quiet" ] \
+    && ok "a load that cannot be read opens the gate (it must not hold the fleet on a blind reading)" || bad "unreadable load closed the gate"
+  # The holder's command is shown to every run that waits, and arguments are
+  # where a token ends up: only the name and two plain words are kept.
+  lv="$(heavy_cmd_label make test-all TOKEN=hunter2 --password=x -f ../secret.mk)"
+  [ "$lv" = "make test-all" ] && ok "a holder's command is shown as its name and plain words, never KEY=value or flags or paths" \
+    || bad "command label leaked or lost the name: '$lv'"
+  lv="$(heavy_cmd_label /usr/bin/docker compose up --build sneaky)"
+  [ "$lv" = "docker compose up" ] && ok "and at most two words after the name" || bad "label: '$lv'"
+  # The real reading, captured on this machine: `sysctl -n vm.loadavg` prints
+  # "{ 4.12 7.20 15.24 }" -- braces and spaces, no commas.
+  lv="$( unset AGENTLOOP_LOADAVG; sysctl() { echo '{ 4.12 7.20 15.24 }'; }; [ -r /proc/loadavg ] && echo '4.12 7.20 15.24' || host_loadavg )"
+  [ "$lv" = "4.12 7.20 15.24" ] && ok "the macOS vm.loadavg shape is read into three numbers" || bad "vm.loadavg parsed as '$lv'"
+  lv="$( unset AGENTLOOP_LOADAVG; host_loadavg )"
+  case "$lv" in *[!0-9.\ ]*|"") bad "this machine's real load did not parse: '$lv'" ;;
+    *) [ "$(echo "$lv" | wc -w | tr -d ' ')" = 3 ] && ok "and this machine's own load parses ($lv)" || bad "real load: '$lv'" ;; esac
+
+  echo "agentloop heavy — one ceiling across jobs, a status that says who, and no leaks"
+  hv_al() { AGENTLOOP_CONFIG="$hv/config" AGENTLOOP_DATA="$hv/data" AGENTLOOP_HEAVY_POLL=1 AGENTLOOP_LOAD_CAP="${HV_CAP:-0}" \
+            AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents" "$BIN_DIR/agentloop" "$@"; }
+  local hrc hpid hs hl wpid want_rc
+  printf '#!/bin/bash\nexit 7\n' > "$hv/exit7.sh"; chmod +x "$hv/exit7.sh"
+  hv_al heavy -- "$hv/exit7.sh" >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 7 ] && ok "the command's exit code comes back unchanged (7)" || bad "exit 7 came back as $hrc"
+  hv_al heavy -- true >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && ok "and 0 is 0" || bad "true came back as $hrc"
+  hv_al heavy -- /nonexistent/command >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 127 ] && ok "a command that cannot be started is 127, as the shell says it" || bad "missing command: $hrc"
+  [ "$(printf 'piped\n' | hv_al heavy -- cat)" = "piped" ] \
+    && ok "stdin reaches the command (a background job would have been given /dev/null)" || bad "stdin did not reach the command"
+  [ -z "$(ls "$hv/data/locks/_heavy" 2>/dev/null)" ] && ok "no slot is left behind by any of them" || bad "left: $(ls "$hv/data/locks/_heavy")"
+
+  # One ceiling across DIFFERENT job ids: max_parallel is per job and never
+  # saw this. The two holders below are shaped like two runs' slots (a live
+  # pid and this boot), which is all the identity lookup reads.
+  mkdir -p "$hv/data/locks/job-a/$$" "$hv/data/locks/job-b/$$"
+  for hs in job-a job-b; do echo $$ > "$hv/data/locks/$hs/$$/pid"; boot_id > "$hv/data/locks/$hs/$$/boot"; done
+  AL_RUN_SLOT="$hv/data/locks/job-a/$$" hv_al heavy -- sleep 9 >/dev/null 2>&1 &
+  hpid=$!
+  sleep 2
+  hv_al host > "$hv/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 1 ] && grep -q '1 of 1 slot' "$hv/host.out" && grep -q 'holder .*job-a run' "$hv/host.out" \
+    && ok "while job-a holds the slot, agentloop host exits 1 and names job-a and its run" \
+    || bad "host ($hrc): $(cat "$hv/host.out")"
+  AL_RUN_SLOT="$hv/data/locks/job-b/$$" hv_al heavy --max-wait 4 -- true > "$hv/wait.out" 2>&1 &
+  wpid=$!
+  sleep 2
+  heavy_wait_fresh "$hv/data/locks/job-b/$$" && ok "job-b, queued behind it, leaves a fresh heartbeat for its watchdog" \
+    || bad "the waiter left no heartbeat in its run's slot"
+  wait "$wpid"; hrc=$?
+  [ "$hrc" = 75 ] && ok "job-b is refused, not let through: --max-wait ends it with 75" || bad "job-b ended $hrc: $(cat "$hv/wait.out")"
+  grep -q 'Holding the slot(s): job-a run' "$hv/wait.out" && ok "and says it was job-a that was in the way" || bad "waiter said: $(cat "$hv/wait.out")"
+  [ ! -e "$hv/data/locks/job-b/$$/heavy-wait" ] && ok "its heartbeat is gone once it stopped waiting" || bad "a heartbeat outlived its waiter"
+  wait "$hpid" 2>/dev/null
+  AL_RUN_SLOT="$hv/data/locks/job-b/$$" hv_al heavy --max-wait 4 -- true >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && ok "and once job-a's command ended, job-b gets the slot" || bad "job-b after the release: $hrc"
+  rm -rf "$hv/data/locks/job-a" "$hv/data/locks/job-b"
+
+  # No AL_RUN_SLOT in the environment (a sandboxed CLI that strips it): the
+  # waiter finds its run by walking up to an ancestor that IS some slot's agent.
+  mkdir -p "$hv/data/locks/job-c/$$"; echo $$ > "$hv/data/locks/job-c/$$/pid"; echo $$ > "$hv/data/locks/job-c/$$/child"
+  boot_id > "$hv/data/locks/job-c/$$/boot"
+  env -u AL_RUN_SLOT AGENTLOOP_CONFIG="$hv/config" AGENTLOOP_DATA="$hv/data" AGENTLOOP_HEAVY_POLL=1 AGENTLOOP_LOAD_CAP=0 \
+    AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents" "$BIN_DIR/agentloop" heavy -- sleep 4 >/dev/null 2>&1 &
+  hpid=$!
+  sleep 2
+  hv_al host > "$hv/host.out" 2>&1
+  grep -q 'holder .*job-c run' "$hv/host.out" \
+    && ok "without AL_RUN_SLOT the holder is still recognised as job-c's, through its ancestors" \
+    || bad "no ancestor identity: $(cat "$hv/host.out")"
+  wait "$hpid"; rm -rf "$hv/data/locks/job-c"
+
+  # A command already inside a slot may call `agentloop heavy` itself (a
+  # Makefile that routes its own suites) without queueing behind its parent --
+  # and a made-up AL_HEAVY_HELD buys nothing.
+  printf '#!/bin/bash\n"$1" heavy -- echo nested-ran\n' > "$hv/nest.sh"; chmod +x "$hv/nest.sh"
+  lv="$(hv_al heavy --max-wait 6 -- "$hv/nest.sh" "$BIN_DIR/agentloop" 2>&1)"
+  [ "$lv" = "nested-ran" ] && ok "a heavy command that calls agentloop heavy runs at once (it is already inside the slot)" \
+    || bad "nested heavy: '$lv'"
+  sleep 30 & wpid=$!       # a live process that is not an ancestor of anything here, holding the only slot
+  mkdir -p "$hv/data/locks/_heavy/$wpid"; echo "$wpid" > "$hv/data/locks/_heavy/$wpid/pid"; boot_id > "$hv/data/locks/_heavy/$wpid/boot"
+  AL_HEAVY_HELD="$hv/data/locks/_heavy/$wpid" hv_al heavy --max-wait 2 -- true >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 75 ] && ok "an AL_HEAVY_HELD that names a slot this process is not inside does not skip the queue" \
+    || bad "forged AL_HEAVY_HELD: rc=$hrc"
+  kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null; rm -rf "$hv/data/locks/_heavy/$wpid"
+
+  # The ceiling is taken under acquire_slot's mutex; a count-then-take without
+  # it lets two waiters that look in the same instant both in. Six at once,
+  # two slots, each command counting who else is inside: never three.
+  mkdir -p "$hv/stress/in"; rm -f "$hv/stress/seen"
+  printf '#!/bin/bash\n: > "$1/in/$$"\nls "$1/in" | wc -l >> "$1/seen"\nsleep 1\nrm -f "$1/in/$$"\n' > "$hv/stress/probe.sh"; chmod +x "$hv/stress/probe.sh"
+  wpid=""
+  for hs in 1 2 3 4 5 6; do AGENTLOOP_HEAVY_SLOTS=2 hv_al heavy -- "$hv/stress/probe.sh" "$hv/stress" >/dev/null 2>&1 & wpid="$wpid $!"; done
+  for hs in $wpid; do wait "$hs"; done
+  [ "$(wc -l < "$hv/stress/seen" | tr -d ' ')" = 6 ] && [ "$(sort -n "$hv/stress/seen" | tail -1 | tr -d ' ')" = 2 ] \
+    && ok "six commands at once through two slots: all six ran, never more than two together" \
+    || bad "ceiling of 2 under a race: ran $(wc -l < "$hv/stress/seen" | tr -d ' '), peak $(sort -n "$hv/stress/seen" | tail -1 | tr -d ' ')"
+
+  # The load gate holds heavy work too, not only the tick.
+  HV_CAP=5 AGENTLOOP_LOADAVG="40 40 40" hv_al heavy --max-wait 2 -- true > "$hv/load.out" 2>&1; hrc=$?
+  [ "$hrc" = 75 ] && grep -q 'above the cap of 5' "$hv/load.out" \
+    && ok "a free slot is not enough above the load cap: heavy waits, and says the load is why" || bad "load gate ($hrc): $(cat "$hv/load.out")"
+  HV_CAP=5 AGENTLOOP_LOADAVG="40 40 40" hv_al host > "$hv/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 1 ] && grep -q 'BUSY — the load is above the cap' "$hv/host.out" \
+    && ok "agentloop host exits 1 for the load alone" || bad "host under load ($hrc): $(cat "$hv/host.out")"
+  HV_CAP=50 AGENTLOOP_LOADAVG="40 40 40" hv_al host >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && ok "and 0 when the slot is free and the load is under the cap" || bad "quiet host exited $hrc"
+
+  # A holder that is KILLED cannot release anything. The lease is what frees
+  # the slot -- the runner must also end the command, or it would go on
+  # running (and keeping a compose stack up) on a slot already given away.
+  hv_al heavy -- sleep 41 >/dev/null 2>&1 &
+  hpid=$!
+  sleep 2
+  hs="$(ls "$hv/data/locks/_heavy" 2>/dev/null | head -1)"
+  [ -n "$hs" ] && kill -9 "$hs" 2>/dev/null
+  wait "$hpid" 2>/dev/null
+  hv_al host > "$hv/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && grep -q '0 of 1 slot' "$hv/host.out" \
+    && ok "a holder killed with -9 is pruned by the lease: the host reads quiet again" || bad "after -9 ($hrc): $(cat "$hv/host.out")"
+  hl=0; while pgrep -f 'sleep 41' >/dev/null 2>&1 && [ "$hl" -lt 8 ]; do sleep 1; hl=$((hl + 1)); done
+  pgrep -f 'sleep 41' >/dev/null 2>&1 && { bad "the command outlived its killed holder"; pkill -f 'sleep 41'; } \
+    || ok "and the command it was running is ended with it, not left holding nothing"
+
+  # TERM/HUP: the slot goes, the command's whole group goes, the status is 128+n.
+  for hs in TERM HUP; do
+    hv_al heavy -- sleep 42 >/dev/null 2>&1 &
+    hpid=$!
+    sleep 2
+    kill -"$hs" "$(ls "$hv/data/locks/_heavy" | head -1)" 2>/dev/null
+    wait "$hpid"; hrc=$?
+    want_rc=$(( 128 + $(kill -l "$hs") ))
+    [ "$hrc" = "$want_rc" ] && [ -z "$(ls "$hv/data/locks/_heavy" 2>/dev/null)" ] \
+      && ok "$hs releases the slot and exits $want_rc" || bad "$hs: rc=$hrc slots=[$(ls "$hv/data/locks/_heavy" 2>/dev/null)]"
+    sleep 1
+    pgrep -f 'sleep 42' >/dev/null 2>&1 && { bad "$hs left the command running"; pkill -f 'sleep 42'; } || ok "and kills the command's process group, not just the shell"
+  done
+  # A waiter whose caller is gone (the agent was stopped or killed) would be
+  # handed a slot one day and run a command nobody asked for, holding it for
+  # the length of a suite.
+  hv_al heavy -- sleep 43 >/dev/null 2>&1 &
+  hpid=$!
+  sleep 2
+  printf '#!/bin/bash\n"$1" heavy -- true &\nwait\n' > "$hv/parent.sh"; chmod +x "$hv/parent.sh"
+  AGENTLOOP_CONFIG="$hv/config" AGENTLOOP_DATA="$hv/data" AGENTLOOP_HEAVY_POLL=1 AGENTLOOP_LOAD_CAP=0 \
+    AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents" "$hv/parent.sh" "$BIN_DIR/agentloop" > "$hv/orph.out" 2>&1 &
+  wpid=$!
+  sleep 2
+  kill -9 "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+  hl=0; while [ "$hl" -lt 10 ] && ! grep -q 'is gone' "$hv/orph.out" 2>/dev/null; do sleep 1; hl=$((hl + 1)); done
+  grep -q 'the process that asked for this is gone' "$hv/orph.out" \
+    && ok "a waiter orphaned by its caller gives up instead of waiting to run an unwanted command" \
+    || bad "an orphaned waiter: $(cat "$hv/orph.out")"
+  kill -TERM "$(ls "$hv/data/locks/_heavy" | head -1)" 2>/dev/null; wait "$hpid" 2>/dev/null
+  heavy_wait_fresh "$hv/nothing-here" && bad "a missing heartbeat counted as fresh" || ok "no heartbeat file is no proof of life"
+  mkdir -p "$hv/beat"; : > "$hv/beat/heavy-wait"; touch -t 202001010000 "$hv/beat/heavy-wait"
+  heavy_wait_fresh "$hv/beat" && bad "a stale heartbeat still vouched for a run" || ok "a heartbeat older than a few polls vouches for nothing (a killed waiter must not shield a hung run)"
+  : > "$hv/beat/heavy-wait"
+  heavy_wait_fresh "$hv/beat" && ok "a fresh one does" || bad "a fresh heartbeat was refused"
+  # THE WATCHDOG'S USE OF IT. e2e scenario 64 proves the behaviour with a real
+  # run; this pins the wiring, in the one place it can silently come undone.
+  got="$(sed -n '/^run_launch_and_watch()/,/^}/p' "$BIN_DIR/agentloop" | grep -c 'heavy_wait_fresh "\$slot"')"
+  [ "${got:-0}" -eq 1 ] && ok "the run watchdog reads a waiter's heartbeat as activity" \
+    || bad "run_launch_and_watch consults heavy_wait_fresh $got times, expected 1 -- queued runs would be killed as stalled"
+
+  echo "a running CI step occupies the host — agentloop host says so and agentloop heavy waits for it"
+  # 2026-10-10: an agent's `make test` held the heavy slot while a pull-request
+  # pipeline ran on the Bitbucket runner of the same Mac. Playwright hit its 30 s
+  # timeout, both pipelines failed and a release merge waited for hours -- and
+  # `agentloop host` said "quiet" throughout, because it only saw agent runs.
+  # The step containers' names are the shape in the runner's own log
+  # (<runner>_<step>_{clone,build,pause,system_auth-proxy}); the two fixtures are
+  # `docker ps --format '{{.Names}}'` lines of that shape (uuids and the runner's
+  # container name anonymised): the idle host, and a host during a step.
+  local ci="$tmp/ci" cit cn
+  mkdir -p "$ci/bin" "$ci/config" "$ci/data"
+  ln -sf "$BASE_DIR/test/fake-docker" "$ci/bin/docker"
+  printf '%s' '{"projects":[]}' > "$ci/config/projects.json"
+  ci_names() { # ci_names <file of container names> -> the fake docker's state
+    python3 - "$1" > "$ci/state.json" <<'PY'
+import json, sys
+names = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+json.dump({"containers": [{"id": "c%02d" % i, "name": n, "project": "", "created": ""}
+                          for i, n in enumerate(names)],
+           "images": [], "volumes": [], "networks": [], "log": []}, sys.stdout)
+PY
+  }
+  ci_al() { PATH="$ci/bin:$PATH" FAKE_DOCKER_STATE="$ci/state.json" AGENTLOOP_CONFIG="$ci/config" AGENTLOOP_DATA="$ci/data" \
+            AGENTLOOP_CI_GATE="${CI_GATE:-1}" AGENTLOOP_HEAVY_POLL=1 AGENTLOOP_LOAD_CAP=0 AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents" \
+            "$BIN_DIR/agentloop" "$@"; }
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-idle.txt"
+  ci_al host > "$ci/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && grep -q 'no CI step running' "$ci/host.out" && grep -q 'no CI step is running' "$ci/host.out" \
+    && ok "no step container (the agents' own stacks and the runner itself do not match): the host is quiet, and says it looked" \
+    || bad "idle host ($hrc): $(cat "$ci/host.out")"
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-ci-step.txt"
+  ci_al host > "$ci/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 1 ] && grep -q 'BUSY — a CI step is running' "$ci/host.out" \
+    && ok "a step's containers running: agentloop host exits 1 for the CI step alone" || bad "host during a step ($hrc): $(cat "$ci/host.out")"
+  [ "$(grep -c 'holder .*ci step' "$ci/host.out")" = 1 ] && grep -q 'holder    ci step 8648124f (bitbucket runner)' "$ci/host.out" \
+    && ok "it is listed as ONE holder (pause and build are one step), named by its short step id" || bad "ci holder lines: $(grep holder "$ci/host.out")"
+  grep -q '0 of 1 slot(s) in use' "$ci/host.out" \
+    && ok "and it takes no heavy slot: it is not counted against the ceiling" || bad "slot count: $(grep heavy "$ci/host.out")"
+  # Only the two containers that live through the step count: a clone or the
+  # auth proxy alone is not a step (clone is gone after the checkout).
+  printf '%s\n' c411fdb1-dc76-56eb-8023-fbc983f1fe62_8648124f-1c0c-4856-8256-31508103c341_clone \
+                c411fdb1-dc76-56eb-8023-fbc983f1fe62_8648124f-1c0c-4856-8256-31508103c341_system_auth-proxy \
+                C411FDB1-DC76-56EB-8023-FBC983F1FE62_8648124F-1C0C-4856-8256-31508103C341_build \
+                c411fdb1-dc76-56eb-8023-fbc983f1fe62_8648124f-1c0c-4856-8256-31508103c341_builder > "$ci/near.txt"
+  ci_names "$ci/near.txt"
+  ci_al host >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && ok "clone, the auth proxy, upper-case ids and a longer suffix are not a step" || bad "near-misses held the host ($hrc)"
+  # An exited container is not listed by a real `docker ps`; nor by the fake.
+  python3 - "$ci" <<'PY'
+import json, sys
+p = sys.argv[1] + "/state.json"
+s = json.load(open(p))
+s["containers"] = [{"id": "x1", "name": "c411fdb1-dc76-56eb-8023-fbc983f1fe62_8648124f-1c0c-4856-8256-31508103c341_pause",
+                    "project": "", "created": "", "state": "exited"}]
+json.dump(s, open(p, "w"))
+PY
+  ci_al host >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && ok "a step container that has exited holds nothing" || bad "an exited container held the host"
+
+  # heavy waits while the step runs, holding no slot, and goes the moment it ends.
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-ci-step.txt"
+  ci_al heavy --max-wait 2 -- true > "$ci/wait.out" 2>&1; hrc=$?
+  [ "$hrc" = 75 ] && grep -q 'waiting — a CI step is running on this host (ci step 8648124f (bitbucket runner))' "$ci/wait.out" \
+    && grep -q 'Holding the slot(s): ci step 8648124f (bitbucket runner)' "$ci/wait.out" \
+    && ok "agentloop heavy waits for the CI step and says that is why, naming it as the holder" \
+    || bad "heavy during a step ($hrc): $(cat "$ci/wait.out")"
+  [ -z "$(ls "$ci/data/locks/_heavy" 2>/dev/null)" ] && ok "and it held no slot while it waited" || bad "a waiter took a slot behind CI"
+  rm -f "$ci/ran.out"
+  ci_al heavy --max-wait 40 -- echo ran-after-ci > "$ci/ran.out" 2>&1 &
+  hpid=$!
+  hl=0; while [ "$hl" -lt 15 ] && ! grep -q 'waiting' "$ci/ran.out" 2>/dev/null; do sleep 1; hl=$((hl + 1)); done
+  sleep 2
+  grep -q 'ran-after-ci$' "$ci/ran.out" && bad "the command ran while the step still did" || ok "the command has not started while the step runs"
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-idle.txt"        # the step ends
+  wait "$hpid"; hrc=$?
+  [ "$hrc" = 0 ] && grep -q 'got a heavy slot' "$ci/ran.out" && grep -q '^ran-after-ci$' "$ci/ran.out" \
+    && ok "it starts once the step's containers are gone, and its exit code comes back" || bad "after the step ($hrc): $(cat "$ci/ran.out")"
+
+  # FAIL OPEN. Docker hung on the day this was written; a gate that waits on a
+  # hung daemon wedges every agent of every project.
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-ci-step.txt"
+  hl=$SECONDS
+  FAKE_DOCKER_HANG=30 AGENTLOOP_CI_TIMEOUT=1 ci_al host > "$ci/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && [ $(( SECONDS - hl )) -lt 12 ] && grep -q 'docker did not answer within 1s — not counting CI steps (failing open)' "$ci/host.out" \
+    && ok "a docker that does not answer in time: host is NOT held by it, answers within the timeout, and says it failed open" \
+    || bad "hung docker ($hrc, $(( SECONDS - hl ))s): $(cat "$ci/host.out")"
+  hl=$SECONDS
+  FAKE_DOCKER_HANG=30 AGENTLOOP_CI_TIMEOUT=1 ci_al heavy --max-wait 20 -- echo ran-open > "$ci/ran.out" 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && [ $(( SECONDS - hl )) -lt 12 ] && [ "$(grep -c 'docker did not answer' "$ci/ran.out")" = 1 ] && grep -q '^ran-open$' "$ci/ran.out" \
+    && ok "heavy runs the command on a hung docker, and says so once" || bad "heavy on a hung docker ($hrc): $(cat "$ci/ran.out")"
+  pgrep -f 'fake-docker ps' >/dev/null 2>&1 && { sleep 2; pgrep -f 'fake-docker ps' >/dev/null 2>&1 && bad "a hung docker ps was left running"; } || ok "and the hung docker ps is ended, not left behind"
+  FAKE_DOCKER_PS_FAIL=1 ci_al host > "$ci/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && grep -q 'docker ps failed (exit 1)' "$ci/host.out" \
+    && ok "a docker that refuses (daemon down) fails open too" || bad "failing docker ($hrc): $(cat "$ci/host.out")"
+  ( host_docker_bin() { return 1; }; PROJECTS_FILE="$ci/config/projects.json"; AGENTLOOP_CI_GATE=1; host_ci_running; echo "$? $HOST_CI_STATE" ) > "$ci/nodocker.out" 2>&1
+  [ "$(cat "$ci/nodocker.out")" = "1 open" ] && ok "and so does a machine with no docker at all" || bad "no docker: $(cat "$ci/nodocker.out")"
+
+  # Off, and the settings in the order the others use.
+  CI_GATE=0 ci_al host > "$ci/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && grep -q 'ci          off' "$ci/host.out" && ! grep -q 'ci step' "$ci/host.out" \
+    && ok "AGENTLOOP_CI_GATE=0 ignores a running step (and host says the gate is off)" || bad "gate off ($hrc): $(cat "$ci/host.out")"
+  CI_GATE=off ci_al host >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && ok "and so does the word off" || bad "AGENTLOOP_CI_GATE=off held the host ($hrc)"
+  for cit in '{"projects":[],"host":{"ci_gate":0}}' '{"projects":[],"host":{"ci_gate":false}}'; do
+    printf '%s' "$cit" > "$ci/config/projects.json"
+    cn="$(PATH="$ci/bin:$PATH" FAKE_DOCKER_STATE="$ci/state.json" AGENTLOOP_CONFIG="$ci/config" AGENTLOOP_DATA="$ci/data" AGENTLOOP_LOAD_CAP=0 \
+          AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents" "$BIN_DIR/agentloop" host 2>&1)"; hrc=$?
+    [ "$hrc" = 0 ] && printf '%s' "$cn" | grep -q 'ci          off' \
+      && ok "host.ci_gate in projects.json switches it off ($cit)" || bad "projects.json $cit ($hrc): $cn"
+  done
+  cn="$(CI_GATE=1 ci_al host 2>&1)"; hrc=$?
+  [ "$hrc" = 1 ] && ok "and the environment wins over the host block (AGENTLOOP_CI_GATE=1 against ci_gate 0)" || bad "env over block ($hrc): $cn"
+  printf '%s' '{"projects":[],"host":{"ci_pattern":"^my-ci-job"}}' > "$ci/config/projects.json"
+  printf '%s\n' my-ci-job-7 > "$ci/custom.txt"; ci_names "$ci/custom.txt"
+  cn="$(ci_al host 2>&1)"; hrc=$?
+  [ "$hrc" = 1 ] && printf '%s' "$cn" | grep -q 'holder    ci container my-ci-job-7' \
+    && ok "host.ci_pattern chooses which containers are a CI step (shown as they are named)" || bad "custom pattern ($hrc): $cn"
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-ci-step.txt"
+  ci_al host >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && ok "and the default shape no longer counts once the pattern is changed" || bad "default shape still held the host under a custom pattern"
+  printf '%s' '{"projects":[]}' > "$ci/config/projects.json"
+  cn="$(AGENTLOOP_CI_PATTERN='(' ci_al host 2>&1)"; hrc=$?
+  [ "$hrc" = 1 ] && ! printf '%s' "$cn" | grep -q 'parentheses' \
+    && ok "a pattern that is not a valid regex is skipped, never half-used (the next source applies: here the default)" || bad "invalid env pattern ($hrc): $cn"
+  # The decision, pinned: a CI step holds heavy work, not launches. The tick
+  # would otherwise run one `docker ps` per due job per tick, and a slow daemon
+  # would sit in the scheduler's own path.
+  [ "$(sed -n '/^cmd_tick()/,/^}/p' "$BIN_DIR/agentloop" | grep -c 'host_ci')" = 0 ] \
+    && ok "the tick does not consult CI: a step holds heavy slots, not launches" || bad "cmd_tick consults the CI gate"
+
+  echo "the host contract reaches every job that can start a stack, and says the right things"
+  # The gate only works if every agent routes its suites through it, and the
+  # only way to tell them is the prompt the scheduler injects -- never a
+  # personal jobs.json (CONTRIBUTING rule 1).
+  local hc hp
+  hc="$(host_contract)"
+  hp="$(inject_contract "rc-dev-agent" "Do the ticket.")"
+  case "$hp" in *"$HOST_CONTRACT_MARKER"*) ok "an ordinary job receives the host contract" ;; *) bad "an ordinary job did not" ;; esac
+  case "$hp" in "Do the ticket."*) ok "after its own prompt, which is kept" ;; *) bad "the job's prompt was displaced" ;; esac
+  [ "$(inject_contract "rc-dev-agent" "$hp")" = "$hp" ] && ok "injection stays idempotent with the host contract in" || bad "a second injection changed the prompt"
+  hp="$(inject_contract "old-job" "Do it. $RUN_ENDING_MARKER already, in my own words.")"
+  case "$hp" in *"$HOST_CONTRACT_MARKER"*) ok "a prompt that already carries the run-ending contract still gets the host contract" ;;
+    *) bad "a job worded its own way never learns about the gate" ;; esac
+  hp="$(inject_contract "${SECURITY_JOB_PREFIX}web" "Triage these rows.")"
+  case "$hp" in *"$HOST_CONTRACT_MARKER"*) bad "a security unit is handed the host contract" ;;
+    *) ok "a security unit is not: it reads code through \`agentloop security read\`, is never provisioned and runs no suite, and an analysis launches hundreds of them" ;; esac
+  case "$hc" in *"$(printf '%q' "$SELF") heavy -- "*) ok "it gives the invocation as an absolute path that works without a PATH" ;; *) bad "no absolute invocation in the contract" ;; esac
+  case "$hc" in *'$AL_BIN'*) ok "and the variable that holds it" ;; *) bad "AL_BIN not named" ;; esac
+  case "$hc" in *"make"*"test"*"docker compose up"*) ok "it names the commands that count as heavy" ;; *) bad "heavy commands not named" ;; esac
+  # The trial merge legitimately runs in a scratch worktree of its own (git worktree add --detach, then
+  # make reset and git worktree remove), so the rule is ONE STACK AT A TIME, not one worktree.
+  case "$hc" in *"One suite and one stack at a time"*"one after the other"*"take the first stack down before bringing up the second"*"remove its worktree"*)
+    ok "one suite and one stack at a time; a trial merge's own worktree is allowed once the first stack is down" ;; *) bad "one-stack-at-a-time rule missing" ;; esac
+  case "$hc" in *"same worktree"*|*"SAME worktree"*|*"never in a second worktree"*) bad "the contract forbids the trial merge's scratch worktree" ;; *) ok "and it no longer forbids a second worktree outright" ;; esac
+  case "$hc" in *"Take down a suite's stack"*"before starting anything else"*) ok "teardown as soon as the result is read" ;; *) bad "teardown rule missing" ;; esac
+  case "$hc" in *"Waiting for a slot is normal"*"deferral"*) ok "waiting is normal, never a deferral" ;; *) bad "waiting rule missing" ;; esac
+  case "$hc" in *"only by timeouts"*"not a red build"*) ok "a suite that failed only by timeouts under load is re-run, not reported red" ;; *) bad "timeout rule missing" ;; esac
+  [ "$(printf '%s\n' "$hc" | wc -l | tr -d ' ')" -le 24 ] && ok "and it is short (read by every run)" || bad "the host contract grew past 24 lines"
+
   echo "the run-ending contract ships with the CODE, not with a personal jobs.json"
   # The classifier demands a marker. If the contract that teaches it lives only in
   # one person's (gitignored) jobs.json, everyone else clones a scheduler that
@@ -5179,6 +5537,29 @@ NASTY
   [ ! -f "$tmp/data/sweep.log" ] \
     && ok "a project with a live run is not swept" \
     || bad "the sweep ran while a run of that project was still live"
+  # A project that opts in (worktree.sweep_during_runs) is swept anyway, but
+  # TOLD that a run is live, so its hook can restrict itself to what holds no
+  # data. Revenue Copilot always has a run going, and without this its sweep
+  # never ran at all: a day of finished runs' images piled up behind it.
+  "$JQ" '(.projects[] | select(.name == "two") | .worktree) |= ((. // {}) + {sweep_during_runs: true})' \
+    "$tmp/proj/two.json" > "$tmp/proj/two-live.json"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "swept live=${AL_SWEEP_LIVE_RUN:-}" >> "$AL_SWEEP_LOG"' \
+    > "$tmp/cfg/provision/two.sweep.sh"
+  rm -f "$tmp/data/.sweep.stamp" "$tmp/data/sweep.log"
+  ( PROJECTS_FILE="$tmp/proj/two-live.json"; CONFIG_DIR="$tmp/cfg"; JOBS_FILE="$tmp/cfg/jobs.json"
+    DATA_DIR="$tmp/data"; LOCK_DIR="$tmp/locks"; WORKTREES_DIR="$tmp/wtroot"
+    AL_SWEEP_LOG="$tmp/data/sweep.log"; export AL_SWEEP_LOG
+    wt_sweep_projects ) >/dev/null 2>&1
+  [ "$(cat "$tmp/data/sweep.log" 2>/dev/null)" = "swept live=1" ] \
+    && ok "a project that opted in is swept during a live run, told AL_SWEEP_LIVE_RUN=1" \
+    || bad "an opted-in project with a live run: $(cat "$tmp/data/sweep.log" 2>/dev/null || echo 'not swept')"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "swept" >> "$AL_SWEEP_LOG"' \
+    'cp "$AL_LIVE_WORKTREES" "$AL_SWEEP_LOG.live"' \
+    'cp "$AL_CANONICALS" "$AL_SWEEP_LOG.canon"' \
+    > "$tmp/cfg/provision/two.sweep.sh"
+  rm -f "$tmp/data/sweep.log"
   # Kill the claim and it runs.
   rm -rf "$tmp/locks/jLive"
   rm -f "$tmp/data/.sweep.stamp"
@@ -6335,6 +6716,15 @@ $(_res w2 false)")" = "1" ] \
     *) bad "the daily cap holding the fleet was not reported" ;;
   esac
 
+  # The host gate holding the fleet back: the load is over the cap and every due
+  # job was turned away at the tick (cmd_tick), so nothing started.
+  : > "$tmp/stall/tick.log"
+  stall_at 90 "a: host busy (load 28.4 > 15.0), not launching"
+  case "$(stall_ask)" in
+    *"host load is above its cap"*) ok "hours of 'host busy' with nothing running is a stall, and says why" ;;
+    *) bad "a load-gated fleet was not reported: $(stall_ask)" ;;
+  esac
+
   # max_parallel with nothing actually running means the slots being counted
   # belong to processes that are gone — a job blocked for ever by a ghost.
   : > "$tmp/stall/tick.log"
@@ -6379,7 +6769,7 @@ $(_res w2 false)")" = "1" ] \
   # this without breaking anything visible.
   srv="$BIN_DIR/agentloop-server"
   miss=""
-  for phrase in "PRECHECK FAILED" "usage limit reached" "daily cap reached" "max_parallel"; do
+  for phrase in "PRECHECK FAILED" "usage limit reached" "daily cap reached" "host busy" "max_parallel"; do
     grep -qF "$phrase" "$srv" || miss="$miss '$phrase'"
   done
   [ -z "$miss" ] \
