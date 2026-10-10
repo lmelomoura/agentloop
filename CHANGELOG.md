@@ -41,8 +41,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Both settings are `AGENTLOOP_HEAVY_SLOTS` / `AGENTLOOP_LOAD_CAP` or the
   `host` block of `projects.json`. Every job (not security units) is handed a
   short host contract telling the agent to run suites through
-  `agentloop heavy`, one at a time, to tear the stack down after reading the
-  result, and never to write a deferral because the host is busy. **The stall
+  `agentloop heavy`, one suite and one stack at a time (a trial merge may use
+  a worktree of its own once the first stack is down), to tear the stack down
+  after reading the result, never to write a deferral because the host is busy,
+  and, because a tool call cut off by its limit leaves the command running, to
+  start a long suite with its output and exit code in files and block on the
+  exit-code file rather than start it a second time. **The stall
   watchdog does not kill a run that is waiting for a slot**: a waiter's
   heartbeat counts as activity, because a run queued behind the gate sleeps
   with no output and no CPU, which is exactly what the stall rule kills.
