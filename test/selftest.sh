@@ -110,6 +110,10 @@ cmd_selftest() { # offline checks of the logic that can kill a run or lose money
   # never leak that account into a fake run here.
   mkdir -p "$tmp/LaunchAgents"
   export AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents"
+  # The CI gate asks the REAL docker which containers run. A pipeline on this
+  # machine must not turn a test of something else BUSY: off for the whole
+  # suite; the block that tests it turns it on beside a fake docker (ci_al).
+  export AGENTLOOP_CI_GATE=0
   ok()   { pass=$(( pass + 1 )); printf '  ok    %s\n' "$1"; }
   bad()  { fail=$(( fail + 1 )); printf '  FAIL  %s\n' "$1"; }
   want() { # want <label> <expected 0|1> <actual-rc>
@@ -3643,6 +3647,136 @@ EOF
   got="$(sed -n '/^run_launch_and_watch()/,/^}/p' "$BIN_DIR/agentloop" | grep -c 'heavy_wait_fresh "\$slot"')"
   [ "${got:-0}" -eq 1 ] && ok "the run watchdog reads a waiter's heartbeat as activity" \
     || bad "run_launch_and_watch consults heavy_wait_fresh $got times, expected 1 -- queued runs would be killed as stalled"
+
+  echo "a running CI step occupies the host — agentloop host says so and agentloop heavy waits for it"
+  # 2026-10-10: an agent's `make test` held the heavy slot while a pull-request
+  # pipeline ran on the Bitbucket runner of the same Mac. Playwright hit its 30 s
+  # timeout, both pipelines failed and a release merge waited for hours -- and
+  # `agentloop host` said "quiet" throughout, because it only saw agent runs.
+  # The step containers' names are the shape in the runner's own log
+  # (<runner>_<step>_{clone,build,pause,system_auth-proxy}); the two fixtures are
+  # `docker ps --format '{{.Names}}'` lines of that shape (uuids and the runner's
+  # container name anonymised): the idle host, and a host during a step.
+  local ci="$tmp/ci" cit cn
+  mkdir -p "$ci/bin" "$ci/config" "$ci/data"
+  ln -sf "$BASE_DIR/test/fake-docker" "$ci/bin/docker"
+  printf '%s' '{"projects":[]}' > "$ci/config/projects.json"
+  ci_names() { # ci_names <file of container names> -> the fake docker's state
+    python3 - "$1" > "$ci/state.json" <<'PY'
+import json, sys
+names = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+json.dump({"containers": [{"id": "c%02d" % i, "name": n, "project": "", "created": ""}
+                          for i, n in enumerate(names)],
+           "images": [], "volumes": [], "networks": [], "log": []}, sys.stdout)
+PY
+  }
+  ci_al() { PATH="$ci/bin:$PATH" FAKE_DOCKER_STATE="$ci/state.json" AGENTLOOP_CONFIG="$ci/config" AGENTLOOP_DATA="$ci/data" \
+            AGENTLOOP_CI_GATE="${CI_GATE:-1}" AGENTLOOP_HEAVY_POLL=1 AGENTLOOP_LOAD_CAP=0 AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents" \
+            "$BIN_DIR/agentloop" "$@"; }
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-idle.txt"
+  ci_al host > "$ci/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && grep -q 'no CI step running' "$ci/host.out" && grep -q 'no CI step is running' "$ci/host.out" \
+    && ok "no step container (the agents' own stacks and the runner itself do not match): the host is quiet, and says it looked" \
+    || bad "idle host ($hrc): $(cat "$ci/host.out")"
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-ci-step.txt"
+  ci_al host > "$ci/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 1 ] && grep -q 'BUSY — a CI step is running' "$ci/host.out" \
+    && ok "a step's containers running: agentloop host exits 1 for the CI step alone" || bad "host during a step ($hrc): $(cat "$ci/host.out")"
+  [ "$(grep -c 'holder .*ci step' "$ci/host.out")" = 1 ] && grep -q 'holder    ci step 8648124f (bitbucket runner)' "$ci/host.out" \
+    && ok "it is listed as ONE holder (pause and build are one step), named by its short step id" || bad "ci holder lines: $(grep holder "$ci/host.out")"
+  grep -q '0 of 1 slot(s) in use' "$ci/host.out" \
+    && ok "and it takes no heavy slot: it is not counted against the ceiling" || bad "slot count: $(grep heavy "$ci/host.out")"
+  # Only the two containers that live through the step count: a clone or the
+  # auth proxy alone is not a step (clone is gone after the checkout).
+  printf '%s\n' c411fdb1-dc76-56eb-8023-fbc983f1fe62_8648124f-1c0c-4856-8256-31508103c341_clone \
+                c411fdb1-dc76-56eb-8023-fbc983f1fe62_8648124f-1c0c-4856-8256-31508103c341_system_auth-proxy \
+                C411FDB1-DC76-56EB-8023-FBC983F1FE62_8648124F-1C0C-4856-8256-31508103C341_build \
+                c411fdb1-dc76-56eb-8023-fbc983f1fe62_8648124f-1c0c-4856-8256-31508103c341_builder > "$ci/near.txt"
+  ci_names "$ci/near.txt"
+  ci_al host >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && ok "clone, the auth proxy, upper-case ids and a longer suffix are not a step" || bad "near-misses held the host ($hrc)"
+  # An exited container is not listed by a real `docker ps`; nor by the fake.
+  python3 - "$ci" <<'PY'
+import json, sys
+p = sys.argv[1] + "/state.json"
+s = json.load(open(p))
+s["containers"] = [{"id": "x1", "name": "c411fdb1-dc76-56eb-8023-fbc983f1fe62_8648124f-1c0c-4856-8256-31508103c341_pause",
+                    "project": "", "created": "", "state": "exited"}]
+json.dump(s, open(p, "w"))
+PY
+  ci_al host >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && ok "a step container that has exited holds nothing" || bad "an exited container held the host"
+
+  # heavy waits while the step runs, holding no slot, and goes the moment it ends.
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-ci-step.txt"
+  ci_al heavy --max-wait 2 -- true > "$ci/wait.out" 2>&1; hrc=$?
+  [ "$hrc" = 75 ] && grep -q 'waiting — a CI step is running on this host (ci step 8648124f (bitbucket runner))' "$ci/wait.out" \
+    && grep -q 'Holding the slot(s): ci step 8648124f (bitbucket runner)' "$ci/wait.out" \
+    && ok "agentloop heavy waits for the CI step and says that is why, naming it as the holder" \
+    || bad "heavy during a step ($hrc): $(cat "$ci/wait.out")"
+  [ -z "$(ls "$ci/data/locks/_heavy" 2>/dev/null)" ] && ok "and it held no slot while it waited" || bad "a waiter took a slot behind CI"
+  rm -f "$ci/ran.out"
+  ci_al heavy --max-wait 40 -- echo ran-after-ci > "$ci/ran.out" 2>&1 &
+  hpid=$!
+  hl=0; while [ "$hl" -lt 15 ] && ! grep -q 'waiting' "$ci/ran.out" 2>/dev/null; do sleep 1; hl=$((hl + 1)); done
+  sleep 2
+  grep -q 'ran-after-ci$' "$ci/ran.out" && bad "the command ran while the step still did" || ok "the command has not started while the step runs"
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-idle.txt"        # the step ends
+  wait "$hpid"; hrc=$?
+  [ "$hrc" = 0 ] && grep -q 'got a heavy slot' "$ci/ran.out" && grep -q '^ran-after-ci$' "$ci/ran.out" \
+    && ok "it starts once the step's containers are gone, and its exit code comes back" || bad "after the step ($hrc): $(cat "$ci/ran.out")"
+
+  # FAIL OPEN. Docker hung on the day this was written; a gate that waits on a
+  # hung daemon wedges every agent of every project.
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-ci-step.txt"
+  hl=$SECONDS
+  FAKE_DOCKER_HANG=30 AGENTLOOP_CI_TIMEOUT=1 ci_al host > "$ci/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && [ $(( SECONDS - hl )) -lt 12 ] && grep -q 'docker did not answer within 1s — not counting CI steps (failing open)' "$ci/host.out" \
+    && ok "a docker that does not answer in time: host is NOT held by it, answers within the timeout, and says it failed open" \
+    || bad "hung docker ($hrc, $(( SECONDS - hl ))s): $(cat "$ci/host.out")"
+  hl=$SECONDS
+  FAKE_DOCKER_HANG=30 AGENTLOOP_CI_TIMEOUT=1 ci_al heavy --max-wait 20 -- echo ran-open > "$ci/ran.out" 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && [ $(( SECONDS - hl )) -lt 12 ] && [ "$(grep -c 'docker did not answer' "$ci/ran.out")" = 1 ] && grep -q '^ran-open$' "$ci/ran.out" \
+    && ok "heavy runs the command on a hung docker, and says so once" || bad "heavy on a hung docker ($hrc): $(cat "$ci/ran.out")"
+  pgrep -f 'fake-docker ps' >/dev/null 2>&1 && { sleep 2; pgrep -f 'fake-docker ps' >/dev/null 2>&1 && bad "a hung docker ps was left running"; } || ok "and the hung docker ps is ended, not left behind"
+  FAKE_DOCKER_PS_FAIL=1 ci_al host > "$ci/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && grep -q 'docker ps failed (exit 1)' "$ci/host.out" \
+    && ok "a docker that refuses (daemon down) fails open too" || bad "failing docker ($hrc): $(cat "$ci/host.out")"
+  ( host_docker_bin() { return 1; }; PROJECTS_FILE="$ci/config/projects.json"; AGENTLOOP_CI_GATE=1; host_ci_running; echo "$? $HOST_CI_STATE" ) > "$ci/nodocker.out" 2>&1
+  [ "$(cat "$ci/nodocker.out")" = "1 open" ] && ok "and so does a machine with no docker at all" || bad "no docker: $(cat "$ci/nodocker.out")"
+
+  # Off, and the settings in the order the others use.
+  CI_GATE=0 ci_al host > "$ci/host.out" 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && grep -q 'ci          off' "$ci/host.out" && ! grep -q 'ci step' "$ci/host.out" \
+    && ok "AGENTLOOP_CI_GATE=0 ignores a running step (and host says the gate is off)" || bad "gate off ($hrc): $(cat "$ci/host.out")"
+  CI_GATE=off ci_al host >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && ok "and so does the word off" || bad "AGENTLOOP_CI_GATE=off held the host ($hrc)"
+  for cit in '{"projects":[],"host":{"ci_gate":0}}' '{"projects":[],"host":{"ci_gate":false}}'; do
+    printf '%s' "$cit" > "$ci/config/projects.json"
+    cn="$(PATH="$ci/bin:$PATH" FAKE_DOCKER_STATE="$ci/state.json" AGENTLOOP_CONFIG="$ci/config" AGENTLOOP_DATA="$ci/data" AGENTLOOP_LOAD_CAP=0 \
+          AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents" "$BIN_DIR/agentloop" host 2>&1)"; hrc=$?
+    [ "$hrc" = 0 ] && printf '%s' "$cn" | grep -q 'ci          off' \
+      && ok "host.ci_gate in projects.json switches it off ($cit)" || bad "projects.json $cit ($hrc): $cn"
+  done
+  cn="$(CI_GATE=1 ci_al host 2>&1)"; hrc=$?
+  [ "$hrc" = 1 ] && ok "and the environment wins over the host block (AGENTLOOP_CI_GATE=1 against ci_gate 0)" || bad "env over block ($hrc): $cn"
+  printf '%s' '{"projects":[],"host":{"ci_pattern":"^my-ci-job"}}' > "$ci/config/projects.json"
+  printf '%s\n' my-ci-job-7 > "$ci/custom.txt"; ci_names "$ci/custom.txt"
+  cn="$(ci_al host 2>&1)"; hrc=$?
+  [ "$hrc" = 1 ] && printf '%s' "$cn" | grep -q 'holder    ci container my-ci-job-7' \
+    && ok "host.ci_pattern chooses which containers are a CI step (shown as they are named)" || bad "custom pattern ($hrc): $cn"
+  ci_names "$BASE_DIR/test/fixtures/docker-ps-names-ci-step.txt"
+  ci_al host >/dev/null 2>&1; hrc=$?
+  [ "$hrc" = 0 ] && ok "and the default shape no longer counts once the pattern is changed" || bad "default shape still held the host under a custom pattern"
+  printf '%s' '{"projects":[]}' > "$ci/config/projects.json"
+  cn="$(AGENTLOOP_CI_PATTERN='(' ci_al host 2>&1)"; hrc=$?
+  [ "$hrc" = 1 ] && ! printf '%s' "$cn" | grep -q 'parentheses' \
+    && ok "a pattern that is not a valid regex is skipped, never half-used (the next source applies: here the default)" || bad "invalid env pattern ($hrc): $cn"
+  # The decision, pinned: a CI step holds heavy work, not launches. The tick
+  # would otherwise run one `docker ps` per due job per tick, and a slow daemon
+  # would sit in the scheduler's own path.
+  [ "$(sed -n '/^cmd_tick()/,/^}/p' "$BIN_DIR/agentloop" | grep -c 'host_ci')" = 0 ] \
+    && ok "the tick does not consult CI: a step holds heavy slots, not launches" || bad "cmd_tick consults the CI gate"
 
   echo "the host contract reaches every job that can start a stack, and says the right things"
   # The gate only works if every agent routes its suites through it, and the

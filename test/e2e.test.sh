@@ -52,6 +52,10 @@ export AL_SECURITY_ENGINES=off
 # fail for a reason that has nothing to do with it. Off here; scenario 65 turns it
 # on with a load it dictates (AGENTLOOP_LOADAVG), which is how it proves the gate.
 export AGENTLOOP_LOAD_CAP=0
+# The same for the CI gate of `agentloop host` / `heavy`: it asks the real docker
+# which containers run, and a pipeline on the developer's machine would make
+# scenarios 64 and 66 wait for it. The selftest proves the gate beside a fake docker.
+export AGENTLOOP_CI_GATE=0
 mkdir -p "$CODEX_HOME"
 git init -q --bare "$ROOT/remote/origin.git"
 git init -q "$ROOT/work/app"

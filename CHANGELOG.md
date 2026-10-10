@@ -20,6 +20,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A running CI step occupies the host's heavy gate.** `agentloop host` and
+  `agentloop heavy` only saw agent runs, but a Bitbucket Pipelines runner shares
+  the same Mac. On 2026-10-10 an agent's `make test` held the heavy slot while a
+  pull-request pipeline ran beside it: Playwright hit its 30 s timeout, the pull
+  request's pipeline and the branch's both failed, and a release merge waited
+  for hours, while `agentloop host` read "quiet" throughout. Now a running
+  container named like the runner's step (`<runner-uuid>_<step-uuid>_pause` or
+  `_build`, the shape in the runner's own log; `_pause` lives for the whole step)
+  makes `agentloop host` print `BUSY — a CI step is running` and list it as a
+  holder (`ci step 8648124f (bitbucket runner)`, once per step), and
+  `agentloop heavy` waits for the step to end, saying so and naming it, before it
+  takes a slot (it holds none while it waits). A CI step is not a slot: it does
+  not count against `heavy_slots`. The check is one `docker ps` per look,
+  bounded by a timeout (5 s), and **fails open**: Docker hung on the day this
+  was found, and a gate that waits on a hung daemon would stop every agent of
+  every project, so a `docker ps` that times out, fails or cannot be run counts
+  as "no CI step", `agentloop host` says so (`docker did not answer within 5s —
+  not counting CI steps (failing open)`) and `heavy` says it once. The tick does
+  not look: a CI step holds heavy work, not launches (launching an agent is
+  light, and a `docker ps` per due job would put a slow daemon in the
+  scheduler's own path). Settings, in the order of the other host ones:
+  `AGENTLOOP_CI_GATE` / `host.ci_gate` (`0`, `off` or `false` = off, default on),
+  `AGENTLOOP_CI_PATTERN` / `host.ci_pattern` (an extended regex over container
+  names; an invalid one is skipped) and `AGENTLOOP_CI_TIMEOUT` /
+  `host.ci_timeout` (seconds, 1-60). The gate is checked when a command asks for
+  a slot: a step that starts while a command already runs is not waited for.
+  `test/fake-docker` learned `ps --format '{{.Names}}'`, `FAKE_DOCKER_HANG` and
+  `FAKE_DOCKER_PS_FAIL`; the selftest and the e2e suite switch the gate off
+  (`AGENTLOOP_CI_GATE=0`) so a pipeline on the developer's machine cannot turn a
+  test of something else busy.
+
 - **The host has a limit of its own: heavy slots and a load gate.**
   `max_parallel` only limits the runs of one job, so nothing stopped every
   project's agents, a reviewer measuring two suites at once and a CI runner

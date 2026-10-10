@@ -4296,6 +4296,112 @@ EOF
   awk -v l="$HOST_L5" -v c="$HOST_CAP" 'BEGIN { exit !(l + 0 > c + 0) }'
 }
 
+# ---- a CI step on this host occupies it too -------------------------------
+# The heavy slots and the load average only see agent runs. A Bitbucket
+# Pipelines runner shares the machine, and on 2026-10-10 an agent's `make test`
+# held the slot while a pull-request pipeline ran beside it: Playwright hit its
+# 30 s timeout, the PR pipeline and the branch pipeline both failed and a release
+# merge waited for hours. While a CI step runs, `agentloop host` says BUSY and
+# `agentloop heavy` waits.
+#
+# THE SIGNAL, captured from a runner's own log: every step creates
+#   <runner-uuid>_<step-uuid>_{clone,build,pause,system_auth-proxy}
+# `_pause` lives for the whole step and `_build` while the script runs; between
+# steps none of them exists (`docker ps` shows only the runner itself). Uuids
+# are lowercase 8-4-4-4-12 hex. The default pattern matches `_pause` and
+# `_build`, which together cover the step; a step is counted once.
+#
+# FAIL OPEN. One `docker ps` per look, bounded by a timeout (run_bounded). Docker
+# hung on the day this was written; a gate that waits on a hung daemon would
+# wedge every agent of every project. A `docker ps` that times out, fails, or
+# cannot be run counts as "no CI step" and `agentloop host` says so.
+#
+# It affects heavy slots only. The tick does not look: launching an agent is
+# light (it reads code and calls `agentloop heavy` for the suite), and a
+# `docker ps` per due job per tick would put a slow daemon in the scheduler's
+# own path.
+HOST_CI_UUID='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+HOST_CI_DEFAULT_PATTERN="^${HOST_CI_UUID}_[0-9a-f-]{36}_(pause|build)\$"
+HOST_CI_STATE="";  HOST_CI_NOTE="";  HOST_CI_NAMES="";  HOST_CI_LABELS=""   # see host_ci_running
+
+host_ci_gate() { # 0 when a running CI step is part of "busy"; AGENTLOOP_CI_GATE=0|off / host.ci_gate 0|false switches it off
+  local v
+  case "$(printf '%s' "${AGENTLOOP_CI_GATE:-}" | tr 'A-Z' 'a-z')" in off|false|no) return 1 ;; esac
+  v="$(host_setting AGENTLOOP_CI_GATE ci_gate '' int)"
+  if [ -z "$v" ] && [ "$("$JQ" -r '.host.ci_gate == false' "$PROJECTS_FILE" 2>/dev/null || true)" = "true" ]; then v=0; fi
+  [ "${v:-1}" != 0 ]
+}
+
+host_ci_timeout() { # seconds `docker ps` may take; at least 1, at most 60, default 5
+  local v; v=$(( 10#$(host_setting AGENTLOOP_CI_TIMEOUT ci_timeout 5 int) ))
+  [ "$v" -ge 1 ] || v=5
+  [ "$v" -le 60 ] || v=60
+  printf '%s' "$v"
+}
+
+# The pattern in force: the environment, then the host block, then the default.
+# One that is not a valid extended regex is skipped, never half-used (grep -E
+# exits 2 on it, 1 on a plain no-match).
+host_ci_pattern() {
+  local v name
+  for name in env block; do
+    if [ "$name" = env ]; then v="${AGENTLOOP_CI_PATTERN:-}"
+    else v="$("$JQ" -r '.host.ci_pattern // empty | strings' "$PROJECTS_FILE" 2>/dev/null || true)"; fi
+    [ -n "$v" ] || continue
+    printf '\n' | grep -Eq -e "$v" 2>/dev/null; [ $? -le 1 ] || continue
+    printf '%s' "$v"; return 0
+  done
+  printf '%s' "$HOST_CI_DEFAULT_PATTERN"
+}
+
+host_docker_bin() { # the docker CLI: the PATH first, then where Docker Desktop and Homebrew put it (launchd's PATH is short)
+  local b
+  b="$(command -v docker 2>/dev/null || true)"
+  if [ -z "$b" ]; then
+    for b in /usr/local/bin/docker /opt/homebrew/bin/docker "$HOME/.docker/bin/docker" /Applications/Docker.app/Contents/Resources/bin/docker; do
+      [ -x "$b" ] && break; b=""
+    done
+  fi
+  [ -n "$b" ] || return 1
+  printf '%s' "$b"
+}
+
+# "ci step 8f3a1c2e (bitbucket runner)" for a runner's step container; any other
+# name that the operator's pattern matched is shown as it is (at most 40 chars,
+# printable only: it is shown to every run that waits).
+host_ci_label() { # host_ci_label <container name>
+  local n="$1" re="^${HOST_CI_UUID}_(${HOST_CI_UUID})_(pause|build|clone)\$"
+  n="$(printf '%s' "$n" | tr -cd '[:print:]' | cut -c1-120)"
+  if [[ "$n" =~ $re ]]; then printf 'ci step %s (bitbucket runner)' "${BASH_REMATCH[1]:0:8}"
+  else printf 'ci container %s' "${n:0:40}"; fi
+}
+
+# host_ci_running -> 0 when a CI step container runs. Always leaves, for the
+# caller to say:
+#   HOST_CI_STATE   off | ok | open ("open": docker did not answer, so the gate failed open)
+#   HOST_CI_NOTE    why it is open
+#   HOST_CI_NAMES   the matching container names, one per line
+#   HOST_CI_LABELS  one line per step (a step's pause and build count once)
+host_ci_running() {
+  local bin secs pat out rc
+  HOST_CI_STATE="ok"; HOST_CI_NOTE=""; HOST_CI_NAMES=""; HOST_CI_LABELS=""
+  if ! host_ci_gate; then HOST_CI_STATE="off"; return 1; fi
+  secs="$(host_ci_timeout)"; pat="$(host_ci_pattern)"
+  if ! bin="$(host_docker_bin)"; then
+    HOST_CI_STATE="open"; HOST_CI_NOTE="there is no docker on this machine's PATH — not counting CI steps"; return 1
+  fi
+  out="$(run_bounded "$secs" "$bin" ps --format '{{.Names}}' 2>/dev/null)"; rc=$?
+  if [ "$rc" = 124 ]; then
+    HOST_CI_STATE="open"; HOST_CI_NOTE="docker did not answer within ${secs}s — not counting CI steps (failing open)"; return 1
+  elif [ "$rc" != 0 ]; then
+    HOST_CI_STATE="open"; HOST_CI_NOTE="docker ps failed (exit $rc) — not counting CI steps (failing open)"; return 1
+  fi
+  HOST_CI_NAMES="$(printf '%s\n' "$out" | grep -E -e "$pat" || true)"
+  [ -n "$HOST_CI_NAMES" ] || return 1
+  HOST_CI_LABELS="$(printf '%s\n' "$HOST_CI_NAMES" | while IFS= read -r out; do host_ci_label "$out"; echo; done | sort -u | grep -v '^$' || true)"
+  [ -n "$HOST_CI_LABELS" ]
+}
+
 # Who is running this: the run's own slot when we were started inside one
 # (AL_RUN_SLOT, put in every agent's environment), else the first ancestor that
 # is the agent of a live slot, else nobody in particular. Leaves HEAVY_JOB,
@@ -4357,11 +4463,18 @@ heavy_holders() {
 }
 
 heavy_holders_text() { # the holders on one line, for "who is in the way"
-  local pid job run since cmd out="" now; now="$(now_epoch)"
+  local pid job run since cmd out="" now l; now="$(now_epoch)"
   while IFS="$HEAVY_SEP" read -r pid job run since cmd; do
     [ -n "$pid" ] || continue
     out="$out${out:+; }$job${run:+ run $run} (pid $pid${since:+, held $(heavy_dur $(( now - $(num "$since" "$now") )))})"
   done < <(heavy_holders)
+  # The CI steps host_ci_running last saw (the loop in cmd_heavy looked just before).
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    out="$out${out:+; }$l"
+  done <<EOF
+$HOST_CI_LABELS
+EOF
   printf '%s' "${out:-nobody}"
 }
 
@@ -4442,7 +4555,16 @@ heavy_inside_slot() { # heavy_inside_slot <slot dir>
   return 1
 }
 
-HEAVY_SLOT=""; HEAVY_NAPPER=""; HEAVY_PID=""
+HEAVY_SLOT=""; HEAVY_NAPPER=""; HEAVY_PID=""; HEAVY_CI_NOTED=0
+# host_ci_running, plus ONE line on stderr the first time docker could not be
+# asked: a waiter that goes on regardless should say why it is not waiting for CI.
+heavy_ci_running() {
+  host_ci_running && return 0
+  if [ "$HOST_CI_STATE" = open ] && [ "$HEAVY_CI_NOTED" = 0 ]; then
+    HEAVY_CI_NOTED=1; printf 'agentloop heavy: %s.\n' "$HOST_CI_NOTE" >&2
+  fi
+  return 1
+}
 heavy_cleanup() { # every way out of cmd_heavy that bash can see: the slot and the heartbeat go
   [ -z "$HEAVY_NAPPER" ] || kill "$HEAVY_NAPPER" 2>/dev/null
   [ -z "$HEAVY_RUN_SLOT" ] || rm -f "$HEAVY_RUN_SLOT/heavy-wait" 2>/dev/null
@@ -4471,7 +4593,7 @@ cmd_heavy() {
   if [ -n "${AL_HEAVY_HELD:-}" ] && heavy_inside_slot "$AL_HEAVY_HELD"; then exec "$@"; fi
 
   local slots began="$SECONDS" announced=0 reason="" rc=0 cmdline now
-  HEAVY_SLOT=""; HEAVY_NAPPER=""; HEAVY_PID=""
+  HEAVY_SLOT=""; HEAVY_NAPPER=""; HEAVY_PID=""; HEAVY_CI_NOTED=0
   slots="$(heavy_slots)"
   heavy_identity
   local parent="$PPID"
@@ -4488,6 +4610,9 @@ cmd_heavy() {
   while :; do
     if host_load_over; then
       reason="the 5-minute load is $HOST_L5, above the cap of $HOST_CAP"
+    elif heavy_ci_running; then
+      # Before the slot, so a waiter never holds one while it waits for CI.
+      reason="a CI step is running on this host ($(printf '%s' "$HOST_CI_LABELS" | tr '\n' ',' | sed 's/,$//; s/,/, /g'))"
     elif HEAVY_SLOT="$(acquire_slot "$HEAVY_ID" "$slots")"; then
       break
     else
@@ -4538,7 +4663,7 @@ cmd_heavy() {
 # a heavy slot is free and the 5-minute load is under the cap, 1 otherwise. A
 # precheck calls it to re-measure a deferral whose cause was the host.
 cmd_host() {
-  local slots n over=0 busy=0 why="" cpus now pid job run since cmd
+  local slots n over=0 busy=0 ci=0 why="" cpus now pid job run since cmd l
   slots="$(heavy_slots)"; cpus="$(host_ncpu)"; now="$(now_epoch)"
   host_load_over && over=1
   n="$(slots_active "$HEAVY_ID")"
@@ -4558,6 +4683,13 @@ cmd_host() {
   else
     printf 'load cap    none (0)\n'
   fi
+  host_ci_running && ci=1
+  case "$HOST_CI_STATE" in
+    off) printf 'ci          off — a running CI step is not counted (AGENTLOOP_CI_GATE / host.ci_gate)\n' ;;
+    open) printf 'ci          %s\n' "$HOST_CI_NOTE" ;;
+    *) if [ "$ci" = 1 ]; then printf 'ci          %s CI step(s) running\n' "$(printf '%s\n' "$HOST_CI_LABELS" | grep -c .)"
+       else printf 'ci          no CI step running\n'; fi ;;
+  esac
   if [ "$slots" -gt 0 ]; then printf 'heavy       %s of %s slot(s) in use\n' "$n" "$slots"
   else printf 'heavy       %s in use, no ceiling (0)\n' "$n"; fi
   while IFS="$HEAVY_SEP" read -r pid job run since cmd; do
@@ -4565,10 +4697,22 @@ cmd_host() {
     printf '  holder    %s%s (pid %s)%s  %s\n' "$job" "${run:+ run $run}" "$pid" \
       "${since:+, held $(heavy_dur $(( now - $(num "$since" "$now") )))}" "$cmd"
   done < <(heavy_holders)
+  # A CI step is not a slot: it is listed beside the holders and makes the host
+  # busy while it runs, and does not count against the ceiling above.
+  while IFS= read -r l; do
+    if [ -n "$l" ]; then printf '  holder    %s\n' "$l"; fi
+  done <<EOF
+$HOST_CI_LABELS
+EOF
   if [ "$slots" -gt 0 ] && [ "$n" -ge "$slots" ]; then busy=1; why="no heavy slot is free"; fi
   if [ "$over" = 1 ]; then busy=1; why="${why:+$why; }the load is above the cap"; fi
+  if [ "$ci" = 1 ]; then busy=1; why="${why:+$why; }a CI step is running"; fi
   if [ "$busy" = 1 ]; then printf 'verdict     BUSY — %s\n' "$why"; return 1; fi
-  printf 'verdict     quiet — a heavy slot is free and the load is under the cap\n'
+  if [ "$HOST_CI_STATE" = ok ]; then
+    printf 'verdict     quiet — a heavy slot is free, the load is under the cap and no CI step is running\n'
+  else
+    printf 'verdict     quiet — a heavy slot is free and the load is under the cap\n'
+  fi
 }
 
 # The host contract every agent is handed (inject_contract). Short, because
