@@ -8,6 +8,7 @@ arithmetic it duplicates from the engine still agrees with the engine.
 
 import ast
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -4894,6 +4895,60 @@ def test_the_run_link_finds_a_run_that_is_still_going(srv):
     assert "unjournaledLive()" in fn, "the run link cannot see a run that is still going"
 
 
+def _poll_src(block):
+    """secSyncPoll and what it calls, for a harness that drives it under Node:
+    the pause it reads off each row (secPauseOf) and the one wake-up it arms
+    for a self-lifting pause (secArmPauseWake, over its own module state)."""
+    return ("let secPauseWake = null;\n" + _const(block, "SEC_SELF_LIFTING") + "\n"
+            + "\n".join(_plainfn(block, name) for name in (
+                "secStopPoll", "secRunStillHeld", "secPauseOf", "secArmPauseWake", "secSyncPoll")))
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_pause_that_lifts_by_itself_is_watched_from_the_moment_it_reopens(srv, tmp_path):
+    """The tick resumes an analysis the usage window paused once it reopens,
+    and the screen should show that without a reload: one wake-up armed for
+    the moment it reopens (never a four-second poll through the hour before),
+    then the poll until the row moves -- ten minutes at most, so a scheduler
+    that is not ticking cannot keep the screen polling. A stop is never
+    watched for: nothing lifts it but a person."""
+    block = _security_js(srv)
+    script = tmp_path / "poll-pause.js"
+    script.write_text("""
+    let live = 0, wakes = [];
+    const SEC_POLL_MS = 4000;
+    let secTimer = null;
+    globalThis.setInterval = () => { live++; return {}; };
+    globalThis.clearInterval = () => { live--; };
+    globalThis.setTimeout = (f, ms) => { wakes.push(ms); return {}; };
+    globalThis.clearTimeout = () => {};
+    const AL = {currentView: "security", DATA: {}};
+    const secReload = () => {};
+    const now = Math.floor(Date.now() / 1000);
+    const paused = (kind, until) => ({state: "interrupted",
+                                      pause: JSON.stringify({kind, at: now - 100, reason: "x", until})});
+    const secState = {project: "web", analyses: [paused("usage", now + 3600)]};
+    """ + _poll_src(block) + """
+    const out = {};
+    secSyncPoll();                 out.ahead = live;   out.wakeMs = wakes[0];
+    secState.analyses = [paused("usage", now - 30)];
+    secSyncPoll();                 out.reopened = live;
+    secState.analyses = [paused("usage", now - 3600)];
+    secSyncPoll();                 out.longAgo = live;
+    secState.analyses = [paused("stopped", null)];
+    wakes = [];
+    secSyncPoll();                 out.stopped = live; out.stoppedWakes = wakes.length;
+    console.log(JSON.stringify(out));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True,
+                                    check=True).stdout)
+    assert out["ahead"] == 0, "polled through the hour before the reopening"
+    assert 3600 * 1000 <= out["wakeMs"] <= 3600 * 1000 + 10000, out
+    assert out["reopened"] == 1, "not watching once the pause reopened"
+    assert out["longAgo"] == 0, "still polling long after the reopening"
+    assert out["stopped"] == 0 and out["stoppedWakes"] == 0, "a stop is not something the tick lifts"
+
+
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_the_analysis_poll_cannot_outlive_the_view(srv, tmp_path):
     """Leaving the Security view has to stop the four-second poll, and stay
@@ -4907,8 +4962,7 @@ def test_the_analysis_poll_cannot_outlive_the_view(srv, tmp_path):
     analysis. The view belongs in the condition.
     """
     block = _security_js(srv)
-    src = "\n".join(_plainfn(block, name)
-                    for name in ("secStopPoll", "secRunStillHeld", "secSyncPoll"))
+    src = _poll_src(block)
     script = tmp_path / "poll.js"
     script.write_text("""
     let live = 0;                       // intervals currently armed
@@ -4960,8 +5014,7 @@ def test_the_analysis_poll_waits_for_the_engines_own_close(srv, tmp_path):
     exactly once, not in a loop.
     """
     block = _security_js(srv)
-    src = "\n".join(_plainfn(block, name)
-                    for name in ("secStopPoll", "secRunStillHeld", "secSyncPoll"))
+    src = _poll_src(block)
     script = tmp_path / "poll-close.js"
     script.write_text("""
     let live = 0, reloads = 0;
@@ -5112,6 +5165,96 @@ def test_the_coverage_is_summarised_by_phase_above_the_paragraph(srv):
     # The status is the server's word, not something read back out of the
     # prose, and the screen must not invent one either.
     assert "JSON.parse" in render
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_coverage_box_carries_only_what_no_phase_already_says(srv, tmp_path):
+    """The yellow box under the phase table repeated every phase's prose as
+    one two-thousand-character paragraph -- the operator's words for it, on
+    2026-10-02: big and useless, nobody reads that. Each phase's prose is a
+    run of the paragraph by identity (security/coverage.py), so the box now
+    shows only what is left once those runs are cut: what belongs to no
+    phase. An analysis with no structured coverage keeps its paragraph whole,
+    and a phase note the paragraph does not contain hides nothing."""
+    block = _security_js(srv)
+    paint = _plainfn(block, "secPaint")
+    assert "secCoverageRest(a)" in paint
+    assert "a.coverage_note));" not in paint, "the paragraph is never painted whole beside its phases"
+    script = tmp_path / "coverage-rest.js"
+    script.write_text(_plainfn(block, "secCoverageRest") + """
+    const phases = [{name: "scope", note: "Scope: 3 files, each read in full."},
+                    {name: "secrets", note: "Secrets were scanned by gitleaks."},
+                    {name: "hygiene", note: ""}];
+    const doc = JSON.stringify({phases});
+    console.log(JSON.stringify([
+      secCoverageRest({coverage: doc, coverage_note:
+        "Scope: 3 files, each read in full. Secrets were scanned by gitleaks. Retried 2 units."}),
+      secCoverageRest({coverage: doc, coverage_note:
+        "Scope: 3 files, each read in full. Secrets were scanned by gitleaks."}),
+      secCoverageRest({coverage: "", coverage_note: "An analysis from before the phases."}),
+      secCoverageRest({coverage: "not json", coverage_note: "A corrupt column hides nothing."}),
+      secCoverageRest({coverage: JSON.stringify({phases: [{name: "scope", note: "elsewhere"}]}),
+                       coverage_note: "A note no phase quotes."}),
+    ]));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True,
+                                    check=True).stdout)
+    assert out == ["Retried 2 units.", "", "An analysis from before the phases.",
+                   "A corrupt column hides nothing.", "A note no phase quotes."]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_an_interrupted_analysis_says_what_paused_it_and_what_happens_next(srv, tmp_path):
+    """2026-10-02: an analysis paused at 98% of the five-hour window said only
+    INTERRUPTED, the reason buried at the end of the coverage paragraph, and a
+    Resume pressed under it stopped on the same limit within the second. The
+    banner reads the analysis's `pause` (security/ledger.py pause_doc) and
+    says by what, when, and what happens next, on the reader's own clock --
+    the twin of the downloaded report's pause_sentence."""
+    block = _security_js(srv)
+    paint = _plainfn(block, "secPaint")
+    assert "secPauseSentence(secPauseOf(a))" in paint
+    poll = _plainfn(block, "secSyncPoll")
+    assert "SEC_SELF_LIFTING" in poll and "secArmPauseWake(" in poll, \
+        "the screen wakes up when a self-lifting pause reopens, and watches it resume"
+    deps = (_const(block, "SEC_SELF_LIFTING")
+            + "\n".join(_plainfn(block, n) for n in ("secPauseOf", "secPauseTime", "secPauseSentence")))
+    script = tmp_path / "pause.js"
+    script.write_text("""
+    const RealDate = Date, NOW = 1790929200 * 1000;   // 2026-10-02 08:20 UTC
+    globalThis.Date = class extends RealDate {
+      constructor(...a){ super(...(a.length ? a : [NOW])); }
+      static now(){ return NOW; }
+    };
+    """ + deps + """
+    const say = (p) => secPauseSentence(secPauseOf({pause: JSON.stringify(p)}));
+    console.log(JSON.stringify([
+      say({kind: "usage", at: 1790929160, until: 1790935200,
+           reason: "the anthropic five_hour window is 99% used"}),
+      say({kind: "cap", at: 1790929160, until: 1790985600,
+           reason: "the daily cap of security-web was reached ($3.10 / $3.00)"}),
+      say({kind: "usage", at: 1790929160, until: null, reason: "the window is spent"}),
+      say({kind: "stopped", at: 1790929160, until: null, reason: ""}),
+      say({kind: "breaker", at: 1790929160, until: null,
+           reason: "the provider refused 3 units in a row (api_error)"}),
+      say({kind: "failed", at: 1790929160, until: null, reason: "its orchestrator failed (RuntimeError)"}),
+      secPauseSentence(secPauseOf({pause: ""})),
+      secPauseSentence(secPauseOf({pause: "not json"})),
+      secPauseSentence(secPauseOf({})),
+    ]));
+    """)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True, check=True,
+                                    env={**os.environ, "TZ": "UTC"}).stdout)
+    assert out == [
+        "Paused at 8:19 AM by the usage limit: the anthropic five_hour window is 99% used. "
+        "It resumes by itself at 10:00 AM.",
+        "Paused at 8:19 AM by the daily cap: the daily cap of security-web was reached "
+        "($3.10 / $3.00). It resumes by itself at Sat 12:00 AM.",
+        "Paused at 8:19 AM by the usage limit: the window is spent. It resumes by itself once that reopens.",
+        "Stopped at 8:19 AM. Resume continues it where it left off.",
+        "Paused at 8:19 AM: the provider refused 3 units in a row (api_error). Resume it once that is fixed.",
+        "Paused at 8:19 AM: its orchestrator failed (RuntimeError). Resume continues it where it left off.",
+        "", "", ""]
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")

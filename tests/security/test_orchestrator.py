@@ -66,6 +66,10 @@ def _row(world):
     return next(r for r in run(world["db"], "list", "--project", "web") if r["id"] == world["aid"])
 
 
+def _pause(world):
+    return ledger.pause_of(_row(world))
+
+
 def _units(world):
     return ledger.units_of(ledger.connect(world["db"]), world["aid"])
 
@@ -478,7 +482,9 @@ def test_a_stop_interrupts_and_a_resume_finishes(world, monkeypatch):
     assert proc.wait(timeout=60) == 0
     assert _row(world)["state"] == "interrupted"
     assert not any(u["state"] == "running" for u in _units(world))
+    assert _pause(world)["kind"] == "stopped", "a stop is a pause only a person lifts"
     run(world["db"], "resume", "--analysis", str(world["aid"]))
+    assert _pause(world) == {}, "a resume ends the pause"
     monkeypatch.setenv("FAKE_ENGINE_MODE", "complete")
     _orchestrator(world).run()
     assert _row(world)["state"] == "done"
@@ -710,7 +716,9 @@ def test_a_raise_in_the_loop_leaves_the_analysis_interrupted(world, monkeypatch,
     assert _orchestrator(world, lock_dir=str(lock)).run() == 1
     row = _row(world)
     assert row["state"] == "interrupted"
-    assert "because its orchestrator failed (RuntimeError)" in row["coverage_note"]
+    assert _pause(world)["kind"] == "failed"
+    assert _pause(world)["reason"] == "its orchestrator failed (RuntimeError)"
+    assert "failed" not in row["coverage_note"], "a pause is not a gap in the coverage"
     assert not lock.exists(), "interrupted and resumable: nothing left for the tick to find"
     monkeypatch.setattr(orchestrator.ledger, "units_of", real)
     run(world["db"], "resume", "--analysis", str(world["aid"]))
@@ -743,7 +751,8 @@ def test_a_close_that_fails_twice_leaves_the_analysis_interrupted(world, monkeyp
     assert len(finishes) == 2
     row = _row(world)
     assert row["state"] == "interrupted"
-    assert "because its orchestrator failed (its close failed)" in row["coverage_note"]
+    assert _pause(world)["kind"] == "failed"
+    assert _pause(world)["reason"] == "its orchestrator failed (its close failed)"
     assert "could not close (try 2)" in log.read_text()
 
 
@@ -853,18 +862,40 @@ def test_a_closed_gate_stops_the_launches_and_interrupts_with_its_name(world, mo
     """A unit is a forced run of the derived job, which skips run_job's own
     gates, so the orchestrator asks the engine for them before each launch:
     closed, nothing launches, and the analysis is interrupted with the gate
-    named -- resumable once it reopens."""
+    in its pause -- what it is, in the engine's words, and when it reopens,
+    so the page can say so and the tick can resume it then."""
     monkeypatch.setenv("FAKE_ENGINE_GATE", "the daily cap of security-web was reached ($3.10 / $3.00)")
+    monkeypatch.setenv("FAKE_ENGINE_GATE_PAUSE",
+                       "cap 1790985600 the daily cap of security-web was reached ($3.10 / $3.00)")
+    before = int(time.time())
     assert _orchestrator(world).run() == 0
     row = _row(world)
     assert row["state"] == "interrupted"
-    assert ("The engine interrupted this analysis because the daily cap of security-web was "
-            "reached ($3.10 / $3.00)") in row["coverage_note"]
+    pause = _pause(world)
+    assert {k: pause[k] for k in ("kind", "until", "reason")} == {
+        "kind": "cap", "until": 1790985600,
+        "reason": "the daily cap of security-web was reached ($3.10 / $3.00)"}
+    assert pause["at"] >= before
+    # THE PARAGRAPH IS COVERAGE, NOT A LOG OF PAUSES: the reason used to be
+    # appended there once per pause -- the page showed 98%, then 99%, at the
+    # end of a two-thousand-character block.
+    assert "interrupted this analysis" not in row["coverage_note"]
     assert all(u["state"] == "pending" for u in _units(world))
     monkeypatch.delenv("FAKE_ENGINE_GATE")
     run(world["db"], "resume", "--analysis", str(world["aid"]))
     assert _orchestrator(world).run() == 0
     assert _row(world)["state"] == "done", _row(world)["coverage_note"]
+
+
+def test_a_gate_that_does_not_say_what_it_is_waits_for_a_person(world, monkeypatch):
+    """An engine whose gate answers with its sentence alone: the analysis is
+    paused all the same, as a `gate` the tick never lifts by itself -- it
+    cannot see the reopening -- with the sentence as its reason."""
+    monkeypatch.setenv("FAKE_ENGINE_GATE", "a gate this test made up")
+    assert _orchestrator(world).run() == 0
+    pause = _pause(world)
+    assert (pause["kind"], pause["until"], pause["reason"]) == ("gate", None, "a gate this test made up")
+    assert ledger.self_lifting_paused(ledger.connect(world["db"])) == []
 
 
 def test_the_gate_is_asked_before_every_launch(world, monkeypatch):
@@ -912,8 +943,10 @@ def test_units_that_cannot_start_pause_the_analysis_after_one_wave(world, monkey
     assert _orchestrator(world).run() == 0
     row = _row(world)
     assert row["state"] == "interrupted", row["coverage_note"]
-    assert ("the agent could not start: 3 units in a row ended before a session opened "
-            "(last error: BadResource: FileSystem.access (/gone/repo))") in row["coverage_note"]
+    assert _pause(world)["kind"] == "breaker", "a person fixes the cause; the tick does not retry it"
+    assert _pause(world)["reason"] == (
+        "the agent could not start: 3 units in a row ended before a session opened "
+        "(last error: BadResource: FileSystem.access (/gone/repo))")
     launched = len(runs.read_text().splitlines())
     assert 3 <= launched <= 3 + orchestrator.BREAKER_RUNS - 1, launched
     assert not [u for u in _units(world) if u["state"] == "failed"], "no lineage given up for the environment"
@@ -955,7 +988,8 @@ def test_a_provider_that_refuses_every_unit_pauses_the_analysis_too(world, monke
     assert _orchestrator(world).run() == 0
     row = _row(world)
     assert row["state"] == "interrupted", row["coverage_note"]
-    assert "the provider refused 3 units in a row (api_error)" in row["coverage_note"]
+    assert (_pause(world)["kind"], _pause(world)["reason"]) == (
+        "breaker", "the provider refused 3 units in a row (api_error)")
     assert not [u for u in _units(world) if u["state"] == "failed"]
 
 

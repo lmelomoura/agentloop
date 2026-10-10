@@ -752,6 +752,48 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **An analysis the usage limit paused says so, and resumes by itself.** On
+  2026-10-02 a deep analysis paused at 98% of the five-hour window, 32 of
+  37 units in. The page said only INTERRUPTED; the reason was the last
+  sentence of the coverage paragraph, twice (98%, then 99%). Each Resume
+  ran for one second, stopped on the same limit and answered the page with
+  success, so pressing it did nothing visible. An interruption now records
+  a `pause` of its own (what stopped it, when, and when it reopens) in place
+  of a sentence appended to the paragraph. The page's banner says it in one
+  line: *Paused at 9:19 AM by the usage limit: … It resumes by itself at
+  11:00 AM.* The downloaded report opens with the same sentence. A Resume
+  while the usage window or a daily cap is still closed is refused, naming
+  the gate (the same for Retry). The tick resumes an analysis those two
+  gates paused once they reopen (`agentloop security paused` lists them),
+  and the page wakes up then to show it. A
+  stop, a failure, or units that cannot start still wait for a person. The
+  sentences older pauses left in a paragraph are cut from it.
+- **The coverage box no longer repeats the whole paragraph.** Under the
+  phase table, which already folds each phase's prose under its own line,
+  the yellow box printed all of that prose again as one block of about two
+  thousand characters. It now shows only what belongs to no phase, such as
+  a retry, and nothing at all when that is empty. An analysis from before
+  the phase table keeps its paragraph.
+- **The dashboard's Resume and Retry are logged as the dashboard's.** Both
+  were written to `tick.log` as "from outside the dashboard (`agentloop
+  stop`, run by Python under launchd)": the wrong origin and the wrong
+  command. The control server vouches for its stop, resume and retry
+  alike (`AL_CALLER=dashboard`, replacing `AL_STOP_SOURCE`). A resume or
+  retry typed in a shell names its own command.
+
+- **Logging the CLI into another account lifts a usage hold at once.** A
+  usage reading was filed under the account's directory alone, so after
+  `~/.claude` was logged into a second account to get past a spent
+  five-hour window, every launch (and every Resume of a paused analysis)
+  was still held back on the first account's 99% until that window reset,
+  90 minutes later. Every reading now carries the account it was measured
+  on — the account and organization in the directory's `.claude.json`, the
+  account in Codex's `auth.json`, read as the run launched, or by the
+  statusline as it writes — and the gate reads a reading only while that
+  account is still the one logged in there. `agentloop usage` says when a
+  reading is another account's. A reading with no account (written before
+  this, or by a login that has none) holds as it always did.
+
 - **A resumed run no longer reports as UNDELIVERED work it delivered, nor
   hides work it did not.** A resume re-took the provisioning snapshot over
   whatever the interrupted session had left, so that session's uncommitted
@@ -1081,7 +1123,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   both reach the same function and nothing told them apart. On 2026-09-24
   an analysis was stopped 28 seconds in that its operator had not stopped,
   and the record named them. The control server now tells the engine a stop
-  is its own (`AL_STOP_SOURCE=dashboard`, on the one call it makes), and
+  is its own (`AL_CALLER=dashboard`, on the one call it makes), and
   the engine writes the origin into the run's stop marker, into the run's
   note — *ended from the dashboard*, or *ended from outside the dashboard
   (`agentloop stop`, run by zsh under claude)*, naming the two processes

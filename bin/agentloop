@@ -1322,15 +1322,30 @@ EOF
   security_orchestrate "$jid" "$aid" "$repo"
 }
 
+# A GATE THAT WOULD STOP THE RESUME ON ITS FIRST LAUNCH, asked before the
+# analysis is resumed rather than after: the orchestrator asks the same gate
+# (`__unit-gate`) before every launch, so a resume past a closed one ran for
+# one second, interrupted the analysis again, and answered the page with
+# success -- the operator pressed Resume twice and saw nothing happen at all.
+# Its first line, the gate's own sentence, when one is closed; nothing when
+# all are open.
+security_resume_refusal() { # security_resume_refusal <job-id>
+  local said
+  said="$(security_unit_gate "$1")" && return 0
+  printf '%s\n' "$said" | head -1
+}
+
 # `agentloop security resume <project> <analysis-id>`: an INTERRUPTED analysis
 # -- stopped, or swept by the next Analyse of another branch -- continued by a
 # new orchestrator, which adopts what is still running, judges what died and
 # never runs a settled unit twice (security/orchestrator.py). Refused while
 # anything of the project's is still alive: a live orchestrator (or one taking
-# the lock, security_analysis_live), or units still winding down after a stop.
+# the lock, security_analysis_live), or units still winding down after a stop;
+# and while one of the engine's gates is closed (security_resume_refusal),
+# saying which, and that the analysis resumes by itself when it reopens.
 cmd_security_resume() { # cmd_security_resume <project> <analysis-id>
   [ $# -ge 2 ] || die "usage: agentloop security resume <project> <analysis-id>"
-  local project="$1" aid="$2" jid row
+  local project="$1" aid="$2" jid row gate
   security_enabled "$project" || die "security is not enabled for project '$project'"
   case "$aid" in ''|*[!0-9]*) die "security: '$aid' is not an analysis id" ;; esac
   jid="$(security_job_id "$project")"
@@ -1340,12 +1355,61 @@ cmd_security_resume() { # cmd_security_resume <project> <analysis-id>
   security_analysis_live "$jid" && die "an analysis of '$project' is already running (job $jid)"
   [ "$(slots_active "$jid")" -eq 0 ] \
     || die "units of '$project' are still winding down — try again in a moment"
+  [ "$(printf '%s' "$row" | "$JQ" -r '.state')" = "interrupted" ] \
+    || die "analysis $aid is not interrupted: there is nothing to resume"
+  gate="$(security_resume_refusal "$jid")"
+  if [ -n "$gate" ]; then
+    # What happens next depends on what paused it: the tick lifts only the
+    # pauses of a self-lifting gate (security_resume_paused).
+    case "$(printf '%s' "$row" | "$JQ" -r '.pause // "" | fromjson? | .kind // empty' 2>/dev/null)" in
+      usage|cap) die "analysis $aid cannot resume yet: $gate. It resumes by itself once that reopens." ;;
+      *)         die "analysis $aid cannot resume yet: $gate. Resume it once that reopens." ;;
+    esac
+  fi
   security_engine_py resume --analysis "$aid" >/dev/null 2>&1 \
     || die "analysis $aid is not interrupted: there is nothing to resume"
   security_launch_detached "$jid" "$aid" "$(printf '%s' "$row" | "$JQ" -r '.branch')" \
     "$(printf '%s' "$row" | "$JQ" -r '.repo')"
-  log_tick "$jid: resumed analysis $aid $(stop_origin)"
+  log_tick "$jid: resumed analysis $aid $(stop_origin "agentloop security resume")"
   printf '{"analysis_id":%s,"resumed":true}\n' "$aid"
+}
+
+# THE TICK'S RESUME OF A PAUSE THAT LIFTS BY ITSELF. An analysis the engine
+# paused on its own ceiling -- the account's usage window, a daily cap
+# (security/ledger.py SELF_LIFTING_PAUSES) -- is resumed by the tick once the
+# same gate reopens, with no Resume pressed: the engine stopped it, so the
+# engine continues it. On 2026-10-02 a deep analysis paused at 98% of the
+# five-hour window, 32 of 37 units in, and sat there until somebody came back
+# to press Resume at the right minute. A stop, a failure, or units that could
+# not start are never resumed here: those need a person. Not counted against
+# SECURITY_MAX_AUTO_RESUMES, which caps an orchestrator that keeps dying, not
+# the number of usage windows a long analysis spans. One analysis per job per
+# tick, and none while anything of the job's is alive; never blocking.
+security_resume_paused() {
+  local aid project jid row paused resumed=" "
+  # No ledger, nothing paused -- and never one created by asking.
+  [ -s "$(security_db)" ] || return 0
+  paused="$(security_engine_py paused 2>/dev/null | "$JQ" -r '.[] | [.id, .project, .run_id] | @tsv' 2>/dev/null)"
+  [ -n "$paused" ] || return 0
+  while IFS="$(printf '\t')" read -r aid project jid; do
+    case "$aid" in ''|*[!0-9]*) continue ;; esac
+    security_enabled "$project" || continue
+    [ "$jid" = "$(security_job_id "$project")" ] || continue
+    # One per job: the orchestrator just launched takes its lock a moment
+    # later, and security_analysis_live would not see it yet.
+    case "$resumed" in *" $jid "*) continue ;; esac
+    security_analysis_live "$jid" && continue
+    [ "$(slots_active "$jid")" -eq 0 ] || continue
+    [ -z "$(security_resume_refusal "$jid")" ] || continue
+    row="$(security_engine_py analysis --id "$aid" 2>/dev/null)" || continue
+    security_engine_py resume --analysis "$aid" >/dev/null 2>&1 || continue
+    security_launch_detached "$jid" "$aid" "$(printf '%s' "$row" | "$JQ" -r '.branch')" \
+      "$(printf '%s' "$row" | "$JQ" -r '.repo')"
+    resumed="$resumed$jid "
+    log_tick "$jid: analysis $aid resumed by itself — the limit that paused it has reopened"
+  done <<EOF
+$paused
+EOF
 }
 
 # `agentloop security retry <project> <analysis-id>`: a CAPPED or FAILED
@@ -1366,6 +1430,12 @@ cmd_security_retry() { # cmd_security_retry <project> <analysis-id>
   security_analysis_live "$jid" && die "an analysis of '$project' is already running (job $jid)"
   [ "$(slots_active "$jid")" -eq 0 ] \
     || die "units of '$project' are still winding down — try again in a moment"
+  # A CLOSED GATE, before anything is reopened: the retry would launch
+  # nothing and pause the analysis on its first launch (see
+  # security_resume_refusal).
+  local gate
+  gate="$(security_resume_refusal "$jid")"
+  [ -z "$gate" ] || die "analysis $aid cannot be retried yet: $gate."
   # A BUDGET THAT CANNOT PAY ONE MORE UNIT: the resumed orchestrator would
   # launch nothing and close the analysis capped again. The budget is the
   # project's (security_analysis_budget), so the ledger's `reopen` cannot
@@ -1392,7 +1462,7 @@ cmd_security_retry() { # cmd_security_retry <project> <analysis-id>
     || die "analysis $aid was reopened but could not be resumed: run agentloop security resume '$project' $aid"
   security_launch_detached "$jid" "$aid" "$(printf '%s' "$row" | "$JQ" -r '.branch')" \
     "$(printf '%s' "$row" | "$JQ" -r '.repo')"
-  log_tick "$jid: retried analysis $aid: $n failed unit(s) run again $(stop_origin)"
+  log_tick "$jid: retried analysis $aid: $n failed unit(s) run again $(stop_origin "agentloop security retry")"
   printf '{"analysis_id":%s,"retried":%s}\n' "$aid" "$n"
 }
 
@@ -2214,6 +2284,33 @@ account_field() { # account_field <platform> <id> <name|dir> -> that field; the 
 
 account_env_dir() { # account_env_dir <platform> <id> -> what the platform's variable carries for a run on that account: nothing for the CLI's own directory
   account_env_value "$1" "$(account_field "$1" "$2" dir)"
+}
+
+# WHO IS LOGGED IN ON AN ACCOUNT DIRECTORY, as the CLI itself records it: for
+# Claude, the account and the organization in <dir>/.claude.json (~/.claude.json
+# for the CLI's own directory) -- a usage window is an account's within an
+# organization, and switching either changes the limits; for Codex, the
+# account in <dir>/auth.json. Nothing when it cannot be read (an API key, no
+# login yet): the usage windows then stay read as they always were. A usage
+# reading is stamped with this (rl_capture), because the directory alone does
+# not say whose it is -- on 2026-10-02 the operator logged ~/.claude into a
+# second account to get past a spent five-hour window, and the gate kept
+# holding everything back on the first account's 99% for another 90 minutes.
+account_identity() { # account_identity <platform> <account-dir> -> the logged-in account's id, or nothing; <account-dir> as account_env_dir gives it (empty for the CLI's own directory)
+  local f
+  case "${1:-}" in
+    anthropic)
+      if [ -n "${2:-}" ]; then f="$2/.claude.json"; else f="$HOME/.claude.json"; fi
+      [ -s "$f" ] || return 0
+      "$JQ" -r '.oauthAccount // empty | objects
+                | select((.accountUuid // "") != "")
+                | .accountUuid + ":" + (.organizationUuid // "")' "$f" 2>/dev/null ;;
+    openai)
+      f="${2:-$(account_cli_default openai)}/auth.json"
+      [ -s "$f" ] || return 0
+      "$JQ" -r '.tokens.account_id // empty | strings' "$f" 2>/dev/null ;;
+  esac
+  return 0
 }
 
 account_export() { # account_export <platform> <account-dir> -- in the calling shell: the platform's account variable unset, then exported when the account has a directory of its own (run_env's rule, for a precheck)
@@ -3157,9 +3254,9 @@ opencode_export_model() { # opencode_export_model <run_cwd> <session-id> [tmp-ba
 # appends to the same file). Sets PF_MODEL_ID and PF_ROLLOUT; both empty when
 # the rollout is not found, with one line in tick.log saying so.
 PF_MODEL_ID=""; PF_ROLLOUT=""
-platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-id] [run_cwd] [codex-home]
+platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-id] [run_cwd] [codex-home] [account] -- account: account_identity as the run launched
   PF_MODEL_ID=""; PF_ROLLOUT=""
-  local tid="${3:-}" id="${4:-run}" home="${6:-$CODEX_HOME_DIR}"
+  local tid="${3:-}" id="${4:-run}" home="${6:-$CODEX_HOME_DIR}" who="${7:-}"
   case "$1" in
     openai) ;;
     opencode)
@@ -3192,7 +3289,7 @@ platform_finish() { # platform_finish <platform> <streamfile> <session-id> [job-
   # failed; this says when the next one may start.
   local refused=""
   [ "$("$JQ" -r '.api_error_status // ""' "$2" 2>/dev/null | tail -1)" = "429" ] && refused="refused"
-  rl_capture_openai "$PF_ROLLOUT" "$refused" "$(rl_key openai "$(account_env_value openai "$home")")"
+  rl_capture_openai "$PF_ROLLOUT" "$refused" "$(rl_key openai "$(account_env_value openai "$home")")" "$who"
   return 0
 }
 
@@ -5253,12 +5350,22 @@ rl_key() { # rl_key <platform> <account-dir> -> the block's key
   if [ -z "${2:-}" ]; then printf '%s\n' "$1"; else printf '%s@%s\n' "$1" "$2"; fi
 }
 
+# A block's key is a DIRECTORY, and a directory can be logged into another
+# account at any moment. Who is logged in on the key's directory now
+# (account_identity): a reading stamped with anybody else is not this
+# account's window, and the gate does not read it.
+rl_key_identity() { # rl_key_identity <key> -> account_identity of the key's platform and directory
+  local k="${1:-}" dir=""
+  case "$k" in *@*) dir="${k#*@}" ;; esac
+  account_identity "${k%%@*}" "$dir"
+}
+
 # Fold every rate_limit_event in a finished run's stream into the shared file,
 # newest per window wins. Never fails a run: this is bookkeeping, and a run that
 # worked must not be reported as broken because a status file could not be
 # written.
-rl_capture() { # rl_capture <streamfile> [key] -- key: rl_key's block (anthropic when none)
-  local sf="${1:-}" key="${2:-anthropic}" tmp lock
+rl_capture() { # rl_capture <streamfile> [key] [account] -- key: rl_key's block (anthropic when none); account: account_identity of the run's directory AS IT LAUNCHED
+  local sf="${1:-}" key="${2:-anthropic}" who="${3:-}" tmp lock
   [ -s "$sf" ] || return 0
   grep -q rate_limit_event "$sf" 2>/dev/null || return 0
   lock="$LOCK_DIR/.ratelimit"
@@ -5268,8 +5375,9 @@ rl_capture() { # rl_capture <streamfile> [key] -- key: rl_key's block (anthropic
   tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX")" || { lock_drop "$lock"; return 0; }
   # `-R` with `fromjson?` for the same reason every other reader of a stream
   # uses it: a killed run is cut off mid-write and one truncated line must not
-  # cost us the other 300.
-  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg k "$key" '
+  # cost us the other 300. `account` is whose windows these are (rl_gate reads
+  # a reading only for the account logged in now); null when it was not known.
+  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg k "$key" --arg who "$who" '
     ($prev[0] // {}) as $was
     | [inputs | fromjson? | objects | select(.type == "rate_limit_event") | .rate_limit_info // empty | objects]
     | reduce .[] as $e ($was;
@@ -5280,7 +5388,8 @@ rl_capture() { # rl_capture <streamfile> [key] -- key: rl_key's block (anthropic
             utilization: ($w.value.utilization // null),
             resets_at:   ($w.value.resetsAt // null),
             overage:     ($e.overageStatus // null),
-            seen_at:     $now
+            seen_at:     $now,
+            account:     (if $who == "" then null else $who end)
           })
         # The window it names, from its own fields: what every CLI before
         # unifiedWindows reported, and still the one place its status lives.
@@ -5290,7 +5399,8 @@ rl_capture() { # rl_capture <streamfile> [key] -- key: rl_key's block (anthropic
               utilization: ($e.utilization // ($e.unifiedWindows | objects | .[$e.rateLimitType] | objects | .utilization) // null),
               resets_at:   ($e.resetsAt // null),
               overage:     ($e.overageStatus // null),
-              seen_at:     $now
+              seen_at:     $now,
+              account:     (if $who == "" then null else $who end)
             }
           end)
   ' "$sf" > "$tmp" 2>/dev/null && mv "$tmp" "$RATE_LIMIT_FILE" 2>/dev/null
@@ -5306,8 +5416,8 @@ rl_capture() { # rl_capture <streamfile> [key] -- key: rl_key's block (anthropic
 # run ended on a quota refusal (turn.failed, "hit your usage limit"): the
 # reset time is in the rollout but not which window tripped, so the FULLER
 # one is marked spent until its own reset -- the gate then lifts by itself.
-rl_capture_openai() { # rl_capture_openai <rollout-file> [refused] [key] -- key: rl_key's block (openai when none)
-  local roll="${1:-}" refused="${2:-}" key="${3:-openai}" tmp lock
+rl_capture_openai() { # rl_capture_openai <rollout-file> [refused] [key] [account] -- key: rl_key's block (openai when none); account: as rl_capture's
+  local roll="${1:-}" refused="${2:-}" key="${3:-openai}" who="${4:-}" tmp lock
   [ -s "$roll" ] || return 0
   grep -q token_count "$roll" 2>/dev/null || return 0
   lock="$LOCK_DIR/.ratelimit"
@@ -5315,7 +5425,7 @@ rl_capture_openai() { # rl_capture_openai <rollout-file> [refused] [key] -- key:
   rl_migrate
   [ -s "$RATE_LIMIT_FILE" ] || echo '{}' > "$RATE_LIMIT_FILE" 2>/dev/null || { lock_drop "$lock"; return 0; }
   tmp="$(mktemp "$DATA_DIR/.rl.XXXXXX")" || { lock_drop "$lock"; return 0; }
-  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg refused "$refused" --arg k "$key" '
+  "$JQ" -n -R --slurpfile prev "$RATE_LIMIT_FILE" --argjson now "$(now_epoch)" --arg refused "$refused" --arg k "$key" --arg who "$who" '
     ($prev[0] // {}) as $was
     | [inputs | fromjson? | select(.type == "event_msg" and .payload.type == "token_count") | .payload.rate_limits // empty]
     | last // empty
@@ -5329,7 +5439,8 @@ rl_capture_openai() { # rl_capture_openai <rollout-file> [refused] [key] -- key:
             utilization: (($w.used_percent // 0) / 100),
             resets_at: ($w.resets_at // null),
             overage: null, seen_at: $now, source: "rollout",
-            plan_type: ($rl.plan_type // null) }
+            plan_type: ($rl.plan_type // null),
+            account: (if $who == "" then null else $who end) }
         end;
     $was
     | .[$k] = ((.[$k] // {})
@@ -5341,38 +5452,64 @@ rl_capture_openai() { # rl_capture_openai <rollout-file> [refused] [key] -- key:
   return 0
 }
 
-# Should a SCHEDULED run be held back? Prints one operator-readable sentence and
-# returns 0 when it should. Silence and 1 mean go.
+# THE WINDOWS THAT HOLD A RUN BACK, as one jq filter over the whole file, for
+# rl_gate (the sentence) and rl_gate_until (when it lifts) alike, so the two
+# can never disagree on which windows count. Each is {sentence, at}.
 #
 # A window only speaks while it is still the window that was measured: once
 # `resets_at` has passed, the count started over and the reading says nothing
 # about now. That is what keeps a single bad afternoon from wedging the fleet
 # for ever -- the gate expires by itself, with no operator action and no clock
 # of our own.
-rl_gate() { # rl_gate [key] [account-name] -> 0 = hold this run back (reason on stdout); anthropic when unnamed. The name is said for an account that is not the Default
-  local k="${1:-anthropic}" p of=""
+#
+# And only while it is still THIS ACCOUNT's window: a reading stamped with an
+# account other than the one logged in on the key's directory now
+# (rl_key_identity) was measured on somebody else's limits. A reading with no
+# stamp -- written before readings carried one, or when nobody's identity
+# could be read -- is read as before, and so is every reading when the
+# current identity cannot be read.
+RL_BLOCKING_JQ='
+  (.[$k] // {}) | to_entries
+  | map(select(.value.resets_at != null and .value.resets_at > $now))
+  | map(select(.value.account == null or $acct == "" or .value.account == $acct))
+  | map(. + {mins: (((.value.resets_at - $now) / 60) | floor)})
+  # A refusal outranks a number: if the API has stopped saying `allowed`, the
+  # window is spent whatever the last utilisation reading was. A reading with
+  # NO status is not a refusal — the statusline reports utilisation without
+  # one, and treating its silence as a refusal would gate every healthy run.
+  | ( [ .[] | select(.value.status != null and ((.value.status | startswith("allowed")) | not)) ]
+      | map({at: .value.resets_at,
+             sentence: "the \($p) \(.key) window\($of) is spent (API says \(.value.status)) -- it resets in \(.mins) min"})
+    ) + (
+      [ .[] | select((.value.utilization // 0) >= $stop) ]
+      | map({at: .value.resets_at,
+             sentence: ("the \($p) \(.key) window\($of) is \((.value.utilization * 100) | floor)% used"
+               + (if .value.overage == "rejected" then " and overage is off, so the ceiling is a dead stop" else "" end)
+               + " -- it resets in \(.mins) min")})
+    )'
+
+rl_blocking() { # rl_blocking <key> <of> <jq-tail> -- RL_BLOCKING_JQ over the file, then <jq-tail>
+  local k="$1" p
   p="${k%%@*}"
-  [ -z "${2:-}" ] || of=" of ${2}"
   rl_migrate
   [ -s "$RATE_LIMIT_FILE" ] || return 1
-  "$JQ" -e -r --arg k "$k" --arg p "$p" --arg of "$of" --argjson now "$(now_epoch)" --argjson stop "$RL_STOP_AT" '
-    (.[$k] // {}) | to_entries
-    | map(select(.value.resets_at != null and .value.resets_at > $now))
-    | map(. + {mins: (((.value.resets_at - $now) / 60) | floor)})
-    # A refusal outranks a number: if the API has stopped saying `allowed`, the
-    # window is spent whatever the last utilisation reading was. A reading with
-    # NO status is not a refusal — the statusline reports utilisation without
-    # one, and treating its silence as a refusal would gate every healthy run.
-    | ( [ .[] | select(.value.status != null and ((.value.status | startswith("allowed")) | not)) ]
-        | map("the \($p) \(.key) window\($of) is spent (API says \(.value.status)) -- it resets in \(.mins) min")
-      ) + (
-        [ .[] | select((.value.utilization // 0) >= $stop) ]
-        | map("the \($p) \(.key) window\($of) is \((.value.utilization * 100) | floor)% used"
-              + (if .value.overage == "rejected" then " and overage is off, so the ceiling is a dead stop" else "" end)
-              + " -- it resets in \(.mins) min")
-      )
-    | first // empty
-  ' "$RATE_LIMIT_FILE" 2>/dev/null
+  "$JQ" -e -r --arg k "$k" --arg p "$p" --arg of "$2" --arg acct "$(rl_key_identity "$k")" \
+    --argjson now "$(now_epoch)" --argjson stop "$RL_STOP_AT" "$RL_BLOCKING_JQ | $3" "$RATE_LIMIT_FILE" 2>/dev/null
+}
+
+# Should a SCHEDULED run be held back? Prints one operator-readable sentence and
+# returns 0 when it should. Silence and 1 mean go.
+rl_gate() { # rl_gate [key] [account-name] -> 0 = hold this run back (reason on stdout); anthropic when unnamed. The name is said for an account that is not the Default
+  local of=""
+  [ -z "${2:-}" ] || of=" of ${2}"
+  rl_blocking "${1:-anthropic}" "$of" 'map(.sentence) | first // empty'
+}
+
+# When the windows holding a run back have all reset: the LAST of their
+# resets, since every one of them must have started over. Nothing when none
+# holds it back.
+rl_gate_until() { # rl_gate_until [key] -> epoch seconds, or nothing
+  rl_blocking "${1:-anthropic}" "" 'map(.at) | max // empty'
 }
 
 # ------------------------------------------------------- the silent stall
@@ -5553,7 +5690,7 @@ cmd_usage() {
         else
           who="$p ($(usage_account_label "$p" "${key#*@}"))"
         fi
-        "$JQ" -r --arg k "$key" --arg who "$who" --argjson now "$now" '
+        "$JQ" -r --arg k "$key" --arg who "$who" --argjson now "$now" --arg acct "$(rl_key_identity "$key")" '
           (.[$k] // {}) | to_entries[]
           | .value as $v
           | (if $v.utilization == null then "  ?" else (($v.utilization * 100) | floor | tostring) + "%" end) as $pct
@@ -5566,6 +5703,9 @@ cmd_usage() {
             + (if $v.plan_type != null then " (\($v.plan_type) plan)" else "" end)
             + (if $v.status != null then ", API said \($v.status)" else "" end)
             + (if $v.overage == "rejected" then ", overage off (the ceiling is a dead stop)" else "" end)
+            + (if $v.account != null and $acct != "" and $v.account != $acct
+               then "\n  measured on another account than the one logged in there now -- it holds nothing back"
+               else "" end)
         ' "$RATE_LIMIT_FILE" 2>/dev/null
         if printf '%s\n' "$read_keys" | grep -qxF "$key" \
            && reason="$(rl_gate "$key")" && [ -n "$reason" ]; then
@@ -5650,8 +5790,15 @@ daily_gate() { # daily_gate <id>
 # job's account, daily_gate -- never a second copy of them. Exit 3 with the
 # gate named in a sentence when one is closed (the orchestrator then stops
 # launching and interrupts the analysis, naming it); 0 when all are open.
+#
+# A SECOND LINE, for the analysis's pause (security/ledger.py pause_doc):
+# `<kind> <until> <reason>` -- `usage` or `cap`, the epoch the gate reopens
+# (`-` when not known), and the gate in a few words, without the "resets in
+# N min" that is stale the minute it is written. The page says from it when
+# the analysis resumes by itself, and the tick resumes it then
+# (security_resume_paused).
 security_unit_gate() { # security_unit_gate <job-id>
-  local id="$1" platform account account_dir name reason dg scope spent cap
+  local id="$1" platform account account_dir name key reason dg scope spent cap until
   platform="$(resolve "$id" platform 'anthropic')"
   case "$platform" in ''|null) platform="anthropic" ;; esac
   account="$(job_account "$id")"
@@ -5660,19 +5807,27 @@ security_unit_gate() { # security_unit_gate <job-id>
   if [ "$account" != "default" ]; then
     name="$(account_field "$platform" "$account" name)"; [ -n "$name" ] || name="$account"
   fi
-  if reason="$(rl_gate "$(rl_key "$platform" "$account_dir")" "$name")" && [ -n "$reason" ]; then
+  key="$(rl_key "$platform" "$account_dir")"
+  if reason="$(rl_gate "$key" "$name")" && [ -n "$reason" ]; then
     printf 'the usage limit was reached (%s)\n' "$reason"
+    until="$(rl_gate_until "$key")"
+    printf 'usage %s %s\n' "${until:--}" "${reason%% -- it resets in *}"
     return 3
   fi
   if dg="$(daily_gate "$id")"; then
     read -r scope spent cap <<EOF
 $dg
 EOF
+    # Spend is counted from local midnight (_spend_since_midnight), so that
+    # is when the cap reopens.
+    until="$(date -v+1d -v0H -v0M -v0S +%s 2>/dev/null)"
     if [ "$scope" = "job" ]; then
-      printf 'the daily cap of %s was reached ($%s / $%s)\n' "$id" "$spent" "$cap"
+      reason="$(printf 'the daily cap of %s was reached ($%s / $%s)' "$id" "$spent" "$cap")"
     else
-      printf 'the global daily cap was reached ($%s / $%s across all jobs)\n' "$spent" "$cap"
+      reason="$(printf 'the global daily cap was reached ($%s / $%s across all jobs)' "$spent" "$cap")"
     fi
+    printf '%s\n' "$reason"
+    printf 'cap %s %s\n' "${until:--}" "$reason"
     return 3
   fi
   return 0
@@ -6227,10 +6382,13 @@ cmd_runs() { # <id> — one active run per line: <run-pid>\t<agent-pid>\t<logfil
 # reach the same function, and nothing told them apart. On 2026-09-24 an
 # analysis was stopped 28 s in that its operator had not stopped, and the
 # record named them. The dashboard vouches for itself (the control server
-# sets AL_STOP_SOURCE on the one call it makes); for anything else, the two
-# processes above this one are the only witness to who asked.
-stop_origin() { # -> "from the dashboard" | "from outside the dashboard (...)"
-  if [ "${AL_STOP_SOURCE:-}" = "dashboard" ]; then
+# sets AL_CALLER on the stop, resume and retry it asks for); for anything
+# else, the two processes above this one are the only witness to who asked.
+# A resume or a retry names its own command: both used to be logged as
+# "`agentloop stop`, run by Python under launchd" -- the dashboard's Resume,
+# misnamed twice over.
+stop_origin() { # stop_origin [command] -> "from the dashboard" | "from outside the dashboard (`<command>`, ...)"; command: agentloop stop when unnamed
+  if [ "${AL_CALLER:-}" = "dashboard" ]; then
     printf 'from the dashboard\n'
     return 0
   fi
@@ -6238,8 +6396,8 @@ stop_origin() { # -> "from the dashboard" | "from outside the dashboard (...)"
   c1="$(ps -o comm= -p "$PPID" 2>/dev/null)"
   p2="$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')"
   c2="$(ps -o comm= -p "${p2:-0}" 2>/dev/null)"
-  printf 'from outside the dashboard (`agentloop stop`, run by %s under %s)\n' \
-    "$(basename "${c1:-unknown}")" "$(basename "${c2:-unknown}")"
+  printf 'from outside the dashboard (`%s`, run by %s under %s)\n' \
+    "${1:-agentloop stop}" "$(basename "${c1:-unknown}")" "$(basename "${c2:-unknown}")"
 }
 
 # The origin a stop marker carries, for the record. Empty -- a marker left by
@@ -7359,6 +7517,11 @@ EOF
       resume_account_sid="$resume_sid"
     fi
   fi
+  # WHOSE USAGE THIS RUN WILL REPORT: the account logged in on its directory as
+  # it launches (account_identity). Read now, not when it ends: a login
+  # switched while it works must not hand its readings to the account that
+  # came after it, and hold that one back on limits it never spent (rl_capture).
+  local rl_who; rl_who="$(account_identity "$platform" "$account_dir")"
   # cwd, model, permission, budget and timeout inherit from the project when the
   # job doesn't set them (see resolve()).
   cwd="$(resolve "$id" cwd "$HOME")"
@@ -8025,7 +8188,7 @@ If the work turns out to be already finished, or it can no longer be done at all
   # here because the stream is open in front of us and this is the only place it
   # is ever parsed in full — and recorded even for a failed run, since a run
   # killed AT the ceiling is exactly the one whose reading matters most.
-  rl_capture "$streamfile" "$(rl_key "$platform" "$account_dir")"
+  rl_capture "$streamfile" "$(rl_key "$platform" "$account_dir")" "$rl_who"
 
   end="$(now_epoch)"
   cost="$("$JQ" -r '.total_cost_usd // 0' "$logfile" 2>/dev/null || echo 0)"
@@ -8070,7 +8233,7 @@ If the work turns out to be already finished, or it can no longer be done at all
   # On openai and opencode the init event carries the slug that was ASKED
   # for; the model that ran is in the rollout (openai) or the export
   # (opencode). platform_finish also feeds the usage gate on openai.
-  platform_finish "$platform" "$streamfile" "$session" "$id" "$run_cwd" "${account_dir:-$(account_cli_default openai)}"
+  platform_finish "$platform" "$streamfile" "$session" "$id" "$run_cwd" "${account_dir:-$(account_cli_default openai)}" "$rl_who"
   [ -z "$PF_MODEL_ID" ] || model_id="$PF_MODEL_ID"
 
   # A stopped/killed/crashed run (no result event) never got the chance to
@@ -8297,6 +8460,7 @@ cmd_tick() {
     models_refresh_launch
   fi
   security_resume_orphans
+  security_resume_paused
   local days hours interval last streak max_par
   local hostbusy=""     # "" = not asked yet this tick; 0 = quiet; 1 = over the load cap
   # IFS is tick_plan's own separator, never a tab: see the note on TICK_SEP
@@ -9909,8 +10073,8 @@ case "${1:-}" in
                # (AGENT_FORBIDDEN in bin/security/cli.py refuses every one of
                # those to an agent session; the engine reaches them through
                # security_engine_py, or the orchestrator's own environment,
-               # with the flag unset); unit-prompt and units are the engine's
-               # reads of the pipeline; migrate-rules is the operator's too,
+               # with the flag unset); unit-prompt, units and paused are the
+               # engine's reads of the pipeline; migrate-rules is the operator's too,
                # though NOT refused the agent -- it takes no arguments and
                # can only apply the rename map this repository declares;
                # export-findings is the operator's export; and index-data,
@@ -9920,7 +10084,7 @@ case "${1:-}" in
                # this message names every verb the door actually accepts, not
                # just the subset any one caller uses (tests/security/
                # test_cli_doors.py pins it against the CLI's own parser).
-               "")      die "usage: agentloop security <analyze|resume|retry|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|unit-close|units|read|verify-queue|interrupt|abandon|reopen|orchestrate|finish|checklist|render|export-findings|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
+               "")      die "usage: agentloop security <analyze|resume|retry|prepare|findings|fingerprint|report-finding|report-verdict|report-gone|unit-prompt|unit-close|units|read|verify-queue|interrupt|paused|abandon|reopen|orchestrate|finish|checklist|render|export-findings|decide|rename-project|migrate-rules|open-analysis|list|index-data|project-data|findings-page|activity-data|analysis|event|events|filters> …" ;;
                *)       security_py "$@" ;;
              esac ;;
   security-branches) [ $# -ge 3 ] || die "usage: agentloop security-branches <project> <repo>"

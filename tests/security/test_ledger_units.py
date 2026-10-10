@@ -1,6 +1,10 @@
 # tests/security/test_ledger_units.py
 """The ledger's side of the pipeline: units, the deep scope, and the interrupted state."""
+import json
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -125,6 +129,68 @@ def test_interrupting_and_resuming_move_only_between_running_and_interrupted(con
     ledger.resume_analysis(conn, aid, automatic=True)
     assert conn.execute("SELECT resumes FROM analysis WHERE id=?", (aid,)).fetchone()[0] == 1
     assert ledger.resume_analysis(conn, aid) is False, "only an interrupted analysis resumes"
+
+
+def _pause(conn, aid):
+    return ledger.pause_of(conn.execute("SELECT * FROM analysis WHERE id=?", (aid,)).fetchone())
+
+
+def test_an_interruption_records_why_and_a_resume_clears_it(conn):
+    """The pause says what stopped the analysis, when, and when it reopens --
+    in a column of its own, never appended to the coverage paragraph: that
+    paragraph is what the analysis looked at, and a pause ends."""
+    aid = _analysis(conn)
+    conn.execute("UPDATE analysis SET coverage_note='Scope: 3 files.' WHERE id=?", (aid,))
+    conn.commit()
+    pause = ledger.pause_doc("usage", "the anthropic five_hour window is 99% used", 1790935200, at=1790929160)
+    assert ledger.interrupt_analysis(conn, aid, pause) is True
+    assert _pause(conn, aid) == {"kind": "usage", "at": 1790929160,
+                                 "reason": "the anthropic five_hour window is 99% used",
+                                 "until": 1790935200}
+    row = conn.execute("SELECT coverage_note FROM analysis WHERE id=?", (aid,)).fetchone()
+    assert row["coverage_note"] == "Scope: 3 files."
+    assert ledger.resume_analysis(conn, aid) is True
+    assert _pause(conn, aid) == {}
+
+
+def test_an_interruption_nobody_named_has_no_pause(conn):
+    aid = _analysis(conn)
+    ledger.interrupt_analysis(conn, aid)
+    assert _pause(conn, aid) == {}
+
+
+def test_closing_an_interrupted_analysis_ends_its_pause(conn):
+    aid = _analysis(conn)
+    ledger.interrupt_analysis(conn, aid, ledger.pause_doc("stopped"))
+    ledger.close_interrupted(conn, aid, "Superseded by analysis 9.")
+    assert _pause(conn, aid) == {}
+
+
+def test_a_pause_of_an_unknown_kind_is_refused_and_an_unreadable_one_reads_as_none(conn):
+    with pytest.raises(ValueError):
+        ledger.pause_doc("coffee")
+    aid = _analysis(conn)
+    for stored in ("not json", "[1]", '{"kind": "coffee"}'):
+        conn.execute("UPDATE analysis SET pause=? WHERE id=?", (stored, aid))
+        assert _pause(conn, aid) == {}, stored
+    assert ledger.pause_of({}) == {}, "a row from before the column"
+
+
+def test_only_a_pause_that_lifts_by_itself_is_listed_for_the_tick(conn):
+    """The usage window and a daily cap reopen by themselves, and the tick
+    resumes what they paused. A stop, a failure, units that could not start
+    and a gate of no known kind wait for a person."""
+    ids = {}
+    for kind in ledger.PAUSE_KINDS:
+        ids[kind] = _analysis(conn)
+        ledger.interrupt_analysis(conn, ids[kind], ledger.pause_doc(kind, "why"))
+    unnamed = _analysis(conn)
+    ledger.interrupt_analysis(conn, unnamed)
+    running = _analysis(conn)
+    listed = [r["id"] for r in ledger.self_lifting_paused(conn)]
+    assert listed == [ids["usage"], ids["cap"]]
+    assert set(ledger.SELF_LIFTING_PAUSES) == {"usage", "cap"}
+    assert running not in listed and unnamed not in listed
 
 
 def test_an_interrupted_analysis_is_never_a_baseline(conn):
@@ -389,3 +455,44 @@ def test_concluding_settles_a_unit_and_adds_its_continuation_together_and_only_o
     assert ledger.conclude_unit(conn, cid, "done") == (True, None)
     with pytest.raises(ValueError):
         ledger.conclude_unit(conn, uid, "running")
+
+
+def test_the_paused_verb_lists_what_the_tick_resumes_by_itself(tmp_path):
+    """`paused` is the tick's question (security_resume_paused in
+    bin/agentloop): the analyses a usage window or a daily cap paused, with
+    the job that runs them and the pause itself -- nothing else."""
+    cli = Path(ledger.__file__).resolve().parent / "cli.py"
+    db = tmp_path / "security.db"
+    conn = ledger.connect(db)
+    usage = ledger.start_analysis(conn, "web", "web", "main", "abc", "deep", "security-web")
+    ledger.interrupt_analysis(conn, usage, ledger.pause_doc("usage", "the window is 99% used", 1790935200))
+    stopped = ledger.start_analysis(conn, "api", "api", "dev", "def", "deep", "security-api")
+    ledger.interrupt_analysis(conn, stopped, ledger.pause_doc("stopped"))
+    out = subprocess.run([sys.executable, str(cli), "--db", str(db), "paused"],
+                         capture_output=True, text=True, check=True)
+    listed = json.loads(out.stdout)
+    assert [(r["id"], r["project"], r["repo"], r["branch"], r["run_id"]) for r in listed] == [
+        (usage, "web", "web", "main", "security-web")]
+    assert listed[0]["pause"]["kind"] == "usage" and listed[0]["pause"]["until"] == 1790935200
+
+
+def test_the_pause_sentences_an_older_engine_appended_are_cut_from_the_paragraph(tmp_path):
+    """An analysis paused before the `pause` column carries the reason in its
+    paragraph, once per pause -- on the analysis of 2026-10-02 twice, 98% and
+    then 99%, at the end of two thousand characters. Opening the ledger cuts
+    exactly those sentences, and nothing around them."""
+    db = tmp_path / "security.db"
+    conn = ledger.connect(db)
+    aid = _analysis(conn)
+    gate = ("The engine interrupted this analysis because the usage limit was reached (the "
+            "anthropic five_hour window is {}% used -- it resets in 97 min); the units it "
+            "finished are kept, and a resume continues it once the gate reopens.")
+    failed = ("The engine interrupted this analysis because its orchestrator failed "
+              "(RuntimeError); the units it finished are kept, and a resume continues it.")
+    note = f"Scope: 3 files. {gate.format(98)} {gate.format(99)} Secrets: gitleaks. {failed}"
+    conn.execute("UPDATE analysis SET coverage_note=? WHERE id=?", (note, aid))
+    conn.commit()
+    conn.close()
+    conn = ledger.connect(db)
+    assert conn.execute("SELECT coverage_note FROM analysis WHERE id=?", (aid,)).fetchone()[0] == \
+        "Scope: 3 files. Secrets: gitleaks."

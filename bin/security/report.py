@@ -10,7 +10,7 @@ import html
 import json
 import time
 
-from . import coverage
+from . import coverage, ledger
 # One definition of what "resolved" means, imported rather than repeated:
 # a second copy is how the export and the screen would come to disagree
 # about which findings are still work. queries imports diff and ledger,
@@ -195,6 +195,10 @@ def _coverage(analysis, coverage_note):
     phases never ran for this analysis: ..."). Kept word-for-word identical to
     the sentence `bin/dashboard.html` prints for the same state, so the
     downloaded file and the screen never disagree.
+
+    An interrupted analysis with a `pause` says what paused it instead
+    (pause_sentence), in the words the analysis screen uses -- the time in
+    UTC here, a file having no local clock to read it by.
     """
     parts = []
     if analysis["state"] == "capped":
@@ -203,11 +207,39 @@ def _coverage(analysis, coverage_note):
     elif analysis["state"] == "failed":
         parts.append("This analysis is INCOMPLETE: it did not finish.")
     elif analysis["state"] == "interrupted":
-        parts.append("This analysis is INTERRUPTED: it stopped before covering the "
-                     "whole scope, and Resume continues it where it left off.")
+        parts.append(pause_sentence(ledger.pause_of(analysis))
+                     or "This analysis is INTERRUPTED: it stopped before covering the "
+                        "whole scope, and Resume continues it where it left off.")
     if coverage_note:
         parts.append(coverage_note)
     return parts
+
+
+def _utc(epoch):
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(int(epoch)))
+
+
+def pause_sentence(pause) -> str:
+    """What paused an interrupted analysis, and what happens next, in one or
+    two sentences -- the twin of the analysis screen's own
+    (ui/security/analysis.js, secPauseSentence), which reads the same
+    document. '' for no pause: the caller says "interrupted" alone."""
+    kind = pause.get("kind")
+    if not kind:
+        return ""
+    at = _utc(pause["at"]) if pause.get("at") else "an unrecorded time"
+    reason = (pause.get("reason") or "").strip().rstrip(".")
+    until = pause.get("until")
+    if kind == "stopped":
+        return f"This analysis was STOPPED at {at}; Resume continues it where it left off."
+    head = f"This analysis was PAUSED at {at}"
+    if kind in ledger.SELF_LIFTING_PAUSES:
+        by = "the usage limit" if kind == "usage" else "the daily cap"
+        when = f" at {_utc(until)}" if until else " once that reopens"
+        return f"{head} by {by}: {reason}. It resumes by itself{when}."
+    if kind == "breaker":
+        return f"{head}: {reason}. Resume it once that is fixed."
+    return f"{head}: {reason}. Resume continues it where it left off."
 
 
 # The `by` column of a phase that had no producer -- `scope`, or any phase

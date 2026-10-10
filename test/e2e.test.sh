@@ -339,17 +339,18 @@ aid9="$(secid "$out9")"
 # Every unit's agent exits 3 before its first event: start failures, which
 # keep the unit's attempt. Three in a row, over two lineages, close the
 # orchestrator's gate, and the analysis is left interrupted with the cause in
-# its note -- for a Resume once it is fixed, never a `running` row nobody
+# its pause -- for a Resume once it is fixed, never a `running` row nobody
 # closes, and never every unit given up one by one.
 w=0
 while [ "$w" -lt 60 ] && [ "$(secstate sandbox "$aid9")" = "running" ]; do sleep 1; w=$((w + 1)); done
 [ "$(secstate sandbox "$aid9")" = "interrupted" ] \
   && ok "a claude that exits without a word leaves the row interrupted, not running (waited ${w}s)" \
   || bad "left '$(secstate sandbox "$aid9")' after ${w}s"
-case "$(secnote sandbox "$aid9")" in
-  *"the agent could not start: 3 units in a row"*"the agent exited 3 with nothing on stderr"*)
-    ok "and the note names the pause and the agent's exit" ;;
-  *) bad "no pause in the coverage note: '$(secnote sandbox "$aid9")'" ;;
+pause9="$("$AL" security list --project sandbox | jq -r --argjson a "$aid9" '.[] | select(.id == $a) | .pause | fromjson? | "\(.kind) \(.reason)"')"
+case "$pause9" in
+  "breaker the agent could not start: 3 units in a row"*"the agent exited 3 with nothing on stderr"*)
+    ok "and its pause names the cause and the agent's exit, for a person to fix" ;;
+  *) bad "no such pause: '$pause9'" ;;
 esac
 sleep 1
 
@@ -1642,7 +1643,7 @@ lastrun | jq -r .note | grep -qF 'STOPPED: ended from outside the dashboard (`ag
 grep -F 'j53: stop asked for run ' "$ROOT/data/tick.log" | grep -qF 'from outside the dashboard (`agentloop stop`, run by ' \
   && ok "and tick.log said so the moment the stop was asked" \
   || bad "tick.log: $(grep -F 'j53:' "$ROOT/data/tick.log" | tail -2)"
-# The control server's own stop sets AL_STOP_SOURCE (bin/agentloop-server
+# The control server's own stop sets AL_CALLER (bin/agentloop-server
 # stop_run, tests/test_stop_origin.py); the engine's half is here. The first
 # launch's slot has to be gone before the second starts -- scenario 44's
 # lesson: a slot a teardown has not finished removing reads, to a glob, as
@@ -1655,7 +1656,7 @@ w=0
 while [ "$w" -lt 90 ] && ! { ls "$ROOT"/data/locks/j53/*/child >/dev/null 2>&1 && [ -s "$pid53b" ]; }; do
   sleep 1; w=$((w + 1))
 done
-AL_STOP_SOURCE=dashboard "$AL" stop j53 >/dev/null 2>&1
+AL_CALLER=dashboard "$AL" stop j53 >/dev/null 2>&1
 wait
 [ "$(lastrun | jq -r .session)" = "sess-53b" ] && lastrun | jq -r .note | grep -qF 'STOPPED: ended from the dashboard. ' \
   && ok "a stop the dashboard makes is recorded as from the dashboard" \
@@ -1757,6 +1758,11 @@ git -C "$ROOT/work/app" worktree list --porcelain | grep -qF "/data/worktrees/se
   && bad "the analysed repo still lists a unit worktree: $(git -C "$ROOT/work/app" worktree list)" \
   || ok "and the analysed repo lists none"
 FAKE_MODE=complete FAKE_SESSION=sess-56b "$AL" security resume sandbox "$aid56" >/dev/null 2>&1
+# A resume typed in a shell names its own command, never `agentloop stop`.
+grep -F "security-sandbox: resumed analysis $aid56 " "$ROOT/data/tick.log" \
+  | grep -qF 'from outside the dashboard (`agentloop security resume`, run by ' \
+  && ok "tick.log says the resume came from a shell, and names the resume" \
+  || bad "tick.log: $(grep -F "resumed analysis $aid56" "$ROOT/data/tick.log" | tail -1)"
 w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid56")" != "done" ]; do sleep 1; w=$((w + 1)); done
 [ "$(secstate sandbox "$aid56")" = "done" ] \
   && ok "resume finishes it (waited ${w}s)" \
@@ -1983,6 +1989,90 @@ sleep 1
 echo
 }
 
+scenario_67() {
+echo "67. a usage reading is the account's that was logged in, so switching the login lifts the hold"
+# 2026-10-02: an analysis paused at 98% of the five-hour window; the operator
+# logged the CLI's directory into a second account, and every launch was
+# still held back on the first account's 99% until it reset 90 minutes later.
+mkdir -p "$ROOT/accounts/claude-67"
+"$AL" platform account-add anthropic "Switched" "$ROOT/accounts/claude-67" >/dev/null 2>&1 || bad "account-add failed"
+login67() { printf '{"oauthAccount":{"accountUuid":"%s","organizationUuid":"org-67"}}\n' "$1" > "$ROOT/accounts/claude-67/.claude.json"; }
+k67="anthropic@$ROOT/accounts/claude-67"
+rl67="$ROOT/data/rate-limits.json"
+rm -f "$rl67"
+mkjob_acct j67 switched
+login67 acct-first
+FAKE_MODE=complete FAKE_SESSION=sess-67 FAKE_RATE_LIMIT_EVENT=unified "$AL" run j67 >/dev/null 2>&1
+sleep 1
+[ "$(jq -r --arg k "$k67" '[.[$k][].account] | unique | join(",")' "$rl67" 2>/dev/null)" = "acct-first:org-67" ] \
+  && ok "the run's readings carry the account logged in as it launched" || bad "readings: $(jq -c --arg k "$k67" '.[$k]' "$rl67" 2>/dev/null)"
+
+jq --arg k "$k67" --argjson r "$(( $(date +%s) + 3600 ))" \
+  '.[$k].five_hour = {status:"allowed_warning", utilization:0.99, resets_at:$r, overage:null, seen_at:1, account:"acct-first:org-67"}' \
+  "$rl67" > "$rl67.next" && mv "$rl67.next" "$rl67"
+"$AL" _exec j67 >/dev/null 2>&1
+grep -qF "j67: usage limit reached — the anthropic five_hour window of Switched is 99% used" "$ROOT/data/tick.log" \
+  && ok "that account's 99% holds its scheduled runs back" || bad "no hold: $(tail -3 "$ROOT/data/tick.log")"
+
+login67 acct-second
+"$AL" usage 2>&1 | grep -q "measured on another account than the one logged in there now" \
+  && ok "after the login switch, usage says the reading is another account's" || bad "usage: $("$AL" usage 2>&1 | head -6)"
+"$AL" usage 2>&1 | grep -q "SCHEDULED anthropic (Switched) RUNS ARE BEING HELD BACK" \
+  && bad "usage still reports the hold: $("$AL" usage 2>&1 | grep -A1 HELD)" || ok "and no hold"
+FAKE_MODE=complete FAKE_SESSION=sess-67b "$AL" _exec j67 >/dev/null 2>&1
+sleep 1
+[ "$(lastrun | jq -r .session)" = "sess-67b" ] \
+  && ok "and the next scheduled run goes ahead on the new account" || bad "still held: $(tail -3 "$ROOT/data/tick.log")"
+rm -f "$rl67"
+
+echo
+}
+
+scenario_68() {
+echo "68. an analysis the usage limit paused says so, refuses a Resume until it reopens, and resumes by itself"
+# 2026-10-02: a deep analysis paused at 98% of the five-hour window, 32 of 37
+# units in. Each Resume ran for one second, hit the same limit, and paused it
+# again -- answering the page with success, so "nothing happened" -- and the
+# reason was the last sentence of a two-thousand-character paragraph.
+rl68="$ROOT/data/rate-limits.json"
+reset68="$(( $(date +%s) + 3600 ))"
+jq -n --argjson r "$reset68" \
+  '{anthropic:{five_hour:{status:"allowed_warning",utilization:0.99,resets_at:$r,overage:null,seen_at:1}}}' > "$rl68"
+out68="$(FAKE_MODE=complete FAKE_SESSION=sess-68 "$AL" security analyze --detach sandbox anything main quick)"
+aid68="$(secid "$out68")"
+w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid68")" = "running" ]; do sleep 1; w=$((w + 1)); done
+pause68="$("$AL" security list --project sandbox | jq -c --argjson a "$aid68" '.[] | select(.id == $a) | .pause | fromjson? // {}')"
+[ "$(secstate sandbox "$aid68")" = "interrupted" ] \
+  && [ "$(printf '%s' "$pause68" | jq -r '"\(.kind) \(.until) \(.reason)"')" = "usage $reset68 the anthropic five_hour window is 99% used" ] \
+  && ok "the analysis is paused, and its pause says by what and until when (waited ${w}s)" \
+  || bad "state '$(secstate sandbox "$aid68")', pause $pause68"
+secnote sandbox "$aid68" | grep -q "interrupted this analysis" \
+  && bad "the pause went into the coverage paragraph: $(secnote sandbox "$aid68")" \
+  || ok "and the coverage paragraph does not carry it"
+w=0; while [ "$w" -lt 60 ] && [ -n "$(ls -A "$ROOT/data/locks/security-sandbox" 2>/dev/null | grep -v '^\.acq$')" ]; do sleep 1; w=$((w + 1)); done
+said68="$("$AL" security resume sandbox "$aid68" 2>&1)"; rc68=$?
+[ "$rc68" -ne 0 ] \
+  && case "$said68" in *"analysis $aid68 cannot resume yet: the usage limit was reached (the anthropic five_hour window is 99% used"*"It resumes by itself once that reopens."*) true ;; *) false ;; esac \
+  && ok "a Resume while the limit holds is refused, saying why" || bad "resume answered rc=$rc68: $said68"
+[ "$(secstate sandbox "$aid68")" = "interrupted" ] && ! grep -qF "resumed analysis $aid68" "$ROOT/data/tick.log" \
+  && ok "and the analysis was not resumed into the same limit" || bad "resumed anyway: $(grep -F "analysis $aid68" "$ROOT/data/tick.log" | tail -3)"
+FAKE_MODE=complete FAKE_SESSION=sess-68b "$AL" tick >/dev/null 2>&1
+[ "$(secstate sandbox "$aid68")" = "interrupted" ] && ! grep -qF "analysis $aid68 resumed by itself" "$ROOT/data/tick.log" \
+  && ok "a tick while it holds leaves it paused" || bad "the tick resumed it under the limit"
+# The window resets.
+jq --argjson r "$(( $(date +%s) - 60 ))" '.anthropic.five_hour.resets_at = $r' "$rl68" > "$rl68.next" && mv "$rl68.next" "$rl68"
+FAKE_MODE=complete FAKE_SESSION=sess-68c "$AL" tick >/dev/null 2>&1
+grep -qF "security-sandbox: analysis $aid68 resumed by itself — the limit that paused it has reopened" "$ROOT/data/tick.log" \
+  && ok "once it reopens, the tick resumes it by itself" || bad "no resume: $(grep -F "analysis $aid68" "$ROOT/data/tick.log" | tail -3)"
+w=0; while [ "$w" -lt 120 ] && [ "$(secstate sandbox "$aid68")" != "done" ]; do sleep 1; w=$((w + 1)); done
+[ "$(secstate sandbox "$aid68")" = "done" ] \
+  && ok "and it finishes (waited ${w}s)" || bad "after the tick's resume: '$(secstate sandbox "$aid68")' -- $(secnote sandbox "$aid68")"
+rm -f "$rl68"
+sleep 1
+
+echo
+}
+
 
 scenario_64() {
 echo "64. a run queued behind agentloop heavy is not killed as stalled, however long it waits"
@@ -2126,11 +2216,11 @@ echo
 # heavy, wherever it keeps the lists within a few seconds of each other --
 # re-measure when the last list grows -- and the count assertion below fails
 # if it is forgotten from every list.
-E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66"
+E2E_ALL="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37 38 39 40 41 41b 41c 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68"
 E2E_LIST_1="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 17b 18 19"
 E2E_LIST_2="20 21 22 23 24 25 26 27 28 29 30 31 32 33 33b 34 35 35b 36 37"
 E2E_LIST_3="38 39 40 41 41b 41c 42 43 44 45 46"
-E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66"
+E2E_LIST_4="47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68"
 
 # What a sandbox needs BEFORE the scenarios that use a platform's catalog: the
 # price table, and the two catalogs resolved from the stand-ins. These used to
