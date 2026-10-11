@@ -705,8 +705,49 @@ mechanisms now limit the host, both shared by every job of every project:
   down, or absent) counts as "no CI step", and `agentloop host` says so, because
   a gate that waits on a hung daemon would stop the whole fleet. The tick does not
   look: a CI step holds heavy work, not launches. The gate is checked when a
-  command asks for a slot; a step that starts after the command began is not
-  waited for.
+  command asks for a slot, and it keeps being checked while the command runs
+  (next item).
+
+- **A CI step that starts while the command runs.** Waiting at the door does not
+  protect a step that begins after the command did: on 2026-10-11 a pipeline's
+  Integration step timed out (Playwright's 30 s, a missed benchmark) beside an
+  agent's `make test` stack at ~70 % CPU. CI is the merge gate and an agent can
+  wait, so the command **yields**. Every few seconds (the heavy poll, at most 5 s)
+  the process that runs the command asks the same question as the gate, with the
+  same docker, name pattern and timeout. When a CI step appears it pauses the
+  compose containers whose project working directory is the command's own
+  directory or below it (`docker pause`, recording exactly which; a stack of
+  another directory, and the step's own containers, are never touched), stops the
+  command's process group (`SIGSTOP`), says so once on stderr (`agentloop heavy:
+  paused — a CI step is running (ci step 8648124f (bitbucket runner)); resuming
+  when it ends.`) and touches the run's `heavy-wait` file on every poll, so the
+  stall watchdog below does not read a paused run as hung. When no step runs any
+  more it `docker unpause`s exactly those containers, continues the group
+  (`SIGCONT`), removes the heartbeat and says `resumed after 4m10s.` A later step
+  pauses it again. A command run by hand yields too (it has no heartbeat to
+  touch). Only the outermost `agentloop heavy` yields: a nested call executes its
+  command directly.
+  - **The ceiling.** A command is never held for longer than
+    `AGENTLOOP_CI_YIELD_MAX` (45 minutes) behind one step: past it, it resumes
+    though the step still runs, and only a NEW step stops it again. A pause counts
+    against the job's `timeout_seconds` like any other time.
+  - **Fail open, as at the door.** A docker that does not answer in time, fails
+    or is absent means "no step": it never pauses anything, and a command that is
+    paused when docker stops answering is resumed (nothing else could tell it the
+    step ended). Every docker call is bounded (three times the `docker ps`
+    timeout), so a hung `docker pause` or `unpause` cannot wedge the run.
+  - **Every road out resumes first.** `INT`/`TERM`/`HUP`, the death of the shell
+    that holds the slot, and the command's own end unpause the stack and continue
+    the group before anything is signalled or the runner exits: a stopped group
+    cannot handle a `TERM`, and a paused stack cannot be stopped cleanly. If the
+    runner itself is killed with `-9` while holding a pause, the shell that started
+    it reads the runner's journal (`<slot>/yielded`) and undoes it; if the shell
+    dies too, the next look at the heavy slots (`agentloop host`, the next
+    `agentloop heavy`) undoes it before it prunes the dead slot (unpause, `SIGCONT`;
+    a slot with no journal costs no docker call).
+  - **Switching it off.** `AGENTLOOP_CI_YIELD=0` (or `host.ci_yield`) keeps the
+    gate at the door and drops the yielding; with the gate off (`AGENTLOOP_CI_GATE`)
+    there is none either.
 
 `agentloop host` (or `agentloop heavy --status`) prints the load, the cap, the
 CI line, the slots in use and their holders, and exits **0 when the host is quiet**
@@ -721,6 +762,8 @@ re-measure.
 | CI steps hold heavy work (`0`, `off` or `false` = off) | `AGENTLOOP_CI_GATE` | `host.ci_gate` | `1` |
 | Which containers are a CI step (extended regex over `docker ps` names) | `AGENTLOOP_CI_PATTERN` | `host.ci_pattern` | the runner's `<uuid>_<uuid>_(pause\|build)` |
 | Seconds `docker ps` may take before the gate fails open (1-60) | `AGENTLOOP_CI_TIMEOUT` | `host.ci_timeout` | `5` |
+| A running command yields to a CI step that starts (`0`, `off` or `false` = off; always off with the CI gate) | `AGENTLOOP_CI_YIELD` | `host.ci_yield` | `1` |
+| Seconds a command may stay suspended behind one CI step (at least 1) | `AGENTLOOP_CI_YIELD_MAX` | `host.ci_yield_max` | `2700` |
 
 The environment wins, then the top-level `host` block of `config/projects.json`
 (`{"projects": [...], "host": {"heavy_slots": 1, "load_cap": 15}}`), then the

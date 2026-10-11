@@ -20,6 +20,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A heavy command yields to a CI step that starts while it runs.** The CI gate
+  only held back a command that asked for a slot while a step was already
+  running; one that was running when a step began competed with it for the same
+  CPUs. On 2026-10-11 CommitFort's pipeline #93 failed its Integration step
+  (Playwright's 30 s timeouts, a missed benchmark) beside a Revenue Copilot
+  agent's `make test` stack at ~70 % CPU, and CI is the merge gate. Now the
+  process that runs an `agentloop heavy` command asks, every few seconds, the
+  gate's own question (same docker, pattern and timeout, same fail-open reading);
+  when a step appears it `docker pause`s the compose containers of the command's
+  working directory (recording which), stops the command's process group, says
+  so once, and touches the run's `heavy-wait` file so the stall watchdog does not
+  call the stillness a hang. When the step is gone, or after
+  `AGENTLOOP_CI_YIELD_MAX` (default 2700 s; only a new step stops it again), it
+  unpauses exactly those containers, continues the group and says how long it
+  was held. Every road out resumes first (a stopped group cannot handle a TERM,
+  a paused stack cannot be stopped cleanly): `INT`/`TERM`/`HUP`, the holder's
+  death and the command's end; a runner killed with `-9` is undone by the shell
+  from a journal in the slot, and if the shell dies too the next prune of the
+  dead slot (any `agentloop host` / `heavy`) undoes it first, so a stopped group
+  and a paused stack are never left behind with their slot. A docker that fails or does not answer never
+  pauses anything. `AGENTLOOP_CI_YIELD=0` / `host.ci_yield` switches it off.
+  `test/fake-docker` learned `pause`, `unpause` (with
+  `FAKE_DOCKER_PAUSE_FAIL`, `FAKE_DOCKER_UNPAUSE_FAIL`, `FAKE_DOCKER_PAUSE_HANG`,
+  `FAKE_DOCKER_UNPAUSE_HANG`, `FAKE_DOCKER_EVENTS`), `--filter status=` and
+  `FAKE_DOCKER_PS_FAIL_FILE` / `FAKE_DOCKER_PS_HANG_FILE`, and writes its state
+  file atomically.
+
 - **A running CI step occupies the host's heavy gate.** `agentloop host` and
   `agentloop heavy` only saw agent runs, but a Bitbucket Pipelines runner shares
   the same Mac. On 2026-10-10 an agent's `make test` held the heavy slot while a

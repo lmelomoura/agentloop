@@ -16,6 +16,18 @@ A container with a "name" is listed by `ps --format '{{.Names}}'`; without
 FAKE_DOCKER_HANG=<seconds> makes `ps` sleep first (a daemon that does not
 answer), FAKE_DOCKER_PS_FAIL=1 makes it fail (one that refuses).
 
+`pause` and `unpause` move a container between "running" and "paused" as the
+real ones do (pausing a paused container, or unpausing a running one, is an
+error with exit 1; a paused container is still listed by `ps`, which shows it
+as "Up (Paused)", and `--filter status=running` leaves it out).
+FAKE_DOCKER_PAUSE_FAIL=1 / FAKE_DOCKER_UNPAUSE_FAIL=1 make them fail, and
+FAKE_DOCKER_PAUSE_HANG=<seconds> / FAKE_DOCKER_UNPAUSE_HANG=<seconds> make them
+sleep first. When FAKE_DOCKER_EVENTS names a file, every successful pause and
+unpause is also appended to it as one line ("pause <id>"): a plain append-only
+log that a test can read while it rewrites the state file.
+FAKE_DOCKER_PS_HANG_FILE / FAKE_DOCKER_PS_FAIL_FILE name a file: while it
+exists, `ps` hangs / fails (a daemon that goes away while a command runs).
+
 `created` is docker's human form ("2026-10-07 14:31:12 +0100 WEST"). An image
 with `"project": ""` carries no compose project label; `"builder"` is the
 `com.docker.compose.image.builder` label compose's classic builder sets
@@ -40,8 +52,12 @@ def load():
 
 
 def save(s):
-    with open(STATE, "w") as f:
+    # Written beside the state file and renamed over it: a test that rewrites the
+    # state while a command runs must never make a concurrent reader see half a file.
+    tmp = "%s.%d.tmp" % (STATE, os.getpid())
+    with open(tmp, "w") as f:
         json.dump(s, f)
+    os.replace(tmp, STATE)
 
 
 def label_filter(args):
@@ -70,6 +86,14 @@ def select(items, args):
     if value is None:
         return [x for x in items if x.get("project")]
     return [x for x in items if x.get("project") == value]
+
+
+def status_filter(args):
+    """The value of a `--filter status=<v>`, or None."""
+    for i, a in enumerate(args):
+        if a == "--filter" and i + 1 < len(args) and args[i + 1].startswith("status="):
+            return args[i + 1].split("=", 1)[1]
+    return None
 
 
 def render(fmt, fields):
@@ -114,18 +138,60 @@ def main(argv):
         # on 2026-10-10, for minutes). FAKE_DOCKER_PS_FAIL=1: one that refuses.
         if os.environ.get("FAKE_DOCKER_HANG"):
             time.sleep(float(os.environ["FAKE_DOCKER_HANG"]))
-        if os.environ.get("FAKE_DOCKER_PS_FAIL"):
+        if os.environ.get("FAKE_DOCKER_PS_HANG_FILE") and os.path.exists(os.environ["FAKE_DOCKER_PS_HANG_FILE"]):
+            time.sleep(30)
+        if os.environ.get("FAKE_DOCKER_PS_FAIL") or (
+                os.environ.get("FAKE_DOCKER_PS_FAIL_FILE") and os.path.exists(os.environ["FAKE_DOCKER_PS_FAIL_FILE"])):
             print("Cannot connect to the Docker daemon", file=sys.stderr)
             return 1
         rows = select(s["containers"], rest)
-        # As the real one does: without -a only RUNNING containers are listed.
+        # As the real one does: without -a only RUNNING containers are listed
+        # (a paused one is still running as far as `ps` is concerned, and is
+        # listed unless the status filter says otherwise).
         # A container with no "state" is running.
-        if not ("-a" in rest or "-aq" in rest or "--all" in rest):
-            rows = [c for c in rows if c.get("state", "running") == "running"]
+        want = status_filter(rest)
+        if want:
+            rows = [c for c in rows if c.get("state", "running") == want]
+        elif not ("-a" in rest or "-aq" in rest or "--all" in rest):
+            rows = [c for c in rows if c.get("state", "running") in ("running", "paused")]
         fmt = opt(rest, "--format")
         for c in rows:
             print(c["id"] if "-aq" in rest or fmt is None else render(fmt, cfields(c)))
         return 0
+
+    if cmd in ("pause", "unpause"):
+        tag = cmd.upper()
+        if os.environ.get("FAKE_DOCKER_%s_HANG" % tag):
+            time.sleep(float(os.environ["FAKE_DOCKER_%s_HANG" % tag]))
+        if os.environ.get("FAKE_DOCKER_%s_FAIL" % tag):
+            print("Error response from daemon: cannot %s" % cmd, file=sys.stderr)
+            return 1
+        rc = 0
+        for ref in [a for a in rest if not a.startswith("-")]:
+            hit = [c for c in s["containers"] if ref in (c["id"], c.get("name"))]
+            if not hit:
+                print("Error response from daemon: No such container: " + ref, file=sys.stderr)
+                rc = 1
+                continue
+            c = hit[0]
+            state = c.get("state", "running")
+            if cmd == "pause" and state != "running":
+                print("Error response from daemon: Container %s is %s" % (
+                    c["id"], "already paused" if state == "paused" else "not running"), file=sys.stderr)
+                rc = 1
+                continue
+            if cmd == "unpause" and state != "paused":
+                print("Error response from daemon: Container %s is not paused" % c["id"], file=sys.stderr)
+                rc = 1
+                continue
+            c["state"] = "paused" if cmd == "pause" else "running"
+            s["log"].append("%s %s" % (cmd, c["id"]))
+            if os.environ.get("FAKE_DOCKER_EVENTS"):
+                with open(os.environ["FAKE_DOCKER_EVENTS"], "a") as f:
+                    f.write("%s %s\n" % (cmd, c["id"]))
+            print(ref)
+        save(s)
+        return rc
 
     if cmd == "rm":
         ids = [a for a in rest if not a.startswith("-")]
