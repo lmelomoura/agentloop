@@ -37,7 +37,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   was held. Every road out resumes first (a stopped group cannot handle a TERM,
   a paused stack cannot be stopped cleanly): `INT`/`TERM`/`HUP`, the holder's
   death and the command's end; a runner killed with `-9` is undone by the shell
-  from a journal in the slot. A docker that fails or does not answer never
+  from a journal in the slot, and if the shell dies too the next prune of the
+  dead slot (any `agentloop host` / `heavy`) undoes it first, so a stopped group
+  and a paused stack are never left behind with their slot. A docker that fails or does not answer never
   pauses anything. `AGENTLOOP_CI_YIELD=0` / `host.ci_yield` switches it off.
   `test/fake-docker` learned `pause`, `unpause` (with
   `FAKE_DOCKER_PAUSE_FAIL`, `FAKE_DOCKER_UNPAUSE_FAIL`, `FAKE_DOCKER_PAUSE_HANG`,

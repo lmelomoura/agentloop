@@ -4259,6 +4259,7 @@ slots_active() { # <id> -> prints count of live slots; prunes dead ones
     if { [ -n "$pid" ] && slot_alive "$d"; } || { [ -z "$pid" ] && [ -d "$d" ] && ! lock_abandoned "$d"; }; then
       n=$((n + 1))
     else
+      yield_undo "$d"                    # a suspended command must not outlive the slot that knew about it
       rm -rf "$d"
     fi
   done
@@ -4929,20 +4930,23 @@ heavy_ci_running() {
 # once the runner is gone means it was killed outright while the command was held:
 # nothing in it could resume, so we do, or the group stays stopped and the stack
 # paused with nobody left to ask.
-heavy_unyield() {
-  local j pg ids bin
-  [ -n "$HEAVY_SLOT" ] || return 0
-  j="$HEAVY_SLOT/yielded"
+# yield_undo <slot dir>: undo a journal left in it (bounded, fail open), then drop
+# the journal. Cheap when there is none: one file test, no docker. Two callers:
+# the shell that started the runner, and slots_active before it prunes a dead
+# slot (runner and shell both killed with -9: nobody else will ever read it).
+yield_undo() {
+  local j="${1:-}/yielded" pg ids bin
   [ -f "$j" ] || return 0
   pg="$(sed -n 1p "$j" 2>/dev/null)"; ids="$(sed -n '2,$p' "$j" 2>/dev/null | tr '\n' ' ')"
   rm -f "$j"
-  printf 'agentloop heavy: the runner ended while the command was suspended behind a CI step — resuming it.\n' >&2
+  printf 'agentloop heavy: a command was left suspended behind a CI step (its runner ended) — resuming it.\n' >&2
   if [ -n "${ids// /}" ] && bin="$(host_docker_bin)"; then
     # shellcheck disable=SC2086
     run_bounded "$(( 3 * $(host_ci_timeout) ))" "$bin" unpause $ids >/dev/null 2>&1 || true
   fi
   case "$pg" in ''|*[!0-9]*) ;; *) kill -CONT -- "-$pg" 2>/dev/null || true ;; esac
 }
+heavy_unyield() { [ -z "$HEAVY_SLOT" ] || yield_undo "$HEAVY_SLOT"; }
 heavy_cleanup() { # every way out of cmd_heavy that bash can see: the slot and the heartbeat go
   [ -z "$HEAVY_NAPPER" ] || kill "$HEAVY_NAPPER" 2>/dev/null
   heavy_unyield

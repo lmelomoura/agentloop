@@ -3937,6 +3937,29 @@ SH
     || bad "runner killed: paused=$(ys_paused_boxes) running=$(ys_running && echo y || echo n): $(tail -3 "$ys/out")"
   ys_end
 
+  # Runner AND holder killed with -9 at once while the command is held: no shell is left to read the
+  # journal, and the dead slot is pruned by whoever looks next -- which must undo it before it deletes it.
+  ys_reset; ys_start
+  ys_until 15 ys_ticking 3; ys_mut on; ys_until 15 ys_stopped; ym=$?
+  yn="$(pgrep -P "$ypid" -f start_new_session | head -1)"
+  [ -f "$ys/data/locks/_heavy/$ypid/yielded" ]; yt0=$?
+  kill -KILL "$yn" "$ypid" 2>/dev/null; wait "$ypid" 2>/dev/null; sleep 1
+  ys_stopped && [ "$(ys_paused_boxes)" = "mine1,mine2" ] && ok "(precondition) both dead: the group is still stopped and the stack still paused, with a journal in the slot" \
+    || bad "precondition: stopped=$(ys_stopped && echo y || echo n) paused=$(ys_paused_boxes) journal=$yt0 pause=$ym"
+  PATH="$ys/bin:$PATH" FAKE_DOCKER_STATE="$ys/state.json" FAKE_DOCKER_EVENTS="$ys/events" AGENTLOOP_CONFIG="$ys/config" AGENTLOOP_DATA="$ys/data" \
+    AGENTLOOP_CI_GATE=1 AGENTLOOP_LOAD_CAP=0 AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents" "$BIN_DIR/agentloop" host > "$ys/host.out" 2>&1
+  ys_until 5 ys_running
+  [ "$ym" = 0 ] && ys_running && [ -z "$(ys_paused_boxes)" ] && [ "$(ys_events 'unpause mine1')" = 1 ] && [ "$(ys_events 'unpause mine2')" = 1 ] \
+    && [ -z "$(ls "$ys/data/locks/_heavy" 2>/dev/null)" ] \
+    && ok "the next look at the slots (agentloop host) unpauses the stack and continues the group BEFORE it prunes the dead slot" \
+    || bad "dead slot pruned without undoing: running=$(ys_running && echo y || echo n) paused=$(ys_paused_boxes) slots=$(ls "$ys/data/locks/_heavy" 2>/dev/null) host: $(tail -3 "$ys/host.out")"
+  : > "$ys/stop"; ys_until 10 ys_gone
+  # And a dead slot without a journal costs no docker call at all.
+  : > "$ys/events"; mkdir -p "$ys/data/locks/_heavy/999999"; echo 999999 > "$ys/data/locks/_heavy/999999/pid"
+  PATH="$ys/bin:$PATH" FAKE_DOCKER_STATE="$ys/state.json" FAKE_DOCKER_EVENTS="$ys/events" AGENTLOOP_CONFIG="$ys/config" AGENTLOOP_DATA="$ys/data" \
+    AGENTLOOP_CI_GATE=0 AGENTLOOP_LOAD_CAP=0 AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents" "$BIN_DIR/agentloop" host >/dev/null 2>&1
+  [ ! -d "$ys/data/locks/_heavy/999999" ] && [ ! -s "$ys/events" ] && ok "a dead slot with no journal is pruned as before, with no docker involved" || bad "plain dead slot: $(ls "$ys/data/locks/_heavy")"
+
   # --- FAIL OPEN: a docker that does not answer never pauses anything
   for ym in "FAKE_DOCKER_HANG=30 AGENTLOOP_CI_TIMEOUT=1" "FAKE_DOCKER_PS_FAIL=1"; do
     ys_reset; ys_mut on                       # a CI step is "running", but docker cannot say so

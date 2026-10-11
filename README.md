@@ -741,7 +741,10 @@ mechanisms now limit the host, both shared by every job of every project:
     the group before anything is signalled or the runner exits: a stopped group
     cannot handle a `TERM`, and a paused stack cannot be stopped cleanly. If the
     runner itself is killed with `-9` while holding a pause, the shell that started
-    it reads the runner's journal (`<slot>/yielded`) and undoes it.
+    it reads the runner's journal (`<slot>/yielded`) and undoes it; if the shell
+    dies too, the next look at the heavy slots (`agentloop host`, the next
+    `agentloop heavy`) undoes it before it prunes the dead slot (unpause, `SIGCONT`;
+    a slot with no journal costs no docker call).
   - **Switching it off.** `AGENTLOOP_CI_YIELD=0` (or `host.ci_yield`) keeps the
     gate at the door and drops the yielding; with the gate off (`AGENTLOOP_CI_GATE`)
     there is none either.
