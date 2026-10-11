@@ -4451,6 +4451,30 @@ host_ci_pattern() {
   printf '%s' "$HOST_CI_DEFAULT_PATTERN"
 }
 
+# Does a heavy command yield to a CI step that STARTS while it runs? On unless
+# AGENTLOOP_CI_YIELD (the environment, then host.ci_yield) says 0, off, false or
+# no, and always off when the CI gate itself is off. A value that is none of those
+# words is skipped, never half-read (the next source applies).
+host_ci_yield() {
+  local v name
+  host_ci_gate || return 1
+  for name in env block; do
+    if [ "$name" = env ]; then v="${AGENTLOOP_CI_YIELD:-}"
+    else v="$("$JQ" -r 'if (.host | type) == "object" and (.host | has("ci_yield")) then (.host.ci_yield | tostring) else empty end' "$PROJECTS_FILE" 2>/dev/null || true)"; fi
+    case "$(printf '%s' "$v" | tr 'A-Z' 'a-z')" in
+      0|off|false|no) return 1 ;;
+      1|on|true|yes)  return 0 ;;
+    esac
+  done
+  return 0
+}
+
+host_ci_yield_max() { # seconds a command may stay suspended behind one CI step; at least 1, default 2700
+  local v; v=$(( 10#$(host_setting AGENTLOOP_CI_YIELD_MAX ci_yield_max 2700 int) ))
+  [ "$v" -ge 1 ] || v=2700
+  printf '%s' "$v"
+}
+
 host_docker_bin() { # the docker CLI: the PATH first, then where Docker Desktop and Homebrew put it (launchd's PATH is short)
   local b
   b="$(command -v docker 2>/dev/null || true)"
@@ -4581,18 +4605,54 @@ EOF
 # outright. Then nothing keeps running -- or keeps a stack up -- on a slot the
 # lease has already given away. Exits with the command's own status (128+n for
 # a signal), 126/127 when it cannot be started.
+#
+# IT ALSO YIELDS TO CI. A step that starts while the command runs would compete
+# with it for the same CPUs (2026-10-11: a pipeline's Integration step timed out
+# beside an agent's `make test` stack), and the CI step is the merge gate: it
+# does not wait, the agent does. Every few seconds the runner asks the same
+# question as host_ci_running (same docker, same name pattern, same timeout, and
+# the same fail-open reading: a docker that does not answer means "no step"). When
+# a step is there it pauses the compose containers of the command's working
+# directory (recording exactly which), stops the command's process group, touches
+# the run's heavy-wait file so the stall watchdog does not read the stillness as
+# a hang, and says so. When the step is gone, or has held the command past the
+# ceiling, it undoes all of it. Every road out undoes it FIRST (a stopped group
+# cannot handle a TERM; a paused stack cannot be stopped cleanly): INT/TERM/HUP,
+# the holder's death, the command's own end. The settings arrive in AL_YIELD_*
+# (none: no yielding), and are not passed on to the command.
 heavy_runner_py() {
   cat <<'PY'
-import os, signal, subprocess, sys, time
+import os, re, signal, subprocess, sys, time
 
 holder = os.getppid()        # the shell that holds the slot; if it vanishes, so does the command
+
+def whole(name, default):
+    try:
+        v = int(os.environ.get("AL_YIELD_" + name, ""))
+    except ValueError:
+        return default
+    return v if v >= 1 else default
+
+DOCKER = os.environ.get("AL_YIELD_DOCKER", "")           # empty: this command does not yield
+PATTERN = os.environ.get("AL_YIELD_PATTERN", "")
+BEAT = os.environ.get("AL_YIELD_BEAT", "")                # the run's heavy-wait file; none for a command run by hand
+JOURNAL = os.environ.get("AL_YIELD_JOURNAL", "")          # what this runner has suspended, for the shell to undo if it is killed
+TIMEOUT = whole("TIMEOUT", 5)                             # one `docker ps`
+ACT_TIMEOUT = 3 * TIMEOUT                                 # one `docker pause` / `unpause`
+POLL = whole("POLL", 5)
+CEILING = whole("MAX", 2700)
+
 try:
-    p = subprocess.Popen(sys.argv[1:], start_new_session=True)
+    p = subprocess.Popen(sys.argv[1:], start_new_session=True,
+                         env=dict((k, v) for k, v in os.environ.items() if not k.startswith("AL_YIELD_")))
 except OSError as e:
     print("agentloop heavy: cannot run %s: %s" % (sys.argv[1], e.strerror or e), file=sys.stderr)
     sys.exit(126 if isinstance(e, PermissionError) else 127)
 
 hit = {"at": 0.0}
+# busy: a pause or a resume is under way and a signal must wait for it (see critical).
+st = {"busy": False, "pending": [], "stopped": False, "ids": [], "since": 0.0,
+      "beat": False, "beat_new": False, "waived": set()}
 
 def group(sig):
     try:
@@ -4600,25 +4660,227 @@ def group(sig):
     except (ProcessLookupError, PermissionError):
         pass
 
-def on_signal(num, frame):
+def say(text):
+    print("agentloop heavy: " + text, file=sys.stderr, flush=True)
+
+def dur(s):
+    s = int(s)
+    if s >= 3600:
+        return "%dh%02dm" % (s // 3600, s % 3600 // 60)
+    if s >= 60:
+        return "%dm%02ds" % (s // 60, s % 60)
+    return "%ds" % s
+
+def bounded(argv, secs):
+    """(rc, stdout) of argv, which is ended with its whole group past `secs`: rc 124; 127 when it cannot be run."""
+    try:
+        q = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return 127, ""
+    try:
+        out, _ = q.communicate(timeout=secs)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(q.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            q.communicate(timeout=2)
+        except Exception:
+            pass
+        return 124, ""
+    return q.returncode, out.decode("utf-8", "replace")
+
+def journal():
+    """What is suspended right now, in a file the shell can read if this process is killed with -9."""
+    if not JOURNAL:
+        return
+    try:
+        if st["stopped"] or st["ids"]:
+            tmp = JOURNAL + ".tmp"
+            with open(tmp, "w") as f:
+                f.write("%d\n%s" % (p.pid, "".join(i + "\n" for i in st["ids"])))
+            os.replace(tmp, JOURNAL)
+        elif os.path.exists(JOURNAL):
+            os.remove(JOURNAL)
+    except OSError:
+        pass
+
+def beat():
+    if not BEAT:
+        return
+    try:
+        if not st["beat"]:
+            st["beat"], st["beat_new"] = True, not os.path.exists(BEAT)
+        with open(BEAT, "w"):
+            pass
+    except OSError:
+        pass
+
+def unbeat():
+    if st["beat"] and st["beat_new"]:
+        try:
+            os.remove(BEAT)
+        except OSError:
+            pass
+    st["beat"] = False
+
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+STEP = re.compile("^%s_(%s)_(pause|build|clone)$" % (UUID, UUID))
+
+def label(name):
+    name = "".join(c for c in name if " " <= c <= "~")[:120]
+    m = STEP.match(name)
+    return "ci step %s (bitbucket runner)" % m.group(1)[:8] if m else "ci container %s" % name[:40]
+
+def ci_look():
+    """(names, labels) of the CI step containers that run. Nothing when there are none, and nothing when docker
+    cannot be asked in time: the same fail-open reading as host_ci_running."""
+    rc, out = bounded([DOCKER, "ps", "--format", "{{.Names}}"], TIMEOUT)
+    names = [n for n in out.splitlines() if n.strip()] if rc == 0 else []
+    if not names:
+        return set(), []
+    try:
+        g = subprocess.run(["grep", "-E", "-e", PATTERN], input="\n".join(names) + "\n", stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, universal_newlines=True, timeout=5)
+    except Exception:
+        return set(), []
+    hits = set(n for n in g.stdout.splitlines() if n) if g.returncode == 0 else set()
+    return hits, sorted(set(label(n) for n in hits))
+
+def own_containers(skip):
+    """Ids of the running compose containers whose project working directory is this command's, or below it."""
+    bases = set()
+    here = os.getcwd()
+    for d in (here, os.environ.get("PWD", "")):
+        try:
+            if d and os.path.samefile(d, here):
+                bases.update((os.path.normpath(d), os.path.realpath(d)))
+        except OSError:
+            pass
+    bases.discard("/")                      # every stack is below the root: that is no scope at all
+    bases.discard("")
+    fmt = '{{.ID}}|{{.Names}}|{{.Label "com.docker.compose.project.working_dir"}}'
+    rc, out = bounded([DOCKER, "ps", "--filter", "status=running", "--filter", "label=com.docker.compose.project",
+                       "--format", fmt], TIMEOUT)
+    ids = []
+    for line in out.splitlines() if rc == 0 else []:
+        cid, _, rest = line.partition("|")
+        name, _, wd = rest.partition("|")
+        if not cid or name in skip or not os.path.isabs(wd):
+            continue                        # the CI step's own containers are never ours to pause
+        for cand in (os.path.normpath(wd), os.path.realpath(wd)):
+            if any(cand == b or cand.startswith(b.rstrip("/") + "/") for b in bases):
+                ids.append(cid)
+                break
+    return ids
+
+def critical(fn):
+    """Run fn with signals deferred: a TERM that lands in the middle of a pause would otherwise unpause
+    what the pause call is still about to pause. They are delivered, in order, as soon as it is done."""
+    st["busy"] = True
+    try:
+        fn()
+    finally:
+        st["busy"] = False
+        while st["pending"]:
+            deliver(st["pending"].pop(0))
+
+def pause_now(labels, skip):
+    def go():
+        if hit["at"] or st["stopped"]:
+            return
+        st["since"] = time.time()
+        for cid in own_containers(skip):
+            if hit["at"] or st["pending"]:
+                break
+            st["ids"].append(cid)           # written down BEFORE the call: a kill in between must still find it
+            journal()
+            rc, _ = bounded([DOCKER, "pause", cid], ACT_TIMEOUT)
+            if rc not in (0, 124):          # refused (already paused, gone): not ours to unpause. 124: maybe it did.
+                st["ids"].remove(cid)
+                journal()
+        if st["pending"]:
+            return                          # a signal is waiting: resume what is paused and let it through
+        st["stopped"] = True
+        journal()
+        group(signal.SIGSTOP)
+        say("paused — a CI step is running (%s); resuming when it ends." % ", ".join(labels))
+        beat()
+    critical(go)
+
+def resume():
+    was = st["stopped"]
+    if not was and not st["ids"]:
+        return
+    ids, left = list(st["ids"]), []
+    if ids:
+        rc, _ = bounded([DOCKER, "unpause"] + ids, ACT_TIMEOUT)
+        if rc == 124:
+            left = ids
+        elif rc != 0:                       # some of them failed (gone already, not paused): one by one
+            left = [i for i in ids if bounded([DOCKER, "unpause", i], ACT_TIMEOUT)[0] == 124]
+    st["ids"] = left
+    if was:
+        group(signal.SIGCONT)
+        st["stopped"] = False
+    journal()
+    unbeat()
+    if left:
+        say("docker unpause did not answer for %s; check `docker ps` if they stay paused." % ", ".join(left))
+    if was:
+        say("resumed after %s." % dur(time.time() - st["since"]))
+
+def deliver(num):
     if not hit["at"]:
         hit["at"] = time.time()
+    critical(resume)
     group(num)
+
+def on_signal(num, frame):
+    if st["busy"]:
+        st["pending"].append(num)
+    else:
+        deliver(num)
 
 for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
     signal.signal(s, on_signal)
 
-while True:
-    try:
-        rc = p.wait(timeout=0.5)
-        break
-    except subprocess.TimeoutExpired:
-        pass
-    if hit["at"] and time.time() - hit["at"] >= 5:
-        group(signal.SIGKILL)          # it had its grace
-    elif not hit["at"] and os.getppid() != holder:
-        hit["at"] = time.time()        # the holder was killed outright
-        group(signal.SIGTERM)
+def look():
+    names, labels = ci_look()
+    st["waived"] &= names                   # a step that ended is forgotten
+    if st["stopped"]:
+        beat()
+        if not names:
+            critical(resume)
+        elif time.time() - st["since"] >= CEILING:
+            st["waived"] |= names           # this step has had its time: only a NEW one stops the command again
+            say("a CI step has kept this command suspended for %s (AGENTLOOP_CI_YIELD_MAX) — resuming anyway." % dur(CEILING))
+            critical(resume)
+    elif names - st["waived"]:
+        pause_now(labels, names)
+
+next_look = time.time() + POLL
+try:
+    while True:
+        try:
+            rc = p.wait(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if hit["at"] and time.time() - hit["at"] >= 5:
+            group(signal.SIGKILL)          # it had its grace
+        elif not hit["at"] and os.getppid() != holder:
+            deliver(signal.SIGTERM)        # the holder was killed outright
+        if DOCKER and not hit["at"] and time.time() >= next_look:
+            try:
+                look()
+            except Exception:
+                critical(resume)           # whatever went wrong, never leave it suspended
+            next_look = time.time() + POLL
+finally:
+    critical(resume)
 sys.exit(128 - rc if rc < 0 else rc)
 PY
 }
@@ -4662,8 +4924,28 @@ heavy_ci_running() {
   fi
   return 1
 }
+# The runner writes what it has suspended (the command's group, the containers it
+# paused) to $slot/yielded and removes it when it has undone it. A file still there
+# once the runner is gone means it was killed outright while the command was held:
+# nothing in it could resume, so we do, or the group stays stopped and the stack
+# paused with nobody left to ask.
+heavy_unyield() {
+  local j pg ids bin
+  [ -n "$HEAVY_SLOT" ] || return 0
+  j="$HEAVY_SLOT/yielded"
+  [ -f "$j" ] || return 0
+  pg="$(sed -n 1p "$j" 2>/dev/null)"; ids="$(sed -n '2,$p' "$j" 2>/dev/null | tr '\n' ' ')"
+  rm -f "$j"
+  printf 'agentloop heavy: the runner ended while the command was suspended behind a CI step — resuming it.\n' >&2
+  if [ -n "${ids// /}" ] && bin="$(host_docker_bin)"; then
+    # shellcheck disable=SC2086
+    run_bounded "$(( 3 * $(host_ci_timeout) ))" "$bin" unpause $ids >/dev/null 2>&1 || true
+  fi
+  case "$pg" in ''|*[!0-9]*) ;; *) kill -CONT -- "-$pg" 2>/dev/null || true ;; esac
+}
 heavy_cleanup() { # every way out of cmd_heavy that bash can see: the slot and the heartbeat go
   [ -z "$HEAVY_NAPPER" ] || kill "$HEAVY_NAPPER" 2>/dev/null
+  heavy_unyield
   [ -z "$HEAVY_RUN_SLOT" ] || rm -f "$HEAVY_RUN_SLOT/heavy-wait" 2>/dev/null
   [ -z "$HEAVY_SLOT" ] || release_slot "$HEAVY_SLOT"
 }
@@ -4743,7 +5025,17 @@ cmd_heavy() {
 
   # `<&0`: a background job gets /dev/null for stdin unless told otherwise, and
   # the command is a foreground one that may read it.
-  AL_HEAVY_HELD="$HEAVY_SLOT" "$PYTHON" -c "$(heavy_runner_py)" "$@" <&0 &
+  # Yielding to a CI step that starts while the command runs (heavy_runner_py): its
+  # settings go in the environment. No docker on this machine, or yielding off: none.
+  local -a yenv=()
+  local ybin ypoll
+  if host_ci_yield && ybin="$(host_docker_bin)"; then
+    ypoll="$HEAVY_POLL"; [ "$ypoll" -le 5 ] || ypoll=5
+    yenv=(AL_YIELD_DOCKER="$ybin" AL_YIELD_PATTERN="$(host_ci_pattern)" AL_YIELD_TIMEOUT="$(host_ci_timeout)"
+          AL_YIELD_POLL="$ypoll" AL_YIELD_MAX="$(host_ci_yield_max)" AL_YIELD_JOURNAL="$HEAVY_SLOT/yielded")
+    [ -z "$HEAVY_RUN_SLOT" ] || yenv+=(AL_YIELD_BEAT="$HEAVY_RUN_SLOT/heavy-wait")
+  fi
+  env AL_HEAVY_HELD="$HEAVY_SLOT" ${yenv[@]+"${yenv[@]}"} "$PYTHON" -c "$(heavy_runner_py)" "$@" <&0 &
   HEAVY_PID=$!
   trap 'kill -INT  "$HEAVY_PID" 2>/dev/null' INT
   trap 'kill -TERM "$HEAVY_PID" 2>/dev/null' TERM
@@ -4753,6 +5045,7 @@ cmd_heavy() {
   # runner still tearing the command down: wait for it to finish, then say so.
   while kill -0 "$HEAVY_PID" 2>/dev/null; do wait "$HEAVY_PID"; rc=$?; done
   trap - INT TERM HUP
+  heavy_unyield
   exit "$rc"
 }
 

@@ -3778,6 +3778,246 @@ PY
   [ "$(sed -n '/^cmd_tick()/,/^}/p' "$BIN_DIR/agentloop" | grep -c 'host_ci')" = 0 ] \
     && ok "the tick does not consult CI: a step holds heavy slots, not launches" || bad "cmd_tick consults the CI gate"
 
+  echo "a CI step that starts while a heavy command runs suspends it and its stack, and the command goes on when the step ends"
+  # 2026-10-11: CommitFort pipeline #93 failed its Integration step (Playwright
+  # 30 s timeouts, a missed benchmark) while an agent's `make test` stack ran at
+  # ~70 % CPU beside it. The gate above only protects a CI step that is already
+  # running when a command asks for a slot; this is the other direction: a step
+  # that STARTS while the command runs. The runner (heavy_runner_py) stops the
+  # command's process group and pauses the compose containers of its working
+  # directory, and undoes both when the step is gone. Every check below starts
+  # with no CI step (otherwise the gate would hold the command at the door) and
+  # brings one up while the command ticks. The command prints one line per 0.2 s,
+  # into the same file as agentloop's own messages, so the ORDER of the lines
+  # proves when it was suspended.
+  local ys="$tmp/yield" ypid="" yrc yphys yn yt0 yt1 ym
+  mkdir -p "$ys/bin" "$ys/config" "$ys/wt/sub/stack" "$ys/other" "$ys/wt-sibling"
+  ln -sf "$BASE_DIR/test/fake-docker" "$ys/bin/docker"
+  printf '%s' '{"projects":[]}' > "$ys/config/projects.json"
+  yphys="$(cd "$ys/wt/sub/stack" && pwd -P)"
+  cat > "$ys/mut.py" <<'PY'
+import json, os, sys
+state, mode, ys, phys = sys.argv[1:5]
+A = "c411fdb1-dc76-56eb-8023-fbc983f1fe62_8648124f-1c0c-4856-8256-31508103c341_"
+B = "c411fdb1-dc76-56eb-8023-fbc983f1fe62_d1d1d1d1-aaaa-4bbb-8ccc-123456789abc_"
+def box(i, name, project, workdir, st="running"):
+    return {"id": i, "name": name, "project": project, "workdir": workdir, "created": "", "state": st}
+if mode == "init":
+    s = {"containers": [
+            box("mine1", "rc-wt-app-1", "rc-wt", ys + "/wt"),              # the command's own directory (as the label spells it)
+            box("mine2", "rc-wt-db-1", "rc-wt-sub", phys),                  # below it, spelled with the real path
+            box("other1", "rc-other-app-1", "rc-other", ys + "/other"),     # another project's stack
+            box("sib1", "rc-sib-app-1", "rc-sib", ys + "/wt-sibling")],     # a sibling whose name merely starts like ours
+         "images": [], "volumes": [], "networks": [], "log": []}
+else:
+    s = json.load(open(state))
+    s["containers"] = [c for c in s["containers"] if not c["id"].startswith("ci-")]
+    steps = {"on": [A], "on2": [B], "both": [A, B], "off": []}[mode]
+    for n, pre in enumerate(steps):
+        for suffix in ("pause", "build"):
+            # the step's build container is a compose container of the command's directory
+            # on purpose: it must never be paused, it is the very thing being yielded to
+            s["containers"].append(box("ci-%s-%s" % (pre[37:45], suffix), pre + suffix, "x", ys + "/wt" if suffix == "build" else ""))
+tmp = state + ".mut"
+json.dump(s, open(tmp, "w"))
+os.replace(tmp, state)
+PY
+  cat > "$ys/cmd.sh" <<'SH'
+#!/bin/sh
+# One line per 0.2 s until $YS/stop appears. On TERM it says how many containers were
+# still paused at that moment: stopped processes do not handle signals, and a stack
+# that is paused cannot be stopped cleanly, so both must be undone first.
+echo $$ > "$YS/pid"
+trap 'echo "got-term paused=$(grep -o "\"state\": \"paused\"" "$YS/state.json" | wc -l | tr -d " ")"; exit 0' TERM
+n=0
+while [ ! -e "$YS/stop" ]; do n=$((n + 1)); echo "tick $n"; sleep 0.2; done
+SH
+  ys_mut() { YS="$ys" python3 "$ys/mut.py" "$ys/state.json" "$1" "$ys" "$yphys"; }
+  ys_start() { # ys_start [VAR=value ...]: agentloop heavy, from the "wt" directory, its output in $ys/out; $ypid is agentloop
+    ( cd "$ys/wt" && exec env PATH="$ys/bin:$PATH" FAKE_DOCKER_STATE="$ys/state.json" FAKE_DOCKER_EVENTS="$ys/events" YS="$ys" \
+        AGENTLOOP_CONFIG="$ys/config" AGENTLOOP_DATA="$ys/data" AGENTLOOP_CI_GATE=1 AGENTLOOP_HEAVY_POLL=1 AGENTLOOP_LOAD_CAP=0 \
+        AGENTLOOP_LAUNCH_AGENTS_DIR="$tmp/LaunchAgents" "$@" "$BIN_DIR/agentloop" heavy -- sh "$ys/cmd.sh" ) > "$ys/out" 2>&1 &
+    ypid=$!
+  }
+  ys_reset() { rm -rf "$ys/out" "$ys/stop" "$ys/pid" "$ys/events" "$ys/data" "$ys/state.json"*; mkdir -p "$ys/data"; : > "$ys/events"; ys_mut init; }
+  ys_until() { local n=$(( $1 * 5 )); shift; while ! "$@" >/dev/null 2>&1; do n=$(( n - 1 )); [ "$n" -gt 0 ] || return 1; sleep 0.2; done; }
+  ys_out_has() { grep -q -- "$1" "$ys/out"; }
+  ys_lines() { grep -c -- "$1" "$ys/out" || true; }
+  ys_events() { grep -c -- "$1" "$ys/events" || true; }
+  ys_ticks() { grep -c '^tick' "$ys/out" || true; }
+  ys_ticking() { [ "$(ys_ticks)" -ge "$1" ]; }
+  ys_running() { local s; s="$(ps -o stat= -p "$(cat "$ys/pid" 2>/dev/null)" 2>/dev/null | tr -d ' ')"; [ -n "$s" ] && [ "${s#T}" = "$s" ]; }
+  ys_stopped() { # 0 when the command's group exists and every process in it is stopped
+    local pg; pg="$(ps -o pgid= -p "$(cat "$ys/pid" 2>/dev/null)" 2>/dev/null | tr -d ' ')"; [ -n "$pg" ] || return 1
+    ps -ax -o pgid=,stat= | awk -v g="$pg" '$1 == g { n++; if ($2 !~ /^T/) bad++ } END { exit !(n > 0 && bad == 0) }'
+  }
+  ys_gone() { ! kill -0 "$(cat "$ys/pid" 2>/dev/null)" 2>/dev/null; }
+  ys_paused_boxes() { python3 -c 'import json,sys; print(",".join(sorted(c["id"] for c in json.load(open(sys.argv[1]))["containers"] if c.get("state") == "paused")))' "$ys/state.json"; }
+  ys_n() { [ "$(ys_lines "$1")" -ge "$2" ]; }
+  ys_end() { # let the command finish and wait for agentloop, never for longer than 30 s
+    local k; ys_mut off; : > "$ys/stop"
+    ( sleep 30; kill -KILL "$ypid" 2>/dev/null ) 2>/dev/null & k=$!
+    wait "$ypid" 2>/dev/null; yrc=$?
+    pkill -P "$k" 2>/dev/null; kill "$k" 2>/dev/null; wait "$k" 2>/dev/null
+  }
+  ys_paused_msg='agentloop heavy: paused — a CI step is running (ci step 8648124f (bitbucket runner)); resuming when it ends.'
+
+  # --- the whole cycle: stop, pause its stack, say so; resume, unpause, say so; and again
+  ys_reset; ys_start
+  ys_until 15 ys_ticking 3 || bad "the yield test command never started: $(cat "$ys/out")"
+  ys_mut on
+  ys_until 15 ys_out_has 'agentloop heavy: paused' ; sleep 0.5
+  grep -qxF "$ys_paused_msg" "$ys/out" && ok "a CI step that appears while the command runs: one line says it was paused, and for which step" \
+    || bad "no pause line: $(cat "$ys/out")"
+  yt0="$(ys_ticks)"; sleep 1.5; yt1="$(ys_ticks)"
+  [ "$yt0" = "$yt1" ] && ys_stopped && ok "the command's whole process group is stopped (SIGSTOP): no tick for 1.5 s, every member in state T" \
+    || bad "not suspended: ticks $yt0 -> $yt1, group: $(ps -ax -o pgid=,stat=,command= | grep -E 'cmd.sh|sleep 0.2' | head -3)"
+  [ "$(sed -n '/^agentloop heavy: paused/,$p' "$ys/out" | grep -c '^tick')" = 0 ] \
+    && ok "and its output order proves it: nothing was printed between the pause line and the resumption" || bad "ticks after the pause line"
+  [ "$(ys_paused_boxes)" = "mine1,mine2" ] && [ "$(ys_events '^pause ')" = 2 ] \
+    && ok "the compose containers of its directory are paused, those of the directory itself and of one below it (spelled either way)" \
+    || bad "paused: $(ys_paused_boxes); events: $(cat "$ys/events")"
+  [ "$(ys_events other1)" = 0 ] && [ "$(ys_events sib1)" = 0 ] \
+    && ok "while another project's stack, and a sibling directory whose name starts the same, are not touched" || bad "events: $(cat "$ys/events")"
+  [ "$(ys_events ci-)" = 0 ] && ok "and neither is a container of the CI step itself, even one that carries the directory's compose label" || bad "paused the CI step: $(cat "$ys/events")"
+  ys_mut off
+  ys_until 15 ys_out_has 'agentloop heavy: resumed after' ; sleep 1
+  grep -qE '^agentloop heavy: resumed after [0-9]+s\.$' "$ys/out" && ok "when the step is gone, one line says it resumed, and after how long" || bad "no resume line: $(cat "$ys/out")"
+  yt0="$(ys_ticks)"; sleep 1; yt1="$(ys_ticks)"
+  [ "$yt1" -gt "$yt0" ] && ys_running && ok "the command goes on (SIGCONT): ticks are coming again" || bad "still stopped: ticks $yt0 -> $yt1"
+  [ -z "$(ys_paused_boxes)" ] && [ "$(ys_events unpause)" = 2 ] && [ "$(ys_events 'unpause mine1')" = 1 ] && [ "$(ys_events 'unpause mine2')" = 1 ] \
+    && ok "exactly the two containers it paused are unpaused" || bad "after resume: paused=$(ys_paused_boxes); events: $(cat "$ys/events")"
+  ys_mut on
+  ys_until 15 ys_stopped && ys_mut off && ys_until 15 ys_n 'resumed after' 2 ; ys_until 10 ys_running
+  [ "$(ys_lines 'agentloop heavy: paused')" = 2 ] && [ "$(ys_events '^pause ')" = 4 ] && ys_running \
+    && ok "a later CI step pauses it again, and it resumes again" || bad "second step: $(grep -c paused "$ys/out") pause lines, events $(cat "$ys/events")"
+  ys_end
+  [ "$yrc" = 0 ] && ok "and the command's own exit status comes back unchanged (0)" || bad "heavy ended $yrc"
+  [ -z "$(ls "$ys/data/locks/_heavy" 2>/dev/null)" ] && ok "no slot or journal is left behind" || bad "left behind: $(ls -R "$ys/data/locks" 2>/dev/null)"
+
+  # --- the run's watchdog hears about it: the heartbeat a waiting command leaves
+  mkdir -p "$ys/slots/job-y/$$"; echo $$ > "$ys/slots/job-y/$$/pid"; boot_id > "$ys/slots/job-y/$$/boot"
+  ys_reset; ys_start AL_RUN_SLOT="$ys/slots/job-y/$$"
+  ys_until 15 ys_ticking 3
+  ys_mut on
+  ys_until 15 ys_stopped; sleep 1
+  heavy_wait_fresh "$ys/slots/job-y/$$" && ok "while the command is suspended, the run's heavy-wait file is fresh (the stall watchdog must not read a paused run as hung)" \
+    || bad "no heartbeat while paused"
+  ym="$(stat -f %m "$ys/slots/job-y/$$/heavy-wait" 2>/dev/null || echo 0)"; sleep 2.5
+  [ "$(stat -f %m "$ys/slots/job-y/$$/heavy-wait" 2>/dev/null || echo 0)" -gt "$ym" ] && ok "and it is touched again on every poll, for as long as the pause lasts" || bad "heartbeat not renewed"
+  ys_mut off
+  ys_until 15 ys_out_has 'resumed after'; sleep 0.5
+  [ ! -e "$ys/slots/job-y/$$/heavy-wait" ] && ok "it is removed once the command goes on" || bad "heartbeat left behind after resume"
+  ys_end; rm -rf "$ys/slots"
+
+  # --- a signal while paused: resume first, then deliver it
+  ys_reset; ys_start
+  ys_until 15 ys_ticking 3; ys_mut on; ys_until 15 ys_stopped; yn=$?
+  kill -TERM "$ypid"; wait "$ypid"; yrc=$?
+  ys_until 5 ys_gone
+  [ "$yn" = 0 ] && [ "$yrc" = 0 ] && grep -q '^got-term paused=0$' "$ys/out" \
+    && ok "TERM while paused: the stack is unpaused and the command continued BEFORE it handled the TERM (a stopped group cannot, a paused stack cannot be stopped cleanly)" \
+    || bad "TERM while paused (suspended: $yn, rc $yrc): $(tail -3 "$ys/out")"
+  [ -z "$(ys_paused_boxes)" ] && [ "$(ys_events unpause)" = 2 ] && ! ps -ax -o stat=,command= | grep -E '^T.*cmd\.sh' | grep -q . \
+    && ok "nothing is left paused or stopped behind it" || bad "left: paused=$(ys_paused_boxes) $(ps -ax -o stat=,command= | grep cmd.sh | head -3)"
+  # The holder (the shell that holds the slot) killed outright, which no trap can see: the runner notices.
+  ys_reset; ys_start
+  ys_until 15 ys_ticking 3; ys_mut on; ys_until 15 ys_stopped; yn=$?
+  kill -KILL "$ypid"; wait "$ypid" 2>/dev/null
+  ys_until 15 ys_gone
+  [ "$yn" = 0 ] && ys_gone && grep -q '^got-term paused=0$' "$ys/out" && [ -z "$(ys_paused_boxes)" ] \
+    && ok "a holder killed with -9 while the command is paused: the runner resumes everything, then ends the command" || bad "holder killed: paused=$(ys_paused_boxes) $(tail -3 "$ys/out")"
+  # The runner killed with -9 while it holds a pause: nothing in it can run, so the shell that started it undoes it.
+  ys_reset; ys_start
+  ys_until 15 ys_ticking 3; ys_mut on; ys_until 15 ys_stopped; ym=$?
+  yn="$(pgrep -P "$ypid" -f start_new_session | head -1)"
+  kill -KILL "$yn" 2>/dev/null
+  ys_until 15 ys_running
+  [ "$ym" = 0 ] && [ -n "$yn" ] && [ -z "$(ys_paused_boxes)" ] && ys_running && ok "the runner itself killed with -9 while paused: the shell that started it unpauses the stack and continues the group" \
+    || bad "runner killed: paused=$(ys_paused_boxes) running=$(ys_running && echo y || echo n): $(tail -3 "$ys/out")"
+  ys_end
+
+  # --- FAIL OPEN: a docker that does not answer never pauses anything
+  for ym in "FAKE_DOCKER_HANG=30 AGENTLOOP_CI_TIMEOUT=1" "FAKE_DOCKER_PS_FAIL=1"; do
+    ys_reset; ys_mut on                       # a CI step is "running", but docker cannot say so
+    ys_start $ym
+    ys_until 15 ys_ticking 2; sleep 3
+    ! ys_out_has 'agentloop heavy: paused' && ys_running && [ "$(ys_events '^pause ')" = 0 ] && [ "$(ys_ticks)" -ge 8 ] \
+      && ok "docker that fails ($ym): the command is never stopped, nothing is paused" || bad "fail open ($ym): $(tail -4 "$ys/out")"
+    ys_end
+    pgrep -f 'fake-docker ps' >/dev/null 2>&1 && { sleep 2; pgrep -f 'fake-docker ps' >/dev/null 2>&1 && bad "a hung docker ps was left running"; }
+  done
+  # ... and one that stops answering while the command is paused releases it (nothing else could tell it the step ended)
+  for ym in PS_FAIL_FILE PS_HANG_FILE; do
+    ys_reset; ys_start AGENTLOOP_CI_TIMEOUT=1 FAKE_DOCKER_$ym="$ys/dockerdown"
+    ys_until 15 ys_ticking 2; ys_mut on; ys_until 15 ys_stopped
+    yt0=$SECONDS; : > "$ys/dockerdown"
+    ys_until 20 ys_out_has 'resumed after'; ys_until 5 ys_running
+    [ $(( SECONDS - yt0 )) -lt 15 ] && ys_running && [ -z "$(ys_paused_boxes)" ] \
+      && ok "docker stops answering while the command is paused ($ym): it fails open, unpauses and continues within a few polls" \
+      || bad "still held after $(( SECONDS - yt0 ))s ($ym): paused=$(ys_paused_boxes)"
+    rm -f "$ys/dockerdown"; ys_end
+    pgrep -f 'fake-docker ps' >/dev/null 2>&1 && sleep 3
+  done
+  # A docker pause that fails records nothing, but the command is still stopped; and a docker unpause that never answers is bounded.
+  ys_reset; ys_start FAKE_DOCKER_PAUSE_FAIL=1
+  ys_until 15 ys_ticking 2; ys_mut on; ys_until 15 ys_stopped
+  ys_mut off; ys_until 15 ys_out_has 'resumed after'; ys_until 5 ys_running
+  [ "$(ys_events '^pause ')" = 0 ] && [ "$(ys_events unpause)" = 0 ] && ys_running \
+    && ok "a docker pause that fails: the command is still suspended and resumed, and nothing it did not pause is unpaused" || bad "pause failing: $(cat "$ys/events"); $(tail -3 "$ys/out")"
+  ys_end
+  ys_reset; ys_start AGENTLOOP_CI_TIMEOUT=1 FAKE_DOCKER_UNPAUSE_HANG=60
+  ys_until 15 ys_ticking 2; ys_mut on; ys_until 15 ys_stopped
+  yt0=$SECONDS; ys_mut off
+  ys_until 25 ys_out_has 'resumed after'; ys_until 5 ys_running
+  [ $(( SECONDS - yt0 )) -lt 20 ] && ys_running \
+    && ok "a docker unpause that hangs is bounded: the command is continued after a few seconds regardless" || bad "unpause hang held it $(( SECONDS - yt0 ))s"
+  ys_end
+  pkill -f 'fake-docker unpause' 2>/dev/null
+
+  # --- off, and the ceiling
+  ys_reset; ys_start AGENTLOOP_CI_YIELD=0
+  ys_until 15 ys_ticking 2; ys_mut on; sleep 3.5
+  ! ys_out_has 'agentloop heavy: paused' && ys_running && [ "$(ys_events '^pause ')" = 0 ] \
+    && ok "AGENTLOOP_CI_YIELD=0: a CI step that starts does not stop the command (the old behaviour)" || bad "yield off: $(tail -3 "$ys/out")"
+  ys_end
+  ys_reset; ys_start AGENTLOOP_CI_YIELD_MAX=3
+  ys_until 15 ys_ticking 2; ys_mut on; ys_until 15 ys_stopped
+  ys_until 15 ys_out_has 'resumed after'; ys_until 5 ys_running; sleep 3
+  ys_running && [ "$(ys_lines 'agentloop heavy: paused')" = 1 ] && [ "$(ys_events unpause)" = 2 ] && [ -z "$(ys_paused_boxes)" ] \
+    && ok "the ceiling (AGENTLOOP_CI_YIELD_MAX) resumes the command though the step still runs, and does not pause it again for the same step" \
+    || bad "ceiling: $(cat "$ys/out" | grep -v '^tick')"
+  ys_mut both; ys_until 15 ys_stopped
+  [ "$(ys_lines 'agentloop heavy: paused')" = 2 ] && ok "but a NEW step appearing beside it pauses it again" || bad "new step did not pause: $(grep -v '^tick' "$ys/out")"
+  ys_mut off; ys_until 10 ys_n 'resumed after' 2; ys_end
+
+  # The settings, in the order of the others (environment, host block, default), without a run.
+  yn="$ys/yield-settings.out"
+  ( PROJECTS_FILE="$ys/config/projects.json"; unset AGENTLOOP_CI_YIELD AGENTLOOP_CI_YIELD_MAX
+    AGENTLOOP_CI_GATE=1
+    printf '%s' '{"projects":[]}' > "$PROJECTS_FILE"
+    host_ci_yield; echo "default $?"
+    for v in 0 off false OFF No; do AGENTLOOP_CI_YIELD="$v" host_ci_yield; echo "env-$v $?"; done
+    AGENTLOOP_CI_YIELD=1 host_ci_yield; echo "env-1 $?"
+    AGENTLOOP_CI_YIELD=banana host_ci_yield; echo "env-banana $?"
+    for hv in false 0 '"off"' '"false"'; do
+      printf '{"projects":[],"host":{"ci_yield":%s}}' "$hv" > "$PROJECTS_FILE"
+      host_ci_yield; echo "block-$hv $?"
+      AGENTLOOP_CI_YIELD=1 host_ci_yield; echo "env-over-block-$hv $?"
+    done
+    printf '%s' '{"projects":[],"host":{"ci_yield":true}}' > "$PROJECTS_FILE"; host_ci_yield; echo "block-true $?"
+    printf '%s' '{"projects":[]}' > "$PROJECTS_FILE"
+    AGENTLOOP_CI_GATE=0 host_ci_yield; echo "gate-off $?"
+    echo "max-default $(host_ci_yield_max)"
+    ym="$(AGENTLOOP_CI_YIELD_MAX=90 host_ci_yield_max)"; echo "max-env $ym"
+    ym="$(AGENTLOOP_CI_YIELD_MAX=0 host_ci_yield_max)"; echo "max-zero $ym"
+    printf '%s' '{"projects":[],"host":{"ci_yield_max":120}}' > "$PROJECTS_FILE"; echo "max-block $(host_ci_yield_max)"
+  ) > "$yn" 2>&1
+  [ "$(tr '\n' ' ' < "$yn")" = "default 0 env-0 1 env-off 1 env-false 1 env-OFF 1 env-No 1 env-1 0 env-banana 0 block-false 1 env-over-block-false 0 block-0 1 env-over-block-0 0 block-\"off\" 1 env-over-block-\"off\" 0 block-\"false\" 1 env-over-block-\"false\" 0 block-true 0 gate-off 1 max-default 2700 max-env 90 max-zero 2700 max-block 120 " ] \
+    && ok "yielding: on by default; 0/off/false/no switch it off, in the environment or in host.ci_yield (the environment wins); off with the CI gate; the ceiling is 2700 s unless set" \
+    || bad "yield settings: $(tr '\n' ' ' < "$yn")"
+  [ "$(sed -n '/^cmd_tick()/,/^}/p' "$BIN_DIR/agentloop" | grep -c 'yield')" = 0 ] && ok "the tick has nothing to do with it" || bad "cmd_tick mentions yielding"
+
   echo "the host contract reaches every job that can start a stack, and says the right things"
   # The gate only works if every agent routes its suites through it, and the
   # only way to tell them is the prompt the scheduler injects -- never a
